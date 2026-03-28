@@ -7,16 +7,16 @@ proxy_address   = "http://127.0.0.1:9001"
 name      = "client-a"
 namespace = "ecommerce"
 version   = "1.0.0"
-wasm_path = "ecommerce-example/client/target/wasm32-wasip2/release/client.wasm"
+wasm_path = "target/wasm32-wasip2/release/client.wasm"
 
 [[module]]
 name      = "client-b"
 namespace = "ecommerce"
 version   = "1.0.0"
-wasm_path = "ecommerce-example/client/target/wasm32-wasip2/release/client.wasm"
+wasm_path = "target/wasm32-wasip2/release/client.wasm"
 
 [[module]]
 name      = "client-c"
 namespace = "ecommerce"
 version   = "1.0.0"
-wasm_path = "ecommerce-example/client/target/wasm32-wasip2/release/client.wasm"
+wasm_path = "target/wasm32-wasip2/release/client.wasm"

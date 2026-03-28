@@ -11,10 +11,12 @@ use tower::{Layer, Service};
 use super::{error_response, ResBody, ResolvedDestination};
 use crate::routing::CachedRoutingTable;
 
+type RoundRobinCounters = Arc<Mutex<HashMap<(String, String, String), usize>>>;
+
 pub struct RoutingLayer {
     table: CachedRoutingTable,
     /// Monotonic counters per (namespace, module, version) for round-robin selection.
-    counters: Arc<Mutex<HashMap<(String, String, String), usize>>>,
+    counters: RoundRobinCounters,
 }
 
 impl RoutingLayer {
@@ -41,7 +43,7 @@ impl<S> Layer<S> for RoutingLayer {
 pub struct RoutingService<S> {
     inner: S,
     table: CachedRoutingTable,
-    counters: Arc<Mutex<HashMap<(String, String, String), usize>>>,
+    counters: RoundRobinCounters,
 }
 
 impl<S> Service<Request<Bytes>> for RoutingService<S>
@@ -149,7 +151,9 @@ where
 
             if candidate_addrs.is_empty() {
                 let msg = match requested_version {
-                    Some(v) => format!("no route for module '{dest_namespace}.{module_name}' version '{v}'"),
+                    Some(v) => format!(
+                        "no route for module '{dest_namespace}.{module_name}' version '{v}'"
+                    ),
                     None => format!("no route for module '{dest_namespace}.{module_name}'"),
                 };
                 return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE, &msg));
@@ -159,7 +163,11 @@ where
             let addr = {
                 let mut map = counters.lock().unwrap();
                 let counter = map
-                    .entry((dest_namespace.clone(), module_name.clone(), resolved_version.clone()))
+                    .entry((
+                        dest_namespace.clone(),
+                        module_name.clone(),
+                        resolved_version.clone(),
+                    ))
                     .or_insert(0);
                 let idx = *counter % candidate_addrs.len();
                 *counter = counter.wrapping_add(1);

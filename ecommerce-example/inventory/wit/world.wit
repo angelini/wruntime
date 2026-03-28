@@ -6,5 +6,5 @@ world inventory {
 
     // WASI HTTP proxy world: imports HTTP types + outgoing-handler,
     // exports wasi:http/incoming-handler (required by the engine's ProxyPre).
-    include wasi:http/proxy@0.2.0;
+    include wasi:http/proxy@0.2.6;
 }

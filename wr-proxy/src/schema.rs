@@ -36,7 +36,12 @@ impl SchemaCache {
     /// Store a compiled schema for `(namespace, module)`. `schema_bytes` must
     /// be a serialised `FileDescriptorSet` as produced by protoc
     /// (`--descriptor_set_out`).
-    pub async fn insert(&self, namespace: &str, module: &str, schema_bytes: &[u8]) -> anyhow::Result<()> {
+    pub async fn insert(
+        &self,
+        namespace: &str,
+        module: &str,
+        schema_bytes: &[u8],
+    ) -> anyhow::Result<()> {
         if schema_bytes.is_empty() {
             return Ok(());
         }
@@ -57,7 +62,13 @@ impl SchemaCache {
     ///
     /// Returns `Some(error_message)` if validation fails. Returns `None` when
     /// the body is valid, the schema is absent, or the path cannot be resolved.
-    pub async fn validate(&self, namespace: &str, module: &str, path: &str, body: &[u8]) -> Option<String> {
+    pub async fn validate(
+        &self,
+        namespace: &str,
+        module: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Option<String> {
         if body.is_empty() {
             return None;
         }
@@ -69,7 +80,9 @@ impl SchemaCache {
 
         match DynamicMessage::decode(message_desc, body) {
             Ok(_) => None,
-            Err(e) => Some(format!("schema validation failed for {namespace}.{module}{path}: {e}")),
+            Err(e) => Some(format!(
+                "schema validation failed for {namespace}.{module}{path}: {e}"
+            )),
         }
     }
 }

@@ -6,8 +6,18 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
 [package.metadata.component]
 package = "ecommerce:client"
 
 [package.metadata.component.target]
 world = "ecommerce:client/client"
+
+[package.metadata.component.target.dependencies]
+"wasi:http" = { path = "wit/deps/http.wit" }
+"wasi:io" = { path = "wit/deps/io.wit" }
+"wasi:cli" = { path = "wit/deps/cli.wit" }
+"wasi:clocks" = { path = "wit/deps/clocks.wit" }
+"wasi:random" = { path = "wit/deps/random.wit" }

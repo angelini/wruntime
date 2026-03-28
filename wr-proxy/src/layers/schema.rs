@@ -73,7 +73,10 @@ where
                     .map(|(s, n)| (s.to_string(), n.to_string()))
                     .unwrap_or_else(|| (host.to_string(), String::new()));
 
-                if let Some(detail) = cache.validate(&namespace, &module, &path, req.body().as_ref()).await {
+                if let Some(detail) = cache
+                    .validate(&namespace, &module, &path, req.body().as_ref())
+                    .await
+                {
                     let source = req
                         .headers()
                         .get("x-wr-source")

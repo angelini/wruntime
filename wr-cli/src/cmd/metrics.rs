@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use std::collections::HashMap;
+
+type MetricGroup = Vec<(u64, u32, bool)>;
+type MetricGroups = HashMap<(String, String), MetricGroup>;
 use tabled::builder::Builder;
 use wr_common::wruntime::GetMetricsSummaryRequest;
 
@@ -37,7 +40,7 @@ async fn summary(manager: &str) -> Result<()> {
     }
 
     // Group by (source, destination)
-    let mut groups: HashMap<(String, String), Vec<(u64, u32, bool)>> = HashMap::new();
+    let mut groups: MetricGroups = HashMap::new();
     for m in &resp.metrics {
         groups
             .entry((m.source.clone(), m.destination.clone()))
@@ -49,7 +52,14 @@ async fn summary(manager: &str) -> Result<()> {
     rows.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut builder = Builder::new();
-    builder.push_record(["Source", "Destination", "Requests", "Avg ms", "P99 ms", "Errors"]);
+    builder.push_record([
+        "Source",
+        "Destination",
+        "Requests",
+        "Avg ms",
+        "P99 ms",
+        "Errors",
+    ]);
 
     for ((source, destination), entries) in &rows {
         let count = entries.len();

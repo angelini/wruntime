@@ -25,7 +25,8 @@ use tonic::transport::Server;
 
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, manager_service_server::ManagerServiceServer,
-    EngineRegistration, GetRoutingTableRequest, ModuleDescriptor, RegisterEngineRequest, RoutingRule,
+    EngineRegistration, GetRoutingTableRequest, ModuleDescriptor, RegisterEngineRequest,
+    RoutingRule,
 };
 use wr_manager::{service::Manager, state::new_state};
 
@@ -109,9 +110,7 @@ pub async fn sync_table(
 }
 
 /// Build and start a proxy with an **empty** schema cache; returns the bound address.
-pub async fn start_proxy(
-    table: wr_proxy::routing::CachedRoutingTable,
-) -> Result<SocketAddr> {
+pub async fn start_proxy(table: wr_proxy::routing::CachedRoutingTable) -> Result<SocketAddr> {
     start_proxy_with_schema(table, Arc::new(wr_proxy::schema::SchemaCache::new())).await
 }
 
@@ -178,38 +177,32 @@ where
         let svc = svc.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
-            let svc_fn =
-                hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
-                    let mut svc = svc.clone();
-                    async move {
-                        let (parts, body) = req.into_parts();
-                        let bytes = match BodyExt::collect(body).await {
-                            Ok(c) => c.to_bytes(),
-                            Err(_) => {
-                                return Ok::<_, Infallible>(
-                                    Response::builder()
-                                        .status(400)
-                                        .body(wr_proxy::layers::full_body(Bytes::from(
-                                            "body error",
-                                        )))
-                                        .unwrap(),
-                                )
-                            }
-                        };
-                        let result = tower::Service::call(
-                            &mut svc,
-                            Request::from_parts(parts, bytes),
-                        )
-                        .await;
-                        Ok::<_, Infallible>(match result {
-                            Ok(r) => r,
-                            Err(_) => Response::builder()
-                                .status(502)
-                                .body(wr_proxy::layers::full_body(Bytes::from("proxy error")))
-                                .unwrap(),
-                        })
-                    }
-                });
+            let svc_fn = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                let mut svc = svc.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let bytes = match BodyExt::collect(body).await {
+                        Ok(c) => c.to_bytes(),
+                        Err(_) => {
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(400)
+                                    .body(wr_proxy::layers::full_body(Bytes::from("body error")))
+                                    .unwrap(),
+                            )
+                        }
+                    };
+                    let result =
+                        tower::Service::call(&mut svc, Request::from_parts(parts, bytes)).await;
+                    Ok::<_, Infallible>(match result {
+                        Ok(r) => r,
+                        Err(_) => Response::builder()
+                            .status(502)
+                            .body(wr_proxy::layers::full_body(Bytes::from("proxy error")))
+                            .unwrap(),
+                    })
+                }
+            });
             let _ = http1::Builder::new().serve_connection(io, svc_fn).await;
         });
     }
@@ -259,19 +252,17 @@ pub async fn identified_stub(listener: TcpListener, id: String) {
         let id = id.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
-            let svc = hyper::service::service_fn(
-                move |_req: Request<hyper::body::Incoming>| {
-                    let id = id.clone();
-                    async move {
-                        Ok::<_, Infallible>(
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .body(Full::new(Bytes::from(id)))
-                                .unwrap(),
-                        )
-                    }
-                },
-            );
+            let svc = hyper::service::service_fn(move |_req: Request<hyper::body::Incoming>| {
+                let id = id.clone();
+                async move {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::from(id)))
+                            .unwrap(),
+                    )
+                }
+            });
             let _ = http1::Builder::new().serve_connection(io, svc).await;
         });
     }

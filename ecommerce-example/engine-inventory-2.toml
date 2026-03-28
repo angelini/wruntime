@@ -10,5 +10,5 @@ max_connections = 8
 name      = "inventory"
 namespace = "ecommerce"
 version   = "1.0.0"
-wasm_path = "ecommerce-example/inventory/target/wasm32-wasip2/release/inventory.wasm"
+wasm_path = "target/wasm32-wasip2/release/inventory.wasm"
 database  = true

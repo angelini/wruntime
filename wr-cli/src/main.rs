@@ -9,7 +9,12 @@ mod display;
 #[command(name = "wr-cli", about = "wruntime deployment management CLI")]
 struct Cli {
     /// Manager gRPC address
-    #[arg(long, env = "WR_MANAGER", default_value = "http://127.0.0.1:9000", global = true)]
+    #[arg(
+        long,
+        env = "WR_MANAGER",
+        default_value = "http://127.0.0.1:9000",
+        global = true
+    )]
     manager: String,
 
     #[command(subcommand)]

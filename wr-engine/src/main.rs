@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, DeregisterEngineRequest, EngineRegistration,
-    HeartbeatRequest, ModuleDescriptor, RegisterEngineRequest,
+    HeartbeatRequest, ModuleDescriptor, RegisterEngineRequest, RoutingRule,
 };
 
 #[tokio::main]
@@ -24,6 +24,16 @@ async fn main() -> Result<()> {
 
     let config = config::EngineConfig::load(&config_path)?;
     let engine_id = Uuid::new_v4().to_string();
+    // Convert listen_address (may bind on 0.0.0.0) to a routable HTTP URL.
+    let advertise_address = {
+        let a = config.listen_address.trim_start_matches("http://");
+        let a = if a.starts_with("0.0.0.0") {
+            a.replacen("0.0.0.0", "127.0.0.1", 1)
+        } else {
+            a.to_string()
+        };
+        format!("http://{a}")
+    };
     info!(engine_id, "engine starting");
 
     // ── Load WASM modules ─────────────────────────────────────────────────
@@ -71,12 +81,38 @@ async fn main() -> Result<()> {
         .register_engine(RegisterEngineRequest {
             registration: Some(EngineRegistration {
                 engine_id: engine_id.clone(),
-                address: config.listen_address.clone(),
+                address: advertise_address.clone(),
                 modules: module_descriptors,
             }),
         })
         .await?;
     info!(address = %config.manager_address, engine_id, "registered with manager");
+
+    // ── Upsert routing rules for every hosted module ──────────────────────
+    for module in &config.modules {
+        client
+            .upsert_routing_rule(RoutingRule {
+                rule_id: format!(
+                    "{}/{}/{}/{}",
+                    engine_id, module.namespace, module.name, module.version
+                ),
+                source_module: String::new(),
+                source_namespace: String::new(),
+                destination_module: module.name.clone(),
+                destination_namespace: module.namespace.clone(),
+                destination_version: module.version.clone(),
+                engine_id: engine_id.clone(),
+                engine_address: advertise_address.clone(),
+                healthy: false, // manager overrides to true on upsert
+            })
+            .await?;
+        info!(
+            namespace = %module.namespace,
+            module    = %module.name,
+            version   = %module.version,
+            "routing rule registered",
+        );
+    }
 
     // ── Heartbeat background task ─────────────────────────────────────────
     {

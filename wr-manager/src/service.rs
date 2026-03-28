@@ -58,7 +58,11 @@ impl ManagerService for Manager {
             }
             if !module.proto_schema.is_empty() {
                 state.schemas.insert(
-                    (module.namespace.clone(), module.name.clone(), module.version.clone()),
+                    (
+                        module.namespace.clone(),
+                        module.name.clone(),
+                        module.version.clone(),
+                    ),
                     module.proto_schema.clone(),
                 );
             }
@@ -233,7 +237,11 @@ impl ManagerService for Manager {
 
         let schema = state
             .schemas
-            .get(&(req.namespace.clone(), req.module.clone(), req.version.clone()))
+            .get(&(
+                req.namespace.clone(),
+                req.module.clone(),
+                req.version.clone(),
+            ))
             .cloned()
             .ok_or_else(|| {
                 Status::not_found(format!(
@@ -254,14 +262,19 @@ impl ManagerService for Manager {
         let req = request.into_inner();
 
         if req.module.is_empty() || req.version.is_empty() || req.namespace.is_empty() {
-            return Err(Status::invalid_argument("namespace, module, and version are required"));
+            return Err(Status::invalid_argument(
+                "namespace, module, and version are required",
+            ));
         }
 
-        self.state
-            .write()
-            .await
-            .schemas
-            .insert((req.namespace.clone(), req.module.clone(), req.version.clone()), req.proto_schema);
+        self.state.write().await.schemas.insert(
+            (
+                req.namespace.clone(),
+                req.module.clone(),
+                req.version.clone(),
+            ),
+            req.proto_schema,
+        );
 
         info!(namespace = %req.namespace, module = %req.module, version = %req.version, "schema stored");
         Ok(Response::new(UploadSchemaResponse {}))

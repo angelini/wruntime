@@ -1,3 +1,4 @@
 [workspace]
 members = ["wr-common", "wr-engine", "wr-proxy", "wr-manager", "wr-tests", "wr-cli"]
+exclude = ["ecommerce-example/client", "ecommerce-example/inventory"]
 resolver = "2"

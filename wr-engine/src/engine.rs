@@ -17,8 +17,8 @@ use wasmtime_wasi_http::{
     WasiHttpView,
 };
 
-use wr_engine::config::{EngineConfig, ModuleConfig};
 use crate::registry::{InboundRequest, ModuleRegistry};
+use wr_engine::config::{EngineConfig, ModuleConfig};
 use wr_engine::state::ModuleState;
 
 pub struct EngineRunner {
@@ -85,7 +85,12 @@ impl EngineRunner {
                 let pre = Arc::new(pre);
                 let (tx, rx) = mpsc::channel::<InboundRequest>(32);
                 registry
-                    .register(module_namespace.clone(), module_name.clone(), module_version.clone(), tx)
+                    .register(
+                        module_namespace.clone(),
+                        module_name.clone(),
+                        module_version.clone(),
+                        tx,
+                    )
                     .await;
 
                 let engine = self.engine.clone();
@@ -111,7 +116,12 @@ impl EngineRunner {
                 } else {
                     None
                 };
-                let state = ModuleState::new(module_name.clone(), module_namespace.clone(), proxy_uri, db_pool);
+                let state = ModuleState::new(
+                    module_name.clone(),
+                    module_namespace.clone(),
+                    proxy_uri,
+                    db_pool,
+                );
                 let mut store = Store::new(&self.engine, state);
                 let instance = linker.instantiate_async(&mut store, &component).await?;
 
@@ -158,8 +168,16 @@ async fn http_handler_task(
         let db_pool = db_pool.clone();
 
         tokio::spawn(async move {
-            if let Err(e) =
-                dispatch_request(&engine, &pre, proxy_uri, &module_name, &module_namespace, db_pool, inbound).await
+            if let Err(e) = dispatch_request(
+                &engine,
+                &pre,
+                proxy_uri,
+                &module_name,
+                &module_namespace,
+                db_pool,
+                inbound,
+            )
+            .await
             {
                 warn!(module = %module_name, error = %e, "inbound request error");
             }
@@ -178,7 +196,12 @@ async fn dispatch_request(
     db_pool: Option<Arc<Pool>>,
     inbound: InboundRequest,
 ) -> Result<()> {
-    let state = ModuleState::new(module_name.to_string(), module_namespace.to_string(), proxy_uri, db_pool);
+    let state = ModuleState::new(
+        module_name.to_string(),
+        module_namespace.to_string(),
+        proxy_uri,
+        db_pool,
+    );
     let mut store = Store::new(engine, state);
     let proxy = pre.instantiate_async(&mut store).await?;
 

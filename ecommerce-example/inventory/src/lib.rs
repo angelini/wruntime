@@ -3,8 +3,7 @@ mod bindings;
 
 use bindings::exports::wasi::http::incoming_handler::Guest;
 use bindings::wasi::http::types::{
-    Fields, IncomingBody, IncomingRequest, Method, OutgoingBody, OutgoingResponse,
-    ResponseOutparam,
+    Fields, IncomingBody, IncomingRequest, Method, OutgoingBody, OutgoingResponse, ResponseOutparam,
 };
 use bindings::wasi::io::streams::StreamError;
 use bindings::wruntime::db::database::{self, PgValue};
@@ -24,12 +23,8 @@ impl Guest for Component {
             (Method::Get, p) if p.starts_with("/stock/") => {
                 handle_get_stock(p.trim_start_matches("/stock/"))
             }
-            (Method::Post, "/buy") => {
-                handle_buy(&read_body(request.consume().unwrap()))
-            }
-            (Method::Post, "/return") => {
-                handle_return(&read_body(request.consume().unwrap()))
-            }
+            (Method::Post, "/buy") => handle_buy(&read_body(request.consume().unwrap())),
+            (Method::Post, "/return") => handle_return(&read_body(request.consume().unwrap())),
             _ => (404, r#"{"error":"not found"}"#.to_string()),
         };
 
@@ -80,7 +75,10 @@ fn handle_get_stock(product_id: &str) -> (u16, String) {
                 PgValue::Int8(v) => *v,
                 _ => return (500, r#"{"error":"unexpected column type"}"#.to_string()),
             };
-            (200, format!(r#"{{"product_id":"{}","stock":{}}}"#, product_id, stock))
+            (
+                200,
+                format!(r#"{{"product_id":"{}","stock":{}}}"#, product_id, stock),
+            )
         }
     }
 }
@@ -127,10 +125,7 @@ fn handle_buy(body: &[u8]) -> (u16, String) {
         let _ = tx.rollback();
         return (
             409,
-            format!(
-                r#"{{"error":"insufficient stock","available":{}}}"#,
-                stock
-            ),
+            format!(r#"{{"error":"insufficient stock","available":{}}}"#, stock),
         );
     }
 
@@ -187,10 +182,10 @@ fn handle_return(body: &[u8]) -> (u16, String) {
 fn parse_body(body: &[u8]) -> Result<(String, i64), String> {
     let s = std::str::from_utf8(body).map_err(|e| e.to_string())?;
 
-    let product_id = json_str(s, "product_id")
-        .ok_or_else(|| "missing or invalid product_id".to_string())?;
-    let quantity = json_num(s, "quantity")
-        .ok_or_else(|| "missing or invalid quantity".to_string())?;
+    let product_id =
+        json_str(s, "product_id").ok_or_else(|| "missing or invalid product_id".to_string())?;
+    let quantity =
+        json_num(s, "quantity").ok_or_else(|| "missing or invalid quantity".to_string())?;
 
     if quantity <= 0 {
         return Err("quantity must be > 0".to_string());
@@ -239,10 +234,7 @@ fn read_body(incoming: IncomingBody) -> Vec<u8> {
 
 fn send_response(response_out: ResponseOutparam, status: u16, body_str: String) {
     let headers = Fields::new();
-    let _ = headers.set(
-        &"content-type".to_string(),
-        &[b"application/json".to_vec()],
-    );
+    let _ = headers.set("content-type", &[b"application/json".to_vec()]);
 
     let resp = OutgoingResponse::new(headers);
     let _ = resp.set_status_code(status);

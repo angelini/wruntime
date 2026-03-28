@@ -37,7 +37,10 @@ pub async fn run(args: EnginesArgs, manager: &str) -> Result<()> {
 
 async fn list(manager: &str) -> Result<()> {
     let mut client = client::connect(manager).await?;
-    let resp = client.list_engines(ListEnginesRequest {}).await?.into_inner();
+    let resp = client
+        .list_engines(ListEnginesRequest {})
+        .await?
+        .into_inner();
 
     if resp.engines.is_empty() {
         println!("No engines registered.");
@@ -59,7 +62,10 @@ async fn list(manager: &str) -> Result<()> {
 
 async fn get(manager: &str, id: &str) -> Result<()> {
     let mut client = client::connect(manager).await?;
-    let resp = client.list_engines(ListEnginesRequest {}).await?.into_inner();
+    let resp = client
+        .list_engines(ListEnginesRequest {})
+        .await?
+        .into_inner();
 
     let engine = resp.engines.iter().find(|e| e.engine_id == id);
     let Some(engine) = engine else {

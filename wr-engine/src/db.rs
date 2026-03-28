@@ -223,7 +223,10 @@ impl Host for ModuleState {
         })?;
 
         self.table()
-            .push(TxState { client, done: false })
+            .push(TxState {
+                client,
+                done: false,
+            })
             .map_err(|e| DbError::Connection(e.to_string()))
     }
 }
@@ -419,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_query_returns_error_when_no_pool() {
-        let mut state = ModuleState::new("test".into(), proxy_uri(), None);
+        let mut state = ModuleState::new("test".into(), "test".into(), proxy_uri(), None);
         let result = state.query("SELECT 1".into(), vec![]);
         assert!(
             matches!(result, Err(DbError::Connection(_))),
@@ -429,7 +432,7 @@ mod tests {
 
     #[test]
     fn test_execute_returns_error_when_no_pool() {
-        let mut state = ModuleState::new("test".into(), proxy_uri(), None);
+        let mut state = ModuleState::new("test".into(), "test".into(), proxy_uri(), None);
         let result = state.execute("SELECT 1".into(), vec![]);
         assert!(
             matches!(result, Err(DbError::Connection(_))),
@@ -439,7 +442,7 @@ mod tests {
 
     #[test]
     fn test_begin_transaction_returns_error_when_no_pool() {
-        let mut state = ModuleState::new("test".into(), proxy_uri(), None);
+        let mut state = ModuleState::new("test".into(), "test".into(), proxy_uri(), None);
         let result = state.begin_transaction();
         assert!(
             matches!(result, Err(DbError::Connection(_))),
@@ -462,7 +465,12 @@ mod tests {
         };
 
         let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
-        let mut state = ModuleState::new("test".into(), proxy_uri(), Some(Arc::new(pool)));
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            Some(Arc::new(pool)),
+        );
 
         let rows = state
             .query(
@@ -484,7 +492,12 @@ mod tests {
         };
 
         let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
-        let mut state = ModuleState::new("test".into(), proxy_uri(), Some(Arc::new(pool)));
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            Some(Arc::new(pool)),
+        );
 
         // DDL returns 0 rows affected.
         let n = state
@@ -507,7 +520,12 @@ mod tests {
         };
 
         let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
-        let mut state = ModuleState::new("test".into(), proxy_uri(), Some(Arc::new(pool)));
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            Some(Arc::new(pool)),
+        );
 
         let rows = state
             .query(
@@ -531,7 +549,12 @@ mod tests {
         };
 
         let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
-        let mut state = ModuleState::new("test".into(), proxy_uri(), Some(Arc::new(pool)));
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            Some(Arc::new(pool)),
+        );
 
         let rows = state
             .query(
@@ -569,7 +592,12 @@ mod tests {
         };
 
         let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
-        let mut state = ModuleState::new("test".into(), proxy_uri(), Some(Arc::new(pool)));
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            Some(Arc::new(pool)),
+        );
 
         // Setup: create a temp table outside the transaction.
         Host::execute(
@@ -590,11 +618,8 @@ mod tests {
         )
         .expect("insert");
 
-        HostTransaction::commit(
-            &mut state,
-            wasmtime::component::Resource::new_borrow(rep),
-        )
-        .expect("commit");
+        HostTransaction::commit(&mut state, wasmtime::component::Resource::new_borrow(rep))
+            .expect("commit");
 
         // After commit the row must be visible outside the transaction.
         let rows = Host::query(
@@ -620,7 +645,12 @@ mod tests {
         };
 
         let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
-        let mut state = ModuleState::new("test".into(), proxy_uri(), Some(Arc::new(pool)));
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            Some(Arc::new(pool)),
+        );
 
         Host::execute(
             &mut state,
@@ -640,11 +670,8 @@ mod tests {
         )
         .expect("insert");
 
-        HostTransaction::rollback(
-            &mut state,
-            wasmtime::component::Resource::new_borrow(rep),
-        )
-        .expect("rollback");
+        HostTransaction::rollback(&mut state, wasmtime::component::Resource::new_borrow(rep))
+            .expect("rollback");
 
         // After rollback the row must not be present.
         let rows = Host::query(
@@ -668,7 +695,12 @@ mod tests {
         };
 
         let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
-        let mut state = ModuleState::new("test".into(), proxy_uri(), Some(Arc::new(pool)));
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            Some(Arc::new(pool)),
+        );
 
         Host::execute(
             &mut state,

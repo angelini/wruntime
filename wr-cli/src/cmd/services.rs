@@ -99,7 +99,13 @@ async fn get(manager: &str, service: &str) -> Result<()> {
     }
 
     let mut builder = Builder::new();
-    builder.push_record(["Rule ID", "Engine ID", "Engine Address", "Version", "Healthy"]);
+    builder.push_record([
+        "Rule ID",
+        "Engine ID",
+        "Engine Address",
+        "Version",
+        "Healthy",
+    ]);
     for rule in &matching {
         builder.push_record([
             rule.rule_id.as_str(),

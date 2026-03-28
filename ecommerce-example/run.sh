@@ -7,7 +7,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-DB_URL="${DB_URL:-postgres://user:pass@localhost:5432/ecommerce}"
+DB_URL="${DB_URL:-${WRUNTIME_TEST_DB_URL:-postgres://user:pass@localhost:5432/ecommerce}}"
 
 # Substitute the DB URL into the engine configs if DB_URL is set.
 update_db_url() {
@@ -18,10 +18,10 @@ update_db_url() {
 
 # ── Build WASM components ──────────────────────────────────────────────────────
 echo "==> Building inventory..."
-(cd ecommerce-example/inventory && cargo component build --release)
+(cd ecommerce-example/inventory && cargo component build --release --target wasm32-wasip2)
 
 echo "==> Building client..."
-(cd ecommerce-example/client && cargo component build --release)
+(cd ecommerce-example/client && cargo component build --release --target wasm32-wasip2)
 
 # ── Build host binaries ────────────────────────────────────────────────────────
 echo "==> Building host services..."
@@ -35,25 +35,25 @@ update_db_url /tmp/inv2.toml
 
 # ── Start manager ──────────────────────────────────────────────────────────────
 echo "==> Starting manager on :9000"
-./target/release/wr-manager --config manager.toml &
+./target/release/wr-manager manager.toml &
 MANAGER_PID=$!
 
 sleep 1
 
 # ── Start proxy ────────────────────────────────────────────────────────────────
 echo "==> Starting proxy on :9001"
-./target/release/wr-proxy --config proxy.toml &
+./target/release/wr-proxy proxy.toml &
 PROXY_PID=$!
 
 sleep 1
 
 # ── Start inventory engines ────────────────────────────────────────────────────
 echo "==> Starting inventory engine 1 on :9100"
-./target/release/wr-engine --config /tmp/inv1.toml &
+./target/release/wr-engine /tmp/inv1.toml &
 INV1_PID=$!
 
 echo "==> Starting inventory engine 2 on :9101"
-./target/release/wr-engine --config /tmp/inv2.toml &
+./target/release/wr-engine /tmp/inv2.toml &
 INV2_PID=$!
 
 # Wait for inventory engines to register with the manager.
@@ -72,7 +72,7 @@ curl -sf -X POST http://127.0.0.1:9001/seed \
 
 # ── Start client engines ───────────────────────────────────────────────────────
 echo "==> Starting client engine on :9200 (3 concurrent clients)"
-./target/release/wr-engine --config ecommerce-example/engine-client.toml &
+./target/release/wr-engine ecommerce-example/engine-client.toml &
 CLIENT_PID=$!
 
 echo ""

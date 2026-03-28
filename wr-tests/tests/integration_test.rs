@@ -12,9 +12,9 @@ use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 
 use wr_common::wruntime::{
-    DeregisterEngineRequest, EngineRegistration,
-    GetMetricsSummaryRequest, GetRoutingTableRequest, HeartbeatRequest, ListEnginesRequest,
-    ModuleDescriptor, RegisterEngineRequest, ReportMetricsRequest, RequestMetrics, RoutingRule,
+    DeregisterEngineRequest, EngineRegistration, GetMetricsSummaryRequest, GetRoutingTableRequest,
+    HeartbeatRequest, ListEnginesRequest, ModuleDescriptor, RegisterEngineRequest,
+    ReportMetricsRequest, RequestMetrics, RoutingRule,
 };
 use wr_manager::config::ManagerConfig;
 use wr_proxy::config::ProxyConfig;
@@ -176,7 +176,15 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
 
-    register_module(&mut mgr_c, "stub-engine", &engine_addr, "store", "inventory-service", "1.0.0").await?;
+    register_module(
+        &mut mgr_c,
+        "stub-engine",
+        &engine_addr,
+        "store",
+        "inventory-service",
+        "1.0.0",
+    )
+    .await?;
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
@@ -221,7 +229,9 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
         .await?
         .into_inner()
         .proto_schema;
-    schema_cache.insert("svc-ns", "ping-service", &schema_bytes).await?;
+    schema_cache
+        .insert("svc-ns", "ping-service", &schema_bytes)
+        .await?;
 
     let proxy_addr =
         start_proxy_with_schema(wr_proxy::routing::new_routing_table(), schema_cache).await?;
@@ -442,8 +452,24 @@ async fn test_proxy_routes_to_explicit_version() -> Result<()> {
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-v1").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-v2").await?;
 
-    register_module(&mut mgr, "e1", &e1_addr, "ver-ns", "versioned-service", "1.0.0").await?;
-    register_module(&mut mgr, "e2", &e2_addr, "ver-ns", "versioned-service", "2.0.0").await?;
+    register_module(
+        &mut mgr,
+        "e1",
+        &e1_addr,
+        "ver-ns",
+        "versioned-service",
+        "1.0.0",
+    )
+    .await?;
+    register_module(
+        &mut mgr,
+        "e2",
+        &e2_addr,
+        "ver-ns",
+        "versioned-service",
+        "2.0.0",
+    )
+    .await?;
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
@@ -470,8 +496,24 @@ async fn test_proxy_routes_to_latest_version() -> Result<()> {
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-v1").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-v2").await?;
 
-    register_module(&mut mgr, "e1", &e1_addr, "latest-ns", "latest-service", "1.0.0").await?;
-    register_module(&mut mgr, "e2", &e2_addr, "latest-ns", "latest-service", "2.0.0").await?;
+    register_module(
+        &mut mgr,
+        "e1",
+        &e1_addr,
+        "latest-ns",
+        "latest-service",
+        "1.0.0",
+    )
+    .await?;
+    register_module(
+        &mut mgr,
+        "e2",
+        &e2_addr,
+        "latest-ns",
+        "latest-service",
+        "2.0.0",
+    )
+    .await?;
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
@@ -480,7 +522,10 @@ async fn test_proxy_routes_to_latest_version() -> Result<()> {
     // No x-wr-version → should route to the highest semver (2.0.0)
     let (s, body) = proxy_get(proxy, "latest-ns", "latest-service", None).await?;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(body, "engine-v2", "no version header should route to latest");
+    assert_eq!(
+        body, "engine-v2",
+        "no version header should route to latest"
+    );
 
     let _ = e1_shutdown.send(());
     let _ = e2_shutdown.send(());
@@ -493,7 +538,15 @@ async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (e1_addr, _stub) = spawn_identified_stub("engine-v1").await?;
-    register_module(&mut mgr, "e1", &e1_addr, "mv-ns", "missing-ver-service", "1.0.0").await?;
+    register_module(
+        &mut mgr,
+        "e1",
+        &e1_addr,
+        "mv-ns",
+        "missing-ver-service",
+        "1.0.0",
+    )
+    .await?;
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
@@ -546,8 +599,24 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-a").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-b").await?;
 
-    register_module(&mut mgr, "ea", &e1_addr, "fo-ns", "failover-service", "1.0.0").await?;
-    register_module(&mut mgr, "eb", &e2_addr, "fo-ns", "failover-service", "1.0.0").await?;
+    register_module(
+        &mut mgr,
+        "ea",
+        &e1_addr,
+        "fo-ns",
+        "failover-service",
+        "1.0.0",
+    )
+    .await?;
+    register_module(
+        &mut mgr,
+        "eb",
+        &e2_addr,
+        "fo-ns",
+        "failover-service",
+        "1.0.0",
+    )
+    .await?;
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
@@ -575,7 +644,10 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
     for _ in 0..4 {
         let (s, body) = proxy_get(proxy, "fo-ns", "failover-service", Some("1.0.0")).await?;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(body, "engine-b", "after failover all traffic should go to engine-b");
+        assert_eq!(
+            body, "engine-b",
+            "after failover all traffic should go to engine-b"
+        );
     }
 
     let _ = e1_shutdown.send(());
@@ -670,7 +742,10 @@ fn test_engine_config_module_database_flag_parses() {
         database  = true
     "#;
     let cfg: EngineConfig = toml::from_str(toml).unwrap();
-    assert!(cfg.modules[0].database, "database flag should parse as true");
+    assert!(
+        cfg.modules[0].database,
+        "database flag should parse as true"
+    );
     assert!(cfg.database.is_some(), "database section should be present");
 }
 
@@ -695,7 +770,12 @@ fn test_engine_config_module_database_flag_defaults_to_false() {
 
 #[test]
 fn test_db_query_without_pool_returns_connection_error() {
-    let mut state = ModuleState::new("test".into(), "test-ns".into(), "http://127.0.0.1:9001".parse().unwrap(), None);
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test-ns".into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        None,
+    );
     let err = state.query("SELECT 1".into(), vec![]).unwrap_err();
     assert!(
         matches!(err, DbError::Connection(_)),
@@ -705,7 +785,12 @@ fn test_db_query_without_pool_returns_connection_error() {
 
 #[test]
 fn test_db_execute_without_pool_returns_connection_error() {
-    let mut state = ModuleState::new("test".into(), "test-ns".into(), "http://127.0.0.1:9001".parse().unwrap(), None);
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test-ns".into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        None,
+    );
     let err = state
         .execute("INSERT INTO t VALUES (1)".into(), vec![])
         .unwrap_err();
@@ -735,13 +820,10 @@ async fn test_db_bytea_roundtrip() {
 async fn test_db_uuid_roundtrip() {
     let Some(mut state) = db_state(2) else { return };
     // UUID 550e8400-e29b-41d4-a716-446655440000 split into (hi, lo) at bit 64.
-    let hi: u64 = 0x550e8400_e29b_41d4;
+    let hi: u64 = 0x550e_8400_e29b_41d4;
     let lo: u64 = 0xa716_4466_5544_0000;
     let rows = state
-        .query(
-            "SELECT $1::uuid AS u".into(),
-            vec![PgValue::Uuid((hi, lo))],
-        )
+        .query("SELECT $1::uuid AS u".into(), vec![PgValue::Uuid((hi, lo))])
         .expect("query");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].columns[0].value, PgValue::Uuid((hi, lo)));
@@ -906,8 +988,24 @@ async fn test_proxy_namespaces_are_isolated() -> Result<()> {
     let (e_alpha_addr, e_alpha_shutdown) = spawn_identified_stub("engine-alpha").await?;
     let (e_beta_addr, e_beta_shutdown) = spawn_identified_stub("engine-beta").await?;
 
-    register_module(&mut mgr, "ea", &e_alpha_addr, "ns-alpha", "shared-service", "1.0.0").await?;
-    register_module(&mut mgr, "eb", &e_beta_addr, "ns-beta", "shared-service", "1.0.0").await?;
+    register_module(
+        &mut mgr,
+        "ea",
+        &e_alpha_addr,
+        "ns-alpha",
+        "shared-service",
+        "1.0.0",
+    )
+    .await?;
+    register_module(
+        &mut mgr,
+        "eb",
+        &e_beta_addr,
+        "ns-beta",
+        "shared-service",
+        "1.0.0",
+    )
+    .await?;
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
@@ -916,7 +1014,10 @@ async fn test_proxy_namespaces_are_isolated() -> Result<()> {
     // ns-alpha routes to engine-alpha, not engine-beta.
     let (s, body) = proxy_get(proxy, "ns-alpha", "shared-service", Some("1.0.0")).await?;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(body, "engine-alpha", "ns-alpha should route to engine-alpha");
+    assert_eq!(
+        body, "engine-alpha",
+        "ns-alpha should route to engine-alpha"
+    );
 
     // ns-beta routes to engine-beta, not engine-alpha.
     let (s, body) = proxy_get(proxy, "ns-beta", "shared-service", Some("1.0.0")).await?;
