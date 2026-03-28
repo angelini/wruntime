@@ -1,0 +1,22 @@
+listen_address  = "0.0.0.0:9200"
+manager_address = "http://127.0.0.1:9000"
+proxy_address   = "http://127.0.0.1:9001"
+
+# Three independent client instances — each runs its own `run` export concurrently.
+[[module]]
+name      = "client-a"
+namespace = "ecommerce"
+version   = "1.0.0"
+wasm_path = "ecommerce-example/client/target/wasm32-wasip2/release/client.wasm"
+
+[[module]]
+name      = "client-b"
+namespace = "ecommerce"
+version   = "1.0.0"
+wasm_path = "ecommerce-example/client/target/wasm32-wasip2/release/client.wasm"
+
+[[module]]
+name      = "client-c"
+namespace = "ecommerce"
+version   = "1.0.0"
+wasm_path = "ecommerce-example/client/target/wasm32-wasip2/release/client.wasm"

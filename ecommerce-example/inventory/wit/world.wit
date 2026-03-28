@@ -1,0 +1,10 @@
+package ecommerce:inventory@0.1.0;
+
+world inventory {
+    // Host-provided Postgres access
+    import wruntime:db/database@0.2.0;
+
+    // WASI HTTP proxy world: imports HTTP types + outgoing-handler,
+    // exports wasi:http/incoming-handler (required by the engine's ProxyPre).
+    include wasi:http/proxy@0.2.0;
+}

@@ -1,0 +1,16 @@
+[package]
+name    = "wr-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wr-cli"
+path = "src/main.rs"
+
+[dependencies]
+clap      = { version = "4", features = ["derive", "env"] }
+tonic     = { version = "0.12", features = ["transport"] }
+tokio     = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow    = "1"
+tabled    = "0.16"
+wr-common = { path = "../wr-common" }

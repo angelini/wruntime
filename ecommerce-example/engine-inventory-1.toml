@@ -1,0 +1,14 @@
+listen_address  = "0.0.0.0:9100"
+manager_address = "http://127.0.0.1:9000"
+proxy_address   = "http://127.0.0.1:9001"
+
+[database]
+url             = "postgres://user:pass@localhost:5432/ecommerce"
+max_connections = 8
+
+[[module]]
+name      = "inventory"
+namespace = "ecommerce"
+version   = "1.0.0"
+wasm_path = "ecommerce-example/inventory/target/wasm32-wasip2/release/inventory.wasm"
+database  = true
