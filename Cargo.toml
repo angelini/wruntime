@@ -1,0 +1,3 @@
+[workspace]
+members = ["wr-common", "wr-engine", "wr-proxy", "wr-manager", "wr-tests"]
+resolver = "2"

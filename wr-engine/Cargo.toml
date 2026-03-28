@@ -1,0 +1,22 @@
+[package]
+name = "wr-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wasmtime           = { version = "41", features = ["component-model"] }
+wasmtime-wasi      = "41"
+wasmtime-wasi-http = { version = "41", features = ["default-send-request"] }
+tokio              = { version = "1", features = ["full"] }
+tonic              = { version = "0.12", features = ["transport"] }
+prost              = "0.13"
+hyper              = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util         = { version = "0.1", features = ["tokio"] }
+http               = "1"
+http-body-util     = "0.1"
+bytes              = "1"
+anyhow             = "1"
+toml               = "0.8"
+serde              = { version = "1", features = ["derive"] }
+uuid               = { version = "1", features = ["v4"] }
+wr-common          = { path = "../wr-common" }

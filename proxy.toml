@@ -1,0 +1,10 @@
+listen_address  = "0.0.0.0:9001"
+manager_address = "http://127.0.0.1:9000"
+
+[cache]
+routing_table_ttl_secs = 5
+schema_ttl_secs        = 60
+
+[metrics]
+flush_interval_secs = 10
+queue_depth         = 1000

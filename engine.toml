@@ -1,0 +1,15 @@
+listen_address  = "0.0.0.0:9100"
+manager_address = "http://127.0.0.1:9000"
+proxy_address   = "http://127.0.0.1:9001"
+
+[[module]]
+name        = "order-service"
+version     = "1.0.0"
+wasm_path   = "modules/order_service.wasm"
+schema_path = "schemas/order_service.binpb"
+
+[[module]]
+name      = "inventory-service"
+version   = "1.0.0"
+wasm_path = "modules/inventory_service.wasm"
+# schema_path is optional — omit if no proto schema is available
