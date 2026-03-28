@@ -41,7 +41,8 @@ async fn handle(
     req: Request<hyper::body::Incoming>,
     registry: ModuleRegistry,
 ) -> Response<Full<Bytes>> {
-    // The proxy injects x-wr-module so we know which module to dispatch to.
+    // The proxy injects x-wr-module and x-wr-version so we know which
+    // module instance to dispatch to.
     let module = match req
         .headers()
         .get("x-wr-module")
@@ -50,6 +51,16 @@ async fn handle(
     {
         Some(m) => m,
         None => return err(StatusCode::BAD_REQUEST, "missing x-wr-module header"),
+    };
+
+    let version = match req
+        .headers()
+        .get("x-wr-version")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+    {
+        Some(v) => v,
+        None => return err(StatusCode::BAD_REQUEST, "missing x-wr-version header"),
     };
 
     // Buffer body.
@@ -62,9 +73,12 @@ async fn handle(
         }
     };
 
-    let sender = match registry.sender(&module).await {
+    let sender = match registry.next_sender(&module, &version).await {
         Some(s) => s,
-        None => return err(StatusCode::NOT_FOUND, &format!("module '{module}' not loaded")),
+        None => return err(
+            StatusCode::NOT_FOUND,
+            &format!("module '{module}@{version}' not loaded"),
+        ),
     };
 
     let (resp_tx, resp_rx) = oneshot::channel();

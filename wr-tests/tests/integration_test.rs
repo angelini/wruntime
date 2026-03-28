@@ -114,7 +114,7 @@ async fn test_heartbeat() -> Result<()> {
     .await?;
 
     // Heartbeat should succeed without error.
-    c.heartbeat(HeartbeatRequest { engine_id: "e1".into() }).await?;
+    c.heartbeat(HeartbeatRequest { engine_id: "e1".into(), healthy_modules: vec![] }).await?;
 
     Ok(())
 }
@@ -125,11 +125,13 @@ async fn test_routing_table_upsert_and_get() -> Result<()> {
     let mut c = manager_client(&addr).await?;
 
     c.upsert_routing_rule(RoutingRule {
-        rule_id:            "r1".into(),
-        source_module:      "order-service".into(),
-        destination_module: "inventory-service".into(),
-        engine_id:          "e1".into(),
-        engine_address:     "http://127.0.0.1:9103".into(),
+        rule_id:             "r1".into(),
+        source_module:       "order-service".into(),
+        destination_module:  "inventory-service".into(),
+        destination_version: "1.0.0".into(),
+        engine_id:           "e1".into(),
+        engine_address:      "http://127.0.0.1:9103".into(),
+        healthy:             false, // server sets this to true on upsert
     })
     .await?;
 
@@ -142,6 +144,7 @@ async fn test_routing_table_upsert_and_get() -> Result<()> {
 
     assert_eq!(table.rules.len(), 1);
     assert_eq!(table.rules[0].destination_module, "inventory-service");
+    assert!(table.rules[0].healthy, "upserted rule should be healthy");
     assert_eq!(table.version, 1);
 
     Ok(())
@@ -215,11 +218,13 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
 
     mgr_c
         .upsert_routing_rule(RoutingRule {
-            rule_id:            "r1".into(),
-            source_module:      "order-service".into(),
-            destination_module: "inventory-service".into(),
-            engine_id:          "stub-engine".into(),
-            engine_address:     engine_addr.clone(),
+            rule_id:             "r1".into(),
+            source_module:       "order-service".into(),
+            destination_module:  "inventory-service".into(),
+            destination_version: "1.0.0".into(),
+            engine_id:           "stub-engine".into(),
+            engine_address:      engine_addr.clone(),
+            healthy:             false, // server sets this to true on upsert
         })
         .await?;
 
@@ -598,6 +603,335 @@ fn test_example_config_files_parse() {
     assert_eq!(raw.modules.len(), 2);
 }
 
+// ── multi-instance / version / health tests ───────────────────────────────────
+
+/// Register one engine + one routing rule in a single call.
+async fn register_module(
+    c:       &mut ManagerServiceClient<tonic::transport::Channel>,
+    engine_id:   &str,
+    engine_addr: &str,
+    module:      &str,
+    version:     &str,
+) -> Result<()> {
+    c.register_engine(RegisterEngineRequest {
+        registration: Some(EngineRegistration {
+            engine_id: engine_id.into(),
+            address:   engine_addr.into(),
+            modules:   vec![ModuleDescriptor {
+                name:         module.into(),
+                version:      version.into(),
+                proto_schema: vec![],
+            }],
+        }),
+    })
+    .await?;
+
+    c.upsert_routing_rule(RoutingRule {
+        rule_id:             format!("{engine_id}-{module}-{version}"),
+        source_module:       String::new(),
+        destination_module:  module.into(),
+        destination_version: version.into(),
+        engine_id:           engine_id.into(),
+        engine_address:      engine_addr.into(),
+        healthy:             false, // server overrides to true
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// Sync the proxy's cached routing table from the manager (one-shot).
+async fn sync_table(
+    mgr_addr: &str,
+    table:    &wr_proxy::routing::CachedRoutingTable,
+) -> Result<()> {
+    let mut c = manager_client(mgr_addr).await?;
+    if let Some(incoming) = c
+        .get_routing_table(GetRoutingTableRequest {})
+        .await?
+        .into_inner()
+        .table
+    {
+        *table.write().await = incoming;
+    }
+    Ok(())
+}
+
+/// Build and start a proxy backed by `table`; returns the bound socket address.
+async fn start_proxy(
+    table: wr_proxy::routing::CachedRoutingTable,
+) -> Result<std::net::SocketAddr> {
+    let schema_cache    = Arc::new(wr_proxy::schema::SchemaCache::new());
+    let (metrics_tx, _) = tokio::sync::mpsc::channel(100);
+
+    let svc = tower::ServiceBuilder::new()
+        .layer(wr_proxy::layers::MetricsLayer::new(metrics_tx))
+        .layer(wr_proxy::layers::SchemaValidationLayer::new(schema_cache))
+        .layer(wr_proxy::layers::RoutingLayer::new(table))
+        .service(wr_proxy::layers::ForwardService::new());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr     = listener.local_addr()?;
+    tokio::spawn(proxy_serve(listener, svc));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    Ok(addr)
+}
+
+/// Send one request through the proxy to `destination_module`, optionally
+/// pinning a version via the `x-wr-version` header.
+async fn proxy_get(
+    proxy_addr:        std::net::SocketAddr,
+    destination_module: &str,
+    version:           Option<&str>,
+) -> Result<(StatusCode, String)> {
+    let client = hyper_util::client::legacy::Client::builder(
+        hyper_util::rt::TokioExecutor::new(),
+    )
+    .build_http::<Full<Bytes>>();
+
+    let mut builder = Request::builder()
+        .uri(format!("http://{proxy_addr}/test"))
+        .header("x-wr-destination", format!("http://{destination_module}/test"))
+        .header("x-wr-source", "test-caller");
+    if let Some(v) = version {
+        builder = builder.header("x-wr-version", v);
+    }
+    let resp  = client.request(builder.body(Full::new(Bytes::new()))?).await?;
+    let status = resp.status();
+    let body   = resp.into_body().collect().await?.to_bytes();
+    Ok((status, String::from_utf8_lossy(&body).into_owned()))
+}
+
+#[tokio::test]
+async fn test_proxy_routes_to_explicit_version() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr  = manager_client(&mgr_addr).await?;
+
+    // Two stubs: each responds with its own identifier
+    let (e1_shutdown, e1_rx) = oneshot::channel::<()>();
+    let e1_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let e1_addr     = format!("http://{}", e1_listener.local_addr()?);
+    tokio::spawn(async move {
+        tokio::select! { _ = e1_rx => {}, _ = identified_stub(e1_listener, "engine-v1".into()) => {} }
+    });
+
+    let (e2_shutdown, e2_rx) = oneshot::channel::<()>();
+    let e2_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let e2_addr     = format!("http://{}", e2_listener.local_addr()?);
+    tokio::spawn(async move {
+        tokio::select! { _ = e2_rx => {}, _ = identified_stub(e2_listener, "engine-v2".into()) => {} }
+    });
+
+    register_module(&mut mgr, "e1", &e1_addr, "versioned-service", "1.0.0").await?;
+    register_module(&mut mgr, "e2", &e2_addr, "versioned-service", "2.0.0").await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+    let proxy = start_proxy(table).await?;
+
+    let (s, body) = proxy_get(proxy, "versioned-service", Some("1.0.0")).await?;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body, "engine-v1", "x-wr-version: 1.0.0 should route to v1 engine");
+
+    let (s, body) = proxy_get(proxy, "versioned-service", Some("2.0.0")).await?;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body, "engine-v2", "x-wr-version: 2.0.0 should route to v2 engine");
+
+    let _ = e1_shutdown.send(());
+    let _ = e2_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_proxy_routes_to_latest_version() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr  = manager_client(&mgr_addr).await?;
+
+    let (e1_shutdown, e1_rx) = oneshot::channel::<()>();
+    let e1_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let e1_addr     = format!("http://{}", e1_listener.local_addr()?);
+    tokio::spawn(async move {
+        tokio::select! { _ = e1_rx => {}, _ = identified_stub(e1_listener, "engine-v1".into()) => {} }
+    });
+
+    let (e2_shutdown, e2_rx) = oneshot::channel::<()>();
+    let e2_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let e2_addr     = format!("http://{}", e2_listener.local_addr()?);
+    tokio::spawn(async move {
+        tokio::select! { _ = e2_rx => {}, _ = identified_stub(e2_listener, "engine-v2".into()) => {} }
+    });
+
+    register_module(&mut mgr, "e1", &e1_addr, "latest-service", "1.0.0").await?;
+    register_module(&mut mgr, "e2", &e2_addr, "latest-service", "2.0.0").await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+    let proxy = start_proxy(table).await?;
+
+    // No x-wr-version → should route to the highest semver (2.0.0)
+    let (s, body) = proxy_get(proxy, "latest-service", None).await?;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body, "engine-v2", "no version header should route to latest (v2.0.0)");
+
+    let _ = e1_shutdown.send(());
+    let _ = e2_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr  = manager_client(&mgr_addr).await?;
+
+    let e1_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let e1_addr     = format!("http://{}", e1_listener.local_addr()?);
+    tokio::spawn(identified_stub(e1_listener, "engine-v1".into()));
+
+    register_module(&mut mgr, "e1", &e1_addr, "missing-ver-service", "1.0.0").await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+    let proxy = start_proxy(table).await?;
+
+    // Request for a version that has no running instance
+    let (s, _) = proxy_get(proxy, "missing-ver-service", Some("9.0.0")).await?;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "unknown version should return 503");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_proxy_load_balances_across_instances() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr  = manager_client(&mgr_addr).await?;
+
+    // Two engines both hosting the same (module, version)
+    let (e1_shutdown, e1_rx) = oneshot::channel::<()>();
+    let e1_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let e1_addr     = format!("http://{}", e1_listener.local_addr()?);
+    tokio::spawn(async move {
+        tokio::select! { _ = e1_rx => {}, _ = identified_stub(e1_listener, "engine-a".into()) => {} }
+    });
+
+    let (e2_shutdown, e2_rx) = oneshot::channel::<()>();
+    let e2_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let e2_addr     = format!("http://{}", e2_listener.local_addr()?);
+    tokio::spawn(async move {
+        tokio::select! { _ = e2_rx => {}, _ = identified_stub(e2_listener, "engine-b".into()) => {} }
+    });
+
+    register_module(&mut mgr, "ea", &e1_addr, "lb-service", "1.0.0").await?;
+    register_module(&mut mgr, "eb", &e2_addr, "lb-service", "1.0.0").await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+    let proxy = start_proxy(table).await?;
+
+    // Collect responses from 10 requests
+    let mut saw_a = false;
+    let mut saw_b = false;
+    for _ in 0..10 {
+        let (s, body) = proxy_get(proxy, "lb-service", Some("1.0.0")).await?;
+        assert_eq!(s, StatusCode::OK);
+        if body == "engine-a" { saw_a = true; }
+        if body == "engine-b" { saw_b = true; }
+    }
+
+    assert!(saw_a, "engine-a should have received at least one request");
+    assert!(saw_b, "engine-b should have received at least one request");
+
+    let _ = e1_shutdown.send(());
+    let _ = e2_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_proxy_failover_after_deregister() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr  = manager_client(&mgr_addr).await?;
+
+    let (e1_shutdown, e1_rx) = oneshot::channel::<()>();
+    let e1_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let e1_addr     = format!("http://{}", e1_listener.local_addr()?);
+    tokio::spawn(async move {
+        tokio::select! { _ = e1_rx => {}, _ = identified_stub(e1_listener, "engine-a".into()) => {} }
+    });
+
+    let (e2_shutdown, e2_rx) = oneshot::channel::<()>();
+    let e2_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let e2_addr     = format!("http://{}", e2_listener.local_addr()?);
+    tokio::spawn(async move {
+        tokio::select! { _ = e2_rx => {}, _ = identified_stub(e2_listener, "engine-b".into()) => {} }
+    });
+
+    register_module(&mut mgr, "ea", &e1_addr, "failover-service", "1.0.0").await?;
+    register_module(&mut mgr, "eb", &e2_addr, "failover-service", "1.0.0").await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+    let proxy = start_proxy(table.clone()).await?;
+
+    // Both instances are reachable initially
+    let responses: Vec<String> = {
+        let mut v = Vec::new();
+        for _ in 0..4 {
+            let (_, body) = proxy_get(proxy, "failover-service", Some("1.0.0")).await?;
+            v.push(body);
+        }
+        v
+    };
+    assert!(responses.iter().any(|b| b == "engine-a"), "engine-a should be reachable before failover");
+    assert!(responses.iter().any(|b| b == "engine-b"), "engine-b should be reachable before failover");
+
+    // Deregister engine-a: its rule is immediately marked unhealthy and the
+    // routing table version is bumped.
+    mgr.deregister_engine(DeregisterEngineRequest { engine_id: "ea".into() }).await?;
+
+    // Re-sync the proxy's cached table to pick up the health change.
+    sync_table(&mgr_addr, &table).await?;
+
+    // All subsequent traffic must go to engine-b
+    for _ in 0..4 {
+        let (s, body) = proxy_get(proxy, "failover-service", Some("1.0.0")).await?;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body, "engine-b", "after failover all traffic should go to engine-b");
+    }
+
+    let _ = e1_shutdown.send(());
+    let _ = e2_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_proxy_503_when_all_instances_unhealthy() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr  = manager_client(&mgr_addr).await?;
+
+    let e1_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let e1_addr     = format!("http://{}", e1_listener.local_addr()?);
+    tokio::spawn(identified_stub(e1_listener, "engine-a".into()));
+
+    register_module(&mut mgr, "ea", &e1_addr, "gone-service", "1.0.0").await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+    let proxy = start_proxy(table.clone()).await?;
+
+    // Verify it's reachable before taking it down
+    let (s, _) = proxy_get(proxy, "gone-service", Some("1.0.0")).await?;
+    assert_eq!(s, StatusCode::OK);
+
+    // Deregister the only instance
+    mgr.deregister_engine(DeregisterEngineRequest { engine_id: "ea".into() }).await?;
+    sync_table(&mgr_addr, &table).await?;
+
+    // Now all rules are unhealthy → 503
+    let (s, _) = proxy_get(proxy, "gone-service", Some("1.0.0")).await?;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "all unhealthy should return 503");
+
+    Ok(())
+}
+
 // ── test utilities ────────────────────────────────────────────────────────────
 
 /// A minimal stub engine: echoes the request path in the response body.
@@ -614,6 +948,30 @@ async fn stub_engine(listener: TcpListener) {
                         .body(Full::new(Bytes::from(path)))
                         .unwrap(),
                 )
+            });
+            let _ = http1::Builder::new().serve_connection(io, svc).await;
+        });
+    }
+}
+
+/// Like `stub_engine` but responds with a fixed `id` so callers can tell
+/// which instance handled the request.
+async fn identified_stub(listener: TcpListener, id: String) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else { break };
+        let id = id.clone();
+        tokio::spawn(async move {
+            let io  = TokioIo::new(stream);
+            let svc = hyper::service::service_fn(move |_req: Request<hyper::body::Incoming>| {
+                let id = id.clone();
+                async move {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::from(id)))
+                            .unwrap(),
+                    )
+                }
             });
             let _ = http1::Builder::new().serve_connection(io, svc).await;
         });

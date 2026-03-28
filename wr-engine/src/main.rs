@@ -79,13 +79,22 @@ async fn main() -> Result<()> {
     // ── Heartbeat background task ─────────────────────────────────────────
     {
         let mut hb_client = client.clone();
-        let hb_id = engine_id.clone();
+        let hb_id         = engine_id.clone();
+        let hb_modules: Vec<ModuleDescriptor> = config.modules.iter().map(|m| ModuleDescriptor {
+            name:         m.name.clone(),
+            version:      m.version.clone(),
+            proto_schema: vec![],
+        }).collect();
+
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
                 if let Err(e) = hb_client
-                    .heartbeat(HeartbeatRequest { engine_id: hb_id.clone() })
+                    .heartbeat(HeartbeatRequest {
+                        engine_id:       hb_id.clone(),
+                        healthy_modules: hb_modules.clone(),
+                    })
                     .await
                 {
                     eprintln!("[engine] heartbeat failed: {e}");

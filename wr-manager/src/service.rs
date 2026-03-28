@@ -63,6 +63,15 @@ impl ManagerService for Manager {
             }
         }
 
+        // Initialise module health so the monitor doesn't immediately mark
+        // modules as unhealthy before their first heartbeat arrives.
+        for module in &reg.modules {
+            state.module_health.insert(
+                (engine_id.clone(), module.name.clone(), module.version.clone()),
+                Instant::now(),
+            );
+        }
+
         state.engines.insert(engine_id.clone(), reg);
         state.heartbeats.insert(engine_id.clone(), Instant::now());
 
@@ -79,6 +88,20 @@ impl ManagerService for Manager {
 
         state.engines.remove(&engine_id);
         state.heartbeats.remove(&engine_id);
+        state.module_health.retain(|(eid, _, _), _| eid != &engine_id);
+
+        // Mark all routing rules for this engine as unhealthy so proxies
+        // stop sending traffic before the next routing table sync.
+        let mut changed = false;
+        for rule in &mut state.routing_table.rules {
+            if rule.engine_id == engine_id && rule.healthy {
+                rule.healthy = false;
+                changed = true;
+            }
+        }
+        if changed {
+            state.routing_table.version += 1;
+        }
 
         println!("[manager] engine deregistered: {engine_id}");
         Ok(Response::new(DeregisterEngineResponse {}))
@@ -88,12 +111,20 @@ impl ManagerService for Manager {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        let engine_id = request.into_inner().engine_id;
-        self.state
-            .write()
-            .await
-            .heartbeats
-            .insert(engine_id, Instant::now());
+        let req       = request.into_inner();
+        let engine_id = req.engine_id;
+        let now       = Instant::now();
+        let mut state = self.state.write().await;
+
+        state.heartbeats.insert(engine_id.clone(), now);
+
+        for module in &req.healthy_modules {
+            state.module_health.insert(
+                (engine_id.clone(), module.name.clone(), module.version.clone()),
+                now,
+            );
+        }
+
         Ok(Response::new(HeartbeatResponse {}))
     }
 
@@ -122,7 +153,8 @@ impl ManagerService for Manager {
         &self,
         request: Request<RoutingRule>,
     ) -> Result<Response<UpsertRoutingRuleResponse>, Status> {
-        let rule = request.into_inner();
+        let mut rule = request.into_inner();
+        rule.healthy = true; // explicitly upserted rules are always healthy
 
         if rule.rule_id.is_empty() {
             return Err(Status::invalid_argument("rule_id is required"));
@@ -138,8 +170,9 @@ impl ManagerService for Manager {
             }
             None => {
                 println!(
-                    "[manager] routing rule added: {} → {} (engine {})",
-                    rule.source_module, rule.destination_module, rule.engine_id
+                    "[manager] routing rule added: {} → {}@{} (engine {})",
+                    rule.source_module, rule.destination_module,
+                    rule.destination_version, rule.engine_id
                 );
                 rules.push(rule);
             }

@@ -49,9 +49,10 @@ impl EngineRunner {
     ) -> Result<()> {
         println!("[engine] loading {}", module_config.name);
 
-        let component   = Component::from_file(&self.engine, &module_config.wasm_path)?;
+        let component      = Component::from_file(&self.engine, &module_config.wasm_path)?;
         let proxy_uri: hyper::Uri = self.config.proxy_address.parse()?;
-        let module_name = module_config.name.clone();
+        let module_name    = module_config.name.clone();
+        let module_version = module_config.version.clone();
 
         let mut linker: Linker<ModuleState> = Linker::new(&self.engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
@@ -63,7 +64,7 @@ impl EngineRunner {
             Ok(pre) => {
                 let pre = Arc::new(pre);
                 let (tx, rx) = mpsc::channel::<InboundRequest>(32);
-                registry.register(module_name.clone(), tx).await;
+                registry.register(module_name.clone(), module_version.clone(), tx).await;
 
                 let engine = self.engine.clone();
                 tokio::spawn(http_handler_task(

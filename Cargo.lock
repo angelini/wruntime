@@ -3476,6 +3476,7 @@ dependencies = [
  "hyper-util",
  "prost",
  "prost-reflect",
+ "semver",
  "serde",
  "serde_json",
  "tokio",

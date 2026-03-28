@@ -16,11 +16,13 @@ message EngineRegistration {
 }
 
 message RoutingRule {
-  string rule_id            = 1;
-  string source_module      = 2;
-  string destination_module = 3;
-  string engine_id          = 4;
-  string engine_address     = 5;
+  string rule_id              = 1;
+  string source_module        = 2;
+  string destination_module   = 3;
+  string engine_id            = 4;
+  string engine_address       = 5;
+  string destination_version  = 6; // semver string, e.g. "1.2.0"
+  bool   healthy              = 7; // set by manager; false means no traffic
 }
 
 message RoutingTable {
@@ -42,7 +44,10 @@ message RegisterEngineRequest    { EngineRegistration registration = 1; }
 message RegisterEngineResponse   { bool accepted = 1; }
 message DeregisterEngineRequest  { string engine_id = 1; }
 message DeregisterEngineResponse {}
-message HeartbeatRequest         { string engine_id = 1; }
+message HeartbeatRequest {
+  string                    engine_id       = 1;
+  repeated ModuleDescriptor healthy_modules = 2; // modules the engine considers healthy
+}
 message HeartbeatResponse        {}
 message ListEnginesRequest       {}
 message ListEnginesResponse      { repeated EngineRegistration engines = 1; }

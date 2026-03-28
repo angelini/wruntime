@@ -62,13 +62,18 @@ wr-proxy
   │  1. MetricsLayer       — records start time
   │  2. SchemaValidation   — decodes body with prost-reflect against the
   │                          module's FileDescriptorSet; returns 400 on failure
-  │  3. RoutingLayer       — resolves destination engine address from table,
-  │                          injects x-wr-module header
-  │  4. ForwardService     — strips x-wr-* headers, forwards to engine
+  │  3. RoutingLayer       — reads optional x-wr-version header; defaults to
+  │                          highest semver among healthy rules for the module;
+  │                          returns 503 if no healthy instance matches;
+  │                          injects x-wr-module and x-wr-version headers;
+  │                          round-robins across multiple healthy instances
+  │                          at the same version
+  │  4. ForwardService     — strips x-wr-destination / x-wr-source, forwards
   │
   ▼
 wr-engine (destination)
-  │  Inbound HTTP server reads x-wr-module, dispatches to WASM instance
+  │  Inbound HTTP server reads x-wr-module + x-wr-version, dispatches to
+  │  the correct WASM instance via round-robin among loaded instances
   │
   ▼
 inventory-service WASM module handles the request
@@ -174,8 +179,8 @@ On startup the engine:
 1. Loads every listed WASM component from disk.
 2. Registers itself and its modules with the manager (including schema bytes).
 3. Starts an inbound HTTP server on `listen_address`.
-4. Sends a heartbeat to the manager every 10 seconds.
-5. Deregisters cleanly on `Ctrl+C`.
+4. Sends a heartbeat to the manager every 10 seconds, reporting all loaded modules as healthy.
+5. Deregisters cleanly on `Ctrl+C`, which immediately marks its routing rules as unhealthy.
 
 #### Routing rules
 
@@ -187,10 +192,15 @@ grpcurl -plaintext -d '{
   "rule_id": "r1",
   "source_module": "order-service",
   "destination_module": "inventory-service",
+  "destination_version": "1.0.0",
   "engine_id": "<engine-uuid>",
   "engine_address": "http://127.0.0.1:9100"
 }' 127.0.0.1:9000 wruntime.ManagerService/UpsertRoutingRule
 ```
+
+To run **multiple instances** of the same module version across different engines, create one rule per engine pointing at the same `(destination_module, destination_version)`. The proxy round-robins across all healthy rules for that pair.
+
+To deploy a **new version** alongside the old one, register a new engine with `version = "2.0.0"` and add a corresponding rule. Callers that omit `x-wr-version` are automatically upgraded to the highest semver. Callers that pin a version with the `x-wr-version` request header continue to reach the older instance.
 
 ---
 
@@ -204,7 +214,7 @@ All inter-service communication uses the `wruntime.ManagerService` gRPC service.
 |-----|---------|----------|-------------|
 | `RegisterEngine` | `EngineRegistration` | `{ accepted }` | Engine announces itself and its modules |
 | `DeregisterEngine` | `{ engine_id }` | — | Engine removes itself on shutdown |
-| `Heartbeat` | `{ engine_id }` | — | Sent every 10 s; manager logs engines that go silent |
+| `Heartbeat` | `{ engine_id, healthy_modules }` | — | Sent every 10 s; carries the list of currently healthy modules; manager uses this to update per-module health and mark routing rules unhealthy when a module goes silent |
 | `ListEngines` | — | `[EngineRegistration]` | Returns all currently registered engines |
 
 ### Routing table
@@ -212,20 +222,24 @@ All inter-service communication uses the `wruntime.ManagerService` gRPC service.
 | RPC | Request | Response | Description |
 |-----|---------|----------|-------------|
 | `GetRoutingTable` | — | `RoutingTable` | Returns the full versioned table |
-| `UpsertRoutingRule` | `RoutingRule` | — | Insert or update a rule by `rule_id` |
+| `UpsertRoutingRule` | `RoutingRule` | — | Insert or update a rule by `rule_id`; always marks the rule healthy |
 | `DeleteRoutingRule` | `{ rule_id }` | — | Remove a rule; increments table version |
 
 A `RoutingRule` has the fields:
 
 ```protobuf
 message RoutingRule {
-  string rule_id            = 1;  // stable identifier for this rule
-  string source_module      = 2;  // module that initiates the call
-  string destination_module = 3;  // module name used as the HTTP host
-  string engine_id          = 4;  // UUID of the destination engine
-  string engine_address     = 5;  // HTTP base URL of the destination engine
+  string rule_id             = 1;  // stable identifier for this rule
+  string source_module       = 2;  // module that initiates the call
+  string destination_module  = 3;  // module name used as the HTTP host
+  string engine_id           = 4;  // UUID of the destination engine
+  string engine_address      = 5;  // HTTP base URL of the destination engine
+  string destination_version = 6;  // semver of the destination module, e.g. "1.2.0"
+  bool   healthy             = 7;  // set by manager; false = proxy will not route to this rule
 }
 ```
+
+The `healthy` field is managed entirely by the manager — it is always set to `true` on `UpsertRoutingRule` and is flipped to `false` automatically when the engine's heartbeat stops reporting the module as healthy, or immediately on `DeregisterEngine`. The routing table version is incremented whenever health status changes, so proxies pick up failover events within one TTL cycle.
 
 ### Schemas
 
@@ -396,6 +410,8 @@ fn call_inventory(category: &str) -> Vec<u8> {
     let req = OutgoingRequest::new(headers);
 
     // Use the destination module name as the host — routing is automatic.
+    // Add x-wr-version to pin a specific version; omit it to always reach
+    // the latest deployed version.
     req.set_authority(Some("inventory-service")).unwrap();
     req.set_path_with_query(Some(
         "/inventory.InventoryService/GetItems"
@@ -444,6 +460,11 @@ The `wr-tests` crate contains integration tests that spin up in-process instance
 - Schema validation: invalid protobuf bodies rejected with structured JSON errors
 - Pass-through when no schema is cached
 - All three example TOML files parse without error
+- Version routing: `x-wr-version` header routes to the correct instance; no header routes to the highest semver
+- Returns 503 when the requested version has no healthy instance
+- Load balancing: requests distributed across multiple instances of the same `(module, version)`
+- Failover: deregistering an instance immediately redirects traffic to remaining healthy instances
+- Full failure: 503 when all instances are unhealthy
 
 ---
 
