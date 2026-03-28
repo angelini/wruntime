@@ -1,4 +1,4 @@
-package wruntime:db@0.1.0;
+package wruntime:db@0.2.0;
 
 interface database {
     /// A typed Postgres value, including NULL.
@@ -70,6 +70,34 @@ interface database {
         sql:    string,
         params: list<pg-value>,
     ) -> result<u64, db-error>;
+
+    /// A live database transaction.
+    ///
+    /// The host issues BEGIN when this resource is created.
+    /// Dropping the handle without calling commit causes the host to issue
+    /// ROLLBACK automatically.
+    resource transaction {
+        /// Execute a SELECT inside this transaction.
+        query: func(
+            sql:    string,
+            params: list<pg-value>,
+        ) -> result<list<row>, db-error>;
+
+        /// Execute an INSERT / UPDATE / DELETE inside this transaction.
+        execute: func(
+            sql:    string,
+            params: list<pg-value>,
+        ) -> result<u64, db-error>;
+
+        /// Commit the transaction.
+        commit: func() -> result<_, db-error>;
+
+        /// Roll back the transaction explicitly.
+        rollback: func() -> result<_, db-error>;
+    }
+
+    /// Acquire a connection and begin a transaction (issues BEGIN).
+    begin-transaction: func() -> result<transaction, db-error>;
 }
 
 /// The world the host exposes to every WASM module that opts in to DB access.

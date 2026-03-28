@@ -1,13 +1,28 @@
 use chrono::Timelike as _;
 use tokio::runtime::Handle;
+use wasmtime::component::Resource;
+use wasmtime_wasi_http::WasiHttpView as _;
+
+/// Host-side state for an active WIT `transaction` resource.
+///
+/// Holds the dedicated pooled connection for the duration of the transaction.
+/// `done` is set to `true` after `commit` or `rollback` so the `drop` handler
+/// does not issue a redundant ROLLBACK.
+pub struct TxState {
+    client: deadpool_postgres::Object,
+    done: bool,
+}
 
 wasmtime::component::bindgen!({
-    path:              "../wit",
-    world:             "db-access",
+    path:               "../wit",
+    world:              "db-access",
     additional_derives: [PartialEq],
+    with: {
+        "wruntime:db/database.transaction": TxState,
+    },
 });
 
-use wruntime::db::database::{Column, DbError, Host, PgValue, Row};
+use wruntime::db::database::{Column, DbError, Host, HostTransaction, PgValue, Row};
 
 use crate::state::ModuleState;
 
@@ -182,6 +197,136 @@ impl Host for ModuleState {
             })
         })
     }
+
+    fn begin_transaction(&mut self) -> Result<Resource<TxState>, DbError> {
+        let pool = match &self.db_pool {
+            Some(p) => p.clone(),
+            None => {
+                return Err(DbError::Connection(
+                    "no database configured for this module".into(),
+                ))
+            }
+        };
+
+        let client = tokio::task::block_in_place(|| {
+            Handle::current().block_on(async move {
+                let client = pool
+                    .get()
+                    .await
+                    .map_err(|e| DbError::Connection(e.to_string()))?;
+                client
+                    .execute("BEGIN", &[])
+                    .await
+                    .map_err(|e| DbError::Query(e.to_string()))?;
+                Ok::<_, DbError>(client)
+            })
+        })?;
+
+        self.table()
+            .push(TxState { client, done: false })
+            .map_err(|e| DbError::Connection(e.to_string()))
+    }
+}
+
+// ── HostTransaction implementation ───────────────────────────────────────────
+
+impl HostTransaction for ModuleState {
+    fn query(
+        &mut self,
+        self_: Resource<TxState>,
+        sql: String,
+        params: Vec<PgValue>,
+    ) -> Result<Vec<Row>, DbError> {
+        let state = self
+            .table()
+            .get(&self_)
+            .map_err(|e| DbError::Connection(e.to_string()))?;
+
+        tokio::task::block_in_place(|| {
+            Handle::current().block_on(async {
+                let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
+                let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                    pg_params.iter().map(|p| p as _).collect();
+                let rows = state
+                    .client
+                    .query(sql.as_str(), &params_ref)
+                    .await
+                    .map_err(|e| DbError::Query(e.to_string()))?;
+                Ok(rows.iter().map(pg_row_to_wit).collect())
+            })
+        })
+    }
+
+    fn execute(
+        &mut self,
+        self_: Resource<TxState>,
+        sql: String,
+        params: Vec<PgValue>,
+    ) -> Result<u64, DbError> {
+        let state = self
+            .table()
+            .get(&self_)
+            .map_err(|e| DbError::Connection(e.to_string()))?;
+
+        tokio::task::block_in_place(|| {
+            Handle::current().block_on(async {
+                let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
+                let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                    pg_params.iter().map(|p| p as _).collect();
+                state
+                    .client
+                    .execute(sql.as_str(), &params_ref)
+                    .await
+                    .map_err(|e| DbError::Query(e.to_string()))
+            })
+        })
+    }
+
+    fn commit(&mut self, self_: Resource<TxState>) -> Result<(), DbError> {
+        {
+            let state = self
+                .table()
+                .get(&self_)
+                .map_err(|e| DbError::Connection(e.to_string()))?;
+            tokio::task::block_in_place(|| {
+                Handle::current().block_on(state.client.execute("COMMIT", &[]))
+            })
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        }
+        self.table()
+            .get_mut(&self_)
+            .map_err(|e| DbError::Connection(e.to_string()))?
+            .done = true;
+        Ok(())
+    }
+
+    fn rollback(&mut self, self_: Resource<TxState>) -> Result<(), DbError> {
+        {
+            let state = self
+                .table()
+                .get(&self_)
+                .map_err(|e| DbError::Connection(e.to_string()))?;
+            tokio::task::block_in_place(|| {
+                Handle::current().block_on(state.client.execute("ROLLBACK", &[]))
+            })
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        }
+        self.table()
+            .get_mut(&self_)
+            .map_err(|e| DbError::Connection(e.to_string()))?
+            .done = true;
+        Ok(())
+    }
+
+    fn drop(&mut self, rep: Resource<TxState>) -> wasmtime::Result<()> {
+        let state = self.table().delete(rep)?;
+        if !state.done {
+            let _ = tokio::task::block_in_place(|| {
+                Handle::current().block_on(state.client.execute("ROLLBACK", &[]))
+            });
+        }
+        Ok(())
+    }
 }
 
 // ── Row conversion ───────────────────────────────────────────────────────────
@@ -286,6 +431,16 @@ mod tests {
     fn test_execute_returns_error_when_no_pool() {
         let mut state = ModuleState::new("test".into(), proxy_uri(), None);
         let result = state.execute("SELECT 1".into(), vec![]);
+        assert!(
+            matches!(result, Err(DbError::Connection(_))),
+            "expected Connection error, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn test_begin_transaction_returns_error_when_no_pool() {
+        let mut state = ModuleState::new("test".into(), proxy_uri(), None);
+        let result = state.begin_transaction();
         assert!(
             matches!(result, Err(DbError::Connection(_))),
             "expected Connection error, got {result:?}",
@@ -402,5 +557,146 @@ mod tests {
         assert_eq!(cols[4].value, PgValue::Float4(1.5));
         assert_eq!(cols[5].value, PgValue::Float8(2.5));
         assert_eq!(cols[6].value, PgValue::Null);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_transaction_commit() {
+        use super::wruntime::db::database::{Host, HostTransaction};
+
+        let url = match db_url() {
+            Some(u) => u,
+            None => return,
+        };
+
+        let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
+        let mut state = ModuleState::new("test".into(), proxy_uri(), Some(Arc::new(pool)));
+
+        // Setup: create a temp table outside the transaction.
+        Host::execute(
+            &mut state,
+            "CREATE TEMP TABLE _wr_tx_commit_test (val INT)".into(),
+            vec![],
+        )
+        .expect("create table");
+
+        let tx = state.begin_transaction().expect("begin");
+        let rep = tx.rep();
+
+        HostTransaction::execute(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(rep),
+            "INSERT INTO _wr_tx_commit_test VALUES (42)".into(),
+            vec![],
+        )
+        .expect("insert");
+
+        HostTransaction::commit(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(rep),
+        )
+        .expect("commit");
+
+        // After commit the row must be visible outside the transaction.
+        let rows = Host::query(
+            &mut state,
+            "SELECT val FROM _wr_tx_commit_test".into(),
+            vec![],
+        )
+        .expect("query after commit");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].columns[0].value, PgValue::Int4(42));
+
+        // Release the resource; done=true so no ROLLBACK is issued.
+        HostTransaction::drop(&mut state, tx).expect("drop");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_transaction_rollback() {
+        use super::wruntime::db::database::{Host, HostTransaction};
+
+        let url = match db_url() {
+            Some(u) => u,
+            None => return,
+        };
+
+        let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
+        let mut state = ModuleState::new("test".into(), proxy_uri(), Some(Arc::new(pool)));
+
+        Host::execute(
+            &mut state,
+            "CREATE TEMP TABLE _wr_tx_rollback_test (val INT)".into(),
+            vec![],
+        )
+        .expect("create table");
+
+        let tx = state.begin_transaction().expect("begin");
+        let rep = tx.rep();
+
+        HostTransaction::execute(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(rep),
+            "INSERT INTO _wr_tx_rollback_test VALUES (99)".into(),
+            vec![],
+        )
+        .expect("insert");
+
+        HostTransaction::rollback(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(rep),
+        )
+        .expect("rollback");
+
+        // After rollback the row must not be present.
+        let rows = Host::query(
+            &mut state,
+            "SELECT val FROM _wr_tx_rollback_test".into(),
+            vec![],
+        )
+        .expect("query after rollback");
+        assert_eq!(rows.len(), 0);
+
+        HostTransaction::drop(&mut state, tx).expect("drop");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_transaction_implicit_rollback_on_drop() {
+        use super::wruntime::db::database::{Host, HostTransaction};
+
+        let url = match db_url() {
+            Some(u) => u,
+            None => return,
+        };
+
+        let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
+        let mut state = ModuleState::new("test".into(), proxy_uri(), Some(Arc::new(pool)));
+
+        Host::execute(
+            &mut state,
+            "CREATE TEMP TABLE _wr_tx_drop_test (val INT)".into(),
+            vec![],
+        )
+        .expect("create table");
+
+        let tx = state.begin_transaction().expect("begin");
+        let rep = tx.rep();
+
+        HostTransaction::execute(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(rep),
+            "INSERT INTO _wr_tx_drop_test VALUES (7)".into(),
+            vec![],
+        )
+        .expect("insert");
+
+        // Drop without committing — host must issue implicit ROLLBACK.
+        HostTransaction::drop(&mut state, tx).expect("drop");
+
+        let rows = Host::query(
+            &mut state,
+            "SELECT val FROM _wr_tx_drop_test".into(),
+            vec![],
+        )
+        .expect("query after implicit rollback");
+        assert_eq!(rows.len(), 0);
     }
 }
