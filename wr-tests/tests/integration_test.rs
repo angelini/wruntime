@@ -443,7 +443,7 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
             .headers
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map_or(true, |v| v.starts_with("application/json")),
+            .is_none_or(|v| v.starts_with("application/json")),
         "expected application/json content-type"
     );
 

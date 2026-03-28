@@ -1,4 +1,5 @@
 use anyhow::Result;
+use deadpool_postgres::Pool;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use crate::state::ModuleState;
 pub struct EngineRunner {
     engine: Arc<Engine>,
     config: EngineConfig,
+    db_pool: Option<Arc<Pool>>,
 }
 
 impl EngineRunner {
@@ -31,9 +33,18 @@ impl EngineRunner {
         wt_config.async_support(true);
         wt_config.wasm_component_model(true);
         let engine = Engine::new(&wt_config)?;
+
+        let db_pool = config
+            .database
+            .as_ref()
+            .map(|db| crate::pool::build_pool(&db.url, db.max_connections))
+            .transpose()?
+            .map(Arc::new);
+
         Ok(Self {
             engine: Arc::new(engine),
             config,
+            db_pool,
         })
     }
 
@@ -61,6 +72,10 @@ impl EngineRunner {
         let mut linker: Linker<ModuleState> = Linker::new(&self.engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+        crate::db::wruntime::db::database::add_to_linker::<
+            ModuleState,
+            wasmtime::component::HasSelf<ModuleState>,
+        >(&mut linker, |s| s)?;
 
         // Try to pre-link as a WASI HTTP Proxy world component first.
         // This succeeds when the component exports `wasi:http/incoming-handler`.
@@ -73,17 +88,28 @@ impl EngineRunner {
                     .await;
 
                 let engine = self.engine.clone();
+                let db_pool = if module_config.database {
+                    self.db_pool.clone()
+                } else {
+                    None
+                };
                 tokio::spawn(http_handler_task(
                     engine,
                     pre,
                     proxy_uri,
                     module_name.clone(),
+                    db_pool,
                     rx,
                 ));
             }
             Err(_) => {
                 // Fall back: spawn as a long-running task that calls `run`.
-                let state = ModuleState::new(module_name.clone(), proxy_uri);
+                let db_pool = if module_config.database {
+                    self.db_pool.clone()
+                } else {
+                    None
+                };
+                let state = ModuleState::new(module_name.clone(), proxy_uri, db_pool);
                 let mut store = Store::new(&self.engine, state);
                 let instance = linker.instantiate_async(&mut store, &component).await?;
 
@@ -117,6 +143,7 @@ async fn http_handler_task(
     pre: Arc<ProxyPre<ModuleState>>,
     proxy_uri: hyper::Uri,
     module_name: String,
+    db_pool: Option<Arc<Pool>>,
     mut rx: mpsc::Receiver<InboundRequest>,
 ) {
     while let Some(inbound) = rx.recv().await {
@@ -124,9 +151,11 @@ async fn http_handler_task(
         let pre = pre.clone();
         let proxy_uri = proxy_uri.clone();
         let module_name = module_name.clone();
+        let db_pool = db_pool.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = dispatch_request(&engine, &pre, proxy_uri, &module_name, inbound).await
+            if let Err(e) =
+                dispatch_request(&engine, &pre, proxy_uri, &module_name, db_pool, inbound).await
             {
                 warn!(module = %module_name, error = %e, "inbound request error");
             }
@@ -141,9 +170,10 @@ async fn dispatch_request(
     pre: &ProxyPre<ModuleState>,
     proxy_uri: hyper::Uri,
     module_name: &str,
+    db_pool: Option<Arc<Pool>>,
     inbound: InboundRequest,
 ) -> Result<()> {
-    let state = ModuleState::new(module_name.to_string(), proxy_uri);
+    let state = ModuleState::new(module_name.to_string(), proxy_uri, db_pool);
     let mut store = Store::new(engine, state);
     let proxy = pre.instantiate_async(&mut store).await?;
 

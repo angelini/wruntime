@@ -86,20 +86,22 @@ inventory-service WASM module handles the request
 | Tool | Purpose |
 |------|---------|
 | Rust + Cargo (stable) | Build all binaries |
+| [`just`](https://github.com/casey/just) | Run project recipes (see `Justfile`) |
 | `protoc` | Compile `.proto` schemas to `FileDescriptorSet` binaries for schema validation (optional at runtime if modules have no schema) |
 | `wasm-tools` or `cargo-component` | Build WASM component modules |
 
-Install Rust via [rustup](https://rustup.rs). Install `protoc` via your system package manager or from [github.com/protocolbuffers/protobuf/releases](https://github.com/protocolbuffers/protobuf/releases).
+Install Rust via [rustup](https://rustup.rs). Install `just` via `cargo install just` or your system package manager. Install `protoc` via your system package manager or from [github.com/protocolbuffers/protobuf/releases](https://github.com/protocolbuffers/protobuf/releases).
 
 ---
 
 ## Building
 
 ```bash
-cargo build --release
+just build          # debug build
+just build-release  # release build
 ```
 
-Binaries are placed in `target/release/`:
+Release binaries are placed in `target/release/`:
 
 ```
 target/release/wr-manager
@@ -113,10 +115,20 @@ target/release/wr-engine
 
 Start the three components **in order**: manager first, then proxy, then engines.
 
+```bash
+just manager   # dev (cargo run)
+just proxy
+just engine
+
+just manager-release   # release binaries
+just proxy-release
+just engine-release
+```
+
 ### 1. wr-manager
 
 ```bash
-./target/release/wr-manager manager.toml
+just manager
 ```
 
 `manager.toml`:
@@ -129,7 +141,7 @@ engine_heartbeat_timeout_secs = 30
 ### 2. wr-proxy
 
 ```bash
-./target/release/wr-proxy proxy.toml
+just proxy
 ```
 
 `proxy.toml`:
@@ -152,7 +164,7 @@ The proxy connects to the manager at startup, then polls for routing table and s
 ### 3. wr-engine
 
 ```bash
-./target/release/wr-engine engine.toml
+just engine
 ```
 
 `engine.toml`:
@@ -337,6 +349,7 @@ Modules must be **WASI Preview 2 components** that implement the `wasi:http/inco
 ```bash
 rustup target add wasm32-wasip2
 cargo install cargo-component   # WASI component tooling
+cargo install just              # task runner
 ```
 
 ### Cargo.toml
@@ -447,10 +460,118 @@ Copy the `.wasm` file to the path referenced by `wasm_path` in `engine.toml`.
 
 ---
 
+## Database access
+
+WASM modules can query Postgres through a host-provided interface defined in `wit/db.wit`. The engine holds a shared connection pool; the module never owns a connection directly.
+
+### Engine configuration
+
+Add a `[database]` section to `engine.toml` and set `database = true` on each module that should have access:
+
+```toml
+[database]
+url             = "postgres://user:pass@localhost:5432/mydb"
+max_connections = 10   # default: 8
+
+[[module]]
+name      = "order-service"
+version   = "1.0.0"
+wasm_path = "modules/order_service.wasm"
+database  = true       # opt in to DB access
+
+[[module]]
+name      = "inventory-service"
+version   = "1.0.0"
+wasm_path = "modules/inventory_service.wasm"
+# database omitted — no DB access for this module
+```
+
+### Guest-side setup
+
+Add the WIT path to your component's `Cargo.toml` and import the interface:
+
+```toml
+[package.metadata.component.target]
+path = "../../wit"   # path to the repo's wit/ directory
+```
+
+Then generate bindings and use them in your module:
+
+```rust
+// src/lib.rs
+wit_bindgen::generate!({
+    path:  "../../wit",
+    world: "db-access",
+});
+
+use wruntime::db::database::{self, PgValue};
+```
+
+### Example: querying Postgres from a WASM module
+
+```rust
+use wruntime::db::database::{self, DbError, PgValue};
+
+/// Look up an order by its integer ID and return the status string.
+fn get_order_status(order_id: i32) -> Result<Option<String>, DbError> {
+    let rows = database::query(
+        "SELECT status FROM orders WHERE id = $1",
+        &[PgValue::Int4(order_id)],
+    )?;
+
+    Ok(rows.first().and_then(|row| {
+        match row.columns.first().map(|c| &c.value) {
+            Some(PgValue::Text(s)) => Some(s.clone()),
+            _ => None,
+        }
+    }))
+}
+
+/// Insert a new order and return the number of rows affected.
+fn create_order(id: i32, status: &str, total: &str) -> Result<u64, DbError> {
+    database::execute(
+        "INSERT INTO orders (id, status, total) VALUES ($1, $2, $3::numeric)",
+        &[
+            PgValue::Int4(id),
+            PgValue::Text(status.to_string()),
+            PgValue::Numeric(total.to_string()),
+        ],
+    )
+}
+```
+
+### `pg-value` type mapping
+
+| Variant | Postgres type | Rust encoding |
+|---|---|---|
+| `PgValue::Null` | SQL NULL | — |
+| `PgValue::Boolean(bool)` | `BOOL` | `bool` |
+| `PgValue::Int2(i16)` | `SMALLINT` | `i16` |
+| `PgValue::Int4(i32)` | `INTEGER` | `i32` |
+| `PgValue::Int8(i64)` | `BIGINT` | `i64` |
+| `PgValue::Float4(f32)` | `REAL` | `f32` |
+| `PgValue::Float8(f64)` | `DOUBLE PRECISION` | `f64` |
+| `PgValue::Text(String)` | `TEXT` / `VARCHAR` / `CHAR` | `String` |
+| `PgValue::Bytea(Vec<u8>)` | `BYTEA` | `Vec<u8>` |
+| `PgValue::Timestamptz(i64)` | `TIMESTAMPTZ` | µs since Unix epoch (UTC) |
+| `PgValue::Date(i32)` | `DATE` | days since Unix epoch |
+| `PgValue::Time(i64)` | `TIME` | µs since midnight |
+| `PgValue::Numeric(String)` | `NUMERIC` / `DECIMAL` | decimal string (lossless) |
+| `PgValue::Uuid((u64, u64))` | `UUID` | 128-bit value as `(high, low)` |
+| `PgValue::Jsonb(String)` | `JSON` / `JSONB` | serialised JSON string |
+| `PgValue::Oid(u32)` | `OID` | `u32` |
+
+Parameters are bound positionally as `$1`, `$2`, … in the SQL string. Use explicit casts (e.g. `$1::numeric`, `$1::jsonb`) when Postgres cannot infer the type from context.
+
+---
+
 ## Testing
 
 ```bash
-cargo test
+just test                    # all tests
+just test-integration        # wr-tests crate only
+just test-one <test_name>    # single test by name
+just test-db                 # integration tests with a local Postgres instance
 ```
 
 The `wr-tests` crate contains integration tests that spin up in-process instances of all three services on random ports — no external processes or files required:

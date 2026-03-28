@@ -1,0 +1,78 @@
+package wruntime:db@0.1.0;
+
+interface database {
+    /// A typed Postgres value, including NULL.
+    ///
+    /// Mapping to Postgres OIDs:
+    ///   null        → SQL NULL (any type)
+    ///   boolean     → BOOL
+    ///   int2        → SMALLINT / INT2
+    ///   int4        → INTEGER  / INT4
+    ///   int8        → BIGINT   / INT8
+    ///   float4      → REAL     / FLOAT4
+    ///   float8      → DOUBLE PRECISION / FLOAT8
+    ///   text        → TEXT / VARCHAR / CHAR / NAME
+    ///   bytea       → BYTEA
+    ///   timestamptz → TIMESTAMPTZ — microseconds since Unix epoch (UTC)
+    ///   date        → DATE  — days since Unix epoch
+    ///   time        → TIME  — microseconds since midnight
+    ///   numeric     → NUMERIC / DECIMAL — preserved as a decimal string
+    ///   uuid        → UUID  — 128-bit value as (high-u64, low-u64)
+    ///   jsonb       → JSON / JSONB — serialised JSON text
+    ///   oid         → OID  — 32-bit object identifier
+    variant pg-value {
+        null,
+        boolean(bool),
+        int2(s16),
+        int4(s32),
+        int8(s64),
+        float4(f32),
+        float8(f64),
+        text(string),
+        bytea(list<u8>),
+        timestamptz(s64),
+        date(s32),
+        time(s64),
+        numeric(string),
+        uuid(tuple<u64, u64>),
+        jsonb(string),
+        oid(u32),
+    }
+
+    /// A single column value in a result row.
+    record column {
+        name:  string,
+        value: pg-value,
+    }
+
+    /// One result row returned by a query.
+    record row {
+        columns: list<column>,
+    }
+
+    variant db-error {
+        /// Could not acquire or use a connection.
+        connection(string),
+        /// The database rejected the query.
+        query(string),
+    }
+
+    /// Execute a parameterised SELECT and return all matching rows.
+    /// Parameters are bound positionally as $1, $2, … in the SQL string.
+    query: func(
+        sql:    string,
+        params: list<pg-value>,
+    ) -> result<list<row>, db-error>;
+
+    /// Execute a parameterised INSERT / UPDATE / DELETE.
+    /// Returns the number of rows affected.
+    execute: func(
+        sql:    string,
+        params: list<pg-value>,
+    ) -> result<u64, db-error>;
+}
+
+/// The world the host exposes to every WASM module that opts in to DB access.
+world db-access {
+    import database;
+}

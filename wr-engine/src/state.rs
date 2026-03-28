@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use deadpool_postgres::Pool;
 use hyper::header::{HeaderName, HeaderValue};
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -15,16 +18,19 @@ pub struct ModuleState {
     module_name: String,
     /// Pre-parsed proxy URI so we don't re-parse on every request.
     proxy_uri: hyper::Uri,
+    /// Shared connection pool, present when the module has DB access enabled.
+    pub db_pool: Option<Arc<Pool>>,
 }
 
 impl ModuleState {
-    pub fn new(module_name: String, proxy_uri: hyper::Uri) -> Self {
+    pub fn new(module_name: String, proxy_uri: hyper::Uri, db_pool: Option<Arc<Pool>>) -> Self {
         Self {
             wasi: WasiCtxBuilder::new().inherit_stdio().build(),
             http: WasiHttpCtx::new(),
             table: ResourceTable::new(),
             module_name,
             proxy_uri,
+            db_pool,
         }
     }
 }

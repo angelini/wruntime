@@ -2,14 +2,21 @@ listen_address  = "0.0.0.0:9100"
 manager_address = "http://127.0.0.1:9000"
 proxy_address   = "http://127.0.0.1:9001"
 
+# Optional — remove this section if no modules need database access.
+[database]
+url             = "postgres://user:pass@localhost:5432/mydb"
+max_connections = 8
+
 [[module]]
 name        = "order-service"
 version     = "1.0.0"
 wasm_path   = "modules/order_service.wasm"
 schema_path = "schemas/order_service.binpb"
+database    = true   # opt in to the shared connection pool
 
 [[module]]
 name      = "inventory-service"
 version   = "1.0.0"
 wasm_path = "modules/inventory_service.wasm"
 # schema_path is optional — omit if no proto schema is available
+# database defaults to false — this module has no DB access

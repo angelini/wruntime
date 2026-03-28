@@ -11,6 +11,21 @@ pub struct EngineConfig {
     pub listen_address: String,
     #[serde(rename = "module", default)]
     pub modules: Vec<ModuleConfig>,
+    /// Optional PostgreSQL connection pool shared across DB-enabled modules.
+    pub database: Option<DatabaseConfig>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct DatabaseConfig {
+    /// `postgres://user:pass@host:port/dbname` connection string.
+    pub url: String,
+    /// Maximum number of pooled connections. Defaults to 8.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+}
+
+fn default_max_connections() -> usize {
+    8
 }
 
 #[derive(Deserialize, Clone)]
@@ -22,6 +37,10 @@ pub struct ModuleConfig {
     /// Optional — if absent the module is registered without a schema and
     /// schema validation for it is skipped by the proxy.
     pub schema_path: Option<String>,
+    /// Whether this module has access to the shared database pool.
+    /// Requires a `[database]` section in the engine config.
+    #[serde(default)]
+    pub database: bool,
 }
 
 impl EngineConfig {
@@ -62,6 +81,11 @@ impl EngineConfig {
                     schema,
                 );
             }
+            anyhow::ensure!(
+                !module.database || self.database.is_some(),
+                "module '{}' has database = true but no [database] section is configured",
+                module.name,
+            );
         }
 
         Ok(())

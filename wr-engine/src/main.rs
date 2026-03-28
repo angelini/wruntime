@@ -1,5 +1,7 @@
 mod config;
+mod db;
 mod engine;
+mod pool;
 mod registry;
 mod server;
 mod state;
