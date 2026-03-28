@@ -13,8 +13,8 @@ use crate::routing::CachedRoutingTable;
 
 pub struct RoutingLayer {
     table: CachedRoutingTable,
-    /// Monotonic counters per (module, version) for round-robin selection.
-    counters: Arc<Mutex<HashMap<(String, String), usize>>>,
+    /// Monotonic counters per (namespace, module, version) for round-robin selection.
+    counters: Arc<Mutex<HashMap<(String, String, String), usize>>>,
 }
 
 impl RoutingLayer {
@@ -41,7 +41,7 @@ impl<S> Layer<S> for RoutingLayer {
 pub struct RoutingService<S> {
     inner: S,
     table: CachedRoutingTable,
-    counters: Arc<Mutex<HashMap<(String, String), usize>>>,
+    counters: Arc<Mutex<HashMap<(String, String, String), usize>>>,
 }
 
 impl<S> Service<Request<Bytes>> for RoutingService<S>
@@ -64,18 +64,29 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // Extract destination module name from the x-wr-destination host
+            // Extract destination module name and namespace from x-wr-destination.
+            // Expected host format: "{service}.{namespace}"
             let dest_uri: Option<http::Uri> = req
                 .headers()
                 .get("x-wr-destination")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse().ok());
 
-            let module_name = dest_uri
+            let host = dest_uri
                 .as_ref()
                 .and_then(|u: &http::Uri| u.host())
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or("");
+
+            let (module_name, dest_namespace) = match host.split_once('.') {
+                Some((svc, ns)) => (svc.to_string(), ns.to_string()),
+                None => {
+                    let msg = format!(
+                        "destination host '{host}' must use the format \
+                         '{{service}}.{{namespace}}' — namespace is required"
+                    );
+                    return Ok(error_response(StatusCode::BAD_REQUEST, &msg));
+                }
+            };
 
             // Optional explicit version requested by the caller
             let requested_version: Option<String> = req
@@ -85,13 +96,17 @@ where
                 .map(|s| s.to_string());
 
             // Collect healthy candidate addresses and resolve the version string.
-            // Multiple rules for the same (module, version) are all candidates.
+            // Multiple rules for the same (namespace, module, version) are all candidates.
             let (resolved_version, candidate_addrs) = {
                 let t = table.read().await;
                 let healthy: Vec<_> = t
                     .rules
                     .iter()
-                    .filter(|r| r.destination_module == module_name && r.healthy)
+                    .filter(|r| {
+                        r.destination_module == module_name
+                            && r.destination_namespace == dest_namespace
+                            && r.healthy
+                    })
                     .collect();
 
                 if let Some(ref version) = requested_version {
@@ -134,25 +149,28 @@ where
 
             if candidate_addrs.is_empty() {
                 let msg = match requested_version {
-                    Some(v) => format!("no route for module '{module_name}' version '{v}'"),
-                    None => format!("no route for module '{module_name}'"),
+                    Some(v) => format!("no route for module '{dest_namespace}.{module_name}' version '{v}'"),
+                    None => format!("no route for module '{dest_namespace}.{module_name}'"),
                 };
                 return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE, &msg));
             }
 
-            // Round-robin across candidates using a per-(module, version) counter
+            // Round-robin across candidates using a per-(namespace, module, version) counter
             let addr = {
                 let mut map = counters.lock().unwrap();
                 let counter = map
-                    .entry((module_name.clone(), resolved_version.clone()))
+                    .entry((dest_namespace.clone(), module_name.clone(), resolved_version.clone()))
                     .or_insert(0);
                 let idx = *counter % candidate_addrs.len();
                 *counter = counter.wrapping_add(1);
                 candidate_addrs[idx].clone()
             };
 
-            // Inject x-wr-module and x-wr-version so the destination engine
-            // knows which WASM module and version to dispatch to.
+            // Inject x-wr-namespace, x-wr-module, and x-wr-version so the
+            // destination engine knows which WASM module and version to dispatch to.
+            if let Ok(v) = http::HeaderValue::from_str(&dest_namespace) {
+                req.headers_mut().insert("x-wr-namespace", v);
+            }
             if !module_name.is_empty() {
                 if let Ok(v) = http::HeaderValue::from_str(&module_name) {
                     req.headers_mut().insert("x-wr-module", v);

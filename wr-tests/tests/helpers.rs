@@ -59,6 +59,7 @@ pub async fn register_module(
     c: &mut ManagerServiceClient<tonic::transport::Channel>,
     engine_id: &str,
     engine_addr: &str,
+    namespace: &str,
     module: &str,
     version: &str,
 ) -> Result<()> {
@@ -68,6 +69,7 @@ pub async fn register_module(
             address: engine_addr.into(),
             modules: vec![ModuleDescriptor {
                 name: module.into(),
+                namespace: namespace.into(),
                 version: version.into(),
                 proto_schema: vec![],
             }],
@@ -75,9 +77,11 @@ pub async fn register_module(
     })
     .await?;
     c.upsert_routing_rule(RoutingRule {
-        rule_id: format!("{engine_id}-{module}-{version}"),
+        rule_id: format!("{engine_id}-{namespace}-{module}-{version}"),
         source_module: String::new(),
+        source_namespace: String::new(),
         destination_module: module.into(),
+        destination_namespace: namespace.into(),
         destination_version: version.into(),
         engine_id: engine_id.into(),
         engine_address: engine_addr.into(),
@@ -129,10 +133,11 @@ pub async fn start_proxy_with_schema(
     Ok(addr)
 }
 
-/// Send a GET request through the proxy to `destination_module`, optionally
-/// pinning a version via `x-wr-version`.  Returns `(status, body_string)`.
+/// Send a GET request through the proxy to `destination_module` in `namespace`,
+/// optionally pinning a version via `x-wr-version`.  Returns `(status, body_string)`.
 pub async fn proxy_get(
     proxy_addr: SocketAddr,
+    namespace: &str,
     destination_module: &str,
     version: Option<&str>,
 ) -> Result<(StatusCode, String)> {
@@ -140,7 +145,7 @@ pub async fn proxy_get(
         .uri(format!("http://{proxy_addr}/test"))
         .header(
             "x-wr-destination",
-            format!("http://{destination_module}/test"),
+            format!("http://{destination_module}.{namespace}/test"),
         )
         .header("x-wr-source", "test-caller");
     if let Some(v) = version {
@@ -373,6 +378,7 @@ pub fn db_state(pool_size: usize) -> Option<ModuleState> {
     let pool = Arc::new(wr_engine::pool::build_pool(&url, pool_size).expect("build_pool"));
     Some(ModuleState::new(
         "test".into(),
+        "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
         Some(pool),
     ))

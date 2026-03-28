@@ -12,12 +12,12 @@ pub struct ManagerState {
     pub engines: HashMap<String, EngineRegistration>,
     /// Last heartbeat timestamp per engine_id
     pub heartbeats: HashMap<String, Instant>,
-    /// Last healthy-heartbeat timestamp per (engine_id, module_name, version)
-    pub module_health: HashMap<(String, String, String), Instant>,
+    /// Last healthy-heartbeat timestamp per (engine_id, namespace, module_name, version)
+    pub module_health: HashMap<(String, String, String, String), Instant>,
     /// Versioned routing table; version is incremented on every write
     pub routing_table: RoutingTable,
-    /// Module schemas: (module_name, version) -> FileDescriptorSet bytes
-    pub schemas: HashMap<(String, String), Vec<u8>>,
+    /// Module schemas: (namespace, module_name, version) -> FileDescriptorSet bytes
+    pub schemas: HashMap<(String, String, String), Vec<u8>>,
     /// Rolling buffer of request metrics reported by proxies
     pub metrics: VecDeque<RequestMetrics>,
 }
@@ -79,6 +79,7 @@ pub async fn monitor_heartbeats(state: SharedState, timeout_secs: u64) {
             .map(|(i, rule)| {
                 let key = (
                     rule.engine_id.clone(),
+                    rule.destination_namespace.clone(),
                     rule.destination_module.clone(),
                     rule.destination_version.clone(),
                 );

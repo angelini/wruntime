@@ -16,6 +16,7 @@ pub struct ModuleState {
     http: WasiHttpCtx,
     table: ResourceTable,
     module_name: String,
+    module_namespace: String,
     /// Pre-parsed proxy URI so we don't re-parse on every request.
     proxy_uri: hyper::Uri,
     /// Shared connection pool, present when the module has DB access enabled.
@@ -23,12 +24,18 @@ pub struct ModuleState {
 }
 
 impl ModuleState {
-    pub fn new(module_name: String, proxy_uri: hyper::Uri, db_pool: Option<Arc<Pool>>) -> Self {
+    pub fn new(
+        module_name: String,
+        module_namespace: String,
+        proxy_uri: hyper::Uri,
+        db_pool: Option<Arc<Pool>>,
+    ) -> Self {
         Self {
             wasi: WasiCtxBuilder::new().inherit_stdio().build(),
             http: WasiHttpCtx::new(),
             table: ResourceTable::new(),
             module_name,
+            module_namespace,
             proxy_uri,
             db_pool,
         }
@@ -72,6 +79,11 @@ impl WasiHttpView for ModuleState {
         request.headers_mut().insert(
             HeaderName::from_static("x-wr-source"),
             HeaderValue::from_str(&self.module_name).map_err(|_| ErrorCode::InternalError(None))?,
+        );
+        request.headers_mut().insert(
+            HeaderName::from_static("x-wr-source-ns"),
+            HeaderValue::from_str(&self.module_namespace)
+                .map_err(|_| ErrorCode::InternalError(None))?,
         );
 
         // Preserve the original path+query; only replace scheme and authority.

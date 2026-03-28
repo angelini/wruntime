@@ -64,10 +64,16 @@ where
                 .to_string();
 
             if let Ok(dest_uri) = destination.parse::<http::Uri>() {
-                let module = dest_uri.host().unwrap_or("").to_string();
+                let host = dest_uri.host().unwrap_or("");
                 let path = dest_uri.path().to_string();
 
-                if let Some(detail) = cache.validate(&module, &path, req.body().as_ref()).await {
+                // host format is "{service}.{namespace}"
+                let (module, namespace) = host
+                    .split_once('.')
+                    .map(|(s, n)| (s.to_string(), n.to_string()))
+                    .unwrap_or_else(|| (host.to_string(), String::new()));
+
+                if let Some(detail) = cache.validate(&namespace, &module, &path, req.body().as_ref()).await {
                     let source = req
                         .headers()
                         .get("x-wr-source")

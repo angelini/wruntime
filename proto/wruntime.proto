@@ -7,6 +7,7 @@ message ModuleDescriptor {
   string name         = 1;
   string version      = 2;
   bytes  proto_schema = 3; // serialised FileDescriptorSet for this module's API
+  string namespace    = 4; // mandatory — e.g. "payments"
 }
 
 message EngineRegistration {
@@ -16,13 +17,15 @@ message EngineRegistration {
 }
 
 message RoutingRule {
-  string rule_id              = 1;
-  string source_module        = 2;
-  string destination_module   = 3;
-  string engine_id            = 4;
-  string engine_address       = 5;
-  string destination_version  = 6; // semver string, e.g. "1.2.0"
-  bool   healthy              = 7; // set by manager; false means no traffic
+  string rule_id                   = 1;
+  string source_module             = 2;
+  string destination_module        = 3;
+  string engine_id                 = 4;
+  string engine_address            = 5;
+  string destination_version       = 6; // semver string, e.g. "1.2.0"
+  bool   healthy                   = 7; // set by manager; false means no traffic
+  string source_namespace          = 8;
+  string destination_namespace     = 9;
 }
 
 message RoutingTable {
@@ -62,9 +65,9 @@ message DeleteRoutingRuleResponse {}
 
 // ── Schemas ───────────────────────────────────────────────────────────────
 
-message GetSchemaRequest    { string module = 1; string version = 2; }
+message GetSchemaRequest    { string module = 1; string version = 2; string namespace = 3; }
 message GetSchemaResponse   { bytes proto_schema = 1; }
-message UploadSchemaRequest { string module = 1; string version = 2; bytes proto_schema = 3; }
+message UploadSchemaRequest { string module = 1; string version = 2; bytes proto_schema = 3; string namespace = 4; }
 message UploadSchemaResponse{}
 
 // ── Metrics ───────────────────────────────────────────────────────────────

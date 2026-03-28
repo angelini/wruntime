@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_default();
             ModuleDescriptor {
                 name: m.name.clone(),
+                namespace: m.namespace.clone(),
                 version: m.version.clone(),
                 proto_schema,
             }
@@ -86,6 +87,7 @@ async fn main() -> Result<()> {
             .iter()
             .map(|m| ModuleDescriptor {
                 name: m.name.clone(),
+                namespace: m.namespace.clone(),
                 version: m.version.clone(),
                 proto_schema: vec![],
             })

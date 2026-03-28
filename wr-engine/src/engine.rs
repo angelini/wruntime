@@ -67,6 +67,7 @@ impl EngineRunner {
         let component = Component::from_file(&self.engine, &module_config.wasm_path)?;
         let proxy_uri: hyper::Uri = self.config.proxy_address.parse()?;
         let module_name = module_config.name.clone();
+        let module_namespace = module_config.namespace.clone();
         let module_version = module_config.version.clone();
 
         let mut linker: Linker<ModuleState> = Linker::new(&self.engine);
@@ -84,7 +85,7 @@ impl EngineRunner {
                 let pre = Arc::new(pre);
                 let (tx, rx) = mpsc::channel::<InboundRequest>(32);
                 registry
-                    .register(module_name.clone(), module_version.clone(), tx)
+                    .register(module_namespace.clone(), module_name.clone(), module_version.clone(), tx)
                     .await;
 
                 let engine = self.engine.clone();
@@ -98,6 +99,7 @@ impl EngineRunner {
                     pre,
                     proxy_uri,
                     module_name.clone(),
+                    module_namespace.clone(),
                     db_pool,
                     rx,
                 ));
@@ -109,7 +111,7 @@ impl EngineRunner {
                 } else {
                     None
                 };
-                let state = ModuleState::new(module_name.clone(), proxy_uri, db_pool);
+                let state = ModuleState::new(module_name.clone(), module_namespace.clone(), proxy_uri, db_pool);
                 let mut store = Store::new(&self.engine, state);
                 let instance = linker.instantiate_async(&mut store, &component).await?;
 
@@ -143,6 +145,7 @@ async fn http_handler_task(
     pre: Arc<ProxyPre<ModuleState>>,
     proxy_uri: hyper::Uri,
     module_name: String,
+    module_namespace: String,
     db_pool: Option<Arc<Pool>>,
     mut rx: mpsc::Receiver<InboundRequest>,
 ) {
@@ -151,11 +154,12 @@ async fn http_handler_task(
         let pre = pre.clone();
         let proxy_uri = proxy_uri.clone();
         let module_name = module_name.clone();
+        let module_namespace = module_namespace.clone();
         let db_pool = db_pool.clone();
 
         tokio::spawn(async move {
             if let Err(e) =
-                dispatch_request(&engine, &pre, proxy_uri, &module_name, db_pool, inbound).await
+                dispatch_request(&engine, &pre, proxy_uri, &module_name, &module_namespace, db_pool, inbound).await
             {
                 warn!(module = %module_name, error = %e, "inbound request error");
             }
@@ -170,10 +174,11 @@ async fn dispatch_request(
     pre: &ProxyPre<ModuleState>,
     proxy_uri: hyper::Uri,
     module_name: &str,
+    module_namespace: &str,
     db_pool: Option<Arc<Pool>>,
     inbound: InboundRequest,
 ) -> Result<()> {
-    let state = ModuleState::new(module_name.to_string(), proxy_uri, db_pool);
+    let state = ModuleState::new(module_name.to_string(), module_namespace.to_string(), proxy_uri, db_pool);
     let mut store = Store::new(engine, state);
     let proxy = pre.instantiate_async(&mut store).await?;
 

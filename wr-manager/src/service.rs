@@ -48,11 +48,17 @@ impl ManagerService for Manager {
         let engine_id = reg.engine_id.clone();
         let mut state = self.state.write().await;
 
-        // Store the FileDescriptorSet bytes from each module's descriptor
+        // Validate and store the FileDescriptorSet bytes from each module's descriptor
         for module in &reg.modules {
+            if module.namespace.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "module '{}' is missing a namespace",
+                    module.name
+                )));
+            }
             if !module.proto_schema.is_empty() {
                 state.schemas.insert(
-                    (module.name.clone(), module.version.clone()),
+                    (module.namespace.clone(), module.name.clone(), module.version.clone()),
                     module.proto_schema.clone(),
                 );
             }
@@ -64,6 +70,7 @@ impl ManagerService for Manager {
             state.module_health.insert(
                 (
                     engine_id.clone(),
+                    module.namespace.clone(),
                     module.name.clone(),
                     module.version.clone(),
                 ),
@@ -89,7 +96,7 @@ impl ManagerService for Manager {
         state.heartbeats.remove(&engine_id);
         state
             .module_health
-            .retain(|(eid, _, _), _| eid != &engine_id);
+            .retain(|(eid, _, _, _), _| eid != &engine_id);
 
         // Mark all routing rules for this engine as unhealthy so proxies
         // stop sending traffic before the next routing table sync.
@@ -123,6 +130,7 @@ impl ManagerService for Manager {
             state.module_health.insert(
                 (
                     engine_id.clone(),
+                    module.namespace.clone(),
                     module.name.clone(),
                     module.version.clone(),
                 ),
@@ -175,11 +183,13 @@ impl ManagerService for Manager {
             }
             None => {
                 info!(
-                    rule_id          = %rule.rule_id,
-                    source           = %rule.source_module,
-                    destination      = %rule.destination_module,
-                    version          = %rule.destination_version,
-                    engine_id        = %rule.engine_id,
+                    rule_id              = %rule.rule_id,
+                    source               = %rule.source_module,
+                    source_namespace     = %rule.source_namespace,
+                    destination          = %rule.destination_module,
+                    destination_namespace = %rule.destination_namespace,
+                    version              = %rule.destination_version,
+                    engine_id            = %rule.engine_id,
                     "routing rule added",
                 );
                 rules.push(rule);
@@ -217,12 +227,19 @@ impl ManagerService for Manager {
         let req = request.into_inner();
         let state = self.state.read().await;
 
+        if req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+
         let schema = state
             .schemas
-            .get(&(req.module.clone(), req.version.clone()))
+            .get(&(req.namespace.clone(), req.module.clone(), req.version.clone()))
             .cloned()
             .ok_or_else(|| {
-                Status::not_found(format!("no schema for {}/{}", req.module, req.version))
+                Status::not_found(format!(
+                    "no schema for {}/{}/{}",
+                    req.namespace, req.module, req.version
+                ))
             })?;
 
         Ok(Response::new(GetSchemaResponse {
@@ -236,17 +253,17 @@ impl ManagerService for Manager {
     ) -> Result<Response<UploadSchemaResponse>, Status> {
         let req = request.into_inner();
 
-        if req.module.is_empty() || req.version.is_empty() {
-            return Err(Status::invalid_argument("module and version are required"));
+        if req.module.is_empty() || req.version.is_empty() || req.namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace, module, and version are required"));
         }
 
         self.state
             .write()
             .await
             .schemas
-            .insert((req.module.clone(), req.version.clone()), req.proto_schema);
+            .insert((req.namespace.clone(), req.module.clone(), req.version.clone()), req.proto_schema);
 
-        info!(module = %req.module, version = %req.version, "schema stored");
+        info!(namespace = %req.namespace, module = %req.module, version = %req.version, "schema stored");
         Ok(Response::new(UploadSchemaResponse {}))
     }
 

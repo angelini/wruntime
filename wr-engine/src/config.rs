@@ -31,6 +31,7 @@ fn default_max_connections() -> usize {
 #[derive(Deserialize, Clone)]
 pub struct ModuleConfig {
     pub name: String,
+    pub namespace: String,
     pub version: String,
     pub wasm_path: String,
     /// Path to a compiled `FileDescriptorSet` binary for this module's API.
@@ -66,6 +67,7 @@ impl EngineConfig {
 
         for module in &self.modules {
             anyhow::ensure!(!module.name.is_empty(), "module.name is required");
+            anyhow::ensure!(!module.namespace.is_empty(), "module.namespace is required");
             anyhow::ensure!(!module.version.is_empty(), "module.version is required");
             anyhow::ensure!(
                 std::path::Path::new(&module.wasm_path).exists(),

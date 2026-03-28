@@ -40,8 +40,18 @@ async fn handle(
     req: Request<hyper::body::Incoming>,
     registry: ModuleRegistry,
 ) -> Response<Full<Bytes>> {
-    // The proxy injects x-wr-module and x-wr-version so we know which
-    // module instance to dispatch to.
+    // The proxy injects x-wr-namespace, x-wr-module, and x-wr-version so we
+    // know which module instance to dispatch to.
+    let namespace = match req
+        .headers()
+        .get("x-wr-namespace")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+    {
+        Some(n) => n,
+        None => return err(StatusCode::BAD_REQUEST, "missing x-wr-namespace header"),
+    };
+
     let module = match req
         .headers()
         .get("x-wr-module")
@@ -72,12 +82,12 @@ async fn handle(
         }
     };
 
-    let sender = match registry.next_sender(&module, &version).await {
+    let sender = match registry.next_sender(&namespace, &module, &version).await {
         Some(s) => s,
         None => {
             return err(
                 StatusCode::NOT_FOUND,
-                &format!("module '{module}@{version}' not loaded"),
+                &format!("module '{namespace}.{module}@{version}' not loaded"),
             )
         }
     };

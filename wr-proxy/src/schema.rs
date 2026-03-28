@@ -12,10 +12,10 @@ use wr_common::wruntime::{
 
 use crate::routing::CachedRoutingTable;
 
-/// Caches a `DescriptorPool` per module name, built from the `FileDescriptorSet`
-/// bytes registered by each engine on startup.
+/// Caches a `DescriptorPool` per (namespace, module) pair, built from the
+/// `FileDescriptorSet` bytes registered by each engine on startup.
 pub struct SchemaCache {
-    pools: RwLock<HashMap<String, DescriptorPool>>,
+    pools: RwLock<HashMap<(String, String), DescriptorPool>>,
 }
 
 impl SchemaCache {
@@ -33,20 +33,23 @@ impl Default for SchemaCache {
 }
 
 impl SchemaCache {
-    /// Store a compiled schema for `module`. `schema_bytes` must be a
-    /// serialised `FileDescriptorSet` as produced by protoc
+    /// Store a compiled schema for `(namespace, module)`. `schema_bytes` must
+    /// be a serialised `FileDescriptorSet` as produced by protoc
     /// (`--descriptor_set_out`).
-    pub async fn insert(&self, module: &str, schema_bytes: &[u8]) -> anyhow::Result<()> {
+    pub async fn insert(&self, namespace: &str, module: &str, schema_bytes: &[u8]) -> anyhow::Result<()> {
         if schema_bytes.is_empty() {
             return Ok(());
         }
         let pool = DescriptorPool::decode(schema_bytes)
-            .map_err(|e| anyhow::anyhow!("bad FileDescriptorSet for {module}: {e}"))?;
-        self.pools.write().await.insert(module.to_string(), pool);
+            .map_err(|e| anyhow::anyhow!("bad FileDescriptorSet for {namespace}.{module}: {e}"))?;
+        self.pools
+            .write()
+            .await
+            .insert((namespace.to_string(), module.to_string()), pool);
         Ok(())
     }
 
-    /// Validate `body` against the protobuf schema registered for `module`.
+    /// Validate `body` against the protobuf schema registered for `(namespace, module)`.
     ///
     /// `path` should be a gRPC-style method path, e.g.
     /// `/inventory.InventoryService/GetItems`, used to resolve the expected
@@ -54,19 +57,19 @@ impl SchemaCache {
     ///
     /// Returns `Some(error_message)` if validation fails. Returns `None` when
     /// the body is valid, the schema is absent, or the path cannot be resolved.
-    pub async fn validate(&self, module: &str, path: &str, body: &[u8]) -> Option<String> {
+    pub async fn validate(&self, namespace: &str, module: &str, path: &str, body: &[u8]) -> Option<String> {
         if body.is_empty() {
             return None;
         }
 
         let pools = self.pools.read().await;
-        let pool = pools.get(module)?;
+        let pool = pools.get(&(namespace.to_string(), module.to_string()))?;
 
         let message_desc = resolve_input_message(pool, path)?;
 
         match DynamicMessage::decode(message_desc, body) {
             Ok(_) => None,
-            Err(e) => Some(format!("schema validation failed for {module}{path}: {e}")),
+            Err(e) => Some(format!("schema validation failed for {namespace}.{module}{path}: {e}")),
         }
     }
 }
@@ -95,15 +98,22 @@ pub async fn sync_schemas(
         for engine in engines {
             for module_desc in engine.modules {
                 let module = &module_desc.name;
+                let namespace = &module_desc.namespace;
                 let version = &module_desc.version;
 
                 // Skip if already cached.
-                if cache.pools.read().await.contains_key(module.as_str()) {
+                if cache
+                    .pools
+                    .read()
+                    .await
+                    .contains_key(&(namespace.clone(), module.clone()))
+                {
                     continue;
                 }
 
                 match client
                     .get_schema(GetSchemaRequest {
+                        namespace: namespace.clone(),
                         module: module.clone(),
                         version: version.clone(),
                     })
@@ -111,15 +121,15 @@ pub async fn sync_schemas(
                 {
                     Ok(resp) => {
                         let bytes = resp.into_inner().proto_schema;
-                        if let Err(e) = cache.insert(module, &bytes).await {
-                            warn!(module, version, error = %e, "schema decode error");
+                        if let Err(e) = cache.insert(namespace, module, &bytes).await {
+                            warn!(namespace, module, version, error = %e, "schema decode error");
                         } else {
-                            info!(module, version, "schema cached");
+                            info!(namespace, module, version, "schema cached");
                         }
                     }
                     Err(e) if e.code() == tonic::Code::NotFound => {}
                     Err(e) => {
-                        warn!(module, version, error = %e, "schema fetch error");
+                        warn!(namespace, module, version, error = %e, "schema fetch error");
                     }
                 }
             }
