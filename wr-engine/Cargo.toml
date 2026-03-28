@@ -20,3 +20,5 @@ toml               = "0.8"
 serde              = { version = "1", features = ["derive"] }
 uuid               = { version = "1", features = ["v4"] }
 wr-common          = { path = "../wr-common" }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

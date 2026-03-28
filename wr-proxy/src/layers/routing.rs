@@ -8,11 +8,11 @@ use bytes::Bytes;
 use http::{Request, StatusCode};
 use tower::{Layer, Service};
 
-use super::{ResBody, ResolvedDestination, error_response};
+use super::{error_response, ResBody, ResolvedDestination};
 use crate::routing::CachedRoutingTable;
 
 pub struct RoutingLayer {
-    table:    CachedRoutingTable,
+    table: CachedRoutingTable,
     /// Monotonic counters per (module, version) for round-robin selection.
     counters: Arc<Mutex<HashMap<(String, String), usize>>>,
 }
@@ -31,7 +31,7 @@ impl<S> Layer<S> for RoutingLayer {
     fn layer(&self, inner: S) -> Self::Service {
         RoutingService {
             inner,
-            table:    self.table.clone(),
+            table: self.table.clone(),
             counters: self.counters.clone(),
         }
     }
@@ -39,30 +39,27 @@ impl<S> Layer<S> for RoutingLayer {
 
 #[derive(Clone)]
 pub struct RoutingService<S> {
-    inner:    S,
-    table:    CachedRoutingTable,
+    inner: S,
+    table: CachedRoutingTable,
     counters: Arc<Mutex<HashMap<(String, String), usize>>>,
 }
 
 impl<S> Service<Request<Bytes>> for RoutingService<S>
 where
-    S: Service<Request<Bytes>, Response = http::Response<ResBody>>
-        + Clone
-        + Send
-        + 'static,
+    S: Service<Request<Bytes>, Response = http::Response<ResBody>> + Clone + Send + 'static,
     S::Error: Send + 'static,
     S::Future: Send + 'static,
 {
     type Response = http::Response<ResBody>;
-    type Error    = S::Error;
-    type Future   = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, mut req: Request<Bytes>) -> Self::Future {
-        let table    = self.table.clone();
+        let table = self.table.clone();
         let counters = self.counters.clone();
         let mut inner = self.inner.clone();
 
@@ -91,21 +88,24 @@ where
             // Multiple rules for the same (module, version) are all candidates.
             let (resolved_version, candidate_addrs) = {
                 let t = table.read().await;
-                let healthy: Vec<_> = t.rules
+                let healthy: Vec<_> = t
+                    .rules
                     .iter()
                     .filter(|r| r.destination_module == module_name && r.healthy)
                     .collect();
 
                 if let Some(ref version) = requested_version {
                     // Exact version match across all healthy rules
-                    let addrs: Vec<String> = healthy.iter()
+                    let addrs: Vec<String> = healthy
+                        .iter()
                         .filter(|r| r.destination_version == *version)
                         .map(|r| r.engine_address.clone())
                         .collect();
                     (version.clone(), addrs)
                 } else {
                     // Find highest semver, then collect all rules at that version
-                    let best = healthy.iter()
+                    let best = healthy
+                        .iter()
                         .max_by(|a, b| {
                             let va = semver::Version::parse(&a.destination_version);
                             let vb = semver::Version::parse(&b.destination_version);
@@ -120,7 +120,8 @@ where
 
                     match best {
                         Some(ver) => {
-                            let addrs: Vec<String> = healthy.iter()
+                            let addrs: Vec<String> = healthy
+                                .iter()
                                 .filter(|r| r.destination_version == ver)
                                 .map(|r| r.engine_address.clone())
                                 .collect();
@@ -134,7 +135,7 @@ where
             if candidate_addrs.is_empty() {
                 let msg = match requested_version {
                     Some(v) => format!("no route for module '{module_name}' version '{v}'"),
-                    None    => format!("no route for module '{module_name}'"),
+                    None => format!("no route for module '{module_name}'"),
                 };
                 return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE, &msg));
             }

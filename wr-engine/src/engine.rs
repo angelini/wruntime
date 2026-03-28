@@ -1,19 +1,20 @@
 use anyhow::Result;
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use wasmtime::{Config, Engine};
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 use wasmtime::component::{Component, Linker};
 use wasmtime::Store;
+use wasmtime::{Config, Engine};
 use wasmtime_wasi_http::{
-    WasiHttpView,
-    bindings::ProxyPre,
     bindings::http::types::{ErrorCode, Scheme},
+    bindings::ProxyPre,
     body::{HostIncomingBody, HyperIncomingBody, HyperOutgoingBody},
     types::{HostIncomingRequest, HostResponseOutparam},
+    WasiHttpView,
 };
-use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
-use std::convert::Infallible;
-use tokio::sync::mpsc;
 
 use crate::config::{EngineConfig, ModuleConfig};
 use crate::registry::{InboundRequest, ModuleRegistry};
@@ -30,7 +31,10 @@ impl EngineRunner {
         wt_config.async_support(true);
         wt_config.wasm_component_model(true);
         let engine = Engine::new(&wt_config)?;
-        Ok(Self { engine: Arc::new(engine), config })
+        Ok(Self {
+            engine: Arc::new(engine),
+            config,
+        })
     }
 
     /// Load and spawn a task for every module listed in the config, registering
@@ -47,11 +51,11 @@ impl EngineRunner {
         module_config: &ModuleConfig,
         registry: &ModuleRegistry,
     ) -> Result<()> {
-        println!("[engine] loading {}", module_config.name);
+        info!(module = %module_config.name, "loading module");
 
-        let component      = Component::from_file(&self.engine, &module_config.wasm_path)?;
+        let component = Component::from_file(&self.engine, &module_config.wasm_path)?;
         let proxy_uri: hyper::Uri = self.config.proxy_address.parse()?;
-        let module_name    = module_config.name.clone();
+        let module_name = module_config.name.clone();
         let module_version = module_config.version.clone();
 
         let mut linker: Linker<ModuleState> = Linker::new(&self.engine);
@@ -64,7 +68,9 @@ impl EngineRunner {
             Ok(pre) => {
                 let pre = Arc::new(pre);
                 let (tx, rx) = mpsc::channel::<InboundRequest>(32);
-                registry.register(module_name.clone(), module_version.clone(), tx).await;
+                registry
+                    .register(module_name.clone(), module_version.clone(), tx)
+                    .await;
 
                 let engine = self.engine.clone();
                 tokio::spawn(http_handler_task(
@@ -77,7 +83,7 @@ impl EngineRunner {
             }
             Err(_) => {
                 // Fall back: spawn as a long-running task that calls `run`.
-                let state    = ModuleState::new(module_name.clone(), proxy_uri);
+                let state = ModuleState::new(module_name.clone(), proxy_uri);
                 let mut store = Store::new(&self.engine, state);
                 let instance = linker.instantiate_async(&mut store, &component).await?;
 
@@ -85,13 +91,13 @@ impl EngineRunner {
                     match instance.get_func(&mut store, "run") {
                         Some(func) => {
                             if let Err(e) = func.call_async(&mut store, &[], &mut []).await {
-                                eprintln!("[{module_name}] exited with error: {e}");
+                                error!(module = %module_name, error = %e, "module exited with error");
                             } else {
-                                println!("[{module_name}] exited cleanly");
+                                info!(module = %module_name, "module exited cleanly");
                             }
                         }
                         None => {
-                            println!("[{module_name}] no `run` export, module is idle");
+                            info!(module = %module_name, "no `run` export, module is idle");
                             std::future::pending::<()>().await;
                         }
                     }
@@ -99,7 +105,7 @@ impl EngineRunner {
             }
         }
 
-        println!("[engine] spawned {}", module_config.name);
+        info!(module = %module_config.name, "module spawned");
         Ok(())
     }
 }
@@ -114,16 +120,15 @@ async fn http_handler_task(
     mut rx: mpsc::Receiver<InboundRequest>,
 ) {
     while let Some(inbound) = rx.recv().await {
-        let engine      = engine.clone();
-        let pre         = pre.clone();
-        let proxy_uri   = proxy_uri.clone();
+        let engine = engine.clone();
+        let pre = pre.clone();
+        let proxy_uri = proxy_uri.clone();
         let module_name = module_name.clone();
 
         tokio::spawn(async move {
-            if let Err(e) =
-                dispatch_request(&engine, &pre, proxy_uri, &module_name, inbound).await
+            if let Err(e) = dispatch_request(&engine, &pre, proxy_uri, &module_name, inbound).await
             {
-                eprintln!("[{module_name}] inbound request error: {e}");
+                warn!(module = %module_name, error = %e, "inbound request error");
             }
         });
     }
@@ -138,9 +143,9 @@ async fn dispatch_request(
     module_name: &str,
     inbound: InboundRequest,
 ) -> Result<()> {
-    let state     = ModuleState::new(module_name.to_string(), proxy_uri);
+    let state = ModuleState::new(module_name.to_string(), proxy_uri);
     let mut store = Store::new(engine, state);
-    let proxy     = pre.instantiate_async(&mut store).await?;
+    let proxy = pre.instantiate_async(&mut store).await?;
 
     // ── Build the incoming request resource ──────────────────────────────
     let (req_parts, req_body) = inbound.request.into_parts();
@@ -148,8 +153,7 @@ async fn dispatch_request(
     // Wrap the buffered Bytes as a HyperIncomingBody
     // (UnsyncBoxBody<Bytes, ErrorCode>).
     let hyper_body: HyperIncomingBody = UnsyncBoxBody::new(
-        Full::new(req_body)
-            .map_err(|_: Infallible| ErrorCode::InternalError(None)),
+        Full::new(req_body).map_err(|_: Infallible| ErrorCode::InternalError(None)),
     );
     let host_body = HostIncomingBody::new(
         hyper_body,
@@ -170,8 +174,10 @@ async fn dispatch_request(
     // ── Build the response outparam resource ─────────────────────────────
     let (resp_tx, resp_rx) =
         tokio::sync::oneshot::channel::<Result<hyper::Response<HyperOutgoingBody>, ErrorCode>>();
-    let out_resource =
-        store.data_mut().table().push(HostResponseOutparam { result: resp_tx })?;
+    let out_resource = store
+        .data_mut()
+        .table()
+        .push(HostResponseOutparam { result: resp_tx })?;
 
     // ── Call the WASM incoming handler ───────────────────────────────────
     proxy
@@ -188,10 +194,12 @@ async fn dispatch_request(
                 .await
                 .map_err(|e| anyhow::anyhow!("collecting WASM response body: {e:?}"))?
                 .to_bytes();
-            let _ = inbound.response_tx.send(http::Response::from_parts(rp, bytes));
+            let _ = inbound
+                .response_tx
+                .send(http::Response::from_parts(rp, bytes));
         }
         Ok(Err(e)) => anyhow::bail!("WASM handler returned ErrorCode: {e:?}"),
-        Err(_)     => anyhow::bail!("WASM handler dropped the response outparam"),
+        Err(_) => anyhow::bail!("WASM handler dropped the response outparam"),
     }
 
     Ok(())

@@ -7,7 +7,7 @@ use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use tower::{Layer, Service};
 
-use super::{ResBody, full_body};
+use super::{full_body, ResBody};
 use crate::schema::SchemaCache;
 
 pub struct SchemaValidationLayer {
@@ -23,7 +23,10 @@ impl SchemaValidationLayer {
 impl<S> Layer<S> for SchemaValidationLayer {
     type Service = SchemaValidationService<S>;
     fn layer(&self, inner: S) -> Self::Service {
-        SchemaValidationService { inner, cache: self.cache.clone() }
+        SchemaValidationService {
+            inner,
+            cache: self.cache.clone(),
+        }
     }
 }
 
@@ -35,23 +38,20 @@ pub struct SchemaValidationService<S> {
 
 impl<S> Service<Request<Bytes>> for SchemaValidationService<S>
 where
-    S: Service<Request<Bytes>, Response = http::Response<ResBody>>
-        + Clone
-        + Send
-        + 'static,
+    S: Service<Request<Bytes>, Response = http::Response<ResBody>> + Clone + Send + 'static,
     S::Error: Send + 'static,
     S::Future: Send + 'static,
 {
     type Response = http::Response<ResBody>;
-    type Error    = S::Error;
-    type Future   = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, req: Request<Bytes>) -> Self::Future {
-        let cache     = self.cache.clone();
+        let cache = self.cache.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -65,11 +65,9 @@ where
 
             if let Ok(dest_uri) = destination.parse::<http::Uri>() {
                 let module = dest_uri.host().unwrap_or("").to_string();
-                let path   = dest_uri.path().to_string();
+                let path = dest_uri.path().to_string();
 
-                if let Some(detail) =
-                    cache.validate(&module, &path, req.body().as_ref()).await
-                {
+                if let Some(detail) = cache.validate(&module, &path, req.body().as_ref()).await {
                     let source = req
                         .headers()
                         .get("x-wr-source")

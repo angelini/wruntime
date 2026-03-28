@@ -6,12 +6,12 @@ mod state;
 
 use anyhow::Result;
 use std::time::Duration;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use wr_common::wruntime::{
-    manager_service_client::ManagerServiceClient,
-    DeregisterEngineRequest, EngineRegistration, HeartbeatRequest,
-    ModuleDescriptor, RegisterEngineRequest,
+    manager_service_client::ManagerServiceClient, DeregisterEngineRequest, EngineRegistration,
+    HeartbeatRequest, ModuleDescriptor, RegisterEngineRequest,
 };
 
 #[tokio::main]
@@ -20,30 +20,31 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "engine.toml".to_string());
 
-    let config    = config::EngineConfig::load(&config_path)?;
+    tracing_subscriber::fmt::init();
+
+    let config = config::EngineConfig::load(&config_path)?;
     let engine_id = Uuid::new_v4().to_string();
-    println!("[engine] starting  id={engine_id}");
+    info!(engine_id, "engine starting");
 
     // ── Load WASM modules ─────────────────────────────────────────────────
     let registry = registry::ModuleRegistry::new();
-    let runner   = engine::EngineRunner::new(config.clone())?;
+    let runner = engine::EngineRunner::new(config.clone())?;
     runner.load_modules(&registry).await?;
-    println!("[engine] all modules loaded");
+    info!("all modules loaded");
 
     // ── Start inbound HTTP server ─────────────────────────────────────────
     {
-        let reg  = registry.clone();
+        let reg = registry.clone();
         let addr = config.listen_address.clone();
         tokio::spawn(async move {
             if let Err(e) = server::serve(&addr, reg).await {
-                eprintln!("[engine] inbound server error: {e}");
+                error!(error = %e, "inbound server error");
             }
         });
     }
 
     // ── Connect to wr-manager ─────────────────────────────────────────────
-    let mut client =
-        ManagerServiceClient::connect(config.manager_address.clone()).await?;
+    let mut client = ManagerServiceClient::connect(config.manager_address.clone()).await?;
 
     // Build module descriptors, loading schema files where available.
     let module_descriptors: Vec<ModuleDescriptor> = config
@@ -68,23 +69,27 @@ async fn main() -> Result<()> {
     client
         .register_engine(RegisterEngineRequest {
             registration: Some(EngineRegistration {
-                engine_id:      engine_id.clone(),
-                address:        config.listen_address.clone(),
-                modules:        module_descriptors,
+                engine_id: engine_id.clone(),
+                address: config.listen_address.clone(),
+                modules: module_descriptors,
             }),
         })
         .await?;
-    println!("[engine] registered with manager at {}", config.manager_address);
+    info!(address = %config.manager_address, engine_id, "registered with manager");
 
     // ── Heartbeat background task ─────────────────────────────────────────
     {
         let mut hb_client = client.clone();
-        let hb_id         = engine_id.clone();
-        let hb_modules: Vec<ModuleDescriptor> = config.modules.iter().map(|m| ModuleDescriptor {
-            name:         m.name.clone(),
-            version:      m.version.clone(),
-            proto_schema: vec![],
-        }).collect();
+        let hb_id = engine_id.clone();
+        let hb_modules: Vec<ModuleDescriptor> = config
+            .modules
+            .iter()
+            .map(|m| ModuleDescriptor {
+                name: m.name.clone(),
+                version: m.version.clone(),
+                proto_schema: vec![],
+            })
+            .collect();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -92,31 +97,33 @@ async fn main() -> Result<()> {
                 interval.tick().await;
                 if let Err(e) = hb_client
                     .heartbeat(HeartbeatRequest {
-                        engine_id:       hb_id.clone(),
+                        engine_id: hb_id.clone(),
                         healthy_modules: hb_modules.clone(),
                     })
                     .await
                 {
-                    eprintln!("[engine] heartbeat failed: {e}");
+                    warn!(error = %e, "heartbeat failed");
                 }
             }
         });
     }
 
-    println!("[engine] running — press Ctrl+C to stop");
+    info!("engine running — press Ctrl+C to stop");
 
     // ── Wait for shutdown signal ──────────────────────────────────────────
     tokio::signal::ctrl_c().await?;
-    println!("[engine] shutting down");
+    info!("engine shutting down");
 
     // ── Deregister ────────────────────────────────────────────────────────
     if let Err(e) = client
-        .deregister_engine(DeregisterEngineRequest { engine_id: engine_id.clone() })
+        .deregister_engine(DeregisterEngineRequest {
+            engine_id: engine_id.clone(),
+        })
         .await
     {
-        eprintln!("[engine] deregister failed (manager may be down): {e}");
+        warn!(error = %e, "deregister failed (manager may be down)");
     } else {
-        println!("[engine] deregistered");
+        info!(engine_id, "engine deregistered");
     }
 
     Ok(())

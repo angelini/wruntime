@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 /// A single inbound HTTP request dispatched from the engine's inbound server
 /// to a WASM module task.
 pub struct InboundRequest {
-    pub request:     http::Request<Bytes>,
+    pub request: http::Request<Bytes>,
     pub response_tx: oneshot::Sender<http::Response<Bytes>>,
 }
 

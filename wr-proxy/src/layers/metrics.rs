@@ -24,28 +24,28 @@ impl MetricsLayer {
 impl<S> Layer<S> for MetricsLayer {
     type Service = MetricsService<S>;
     fn layer(&self, inner: S) -> Self::Service {
-        MetricsService { inner, tx: self.tx.clone() }
+        MetricsService {
+            inner,
+            tx: self.tx.clone(),
+        }
     }
 }
 
 #[derive(Clone)]
 pub struct MetricsService<S> {
     inner: S,
-    tx:    mpsc::Sender<RequestMetrics>,
+    tx: mpsc::Sender<RequestMetrics>,
 }
 
 impl<S> Service<Request<Bytes>> for MetricsService<S>
 where
-    S: Service<Request<Bytes>, Response = http::Response<ResBody>>
-        + Clone
-        + Send
-        + 'static,
+    S: Service<Request<Bytes>, Response = http::Response<ResBody>> + Clone + Send + 'static,
     S::Error: std::fmt::Display + Send + 'static,
     S::Future: Send + 'static,
 {
     type Response = http::Response<ResBody>;
-    type Error    = S::Error;
-    type Future   = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -53,9 +53,9 @@ where
 
     fn call(&mut self, req: Request<Bytes>) -> Self::Future {
         let source = header_str(req.headers(), "x-wr-source").to_string();
-        let dest   = header_str(req.headers(), "x-wr-destination").to_string();
-        let start  = Instant::now();
-        let tx     = self.tx.clone();
+        let dest = header_str(req.headers(), "x-wr-destination").to_string();
+        let start = Instant::now();
+        let tx = self.tx.clone();
 
         // Clone inner so the future is 'static (doesn't borrow self).
         let mut inner = self.inner.clone();
@@ -66,7 +66,7 @@ where
 
             let (status, error) = match &result {
                 Ok(resp) => (resp.status().as_u16() as u32, String::new()),
-                Err(e)   => (502u32, e.to_string()),
+                Err(e) => (502u32, e.to_string()),
             };
 
             let _ = tx.try_send(RequestMetrics {

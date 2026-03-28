@@ -5,11 +5,11 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use http::Request;
 use http_body_util::{BodyExt, Full};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use tower::Service;
 
-use super::{ResBody, ResolvedDestination, full_body};
+use super::{full_body, ResBody, ResolvedDestination};
 
 #[derive(Clone)]
 pub struct ForwardService {
@@ -23,10 +23,16 @@ impl ForwardService {
     }
 }
 
+impl Default for ForwardService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Service<Request<Bytes>> for ForwardService {
     type Response = http::Response<ResBody>;
-    type Error    = anyhow::Error;
-    type Future   = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Error = anyhow::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -76,7 +82,10 @@ impl Service<Request<Bytes>> for ForwardService {
                 .map_err(|e| anyhow::anyhow!("response body error: {e}"))?
                 .to_bytes();
 
-            Ok(http::Response::from_parts(resp_parts, full_body(resp_bytes)))
+            Ok(http::Response::from_parts(
+                resp_parts,
+                full_body(resp_bytes),
+            ))
         })
     }
 }

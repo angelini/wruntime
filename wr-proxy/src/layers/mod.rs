@@ -10,7 +10,7 @@ pub use schema::SchemaValidationLayer;
 
 use bytes::Bytes;
 use http::Response;
-use http_body_util::{Full, combinators::BoxBody};
+use http_body_util::{combinators::BoxBody, Full};
 use std::convert::Infallible;
 
 /// Shared response body type used throughout the proxy Tower stack.

@@ -1,20 +1,15 @@
 use std::time::Instant;
 
 use tonic::{Request, Response, Status};
+use tracing::info;
 
 use wr_common::wruntime::{
-    manager_service_server::ManagerService,
-    DeregisterEngineRequest, DeregisterEngineResponse,
-    DeleteRoutingRuleRequest, DeleteRoutingRuleResponse,
-    GetMetricsSummaryRequest, GetMetricsSummaryResponse,
-    GetRoutingTableRequest, GetRoutingTableResponse,
-    GetSchemaRequest, GetSchemaResponse,
-    HeartbeatRequest, HeartbeatResponse,
-    ListEnginesRequest, ListEnginesResponse,
-    RegisterEngineRequest, RegisterEngineResponse,
-    ReportMetricsRequest, ReportMetricsResponse,
-    RoutingRule,
-    UploadSchemaRequest, UploadSchemaResponse,
+    manager_service_server::ManagerService, DeleteRoutingRuleRequest, DeleteRoutingRuleResponse,
+    DeregisterEngineRequest, DeregisterEngineResponse, GetMetricsSummaryRequest,
+    GetMetricsSummaryResponse, GetRoutingTableRequest, GetRoutingTableResponse, GetSchemaRequest,
+    GetSchemaResponse, HeartbeatRequest, HeartbeatResponse, ListEnginesRequest,
+    ListEnginesResponse, RegisterEngineRequest, RegisterEngineResponse, ReportMetricsRequest,
+    ReportMetricsResponse, RoutingRule, UploadSchemaRequest, UploadSchemaResponse,
     UpsertRoutingRuleResponse,
 };
 
@@ -67,7 +62,11 @@ impl ManagerService for Manager {
         // modules as unhealthy before their first heartbeat arrives.
         for module in &reg.modules {
             state.module_health.insert(
-                (engine_id.clone(), module.name.clone(), module.version.clone()),
+                (
+                    engine_id.clone(),
+                    module.name.clone(),
+                    module.version.clone(),
+                ),
                 Instant::now(),
             );
         }
@@ -75,7 +74,7 @@ impl ManagerService for Manager {
         state.engines.insert(engine_id.clone(), reg);
         state.heartbeats.insert(engine_id.clone(), Instant::now());
 
-        println!("[manager] engine registered: {engine_id}");
+        info!(engine_id, "engine registered");
         Ok(Response::new(RegisterEngineResponse { accepted: true }))
     }
 
@@ -88,7 +87,9 @@ impl ManagerService for Manager {
 
         state.engines.remove(&engine_id);
         state.heartbeats.remove(&engine_id);
-        state.module_health.retain(|(eid, _, _), _| eid != &engine_id);
+        state
+            .module_health
+            .retain(|(eid, _, _), _| eid != &engine_id);
 
         // Mark all routing rules for this engine as unhealthy so proxies
         // stop sending traffic before the next routing table sync.
@@ -103,7 +104,7 @@ impl ManagerService for Manager {
             state.routing_table.version += 1;
         }
 
-        println!("[manager] engine deregistered: {engine_id}");
+        info!(engine_id, "engine deregistered");
         Ok(Response::new(DeregisterEngineResponse {}))
     }
 
@@ -111,16 +112,20 @@ impl ManagerService for Manager {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        let req       = request.into_inner();
+        let req = request.into_inner();
         let engine_id = req.engine_id;
-        let now       = Instant::now();
+        let now = Instant::now();
         let mut state = self.state.write().await;
 
         state.heartbeats.insert(engine_id.clone(), now);
 
         for module in &req.healthy_modules {
             state.module_health.insert(
-                (engine_id.clone(), module.name.clone(), module.version.clone()),
+                (
+                    engine_id.clone(),
+                    module.name.clone(),
+                    module.version.clone(),
+                ),
                 now,
             );
         }
@@ -132,7 +137,7 @@ impl ManagerService for Manager {
         &self,
         _request: Request<ListEnginesRequest>,
     ) -> Result<Response<ListEnginesResponse>, Status> {
-        let state   = self.state.read().await;
+        let state = self.state.read().await;
         let engines = state.engines.values().cloned().collect();
         Ok(Response::new(ListEnginesResponse { engines }))
     }
@@ -161,18 +166,21 @@ impl ManagerService for Manager {
         }
 
         let mut state = self.state.write().await;
-        let rules     = &mut state.routing_table.rules;
+        let rules = &mut state.routing_table.rules;
 
         match rules.iter_mut().find(|r| r.rule_id == rule.rule_id) {
             Some(existing) => {
-                println!("[manager] routing rule updated: {}", rule.rule_id);
+                info!(rule_id = rule.rule_id, "routing rule updated");
                 *existing = rule;
             }
             None => {
-                println!(
-                    "[manager] routing rule added: {} → {}@{} (engine {})",
-                    rule.source_module, rule.destination_module,
-                    rule.destination_version, rule.engine_id
+                info!(
+                    rule_id          = %rule.rule_id,
+                    source           = %rule.source_module,
+                    destination      = %rule.destination_module,
+                    version          = %rule.destination_version,
+                    engine_id        = %rule.engine_id,
+                    "routing rule added",
                 );
                 rules.push(rule);
             }
@@ -186,15 +194,15 @@ impl ManagerService for Manager {
         &self,
         request: Request<DeleteRoutingRuleRequest>,
     ) -> Result<Response<DeleteRoutingRuleResponse>, Status> {
-        let rule_id   = request.into_inner().rule_id;
+        let rule_id = request.into_inner().rule_id;
         let mut state = self.state.write().await;
-        let before    = state.routing_table.rules.len();
+        let before = state.routing_table.rules.len();
 
         state.routing_table.rules.retain(|r| r.rule_id != rule_id);
 
         if state.routing_table.rules.len() < before {
             state.routing_table.version += 1;
-            println!("[manager] routing rule deleted: {rule_id}");
+            info!(rule_id, "routing rule deleted");
         }
 
         Ok(Response::new(DeleteRoutingRuleResponse {}))
@@ -206,7 +214,7 @@ impl ManagerService for Manager {
         &self,
         request: Request<GetSchemaRequest>,
     ) -> Result<Response<GetSchemaResponse>, Status> {
-        let req   = request.into_inner();
+        let req = request.into_inner();
         let state = self.state.read().await;
 
         let schema = state
@@ -217,7 +225,9 @@ impl ManagerService for Manager {
                 Status::not_found(format!("no schema for {}/{}", req.module, req.version))
             })?;
 
-        Ok(Response::new(GetSchemaResponse { proto_schema: schema }))
+        Ok(Response::new(GetSchemaResponse {
+            proto_schema: schema,
+        }))
     }
 
     async fn upload_schema(
@@ -236,7 +246,7 @@ impl ManagerService for Manager {
             .schemas
             .insert((req.module.clone(), req.version.clone()), req.proto_schema);
 
-        println!("[manager] schema stored: {}/{}", req.module, req.version);
+        info!(module = %req.module, version = %req.version, "schema stored");
         Ok(Response::new(UploadSchemaResponse {}))
     }
 
@@ -246,7 +256,7 @@ impl ManagerService for Manager {
         &self,
         request: Request<ReportMetricsRequest>,
     ) -> Result<Response<ReportMetricsResponse>, Status> {
-        let incoming  = request.into_inner().metrics;
+        let incoming = request.into_inner().metrics;
         let mut state = self.state.write().await;
 
         for metric in incoming {
@@ -263,7 +273,7 @@ impl ManagerService for Manager {
         &self,
         _request: Request<GetMetricsSummaryRequest>,
     ) -> Result<Response<GetMetricsSummaryResponse>, Status> {
-        let state   = self.state.read().await;
+        let state = self.state.read().await;
         let metrics = state.metrics.iter().cloned().collect();
         Ok(Response::new(GetMetricsSummaryResponse { metrics }))
     }

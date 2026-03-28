@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
+use tracing::{info, warn};
 
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, GetSchemaRequest, ListEnginesRequest,
@@ -19,9 +20,19 @@ pub struct SchemaCache {
 
 impl SchemaCache {
     pub fn new() -> Self {
-        Self { pools: RwLock::new(HashMap::new()) }
+        Self {
+            pools: RwLock::new(HashMap::new()),
+        }
     }
+}
 
+impl Default for SchemaCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SchemaCache {
     /// Store a compiled schema for `module`. `schema_bytes` must be a
     /// serialised `FileDescriptorSet` as produced by protoc
     /// (`--descriptor_set_out`).
@@ -74,16 +85,16 @@ pub async fn sync_schemas(
 
         // Enumerate all registered engines to find (module, version) pairs.
         let engines = match client.list_engines(ListEnginesRequest {}).await {
-            Ok(r)  => r.into_inner().engines,
+            Ok(r) => r.into_inner().engines,
             Err(e) => {
-                eprintln!("[proxy] schema sync — list_engines failed: {e}");
+                warn!(error = %e, "schema sync — list_engines failed");
                 continue;
             }
         };
 
         for engine in engines {
             for module_desc in engine.modules {
-                let module  = &module_desc.name;
+                let module = &module_desc.name;
                 let version = &module_desc.version;
 
                 // Skip if already cached.
@@ -93,7 +104,7 @@ pub async fn sync_schemas(
 
                 match client
                     .get_schema(GetSchemaRequest {
-                        module:  module.clone(),
+                        module: module.clone(),
                         version: version.clone(),
                     })
                     .await
@@ -101,18 +112,14 @@ pub async fn sync_schemas(
                     Ok(resp) => {
                         let bytes = resp.into_inner().proto_schema;
                         if let Err(e) = cache.insert(module, &bytes).await {
-                            eprintln!(
-                                "[proxy] schema decode error for {module}/{version}: {e}"
-                            );
+                            warn!(module, version, error = %e, "schema decode error");
                         } else {
-                            println!("[proxy] schema cached for {module}/{version}");
+                            info!(module, version, "schema cached");
                         }
                     }
                     Err(e) if e.code() == tonic::Code::NotFound => {}
                     Err(e) => {
-                        eprintln!(
-                            "[proxy] schema fetch error for {module}/{version}: {e}"
-                        );
+                        warn!(module, version, error = %e, "schema fetch error");
                     }
                 }
             }

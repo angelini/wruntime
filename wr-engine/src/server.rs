@@ -8,6 +8,7 @@ use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tracing::{info, warn};
 
 use crate::registry::{InboundRequest, ModuleRegistry};
 
@@ -16,7 +17,7 @@ use crate::registry::{InboundRequest, ModuleRegistry};
 /// via the registry.
 pub async fn serve(addr: &str, registry: ModuleRegistry) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    println!("[engine] inbound server listening on {addr}");
+    info!(address = %addr, "inbound server listening");
 
     loop {
         let (stream, _peer) = listener.accept().await?;
@@ -24,14 +25,12 @@ pub async fn serve(addr: &str, registry: ModuleRegistry) -> Result<()> {
 
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
-            let svc = hyper::service::service_fn(
-                move |req: Request<hyper::body::Incoming>| {
-                    let registry = registry.clone();
-                    async move { Ok::<_, Infallible>(handle(req, registry).await) }
-                },
-            );
+            let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                let registry = registry.clone();
+                async move { Ok::<_, Infallible>(handle(req, registry).await) }
+            });
             if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
-                eprintln!("[engine] inbound connection error: {e}");
+                warn!(error = %e, "inbound connection error");
             }
         });
     }
@@ -66,24 +65,26 @@ async fn handle(
     // Buffer body.
     let (parts, body) = req.into_parts();
     let bytes = match BodyExt::collect(body).await {
-        Ok(c)  => c.to_bytes(),
+        Ok(c) => c.to_bytes(),
         Err(e) => {
-            eprintln!("[engine] body read error: {e}");
+            warn!(error = %e, "body read error");
             return err(StatusCode::INTERNAL_SERVER_ERROR, "failed to read body");
         }
     };
 
     let sender = match registry.next_sender(&module, &version).await {
         Some(s) => s,
-        None => return err(
-            StatusCode::NOT_FOUND,
-            &format!("module '{module}@{version}' not loaded"),
-        ),
+        None => {
+            return err(
+                StatusCode::NOT_FOUND,
+                &format!("module '{module}@{version}' not loaded"),
+            )
+        }
     };
 
     let (resp_tx, resp_rx) = oneshot::channel();
     let inbound = InboundRequest {
-        request:     Request::from_parts(parts, bytes),
+        request: Request::from_parts(parts, bytes),
         response_tx: resp_tx,
     };
 

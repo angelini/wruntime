@@ -4,11 +4,11 @@ use serde::Deserialize;
 #[derive(Deserialize, Clone)]
 pub struct ProxyConfig {
     /// TCP address to listen on for inbound HTTP, e.g. "0.0.0.0:9001"
-    pub listen_address:  String,
+    pub listen_address: String,
     /// gRPC address of wr-manager, e.g. "http://127.0.0.1:9000"
     pub manager_address: String,
     #[serde(default)]
-    pub cache:   CacheConfig,
+    pub cache: CacheConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
 }
@@ -23,7 +23,10 @@ pub struct CacheConfig {
 
 impl Default for CacheConfig {
     fn default() -> Self {
-        Self { routing_table_ttl_secs: 5, schema_ttl_secs: 60 }
+        Self {
+            routing_table_ttl_secs: 5,
+            schema_ttl_secs: 60,
+        }
     }
 }
 
@@ -37,7 +40,10 @@ pub struct MetricsConfig {
 
 impl Default for MetricsConfig {
     fn default() -> Self {
-        Self { flush_interval_secs: 10, queue_depth: 1000 }
+        Self {
+            flush_interval_secs: 10,
+            queue_depth: 1000,
+        }
     }
 }
 
@@ -52,8 +58,14 @@ impl ProxyConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        anyhow::ensure!(!self.listen_address.is_empty(),  "listen_address is required");
-        anyhow::ensure!(!self.manager_address.is_empty(), "manager_address is required");
+        anyhow::ensure!(
+            !self.listen_address.is_empty(),
+            "listen_address is required"
+        );
+        anyhow::ensure!(
+            !self.manager_address.is_empty(),
+            "manager_address is required"
+        );
         anyhow::ensure!(
             self.cache.routing_table_ttl_secs > 0,
             "cache.routing_table_ttl_secs must be > 0"

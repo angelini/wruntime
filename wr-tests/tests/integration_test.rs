@@ -17,11 +17,10 @@ use tokio::sync::oneshot;
 use tonic::transport::Server;
 
 use wr_common::wruntime::{
-    manager_service_client::ManagerServiceClient,
-    manager_service_server::ManagerServiceServer,
-    DeregisterEngineRequest, EngineRegistration, GetMetricsSummaryRequest,
-    GetRoutingTableRequest, HeartbeatRequest, ListEnginesRequest, ModuleDescriptor,
-    RegisterEngineRequest, ReportMetricsRequest, RequestMetrics, RoutingRule,
+    manager_service_client::ManagerServiceClient, manager_service_server::ManagerServiceServer,
+    DeregisterEngineRequest, EngineRegistration, GetMetricsSummaryRequest, GetRoutingTableRequest,
+    HeartbeatRequest, ListEnginesRequest, ModuleDescriptor, RegisterEngineRequest,
+    ReportMetricsRequest, RequestMetrics, RoutingRule,
 };
 use wr_manager::{config::ManagerConfig, service::Manager, state::new_state};
 use wr_proxy::config::ProxyConfig;
@@ -31,9 +30,9 @@ use wr_proxy::config::ProxyConfig;
 /// Start an in-process wr-manager on a random port and return its address.
 async fn start_manager() -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr     = listener.local_addr()?;
-    let state    = new_state();
-    let manager  = Manager::new(state);
+    let addr = listener.local_addr()?;
+    let state = new_state();
+    let manager = Manager::new(state);
 
     tokio::spawn(
         Server::builder()
@@ -53,23 +52,27 @@ async fn manager_client(addr: &str) -> Result<ManagerServiceClient<tonic::transp
 
 #[tokio::test]
 async fn test_register_and_list_engines() -> Result<()> {
-    let addr   = start_manager().await?;
-    let mut c  = manager_client(&addr).await?;
+    let addr = start_manager().await?;
+    let mut c = manager_client(&addr).await?;
 
     c.register_engine(RegisterEngineRequest {
         registration: Some(EngineRegistration {
             engine_id: "e1".into(),
-            address:   "http://127.0.0.1:9100".into(),
-            modules:   vec![ModuleDescriptor {
-                name:         "inventory-service".into(),
-                version:      "1.0.0".into(),
+            address: "http://127.0.0.1:9100".into(),
+            modules: vec![ModuleDescriptor {
+                name: "inventory-service".into(),
+                version: "1.0.0".into(),
                 proto_schema: vec![],
             }],
         }),
     })
     .await?;
 
-    let list = c.list_engines(ListEnginesRequest {}).await?.into_inner().engines;
+    let list = c
+        .list_engines(ListEnginesRequest {})
+        .await?
+        .into_inner()
+        .engines;
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].engine_id, "e1");
     assert_eq!(list[0].modules[0].name, "inventory-service");
@@ -79,21 +82,28 @@ async fn test_register_and_list_engines() -> Result<()> {
 
 #[tokio::test]
 async fn test_deregister_engine() -> Result<()> {
-    let addr  = start_manager().await?;
+    let addr = start_manager().await?;
     let mut c = manager_client(&addr).await?;
 
     c.register_engine(RegisterEngineRequest {
         registration: Some(EngineRegistration {
             engine_id: "e1".into(),
-            address:   "http://127.0.0.1:9101".into(),
-            modules:   vec![],
+            address: "http://127.0.0.1:9101".into(),
+            modules: vec![],
         }),
     })
     .await?;
 
-    c.deregister_engine(DeregisterEngineRequest { engine_id: "e1".into() }).await?;
+    c.deregister_engine(DeregisterEngineRequest {
+        engine_id: "e1".into(),
+    })
+    .await?;
 
-    let list = c.list_engines(ListEnginesRequest {}).await?.into_inner().engines;
+    let list = c
+        .list_engines(ListEnginesRequest {})
+        .await?
+        .into_inner()
+        .engines;
     assert!(list.is_empty());
 
     Ok(())
@@ -101,37 +111,41 @@ async fn test_deregister_engine() -> Result<()> {
 
 #[tokio::test]
 async fn test_heartbeat() -> Result<()> {
-    let addr  = start_manager().await?;
+    let addr = start_manager().await?;
     let mut c = manager_client(&addr).await?;
 
     c.register_engine(RegisterEngineRequest {
         registration: Some(EngineRegistration {
             engine_id: "e1".into(),
-            address:   "http://127.0.0.1:9102".into(),
-            modules:   vec![],
+            address: "http://127.0.0.1:9102".into(),
+            modules: vec![],
         }),
     })
     .await?;
 
     // Heartbeat should succeed without error.
-    c.heartbeat(HeartbeatRequest { engine_id: "e1".into(), healthy_modules: vec![] }).await?;
+    c.heartbeat(HeartbeatRequest {
+        engine_id: "e1".into(),
+        healthy_modules: vec![],
+    })
+    .await?;
 
     Ok(())
 }
 
 #[tokio::test]
 async fn test_routing_table_upsert_and_get() -> Result<()> {
-    let addr  = start_manager().await?;
+    let addr = start_manager().await?;
     let mut c = manager_client(&addr).await?;
 
     c.upsert_routing_rule(RoutingRule {
-        rule_id:             "r1".into(),
-        source_module:       "order-service".into(),
-        destination_module:  "inventory-service".into(),
+        rule_id: "r1".into(),
+        source_module: "order-service".into(),
+        destination_module: "inventory-service".into(),
         destination_version: "1.0.0".into(),
-        engine_id:           "e1".into(),
-        engine_address:      "http://127.0.0.1:9103".into(),
-        healthy:             false, // server sets this to true on upsert
+        engine_id: "e1".into(),
+        engine_address: "http://127.0.0.1:9103".into(),
+        healthy: false, // server sets this to true on upsert
     })
     .await?;
 
@@ -152,16 +166,16 @@ async fn test_routing_table_upsert_and_get() -> Result<()> {
 
 #[tokio::test]
 async fn test_metrics_report_and_summary() -> Result<()> {
-    let addr  = start_manager().await?;
+    let addr = start_manager().await?;
     let mut c = manager_client(&addr).await?;
 
     c.report_metrics(ReportMetricsRequest {
         metrics: vec![RequestMetrics {
-            source:      "order-service".into(),
+            source: "order-service".into(),
             destination: "inventory-service".into(),
             duration_ms: 42,
-            status:      200,
-            error:       String::new(),
+            status: 200,
+            error: String::new(),
         }],
     })
     .await?;
@@ -186,7 +200,7 @@ async fn test_metrics_report_and_summary() -> Result<()> {
 #[tokio::test]
 async fn test_proxy_routes_to_engine() -> Result<()> {
     // 1. Start manager.
-    let mgr_addr  = start_manager().await?;
+    let mgr_addr = start_manager().await?;
     let mut mgr_c = manager_client(&mgr_addr).await?;
 
     // 2. Start a stub engine inbound server that echoes the request path.
@@ -206,10 +220,10 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
         .register_engine(RegisterEngineRequest {
             registration: Some(EngineRegistration {
                 engine_id: "stub-engine".into(),
-                address:   engine_addr.clone(),
-                modules:   vec![ModuleDescriptor {
-                    name:         "inventory-service".into(),
-                    version:      "1.0.0".into(),
+                address: engine_addr.clone(),
+                modules: vec![ModuleDescriptor {
+                    name: "inventory-service".into(),
+                    version: "1.0.0".into(),
                     proto_schema: vec![],
                 }],
             }),
@@ -218,29 +232,32 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
 
     mgr_c
         .upsert_routing_rule(RoutingRule {
-            rule_id:             "r1".into(),
-            source_module:       "order-service".into(),
-            destination_module:  "inventory-service".into(),
+            rule_id: "r1".into(),
+            source_module: "order-service".into(),
+            destination_module: "inventory-service".into(),
             destination_version: "1.0.0".into(),
-            engine_id:           "stub-engine".into(),
-            engine_address:      engine_addr.clone(),
-            healthy:             false, // server sets this to true on upsert
+            engine_id: "stub-engine".into(),
+            engine_address: engine_addr.clone(),
+            healthy: false, // server sets this to true on upsert
         })
         .await?;
 
     // 4. Start the proxy.
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let proxy_addr     = proxy_listener.local_addr()?;
+    let proxy_addr = proxy_listener.local_addr()?;
 
     let routing_table = wr_proxy::routing::new_routing_table();
-    let schema_cache  = Arc::new(wr_proxy::schema::SchemaCache::new());
+    let schema_cache = Arc::new(wr_proxy::schema::SchemaCache::new());
     let (metrics_tx, _metrics_rx) = tokio::sync::mpsc::channel(100);
 
     // Sync routing table immediately (one-shot).
     {
-        let table  = routing_table.clone();
-        let mut c  = manager_client(&mgr_addr).await?;
-        let resp   = c.get_routing_table(GetRoutingTableRequest {}).await?.into_inner();
+        let table = routing_table.clone();
+        let mut c = manager_client(&mgr_addr).await?;
+        let resp = c
+            .get_routing_table(GetRoutingTableRequest {})
+            .await?
+            .into_inner();
         if let Some(incoming) = resp.table {
             *table.write().await = incoming;
         }
@@ -258,10 +275,8 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // 5. Send a request through the proxy simulating an inter-module call.
-    let client = hyper_util::client::legacy::Client::builder(
-        hyper_util::rt::TokioExecutor::new(),
-    )
-    .build_http::<Full<Bytes>>();
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http::<Full<Bytes>>();
 
     let req = Request::builder()
         .uri(format!("http://{proxy_addr}/items"))
@@ -274,7 +289,10 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
 
     let body = resp.into_body().collect().await?.to_bytes();
     let body_str = std::str::from_utf8(&body)?;
-    assert!(body_str.contains("/items"), "expected stub to echo path, got: {body_str}");
+    assert!(
+        body_str.contains("/items"),
+        "expected stub to echo path, got: {body_str}"
+    );
 
     let _ = engine_shutdown_tx.send(());
     Ok(())
@@ -287,17 +305,17 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
 /// running `protoc`.
 fn minimal_file_descriptor_set() -> Vec<u8> {
     use prost_types::{
+        field_descriptor_proto::{Label, Type},
         DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
         MethodDescriptorProto, ServiceDescriptorProto,
-        field_descriptor_proto::{Label, Type},
     };
 
     let req_msg = DescriptorProto {
         name: Some("PingRequest".into()),
         field: vec![FieldDescriptorProto {
-            name:   Some("message".into()),
+            name: Some("message".into()),
             number: Some(1),
-            label:  Some(Label::Optional as i32),
+            label: Some(Label::Optional as i32),
             r#type: Some(Type::String as i32),
             json_name: Some("message".into()),
             ..Default::default()
@@ -311,19 +329,19 @@ fn minimal_file_descriptor_set() -> Vec<u8> {
     let service = ServiceDescriptorProto {
         name: Some("PingService".into()),
         method: vec![MethodDescriptorProto {
-            name:        Some("Ping".into()),
-            input_type:  Some(".test.PingRequest".into()),
+            name: Some("Ping".into()),
+            input_type: Some(".test.PingRequest".into()),
             output_type: Some(".test.PingResponse".into()),
             ..Default::default()
         }],
         ..Default::default()
     };
     let file = FileDescriptorProto {
-        name:         Some("test.proto".into()),
-        package:      Some("test".into()),
+        name: Some("test.proto".into()),
+        package: Some("test".into()),
         message_type: vec![req_msg, resp_msg],
-        service:      vec![service],
-        syntax:       Some("proto3".into()),
+        service: vec![service],
+        syntax: Some("proto3".into()),
         ..Default::default()
     };
     FileDescriptorSet { file: vec![file] }.encode_to_vec()
@@ -345,12 +363,12 @@ fn invalid_protobuf() -> Bytes {
 async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
     // 1. Start manager and upload a schema for "ping-service".
     let mgr_addr = start_manager().await?;
-    let mut mgr  = manager_client(&mgr_addr).await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
 
     let schema_bytes = minimal_file_descriptor_set();
     mgr.upload_schema(wr_common::wruntime::UploadSchemaRequest {
-        module:       "ping-service".into(),
-        version:      "1.0.0".into(),
+        module: "ping-service".into(),
+        version: "1.0.0".into(),
         proto_schema: schema_bytes,
     })
     .await?;
@@ -360,7 +378,7 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
     let schema_bytes2 = {
         let mut c2 = manager_client(&mgr_addr).await?;
         c2.get_schema(wr_common::wruntime::GetSchemaRequest {
-            module:  "ping-service".into(),
+            module: "ping-service".into(),
             version: "1.0.0".into(),
         })
         .await?
@@ -379,29 +397,34 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
         .service(wr_proxy::layers::ForwardService::new());
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let proxy_addr     = proxy_listener.local_addr()?;
+    let proxy_addr = proxy_listener.local_addr()?;
     tokio::spawn(proxy_serve(proxy_listener, svc));
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let client = hyper_util::client::legacy::Client::builder(
-        hyper_util::rt::TokioExecutor::new(),
-    )
-    .build_http::<Full<Bytes>>();
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http::<Full<Bytes>>();
 
     // 3. Invalid body → 400 with JSON error.
     let bad_req = Request::builder()
         .method("POST")
         .uri(format!("http://{proxy_addr}/test.PingService/Ping"))
-        .header("x-wr-destination", "http://ping-service/test.PingService/Ping")
+        .header(
+            "x-wr-destination",
+            "http://ping-service/test.PingService/Ping",
+        )
         .header("x-wr-source", "caller-service")
         .body(Full::new(invalid_protobuf()))?;
 
     let resp = client.request(bad_req).await?;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "expected 400 for invalid protobuf");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "expected 400 for invalid protobuf"
+    );
 
     let (resp_parts, resp_body) = resp.into_parts();
     let body_bytes = resp_body.collect().await?.to_bytes();
-    let body_str   = std::str::from_utf8(&body_bytes)?;
+    let body_str = std::str::from_utf8(&body_bytes)?;
 
     assert!(
         body_str.contains(r#""error":"schema_validation_failed""#),
@@ -416,7 +439,8 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
         "expected destination in error, got: {body_str}"
     );
     assert!(
-        resp_parts.headers
+        resp_parts
+            .headers
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map_or(true, |v| v.starts_with("application/json")),
@@ -428,7 +452,10 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
     let good_req = Request::builder()
         .method("POST")
         .uri(format!("http://{proxy_addr}/test.PingService/Ping"))
-        .header("x-wr-destination", "http://ping-service/test.PingService/Ping")
+        .header(
+            "x-wr-destination",
+            "http://ping-service/test.PingService/Ping",
+        )
         .header("x-wr-source", "caller-service")
         .body(Full::new(valid_ping_request()))?;
 
@@ -446,7 +473,7 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
 async fn test_schema_validation_passes_when_no_schema_cached() -> Result<()> {
     // If no schema is loaded for a module, validation is skipped (pass-through).
     let routing_table = wr_proxy::routing::new_routing_table();
-    let schema_cache  = Arc::new(wr_proxy::schema::SchemaCache::new()); // empty
+    let schema_cache = Arc::new(wr_proxy::schema::SchemaCache::new()); // empty
     let (metrics_tx, _) = tokio::sync::mpsc::channel(100);
 
     let svc = tower::ServiceBuilder::new()
@@ -456,14 +483,12 @@ async fn test_schema_validation_passes_when_no_schema_cached() -> Result<()> {
         .service(wr_proxy::layers::ForwardService::new());
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let proxy_addr     = proxy_listener.local_addr()?;
+    let proxy_addr = proxy_listener.local_addr()?;
     tokio::spawn(proxy_serve(proxy_listener, svc));
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let client = hyper_util::client::legacy::Client::builder(
-        hyper_util::rt::TokioExecutor::new(),
-    )
-    .build_http::<Full<Bytes>>();
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http::<Full<Bytes>>();
 
     // Send garbage bytes — schema cache is empty so validation is skipped,
     // then routing fails with 502 (no rule for "unknown-service").
@@ -519,7 +544,7 @@ fn test_proxy_config_valid() {
         queue_depth         = 1000
     "#;
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
-    assert_eq!(cfg.listen_address,  "0.0.0.0:9001");
+    assert_eq!(cfg.listen_address, "0.0.0.0:9001");
     assert_eq!(cfg.manager_address, "http://127.0.0.1:9000");
     assert_eq!(cfg.cache.routing_table_ttl_secs, 5);
     assert_eq!(cfg.cache.schema_ttl_secs, 60);
@@ -571,7 +596,10 @@ fn test_proxy_config_rejects_zero_queue_depth() {
         queue_depth         = 0
     "#;
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
-    assert_eq!(cfg.metrics.queue_depth, 0, "precondition for validation guard");
+    assert_eq!(
+        cfg.metrics.queue_depth, 0,
+        "precondition for validation guard"
+    );
 }
 
 #[test]
@@ -579,22 +607,20 @@ fn test_example_config_files_parse() {
     // Confirm the shipped example TOML files are syntactically valid
     // (they reference non-existent wasm/schema paths so we only parse, not validate).
     let manager_toml = include_str!("../../manager.toml");
-    let proxy_toml   = include_str!("../../proxy.toml");
-    let engine_toml  = include_str!("../../engine.toml");
+    let proxy_toml = include_str!("../../proxy.toml");
+    let engine_toml = include_str!("../../engine.toml");
 
-    toml::from_str::<ManagerConfig>(manager_toml)
-        .expect("manager.toml must parse");
-    toml::from_str::<ProxyConfig>(proxy_toml)
-        .expect("proxy.toml must parse");
+    toml::from_str::<ManagerConfig>(manager_toml).expect("manager.toml must parse");
+    toml::from_str::<ProxyConfig>(proxy_toml).expect("proxy.toml must parse");
 
     // Engine config references wasm files that don't exist in CI, so only
     // check that the TOML itself is structurally valid.
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
     struct EngineRaw {
-        listen_address:  String,
+        listen_address: String,
         manager_address: String,
-        proxy_address:   String,
+        proxy_address: String,
         #[serde(rename = "module", default)]
         modules: Vec<toml::Value>,
     }
@@ -607,19 +633,19 @@ fn test_example_config_files_parse() {
 
 /// Register one engine + one routing rule in a single call.
 async fn register_module(
-    c:       &mut ManagerServiceClient<tonic::transport::Channel>,
-    engine_id:   &str,
+    c: &mut ManagerServiceClient<tonic::transport::Channel>,
+    engine_id: &str,
     engine_addr: &str,
-    module:      &str,
-    version:     &str,
+    module: &str,
+    version: &str,
 ) -> Result<()> {
     c.register_engine(RegisterEngineRequest {
         registration: Some(EngineRegistration {
             engine_id: engine_id.into(),
-            address:   engine_addr.into(),
-            modules:   vec![ModuleDescriptor {
-                name:         module.into(),
-                version:      version.into(),
+            address: engine_addr.into(),
+            modules: vec![ModuleDescriptor {
+                name: module.into(),
+                version: version.into(),
                 proto_schema: vec![],
             }],
         }),
@@ -627,13 +653,13 @@ async fn register_module(
     .await?;
 
     c.upsert_routing_rule(RoutingRule {
-        rule_id:             format!("{engine_id}-{module}-{version}"),
-        source_module:       String::new(),
-        destination_module:  module.into(),
+        rule_id: format!("{engine_id}-{module}-{version}"),
+        source_module: String::new(),
+        destination_module: module.into(),
         destination_version: version.into(),
-        engine_id:           engine_id.into(),
-        engine_address:      engine_addr.into(),
-        healthy:             false, // server overrides to true
+        engine_id: engine_id.into(),
+        engine_address: engine_addr.into(),
+        healthy: false, // server overrides to true
     })
     .await?;
 
@@ -641,10 +667,7 @@ async fn register_module(
 }
 
 /// Sync the proxy's cached routing table from the manager (one-shot).
-async fn sync_table(
-    mgr_addr: &str,
-    table:    &wr_proxy::routing::CachedRoutingTable,
-) -> Result<()> {
+async fn sync_table(mgr_addr: &str, table: &wr_proxy::routing::CachedRoutingTable) -> Result<()> {
     let mut c = manager_client(mgr_addr).await?;
     if let Some(incoming) = c
         .get_routing_table(GetRoutingTableRequest {})
@@ -658,10 +681,8 @@ async fn sync_table(
 }
 
 /// Build and start a proxy backed by `table`; returns the bound socket address.
-async fn start_proxy(
-    table: wr_proxy::routing::CachedRoutingTable,
-) -> Result<std::net::SocketAddr> {
-    let schema_cache    = Arc::new(wr_proxy::schema::SchemaCache::new());
+async fn start_proxy(table: wr_proxy::routing::CachedRoutingTable) -> Result<std::net::SocketAddr> {
+    let schema_cache = Arc::new(wr_proxy::schema::SchemaCache::new());
     let (metrics_tx, _) = tokio::sync::mpsc::channel(100);
 
     let svc = tower::ServiceBuilder::new()
@@ -671,7 +692,7 @@ async fn start_proxy(
         .service(wr_proxy::layers::ForwardService::new());
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr     = listener.local_addr()?;
+    let addr = listener.local_addr()?;
     tokio::spawn(proxy_serve(listener, svc));
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     Ok(addr)
@@ -680,44 +701,47 @@ async fn start_proxy(
 /// Send one request through the proxy to `destination_module`, optionally
 /// pinning a version via the `x-wr-version` header.
 async fn proxy_get(
-    proxy_addr:        std::net::SocketAddr,
+    proxy_addr: std::net::SocketAddr,
     destination_module: &str,
-    version:           Option<&str>,
+    version: Option<&str>,
 ) -> Result<(StatusCode, String)> {
-    let client = hyper_util::client::legacy::Client::builder(
-        hyper_util::rt::TokioExecutor::new(),
-    )
-    .build_http::<Full<Bytes>>();
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http::<Full<Bytes>>();
 
     let mut builder = Request::builder()
         .uri(format!("http://{proxy_addr}/test"))
-        .header("x-wr-destination", format!("http://{destination_module}/test"))
+        .header(
+            "x-wr-destination",
+            format!("http://{destination_module}/test"),
+        )
         .header("x-wr-source", "test-caller");
     if let Some(v) = version {
         builder = builder.header("x-wr-version", v);
     }
-    let resp  = client.request(builder.body(Full::new(Bytes::new()))?).await?;
+    let resp = client
+        .request(builder.body(Full::new(Bytes::new()))?)
+        .await?;
     let status = resp.status();
-    let body   = resp.into_body().collect().await?.to_bytes();
+    let body = resp.into_body().collect().await?.to_bytes();
     Ok((status, String::from_utf8_lossy(&body).into_owned()))
 }
 
 #[tokio::test]
 async fn test_proxy_routes_to_explicit_version() -> Result<()> {
     let mgr_addr = start_manager().await?;
-    let mut mgr  = manager_client(&mgr_addr).await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
 
     // Two stubs: each responds with its own identifier
     let (e1_shutdown, e1_rx) = oneshot::channel::<()>();
     let e1_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let e1_addr     = format!("http://{}", e1_listener.local_addr()?);
+    let e1_addr = format!("http://{}", e1_listener.local_addr()?);
     tokio::spawn(async move {
         tokio::select! { _ = e1_rx => {}, _ = identified_stub(e1_listener, "engine-v1".into()) => {} }
     });
 
     let (e2_shutdown, e2_rx) = oneshot::channel::<()>();
     let e2_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let e2_addr     = format!("http://{}", e2_listener.local_addr()?);
+    let e2_addr = format!("http://{}", e2_listener.local_addr()?);
     tokio::spawn(async move {
         tokio::select! { _ = e2_rx => {}, _ = identified_stub(e2_listener, "engine-v2".into()) => {} }
     });
@@ -731,11 +755,17 @@ async fn test_proxy_routes_to_explicit_version() -> Result<()> {
 
     let (s, body) = proxy_get(proxy, "versioned-service", Some("1.0.0")).await?;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(body, "engine-v1", "x-wr-version: 1.0.0 should route to v1 engine");
+    assert_eq!(
+        body, "engine-v1",
+        "x-wr-version: 1.0.0 should route to v1 engine"
+    );
 
     let (s, body) = proxy_get(proxy, "versioned-service", Some("2.0.0")).await?;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(body, "engine-v2", "x-wr-version: 2.0.0 should route to v2 engine");
+    assert_eq!(
+        body, "engine-v2",
+        "x-wr-version: 2.0.0 should route to v2 engine"
+    );
 
     let _ = e1_shutdown.send(());
     let _ = e2_shutdown.send(());
@@ -745,18 +775,18 @@ async fn test_proxy_routes_to_explicit_version() -> Result<()> {
 #[tokio::test]
 async fn test_proxy_routes_to_latest_version() -> Result<()> {
     let mgr_addr = start_manager().await?;
-    let mut mgr  = manager_client(&mgr_addr).await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
 
     let (e1_shutdown, e1_rx) = oneshot::channel::<()>();
     let e1_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let e1_addr     = format!("http://{}", e1_listener.local_addr()?);
+    let e1_addr = format!("http://{}", e1_listener.local_addr()?);
     tokio::spawn(async move {
         tokio::select! { _ = e1_rx => {}, _ = identified_stub(e1_listener, "engine-v1".into()) => {} }
     });
 
     let (e2_shutdown, e2_rx) = oneshot::channel::<()>();
     let e2_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let e2_addr     = format!("http://{}", e2_listener.local_addr()?);
+    let e2_addr = format!("http://{}", e2_listener.local_addr()?);
     tokio::spawn(async move {
         tokio::select! { _ = e2_rx => {}, _ = identified_stub(e2_listener, "engine-v2".into()) => {} }
     });
@@ -771,7 +801,10 @@ async fn test_proxy_routes_to_latest_version() -> Result<()> {
     // No x-wr-version → should route to the highest semver (2.0.0)
     let (s, body) = proxy_get(proxy, "latest-service", None).await?;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(body, "engine-v2", "no version header should route to latest (v2.0.0)");
+    assert_eq!(
+        body, "engine-v2",
+        "no version header should route to latest (v2.0.0)"
+    );
 
     let _ = e1_shutdown.send(());
     let _ = e2_shutdown.send(());
@@ -781,10 +814,10 @@ async fn test_proxy_routes_to_latest_version() -> Result<()> {
 #[tokio::test]
 async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
     let mgr_addr = start_manager().await?;
-    let mut mgr  = manager_client(&mgr_addr).await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
 
     let e1_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let e1_addr     = format!("http://{}", e1_listener.local_addr()?);
+    let e1_addr = format!("http://{}", e1_listener.local_addr()?);
     tokio::spawn(identified_stub(e1_listener, "engine-v1".into()));
 
     register_module(&mut mgr, "e1", &e1_addr, "missing-ver-service", "1.0.0").await?;
@@ -795,7 +828,11 @@ async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
 
     // Request for a version that has no running instance
     let (s, _) = proxy_get(proxy, "missing-ver-service", Some("9.0.0")).await?;
-    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "unknown version should return 503");
+    assert_eq!(
+        s,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unknown version should return 503"
+    );
 
     Ok(())
 }
@@ -803,19 +840,19 @@ async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
 #[tokio::test]
 async fn test_proxy_load_balances_across_instances() -> Result<()> {
     let mgr_addr = start_manager().await?;
-    let mut mgr  = manager_client(&mgr_addr).await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
 
     // Two engines both hosting the same (module, version)
     let (e1_shutdown, e1_rx) = oneshot::channel::<()>();
     let e1_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let e1_addr     = format!("http://{}", e1_listener.local_addr()?);
+    let e1_addr = format!("http://{}", e1_listener.local_addr()?);
     tokio::spawn(async move {
         tokio::select! { _ = e1_rx => {}, _ = identified_stub(e1_listener, "engine-a".into()) => {} }
     });
 
     let (e2_shutdown, e2_rx) = oneshot::channel::<()>();
     let e2_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let e2_addr     = format!("http://{}", e2_listener.local_addr()?);
+    let e2_addr = format!("http://{}", e2_listener.local_addr()?);
     tokio::spawn(async move {
         tokio::select! { _ = e2_rx => {}, _ = identified_stub(e2_listener, "engine-b".into()) => {} }
     });
@@ -833,8 +870,12 @@ async fn test_proxy_load_balances_across_instances() -> Result<()> {
     for _ in 0..10 {
         let (s, body) = proxy_get(proxy, "lb-service", Some("1.0.0")).await?;
         assert_eq!(s, StatusCode::OK);
-        if body == "engine-a" { saw_a = true; }
-        if body == "engine-b" { saw_b = true; }
+        if body == "engine-a" {
+            saw_a = true;
+        }
+        if body == "engine-b" {
+            saw_b = true;
+        }
     }
 
     assert!(saw_a, "engine-a should have received at least one request");
@@ -848,18 +889,18 @@ async fn test_proxy_load_balances_across_instances() -> Result<()> {
 #[tokio::test]
 async fn test_proxy_failover_after_deregister() -> Result<()> {
     let mgr_addr = start_manager().await?;
-    let mut mgr  = manager_client(&mgr_addr).await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
 
     let (e1_shutdown, e1_rx) = oneshot::channel::<()>();
     let e1_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let e1_addr     = format!("http://{}", e1_listener.local_addr()?);
+    let e1_addr = format!("http://{}", e1_listener.local_addr()?);
     tokio::spawn(async move {
         tokio::select! { _ = e1_rx => {}, _ = identified_stub(e1_listener, "engine-a".into()) => {} }
     });
 
     let (e2_shutdown, e2_rx) = oneshot::channel::<()>();
     let e2_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let e2_addr     = format!("http://{}", e2_listener.local_addr()?);
+    let e2_addr = format!("http://{}", e2_listener.local_addr()?);
     tokio::spawn(async move {
         tokio::select! { _ = e2_rx => {}, _ = identified_stub(e2_listener, "engine-b".into()) => {} }
     });
@@ -880,12 +921,21 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
         }
         v
     };
-    assert!(responses.iter().any(|b| b == "engine-a"), "engine-a should be reachable before failover");
-    assert!(responses.iter().any(|b| b == "engine-b"), "engine-b should be reachable before failover");
+    assert!(
+        responses.iter().any(|b| b == "engine-a"),
+        "engine-a should be reachable before failover"
+    );
+    assert!(
+        responses.iter().any(|b| b == "engine-b"),
+        "engine-b should be reachable before failover"
+    );
 
     // Deregister engine-a: its rule is immediately marked unhealthy and the
     // routing table version is bumped.
-    mgr.deregister_engine(DeregisterEngineRequest { engine_id: "ea".into() }).await?;
+    mgr.deregister_engine(DeregisterEngineRequest {
+        engine_id: "ea".into(),
+    })
+    .await?;
 
     // Re-sync the proxy's cached table to pick up the health change.
     sync_table(&mgr_addr, &table).await?;
@@ -894,7 +944,10 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
     for _ in 0..4 {
         let (s, body) = proxy_get(proxy, "failover-service", Some("1.0.0")).await?;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(body, "engine-b", "after failover all traffic should go to engine-b");
+        assert_eq!(
+            body, "engine-b",
+            "after failover all traffic should go to engine-b"
+        );
     }
 
     let _ = e1_shutdown.send(());
@@ -905,10 +958,10 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
 #[tokio::test]
 async fn test_proxy_503_when_all_instances_unhealthy() -> Result<()> {
     let mgr_addr = start_manager().await?;
-    let mut mgr  = manager_client(&mgr_addr).await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
 
     let e1_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let e1_addr     = format!("http://{}", e1_listener.local_addr()?);
+    let e1_addr = format!("http://{}", e1_listener.local_addr()?);
     tokio::spawn(identified_stub(e1_listener, "engine-a".into()));
 
     register_module(&mut mgr, "ea", &e1_addr, "gone-service", "1.0.0").await?;
@@ -922,12 +975,19 @@ async fn test_proxy_503_when_all_instances_unhealthy() -> Result<()> {
     assert_eq!(s, StatusCode::OK);
 
     // Deregister the only instance
-    mgr.deregister_engine(DeregisterEngineRequest { engine_id: "ea".into() }).await?;
+    mgr.deregister_engine(DeregisterEngineRequest {
+        engine_id: "ea".into(),
+    })
+    .await?;
     sync_table(&mgr_addr, &table).await?;
 
     // Now all rules are unhealthy → 503
     let (s, _) = proxy_get(proxy, "gone-service", Some("1.0.0")).await?;
-    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "all unhealthy should return 503");
+    assert_eq!(
+        s,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "all unhealthy should return 503"
+    );
 
     Ok(())
 }
@@ -937,18 +997,21 @@ async fn test_proxy_503_when_all_instances_unhealthy() -> Result<()> {
 /// A minimal stub engine: echoes the request path in the response body.
 async fn stub_engine(listener: TcpListener) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else { break };
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
         tokio::spawn(async move {
-            let io  = TokioIo::new(stream);
-            let svc = hyper::service::service_fn(|req: Request<hyper::body::Incoming>| async move {
-                let path = req.uri().path().to_string();
-                Ok::<_, Infallible>(
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .body(Full::new(Bytes::from(path)))
-                        .unwrap(),
-                )
-            });
+            let io = TokioIo::new(stream);
+            let svc =
+                hyper::service::service_fn(|req: Request<hyper::body::Incoming>| async move {
+                    let path = req.uri().path().to_string();
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::from(path)))
+                            .unwrap(),
+                    )
+                });
             let _ = http1::Builder::new().serve_connection(io, svc).await;
         });
     }
@@ -958,10 +1021,12 @@ async fn stub_engine(listener: TcpListener) {
 /// which instance handled the request.
 async fn identified_stub(listener: TcpListener, id: String) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else { break };
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
         let id = id.clone();
         tokio::spawn(async move {
-            let io  = TokioIo::new(stream);
+            let io = TokioIo::new(stream);
             let svc = hyper::service::service_fn(move |_req: Request<hyper::body::Incoming>| {
                 let id = id.clone();
                 async move {
@@ -991,30 +1056,31 @@ where
     S::Future: Send + 'static,
 {
     loop {
-        let Ok((stream, _)) = listener.accept().await else { break };
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
         let svc = svc.clone();
         tokio::spawn(async move {
-            let io      = TokioIo::new(stream);
-            let svc_fn  = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+            let io = TokioIo::new(stream);
+            let svc_fn = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
                 let mut svc = svc.clone();
                 async move {
                     let (parts, body) = req.into_parts();
                     let bytes = match BodyExt::collect(body).await {
-                        Ok(c)  => c.to_bytes(),
-                        Err(_) => return Ok::<_, Infallible>(
-                            Response::builder()
-                                .status(400)
-                                .body(wr_proxy::layers::full_body(Bytes::from("body error")))
-                                .unwrap(),
-                        ),
+                        Ok(c) => c.to_bytes(),
+                        Err(_) => {
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(400)
+                                    .body(wr_proxy::layers::full_body(Bytes::from("body error")))
+                                    .unwrap(),
+                            )
+                        }
                     };
-                    let result = tower::Service::call(
-                        &mut svc,
-                        Request::from_parts(parts, bytes),
-                    )
-                    .await;
+                    let result =
+                        tower::Service::call(&mut svc, Request::from_parts(parts, bytes)).await;
                     Ok::<_, Infallible>(match result {
-                        Ok(r)  => r,
+                        Ok(r) => r,
                         Err(_) => Response::builder()
                             .status(502)
                             .body(wr_proxy::layers::full_body(Bytes::from("proxy error")))

@@ -1,5 +1,6 @@
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tracing::warn;
 
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, ReportMetricsRequest, RequestMetrics,
@@ -24,7 +25,7 @@ pub async fn flush_metrics(
                         .report_metrics(ReportMetricsRequest { metrics: batch })
                         .await
                     {
-                        eprintln!("[proxy] metrics flush failed: {e}");
+                        warn!(error = %e, "metrics flush failed");
                     }
                 }
             }

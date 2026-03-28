@@ -35,8 +35,14 @@ impl EngineConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        anyhow::ensure!(!self.listen_address.is_empty(), "listen_address is required");
-        anyhow::ensure!(!self.manager_address.is_empty(), "manager_address is required");
+        anyhow::ensure!(
+            !self.listen_address.is_empty(),
+            "listen_address is required"
+        );
+        anyhow::ensure!(
+            !self.manager_address.is_empty(),
+            "manager_address is required"
+        );
         anyhow::ensure!(!self.proxy_address.is_empty(), "proxy_address is required");
 
         for module in &self.modules {

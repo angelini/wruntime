@@ -10,7 +10,9 @@ pub struct ManagerConfig {
     pub engine_heartbeat_timeout_secs: u64,
 }
 
-fn default_heartbeat_timeout() -> u64 { 30 }
+fn default_heartbeat_timeout() -> u64 {
+    30
+}
 
 impl ManagerConfig {
     pub fn load(path: &str) -> Result<Self> {
@@ -23,7 +25,10 @@ impl ManagerConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        anyhow::ensure!(!self.listen_address.is_empty(), "listen_address is required");
+        anyhow::ensure!(
+            !self.listen_address.is_empty(),
+            "listen_address is required"
+        );
         anyhow::ensure!(
             self.engine_heartbeat_timeout_secs > 0,
             "engine_heartbeat_timeout_secs must be > 0"
