@@ -19,5 +19,7 @@ prost-types    = "0.13"
 serde          = { version = "1", features = ["derive"] }
 toml           = "0.8"
 wr-common      = { path = "../wr-common" }
+wr-engine      = { path = "../wr-engine" }
 wr-manager     = { path = "../wr-manager" }
 wr-proxy       = { path = "../wr-proxy" }
+serde_json     = "1"

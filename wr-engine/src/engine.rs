@@ -17,9 +17,9 @@ use wasmtime_wasi_http::{
     WasiHttpView,
 };
 
-use crate::config::{EngineConfig, ModuleConfig};
+use wr_engine::config::{EngineConfig, ModuleConfig};
 use crate::registry::{InboundRequest, ModuleRegistry};
-use crate::state::ModuleState;
+use wr_engine::state::ModuleState;
 
 pub struct EngineRunner {
     engine: Arc<Engine>,
@@ -37,7 +37,7 @@ impl EngineRunner {
         let db_pool = config
             .database
             .as_ref()
-            .map(|db| crate::pool::build_pool(&db.url, db.max_connections))
+            .map(|db| wr_engine::pool::build_pool(&db.url, db.max_connections))
             .transpose()?
             .map(Arc::new);
 
@@ -72,7 +72,7 @@ impl EngineRunner {
         let mut linker: Linker<ModuleState> = Linker::new(&self.engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
-        crate::db::wruntime::db::database::add_to_linker::<
+        wr_engine::db::wruntime::db::database::add_to_linker::<
             ModuleState,
             wasmtime::component::HasSelf<ModuleState>,
         >(&mut linker, |s| s)?;
