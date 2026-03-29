@@ -12,6 +12,16 @@ use wr_common::wruntime::{
 
 use crate::routing::CachedRoutingTable;
 
+/// Result of looking up a message descriptor by fully-qualified type name.
+pub enum MessageLookup {
+    /// Descriptor found.
+    Found(MessageDescriptor),
+    /// No schema has been synced yet for this (namespace, module) pair.
+    SchemaNotCached,
+    /// Schema is cached but the requested type name is not present.
+    TypeNotFound,
+}
+
 /// Outcome of a schema validation check.
 pub enum ValidationOutcome {
     /// Body decoded successfully against the expected message type.
@@ -65,6 +75,25 @@ impl SchemaCache {
             .await
             .insert((namespace.to_string(), module.to_string()), pool);
         Ok(())
+    }
+
+    /// Look up a message descriptor by its fully-qualified type name
+    /// (e.g. `"inventory.GetItemRequest"`) within the schema cached for
+    /// `(namespace, module)`.
+    pub async fn message_descriptor(
+        &self,
+        namespace: &str,
+        module: &str,
+        type_name: &str,
+    ) -> MessageLookup {
+        let pools = self.pools.read().await;
+        let Some(pool) = pools.get(&(namespace.to_string(), module.to_string())) else {
+            return MessageLookup::SchemaNotCached;
+        };
+        match pool.get_message_by_name(type_name) {
+            Some(desc) => MessageLookup::Found(desc),
+            None => MessageLookup::TypeNotFound,
+        }
     }
 
     /// Validate `body` against the protobuf schema registered for `(namespace, module)`.

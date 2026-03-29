@@ -33,6 +33,7 @@ use wr_manager::{service::Manager, state::new_state};
 // Re-export DB types so tests using `helpers::*` need no local `use` statements.
 pub use wr_engine::db::wruntime::db::database::{DbError, Host as DbHost, PgValue};
 pub use wr_engine::state::ModuleState;
+pub use wr_proxy::config::ExternalRoute;
 
 // ── Manager ───────────────────────────────────────────────────────────────────
 
@@ -133,6 +134,35 @@ pub async fn sync_table(
 /// Build and start a proxy with an empty schema cache (not yet synced); returns the bound address.
 pub async fn start_proxy(table: wr_proxy::routing::CachedRoutingTable) -> Result<SocketAddr> {
     start_proxy_with_schema(table, Arc::new(wr_proxy::schema::SchemaCache::new()), "").await
+}
+
+/// Build and start an external-facing ingress proxy on an ephemeral port.
+///
+/// The proxy strips all `x-wr-*` headers from incoming requests, matches the
+/// request path and method against `routes`, and — if a route matches — injects
+/// `x-wr-destination` before forwarding through the normal routing stack.
+/// Requests that match no route receive a 404 response.
+///
+/// Pass a pre-populated `schema_cache` when testing transcoding routes; pass
+/// an empty cache (`Arc::new(SchemaCache::new())`) for plain HTTP routes.
+pub async fn start_ingress_proxy(
+    table: wr_proxy::routing::CachedRoutingTable,
+    schema_cache: Arc<wr_proxy::schema::SchemaCache>,
+    routes: Vec<ExternalRoute>,
+) -> Result<SocketAddr> {
+    let (metrics_tx, _) = tokio::sync::mpsc::channel(100);
+    // External traffic bypasses schema validation — the IngressLayer handles
+    // transcoding (and therefore any necessary validation) directly.
+    let svc = tower::ServiceBuilder::new()
+        .layer(wr_proxy::layers::IngressLayer::new(routes, schema_cache))
+        .layer(wr_proxy::layers::MetricsLayer::new(metrics_tx))
+        .layer(wr_proxy::layers::RoutingLayer::new(table, ""))
+        .service(wr_proxy::layers::ForwardService::new());
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(proxy_serve(listener, svc));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    Ok(addr)
 }
 
 /// Fetch all schemas from the manager and populate `cache`.
@@ -370,6 +400,50 @@ pub async fn stub_engine(listener: TcpListener) {
             let _ = http1::Builder::new().serve_connection(io, svc).await;
         });
     }
+}
+
+/// Like `stub_engine` but responds with a fixed protobuf-encoded body.
+///
+/// Used when testing transcoding: the ingress layer will attempt to decode the
+/// response as the configured `response_type`.
+pub async fn proto_stub_engine(listener: TcpListener, response_body: bytes::Bytes) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
+        let body = response_body.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc = hyper::service::service_fn(move |_req: Request<hyper::body::Incoming>| {
+                let body = body.clone();
+                async move {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(body))
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = http1::Builder::new().serve_connection(io, svc).await;
+        });
+    }
+}
+
+/// Spawn a `proto_stub_engine`; returns the engine's HTTP address and a shutdown sender.
+pub async fn spawn_proto_stub_engine(
+    response_body: bytes::Bytes,
+) -> Result<(String, oneshot::Sender<()>)> {
+    let (tx, rx) = oneshot::channel::<()>();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = rx => {}
+            _ = proto_stub_engine(listener, response_body) => {}
+        }
+    });
+    Ok((addr, tx))
 }
 
 /// Like `stub_engine` but responds with a fixed `id` string so callers can

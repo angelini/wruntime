@@ -14,6 +14,44 @@ pub struct ProxyConfig {
     pub cache: CacheConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Optional external-facing listener with a restricted set of public routes.
+    pub external: Option<ExternalConfig>,
+}
+
+/// Configuration for the external-facing HTTP listener.
+#[derive(Deserialize, Clone)]
+pub struct ExternalConfig {
+    /// TCP address to bind the external listener, e.g. "0.0.0.0:8080"
+    pub listen_address: String,
+    /// Routes accessible to external callers.
+    #[serde(default)]
+    pub routes: Vec<ExternalRoute>,
+}
+
+/// A single publicly-exposed route mapping an HTTP path to an internal module.
+#[derive(Deserialize, Clone, Default)]
+pub struct ExternalRoute {
+    /// URL path pattern, e.g. "/items" or "/items/{id}".
+    /// Segments wrapped in `{braces}` match any single path segment.
+    pub path: String,
+    /// Allowed HTTP methods (case-insensitive). Empty means all methods are allowed.
+    #[serde(default)]
+    pub methods: Vec<String>,
+    /// Target module name.
+    pub module: String,
+    /// Target namespace.
+    pub namespace: String,
+    /// gRPC method path to forward to, e.g. "/inventory.InventoryService/GetItem".
+    /// When set together with `request_type` and `response_type`, the ingress
+    /// layer transcodes the JSON request body to protobuf before forwarding and
+    /// transcodes the protobuf response back to JSON before returning.
+    pub grpc_path: Option<String>,
+    /// Fully-qualified protobuf message type for the request body,
+    /// e.g. "inventory.GetItemRequest". Required when `grpc_path` is set.
+    pub request_type: Option<String>,
+    /// Fully-qualified protobuf message type for the response body,
+    /// e.g. "inventory.GetItemResponse". Required when `grpc_path` is set.
+    pub response_type: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -89,6 +127,40 @@ impl ProxyConfig {
             self.metrics.queue_depth > 0,
             "metrics.queue_depth must be > 0"
         );
+        if let Some(ext) = &self.external {
+            anyhow::ensure!(
+                !ext.listen_address.is_empty(),
+                "external.listen_address is required"
+            );
+            for (i, route) in ext.routes.iter().enumerate() {
+                anyhow::ensure!(
+                    !route.path.is_empty(),
+                    "external.routes[{i}].path is required"
+                );
+                anyhow::ensure!(
+                    !route.module.is_empty(),
+                    "external.routes[{i}].module is required"
+                );
+                anyhow::ensure!(
+                    !route.namespace.is_empty(),
+                    "external.routes[{i}].namespace is required"
+                );
+                let has_grpc = route.grpc_path.is_some();
+                let has_req = route.request_type.is_some();
+                let has_resp = route.response_type.is_some();
+                anyhow::ensure!(
+                    has_grpc == has_req && has_req == has_resp,
+                    "external.routes[{i}]: grpc_path, request_type, and response_type \
+                     must all be set together or all omitted"
+                );
+                if let Some(p) = &route.grpc_path {
+                    anyhow::ensure!(
+                        p.starts_with('/'),
+                        "external.routes[{i}].grpc_path must start with '/'"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }

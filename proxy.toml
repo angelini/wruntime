@@ -11,3 +11,21 @@ schema_ttl_secs        = 60
 [metrics]
 flush_interval_secs = 10
 queue_depth         = 1000
+
+# Optional: expose a subset of routes to external callers on a separate port.
+# All x-wr-* headers are stripped from incoming requests before routing.
+#
+# [external]
+# listen_address = "0.0.0.0:8080"
+#
+# [[external.route]]
+# path      = "/items"
+# methods   = ["GET", "POST"]
+# module    = "inventory"
+# namespace = "ecommerce"
+#
+# [[external.route]]
+# path      = "/items/{id}"
+# methods   = ["GET"]
+# module    = "inventory"
+# namespace = "ecommerce"

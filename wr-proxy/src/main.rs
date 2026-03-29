@@ -10,7 +10,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
-use http_body_util::{combinators::BoxBody, Full};
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
@@ -18,7 +17,8 @@ use tokio::sync::mpsc;
 use tower::{Service, ServiceBuilder};
 
 use layers::{
-    ForwardService, MetricsLayer, ResBody, RoutingLayer, SchemaValidationLayer, TracingLayer,
+    ForwardService, IngressLayer, MetricsLayer, ResBody, RoutingLayer, SchemaValidationLayer,
+    TracingLayer,
 };
 use tracing::{error, info, warn};
 use wr_common::wruntime::manager_service_client::ManagerServiceClient;
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
         config.metrics.flush_interval_secs,
     ));
 
-    // ── Tower service stack ───────────────────────────────────────────────
+    // ── Internal Tower service stack ──────────────────────────────────────
     //
     //   TracingLayer          ← root OTel span per request
     //     └─ MetricsLayer
@@ -70,29 +70,75 @@ async fn main() -> Result<()> {
     //               └─ RoutingLayer
     //                    └─ ForwardService
     //
-    let svc = ServiceBuilder::new()
+    let internal_svc = ServiceBuilder::new()
         .layer(TracingLayer)
-        .layer(MetricsLayer::new(metrics_tx))
-        .layer(SchemaValidationLayer::new(schema_cache))
+        .layer(MetricsLayer::new(metrics_tx.clone()))
+        .layer(SchemaValidationLayer::new(schema_cache.clone()))
         .layer(RoutingLayer::new(
-            routing_table,
+            routing_table.clone(),
             config.node.proxy_address.clone(),
         ))
         .service(ForwardService::new());
 
-    // ── TCP listener ──────────────────────────────────────────────────────
-    let listener = TcpListener::bind(&config.listen_address).await?;
-    info!(address = %config.listen_address, "proxy listening");
+    let internal_listener = TcpListener::bind(&config.listen_address).await?;
+    info!(address = %config.listen_address, "proxy listening (internal)");
+    tokio::spawn(accept_loop(internal_listener, internal_svc));
 
+    // ── External Tower service stack (optional) ───────────────────────────
+    //
+    //   IngressLayer          ← strips x-wr-* headers, matches public routes,
+    //     |                     injects x-wr-destination + x-wr-source: external
+    //     └─ TracingLayer
+    //          └─ MetricsLayer
+    //               └─ SchemaValidationLayer
+    //                    └─ RoutingLayer
+    //                         └─ ForwardService
+    //
+    if let Some(ext) = &config.external {
+        // External traffic is plain HTTP, not protobuf-over-proxy, so schema
+        // validation is omitted from this stack.
+        let external_svc = ServiceBuilder::new()
+            .layer(IngressLayer::new(ext.routes.clone(), schema_cache))
+            .layer(TracingLayer)
+            .layer(MetricsLayer::new(metrics_tx))
+            .layer(RoutingLayer::new(
+                routing_table,
+                config.node.proxy_address.clone(),
+            ))
+            .service(ForwardService::new());
+
+        let external_listener = TcpListener::bind(&ext.listen_address).await?;
+        info!(address = %ext.listen_address, "proxy listening (external)");
+        tokio::spawn(accept_loop(external_listener, external_svc));
+    }
+
+    // ── Wait for shutdown signal ──────────────────────────────────────────
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
 
+    tokio::select! {
+        _ = sigint.recv()  => {},
+        _ = sigterm.recv() => {},
+    }
+    Ok(())
+}
+
+/// Accepts connections on `listener` and spawns a task per connection that
+/// drives `svc` for each HTTP/1.1 request.
+async fn accept_loop<S>(listener: TcpListener, svc: S)
+where
+    S: Service<Request<Bytes>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Error: std::fmt::Display + Send + 'static,
+    S::Future: Send + 'static,
+{
     loop {
-        let (stream, peer_addr) = tokio::select! {
-            res = listener.accept() => res?,
-            _ = sigint.recv()  => break,
-            _ = sigterm.recv() => break,
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "accept error");
+                continue;
+            }
         };
         let svc = svc.clone();
 
@@ -108,7 +154,10 @@ async fn main() -> Result<()> {
                             Ok(c) => c.to_bytes(),
                             Err(e) => {
                                 warn!(error = %e, "body read error");
-                                return Ok::<_, Infallible>(bad_request("failed to read body"));
+                                return Ok::<_, Infallible>(layers::error_response(
+                                    StatusCode::BAD_REQUEST,
+                                    "failed to read body",
+                                ));
                             }
                         };
 
@@ -116,7 +165,10 @@ async fn main() -> Result<()> {
                             Ok(resp) => Ok::<_, Infallible>(resp),
                             Err(e) => {
                                 error!(error = %e, "service error");
-                                Ok(gateway_error("internal proxy error"))
+                                Ok(layers::error_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    "internal proxy error",
+                                ))
                             }
                         }
                     }
@@ -127,19 +179,4 @@ async fn main() -> Result<()> {
             }
         });
     }
-    Ok(())
-}
-
-fn bad_request(msg: &str) -> Response<ResBody> {
-    Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .body(BoxBody::new(Full::new(Bytes::from(msg.to_string()))))
-        .unwrap()
-}
-
-fn gateway_error(msg: &str) -> Response<ResBody> {
-    Response::builder()
-        .status(StatusCode::BAD_GATEWAY)
-        .body(BoxBody::new(Full::new(Bytes::from(msg.to_string()))))
-        .unwrap()
 }

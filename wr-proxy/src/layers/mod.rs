@@ -1,10 +1,12 @@
 mod forward;
+mod ingress;
 mod metrics;
 mod routing;
 mod schema;
 mod tracing;
 
 pub use forward::ForwardService;
+pub use ingress::IngressLayer;
 pub use metrics::MetricsLayer;
 pub use routing::RoutingLayer;
 pub use schema::SchemaValidationLayer;
