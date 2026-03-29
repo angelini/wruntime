@@ -162,9 +162,9 @@ where
             if candidate_addrs.is_empty() {
                 let msg = match requested_version {
                     Some(v) => format!(
-                        "no route for module '{dest_namespace}.{module_name}' version '{v}'"
+                        "no route for module '{module_name}.{dest_namespace}' version '{v}'"
                     ),
-                    None => format!("no route for module '{dest_namespace}.{module_name}'"),
+                    None => format!("no route for module '{module_name}.{dest_namespace}'"),
                 };
                 span.record("otel.status_code", "ERROR");
                 return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE, &msg));

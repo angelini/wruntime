@@ -144,7 +144,7 @@ fn method_not_found_error(detail: &str, source: &str, destination: &str) -> Resp
 fn schema_not_cached_error(module: &str, namespace: &str) -> Response<ResBody> {
     let body = serde_json::json!({
         "error":  "schema_not_cached",
-        "detail": format!("schema for {namespace}.{module} has not been synced yet"),
+        "detail": format!("schema for {module}.{namespace} has not been synced yet"),
         "module": module,
         "namespace": namespace,
     })

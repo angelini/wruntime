@@ -36,7 +36,7 @@ pub async fn serve(addr: &str, registry: ModuleRegistry) -> Result<()> {
 
                     let span = info_span!(
                         "engine.dispatch",
-                        otel.name                 = format!("{method} {namespace}.{module}"),
+                        otel.name                 = format!("{method} {module}.{namespace}"),
                         wr.namespace              = %namespace,
                         wr.module                 = %module,
                         wr.version                = %version,
@@ -117,7 +117,7 @@ async fn handle(
         None => {
             return err(
                 StatusCode::NOT_FOUND,
-                &format!("module '{namespace}.{module}@{version}' not loaded"),
+                &format!("module '{module}.{namespace}@{version}' not loaded"),
             )
         }
     };

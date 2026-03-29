@@ -56,10 +56,10 @@ impl SchemaCache {
         schema_bytes: &[u8],
     ) -> anyhow::Result<()> {
         if schema_bytes.is_empty() {
-            anyhow::bail!("schema bytes for {namespace}.{module} must not be empty");
+            anyhow::bail!("schema bytes for {module}.{namespace} must not be empty");
         }
         let pool = DescriptorPool::decode(schema_bytes)
-            .map_err(|e| anyhow::anyhow!("bad FileDescriptorSet for {namespace}.{module}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("bad FileDescriptorSet for {module}.{namespace}: {e}"))?;
         self.pools
             .write()
             .await
@@ -93,7 +93,7 @@ impl SchemaCache {
         let Some(message_desc) = resolve_input_message(pool, path) else {
             return ValidationOutcome::MethodNotFound(format!(
                 "path '{path}' does not match any RPC in the schema for \
-                 {namespace}.{module} — all inter-service calls must use \
+                 {module}.{namespace} — all inter-service calls must use \
                  gRPC paths (/package.Service/Method)"
             ));
         };
@@ -101,7 +101,7 @@ impl SchemaCache {
         match DynamicMessage::decode(message_desc, body) {
             Ok(_) => ValidationOutcome::Pass,
             Err(e) => ValidationOutcome::Fail(format!(
-                "schema validation failed for {namespace}.{module}{path}: {e}"
+                "schema validation failed for {module}.{namespace}{path}: {e}"
             )),
         }
     }
