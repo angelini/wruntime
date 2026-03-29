@@ -83,19 +83,14 @@ db-init:
     echo "port = {{pg_port}}" >> {{pg_data}}/postgresql.conf
     @echo "Initialised — run 'just db-start' to start"
 
-# Start the local Postgres instance and create the test DB
-db-start-tests:
-    pg_ctl -D {{pg_data}} -l {{pg_data}}/postgres.log start
-    @until pg_isready -p {{pg_port}} -U postgres -q; do sleep 0.5; done
-    createdb -p {{pg_port}} -U postgres wruntime_test 2>/dev/null || true
-    @echo "Ready — WRUNTIME_TEST_DB_URL={{db_url}}/wruntime_test"
-
-# Start the local Postgres instance and create the example DB
-db-start-example:
+# Start the local Postgres instance and create the example and test DBs
+db-start:
     pg_ctl -D {{pg_data}} -l {{pg_data}}/postgres.log start
     @until pg_isready -p {{pg_port}} -U postgres -q; do sleep 0.5; done
     createdb -p {{pg_port}} -U postgres wruntime_example 2>/dev/null || true
+    createdb -p {{pg_port}} -U postgres wruntime_test 2>/dev/null || true
     @echo "Ready — WRUNTIME_EXAMPLE_DB_URL={{db_url}}/wruntime_example"
+    @echo "Ready — WRUNTIME_TEST_DB_URL={{db_url}}/wruntime_test"
 
 # Stop the local Postgres instance
 db-stop:
