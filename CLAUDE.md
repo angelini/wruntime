@@ -49,8 +49,8 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 
 ### Request Flow
 
-1. A WASM module makes an HTTP call to another module (e.g., `http://inventory.ecommerce/items`)
-2. `WasiHttpView` intercepts it, attaches `x-wr-source` / `x-wr-destination` (format: `module.namespace`) headers, rewrites the URI to point at `wr-proxy`
+1. A WASM module makes an HTTP call to another module (e.g., `http://ecommerce.inventory/items`)
+2. `WasiHttpView` intercepts it, attaches `x-wr-source` / `x-wr-destination` (format: `namespace.module`) headers, rewrites the URI to point at `wr-proxy`
 3. `wr-proxy` validates the body against a cached protobuf schema, resolves the destination engine from its cached routing table, injects `x-wr-module` / `x-wr-namespace` / `x-wr-version`, then forwards to the target `wr-engine`
 4. The destination `wr-engine` dispatches to the correct WASM instance via `ModuleRegistry` (round-robin across instances)
 
@@ -86,6 +86,6 @@ Each service reads a TOML config file. Examples: `manager.toml`, `proxy.toml`, `
 
 `ecommerce-example/` contains two WASM components (separate Cargo workspaces, excluded from the main workspace):
 - **inventory** — PostgreSQL-backed service (seed, stock check, buy, return)
-- **client** — drives 100 buy/return transactions against inventory via `http://inventory.ecommerce/...`
+- **client** — drives 100 buy/return transactions against inventory via `http://ecommerce.inventory/...`
 
 Multiple engine configs (`engine-inventory-1.toml`, `engine-inventory-2.toml`, `engine-client.toml`) demonstrate running several engine instances with load-balanced routing.

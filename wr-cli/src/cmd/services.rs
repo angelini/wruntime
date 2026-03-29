@@ -16,9 +16,9 @@ pub struct ServicesArgs {
 pub enum ServicesCommand {
     /// List all logical services derived from the routing table
     List,
-    /// Show routing rules for a specific service (format: module.namespace)
+    /// Show routing rules for a specific service (format: namespace.module)
     Get {
-        /// Service in the form module.namespace (e.g. order-service.payments)
+        /// Service in the form namespace.module (e.g. payments.order-service)
         service: String,
     },
 }
@@ -66,7 +66,7 @@ async fn list(manager: &str) -> Result<()> {
     let mut builder = Builder::new();
     builder.push_record(["Service", "Total", "Healthy", "Unhealthy"]);
     for ((ns, module), (healthy, unhealthy)) in &rows {
-        let service = format!("{module}.{ns}");
+        let service = format!("{ns}.{module}");
         let total = healthy + unhealthy;
         builder.push_record([
             service.as_str(),
@@ -121,9 +121,9 @@ async fn get(manager: &str, service: &str) -> Result<()> {
 
 fn parse_service(service: &str) -> Result<(&str, &str)> {
     match service.split_once('.') {
-        Some((module, ns)) => Ok((ns, module)),
+        Some((ns, module)) => Ok((ns, module)),
         None => bail!(
-            "Invalid service format '{}'. Expected module.namespace (e.g. order-service.payments)",
+            "Invalid service format '{}'. Expected namespace.module (e.g. payments.order-service)",
             service
         ),
     }

@@ -24,12 +24,12 @@ impl wr_sdk::ServiceGuest for Component {
         let body_bytes = read_body(request.consume().unwrap());
 
         let (status, body) = match (method, path.as_str()) {
-            (Method::Post, "/ecommerce.InventoryService/Seed") => handle_seed(),
-            (Method::Post, "/ecommerce.InventoryService/GetStock") => {
+            (Method::Post, "/ecommerce.inventory/Seed") => handle_seed(),
+            (Method::Post, "/ecommerce.inventory/GetStock") => {
                 handle_get_stock(&body_bytes)
             }
-            (Method::Post, "/ecommerce.InventoryService/Buy") => handle_buy(&body_bytes),
-            (Method::Post, "/ecommerce.InventoryService/Return") => handle_return(&body_bytes),
+            (Method::Post, "/ecommerce.inventory/Buy") => handle_buy(&body_bytes),
+            (Method::Post, "/ecommerce.inventory/Return") => handle_return(&body_bytes),
             _ => err_body(404, &format!("no handler for {path}")),
         };
 

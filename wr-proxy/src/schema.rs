@@ -122,8 +122,8 @@ impl SchemaCache {
         let Some(message_desc) = resolve_input_message(pool, path) else {
             return ValidationOutcome::MethodNotFound(format!(
                 "path '{path}' does not match any RPC in the schema for \
-                 {module}.{namespace} — all inter-service calls must use \
-                 gRPC paths (/package.Service/Method)"
+                 {namespace}.{module} — all inter-service calls must use \
+                 paths of the form /{namespace}.{module}/MethodName"
             ));
         };
 
@@ -218,12 +218,13 @@ pub async fn sync_schemas(
     }
 }
 
-/// Parse a gRPC path (`/package.ServiceName/MethodName`) and return the input
-/// `MessageDescriptor` for that RPC.
+/// Parse a path (`/{namespace}.{module}/MethodName`) and return the input
+/// `MessageDescriptor` for that RPC by searching all services in the pool for
+/// a method whose name matches the final path segment.
 fn resolve_input_message(pool: &DescriptorPool, path: &str) -> Option<MessageDescriptor> {
     let path = path.trim_start_matches('/');
-    let (service_name, method_name) = path.split_once('/')?;
-    let service = pool.get_service_by_name(service_name)?;
-    let method = service.methods().find(|m| m.name() == method_name)?;
-    Some(method.input())
+    let (_, method_name) = path.split_once('/')?;
+    pool.services()
+        .find_map(|s| s.methods().find(|m| m.name() == method_name))
+        .map(|m| m.input())
 }

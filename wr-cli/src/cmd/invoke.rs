@@ -8,7 +8,7 @@ pub struct InvokeArgs {
     #[arg(long, env = "WR_PROXY", default_value = "http://127.0.0.1:9001")]
     pub proxy: String,
 
-    /// Destination module URL, e.g. http://inventory.ecommerce/seed
+    /// Destination module URL, e.g. http://ecommerce.inventory/seed
     #[arg(long)]
     pub destination: String,
 

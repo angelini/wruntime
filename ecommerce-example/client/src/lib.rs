@@ -15,7 +15,7 @@ impl wr_sdk::RunGuest for Component {
     fn run() {
         wr_sdk::log::log("client starting");
 
-        let client = InventoryServiceClient::new("inventory.ecommerce");
+        let client = InventoryServiceClient::new("ecommerce.inventory");
 
         // Seed inventory — idempotent (ON CONFLICT DO NOTHING in inventory service).
         match client.seed(proto::SeedRequest {}) {

@@ -41,16 +41,18 @@ pub struct ExternalRoute {
     pub module: String,
     /// Target namespace.
     pub namespace: String,
-    /// gRPC method path to forward to, e.g. "/inventory.InventoryService/GetItem".
+    /// RPC method path to forward to, e.g. "/ecommerce.inventory/GetItem".
+    /// Uses the `{namespace}.{module}/MethodName` format, consistent with the
+    /// HTTP hostname used for inter-module addressing.
     /// When set together with `request_type` and `response_type`, the ingress
     /// layer transcodes the JSON request body to protobuf before forwarding and
     /// transcodes the protobuf response back to JSON before returning.
     pub grpc_path: Option<String>,
     /// Fully-qualified protobuf message type for the request body,
-    /// e.g. "inventory.GetItemRequest". Required when `grpc_path` is set.
+    /// e.g. "ecommerce.GetItemRequest". Required when `grpc_path` is set.
     pub request_type: Option<String>,
     /// Fully-qualified protobuf message type for the response body,
-    /// e.g. "inventory.GetItemResponse". Required when `grpc_path` is set.
+    /// e.g. "ecommerce.GetItemResponse". Required when `grpc_path` is set.
     pub response_type: Option<String>,
 }
 

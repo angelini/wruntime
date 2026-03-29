@@ -74,7 +74,7 @@ where
 
         Box::pin(async move {
             // Extract destination module name and namespace from x-wr-destination.
-            // Expected host format: "{service}.{namespace}"
+            // Expected host format: "{namespace}.{service}"
             let dest_uri: Option<http::Uri> = req
                 .headers()
                 .get("x-wr-destination")
@@ -86,12 +86,12 @@ where
                 .and_then(|u: &http::Uri| u.host())
                 .unwrap_or("");
 
-            let (module_name, dest_namespace) = match host.split_once('.') {
-                Some((svc, ns)) => (svc.to_string(), ns.to_string()),
+            let (dest_namespace, module_name) = match host.split_once('.') {
+                Some((ns, svc)) => (ns.to_string(), svc.to_string()),
                 None => {
                     let msg = format!(
                         "destination host '{host}' must use the format \
-                         '{{service}}.{{namespace}}' — namespace is required"
+                         '{{namespace}}.{{service}}' — namespace is required"
                     );
                     return Ok(error_response(StatusCode::BAD_REQUEST, &msg));
                 }

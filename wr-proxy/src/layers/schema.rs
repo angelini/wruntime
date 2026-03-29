@@ -74,12 +74,12 @@ where
                 let host = dest_uri.host().unwrap_or("");
                 let path = dest_uri.path().to_string();
 
-                // host format is "{service}.{namespace}"
+                // host format is "{namespace}.{service}"
                 // If there is no dot the destination is malformed — pass
                 // through so the routing layer can return a 400.
-                let Some((module, namespace)) = host
+                let Some((namespace, module)) = host
                     .split_once('.')
-                    .map(|(s, n)| (s.to_string(), n.to_string()))
+                    .map(|(ns, s)| (ns.to_string(), s.to_string()))
                 else {
                     return inner.call(req).await;
                 };

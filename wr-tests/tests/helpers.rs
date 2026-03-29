@@ -298,13 +298,13 @@ pub async fn proxy_get(
     destination_module: &str,
     version: Option<&str>,
 ) -> Result<(StatusCode, String)> {
-    // Use the PingService RPC path that matches minimal_file_descriptor_set().
-    const PATH: &str = "/test.PingService/Ping";
+    // Path uses {namespace}.{module}/Method format, consistent with the HTTP hostname.
+    let path = format!("/{namespace}.{destination_module}/Ping");
     let mut builder = Request::builder()
-        .uri(format!("http://{proxy_addr}{PATH}"))
+        .uri(format!("http://{proxy_addr}{path}"))
         .header(
             "x-wr-destination",
-            format!("http://{destination_module}.{namespace}{PATH}"),
+            format!("http://{namespace}.{destination_module}{path}"),
         )
         .header("x-wr-source", "test-caller");
     if let Some(v) = version {

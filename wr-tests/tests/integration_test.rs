@@ -203,7 +203,7 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
     let (status, body) = proxy_get(proxy, "store", "inventory-service", Some("1.0.0")).await?;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains("/test"),
+        body.contains("/store.inventory-service"),
         "expected stub to echo request path, got: {body}"
     );
 
@@ -254,7 +254,7 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
         .uri(format!("http://{proxy_addr}/test.PingService/Ping"))
         .header(
             "x-wr-destination",
-            "http://ping-service.svc-ns/test.PingService/Ping",
+            "http://svc-ns.ping-service/test.PingService/Ping",
         )
         .header("x-wr-source", "caller-service")
         .body(Full::new(invalid_protobuf()))?;
@@ -298,7 +298,7 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
         .uri(format!("http://{proxy_addr}/test.PingService/Ping"))
         .header(
             "x-wr-destination",
-            "http://ping-service.svc-ns/test.PingService/Ping",
+            "http://svc-ns.ping-service/test.PingService/Ping",
         )
         .header("x-wr-source", "caller-service")
         .body(Full::new(valid_ping_request()))?;
@@ -1407,7 +1407,7 @@ async fn test_cross_node_routing() -> Result<()> {
 
 // ── external ingress tests ────────────────────────────────────────────────────
 
-/// Spin up a manager + stub engine registered as `module.namespace`, then start
+/// Spin up a manager + stub engine registered as `namespace.module`, then start
 /// an ingress proxy with the given `routes`.  Returns `(ingress_addr, engine_shutdown)`.
 async fn ingress_fixture(
     module: &str,
@@ -1538,7 +1538,7 @@ async fn test_external_route_method_filter() -> Result<()> {
 
 #[tokio::test]
 async fn test_external_route_strips_spoofed_internal_headers() -> Result<()> {
-    // Route /items → inventory.ecommerce.
+    // Route /items → ecommerce.inventory.
     // A malicious caller also sends x-wr-destination pointing to a non-existent
     // module.  The ingress layer must strip it so routing uses the configured
     // destination, not the spoofed one.
@@ -1614,7 +1614,7 @@ async fn transcoding_fixture() -> Result<(std::net::SocketAddr, tokio::sync::one
         methods: vec!["POST".into()],
         module: "ping".into(),
         namespace: "test".into(),
-        grpc_path: Some("/test.PingService/Ping".into()),
+        grpc_path: Some("/test.ping/Ping".into()),
         request_type: Some("test.PingRequest".into()),
         response_type: Some("test.PingResponse".into()),
     }];
@@ -1701,7 +1701,7 @@ async fn test_transcoding_schema_not_cached_returns_503() -> Result<()> {
         methods: vec![],
         module: "ping".into(),
         namespace: "test".into(),
-        grpc_path: Some("/test.PingService/Ping".into()),
+        grpc_path: Some("/test.ping/Ping".into()),
         request_type: Some("test.PingRequest".into()),
         response_type: Some("test.PingResponse".into()),
     }];

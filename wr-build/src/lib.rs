@@ -22,6 +22,10 @@
 ///     pub fn seed(&self, req: SeedRequest) -> Result<SeedResponse, String> { ... }
 /// }
 /// ```
+///
+/// The RPC path is derived at runtime from the authority (e.g. `ecommerce.inventory`),
+/// producing paths like `/ecommerce.inventory/Seed`.  This keeps the path prefix
+/// consistent with the HTTP hostname used for inter-module addressing.
 pub struct WrClientGenerator;
 
 impl prost_build::ServiceGenerator for WrClientGenerator {
@@ -40,10 +44,7 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
         buf.push_str("    }\n");
 
         for method in &service.methods {
-            let rpc_path = format!(
-                "/{}.{}/{}",
-                service.package, service.proto_name, method.proto_name
-            );
+            let proto_name = &method.proto_name;
             let method_name = &method.name;
             let input = &method.input_type;
             let output = &method.output_type;
@@ -52,9 +53,14 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
                 "\n    pub fn {method_name}(&self, req: {input}) -> Result<{output}, String> {{\n"
             ));
             buf.push_str("        let body = prost::Message::encode_to_vec(&req);\n");
+            // Path is /{authority}/{MethodName} — e.g. /ecommerce.inventory/Seed.
+            // This mirrors the HTTP hostname format so both use the same namespace.module identifier.
             buf.push_str(&format!(
-                "        let (status, resp_bytes) = wr_sdk::http::http_rpc(&self.authority, \"{rpc_path}\", &body)?;\n"
+                "        let path = format!(\"/{{}}/{{}}\", self.authority, \"{proto_name}\");\n"
             ));
+            buf.push_str(
+                "        let (status, resp_bytes) = wr_sdk::http::http_rpc(&self.authority, &path, &body)?;\n",
+            );
             buf.push_str("        if status != 200 {\n");
             buf.push_str("            return Err(format!(\"rpc error: HTTP {status}\"));\n");
             buf.push_str("        }\n");

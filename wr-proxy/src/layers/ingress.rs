@@ -165,7 +165,7 @@ where
                     // Inject routing headers; gRPC path goes into x-wr-destination so
                     // the schema validation layer (on the internal stack) can resolve
                     // the RPC method if it's present.
-                    let dest = format!("http://{module}.{namespace}{grpc_path}");
+                    let dest = format!("http://{namespace}.{module}{grpc_path}");
                     if let Ok(v) = http::HeaderValue::from_str(&dest) {
                         parts.headers.insert("x-wr-destination", v);
                     }
@@ -212,7 +212,7 @@ where
 
                 // ── Plain HTTP pass-through ───────────────────────────────────
                 _ => {
-                    let dest = format!("http://{module}.{namespace}/");
+                    let dest = format!("http://{namespace}.{module}/");
                     if let Ok(v) = http::HeaderValue::from_str(&dest) {
                         parts.headers.insert("x-wr-destination", v);
                     }
