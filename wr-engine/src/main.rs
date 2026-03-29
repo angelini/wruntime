@@ -39,6 +39,7 @@ async fn main() -> Result<()> {
     // ── Load WASM modules ─────────────────────────────────────────────────
     let registry = registry::ModuleRegistry::new();
     let runner = engine::EngineRunner::new(config.clone())?;
+    runner.provision_schemas().await?;
     runner.load_modules(&registry).await?;
     info!("all modules loaded");
 

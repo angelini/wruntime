@@ -147,6 +147,7 @@ impl Host for ModuleState {
                 ))
             }
         };
+        let schema = self.db_schema.clone();
 
         tokio::task::block_in_place(|| {
             Handle::current().block_on(async move {
@@ -154,6 +155,16 @@ impl Host for ModuleState {
                     .get()
                     .await
                     .map_err(|e| DbError::Connection(e.to_string()))?;
+
+                if let Some(s) = &schema {
+                    client
+                        .execute(
+                            &format!("SET search_path = \"{s}\", public"),
+                            &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
+                        )
+                        .await
+                        .map_err(|e| DbError::Connection(e.to_string()))?;
+                }
 
                 let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
                 let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -178,6 +189,7 @@ impl Host for ModuleState {
                 ))
             }
         };
+        let schema = self.db_schema.clone();
 
         tokio::task::block_in_place(|| {
             Handle::current().block_on(async move {
@@ -185,6 +197,16 @@ impl Host for ModuleState {
                     .get()
                     .await
                     .map_err(|e| DbError::Connection(e.to_string()))?;
+
+                if let Some(s) = &schema {
+                    client
+                        .execute(
+                            &format!("SET search_path = \"{s}\", public"),
+                            &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
+                        )
+                        .await
+                        .map_err(|e| DbError::Connection(e.to_string()))?;
+                }
 
                 let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
                 let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -207,6 +229,7 @@ impl Host for ModuleState {
                 ))
             }
         };
+        let schema = self.db_schema.clone();
 
         let client = tokio::task::block_in_place(|| {
             Handle::current().block_on(async move {
@@ -218,6 +241,15 @@ impl Host for ModuleState {
                     .execute("BEGIN", &[])
                     .await
                     .map_err(|e| DbError::Query(e.to_string()))?;
+                if let Some(s) = &schema {
+                    client
+                        .execute(
+                            &format!("SET search_path = \"{s}\", public"),
+                            &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
+                        )
+                        .await
+                        .map_err(|e| DbError::Connection(e.to_string()))?;
+                }
                 Ok::<_, DbError>(client)
             })
         })?;
@@ -422,7 +454,7 @@ mod tests {
 
     #[test]
     fn test_query_returns_error_when_no_pool() {
-        let mut state = ModuleState::new("test".into(), "test".into(), proxy_uri(), None);
+        let mut state = ModuleState::new("test".into(), "test".into(), proxy_uri(), None, None);
         let result = state.query("SELECT 1".into(), vec![]);
         assert!(
             matches!(result, Err(DbError::Connection(_))),
@@ -432,7 +464,7 @@ mod tests {
 
     #[test]
     fn test_execute_returns_error_when_no_pool() {
-        let mut state = ModuleState::new("test".into(), "test".into(), proxy_uri(), None);
+        let mut state = ModuleState::new("test".into(), "test".into(), proxy_uri(), None, None);
         let result = state.execute("SELECT 1".into(), vec![]);
         assert!(
             matches!(result, Err(DbError::Connection(_))),
@@ -442,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_begin_transaction_returns_error_when_no_pool() {
-        let mut state = ModuleState::new("test".into(), "test".into(), proxy_uri(), None);
+        let mut state = ModuleState::new("test".into(), "test".into(), proxy_uri(), None, None);
         let result = state.begin_transaction();
         assert!(
             matches!(result, Err(DbError::Connection(_))),
@@ -470,6 +502,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             Some(Arc::new(pool)),
+            None,
         );
 
         let rows = state
@@ -497,6 +530,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             Some(Arc::new(pool)),
+            None,
         );
 
         // DDL returns 0 rows affected.
@@ -525,6 +559,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             Some(Arc::new(pool)),
+            None,
         );
 
         let rows = state
@@ -554,6 +589,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             Some(Arc::new(pool)),
+            None,
         );
 
         let rows = state
@@ -597,6 +633,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             Some(Arc::new(pool)),
+            None,
         );
 
         // Setup: create a temp table outside the transaction.
@@ -652,6 +689,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             Some(Arc::new(pool)),
+            None,
         );
 
         Host::execute(
@@ -704,6 +742,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             Some(Arc::new(pool)),
+            None,
         );
 
         Host::execute(

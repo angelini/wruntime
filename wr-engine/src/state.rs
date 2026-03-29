@@ -21,6 +21,9 @@ pub struct ModuleState {
     proxy_uri: hyper::Uri,
     /// Shared connection pool, present when the module has DB access enabled.
     pub db_pool: Option<Arc<Pool>>,
+    /// Postgres schema name for this module (`wr__{namespace}__{name}`).
+    /// Set when DB access is enabled; used to scope all queries to the module's schema.
+    pub db_schema: Option<String>,
 }
 
 impl ModuleState {
@@ -29,6 +32,7 @@ impl ModuleState {
         module_namespace: String,
         proxy_uri: hyper::Uri,
         db_pool: Option<Arc<Pool>>,
+        db_schema: Option<String>,
     ) -> Self {
         Self {
             wasi: WasiCtxBuilder::new().inherit_stdio().build(),
@@ -38,6 +42,7 @@ impl ModuleState {
             module_namespace,
             proxy_uri,
             db_pool,
+            db_schema,
         }
     }
 }

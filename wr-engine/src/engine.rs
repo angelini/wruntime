@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use deadpool_postgres::Pool;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,12 +20,16 @@ use wasmtime_wasi_http::{
 
 use crate::registry::{InboundRequest, ModuleRegistry};
 use wr_engine::config::{EngineConfig, ModuleConfig};
+use wr_engine::pool::module_schema;
 use wr_engine::state::ModuleState;
 
 pub struct EngineRunner {
     engine: Arc<Engine>,
     config: EngineConfig,
+    /// Admin pool used only for schema provisioning; shares creds with module pools.
     db_pool: Option<Arc<Pool>>,
+    /// One pool per DB-enabled module, keyed by (namespace, name).
+    db_pools: HashMap<(String, String), Arc<Pool>>,
 }
 
 impl EngineRunner {
@@ -41,11 +46,52 @@ impl EngineRunner {
             .transpose()?
             .map(Arc::new);
 
+        let mut db_pools: HashMap<(String, String), Arc<Pool>> = HashMap::new();
+        if let Some(db) = &config.database {
+            for module in &config.modules {
+                if module.database {
+                    let pool = wr_engine::pool::build_pool(&db.url, db.max_connections)?;
+                    db_pools.insert(
+                        (module.namespace.clone(), module.name.clone()),
+                        Arc::new(pool),
+                    );
+                }
+            }
+        }
+
         Ok(Self {
             engine: Arc::new(engine),
             config,
             db_pool,
+            db_pools,
         })
+    }
+
+    /// For every DB-enabled module, ensure its Postgres schema exists.
+    /// Idempotent — safe to run on every startup.
+    pub async fn provision_schemas(&self) -> Result<()> {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        for module in &self.config.modules {
+            if !module.database {
+                continue;
+            }
+            let schema = module_schema(&module.namespace, &module.name);
+            let client = pool.get().await.context("failed to get DB connection for schema provisioning")?;
+            client
+                .execute(
+                    &format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""),
+                    &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
+                )
+                .await
+                .with_context(|| format!("failed to provision schema '{schema}'"))?;
+            info!(schema, "schema provisioned");
+        }
+
+        Ok(())
     }
 
     /// Load and spawn a task for every module listed in the config, registering
@@ -94,10 +140,15 @@ impl EngineRunner {
                     .await;
 
                 let engine = self.engine.clone();
-                let db_pool = if module_config.database {
-                    self.db_pool.clone()
+                let (db_pool, db_schema) = if module_config.database {
+                    let schema = module_schema(&module_namespace, &module_name);
+                    let pool = self
+                        .db_pools
+                        .get(&(module_namespace.clone(), module_name.clone()))
+                        .cloned();
+                    (pool, Some(schema))
                 } else {
-                    None
+                    (None, None)
                 };
                 tokio::spawn(http_handler_task(
                     engine,
@@ -106,21 +157,28 @@ impl EngineRunner {
                     module_name.clone(),
                     module_namespace.clone(),
                     db_pool,
+                    db_schema,
                     rx,
                 ));
             }
             Err(_) => {
                 // Fall back: spawn as a long-running task that calls `run`.
-                let db_pool = if module_config.database {
-                    self.db_pool.clone()
+                let (db_pool, db_schema) = if module_config.database {
+                    let schema = module_schema(&module_namespace, &module_name);
+                    let pool = self
+                        .db_pools
+                        .get(&(module_namespace.clone(), module_name.clone()))
+                        .cloned();
+                    (pool, Some(schema))
                 } else {
-                    None
+                    (None, None)
                 };
                 let state = ModuleState::new(
                     module_name.clone(),
                     module_namespace.clone(),
                     proxy_uri,
                     db_pool,
+                    db_schema,
                 );
                 let mut store = Store::new(&self.engine, state);
                 let instance = linker.instantiate_async(&mut store, &component).await?;
@@ -157,6 +215,7 @@ async fn http_handler_task(
     module_name: String,
     module_namespace: String,
     db_pool: Option<Arc<Pool>>,
+    db_schema: Option<String>,
     mut rx: mpsc::Receiver<InboundRequest>,
 ) {
     while let Some(inbound) = rx.recv().await {
@@ -166,6 +225,7 @@ async fn http_handler_task(
         let module_name = module_name.clone();
         let module_namespace = module_namespace.clone();
         let db_pool = db_pool.clone();
+        let db_schema = db_schema.clone();
 
         tokio::spawn(async move {
             if let Err(e) = dispatch_request(
@@ -175,6 +235,7 @@ async fn http_handler_task(
                 &module_name,
                 &module_namespace,
                 db_pool,
+                db_schema,
                 inbound,
             )
             .await
@@ -194,6 +255,7 @@ async fn dispatch_request(
     module_name: &str,
     module_namespace: &str,
     db_pool: Option<Arc<Pool>>,
+    db_schema: Option<String>,
     inbound: InboundRequest,
 ) -> Result<()> {
     let state = ModuleState::new(
@@ -201,6 +263,7 @@ async fn dispatch_request(
         module_namespace.to_string(),
         proxy_uri,
         db_pool,
+        db_schema,
     );
     let mut store = Store::new(engine, state);
     let proxy = pre.instantiate_async(&mut store).await?;

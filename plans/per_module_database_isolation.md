@@ -32,6 +32,53 @@ If stronger isolation is needed later, the role-per-module approach described in
 
 ---
 
+## Implementation Phases
+
+### Phase 1 — Foundation (no behavior change)
+
+Pure, side-effect-free scaffolding. Safe to merge independently; nothing calls the new code yet.
+
+- Add `module_schema()` helper (see §Changes/1)
+- Add `db_schema: Option<String>` to `ModuleState` (see §Changes/4), populated from `module_schema()` when `database = true`
+
+**Verification:** `cargo check` + unit test for `module_schema()` covering edge cases (hyphens, dots, mixed case).
+
+---
+
+### Phase 2 — Schema provisioning at startup
+
+Run `CREATE SCHEMA IF NOT EXISTS` for each DB-enabled module before accepting traffic. Idempotent; safe to run on every restart.
+
+- Implement engine startup sequence §Changes/7 steps (a) and (b)
+- Admin pool borrows the existing `[database]` URL — no config changes
+
+**Verification:** Start the engine against a real Postgres instance; inspect `\dn` to confirm schemas appear. Restart and confirm idempotency (no errors on second run).
+
+---
+
+### Phase 3 — Per-module pool + `search_path` enforcement
+
+Actually enforce isolation. Two sub-steps that can land together:
+
+1. Build a `HashMap<(namespace, name), Arc<Pool>>` at startup (§Changes/3); pass the correct pool into each `ModuleState`
+2. Issue `SET search_path = "<schema>", public` at the top of `Host::query`, `Host::execute`, and `Host::begin_transaction` (§Changes/5)
+
+**Verification:** Run the ecommerce example — `engine-inventory-1` and `engine-inventory-2` both resolve to `wr__ecommerce__inventory`; rows written by one instance are visible to the other.
+
+---
+
+### Phase 4 — Integration tests
+
+Cover correctness and regression.
+
+- Two in-process engines with distinct modules (`foo.bar`, `foo.other`), both using `WRUNTIME_TEST_DB_URL`
+- Assert `foo.other` cannot see `foo.bar`'s tables (query returns error or empty result)
+- Assert two instances of `foo.bar` share the same schema (cross-instance row visibility)
+
+See §Changes/8 for full test spec.
+
+---
+
 ## Changes Required
 
 ### 1. Schema naming helper (`wr-engine/src/pool.rs` or new `wr-engine/src/schema.rs`)

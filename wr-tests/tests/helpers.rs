@@ -421,5 +421,38 @@ pub fn db_state(pool_size: usize) -> Option<ModuleState> {
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
         Some(pool),
+        None,
+    ))
+}
+
+/// Build a `ModuleState` for a specific `(namespace, name)` pair, provisioning
+/// the module's Postgres schema (`wr__{namespace}__{name}`) if it does not
+/// already exist.
+///
+/// Returns `None` when `WRUNTIME_TEST_DB_URL` is absent so the calling test
+/// can skip DB-dependent assertions without a running Postgres instance.
+pub async fn db_state_for_module(
+    pool_size: usize,
+    namespace: &str,
+    name: &str,
+) -> Option<ModuleState> {
+    let url = std::env::var("WRUNTIME_TEST_DB_URL").ok()?;
+    let schema = wr_engine::pool::module_schema(namespace, name);
+    let pool = Arc::new(wr_engine::pool::build_pool(&url, pool_size).expect("build_pool"));
+    let client = pool
+        .get()
+        .await
+        .expect("get connection for schema provisioning");
+    client
+        .simple_query(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
+        .await
+        .expect("provision schema");
+    drop(client);
+    Some(ModuleState::new(
+        name.into(),
+        namespace.into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        Some(pool),
+        Some(schema),
     ))
 }

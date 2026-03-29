@@ -791,6 +791,7 @@ fn test_db_query_without_pool_returns_connection_error() {
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
         None,
+        None,
     );
     let err = state.query("SELECT 1".into(), vec![]).unwrap_err();
     assert!(
@@ -805,6 +806,7 @@ fn test_db_execute_without_pool_returns_connection_error() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
+        None,
         None,
     );
     let err = state
@@ -1090,4 +1092,74 @@ async fn test_manager_rejects_module_without_namespace() -> Result<()> {
 
     assert!(result.is_err(), "manager should reject empty namespace");
     Ok(())
+}
+
+// ── per-module DB schema isolation tests ──────────────────────────────────────
+//
+// These tests require WRUNTIME_TEST_DB_URL; they skip silently when it is absent.
+
+/// `foo.bar` and `foo.other` each get their own Postgres schema.
+/// A table created by `foo.bar` must not be visible to `foo.other`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_db_schema_isolation_between_modules() {
+    const TABLE: &str = "_wr_isol_items";
+
+    let Some(mut bar) = db_state_for_module(1, "foo", "bar").await else {
+        return;
+    };
+    let Some(mut other) = db_state_for_module(1, "foo", "other").await else {
+        return;
+    };
+
+    // Drop any table left by a previous test run.
+    let _ = DbHost::execute(&mut bar, format!("DROP TABLE IF EXISTS {TABLE}"), vec![]);
+
+    // foo.bar creates and populates its own table.
+    DbHost::execute(&mut bar, format!("CREATE TABLE {TABLE} (id INT4)"), vec![])
+        .expect("create table in foo.bar schema");
+    DbHost::execute(&mut bar, format!("INSERT INTO {TABLE} VALUES (1)"), vec![])
+        .expect("insert into foo.bar schema");
+
+    // foo.other's schema has no such table — the query must fail.
+    let result = DbHost::query(&mut other, format!("SELECT id FROM {TABLE}"), vec![]);
+    assert!(
+        result.is_err(),
+        "foo.other must not see foo.bar's table; got: {result:?}",
+    );
+
+    // Clean up.
+    DbHost::execute(&mut bar, format!("DROP TABLE {TABLE}"), vec![]).expect("drop");
+}
+
+/// Two engine instances of the same module share the same Postgres schema.
+/// A row written by instance 1 must be readable by instance 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_db_schema_shared_across_module_instances() {
+    const TABLE: &str = "_wr_shared_items";
+
+    // Two separate pools simulate two independent engine processes.
+    let Some(mut inst1) = db_state_for_module(1, "foo", "bar").await else {
+        return;
+    };
+    let Some(mut inst2) = db_state_for_module(1, "foo", "bar").await else {
+        return;
+    };
+
+    // Drop any table left by a previous test run.
+    let _ = DbHost::execute(&mut inst1, format!("DROP TABLE IF EXISTS {TABLE}"), vec![]);
+
+    // Instance 1 creates the table and inserts a row.
+    DbHost::execute(&mut inst1, format!("CREATE TABLE {TABLE} (val INT4)"), vec![])
+        .expect("create table");
+    DbHost::execute(&mut inst1, format!("INSERT INTO {TABLE} VALUES (42)"), vec![])
+        .expect("insert");
+
+    // Instance 2 reads from the same schema and must see the row.
+    let rows =
+        DbHost::query(&mut inst2, format!("SELECT val FROM {TABLE}"), vec![]).expect("query");
+    assert_eq!(rows.len(), 1, "instance 2 should see the row written by instance 1");
+    assert_eq!(rows[0].columns[0].value, PgValue::Int4(42));
+
+    // Clean up.
+    DbHost::execute(&mut inst1, format!("DROP TABLE {TABLE}"), vec![]).expect("drop");
 }
