@@ -29,6 +29,8 @@ enum Commands {
     Services(cmd::services::ServicesArgs),
     /// View aggregated request metrics
     Metrics(cmd::metrics::MetricsArgs),
+    /// Send an HTTP request through the proxy to a module
+    Invoke(cmd::invoke::InvokeArgs),
 }
 
 #[tokio::main]
@@ -39,5 +41,6 @@ async fn main() -> Result<()> {
         Commands::Engines(args) => cmd::engines::run(args, &cli.manager).await,
         Commands::Services(args) => cmd::services::run(args, &cli.manager).await,
         Commands::Metrics(args) => cmd::metrics::run(args, &cli.manager).await,
+        Commands::Invoke(args) => cmd::invoke::run(args).await,
     }
 }

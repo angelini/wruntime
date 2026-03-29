@@ -101,6 +101,17 @@ db-start-example:
 db-stop:
     pg_ctl -D {{pg_data}} stop
 
+# ── Ecommerce Example ─────────────────────────────────────────────────────────
+
+# Build WASM components for the ecommerce example
+build-example:
+    (cd ecommerce-example/inventory && cargo component build --release --target wasm32-wasip2)
+    (cd ecommerce-example/client && cargo component build --release --target wasm32-wasip2)
+
+# Run the full ecommerce example (requires Postgres — see `just db-start-example`)
+example:
+    bash ecommerce-example/run.sh
+
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 
 # Remove build artifacts

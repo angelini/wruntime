@@ -10,23 +10,19 @@ cd "$REPO_ROOT"
 DB_URL="${DB_URL:-${WRUNTIME_EXAMPLE_DB_URL:-postgres://localhost:5432/wruntime_example}}"
 echo "DB_URL: ${DB_URL}"
 
-# Substitute the DB URL into the engine configs if DB_URL is set.
+# Substitute the DB URL into the engine configs.
 update_db_url() {
     local file="$1"
     sed -i.bak "s|postgres://user:pass@localhost:5432/ecommerce|${DB_URL}|g" "$file"
     rm -f "${file}.bak"
 }
 
-# ── Build WASM components ──────────────────────────────────────────────────────
-echo "==> Building inventory..."
-(cd ecommerce-example/inventory && cargo component build --release --target wasm32-wasip2)
+# ── Build ──────────────────────────────────────────────────────────────────────
+echo "==> Building WASM components..."
+just build-example
 
-echo "==> Building client..."
-(cd ecommerce-example/client && cargo component build --release --target wasm32-wasip2)
-
-# ── Build host binaries ────────────────────────────────────────────────────────
 echo "==> Building host services..."
-cargo build --release -p wr-manager -p wr-proxy -p wr-engine
+just build-release
 
 # ── Apply DB URL to engine configs ────────────────────────────────────────────
 cp ecommerce-example/engine-inventory-1.toml /tmp/inv1.toml
@@ -38,14 +34,12 @@ update_db_url /tmp/inv2.toml
 echo "==> Starting manager on :9000"
 ./target/release/wr-manager manager.toml &
 MANAGER_PID=$!
-
 sleep 1
 
 # ── Start proxy ────────────────────────────────────────────────────────────────
 echo "==> Starting proxy on :9001"
 ./target/release/wr-proxy proxy.toml &
 PROXY_PID=$!
-
 sleep 1
 
 # ── Start inventory engines ────────────────────────────────────────────────────
@@ -61,17 +55,19 @@ INV2_PID=$!
 echo "==> Waiting for inventory engines to register..."
 sleep 3
 
-# ── Seed inventory via the proxy ───────────────────────────────────────────────
-# The proxy resolves "inventory.ecommerce" → engine running the inventory module.
-echo "==> Seeding inventory..."
-curl -sf -X POST http://127.0.0.1:9001/seed \
-    -H "x-wr-destination: http://inventory.ecommerce/seed" \
-    -H "x-wr-source: bootstrap" \
-    -H "x-wr-source-ns: ecommerce" \
-    -H "Content-Type: application/json" \
-    -d '{}' && echo " OK" || echo " (seed may already exist)"
+wr-cli engines list
+wr-cli services list
 
-# ── Start client engines ───────────────────────────────────────────────────────
+# ── Seed inventory via the proxy ───────────────────────────────────────────────
+echo "==> Seeding inventory..."
+wr-cli invoke \
+    --proxy http://127.0.0.1:9001 \
+    --destination http://inventory.ecommerce/seed \
+    --source bootstrap \
+    --source-ns ecommerce \
+    --body '{}' || echo " (seed may already exist)"
+
+# ── Start client engine ────────────────────────────────────────────────────────
 echo "==> Starting client engine on :9200 (3 concurrent clients)"
 ./target/release/wr-engine ecommerce-example/engine-client.toml &
 CLIENT_PID=$!
@@ -83,9 +79,10 @@ echo "  Proxy    : http://127.0.0.1:9001"
 echo "  Inventory: http://127.0.0.1:9100 + :9101 (2 engines, shared Postgres)"
 echo "  Clients  : http://127.0.0.1:9200 (client-a, client-b, client-c)"
 echo ""
-echo "Check stock: curl http://127.0.0.1:9001/stock/prod-001"
-echo "             -H 'x-wr-destination: http://inventory.ecommerce/stock/prod-001'"
-echo "             -H 'x-wr-source: cli' -H 'x-wr-source-ns: ecommerce'"
+echo "Inspect while running:"
+echo "  wr-cli engines list"
+echo "  wr-cli services list"
+echo "  wr-cli metrics"
 
 cleanup() {
     echo "==> Shutting down..."
@@ -95,3 +92,5 @@ trap cleanup EXIT INT TERM
 
 wait "$CLIENT_PID"
 echo "==> All clients finished."
+
+wr-cli metrics
