@@ -22,12 +22,12 @@ pub mod exports {
 
         /// Implement this trait and use `wr_sdk::export!` to register an HTTP
         /// handler module.
-        pub trait Guest {
+        pub trait ServiceGuest {
             fn handle(request: IncomingRequest, response_out: ResponseOutparam);
         }
 
         #[doc(hidden)]
-        pub unsafe fn _export_handle_cabi<T: Guest>(arg0: i32, arg1: i32) {
+        pub unsafe fn _export_handle_cabi<T: ServiceGuest>(arg0: i32, arg1: i32) {
             #[cfg(target_arch = "wasm32")]
             ::wit_bindgen_rt::run_ctors_once();
             T::handle(
@@ -38,8 +38,8 @@ pub mod exports {
     }
 }
 
-/// Convenience re-export of the HTTP handler `Guest` trait.
-pub use exports::incoming_handler::Guest;
+/// Convenience re-export of the HTTP handler `ServiceGuest` trait.
+pub use exports::incoming_handler::ServiceGuest;
 
 /// Implement this trait and use `wr_sdk::export_run!` to register a runner module
 /// (one that exports `run` rather than `wasi:http/incoming-handler`).
@@ -57,7 +57,7 @@ pub mod log;
 /// ```rust,ignore
 /// struct MyComponent;
 /// wr_sdk::export!(MyComponent with_types_in wr_sdk::bindings);
-/// impl wr_sdk::Guest for MyComponent { fn handle(...) { ... } }
+/// impl wr_sdk::ServiceGuest for MyComponent { fn handle(...) { ... } }
 /// ```
 #[macro_export]
 macro_rules! export {

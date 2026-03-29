@@ -16,7 +16,7 @@ use prost::Message;
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
-impl wr_sdk::Guest for Component {
+impl wr_sdk::ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         let method = request.method();
         let path = request.path_with_query().unwrap_or_default();
