@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 prost = "0.13"
-wr-sdk = { path = "../../wr-sdk" }
+wr-sdk = { path = "../../../wr-sdk" }
 wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
 
 [build-dependencies]
@@ -21,9 +21,10 @@ package = "ecommerce:inventory"
 world = "ecommerce:inventory/inventory"
 
 [package.metadata.component.target.dependencies]
-"wruntime:db" = { path = "../../wr-sdk/wit/deps/db.wit" }
-"wasi:http" = { path = "../../wr-sdk/wit/deps/http.wit" }
-"wasi:clocks" = { path = "../../wr-sdk/wit/deps/clocks.wit" }
-"wasi:io" = { path = "../../wr-sdk/wit/deps/io.wit" }
-"wasi:random" = { path = "../../wr-sdk/wit/deps/random.wit" }
-"wasi:cli" = { path = "../../wr-sdk/wit/deps/cli.wit" }
+"wruntime:db" = { path = "../../../wr-sdk/wit/deps/db.wit" }
+"wruntime:tracing" = { path = "../../../wr-sdk/wit/deps/tracing.wit" }
+"wasi:http" = { path = "../../../wr-sdk/wit/deps/http.wit" }
+"wasi:clocks" = { path = "../../../wr-sdk/wit/deps/clocks.wit" }
+"wasi:io" = { path = "../../../wr-sdk/wit/deps/io.wit" }
+"wasi:random" = { path = "../../../wr-sdk/wit/deps/random.wit" }
+"wasi:cli" = { path = "../../../wr-sdk/wit/deps/cli.wit" }

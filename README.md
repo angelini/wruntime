@@ -643,7 +643,7 @@ impl wr_sdk::RunGuest for Component {
 
 ```bash
 cargo component build --release
-# produces: target/wasm32-wasip1/release/inventory_service.wasm
+# produces: target/wasm32-wasip2/release/inventory_service.wasm
 ```
 
 Copy the `.wasm` file to the path referenced by `wasm_path` in `engine.toml`.
