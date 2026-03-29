@@ -126,6 +126,7 @@ lgtm_dir := "observability"
 
 # Start the Grafana LGTM stack (Loki, Grafana, Tempo, Mimir)
 obs-up:
+    mkdir -p {{lgtm_dir}}/data
     docker run --rm -d \
         --name lgtm \
         -p 3000:3000 \

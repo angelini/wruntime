@@ -5,12 +5,10 @@
 /// # Example `build.rs`
 ///
 /// ```rust,no_run
-/// fn main() {
-///     prost_build::Config::new()
-///         .service_generator(Box::new(wr_build::WrClientGenerator))
-///         .compile_protos(&["../schemas/inventory.proto"], &["../schemas"])
-///         .unwrap();
-/// }
+/// prost_build::Config::new()
+///     .service_generator(Box::new(wr_build::WrClientGenerator))
+///     .compile_protos(&["../schemas/inventory.proto"], &["../schemas"])
+///     .unwrap();
 /// ```
 ///
 /// For a service `InventoryService` in package `ecommerce` with a `Seed` RPC,
@@ -58,9 +56,7 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
                 "        let (status, resp_bytes) = wr_sdk::http::http_rpc(&self.authority, \"{rpc_path}\", &body)?;\n"
             ));
             buf.push_str("        if status != 200 {\n");
-            buf.push_str(
-                "            return Err(format!(\"rpc error: HTTP {status}\"));\n",
-            );
+            buf.push_str("            return Err(format!(\"rpc error: HTTP {status}\"));\n");
             buf.push_str("        }\n");
             buf.push_str(
                 "        prost::Message::decode(resp_bytes.as_slice()).map_err(|e| e.to_string())\n",

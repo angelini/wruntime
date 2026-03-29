@@ -89,7 +89,8 @@ cleanup() {
     # Give services time to flush the OTLP batch exporter before exiting.
     sleep 5
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 0' INT TERM
 
 wait "$CLIENT_PID"
 echo "==> All clients finished."

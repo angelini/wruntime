@@ -80,7 +80,10 @@ impl EngineRunner {
                 continue;
             }
             let schema = module_schema(&module.namespace, &module.name);
-            let client = pool.get().await.context("failed to get DB connection for schema provisioning")?;
+            let client = pool
+                .get()
+                .await
+                .context("failed to get DB connection for schema provisioning")?;
             client
                 .execute(
                     &format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""),
@@ -139,7 +142,6 @@ impl EngineRunner {
                     )
                     .await;
 
-                let engine = self.engine.clone();
                 let (db_pool, db_schema) = if module_config.database {
                     let schema = module_schema(&module_namespace, &module_name);
                     let pool = self
@@ -150,16 +152,18 @@ impl EngineRunner {
                 } else {
                     (None, None)
                 };
-                tokio::spawn(http_handler_task(
-                    engine,
+                let handler = HandlerContext {
+                    engine: self.engine.clone(),
                     pre,
-                    proxy_uri,
-                    module_name.clone(),
-                    module_namespace.clone(),
+                };
+                let module = ModuleContext {
+                    name: module_name.clone(),
+                    namespace: module_namespace.clone(),
+                    proxy_uri: proxy_uri.clone(),
                     db_pool,
                     db_schema,
-                    rx,
-                ));
+                };
+                tokio::spawn(http_handler_task(handler, module, rx));
             }
             Err(_) => {
                 // Fall back: spawn as a long-running task that calls `run`.
@@ -206,41 +210,37 @@ impl EngineRunner {
     }
 }
 
+/// Wasmtime engine and pre-instantiated component — shared across requests.
+#[derive(Clone)]
+struct HandlerContext {
+    engine: Arc<Engine>,
+    pre: Arc<ProxyPre<ModuleState>>,
+}
+
+/// Module identity and database config — shared across requests.
+#[derive(Clone)]
+struct ModuleContext {
+    name: String,
+    namespace: String,
+    proxy_uri: hyper::Uri,
+    db_pool: Option<Arc<Pool>>,
+    db_schema: Option<String>,
+}
+
 /// Task that owns the module's channel receiver and spawns a sub-task per
 /// inbound request, each with its own `Store` for isolation.
 async fn http_handler_task(
-    engine: Arc<Engine>,
-    pre: Arc<ProxyPre<ModuleState>>,
-    proxy_uri: hyper::Uri,
-    module_name: String,
-    module_namespace: String,
-    db_pool: Option<Arc<Pool>>,
-    db_schema: Option<String>,
+    handler: HandlerContext,
+    module: ModuleContext,
     mut rx: mpsc::Receiver<InboundRequest>,
 ) {
     while let Some(inbound) = rx.recv().await {
-        let engine = engine.clone();
-        let pre = pre.clone();
-        let proxy_uri = proxy_uri.clone();
-        let module_name = module_name.clone();
-        let module_namespace = module_namespace.clone();
-        let db_pool = db_pool.clone();
-        let db_schema = db_schema.clone();
+        let handler = handler.clone();
+        let module = module.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = dispatch_request(
-                &engine,
-                &pre,
-                proxy_uri,
-                &module_name,
-                &module_namespace,
-                db_pool,
-                db_schema,
-                inbound,
-            )
-            .await
-            {
-                warn!(module = %module_name, error = %e, "inbound request error");
+            if let Err(e) = dispatch_request(&handler, &module, inbound).await {
+                warn!(module = %module.name, error = %e, "inbound request error");
             }
         });
     }
@@ -249,24 +249,19 @@ async fn http_handler_task(
 /// Instantiate the component for one request and drive the WASI HTTP
 /// incoming-handler, returning the response through `inbound.response_tx`.
 async fn dispatch_request(
-    engine: &Engine,
-    pre: &ProxyPre<ModuleState>,
-    proxy_uri: hyper::Uri,
-    module_name: &str,
-    module_namespace: &str,
-    db_pool: Option<Arc<Pool>>,
-    db_schema: Option<String>,
+    handler: &HandlerContext,
+    module: &ModuleContext,
     inbound: InboundRequest,
 ) -> Result<()> {
     let state = ModuleState::new(
-        module_name.to_string(),
-        module_namespace.to_string(),
-        proxy_uri,
-        db_pool,
-        db_schema,
+        module.name.clone(),
+        module.namespace.clone(),
+        module.proxy_uri.clone(),
+        module.db_pool.clone(),
+        module.db_schema.clone(),
     );
-    let mut store = Store::new(engine, state);
-    let proxy = pre.instantiate_async(&mut store).await?;
+    let mut store = Store::new(&handler.engine, state);
+    let proxy = handler.pre.instantiate_async(&mut store).await?;
 
     // ── Build the incoming request resource ──────────────────────────────
     let (req_parts, req_body) = inbound.request.into_parts();

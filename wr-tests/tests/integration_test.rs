@@ -1149,15 +1149,27 @@ async fn test_db_schema_shared_across_module_instances() {
     let _ = DbHost::execute(&mut inst1, format!("DROP TABLE IF EXISTS {TABLE}"), vec![]);
 
     // Instance 1 creates the table and inserts a row.
-    DbHost::execute(&mut inst1, format!("CREATE TABLE {TABLE} (val INT4)"), vec![])
-        .expect("create table");
-    DbHost::execute(&mut inst1, format!("INSERT INTO {TABLE} VALUES (42)"), vec![])
-        .expect("insert");
+    DbHost::execute(
+        &mut inst1,
+        format!("CREATE TABLE {TABLE} (val INT4)"),
+        vec![],
+    )
+    .expect("create table");
+    DbHost::execute(
+        &mut inst1,
+        format!("INSERT INTO {TABLE} VALUES (42)"),
+        vec![],
+    )
+    .expect("insert");
 
     // Instance 2 reads from the same schema and must see the row.
     let rows =
         DbHost::query(&mut inst2, format!("SELECT val FROM {TABLE}"), vec![]).expect("query");
-    assert_eq!(rows.len(), 1, "instance 2 should see the row written by instance 1");
+    assert_eq!(
+        rows.len(),
+        1,
+        "instance 2 should see the row written by instance 1"
+    );
     assert_eq!(rows[0].columns[0].value, PgValue::Int4(42));
 
     // Clean up.

@@ -11,13 +11,27 @@ pub fn module_schema(namespace: &str, name: &str) -> String {
     format!("wr__{}__{}", sanitize(namespace), sanitize(name))
 }
 
+pub fn build_pool(database_url: &str, max_size: usize) -> anyhow::Result<Pool> {
+    let mut cfg = Config::new();
+    cfg.url = Some(database_url.to_string());
+    cfg.pool = Some(PoolConfig {
+        max_size,
+        ..Default::default()
+    });
+    cfg.create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
+        .map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::module_schema;
 
     #[test]
     fn test_module_schema_simple() {
-        assert_eq!(module_schema("ecommerce", "inventory"), "wr__ecommerce__inventory");
+        assert_eq!(
+            module_schema("ecommerce", "inventory"),
+            "wr__ecommerce__inventory"
+        );
     }
 
     #[test]
@@ -34,15 +48,4 @@ mod tests {
     fn test_module_schema_special_chars() {
         assert_eq!(module_schema("a b", "c/d"), "wr__a_b__c_d");
     }
-}
-
-pub fn build_pool(database_url: &str, max_size: usize) -> anyhow::Result<Pool> {
-    let mut cfg = Config::new();
-    cfg.url = Some(database_url.to_string());
-    cfg.pool = Some(PoolConfig {
-        max_size,
-        ..Default::default()
-    });
-    cfg.create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
-        .map_err(Into::into)
 }

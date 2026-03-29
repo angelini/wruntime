@@ -1,4 +1,5 @@
 use anyhow::Result;
+use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{global, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
@@ -6,7 +7,7 @@ use opentelemetry_sdk::{
     metrics::SdkMeterProvider,
     propagation::TraceContextPropagator,
     runtime,
-    trace::{Config as TraceConfig, RandomIdGenerator, Sampler},
+    trace::{Config as TraceConfig, RandomIdGenerator, Sampler, TracerProvider},
     Resource,
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -16,13 +17,21 @@ const OTLP_ENDPOINT: &str = "http://localhost:4317";
 
 /// Holds provider handles and shuts them down cleanly when dropped.
 pub struct TelemetryGuard {
+    tracer_provider: TracerProvider,
     meter_provider: SdkMeterProvider,
     logger_provider: opentelemetry_sdk::logs::LoggerProvider,
 }
 
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
-        global::shutdown_tracer_provider();
+        for result in self.tracer_provider.force_flush() {
+            if let Err(e) = result {
+                eprintln!("tracer force_flush error: {e}");
+            }
+        }
+        if let Err(e) = self.tracer_provider.shutdown() {
+            eprintln!("tracer provider shutdown error: {e}");
+        }
         if let Err(e) = self.meter_provider.shutdown() {
             eprintln!("metrics provider shutdown error: {e}");
         }
@@ -59,10 +68,14 @@ pub fn init(service_name: &'static str) -> Result<TelemetryGuard> {
         )
         .install_batch(runtime::Tokio)?;
 
-    global::set_tracer_provider(tracer_provider);
+    global::set_tracer_provider(tracer_provider.clone());
 
     // W3C TraceContext: propagates trace-id/span-id via `traceparent` header.
     global::set_text_map_propagator(TraceContextPropagator::new());
+
+    // Obtain a concrete tracer to pass to the tracing_opentelemetry layer.
+    // tracing_opentelemetry::layer() defaults to NoopTracer in 0.27 — with_tracer() is required.
+    let tracer = tracer_provider.tracer(service_name);
 
     // ── Metrics ───────────────────────────────────────────────────────────
     let meter_provider = opentelemetry_otlp::new_pipeline()
@@ -95,11 +108,12 @@ pub fn init(service_name: &'static str) -> Result<TelemetryGuard> {
     tracing_subscriber::registry()
         .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .with(tracing_subscriber::fmt::layer())
-        .with(tracing_opentelemetry::layer())
+        .with(tracing_opentelemetry::layer().with_tracer(tracer))
         .with(OpenTelemetryTracingBridge::new(&logger_provider))
         .init();
 
     Ok(TelemetryGuard {
+        tracer_provider,
         meter_provider,
         logger_provider,
     })
