@@ -1,6 +1,8 @@
 listen_address  = "0.0.0.0:9200"
 manager_address = "http://127.0.0.1:9000"
-proxy_address   = "http://127.0.0.1:9001"
+
+[node]
+proxy_address = "http://127.0.0.1:9001"
 
 # Three independent client instances — each runs its own `run` export concurrently.
 [[module]]

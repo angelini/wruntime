@@ -1,6 +1,9 @@
 listen_address  = "0.0.0.0:9100"
 manager_address = "http://127.0.0.1:9000"
-proxy_address   = "http://127.0.0.1:9001"
+
+[node]
+proxy_address = "http://127.0.0.1:9001"   # local proxy; used to rewrite WASM outbound calls
+                                            # and sent to the manager on registration
 
 # Optional — remove this section if no modules need database access.
 [database]

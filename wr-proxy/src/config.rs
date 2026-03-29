@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use wr_common::node::NodeConfig;
 
 #[derive(Deserialize, Clone)]
 pub struct ProxyConfig {
@@ -7,6 +8,8 @@ pub struct ProxyConfig {
     pub listen_address: String,
     /// gRPC address of wr-manager, e.g. "http://127.0.0.1:9000"
     pub manager_address: String,
+    /// Node configuration — this proxy's own address as reachable by peer proxies.
+    pub node: NodeConfig,
     #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
@@ -65,6 +68,10 @@ impl ProxyConfig {
         anyhow::ensure!(
             !self.manager_address.is_empty(),
             "manager_address is required"
+        );
+        anyhow::ensure!(
+            !self.node.proxy_address.is_empty(),
+            "node.proxy_address is required"
         );
         anyhow::ensure!(
             self.cache.routing_table_ttl_secs > 0,

@@ -454,7 +454,9 @@ mod tests {
 
     #[test]
     fn test_query_returns_error_when_no_pool() {
-        let mut state = ModuleState::new("test".into(), "test".into(), proxy_uri(), None, None);
+        let mut state =
+            ModuleState::new("test".into(), "test".into(), proxy_uri(), None, None, None)
+                .expect("state");
         let result = state.query("SELECT 1".into(), vec![]);
         assert!(
             matches!(result, Err(DbError::Connection(_))),
@@ -464,7 +466,9 @@ mod tests {
 
     #[test]
     fn test_execute_returns_error_when_no_pool() {
-        let mut state = ModuleState::new("test".into(), "test".into(), proxy_uri(), None, None);
+        let mut state =
+            ModuleState::new("test".into(), "test".into(), proxy_uri(), None, None, None)
+                .expect("state");
         let result = state.execute("SELECT 1".into(), vec![]);
         assert!(
             matches!(result, Err(DbError::Connection(_))),
@@ -474,7 +478,9 @@ mod tests {
 
     #[test]
     fn test_begin_transaction_returns_error_when_no_pool() {
-        let mut state = ModuleState::new("test".into(), "test".into(), proxy_uri(), None, None);
+        let mut state =
+            ModuleState::new("test".into(), "test".into(), proxy_uri(), None, None, None)
+                .expect("state");
         let result = state.begin_transaction();
         assert!(
             matches!(result, Err(DbError::Connection(_))),
@@ -503,7 +509,9 @@ mod tests {
             proxy_uri(),
             Some(Arc::new(pool)),
             None,
-        );
+            None,
+        )
+        .expect("state");
 
         let rows = state
             .query(
@@ -531,7 +539,9 @@ mod tests {
             proxy_uri(),
             Some(Arc::new(pool)),
             None,
-        );
+            None,
+        )
+        .expect("state");
 
         // DDL returns 0 rows affected.
         let n = state
@@ -560,7 +570,9 @@ mod tests {
             proxy_uri(),
             Some(Arc::new(pool)),
             None,
-        );
+            None,
+        )
+        .expect("state");
 
         let rows = state
             .query(
@@ -590,7 +602,9 @@ mod tests {
             proxy_uri(),
             Some(Arc::new(pool)),
             None,
-        );
+            None,
+        )
+        .expect("state");
 
         let rows = state
             .query(
@@ -634,7 +648,9 @@ mod tests {
             proxy_uri(),
             Some(Arc::new(pool)),
             None,
-        );
+            None,
+        )
+        .expect("state");
 
         // Setup: create a temp table outside the transaction.
         Host::execute(
@@ -690,7 +706,9 @@ mod tests {
             proxy_uri(),
             Some(Arc::new(pool)),
             None,
-        );
+            None,
+        )
+        .expect("state");
 
         Host::execute(
             &mut state,
@@ -743,7 +761,9 @@ mod tests {
             proxy_uri(),
             Some(Arc::new(pool)),
             None,
-        );
+            None,
+        )
+        .expect("state");
 
         Host::execute(
             &mut state,

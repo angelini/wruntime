@@ -74,7 +74,10 @@ async fn main() -> Result<()> {
         .layer(TracingLayer)
         .layer(MetricsLayer::new(metrics_tx))
         .layer(SchemaValidationLayer::new(schema_cache))
-        .layer(RoutingLayer::new(routing_table))
+        .layer(RoutingLayer::new(
+            routing_table,
+            config.node.proxy_address.clone(),
+        ))
         .service(ForwardService::new());
 
     // ── TCP listener ──────────────────────────────────────────────────────

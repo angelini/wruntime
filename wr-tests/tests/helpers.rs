@@ -55,42 +55,58 @@ pub async fn manager_client(addr: &str) -> Result<ManagerServiceClient<tonic::tr
 
 // ── Proxy ─────────────────────────────────────────────────────────────────────
 
+/// Identifies an engine instance and the node it belongs to.
+pub struct EngineSpec<'a> {
+    pub id: &'a str,
+    pub addr: &'a str,
+    /// Node proxy address for local-vs-remote dispatch.  Use `""` in
+    /// single-node tests where cross-node routing is not exercised.
+    pub proxy_address: &'a str,
+}
+
+/// Identifies a single WASM module hosted by an engine.
+pub struct ModuleSpec<'a> {
+    pub namespace: &'a str,
+    pub name: &'a str,
+    pub version: &'a str,
+    /// Serialised `FileDescriptorSet`.  Use [`minimal_file_descriptor_set`]
+    /// when a real schema is not needed.
+    pub schema: Vec<u8>,
+}
+
 /// Register one engine and one routing rule in a single call.
-///
-/// `proto_schema` must be a non-empty serialised `FileDescriptorSet` — the
-/// manager now rejects modules that declare no schema.  Use
-/// [`minimal_file_descriptor_set`] when a real schema is not needed.
 pub async fn register_module(
     c: &mut ManagerServiceClient<tonic::transport::Channel>,
-    engine_id: &str,
-    engine_addr: &str,
-    namespace: &str,
-    module: &str,
-    version: &str,
-    proto_schema: Vec<u8>,
+    engine: EngineSpec<'_>,
+    module: ModuleSpec<'_>,
 ) -> Result<()> {
     c.register_engine(RegisterEngineRequest {
         registration: Some(EngineRegistration {
-            engine_id: engine_id.into(),
-            address: engine_addr.into(),
+            engine_id: engine.id.into(),
+            address: engine.addr.into(),
+            proxy_address: engine.proxy_address.into(),
             modules: vec![ModuleDescriptor {
-                name: module.into(),
-                namespace: namespace.into(),
-                version: version.into(),
-                proto_schema,
+                name: module.name.into(),
+                namespace: module.namespace.into(),
+                version: module.version.into(),
+                proto_schema: module.schema,
             }],
         }),
     })
     .await?;
     c.upsert_routing_rule(RoutingRule {
-        rule_id: format!("{engine_id}-{namespace}-{module}-{version}"),
+        rule_id: format!(
+            "{}-{}-{}-{}",
+            engine.id, module.namespace, module.name, module.version
+        ),
         source_module: String::new(),
         source_namespace: String::new(),
-        destination_module: module.into(),
-        destination_namespace: namespace.into(),
-        destination_version: version.into(),
-        engine_id: engine_id.into(),
-        engine_address: engine_addr.into(),
+        destination_module: module.name.into(),
+        destination_namespace: module.namespace.into(),
+        destination_version: module.version.into(),
+        engine_id: engine.id.into(),
+        engine_address: engine.addr.into(),
+        proxy_address: engine.proxy_address.into(),
         healthy: false, // manager overrides to true on upsert
     })
     .await?;
@@ -116,7 +132,7 @@ pub async fn sync_table(
 
 /// Build and start a proxy with an empty schema cache (not yet synced); returns the bound address.
 pub async fn start_proxy(table: wr_proxy::routing::CachedRoutingTable) -> Result<SocketAddr> {
-    start_proxy_with_schema(table, Arc::new(wr_proxy::schema::SchemaCache::new())).await
+    start_proxy_with_schema(table, Arc::new(wr_proxy::schema::SchemaCache::new()), "").await
 }
 
 /// Fetch all schemas from the manager and populate `cache`.
@@ -158,25 +174,90 @@ pub async fn start_proxy_synced(
 ) -> Result<SocketAddr> {
     let schema_cache = Arc::new(wr_proxy::schema::SchemaCache::new());
     sync_schema_cache(mgr_addr, &schema_cache).await?;
-    start_proxy_with_schema(table, schema_cache).await
+    start_proxy_with_schema(table, schema_cache, "").await
 }
 
 /// Build and start a proxy with a **pre-populated** schema cache; returns the bound address.
+///
+/// `self_proxy_address` is the address this proxy considers its own — used to
+/// distinguish local (same-node) engine rules from remote (cross-node) rules.
+/// Pass `""` for single-node tests.
 pub async fn start_proxy_with_schema(
     table: wr_proxy::routing::CachedRoutingTable,
     schema_cache: Arc<wr_proxy::schema::SchemaCache>,
+    self_proxy_address: &str,
 ) -> Result<SocketAddr> {
     let (metrics_tx, _) = tokio::sync::mpsc::channel(100);
     let svc = tower::ServiceBuilder::new()
         .layer(wr_proxy::layers::MetricsLayer::new(metrics_tx))
         .layer(wr_proxy::layers::SchemaValidationLayer::new(schema_cache))
-        .layer(wr_proxy::layers::RoutingLayer::new(table))
+        .layer(wr_proxy::layers::RoutingLayer::new(
+            table,
+            self_proxy_address,
+        ))
         .service(wr_proxy::layers::ForwardService::new());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(proxy_serve(listener, svc));
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     Ok(addr)
+}
+
+/// A running proxy node.
+pub struct Node {
+    /// TCP address this node listens on — pass to [`proxy_get`] and friends.
+    pub addr: std::net::SocketAddr,
+    /// `"http://127.0.0.1:{port}"` — store in routing rules for engines on this node.
+    pub proxy_address: String,
+    /// Shared routing table — call [`sync_table`] on it after registering new engines.
+    pub table: wr_proxy::routing::CachedRoutingTable,
+    /// Drop or send to shut the proxy down.
+    pub proxy_shutdown: oneshot::Sender<()>,
+}
+
+/// Spin up a proxy node on an ephemeral port.
+///
+/// The node derives its own `proxy_address` from the bound port, so callers
+/// can pass `node.proxy_address` to [`register_module`] without knowing the
+/// port in advance.  After registering engines call [`sync_table`] with
+/// `node.table` so the node picks up the new routing rules.
+pub async fn start_node(mgr_addr: &str) -> Result<Node> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let proxy_address = format!("http://{addr}");
+
+    let schema_cache = Arc::new(wr_proxy::schema::SchemaCache::new());
+    sync_schema_cache(mgr_addr, &schema_cache).await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(mgr_addr, &table).await?;
+
+    let (metrics_tx, _) = tokio::sync::mpsc::channel(100);
+    let svc = tower::ServiceBuilder::new()
+        .layer(wr_proxy::layers::MetricsLayer::new(metrics_tx))
+        .layer(wr_proxy::layers::SchemaValidationLayer::new(schema_cache))
+        .layer(wr_proxy::layers::RoutingLayer::new(
+            table.clone(),
+            &proxy_address,
+        ))
+        .service(wr_proxy::layers::ForwardService::new());
+
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = rx => {}
+            _ = proxy_serve(listener, svc) => {}
+        }
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    Ok(Node {
+        addr,
+        proxy_address,
+        table,
+        proxy_shutdown: tx,
+    })
 }
 
 /// Send a GET request through the proxy to `destination_module` in `namespace`,
@@ -416,13 +497,17 @@ pub fn invalid_protobuf() -> Bytes {
 pub fn db_state(pool_size: usize) -> Option<ModuleState> {
     let url = std::env::var("WRUNTIME_TEST_DB_URL").ok()?;
     let pool = Arc::new(wr_engine::pool::build_pool(&url, pool_size).expect("build_pool"));
-    Some(ModuleState::new(
-        "test".into(),
-        "test-ns".into(),
-        "http://127.0.0.1:9001".parse().unwrap(),
-        Some(pool),
-        None,
-    ))
+    Some(
+        ModuleState::new(
+            "test".into(),
+            "test-ns".into(),
+            "http://127.0.0.1:9001".parse().unwrap(),
+            Some(pool),
+            None,
+            None,
+        )
+        .expect("ModuleState"),
+    )
 }
 
 /// Build a `ModuleState` for a specific `(namespace, name)` pair, provisioning
@@ -448,11 +533,15 @@ pub async fn db_state_for_module(
         .await
         .expect("provision schema");
     drop(client);
-    Some(ModuleState::new(
-        name.into(),
-        namespace.into(),
-        "http://127.0.0.1:9001".parse().unwrap(),
-        Some(pool),
-        Some(schema),
-    ))
+    Some(
+        ModuleState::new(
+            name.into(),
+            namespace.into(),
+            "http://127.0.0.1:9001".parse().unwrap(),
+            Some(pool),
+            Some(schema),
+            None,
+        )
+        .expect("ModuleState"),
+    )
 }

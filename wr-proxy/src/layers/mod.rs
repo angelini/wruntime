@@ -29,6 +29,15 @@ pub fn error_response(status: http::StatusCode, msg: &str) -> Response<ResBody> 
         .unwrap()
 }
 
+/// Routing decision made by [`RoutingLayer`]; consumed by [`ForwardService`].
+#[derive(Clone)]
+pub enum Destination {
+    /// Forward directly to the local engine at this address.
+    LocalEngine(String),
+    /// Forward to a peer proxy at this address (cross-node hop).
+    RemoteProxy(String),
+}
+
 /// Set by [`RoutingLayer`] on the request extensions; read by [`ForwardService`].
 #[derive(Clone)]
-pub struct ResolvedDestination(pub String);
+pub struct ResolvedDestination(pub Destination);

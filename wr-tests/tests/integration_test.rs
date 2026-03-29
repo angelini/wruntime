@@ -30,6 +30,7 @@ async fn test_register_and_list_engines() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9100".into(),
+            proxy_address: String::new(),
             modules: vec![ModuleDescriptor {
                 name: "inventory-service".into(),
                 namespace: "store".into(),
@@ -61,6 +62,7 @@ async fn test_deregister_engine() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9101".into(),
+            proxy_address: String::new(),
             modules: vec![],
         }),
     })
@@ -90,6 +92,7 @@ async fn test_heartbeat() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9102".into(),
+            proxy_address: String::new(),
             modules: vec![],
         }),
     })
@@ -118,6 +121,7 @@ async fn test_routing_table_upsert_and_get() -> Result<()> {
         destination_version: "1.0.0".into(),
         engine_id: "e1".into(),
         engine_address: "http://127.0.0.1:9103".into(),
+        proxy_address: String::new(),
         healthy: false, // server sets this to true on upsert
     })
     .await?;
@@ -178,12 +182,17 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
 
     register_module(
         &mut mgr_c,
-        "stub-engine",
-        &engine_addr,
-        "store",
-        "inventory-service",
-        "1.0.0",
-        minimal_file_descriptor_set(),
+        EngineSpec {
+            id: "stub-engine",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "store",
+            name: "inventory-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
     )
     .await?;
 
@@ -235,7 +244,7 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
         .await?;
 
     let proxy_addr =
-        start_proxy_with_schema(wr_proxy::routing::new_routing_table(), schema_cache).await?;
+        start_proxy_with_schema(wr_proxy::routing::new_routing_table(), schema_cache, "").await?;
 
     let client = http_client();
 
@@ -331,6 +340,9 @@ fn test_proxy_config_valid() {
         listen_address  = "0.0.0.0:9001"
         manager_address = "http://127.0.0.1:9000"
 
+        [node]
+        proxy_address = "http://127.0.0.1:9001"
+
         [cache]
         routing_table_ttl_secs = 5
         schema_ttl_secs        = 60
@@ -353,6 +365,8 @@ fn test_proxy_config_defaults() {
     let toml = r#"
         listen_address  = "0.0.0.0:9001"
         manager_address = "http://127.0.0.1:9000"
+        [node]
+        proxy_address   = "http://127.0.0.1:9001"
     "#;
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
     assert_eq!(cfg.cache.routing_table_ttl_secs, 5);
@@ -366,6 +380,8 @@ fn test_proxy_config_rejects_zero_ttl() {
     let toml = r#"
         listen_address  = "0.0.0.0:9001"
         manager_address = "http://127.0.0.1:9000"
+        [node]
+        proxy_address   = "http://127.0.0.1:9001"
         [cache]
         routing_table_ttl_secs = 0
         schema_ttl_secs        = 60
@@ -384,6 +400,8 @@ fn test_proxy_config_rejects_zero_queue_depth() {
     let toml = r#"
         listen_address  = "0.0.0.0:9001"
         manager_address = "http://127.0.0.1:9000"
+        [node]
+        proxy_address   = "http://127.0.0.1:9001"
         [metrics]
         flush_interval_secs = 10
         queue_depth         = 0
@@ -410,10 +428,15 @@ fn test_example_config_files_parse() {
     // check that the TOML itself is structurally valid.
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
+    struct NodeSection {
+        proxy_address: String,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
     struct EngineRaw {
         listen_address: String,
         manager_address: String,
-        proxy_address: String,
+        node: NodeSection,
         #[serde(rename = "module", default)]
         modules: Vec<toml::Value>,
     }
@@ -434,22 +457,32 @@ async fn test_proxy_routes_to_explicit_version() -> Result<()> {
 
     register_module(
         &mut mgr,
-        "e1",
-        &e1_addr,
-        "ver-ns",
-        "versioned-service",
-        "1.0.0",
-        minimal_file_descriptor_set(),
+        EngineSpec {
+            id: "e1",
+            addr: &e1_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "ver-ns",
+            name: "versioned-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
     )
     .await?;
     register_module(
         &mut mgr,
-        "e2",
-        &e2_addr,
-        "ver-ns",
-        "versioned-service",
-        "2.0.0",
-        minimal_file_descriptor_set(),
+        EngineSpec {
+            id: "e2",
+            addr: &e2_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "ver-ns",
+            name: "versioned-service",
+            version: "2.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
     )
     .await?;
 
@@ -480,22 +513,32 @@ async fn test_proxy_routes_to_latest_version() -> Result<()> {
 
     register_module(
         &mut mgr,
-        "e1",
-        &e1_addr,
-        "latest-ns",
-        "latest-service",
-        "1.0.0",
-        minimal_file_descriptor_set(),
+        EngineSpec {
+            id: "e1",
+            addr: &e1_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "latest-ns",
+            name: "latest-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
     )
     .await?;
     register_module(
         &mut mgr,
-        "e2",
-        &e2_addr,
-        "latest-ns",
-        "latest-service",
-        "2.0.0",
-        minimal_file_descriptor_set(),
+        EngineSpec {
+            id: "e2",
+            addr: &e2_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "latest-ns",
+            name: "latest-service",
+            version: "2.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
     )
     .await?;
 
@@ -524,12 +567,17 @@ async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
     let (e1_addr, _stub) = spawn_identified_stub("engine-v1").await?;
     register_module(
         &mut mgr,
-        "e1",
-        &e1_addr,
-        "mv-ns",
-        "missing-ver-service",
-        "1.0.0",
-        minimal_file_descriptor_set(),
+        EngineSpec {
+            id: "e1",
+            addr: &e1_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "mv-ns",
+            name: "missing-ver-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
     )
     .await?;
 
@@ -554,22 +602,32 @@ async fn test_proxy_load_balances_across_instances() -> Result<()> {
 
     register_module(
         &mut mgr,
-        "ea",
-        &e1_addr,
-        "lb-ns",
-        "lb-service",
-        "1.0.0",
-        minimal_file_descriptor_set(),
+        EngineSpec {
+            id: "ea",
+            addr: &e1_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "lb-ns",
+            name: "lb-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
     )
     .await?;
     register_module(
         &mut mgr,
-        "eb",
-        &e2_addr,
-        "lb-ns",
-        "lb-service",
-        "1.0.0",
-        minimal_file_descriptor_set(),
+        EngineSpec {
+            id: "eb",
+            addr: &e2_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "lb-ns",
+            name: "lb-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
     )
     .await?;
 
@@ -604,22 +662,32 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
 
     register_module(
         &mut mgr,
-        "ea",
-        &e1_addr,
-        "fo-ns",
-        "failover-service",
-        "1.0.0",
-        minimal_file_descriptor_set(),
+        EngineSpec {
+            id: "ea",
+            addr: &e1_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "fo-ns",
+            name: "failover-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
     )
     .await?;
     register_module(
         &mut mgr,
-        "eb",
-        &e2_addr,
-        "fo-ns",
-        "failover-service",
-        "1.0.0",
-        minimal_file_descriptor_set(),
+        EngineSpec {
+            id: "eb",
+            addr: &e2_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "fo-ns",
+            name: "failover-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
     )
     .await?;
 
@@ -668,12 +736,17 @@ async fn test_proxy_503_when_all_instances_unhealthy() -> Result<()> {
     let (e1_addr, _stub) = spawn_identified_stub("engine-a").await?;
     register_module(
         &mut mgr,
-        "ea",
-        &e1_addr,
-        "gone-ns",
-        "gone-service",
-        "1.0.0",
-        minimal_file_descriptor_set(),
+        EngineSpec {
+            id: "ea",
+            addr: &e1_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "gone-ns",
+            name: "gone-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
     )
     .await?;
 
@@ -711,6 +784,7 @@ fn test_engine_config_database_section_parses() {
     let toml = r#"
         listen_address  = "0.0.0.0:9100"
         manager_address = "http://127.0.0.1:9000"
+        [node]
         proxy_address   = "http://127.0.0.1:9001"
         [database]
         url             = "postgres://user:pass@localhost:5432/mydb"
@@ -728,6 +802,7 @@ fn test_engine_config_database_max_connections_defaults_to_8() {
     let toml = r#"
         listen_address  = "0.0.0.0:9100"
         manager_address = "http://127.0.0.1:9000"
+        [node]
         proxy_address   = "http://127.0.0.1:9001"
         [database]
         url = "postgres://user:pass@localhost:5432/mydb"
@@ -745,6 +820,7 @@ fn test_engine_config_module_database_flag_parses() {
     let toml = r#"
         listen_address  = "0.0.0.0:9100"
         manager_address = "http://127.0.0.1:9000"
+        [node]
         proxy_address   = "http://127.0.0.1:9001"
         [database]
         url = "postgres://user:pass@localhost:5432/mydb"
@@ -770,6 +846,7 @@ fn test_engine_config_module_database_flag_defaults_to_false() {
     let toml = r#"
         listen_address  = "0.0.0.0:9100"
         manager_address = "http://127.0.0.1:9000"
+        [node]
         proxy_address   = "http://127.0.0.1:9001"
         [[module]]
         name        = "svc"
@@ -792,7 +869,9 @@ fn test_db_query_without_pool_returns_connection_error() {
         "http://127.0.0.1:9001".parse().unwrap(),
         None,
         None,
-    );
+        None,
+    )
+    .expect("ModuleState");
     let err = state.query("SELECT 1".into(), vec![]).unwrap_err();
     assert!(
         matches!(err, DbError::Connection(_)),
@@ -808,7 +887,9 @@ fn test_db_execute_without_pool_returns_connection_error() {
         "http://127.0.0.1:9001".parse().unwrap(),
         None,
         None,
-    );
+        None,
+    )
+    .expect("ModuleState");
     let err = state
         .execute("INSERT INTO t VALUES (1)".into(), vec![])
         .unwrap_err();
@@ -1008,22 +1089,32 @@ async fn test_proxy_namespaces_are_isolated() -> Result<()> {
 
     register_module(
         &mut mgr,
-        "ea",
-        &e_alpha_addr,
-        "ns-alpha",
-        "shared-service",
-        "1.0.0",
-        minimal_file_descriptor_set(),
+        EngineSpec {
+            id: "ea",
+            addr: &e_alpha_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "ns-alpha",
+            name: "shared-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
     )
     .await?;
     register_module(
         &mut mgr,
-        "eb",
-        &e_beta_addr,
-        "ns-beta",
-        "shared-service",
-        "1.0.0",
-        minimal_file_descriptor_set(),
+        EngineSpec {
+            id: "eb",
+            addr: &e_beta_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "ns-beta",
+            name: "shared-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
     )
     .await?;
 
@@ -1080,6 +1171,7 @@ async fn test_manager_rejects_module_without_namespace() -> Result<()> {
             registration: Some(EngineRegistration {
                 engine_id: "e1".into(),
                 address: "http://127.0.0.1:9100".into(),
+                proxy_address: String::new(),
                 modules: vec![ModuleDescriptor {
                     name: "svc".into(),
                     namespace: String::new(), // empty namespace → should be rejected
@@ -1174,4 +1266,51 @@ async fn test_db_schema_shared_across_module_instances() {
 
     // Clean up.
     DbHost::execute(&mut inst1, format!("DROP TABLE {TABLE}"), vec![]).expect("drop");
+}
+
+// ── cross-node routing tests ──────────────────────────────────────────────────
+
+/// Two proxies simulate two separate nodes on 127.0.0.1.
+/// A request entering node A must be forwarded to node B's proxy, which then
+/// dispatches it to the engine registered on node B.
+#[tokio::test]
+async fn test_cross_node_routing() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    let (engine_b_addr, engine_b_shutdown) = spawn_identified_stub("engine-b").await?;
+
+    // Start node B first to obtain its proxy address, then register the engine
+    // under that address and re-sync so node B's routing table sees the rule.
+    let node_b = start_node(&mgr_addr).await?;
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "engine-b-id",
+            addr: &engine_b_addr,
+            proxy_address: &node_b.proxy_address,
+        },
+        ModuleSpec {
+            namespace: "store",
+            name: "cross-node-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+    sync_table(&mgr_addr, &node_b.table).await?;
+
+    // Start node A after registration so its initial sync picks up engine B's rule.
+    // Since node_a.proxy_address ≠ node_b.proxy_address, node A will forward cross-node.
+    let node_a = start_node(&mgr_addr).await?;
+
+    let (status, body) =
+        proxy_get(node_a.addr, "store", "cross-node-service", Some("1.0.0")).await?;
+    assert_eq!(status, StatusCode::OK, "cross-node request should succeed");
+    assert_eq!(body, "engine-b", "request should reach engine-b via node B");
+
+    let _ = engine_b_shutdown.send(());
+    let _ = node_a.proxy_shutdown.send(());
+    let _ = node_b.proxy_shutdown.send(());
+    Ok(())
 }

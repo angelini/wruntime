@@ -6,36 +6,42 @@ A distributed WASM module networking runtime. WASM modules running inside **wr-e
 
 ## Architecture
 
+A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. Nodes are independent — each proxy handles its own inbound traffic and forwards cross-node requests directly to the peer proxy, which then routes locally to its engines.
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  wr-engine A                     wr-engine B                │
-│  ┌──────────────────┐            ┌───────────────────┐      │
-│  │  order-service   │            │ inventory-service │      │
-│  │  (WASM module)   │            │  (WASM module)    │      │
-│  └────────┬─────────┘            └────────▲──────────┘      │
-│           │ HTTP (intercepted)            │ HTTP            │
-│           │ x-wr-source / x-wr-destination│                 │
-└───────────┼───────────────────────────────┼─────────────────┘
-            │                               │
-            ▼                               │
-┌───────────────────────┐                   │
-│       wr-proxy        │───────────────────┘
-│                       │   forwards to engine B
-│  MetricsLayer         │
-│  SchemaValidationLayer│
-│  RoutingLayer         │
-│  ForwardService       │
-└──────────┬────────────┘
-           │ gRPC (routing table, schemas, metrics)
-           ▼
-┌───────────────────────┐
-│      wr-manager       │
-│                       │
-│  Engine registry      │
-│  Routing table        │
-│  Schema store         │
-│  Metrics buffer       │
-└───────────────────────┘
+                         ┌───────────────────────┐
+                         │      wr-manager        │
+                         │                        │
+                         │  Engine registry       │
+                         │  Routing table         │
+                         │  Schema store          │
+                         │  Metrics buffer        │
+                         └──────────┬─────────────┘
+                                    │ gRPC (all nodes)
+               ┌────────────────────┴─────────────────────┐
+               │                                          │
+               ▼                                          ▼
+┌─────────────────────────────┐        ┌─────────────────────────────┐
+│           Node A            │        │           Node B            │
+│                             │        │                             │
+│  ┌───────────────────────┐  │        │  ┌───────────────────────┐  │
+│  │      wr-proxy A       │◄─┼────────┼─►│      wr-proxy B       │  │
+│  │  TracingLayer         │  │  HTTP  │  │  TracingLayer         │  │
+│  │  MetricsLayer         │  │        │  │  MetricsLayer         │  │
+│  │  SchemaValidationLayer│  │        │  │  (skipped for relayed │  │
+│  │  RoutingLayer         │  │        │  │   x-wr-via-proxy reqs)│  │
+│  │  ForwardService       │  │        │  │  RoutingLayer         │  │
+│  └──────────┬────────────┘  │        │  │  ForwardService       │  │
+│             │ local         │        │  └──────────┬────────────┘  │
+│             ▼               │        │             │ local         │
+│  ┌───────────────────────┐  │        │  ┌──────────▼────────────┐  │
+│  │      wr-engine A      │  │        │  │      wr-engine B      │  │
+│  │  ┌─────────────────┐  │  │        │  │  ┌─────────────────┐  │  │
+│  │  │  order-service  │  │  │        │  │  │inventory-service│  │  │
+│  │  │  (WASM module)  │  │  │        │  │  │  (WASM module)  │  │  │
+│  │  └─────────────────┘  │  │        │  │  └─────────────────┘  │  │
+│  └───────────────────────┘  │        │  └───────────────────────┘  │
+└─────────────────────────────┘        └─────────────────────────────┘
 ```
 
 ### Components
@@ -43,22 +49,24 @@ A distributed WASM module networking runtime. WASM modules running inside **wr-e
 | Binary | Default port | Role |
 |--------|-------------|------|
 | `wr-manager` | `9000` (gRPC) | Central registry — engines register here, proxies sync routing and schemas from here |
-| `wr-proxy` | `9001` (HTTP) | Intercepts and routes inter-module traffic; validates request bodies against protobuf schemas |
+| `wr-proxy` | `9001` (HTTP) | Intercepts and routes inter-module traffic; validates schemas; forwards cross-node requests to peer proxies |
 | `wr-engine` | `9100` (HTTP) | Loads WASM modules, runs them, and receives forwarded requests |
+
+A **node** groups one `wr-proxy` with one or more `wr-engine` instances behind a shared externally-reachable proxy address. Each node knows its own address via `[node] proxy_address` in its config files; the engine sends this value to the manager on registration so the routing table can distinguish local from remote destinations.
 
 ### Request flow
 
 ```
-WASM module makes HTTP call to "http://inventory-service/items"
+WASM module makes HTTP call to "http://inventory-service.ecommerce/items"
   │
   ▼  [WasiHttpView::send_request intercepts — transparent to the module]
   │  Adds headers:
-  │    x-wr-source:      "order-service"
-  │    x-wr-destination: "http://inventory-service/items"
-  │  Rewrites URI to wr-proxy
+  │    x-wr-source:      "order-service.ecommerce"
+  │    x-wr-destination: "http://inventory-service.ecommerce/items"
+  │  Rewrites URI to the local wr-proxy (Node A)
   │
   ▼
-wr-proxy
+wr-proxy A  (Node A)
   │  1. TracingLayer       — opens an OTel span; injects W3C traceparent header
   │  2. MetricsLayer       — records start time
   │  3. SchemaValidation   — enforces gRPC path format; decodes body with
@@ -69,16 +77,34 @@ wr-proxy
   │  4. RoutingLayer       — reads optional x-wr-version header; defaults to
   │                          highest semver among healthy rules for the module;
   │                          returns 503 if no healthy instance matches;
-  │                          injects x-wr-module and x-wr-version headers;
+  │                          injects x-wr-module, x-wr-namespace, x-wr-version;
   │                          round-robins across multiple healthy instances
-  │                          at the same version
+  │                          at the same version;
+  │                          resolves destination as LocalEngine or RemoteProxy
   │  5. ForwardService     — strips x-wr-destination / x-wr-source, injects
-  │                          traceparent, forwards to destination engine
+  │                          traceparent, then:
   │
-  ▼
+  ├── destination is on Node A (LocalEngine) ─────────────────────────────────┐
+  │     strips x-wr-destination / x-wr-source / x-wr-via-proxy                │
+  │     forwards directly to wr-engine A                                       │
+  │                                                                            ▼
+  │                                                                    wr-engine A
+  │
+  └── destination is on Node B (RemoteProxy) ──────────────────────────────────┐
+        sets x-wr-via-proxy: 1                                                  │
+        forwards to wr-proxy B                                                  │
+                                                                               ▼
+                                                               wr-proxy B  (Node B)
+                                                                 SchemaValidation skipped
+                                                                 (x-wr-via-proxy already set)
+                                                                 RoutingLayer routes locally
+                                                                               │
+                                                                               ▼
+                                                                       wr-engine B
+
 wr-engine (destination)
-  │  Inbound HTTP server reads x-wr-module + x-wr-version, dispatches to
-  │  the correct WASM instance via round-robin among loaded instances
+  │  Inbound HTTP server reads x-wr-module + x-wr-version + x-wr-namespace,
+  │  dispatches to the correct WASM instance via round-robin
   │
   ▼
 inventory-service WASM module handles the request
@@ -155,6 +181,9 @@ just proxy
 listen_address  = "0.0.0.0:9001"
 manager_address = "http://127.0.0.1:9000"
 
+[node]
+proxy_address = "http://127.0.0.1:9001"   # this proxy's own address, as reachable by peers
+
 [cache]
 routing_table_ttl_secs = 5   # how often to poll the manager for routing updates
 schema_ttl_secs        = 60  # how often to sync module schemas
@@ -163,6 +192,8 @@ schema_ttl_secs        = 60  # how often to sync module schemas
 flush_interval_secs = 10
 queue_depth         = 1000
 ```
+
+`proxy_address` must match how peer nodes (and engines on this node) will reach this proxy. The routing layer uses it to distinguish rules whose `proxy_address` matches this node — those are forwarded directly to the local engine; all others are forwarded to the peer proxy that owns that address.
 
 The proxy connects to the manager at startup, then polls for routing table and schema updates in the background.
 
@@ -177,16 +208,22 @@ just engine
 ```toml
 listen_address  = "0.0.0.0:9100"
 manager_address = "http://127.0.0.1:9000"
-proxy_address   = "http://127.0.0.1:9001"
+
+[node]
+proxy_address = "http://127.0.0.1:9001"   # local proxy; WASM outbound calls are rewritten to
+                                           # this address, and it is sent to the manager on
+                                           # registration so peers can find this node
 
 [[module]]
 name        = "order-service"
+namespace   = "ecommerce"
 version     = "1.0.0"
 wasm_path   = "modules/order_service.wasm"
 schema_path = "schemas/order_service.binpb"
 
 [[module]]
 name        = "inventory-service"
+namespace   = "ecommerce"
 version     = "1.0.0"
 wasm_path   = "modules/inventory_service.wasm"
 schema_path = "schemas/inventory_service.binpb"
@@ -210,16 +247,43 @@ Engines register themselves but do not create routing rules automatically — yo
 grpcurl -plaintext -d '{
   "rule_id": "r1",
   "source_module": "order-service",
+  "source_namespace": "ecommerce",
   "destination_module": "inventory-service",
+  "destination_namespace": "ecommerce",
   "destination_version": "1.0.0",
   "engine_id": "<engine-uuid>",
-  "engine_address": "http://127.0.0.1:9100"
+  "engine_address": "http://127.0.0.1:9100",
+  "proxy_address": "http://127.0.0.1:9001"
 }' 127.0.0.1:9000 wruntime.ManagerService/UpsertRoutingRule
 ```
 
-To run **multiple instances** of the same module version across different engines, create one rule per engine pointing at the same `(destination_module, destination_version)`. The proxy round-robins across all healthy rules for that pair.
+`proxy_address` tells every proxy which node owns this rule. A proxy whose own `[node] proxy_address` matches will route directly to `engine_address`; all other proxies will relay to `proxy_address` and let that node route locally.
+
+To run **multiple instances** of the same module version across different engines (on the same or different nodes), create one rule per engine pointing at the same `(destination_module, destination_namespace, destination_version)`. The proxy round-robins across all healthy rules for that tuple.
 
 To deploy a **new version** alongside the old one, register a new engine with `version = "2.0.0"` and add a corresponding rule. Callers that omit `x-wr-version` are automatically upgraded to the highest semver. Callers that pin a version with the `x-wr-version` request header continue to reach the older instance.
+
+#### Multi-node deployment
+
+Node B config files follow the same structure — just use different ports and a matching `proxy_address`:
+
+```toml
+# node-b/proxy.toml
+listen_address  = "0.0.0.0:9002"
+manager_address = "http://127.0.0.1:9000"
+
+[node]
+proxy_address = "http://node-b-host:9002"
+
+# node-b/engine.toml
+listen_address  = "0.0.0.0:9200"
+manager_address = "http://127.0.0.1:9000"
+
+[node]
+proxy_address = "http://node-b-host:9002"
+```
+
+When a module on Node A calls a module whose routing rule has `proxy_address = "http://node-b-host:9002"`, Node A's proxy adds `x-wr-via-proxy: 1` and forwards the request to Node B's proxy. Node B's `SchemaValidationLayer` skips re-validation (the header signals it was already validated at ingress), and `RoutingLayer` resolves the destination as a local engine.
 
 ---
 
@@ -248,15 +312,20 @@ A `RoutingRule` has the fields:
 
 ```protobuf
 message RoutingRule {
-  string rule_id             = 1;  // stable identifier for this rule
-  string source_module       = 2;  // module that initiates the call
-  string destination_module  = 3;  // module name used as the HTTP host
-  string engine_id           = 4;  // UUID of the destination engine
-  string engine_address      = 5;  // HTTP base URL of the destination engine
-  string destination_version = 6;  // semver of the destination module, e.g. "1.2.0"
-  bool   healthy             = 7;  // set by manager; false = proxy will not route to this rule
+  string rule_id               = 1;   // stable identifier for this rule
+  string source_module         = 2;   // module that initiates the call
+  string destination_module    = 3;   // module name used as the HTTP host
+  string engine_id             = 4;   // UUID of the destination engine
+  string engine_address        = 5;   // HTTP base URL of the destination engine
+  string destination_version   = 6;   // semver of the destination module, e.g. "1.2.0"
+  bool   healthy               = 7;   // set by manager; false = proxy will not route to this rule
+  string destination_namespace = 8;   // namespace of the destination module
+  string source_namespace      = 9;   // namespace of the source module
+  string proxy_address         = 10;  // externally-reachable address of the node's proxy
 }
 ```
+
+`proxy_address` is set automatically from the engine's `[node] proxy_address` when the engine registers. The routing layer on each proxy compares this field against its own `[node] proxy_address` to decide whether to forward the request directly to the local `engine_address` (`LocalEngine`) or to relay it to the peer proxy at `proxy_address` (`RemoteProxy`).
 
 The `healthy` field is managed entirely by the manager — it is always set to `true` on `UpsertRoutingRule` and is flipped to `false` automatically when the engine's heartbeat stops reporting the module as healthy, or immediately on `DeregisterEngine`. The routing table version is incremented whenever health status changes, so proxies pick up failover events within one TTL cycle.
 
@@ -564,6 +633,34 @@ wasm_path = "modules/inventory_service.wasm"
 # database omitted — no DB access for this module
 ```
 
+---
+
+## Filesystem access
+
+By default WASM modules have no filesystem access. Set `fs = "tempdir"` in a `[[module]]` block to mount an ephemeral writable directory at `/`:
+
+```toml
+[[module]]
+name        = "order-service"
+namespace   = "ecommerce"
+version     = "1.0.0"
+wasm_path   = "modules/order_service.wasm"
+schema_path = "schemas/order_service.binpb"
+fs          = "tempdir"
+```
+
+The directory is created fresh on the host for each store and deleted when the store is dropped:
+
+- For **HTTP handler modules** a new directory is created per request (each request gets its own store).
+- For **runner modules** the directory lives for the lifetime of the module.
+
+The directory is empty on creation. It is not shared between module instances or across requests. Use it for scratch space, caching, or temporary files — do not rely on it for durable state.
+
+| Value | Effect |
+|-------|--------|
+| `fs = "tempdir"` | Mount an ephemeral temp directory at `/` |
+| *(omitted)* | No filesystem access (default) |
+
 ### Example: querying Postgres from a WASM module
 
 ```rust
@@ -640,6 +737,7 @@ The `wr-tests` crate contains integration tests that spin up in-process instance
 - Load balancing: requests distributed across multiple instances of the same `(module, version)`
 - Failover: deregistering an instance immediately redirects traffic to remaining healthy instances
 - Full failure: 503 when all instances are unhealthy
+- Cross-node routing: request originating on Node A is relayed to Node B's proxy when the destination engine lives on Node B; schema validation is skipped on the second hop (`x-wr-via-proxy`)
 
 ---
 
@@ -649,7 +747,7 @@ The `wr-tests` crate contains integration tests that spin up in-process instance
 wruntime/
 ├── proto/
 │   └── wruntime.proto      # single source of truth for all gRPC messages
-├── wr-common/              # generated proto types (tonic + prost)
+├── wr-common/              # generated proto types (tonic + prost); shared NodeConfig
 ├── wr-manager/             # central registry gRPC server
 ├── wr-proxy/               # HTTP routing + schema validation proxy
 │   └── src/layers/         # Tower middleware stack
@@ -658,7 +756,9 @@ wruntime/
 ├── wr-build/               # build.rs helper: WrClientGenerator for typed gRPC clients
 ├── wr-tests/               # integration tests
 ├── ecommerce-example/      # example: inventory (handler) + client (runner) modules
+├── node-a/                 # example multi-node: Node A configs (proxy :9001, engines :9100/:9101)
+├── node-b/                 # example multi-node: Node B configs (proxy :9002, engine :9200)
 ├── manager.toml            # example manager config
-├── proxy.toml              # example proxy config
-└── engine.toml             # example engine config
+├── proxy.toml              # example single-node proxy config
+└── engine.toml             # example single-node engine config
 ```

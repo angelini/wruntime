@@ -98,6 +98,7 @@ pub fn init(service_name: &'static str) -> Result<TelemetryGuard> {
                 .tonic()
                 .with_endpoint(OTLP_ENDPOINT),
         )
+        .with_resource(resource.clone())
         .install_batch(runtime::Tokio)?;
 
     // ── tracing subscriber ────────────────────────────────────────────────

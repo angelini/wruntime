@@ -1,0 +1,12 @@
+listen_address  = "0.0.0.0:9100"
+manager_address = "http://127.0.0.1:9000"
+
+[node]
+proxy_address = "http://127.0.0.1:9001"
+
+# [[module]]
+# name        = "my-service"
+# namespace   = "my-ns"
+# version     = "1.0.0"
+# wasm_path   = "path/to/module.wasm"
+# schema_path = "path/to/schema.binpb"

@@ -1,14 +1,15 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use wr_common::node::NodeConfig;
 
 #[derive(Deserialize, Clone)]
 pub struct EngineConfig {
     /// gRPC address of wr-manager, e.g. "http://127.0.0.1:9000"
     pub manager_address: String,
-    /// Plain HTTP address of wr-proxy, e.g. "http://127.0.0.1:9001"
-    pub proxy_address: String,
     /// Address this engine listens on for inbound requests from the proxy
     pub listen_address: String,
+    /// Node configuration — identifies the local proxy for this engine.
+    pub node: NodeConfig,
     #[serde(rename = "module", default)]
     pub modules: Vec<ModuleConfig>,
     /// Optional PostgreSQL connection pool shared across DB-enabled modules.
@@ -28,6 +29,14 @@ fn default_max_connections() -> usize {
     8
 }
 
+/// Filesystem access mode for a module.
+#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FsMode {
+    /// Mount an ephemeral temp directory at `/`. Deleted when the store is dropped.
+    Tempdir,
+}
+
 #[derive(Deserialize, Clone)]
 pub struct ModuleConfig {
     pub name: String,
@@ -42,6 +51,10 @@ pub struct ModuleConfig {
     /// Requires a `[database]` section in the engine config.
     #[serde(default)]
     pub database: bool,
+    /// Optional filesystem access. Set `fs = "tempdir"` to mount an ephemeral
+    /// writable directory at `/` for the duration of each store's lifetime.
+    #[serde(default)]
+    pub fs: Option<FsMode>,
 }
 
 impl EngineConfig {
@@ -63,7 +76,10 @@ impl EngineConfig {
             !self.manager_address.is_empty(),
             "manager_address is required"
         );
-        anyhow::ensure!(!self.proxy_address.is_empty(), "proxy_address is required");
+        anyhow::ensure!(
+            !self.node.proxy_address.is_empty(),
+            "node.proxy_address is required"
+        );
 
         for module in &self.modules {
             anyhow::ensure!(!module.name.is_empty(), "module.name is required");

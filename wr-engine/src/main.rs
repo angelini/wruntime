@@ -76,6 +76,7 @@ async fn main() -> Result<()> {
             registration: Some(EngineRegistration {
                 engine_id: engine_id.clone(),
                 address: advertise_address.clone(),
+                proxy_address: config.node.proxy_address.clone(),
                 modules: module_descriptors,
             }),
         })
@@ -97,6 +98,7 @@ async fn main() -> Result<()> {
                 destination_version: module.version.clone(),
                 engine_id: engine_id.clone(),
                 engine_address: advertise_address.clone(),
+                proxy_address: config.node.proxy_address.clone(),
                 healthy: false, // manager overrides to true on upsert
             })
             .await?;

@@ -9,21 +9,24 @@ use http::{Request, StatusCode};
 use tower::{Layer, Service};
 use tracing::{info_span, Instrument};
 
-use super::{error_response, ResBody, ResolvedDestination};
+use super::{error_response, Destination, ResBody, ResolvedDestination};
 use crate::routing::CachedRoutingTable;
 
 type RoundRobinCounters = Arc<Mutex<HashMap<(String, String, String), usize>>>;
 
 pub struct RoutingLayer {
     table: CachedRoutingTable,
+    /// This proxy's own address — used to distinguish local vs. remote rules.
+    self_proxy_address: String,
     /// Monotonic counters per (namespace, module, version) for round-robin selection.
     counters: RoundRobinCounters,
 }
 
 impl RoutingLayer {
-    pub fn new(table: CachedRoutingTable) -> Self {
+    pub fn new(table: CachedRoutingTable, self_proxy_address: impl Into<String>) -> Self {
         Self {
             table,
+            self_proxy_address: self_proxy_address.into(),
             counters: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -35,6 +38,7 @@ impl<S> Layer<S> for RoutingLayer {
         RoutingService {
             inner,
             table: self.table.clone(),
+            self_proxy_address: self.self_proxy_address.clone(),
             counters: self.counters.clone(),
         }
     }
@@ -44,6 +48,7 @@ impl<S> Layer<S> for RoutingLayer {
 pub struct RoutingService<S> {
     inner: S,
     table: CachedRoutingTable,
+    self_proxy_address: String,
     counters: RoundRobinCounters,
 }
 
@@ -64,6 +69,7 @@ where
     fn call(&mut self, mut req: Request<Bytes>) -> Self::Future {
         let table = self.table.clone();
         let counters = self.counters.clone();
+        let self_proxy_address = self.self_proxy_address.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -107,9 +113,9 @@ where
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
 
-            // Collect healthy candidate addresses and resolve the version string.
-            // Multiple rules for the same (namespace, module, version) are all candidates.
-            let (resolved_version, candidate_addrs) = {
+            // Collect healthy candidates and resolve the version string.
+            // Each candidate is a Destination (local engine or remote proxy).
+            let (resolved_version, candidates) = {
                 let t = table.read().await;
                 let healthy: Vec<_> = t
                     .rules
@@ -121,14 +127,22 @@ where
                     })
                     .collect();
 
+                let make_destination = |r: &&wr_common::wruntime::RoutingRule| {
+                    if r.proxy_address == self_proxy_address {
+                        Destination::LocalEngine(r.engine_address.clone())
+                    } else {
+                        Destination::RemoteProxy(r.proxy_address.clone())
+                    }
+                };
+
                 if let Some(ref version) = requested_version {
                     // Exact version match across all healthy rules
-                    let addrs: Vec<String> = healthy
+                    let cands: Vec<Destination> = healthy
                         .iter()
                         .filter(|r| r.destination_version == *version)
-                        .map(|r| r.engine_address.clone())
+                        .map(make_destination)
                         .collect();
-                    (version.clone(), addrs)
+                    (version.clone(), cands)
                 } else {
                     // Find highest semver, then collect all rules at that version
                     let best = healthy
@@ -147,19 +161,19 @@ where
 
                     match best {
                         Some(ver) => {
-                            let addrs: Vec<String> = healthy
+                            let cands: Vec<Destination> = healthy
                                 .iter()
                                 .filter(|r| r.destination_version == ver)
-                                .map(|r| r.engine_address.clone())
+                                .map(make_destination)
                                 .collect();
-                            (ver, addrs)
+                            (ver, cands)
                         }
                         None => (String::new(), vec![]),
                     }
                 }
             };
 
-            if candidate_addrs.is_empty() {
+            if candidates.is_empty() {
                 let msg = match requested_version {
                     Some(v) => format!(
                         "no route for module '{module_name}.{dest_namespace}' version '{v}'"
@@ -171,7 +185,7 @@ where
             }
 
             // Round-robin across candidates using a per-(namespace, module, version) counter
-            let addr = {
+            let destination = {
                 let mut map = counters.lock().unwrap();
                 let counter = map
                     .entry((
@@ -180,13 +194,19 @@ where
                         resolved_version.clone(),
                     ))
                     .or_insert(0);
-                let idx = *counter % candidate_addrs.len();
+                let idx = *counter % candidates.len();
                 *counter = counter.wrapping_add(1);
-                candidate_addrs[idx].clone()
+                candidates[idx].clone()
+            };
+
+            let dest_addr = match &destination {
+                Destination::LocalEngine(a) => a.clone(),
+                Destination::RemoteProxy(a) => a.clone(),
             };
 
             // Inject x-wr-namespace, x-wr-module, and x-wr-version so the
-            // destination engine knows which WASM module and version to dispatch to.
+            // destination engine (or peer proxy's routing layer) knows which
+            // WASM module and version to dispatch to.
             if let Ok(v) = http::HeaderValue::from_str(&dest_namespace) {
                 req.headers_mut().insert("x-wr-namespace", v);
             }
@@ -199,9 +219,10 @@ where
                 req.headers_mut().insert("x-wr-version", v);
             }
             span.record("wr.version", &resolved_version);
-            span.record("wr.engine", &addr);
+            span.record("wr.engine", &dest_addr);
 
-            req.extensions_mut().insert(ResolvedDestination(addr));
+            req.extensions_mut()
+                .insert(ResolvedDestination(destination));
             inner.call(req).instrument(span).await
         })
     }

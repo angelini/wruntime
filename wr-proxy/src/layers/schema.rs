@@ -55,6 +55,13 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
+            // Requests arriving from a peer proxy were already validated at ingress.
+            // Skip re-validation to avoid double-checking and allow the routing layer
+            // to dispatch to the local engine.
+            if req.headers().contains_key("x-wr-via-proxy") {
+                return inner.call(req).await;
+            }
+
             // Parse x-wr-destination to get module name and RPC path.
             let destination = req
                 .headers()

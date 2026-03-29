@@ -114,7 +114,7 @@ impl EngineRunner {
         info!(module = %module_config.name, "loading module");
 
         let component = Component::from_file(&self.engine, &module_config.wasm_path)?;
-        let proxy_uri: hyper::Uri = self.config.proxy_address.parse()?;
+        let proxy_uri: hyper::Uri = self.config.node.proxy_address.parse()?;
         let module_name = module_config.name.clone();
         let module_namespace = module_config.namespace.clone();
         let module_version = module_config.version.clone();
@@ -162,6 +162,7 @@ impl EngineRunner {
                     proxy_uri: proxy_uri.clone(),
                     db_pool,
                     db_schema,
+                    fs: module_config.fs.clone(),
                 };
                 tokio::spawn(http_handler_task(handler, module, rx));
             }
@@ -183,7 +184,8 @@ impl EngineRunner {
                     proxy_uri,
                     db_pool,
                     db_schema,
-                );
+                    module_config.fs.as_ref(),
+                )?;
                 let mut store = Store::new(&self.engine, state);
                 let instance = linker.instantiate_async(&mut store, &component).await?;
 
@@ -225,6 +227,7 @@ struct ModuleContext {
     proxy_uri: hyper::Uri,
     db_pool: Option<Arc<Pool>>,
     db_schema: Option<String>,
+    fs: Option<wr_engine::config::FsMode>,
 }
 
 /// Task that owns the module's channel receiver and spawns a sub-task per
@@ -259,7 +262,8 @@ async fn dispatch_request(
         module.proxy_uri.clone(),
         module.db_pool.clone(),
         module.db_schema.clone(),
-    );
+        module.fs.as_ref(),
+    )?;
     let mut store = Store::new(&handler.engine, state);
     let proxy = handler.pre.instantiate_async(&mut store).await?;
 

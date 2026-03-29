@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
+use crate::config::FsMode;
 use deadpool_postgres::Pool;
 use hyper::header::{HeaderName, HeaderValue};
+use tempfile::TempDir;
 use wasmtime::component::ResourceTable;
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{
     bindings::http::types::ErrorCode,
     body::HyperOutgoingBody,
@@ -24,6 +26,10 @@ pub struct ModuleState {
     /// Postgres schema name for this module (`wr__{namespace}__{name}`).
     /// Set when DB access is enabled; used to scope all queries to the module's schema.
     pub db_schema: Option<String>,
+    /// Ephemeral temp directory backing the module's WASI filesystem.
+    /// `Some` only when `fs = "tempdir"` is set; kept alive so it isn't
+    /// deleted until the store is dropped.
+    _fs_root: Option<TempDir>,
 }
 
 impl ModuleState {
@@ -33,9 +39,20 @@ impl ModuleState {
         proxy_uri: hyper::Uri,
         db_pool: Option<Arc<Pool>>,
         db_schema: Option<String>,
-    ) -> Self {
-        Self {
-            wasi: WasiCtxBuilder::new().inherit_stdio().build(),
+        fs: Option<&FsMode>,
+    ) -> anyhow::Result<Self> {
+        let mut builder = WasiCtxBuilder::new();
+        builder.inherit_stdio();
+        let fs_root = match fs {
+            Some(FsMode::Tempdir) => {
+                let dir = tempfile::tempdir()?;
+                builder.preopened_dir(dir.path(), "/", DirPerms::all(), FilePerms::all())?;
+                Some(dir)
+            }
+            None => None,
+        };
+        Ok(Self {
+            wasi: builder.build(),
             http: WasiHttpCtx::new(),
             table: ResourceTable::new(),
             module_name,
@@ -43,7 +60,8 @@ impl ModuleState {
             proxy_uri,
             db_pool,
             db_schema,
-        }
+            _fs_root: fs_root,
+        })
     }
 }
 

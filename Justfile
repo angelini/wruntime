@@ -71,6 +71,28 @@ proxy-release:
 engine-release:
     cargo run --release -p wr-engine -- --config engine.toml
 
+# ── Multi-node local development ──────────────────────────────────────────────
+
+# Start node A proxy (listens :9001, proxy_address = "http://127.0.0.1:9001")
+node-a-proxy:
+    cargo run -p wr-proxy -- --config node-a/proxy.toml
+
+# Start node A engine 1 (listens :9100)
+node-a-engine-1:
+    cargo run -p wr-engine -- --config node-a/engine-1.toml
+
+# Start node A engine 2 (listens :9101)
+node-a-engine-2:
+    cargo run -p wr-engine -- --config node-a/engine-2.toml
+
+# Start node B proxy (listens :9002, proxy_address = "http://127.0.0.1:9002")
+node-b-proxy:
+    cargo run -p wr-proxy -- --config node-b/proxy.toml
+
+# Start node B engine 1 (listens :9200)
+node-b-engine-1:
+    cargo run -p wr-engine -- --config node-b/engine-1.toml
+
 # ── Database (test) ───────────────────────────────────────────────────────────
 
 pg_data := ".pg-test-data"

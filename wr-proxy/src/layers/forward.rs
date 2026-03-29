@@ -10,7 +10,7 @@ use hyper_util::rt::TokioExecutor;
 use tower::Service;
 use tracing::{info_span, Instrument};
 
-use super::{full_body, ResBody, ResolvedDestination};
+use super::{full_body, Destination, ResBody, ResolvedDestination};
 
 #[derive(Clone)]
 pub struct ForwardService {
@@ -43,30 +43,42 @@ impl Service<Request<Bytes>> for ForwardService {
         let client = self.client.clone();
 
         Box::pin(async move {
-            // Read the engine address injected by RoutingLayer
-            let dest = req
+            // Read the routing decision injected by RoutingLayer
+            let destination = req
                 .extensions()
                 .get::<ResolvedDestination>()
                 .map(|d| d.0.clone())
                 .ok_or_else(|| anyhow::anyhow!("missing ResolvedDestination extension"))?;
 
-            // Strip internal routing headers before forwarding
-            // (x-wr-module is kept so the destination engine can dispatch correctly)
-            req.headers_mut().remove("x-wr-destination");
-            req.headers_mut().remove("x-wr-source");
+            let forward_addr = match &destination {
+                Destination::LocalEngine(addr) => {
+                    // Strip internal routing headers — engine doesn't need them.
+                    // (x-wr-module is kept so the engine can dispatch correctly)
+                    req.headers_mut().remove("x-wr-destination");
+                    req.headers_mut().remove("x-wr-source");
+                    req.headers_mut().remove("x-wr-via-proxy");
+                    addr.clone()
+                }
+                Destination::RemoteProxy(addr) => {
+                    // Preserve x-wr-destination so the peer proxy can route.
+                    // Mark as a proxy hop to suppress re-validation on the peer.
+                    req.headers_mut()
+                        .insert("x-wr-via-proxy", http::HeaderValue::from_static("1"));
+                    addr.clone()
+                }
+            };
 
-            // Build the forwarding URI: engine address + original path+query
+            // Build the forwarding URI: target address + original path+query
             let path = req
                 .uri()
                 .path_and_query()
                 .map(|pq: &http::uri::PathAndQuery| pq.as_str())
                 .unwrap_or("/");
             let forward_uri: http::Uri =
-                format!("{}{}", dest.trim_end_matches('/'), path).parse()?;
+                format!("{}{}", forward_addr.trim_end_matches('/'), path).parse()?;
 
             // Re-use the original method and headers; replace URI and body type.
-            // Inject the W3C traceparent header so the engine can link its span
-            // to this proxy span.
+            // Inject the W3C traceparent header so the downstream can link its span.
             let (mut parts, body) = req.into_parts();
             parts.uri = forward_uri;
             wr_common::telemetry::inject_context(&mut parts.headers);
@@ -74,7 +86,7 @@ impl Service<Request<Bytes>> for ForwardService {
 
             let span = info_span!(
                 "proxy.forward",
-                wr.engine                 = %dest,
+                wr.engine                 = %forward_addr,
                 http.response.status_code = tracing::field::Empty,
                 otel.status_code          = tracing::field::Empty,
             );

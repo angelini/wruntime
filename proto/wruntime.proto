@@ -11,9 +11,10 @@ message ModuleDescriptor {
 }
 
 message EngineRegistration {
-  string                    engine_id = 1;
-  string                    address   = 2; // host:port wr-proxy uses to reach this engine
-  repeated ModuleDescriptor modules   = 3;
+  string                    engine_id     = 1;
+  string                    address       = 2; // host:port wr-proxy uses to reach this engine
+  repeated ModuleDescriptor modules       = 3;
+  string                    proxy_address = 4; // local proxy address (node identity)
 }
 
 message RoutingRule {
@@ -26,6 +27,7 @@ message RoutingRule {
   bool   healthy                   = 7; // set by manager; false means no traffic
   string source_namespace          = 8;
   string destination_namespace     = 9;
+  string proxy_address             = 10; // node proxy address for this engine
 }
 
 message RoutingTable {

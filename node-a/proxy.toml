@@ -5,7 +5,7 @@ manager_address = "http://127.0.0.1:9000"
 proxy_address = "http://127.0.0.1:9001"   # this proxy's own address, as reachable by peers
 
 [cache]
-routing_table_ttl_secs = 1
+routing_table_ttl_secs = 5
 schema_ttl_secs        = 60
 
 [metrics]
