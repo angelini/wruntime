@@ -3,6 +3,9 @@ mod proto {
     include!(concat!(env!("OUT_DIR"), "/ecommerce.rs"));
 }
 
+#[allow(dead_code, unused_imports)]
+mod bindings;
+
 use proto::InventoryServiceClient;
 
 struct Component;

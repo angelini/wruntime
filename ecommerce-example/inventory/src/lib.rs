@@ -3,23 +3,23 @@ mod proto {
     include!(concat!(env!("OUT_DIR"), "/ecommerce.rs"));
 }
 
+// Include generated bindings so the component-type metadata section
+// (which declares `export wasi:http/incoming-handler`) is linked in.
+#[allow(dead_code, unused_imports)]
+mod bindings;
+
 use wr_sdk::bindings::wasi::http::types::{IncomingRequest, Method, ResponseOutparam};
 use wr_sdk::bindings::wruntime::db::database::{self, PgValue};
 use wr_sdk::io::{err_body, read_body, send_response};
 use prost::Message;
-use std::sync::OnceLock;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
-
-static SCHEMA_INIT: OnceLock<()> = OnceLock::new();
 
 impl wr_sdk::Guest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         let method = request.method();
         let path = request.path_with_query().unwrap_or_default();
-
-        SCHEMA_INIT.get_or_init(ensure_schema);
 
         let body_bytes = read_body(request.consume().unwrap());
 
@@ -37,9 +37,9 @@ impl wr_sdk::Guest for Component {
     }
 }
 
-// ── DB helpers ────────────────────────────────────────────────────────────────
+// ── Route handlers ────────────────────────────────────────────────────────────
 
-fn ensure_schema() -> () {
+fn handle_seed() -> (u16, Vec<u8>) {
     let _ = database::execute(
         "CREATE TABLE IF NOT EXISTS inventory (\
             product_id TEXT PRIMARY KEY, \
@@ -48,11 +48,7 @@ fn ensure_schema() -> () {
         )",
         &[],
     );
-}
 
-// ── Route handlers ────────────────────────────────────────────────────────────
-
-fn handle_seed() -> (u16, Vec<u8>) {
     for i in 1u32..=50 {
         let id = format!("prod-{:03}", i);
         let name = format!("Product {}", i);

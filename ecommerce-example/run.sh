@@ -10,6 +10,12 @@ cd "$REPO_ROOT"
 DB_URL="${DB_URL:-${WRUNTIME_EXAMPLE_DB_URL:-postgres://localhost:5432/wruntime_example}}"
 echo "DB_URL: ${DB_URL}"
 
+# ── Tracing (OpenTelemetry → Grafana LGTM) ────────────────────────────────────
+# OTLP gRPC collector exposed by `just obs-up` (grafana/otel-lgtm) on :4317.
+# The services hard-code localhost:4317 as their OTLP endpoint, so no endpoint
+# override is needed — just set the log level.
+export RUST_LOG="${RUST_LOG:-info}"
+
 # Substitute the DB URL into the engine configs.
 update_db_url() {
     local file="$1"
@@ -81,7 +87,7 @@ cleanup() {
     echo "==> Shutting down..."
     kill -INT "$CLIENT_PID" "$INV1_PID" "$INV2_PID" "$PROXY_PID" "$MANAGER_PID" 2>/dev/null || true
     # Give services time to flush the OTLP batch exporter before exiting.
-    sleep 2
+    sleep 5
 }
 trap cleanup EXIT INT TERM
 
