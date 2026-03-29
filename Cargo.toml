@@ -1,4 +1,4 @@
 [workspace]
-members = ["wr-common", "wr-engine", "wr-proxy", "wr-manager", "wr-tests", "wr-cli"]
+members = ["wr-common", "wr-engine", "wr-proxy", "wr-manager", "wr-tests", "wr-cli", "wr-sdk", "wr-build"]
 exclude = ["ecommerce-example/client", "ecommerce-example/inventory"]
 resolver = "2"

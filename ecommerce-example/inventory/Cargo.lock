@@ -133,7 +133,7 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "prost-build",
- "wit-bindgen-rt",
+ "wr-sdk",
 ]
 
 [[package]]
@@ -488,6 +488,7 @@ version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
 dependencies = [
+ "bitflags",
  "wit-bindgen-rust-macro",
 ]
 
@@ -577,6 +578,14 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "wr-sdk"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+ "wit-bindgen-rt",
 ]
 
 [[package]]

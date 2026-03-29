@@ -1,26 +1,25 @@
-#[allow(warnings)]
-mod bindings;
-
 #[allow(dead_code)]
 mod proto {
     include!(concat!(env!("OUT_DIR"), "/ecommerce.rs"));
 }
 
-use bindings::exports::wasi::http::incoming_handler::Guest;
-use bindings::wasi::http::types::{
-    Fields, IncomingBody, IncomingRequest, Method, OutgoingBody, OutgoingResponse, ResponseOutparam,
-};
-use bindings::wasi::io::streams::StreamError;
-use bindings::wruntime::db::database::{self, PgValue};
+use wr_sdk::bindings::wasi::http::types::{IncomingRequest, Method, ResponseOutparam};
+use wr_sdk::bindings::wruntime::db::database::{self, PgValue};
+use wr_sdk::io::{err_body, read_body, send_response};
 use prost::Message;
+use std::sync::OnceLock;
 
 struct Component;
-bindings::export!(Component with_types_in bindings);
+wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
-impl Guest for Component {
+static SCHEMA_INIT: OnceLock<()> = OnceLock::new();
+
+impl wr_sdk::Guest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         let method = request.method();
         let path = request.path_with_query().unwrap_or_default();
+
+        SCHEMA_INIT.get_or_init(ensure_schema);
 
         let body_bytes = read_body(request.consume().unwrap());
 
@@ -38,23 +37,28 @@ impl Guest for Component {
     }
 }
 
-// ── Route handlers ────────────────────────────────────────────────────────────
+// ── DB helpers ────────────────────────────────────────────────────────────────
 
-fn handle_seed() -> (u16, Vec<u8>) {
-    let _ = database::execute("DROP TABLE IF EXISTS inventory", &[]);
+fn ensure_schema() -> () {
     let _ = database::execute(
-        "CREATE TABLE inventory (\
+        "CREATE TABLE IF NOT EXISTS inventory (\
             product_id TEXT PRIMARY KEY, \
             name       TEXT NOT NULL, \
             stock      BIGINT NOT NULL CHECK (stock >= 0)\
         )",
         &[],
     );
+}
+
+// ── Route handlers ────────────────────────────────────────────────────────────
+
+fn handle_seed() -> (u16, Vec<u8>) {
     for i in 1u32..=50 {
         let id = format!("prod-{:03}", i);
         let name = format!("Product {}", i);
         let _ = database::execute(
-            "INSERT INTO inventory (product_id, name, stock) VALUES ($1, $2, 10000)",
+            "INSERT INTO inventory (product_id, name, stock) \
+             VALUES ($1, $2, 10000) ON CONFLICT DO NOTHING",
             &[PgValue::Text(id), PgValue::Text(name)],
         );
     }
@@ -72,7 +76,9 @@ fn handle_get_stock(body: &[u8]) -> (u16, Vec<u8>) {
         &[PgValue::Text(req.product_id.clone())],
     ) {
         Err(e) => err_body(500, &format!("{e:?}")),
-        Ok(rows) if rows.is_empty() => err_body(404, &format!("product {} not found", req.product_id)),
+        Ok(rows) if rows.is_empty() => {
+            err_body(404, &format!("product {} not found", req.product_id))
+        }
         Ok(rows) => match &rows[0].columns[0].value {
             PgValue::Int8(v) => (
                 200,
@@ -176,43 +182,4 @@ fn handle_return(body: &[u8]) -> (u16, Vec<u8>) {
             .encode_to_vec(),
         ),
     }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn err_body(status: u16, msg: &str) -> (u16, Vec<u8>) {
-    (status, format!(r#"{{"error":"{}"}}"#, msg).into_bytes())
-}
-
-fn read_body(incoming: IncomingBody) -> Vec<u8> {
-    let stream = incoming.stream().unwrap();
-    let mut bytes = Vec::new();
-    loop {
-        match stream.blocking_read(8192) {
-            Ok(chunk) if chunk.is_empty() => break,
-            Ok(chunk) => bytes.extend_from_slice(&chunk),
-            Err(StreamError::Closed) => break,
-            Err(_) => break,
-        }
-    }
-    drop(stream);
-    IncomingBody::finish(incoming);
-    bytes
-}
-
-fn send_response(response_out: ResponseOutparam, status: u16, body: Vec<u8>) {
-    let headers = Fields::new();
-    let _ = headers.set("content-type", &[b"application/x-protobuf".to_vec()]);
-
-    let resp = OutgoingResponse::new(headers);
-    let _ = resp.set_status_code(status);
-
-    let out_body = resp.body().unwrap();
-    {
-        let stream = out_body.write().unwrap();
-        let _ = stream.blocking_write_and_flush(&body);
-    }
-
-    ResponseOutparam::set(response_out, Ok(resp));
-    let _ = OutgoingBody::finish(out_body, None);
 }

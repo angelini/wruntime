@@ -93,7 +93,7 @@ inventory-service WASM module handles the request
 | Rust + Cargo (stable) | Build all binaries |
 | [`just`](https://github.com/casey/just) | Run project recipes (see `Justfile`) |
 | `protoc` | Compile `.proto` schemas to `FileDescriptorSet` binaries — required for every module |
-| `wasm-tools` or `cargo-component` | Build WASM component modules |
+| `cargo-component` | Build WASM component modules |
 
 Install Rust via [rustup](https://rustup.rs). Install `just` via `cargo install just` or your system package manager. Install `protoc` via your system package manager or from [github.com/protocolbuffers/protobuf/releases](https://github.com/protocolbuffers/protobuf/releases).
 
@@ -358,23 +358,16 @@ Example `404` response for an unrecognised path:
 
 ---
 
-## Building a compatible WASM module
+## Module SDK (`wr-sdk` + `wr-build`)
 
-Modules must be **WASI Preview 2 components** that implement the `wasi:http/incoming-handler` world. They make outbound calls using the standard `wasi:http/outgoing-handler` interface — all routing is transparent.
+Two crates eliminate boilerplate from wruntime WASM modules:
 
-All inter-module communication **must use gRPC-style paths** and **protobuf-encoded bodies**. The proxy enforces both. Plain HTTP paths and JSON bodies will be rejected.
+- **`wr-sdk`** — shared WASI helpers that every module links against: `http_rpc`, `read_body`, `send_response`, `err_body`, `log`, export macros, and the `Guest` / `RunGuest` traits.
+- **`wr-build`** — a `build.rs` library providing a `prost-build` `ServiceGenerator` that emits typed gRPC client structs from `.proto` files.
 
-### Toolchain
+### Building a handler module (HTTP request/response)
 
-```bash
-rustup target add wasm32-wasip2
-cargo install cargo-component   # WASI component tooling
-cargo install just              # task runner
-```
-
-`protoc` must also be installed — it is invoked by `prost-build` at compile time to generate Rust types from your `.proto` file.
-
-### Cargo.toml
+`Cargo.toml`:
 
 ```toml
 [package]
@@ -386,17 +379,20 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen-rt = "0.44"
-prost          = "0.13"   # protobuf encode / decode
+prost   = "0.13"
+wr-sdk  = { path = "../../wr-sdk" }
 
 [build-dependencies]
-prost-build = "0.13"      # generates Rust types from .proto at compile time
+prost-build = "0.13"
 
 [package.metadata.component]
 package = "wruntime:inventory-service"
+
+[package.metadata.component.target]
+world = "wruntime:inventory-service/inventory-service"
 ```
 
-### build.rs
+`build.rs`:
 
 ```rust
 fn main() {
@@ -408,115 +404,132 @@ fn main() {
 }
 ```
 
-Include the generated types in your module:
+`src/lib.rs`:
 
 ```rust
 mod proto {
     include!(concat!(env!("OUT_DIR"), "/inventory.rs"));
 }
-```
 
-### WIT world
+use wr_sdk::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
+use wr_sdk::io::{err_body, read_body, send_response};
+use prost::Message;
 
-Your component must implement the WASI HTTP proxy world. With `cargo-component` this is done automatically. The relevant WIT interface is:
+struct Component;
+wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
-```wit
-// WASI HTTP proxy world (provided by the host)
-world proxy {
-  export wasi:http/incoming-handler@0.2.0;
-  import wasi:http/outgoing-handler@0.2.0;
+impl wr_sdk::Guest for Component {
+    fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
+        let path  = request.path_with_query().unwrap_or_default();
+        let body  = read_body(request.consume().unwrap());
+
+        let (status, resp) = match path.as_str() {
+            "/inventory.InventoryService/GetItems" => {
+                match proto::GetItemsRequest::decode(body.as_slice()) {
+                    Ok(req) => (200, process_get_items(req).encode_to_vec()),
+                    Err(e)  => err_body(400, &e.to_string()),
+                }
+            }
+            _ => err_body(404, &format!("no handler for {path}")),
+        };
+
+        send_response(response_out, status, resp);
+    }
 }
 ```
 
-### Example: making an outbound call to another module
+### Building a runner module (long-running task that calls other services)
 
-Use `{module}.{namespace}` as the HTTP authority. The engine intercepts the call and routes it via the proxy. The path **must** be a gRPC method path and the body **must** be a protobuf-encoded message:
+Add `wr-build` as a build dependency to get generated typed clients from your `.proto` file.
+
+`Cargo.toml`:
+
+```toml
+[dependencies]
+prost   = "0.13"
+wr-sdk  = { path = "../../wr-sdk" }
+
+[build-dependencies]
+prost-build = "0.13"
+wr-build    = { path = "../../wr-build" }
+
+[package.metadata.component]
+package = "wruntime:client"
+
+[package.metadata.component.target]
+world = "wruntime:client/client"
+```
+
+`build.rs`:
 
 ```rust
-use prost::Message;
-use wasi::http::{outgoing_handler, types::*};
+fn main() {
+    prost_build::Config::new()
+        .service_generator(Box::new(wr_build::WrClientGenerator))
+        .compile_protos(&["schemas/inventory_service.proto"], &["schemas"])
+        .unwrap();
+}
+```
 
-fn buy_item(product_id: &str, quantity: i64) -> proto::BuyResponse {
-    // Encode the protobuf request body.
-    let body_bytes = proto::BuyRequest {
-        product_id: product_id.to_string(),
-        quantity,
-    }
-    .encode_to_vec();
+`WrClientGenerator` appends a typed `{ServiceName}Client` struct to the generated file. For a service `InventoryService` in package `inventory`, the generated client looks like:
 
-    let headers = Fields::new();
-    headers.set("content-type", &[b"application/x-protobuf".to_vec()]).unwrap();
-    let req = OutgoingRequest::new(headers);
+```rust
+pub struct InventoryServiceClient { authority: String }
 
-    // Authority is "{module}.{namespace}" — routing is automatic.
-    // Omit x-wr-version to reach the latest deployed version, or set it to
-    // pin a specific semver.
-    req.set_authority(Some("inventory-service.myapp")).unwrap();
-    req.set_path_with_query(Some("/inventory.InventoryService/Buy")).unwrap();
-    req.set_scheme(Some(&Scheme::Http)).unwrap();
-    req.set_method(&Method::Post).unwrap();
+impl InventoryServiceClient {
+    pub fn new(authority: impl Into<String>) -> Self { ... }
 
-    let out_body = req.body().unwrap();
-    {
-        let stream = out_body.write().unwrap();
-        stream.blocking_write_and_flush(&body_bytes).unwrap();
-    }
-    OutgoingBody::finish(out_body, None).unwrap();
+    pub fn get_items(&self, req: GetItemsRequest) -> Result<GetItemsResponse, String> { ... }
+    // one method per RPC; keyword names are escaped (e.g. r#return)
+}
+```
 
-    let future = outgoing_handler::handle(req, None).unwrap();
-    loop {
-        match future.get() {
-            Some(Ok(Ok(resp))) => {
-                let incoming = resp.consume().unwrap();
-                let stream = incoming.stream().unwrap();
-                let mut bytes = Vec::new();
-                loop {
-                    match stream.blocking_read(8192) {
-                        Ok(chunk) if chunk.is_empty() => break,
-                        Ok(chunk) => bytes.extend_from_slice(&chunk),
-                        Err(_) => break,
-                    }
-                }
-                return proto::BuyResponse::decode(bytes.as_slice()).unwrap();
-            }
-            None => future.subscribe().block(),
-            _ => panic!("request failed"),
+`src/lib.rs`:
+
+```rust
+mod proto {
+    include!(concat!(env!("OUT_DIR"), "/inventory.rs"));
+}
+
+use proto::InventoryServiceClient;
+
+struct Component;
+wr_sdk::export_run!(Component);
+
+impl wr_sdk::RunGuest for Component {
+    fn run() {
+        wr_sdk::log::log("starting");
+
+        let client = InventoryServiceClient::new("inventory-service.myapp");
+
+        match client.get_items(proto::GetItemsRequest { category: "books".into() }) {
+            Ok(resp) => wr_sdk::log::log(&format!("items: {:?}", resp.items)),
+            Err(e)   => wr_sdk::log::log(&format!("error: {e}")),
         }
     }
 }
 ```
 
-### Example: handling an incoming gRPC-style request
+### SDK reference
 
-```rust
-impl Guest for Component {
-    fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        let path = request.path_with_query().unwrap_or_default();
-        let body = read_body(request.consume().unwrap());
-
-        let (status, resp_bytes) = match path.as_str() {
-            "/inventory.InventoryService/Buy" => {
-                match proto::BuyRequest::decode(body.as_slice()) {
-                    Ok(req) => {
-                        let resp = process_buy(req);
-                        (200, resp.encode_to_vec())
-                    }
-                    Err(e) => (400, format!(r#"{{"error":"{e}"}}"#).into_bytes()),
-                }
-            }
-            _ => (404, b"not found".to_vec()),
-        };
-
-        send_response(response_out, status, resp_bytes);
-    }
-}
-```
+| Item | Description |
+|------|-------------|
+| `wr_sdk::http::http_rpc(authority, path, body)` | POST a protobuf body to `http://{authority}{path}`; returns `(status, bytes)` |
+| `wr_sdk::io::read_body(incoming)` | Drain an `IncomingBody` into `Vec<u8>` |
+| `wr_sdk::io::send_response(out, status, body)` | Write a response with the given status and body |
+| `wr_sdk::io::err_body(status, msg)` | Return `(status, {"error":"msg"})` |
+| `wr_sdk::log::log(msg)` | Write a line to WASI stderr |
+| `wr_sdk::export!(T with_types_in wr_sdk::bindings)` | Register `T` as the `wasi:http/incoming-handler` implementation |
+| `wr_sdk::export_run!(T)` | Register `T::run()` as the WASM `run` export |
+| `wr_sdk::Guest` | Trait for HTTP handler modules (`fn handle(request, response_out)`) |
+| `wr_sdk::RunGuest` | Trait for runner modules (`fn run()`) |
+| `wr_sdk::bindings::wruntime::db::database` | DB access types — same as used by the host |
 
 ### Building the component
 
 ```bash
 cargo component build --release
-# produces: target/wasm32-wasip2/release/inventory_service.wasm
+# produces: target/wasm32-wasip1/release/inventory_service.wasm
 ```
 
 Copy the `.wasm` file to the path referenced by `wasm_path` in `engine.toml`.
@@ -526,6 +539,8 @@ Copy the `.wasm` file to the path referenced by `wasm_path` in `engine.toml`.
 ## Database access
 
 WASM modules can query Postgres through a host-provided interface defined in `wit/db.wit`. The engine holds a shared connection pool; the module never owns a connection directly.
+
+When using `wr-sdk`, the database types (`PgValue`, `Row`, etc.) are available at `wr_sdk::bindings::wruntime::db::database` — no separate `wit_bindgen::generate!` call is required.
 
 ### Engine configuration
 
@@ -549,49 +564,26 @@ wasm_path = "modules/inventory_service.wasm"
 # database omitted — no DB access for this module
 ```
 
-### Guest-side setup
-
-Add the WIT path to your component's `Cargo.toml` and import the interface:
-
-```toml
-[package.metadata.component.target]
-path = "../../wit"   # path to the repo's wit/ directory
-```
-
-Then generate bindings and use them in your module:
-
-```rust
-// src/lib.rs
-wit_bindgen::generate!({
-    path:  "../../wit",
-    world: "db-access",
-});
-
-use wruntime::db::database::{self, PgValue};
-```
-
 ### Example: querying Postgres from a WASM module
 
 ```rust
-use wruntime::db::database::{self, DbError, PgValue};
+use wr_sdk::bindings::wruntime::db::database::{self, PgValue};
 
 /// Look up an order by its integer ID and return the status string.
-fn get_order_status(order_id: i32) -> Result<Option<String>, DbError> {
+fn get_order_status(order_id: i32) -> Option<String> {
     let rows = database::query(
         "SELECT status FROM orders WHERE id = $1",
         &[PgValue::Int4(order_id)],
-    )?;
+    ).ok()?;
 
-    Ok(rows.first().and_then(|row| {
-        match row.columns.first().map(|c| &c.value) {
-            Some(PgValue::Text(s)) => Some(s.clone()),
-            _ => None,
-        }
-    }))
+    match rows.first()?.columns.first().map(|c| &c.value) {
+        Some(PgValue::Text(s)) => Some(s.clone()),
+        _ => None,
+    }
 }
 
 /// Insert a new order and return the number of rows affected.
-fn create_order(id: i32, status: &str, total: &str) -> Result<u64, DbError> {
+fn create_order(id: i32, status: &str, total: &str) -> u64 {
     database::execute(
         "INSERT INTO orders (id, status, total) VALUES ($1, $2, $3::numeric)",
         &[
@@ -599,7 +591,7 @@ fn create_order(id: i32, status: &str, total: &str) -> Result<u64, DbError> {
             PgValue::Text(status.to_string()),
             PgValue::Numeric(total.to_string()),
         ],
-    )
+    ).unwrap_or(0)
 }
 ```
 
@@ -654,7 +646,7 @@ The `wr-tests` crate contains integration tests that spin up in-process instance
 ## Project layout
 
 ```
-runtime/
+wruntime/
 ├── proto/
 │   └── wruntime.proto      # single source of truth for all gRPC messages
 ├── wr-common/              # generated proto types (tonic + prost)
@@ -662,7 +654,10 @@ runtime/
 ├── wr-proxy/               # HTTP routing + schema validation proxy
 │   └── src/layers/         # Tower middleware stack
 ├── wr-engine/              # WASM runtime (wasmtime) + inbound HTTP server
+├── wr-sdk/                 # WASM module SDK: http_rpc, io, log, export macros
+├── wr-build/               # build.rs helper: WrClientGenerator for typed gRPC clients
 ├── wr-tests/               # integration tests
+├── ecommerce-example/      # example: inventory (handler) + client (runner) modules
 ├── manager.toml            # example manager config
 ├── proxy.toml              # example proxy config
 └── engine.toml             # example engine config

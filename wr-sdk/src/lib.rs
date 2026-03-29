@@ -1,0 +1,99 @@
+/// Generated WASI bindings for the import-only sdk world.
+/// Does not export `wasi:http/incoming-handler`; each module's own cargo-component
+/// world definition provides that.
+pub mod bindings {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "sdk",
+        generate_all,
+    });
+}
+
+// Re-export wit_bindgen_rt so macro-generated code can reference it via $crate.
+#[doc(hidden)]
+pub use ::wit_bindgen_rt as _rt;
+
+/// Handler export helpers. The `IncomingRequest` and `ResponseOutparam` types
+/// come from `wr_sdk::bindings::wasi::http::types`, ensuring type compatibility
+/// with all modules that import `wr_sdk::bindings`.
+pub mod exports {
+    pub mod incoming_handler {
+        use crate::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
+
+        /// Implement this trait and use `wr_sdk::export!` to register an HTTP
+        /// handler module.
+        pub trait Guest {
+            fn handle(request: IncomingRequest, response_out: ResponseOutparam);
+        }
+
+        #[doc(hidden)]
+        pub unsafe fn _export_handle_cabi<T: Guest>(arg0: i32, arg1: i32) {
+            #[cfg(target_arch = "wasm32")]
+            ::wit_bindgen_rt::run_ctors_once();
+            T::handle(
+                unsafe { IncomingRequest::from_handle(arg0 as u32) },
+                unsafe { ResponseOutparam::from_handle(arg1 as u32) },
+            );
+        }
+    }
+}
+
+/// Convenience re-export of the HTTP handler `Guest` trait.
+pub use exports::incoming_handler::Guest;
+
+/// Implement this trait and use `wr_sdk::export_run!` to register a runner module
+/// (one that exports `run` rather than `wasi:http/incoming-handler`).
+pub trait RunGuest {
+    fn run();
+}
+
+pub mod http;
+pub mod io;
+pub mod log;
+
+/// Export macro for HTTP handler modules (those that export `wasi:http/incoming-handler`).
+///
+/// Usage (in the module's `lib.rs`):
+/// ```rust,ignore
+/// struct MyComponent;
+/// wr_sdk::export!(MyComponent with_types_in wr_sdk::bindings);
+/// impl wr_sdk::Guest for MyComponent { fn handle(...) { ... } }
+/// ```
+#[macro_export]
+macro_rules! export {
+    ($ty:ident) => {
+        $crate::export!($ty with_types_in $crate::bindings);
+    };
+    ($ty:ident with_types_in $($path_to_types:tt)*) => {
+        const _: () = {
+            #[unsafe(export_name = "wasi:http/incoming-handler@0.2.6#handle")]
+            unsafe extern "C" fn wr_sdk_export_handle(arg0: i32, arg1: i32) {
+                unsafe {
+                    $crate::exports::incoming_handler::_export_handle_cabi::<$ty>(arg0, arg1)
+                }
+            }
+        };
+    };
+}
+
+/// Export macro for runner modules (those that export `run`).
+///
+/// Usage (in the module's `lib.rs`):
+/// ```rust,ignore
+/// struct MyComponent;
+/// wr_sdk::export_run!(MyComponent);
+/// impl wr_sdk::RunGuest for MyComponent { fn run() { ... } }
+/// ```
+#[macro_export]
+macro_rules! export_run {
+    ($ty:ident) => {
+        const _: () = {
+            #[unsafe(export_name = "run")]
+            unsafe extern "C" fn wr_sdk_export_run() {
+                #[cfg(target_arch = "wasm32")]
+                $crate::_rt::run_ctors_once();
+                <$ty as $crate::RunGuest>::run();
+            }
+        };
+    };
+}

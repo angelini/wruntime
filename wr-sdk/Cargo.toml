@@ -1,0 +1,8 @@
+[package]
+name = "wr-sdk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wit-bindgen = "0.51.0"
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
