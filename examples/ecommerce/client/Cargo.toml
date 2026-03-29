@@ -22,6 +22,7 @@ package = "ecommerce:client"
 world = "ecommerce:client/client"
 
 [package.metadata.component.target.dependencies]
+"wruntime:tracing" = { path = "../../../wr-sdk/wit/deps/tracing.wit" }
 "wasi:http" = { path = "../../../wr-sdk/wit/deps/http.wit" }
 "wasi:io" = { path = "../../../wr-sdk/wit/deps/io.wit" }
 "wasi:cli" = { path = "../../../wr-sdk/wit/deps/cli.wit" }

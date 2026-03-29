@@ -126,6 +126,7 @@ async fn handle(
     let inbound = InboundRequest {
         request: Request::from_parts(parts, bytes),
         response_tx: resp_tx,
+        span: tracing::Span::current(),
     };
 
     use tokio::sync::mpsc::error::TrySendError;

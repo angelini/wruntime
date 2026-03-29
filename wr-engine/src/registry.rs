@@ -10,6 +10,9 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 pub struct InboundRequest {
     pub request: http::Request<Bytes>,
     pub response_tx: oneshot::Sender<http::Response<Bytes>>,
+    /// The `engine.dispatch` span from the inbound server, carried through the
+    /// channel so that WASM-side child spans are attached to the correct trace.
+    pub span: tracing::Span,
 }
 
 pub type ModuleTx = mpsc::Sender<InboundRequest>;

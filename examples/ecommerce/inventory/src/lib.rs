@@ -10,6 +10,7 @@ mod bindings;
 
 use wr_sdk::bindings::wasi::http::types::{IncomingRequest, Method, ResponseOutparam};
 use wr_sdk::bindings::wruntime::db::database::{self, PgValue};
+use wr_sdk::bindings::wruntime::tracing::span;
 use wr_sdk::io::{err_body, read_body, send_response};
 use prost::Message;
 
@@ -40,6 +41,7 @@ impl wr_sdk::ServiceGuest for Component {
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 fn handle_seed() -> (u16, Vec<u8>) {
+    let sp = span::start("inventory.seed");
     let _ = database::execute(
         "CREATE TABLE IF NOT EXISTS inventory (\
             product_id TEXT PRIMARY KEY, \
@@ -58,6 +60,7 @@ fn handle_seed() -> (u16, Vec<u8>) {
             &[PgValue::Text(id), PgValue::Text(name)],
         );
     }
+    sp.set_attribute("inventory.seeded", "50");
     (200, proto::SeedResponse { seeded: 50 }.encode_to_vec())
 }
 
@@ -66,6 +69,9 @@ fn handle_get_stock(body: &[u8]) -> (u16, Vec<u8>) {
         Ok(r) => r,
         Err(e) => return err_body(400, &format!("invalid request: {e}")),
     };
+
+    let sp = span::start("inventory.get_stock");
+    sp.set_attribute("product.id", &req.product_id);
 
     match database::query(
         "SELECT stock FROM inventory WHERE product_id = $1",
@@ -76,14 +82,17 @@ fn handle_get_stock(body: &[u8]) -> (u16, Vec<u8>) {
             err_body(404, &format!("product {} not found", req.product_id))
         }
         Ok(rows) => match &rows[0].columns[0].value {
-            PgValue::Int8(v) => (
-                200,
-                proto::GetStockResponse {
-                    product_id: req.product_id,
-                    stock: *v,
-                }
-                .encode_to_vec(),
-            ),
+            PgValue::Int8(v) => {
+                sp.set_attribute("product.stock", &v.to_string());
+                (
+                    200,
+                    proto::GetStockResponse {
+                        product_id: req.product_id,
+                        stock: *v,
+                    }
+                    .encode_to_vec(),
+                )
+            }
             _ => err_body(500, "unexpected column type"),
         },
     }
@@ -97,6 +106,10 @@ fn handle_buy(body: &[u8]) -> (u16, Vec<u8>) {
     if req.quantity <= 0 {
         return err_body(400, "quantity must be > 0");
     }
+
+    let sp = span::start("inventory.buy");
+    sp.set_attribute("product.id", &req.product_id);
+    sp.set_attribute("product.quantity", &req.quantity.to_string());
 
     let tx = match database::begin_transaction() {
         Ok(t) => t,
@@ -129,6 +142,7 @@ fn handle_buy(body: &[u8]) -> (u16, Vec<u8>) {
 
     if stock < req.quantity {
         let _ = tx.rollback();
+        sp.set_error(&format!("insufficient stock — available: {stock}"));
         return err_body(409, &format!("insufficient stock — available: {stock}"));
     }
 
@@ -144,11 +158,17 @@ fn handle_buy(body: &[u8]) -> (u16, Vec<u8>) {
         return err_body(500, &format!("{e:?}"));
     }
 
+    let remaining = stock - req.quantity;
+    sp.set_attribute("product.remaining", &remaining.to_string());
+    sp.record_event("buy.committed", &[
+        ("product_id".into(), req.product_id.clone()),
+        ("quantity".into(), req.quantity.to_string()),
+    ]);
     (
         200,
         proto::BuyResponse {
             bought: req.quantity,
-            remaining: stock - req.quantity,
+            remaining,
         }
         .encode_to_vec(),
     )
@@ -165,6 +185,11 @@ fn handle_transfer(body: &[u8]) -> (u16, Vec<u8>) {
     if req.from_product_id == req.to_product_id {
         return err_body(400, "from and to products must differ");
     }
+
+    let sp = span::start("inventory.transfer");
+    sp.set_attribute("product.from", &req.from_product_id);
+    sp.set_attribute("product.to", &req.to_product_id);
+    sp.set_attribute("product.quantity", &req.quantity.to_string());
 
     let tx = match database::begin_transaction() {
         Ok(t) => t,
@@ -224,6 +249,7 @@ fn handle_transfer(body: &[u8]) -> (u16, Vec<u8>) {
 
     if stock_from < req.quantity {
         let _ = tx.rollback();
+        sp.set_error(&format!("insufficient stock — available: {stock_from}"));
         return err_body(409, &format!("insufficient stock — available: {stock_from}"));
     }
 
@@ -247,6 +273,11 @@ fn handle_transfer(body: &[u8]) -> (u16, Vec<u8>) {
         return err_body(500, &format!("{e:?}"));
     }
 
+    sp.record_event("transfer.committed", &[
+        ("from".into(), req.from_product_id.clone()),
+        ("to".into(), req.to_product_id.clone()),
+        ("quantity".into(), req.quantity.to_string()),
+    ]);
     (
         200,
         proto::TransferResponse { transferred: req.quantity }.encode_to_vec(),
@@ -262,6 +293,10 @@ fn handle_restock(body: &[u8]) -> (u16, Vec<u8>) {
         return err_body(400, "quantity must be > 0");
     }
 
+    let sp = span::start("inventory.restock");
+    sp.set_attribute("product.id", &req.product_id);
+    sp.set_attribute("product.quantity", &req.quantity.to_string());
+
     match database::query(
         "UPDATE inventory SET stock = stock + $2 WHERE product_id = $1 RETURNING stock",
         &[PgValue::Text(req.product_id.clone()), PgValue::Int8(req.quantity)],
@@ -271,14 +306,17 @@ fn handle_restock(body: &[u8]) -> (u16, Vec<u8>) {
             err_body(404, &format!("product {} not found", req.product_id))
         }
         Ok(rows) => match &rows[0].columns[0].value {
-            PgValue::Int8(new_stock) => (
-                200,
-                proto::RestockResponse {
-                    product_id: req.product_id,
-                    new_stock: *new_stock,
-                }
-                .encode_to_vec(),
-            ),
+            PgValue::Int8(new_stock) => {
+                sp.set_attribute("product.new_stock", &new_stock.to_string());
+                (
+                    200,
+                    proto::RestockResponse {
+                        product_id: req.product_id,
+                        new_stock: *new_stock,
+                    }
+                    .encode_to_vec(),
+                )
+            }
             _ => err_body(500, "unexpected column type"),
         },
     }
@@ -292,6 +330,10 @@ fn handle_return(body: &[u8]) -> (u16, Vec<u8>) {
     if req.quantity <= 0 {
         return err_body(400, "quantity must be > 0");
     }
+
+    let sp = span::start("inventory.return");
+    sp.set_attribute("product.id", &req.product_id);
+    sp.set_attribute("product.quantity", &req.quantity.to_string());
 
     match database::execute(
         "UPDATE inventory SET stock = stock + $2 WHERE product_id = $1",

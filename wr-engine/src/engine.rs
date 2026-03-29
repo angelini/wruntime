@@ -7,7 +7,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Instrument};
 use wasmtime::component::{Component, Linker};
 use wasmtime::Store;
 use wasmtime::{Config, Engine};
@@ -248,17 +248,21 @@ async fn http_handler_task(
     while let Some(inbound) = rx.recv().await {
         let handler = handler.clone();
         let module = module.clone();
+        let InboundRequest {
+            request,
+            response_tx,
+            span,
+        } = inbound;
 
-        tokio::spawn(async move {
-            let InboundRequest {
-                request,
-                response_tx,
-            } = inbound;
-            let timeout = module.request_timeout;
+        tokio::spawn(
+            async move {
+                let timeout = module.request_timeout;
 
-            let response =
-                match tokio::time::timeout(timeout, dispatch_request(&handler, &module, request))
-                    .await
+                let response = match tokio::time::timeout(
+                    timeout,
+                    dispatch_request(&handler, &module, request),
+                )
+                .await
                 {
                     Ok(Ok(resp)) => resp,
                     Ok(Err(e)) => {
@@ -281,8 +285,10 @@ async fn http_handler_task(
                     }
                 };
 
-            let _ = response_tx.send(response);
-        });
+                let _ = response_tx.send(response);
+            }
+            .instrument(span),
+        );
     }
 }
 
@@ -376,6 +382,7 @@ pub async fn check_module_health(tx: &ModuleTx) -> bool {
         .send(InboundRequest {
             request,
             response_tx: resp_tx,
+            span: tracing::Span::none(),
         })
         .await
         .is_err()

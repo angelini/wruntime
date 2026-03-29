@@ -8,6 +8,7 @@ mod bindings;
 
 use proto::InventoryServiceClient;
 use wr_sdk::bindings::wasi::http::types::{IncomingRequest, Method, ResponseOutparam};
+use wr_sdk::bindings::wruntime::tracing::span;
 use wr_sdk::io::{err_body, read_body, send_response};
 use prost::Message;
 
@@ -39,6 +40,9 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
 
     wr_sdk::log::log(&format!("client starting — {count} iterations"));
 
+    let run_span = span::start("client.run");
+    run_span.set_attribute("client.count", &count.to_string());
+
     let inv = InventoryServiceClient::new("ecommerce.inventory");
 
     match inv.seed(proto::SeedRequest {}) {
@@ -59,11 +63,15 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
         match i % 6 {
             // 0, 3 — Buy
             0 | 3 => {
+                let sp = span::start("client.buy");
+                sp.set_attribute("product.id", &product_id);
+                sp.set_attribute("product.quantity", &quantity.to_string());
                 match inv.buy(proto::BuyRequest {
                     product_id: product_id.clone(),
                     quantity,
                 }) {
                     Ok(r) => {
+                        sp.set_attribute("product.remaining", &r.remaining.to_string());
                         wr_sdk::log::log(&format!(
                             "bought {} x{} — remaining={}",
                             product_id, quantity, r.remaining
@@ -71,9 +79,11 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                         purchased.push((product_id, quantity));
                     }
                     Err(e) if e.contains("HTTP 409") => {
+                        sp.set_error("out of stock");
                         wr_sdk::log::log(&format!("out of stock {} x{}", product_id, quantity));
                     }
                     Err(e) => {
+                        sp.set_error(&e);
                         wr_sdk::log::log(&format!("buy error: {e}"));
                     }
                 }
@@ -81,6 +91,9 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
             // 1 — Return a previously purchased item
             1 => {
                 if let Some((ret_id, ret_qty)) = purchased.pop() {
+                    let sp = span::start("client.return");
+                    sp.set_attribute("product.id", &ret_id);
+                    sp.set_attribute("product.quantity", &ret_qty.to_string());
                     match inv.r#return(proto::ReturnRequest {
                         product_id: ret_id.clone(),
                         quantity: ret_qty,
@@ -91,22 +104,31 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                                 ret_id, ret_qty, r.product_id
                             ));
                         }
-                        Err(e) => wr_sdk::log::log(&format!("return error: {e}")),
+                        Err(e) => {
+                            sp.set_error(&e);
+                            wr_sdk::log::log(&format!("return error: {e}"));
+                        }
                     }
                 }
             }
             // 2 — GetStock (read-only, high-frequency)
             2 => {
+                let sp = span::start("client.get_stock");
+                sp.set_attribute("product.id", &product_id);
                 match inv.get_stock(proto::GetStockRequest {
                     product_id: product_id.clone(),
                 }) {
                     Ok(r) => {
+                        sp.set_attribute("product.stock", &r.stock.to_string());
                         wr_sdk::log::log(&format!(
                             "stock {} = {}",
                             product_id, r.stock
                         ));
                     }
-                    Err(e) => wr_sdk::log::log(&format!("get_stock error: {e}")),
+                    Err(e) => {
+                        sp.set_error(&e);
+                        wr_sdk::log::log(&format!("get_stock error: {e}"));
+                    }
                 }
             }
             // 4 — Transfer between two products
@@ -114,40 +136,56 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                 let to_idx = ((i.wrapping_mul(11).wrapping_add(3)) % 50) as usize;
                 let to_product_id = PRODUCTS[to_idx].to_string();
                 if product_id != to_product_id {
+                    let sp = span::start("client.transfer");
+                    sp.set_attribute("product.from", &product_id);
+                    sp.set_attribute("product.to", &to_product_id);
+                    sp.set_attribute("product.quantity", &quantity.to_string());
                     match inv.transfer(proto::TransferRequest {
                         from_product_id: product_id.clone(),
                         to_product_id: to_product_id.clone(),
                         quantity,
                     }) {
                         Ok(r) => {
+                            sp.set_attribute("product.transferred", &r.transferred.to_string());
                             wr_sdk::log::log(&format!(
                                 "transferred {} → {} x{}",
                                 product_id, to_product_id, r.transferred
                             ));
                         }
                         Err(e) if e.contains("HTTP 409") => {
+                            sp.set_error("insufficient stock");
                             wr_sdk::log::log(&format!(
                                 "transfer insufficient stock {} → {}",
                                 product_id, to_product_id
                             ));
                         }
-                        Err(e) => wr_sdk::log::log(&format!("transfer error: {e}")),
+                        Err(e) => {
+                            sp.set_error(&e);
+                            wr_sdk::log::log(&format!("transfer error: {e}"));
+                        }
                     }
                 }
             }
             // 5 — Restock
             _ => {
+                let sp = span::start("client.restock");
+                sp.set_attribute("product.id", &product_id);
+                sp.set_attribute("product.quantity", &(quantity * 10).to_string());
                 match inv.restock(proto::RestockRequest {
                     product_id: product_id.clone(),
                     quantity: quantity * 10,
                 }) {
                     Ok(r) => {
+                        sp.set_attribute("product.new_stock", &r.new_stock.to_string());
                         wr_sdk::log::log(&format!(
                             "restocked {} — new_stock={}",
                             product_id, r.new_stock
                         ));
                     }
-                    Err(e) => wr_sdk::log::log(&format!("restock error: {e}")),
+                    Err(e) => {
+                        sp.set_error(&e);
+                        wr_sdk::log::log(&format!("restock error: {e}"));
+                    }
                 }
             }
         }
@@ -155,6 +193,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
         completed += 1;
     }
 
+    run_span.set_attribute("client.completed", &completed.to_string());
     wr_sdk::log::log(&format!("client done — {completed} operations"));
     (200, proto::RunResponse { completed }.encode_to_vec())
 }
