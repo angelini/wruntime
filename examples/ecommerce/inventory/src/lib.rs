@@ -25,11 +25,11 @@ impl wr_sdk::ServiceGuest for Component {
 
         let (status, body) = match (method, path.as_str()) {
             (Method::Post, "/ecommerce.inventory/Seed") => handle_seed(),
-            (Method::Post, "/ecommerce.inventory/GetStock") => {
-                handle_get_stock(&body_bytes)
-            }
+            (Method::Post, "/ecommerce.inventory/GetStock") => handle_get_stock(&body_bytes),
             (Method::Post, "/ecommerce.inventory/Buy") => handle_buy(&body_bytes),
             (Method::Post, "/ecommerce.inventory/Return") => handle_return(&body_bytes),
+            (Method::Post, "/ecommerce.inventory/Transfer") => handle_transfer(&body_bytes),
+            (Method::Post, "/ecommerce.inventory/Restock") => handle_restock(&body_bytes),
             _ => err_body(404, &format!("no handler for {path}")),
         };
 
@@ -152,6 +152,136 @@ fn handle_buy(body: &[u8]) -> (u16, Vec<u8>) {
         }
         .encode_to_vec(),
     )
+}
+
+fn handle_transfer(body: &[u8]) -> (u16, Vec<u8>) {
+    let req = match proto::TransferRequest::decode(body) {
+        Ok(r) => r,
+        Err(e) => return err_body(400, &format!("invalid request: {e}")),
+    };
+    if req.quantity <= 0 {
+        return err_body(400, "quantity must be > 0");
+    }
+    if req.from_product_id == req.to_product_id {
+        return err_body(400, "from and to products must differ");
+    }
+
+    let tx = match database::begin_transaction() {
+        Ok(t) => t,
+        Err(e) => return err_body(500, &format!("{e:?}")),
+    };
+
+    // Lock both rows in a consistent lexicographic order to avoid deadlocks under
+    // concurrent transfers. We acquire the lock with the lower product_id first.
+    let lock_first = if req.from_product_id < req.to_product_id {
+        req.from_product_id.clone()
+    } else {
+        req.to_product_id.clone()
+    };
+    let lock_second = if req.from_product_id < req.to_product_id {
+        req.to_product_id.clone()
+    } else {
+        req.from_product_id.clone()
+    };
+
+    for id in [&lock_first, &lock_second] {
+        match tx.query(
+            "SELECT 1 FROM inventory WHERE product_id = $1 FOR UPDATE",
+            &[PgValue::Text(id.clone())],
+        ) {
+            Ok(rows) if rows.is_empty() => {
+                let _ = tx.rollback();
+                return err_body(404, &format!("product {id} not found"));
+            }
+            Err(e) => {
+                let _ = tx.rollback();
+                return err_body(500, &format!("{e:?}"));
+            }
+            Ok(_) => {}
+        }
+    }
+
+    // Read source stock after both locks are held.
+    let stock_from = match tx.query(
+        "SELECT stock FROM inventory WHERE product_id = $1",
+        &[PgValue::Text(req.from_product_id.clone())],
+    ) {
+        Ok(rows) => match rows.first().and_then(|r| match &r.columns[0].value {
+            PgValue::Int8(v) => Some(*v),
+            _ => None,
+        }) {
+            Some(s) => s,
+            None => {
+                let _ = tx.rollback();
+                return err_body(500, "unexpected column type");
+            }
+        },
+        Err(e) => {
+            let _ = tx.rollback();
+            return err_body(500, &format!("{e:?}"));
+        }
+    };
+
+    if stock_from < req.quantity {
+        let _ = tx.rollback();
+        return err_body(409, &format!("insufficient stock — available: {stock_from}"));
+    }
+
+    if let Err(e) = tx.execute(
+        "UPDATE inventory SET stock = stock - $2 WHERE product_id = $1",
+        &[PgValue::Text(req.from_product_id.clone()), PgValue::Int8(req.quantity)],
+    ) {
+        let _ = tx.rollback();
+        return err_body(500, &format!("{e:?}"));
+    }
+
+    if let Err(e) = tx.execute(
+        "UPDATE inventory SET stock = stock + $2 WHERE product_id = $1",
+        &[PgValue::Text(req.to_product_id.clone()), PgValue::Int8(req.quantity)],
+    ) {
+        let _ = tx.rollback();
+        return err_body(500, &format!("{e:?}"));
+    }
+
+    if let Err(e) = tx.commit() {
+        return err_body(500, &format!("{e:?}"));
+    }
+
+    (
+        200,
+        proto::TransferResponse { transferred: req.quantity }.encode_to_vec(),
+    )
+}
+
+fn handle_restock(body: &[u8]) -> (u16, Vec<u8>) {
+    let req = match proto::RestockRequest::decode(body) {
+        Ok(r) => r,
+        Err(e) => return err_body(400, &format!("invalid request: {e}")),
+    };
+    if req.quantity <= 0 {
+        return err_body(400, "quantity must be > 0");
+    }
+
+    match database::query(
+        "UPDATE inventory SET stock = stock + $2 WHERE product_id = $1 RETURNING stock",
+        &[PgValue::Text(req.product_id.clone()), PgValue::Int8(req.quantity)],
+    ) {
+        Err(e) => err_body(500, &format!("{e:?}")),
+        Ok(rows) if rows.is_empty() => {
+            err_body(404, &format!("product {} not found", req.product_id))
+        }
+        Ok(rows) => match &rows[0].columns[0].value {
+            PgValue::Int8(new_stock) => (
+                200,
+                proto::RestockResponse {
+                    product_id: req.product_id,
+                    new_stock: *new_stock,
+                }
+                .encode_to_vec(),
+            ),
+            _ => err_body(500, "unexpected column type"),
+        },
+    }
 }
 
 fn handle_return(body: &[u8]) -> (u16, Vec<u8>) {

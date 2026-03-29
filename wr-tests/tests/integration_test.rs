@@ -417,9 +417,9 @@ fn test_proxy_config_rejects_zero_queue_depth() {
 fn test_example_config_files_parse() {
     // Confirm the shipped example TOML files are syntactically valid
     // (they reference non-existent wasm/schema paths so we only parse, not validate).
-    let manager_toml = include_str!("../../manager.toml");
-    let proxy_toml = include_str!("../../proxy.toml");
-    let engine_toml = include_str!("../../engine.toml");
+    let manager_toml = include_str!("../../examples/config/manager.toml");
+    let proxy_toml = include_str!("../../examples/config/proxy.toml");
+    let engine_toml = include_str!("../../examples/config/engine.toml");
 
     toml::from_str::<ManagerConfig>(manager_toml).expect("manager.toml must parse");
     toml::from_str::<ProxyConfig>(proxy_toml).expect("proxy.toml must parse");
@@ -960,6 +960,7 @@ fn test_db_query_without_pool_returns_connection_error() {
         None,
         None,
         None,
+        tracing::Span::none(),
     )
     .expect("ModuleState");
     let err = state.query("SELECT 1".into(), vec![]).unwrap_err();
@@ -978,6 +979,7 @@ fn test_db_execute_without_pool_returns_connection_error() {
         None,
         None,
         None,
+        tracing::Span::none(),
     )
     .expect("ModuleState");
     let err = state
@@ -1718,4 +1720,102 @@ async fn test_transcoding_schema_not_cached_returns_503() -> Result<()> {
     .await?;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     Ok(())
+}
+
+// ── tracing host interface tests ──────────────────────────────────────────────
+
+#[test]
+fn test_tracing_span_start_and_drop() {
+    use wr_engine::tracing::wruntime::tracing::span::{Host, HostActiveSpan};
+
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test-ns".into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        None,
+        None,
+        None,
+        tracing::Span::none(),
+    )
+    .expect("ModuleState");
+
+    let span = Host::start(&mut state, "my-operation".into());
+    HostActiveSpan::drop(&mut state, span).expect("drop span");
+}
+
+#[test]
+fn test_tracing_span_set_attribute() {
+    use wr_engine::tracing::wruntime::tracing::span::{Host, HostActiveSpan};
+
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test-ns".into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        None,
+        None,
+        None,
+        tracing::Span::none(),
+    )
+    .expect("ModuleState");
+
+    let span = Host::start(&mut state, "op".into());
+    let rep = span.rep();
+    HostActiveSpan::set_attribute(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(rep),
+        "db.table".into(),
+        "users".into(),
+    );
+    HostActiveSpan::drop(&mut state, span).expect("drop");
+}
+
+#[test]
+fn test_tracing_span_record_event() {
+    use wr_engine::tracing::wruntime::tracing::span::{Host, HostActiveSpan};
+
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test-ns".into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        None,
+        None,
+        None,
+        tracing::Span::none(),
+    )
+    .expect("ModuleState");
+
+    let span = Host::start(&mut state, "op".into());
+    let rep = span.rep();
+    HostActiveSpan::record_event(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(rep),
+        "cache.miss".into(),
+        vec![("key".into(), "user:42".into())],
+    );
+    HostActiveSpan::drop(&mut state, span).expect("drop");
+}
+
+#[test]
+fn test_tracing_span_set_error() {
+    use wr_engine::tracing::wruntime::tracing::span::{Host, HostActiveSpan};
+
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test-ns".into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        None,
+        None,
+        None,
+        tracing::Span::none(),
+    )
+    .expect("ModuleState");
+
+    let span = Host::start(&mut state, "op".into());
+    let rep = span.rep();
+    HostActiveSpan::set_error(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(rep),
+        "connection refused".into(),
+    );
+    HostActiveSpan::drop(&mut state, span).expect("drop");
 }

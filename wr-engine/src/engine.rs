@@ -127,6 +127,10 @@ impl EngineRunner {
             ModuleState,
             wasmtime::component::HasSelf<ModuleState>,
         >(&mut linker, |s| s)?;
+        wr_engine::tracing::add_to_linker::<ModuleState, wasmtime::component::HasSelf<ModuleState>>(
+            &mut linker,
+            |s| s,
+        )?;
 
         // Try to pre-link as a WASI HTTP Proxy world component first.
         // This succeeds when the component exports `wasi:http/incoming-handler`.
@@ -187,6 +191,7 @@ impl EngineRunner {
                     db_pool,
                     db_schema,
                     module_config.fs.as_ref(),
+                    tracing::Span::current(),
                 )?;
                 let mut store = Store::new(&self.engine, state);
                 let instance = linker.instantiate_async(&mut store, &component).await?;
@@ -295,6 +300,7 @@ async fn dispatch_request(
         module.db_pool.clone(),
         module.db_schema.clone(),
         module.fs.as_ref(),
+        tracing::Span::current(),
     )?;
     let mut store = Store::new(&handler.engine, state);
     let proxy = handler.pre.instantiate_async(&mut store).await?;

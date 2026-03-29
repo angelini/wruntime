@@ -7,72 +7,156 @@ mod proto {
 mod bindings;
 
 use proto::InventoryServiceClient;
+use wr_sdk::bindings::wasi::http::types::{IncomingRequest, Method, ResponseOutparam};
+use wr_sdk::io::{err_body, read_body, send_response};
+use prost::Message;
 
 struct Component;
-wr_sdk::export_run!(Component);
+wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
-impl wr_sdk::RunGuest for Component {
-    fn run() {
-        wr_sdk::log::log("client starting");
+impl wr_sdk::ServiceGuest for Component {
+    fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
+        let method = request.method();
+        let path = request.path_with_query().unwrap_or_default();
+        let body_bytes = read_body(request.consume().unwrap());
 
-        let client = InventoryServiceClient::new("ecommerce.inventory");
+        let (status, body) = match (method, path.as_str()) {
+            (Method::Post, "/ecommerce.client/Run") => handle_run(&body_bytes),
+            _ => err_body(404, &format!("no handler for {path}")),
+        };
 
-        // Seed inventory — idempotent (ON CONFLICT DO NOTHING in inventory service).
-        match client.seed(proto::SeedRequest {}) {
-            Ok(_) => wr_sdk::log::log("inventory seeded"),
-            Err(e) => wr_sdk::log::log(&format!("seed error: {e}")),
-        }
+        send_response(response_out, status, body);
+    }
+}
 
-        // Track purchases so we can return some later.
-        let mut purchased: Vec<(&str, i64)> = Vec::new();
+fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
+    let req = match proto::RunRequest::decode(body) {
+        Ok(r) => r,
+        Err(e) => return err_body(400, &format!("invalid request: {e}")),
+    };
 
-        for i in 0u64..100 {
-            // Deterministic pseudo-random selection spread across all 50 products.
-            let product_id = PRODUCTS[((i.wrapping_mul(7).wrapping_add(13)) % 50) as usize];
-            let quantity = (i % 5 + 1) as i64;
+    let count = if req.count > 0 { req.count as u64 } else { 100 };
 
-            match client.buy(proto::BuyRequest {
-                product_id: product_id.to_string(),
-                quantity,
-            }) {
-                Ok(r) => {
-                    wr_sdk::log::log(&format!(
-                        "bought {} x{} — bought={} remaining={}",
-                        product_id, quantity, r.bought, r.remaining
-                    ));
-                    purchased.push((product_id, quantity));
-                }
-                Err(e) if e.contains("HTTP 409") => {
-                    wr_sdk::log::log(&format!("out of stock {} x{}", product_id, quantity));
-                }
-                Err(e) => {
-                    wr_sdk::log::log(&format!("buy error {} x{}: {}", product_id, quantity, e));
-                }
-            }
+    wr_sdk::log::log(&format!("client starting — {count} iterations"));
 
-            // Return ~30 % of purchases (every 3rd iteration when we have items to return).
-            if i % 10 < 3 && !purchased.is_empty() {
-                let (ret_id, ret_qty) = purchased.remove(0);
+    let inv = InventoryServiceClient::new("ecommerce.inventory");
 
-                match client.r#return(proto::ReturnRequest {
-                    product_id: ret_id.to_string(),
-                    quantity: ret_qty,
+    match inv.seed(proto::SeedRequest {}) {
+        Ok(_) => wr_sdk::log::log("inventory seeded"),
+        Err(e) => wr_sdk::log::log(&format!("seed error: {e}")),
+    }
+
+    let mut purchased: Vec<(String, i64)> = Vec::new();
+    let mut completed: i64 = 0;
+
+    for i in 0u64..count {
+        // Spread load evenly across all 50 products via a cheap hash.
+        let idx = ((i.wrapping_mul(7).wrapping_add(13)) % 50) as usize;
+        let product_id = PRODUCTS[idx].to_string();
+        let quantity = (i % 5 + 1) as i64;
+
+        // Rotate through all 6 actions so every operation type gets exercised.
+        match i % 6 {
+            // 0, 3 — Buy
+            0 | 3 => {
+                match inv.buy(proto::BuyRequest {
+                    product_id: product_id.clone(),
+                    quantity,
                 }) {
                     Ok(r) => {
                         wr_sdk::log::log(&format!(
-                            "returned {} x{} — returned={} product={}",
-                            ret_id, ret_qty, r.returned, r.product_id
+                            "bought {} x{} — remaining={}",
+                            product_id, quantity, r.remaining
                         ));
+                        purchased.push((product_id, quantity));
+                    }
+                    Err(e) if e.contains("HTTP 409") => {
+                        wr_sdk::log::log(&format!("out of stock {} x{}", product_id, quantity));
                     }
                     Err(e) => {
-                        wr_sdk::log::log(&format!("return error: {e}"));
+                        wr_sdk::log::log(&format!("buy error: {e}"));
                     }
+                }
+            }
+            // 1 — Return a previously purchased item
+            1 => {
+                if let Some((ret_id, ret_qty)) = purchased.pop() {
+                    match inv.r#return(proto::ReturnRequest {
+                        product_id: ret_id.clone(),
+                        quantity: ret_qty,
+                    }) {
+                        Ok(r) => {
+                            wr_sdk::log::log(&format!(
+                                "returned {} x{} — product={}",
+                                ret_id, ret_qty, r.product_id
+                            ));
+                        }
+                        Err(e) => wr_sdk::log::log(&format!("return error: {e}")),
+                    }
+                }
+            }
+            // 2 — GetStock (read-only, high-frequency)
+            2 => {
+                match inv.get_stock(proto::GetStockRequest {
+                    product_id: product_id.clone(),
+                }) {
+                    Ok(r) => {
+                        wr_sdk::log::log(&format!(
+                            "stock {} = {}",
+                            product_id, r.stock
+                        ));
+                    }
+                    Err(e) => wr_sdk::log::log(&format!("get_stock error: {e}")),
+                }
+            }
+            // 4 — Transfer between two products
+            4 => {
+                let to_idx = ((i.wrapping_mul(11).wrapping_add(3)) % 50) as usize;
+                let to_product_id = PRODUCTS[to_idx].to_string();
+                if product_id != to_product_id {
+                    match inv.transfer(proto::TransferRequest {
+                        from_product_id: product_id.clone(),
+                        to_product_id: to_product_id.clone(),
+                        quantity,
+                    }) {
+                        Ok(r) => {
+                            wr_sdk::log::log(&format!(
+                                "transferred {} → {} x{}",
+                                product_id, to_product_id, r.transferred
+                            ));
+                        }
+                        Err(e) if e.contains("HTTP 409") => {
+                            wr_sdk::log::log(&format!(
+                                "transfer insufficient stock {} → {}",
+                                product_id, to_product_id
+                            ));
+                        }
+                        Err(e) => wr_sdk::log::log(&format!("transfer error: {e}")),
+                    }
+                }
+            }
+            // 5 — Restock
+            _ => {
+                match inv.restock(proto::RestockRequest {
+                    product_id: product_id.clone(),
+                    quantity: quantity * 10,
+                }) {
+                    Ok(r) => {
+                        wr_sdk::log::log(&format!(
+                            "restocked {} — new_stock={}",
+                            product_id, r.new_stock
+                        ));
+                    }
+                    Err(e) => wr_sdk::log::log(&format!("restock error: {e}")),
                 }
             }
         }
 
-        wr_sdk::log::log("client done");
+        completed += 1;
     }
+
+    wr_sdk::log::log(&format!("client done — {completed} operations"));
+    (200, proto::RunResponse { completed }.encode_to_vec())
 }
 
 // ── Product catalogue ─────────────────────────────────────────────────────────

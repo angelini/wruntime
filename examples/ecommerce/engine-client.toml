@@ -4,23 +4,24 @@ manager_address = "http://127.0.0.1:9000"
 [node]
 proxy_address = "http://127.0.0.1:9001"
 
-# Three independent client instances — each runs its own `run` export concurrently.
+# Three instances of the same client module — the proxy load-balances Run requests
+# across all three, so concurrent callers each land on a different WASM instance.
 [[module]]
-name        = "client-a"
+name        = "client"
 namespace   = "ecommerce"
 version     = "1.0.0"
 wasm_path   = "examples/ecommerce/client/target/wasm32-wasip2/release/client.wasm"
 schema_path = "examples/ecommerce/schemas/client.binpb"
 
 [[module]]
-name        = "client-b"
+name        = "client"
 namespace   = "ecommerce"
 version     = "1.0.0"
 wasm_path   = "examples/ecommerce/client/target/wasm32-wasip2/release/client.wasm"
 schema_path = "examples/ecommerce/schemas/client.binpb"
 
 [[module]]
-name        = "client-c"
+name        = "client"
 namespace   = "ecommerce"
 version     = "1.0.0"
 wasm_path   = "examples/ecommerce/client/target/wasm32-wasip2/release/client.wasm"

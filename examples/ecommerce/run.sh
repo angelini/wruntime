@@ -67,20 +67,39 @@ cargo run -p wr-cli -- invoke \
     --body '' || echo " (seed may already exist)"
 
 # ── Start client engine ────────────────────────────────────────────────────────
-echo "==> Starting client engine on :9200 (3 concurrent clients)"
+echo "==> Starting client engine on :9200 (3 load-balanced client instances)"
 ./target/debug/wr-engine examples/ecommerce/engine-client.toml &
 CLIENT_PID=$!
+
+# Wait for the client engine to register.
+sleep 2
+
+cargo run -p wr-cli -- engines list
+cargo run -p wr-cli -- services list
 
 echo ""
 echo "All services running. Press Ctrl-C to stop."
 echo "  Manager  : http://127.0.0.1:9000 (gRPC)"
 echo "  Proxy    : http://127.0.0.1:9001"
 echo "  Inventory: http://127.0.0.1:9100 + :9101 (2 engines, shared Postgres)"
-echo "  Clients  : http://127.0.0.1:9200 (client-a, client-b, client-c)"
+echo "  Client   : http://127.0.0.1:9200 (3 instances, ServiceGuest)"
 echo ""
-echo "Inspect while running:"
-echo "  cargo run -p wr-cli -- engines list"
-echo "  cargo run -p wr-cli -- services list"
+echo "Trigger a load run (default 100 iterations):"
+echo "  cargo run -p wr-cli -- invoke \\"
+echo "    --proxy http://127.0.0.1:9001 \\"
+echo "    --destination http://client.ecommerce/ecommerce.ClientService/Run \\"
+echo "    --source loadtest --source-ns ecommerce \\"
+echo "    --body ''"
+echo ""
+echo "Trigger with a custom request count (e.g. 1000):"
+echo "  cargo run -p wr-cli -- invoke \\"
+echo "    --proxy http://127.0.0.1:9001 \\"
+echo "    --destination http://client.ecommerce/ecommerce.ClientService/Run \\"
+echo "    --source loadtest --source-ns ecommerce \\"
+echo "    --proto examples/ecommerce/schemas/client.proto \\"
+echo "    --body '{\"count\": 1000}'"
+echo ""
+echo "Inspect metrics:"
 echo "  cargo run -p wr-cli -- metrics"
 
 cleanup() {
@@ -92,7 +111,4 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 0' INT TERM
 
-wait "$CLIENT_PID"
-echo "==> All clients finished."
-
-cargo run -p wr-cli -- metrics
+wait

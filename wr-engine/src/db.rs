@@ -14,7 +14,7 @@ pub struct TxState {
 }
 
 wasmtime::component::bindgen!({
-    path:               "../wit",
+    path:               "../wit/db.wit",
     world:              "db-access",
     additional_derives: [PartialEq],
     with: {
@@ -454,9 +454,16 @@ mod tests {
 
     #[test]
     fn test_query_returns_error_when_no_pool() {
-        let mut state =
-            ModuleState::new("test".into(), "test".into(), proxy_uri(), None, None, None)
-                .expect("state");
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            None,
+            None,
+            None,
+            tracing::Span::none(),
+        )
+        .expect("state");
         let result = state.query("SELECT 1".into(), vec![]);
         assert!(
             matches!(result, Err(DbError::Connection(_))),
@@ -466,9 +473,16 @@ mod tests {
 
     #[test]
     fn test_execute_returns_error_when_no_pool() {
-        let mut state =
-            ModuleState::new("test".into(), "test".into(), proxy_uri(), None, None, None)
-                .expect("state");
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            None,
+            None,
+            None,
+            tracing::Span::none(),
+        )
+        .expect("state");
         let result = state.execute("SELECT 1".into(), vec![]);
         assert!(
             matches!(result, Err(DbError::Connection(_))),
@@ -478,9 +492,16 @@ mod tests {
 
     #[test]
     fn test_begin_transaction_returns_error_when_no_pool() {
-        let mut state =
-            ModuleState::new("test".into(), "test".into(), proxy_uri(), None, None, None)
-                .expect("state");
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            None,
+            None,
+            None,
+            tracing::Span::none(),
+        )
+        .expect("state");
         let result = state.begin_transaction();
         assert!(
             matches!(result, Err(DbError::Connection(_))),
@@ -510,6 +531,7 @@ mod tests {
             Some(Arc::new(pool)),
             None,
             None,
+            tracing::Span::none(),
         )
         .expect("state");
 
@@ -540,6 +562,7 @@ mod tests {
             Some(Arc::new(pool)),
             None,
             None,
+            tracing::Span::none(),
         )
         .expect("state");
 
@@ -571,6 +594,7 @@ mod tests {
             Some(Arc::new(pool)),
             None,
             None,
+            tracing::Span::none(),
         )
         .expect("state");
 
@@ -603,6 +627,7 @@ mod tests {
             Some(Arc::new(pool)),
             None,
             None,
+            tracing::Span::none(),
         )
         .expect("state");
 
@@ -649,6 +674,7 @@ mod tests {
             Some(Arc::new(pool)),
             None,
             None,
+            tracing::Span::none(),
         )
         .expect("state");
 
@@ -707,6 +733,7 @@ mod tests {
             Some(Arc::new(pool)),
             None,
             None,
+            tracing::Span::none(),
         )
         .expect("state");
 
@@ -762,6 +789,7 @@ mod tests {
             Some(Arc::new(pool)),
             None,
             None,
+            tracing::Span::none(),
         )
         .expect("state");
 

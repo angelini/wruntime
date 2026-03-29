@@ -4773,6 +4773,8 @@ dependencies = [
  "toml 0.8.23",
  "tonic",
  "tower 0.5.3",
+ "tracing",
+ "wasmtime",
  "wr-common",
  "wr-engine",
  "wr-manager",

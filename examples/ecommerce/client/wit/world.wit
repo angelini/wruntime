@@ -11,5 +11,5 @@ world client {
   import wasi:io/error@0.2.6;
   import wasi:clocks/monotonic-clock@0.2.6;
   import wasi:random/random@0.2.6;
-  export run: func();
+  export wasi:http/incoming-handler@0.2.6;
 }

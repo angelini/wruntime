@@ -2,10 +2,12 @@ syntax = "proto3";
 package ecommerce;
 
 service InventoryService {
-  rpc Seed      (SeedRequest)     returns (SeedResponse);
-  rpc Buy       (BuyRequest)      returns (BuyResponse);
-  rpc Return    (ReturnRequest)   returns (ReturnResponse);
-  rpc GetStock  (GetStockRequest) returns (GetStockResponse);
+  rpc Seed      (SeedRequest)      returns (SeedResponse);
+  rpc Buy       (BuyRequest)       returns (BuyResponse);
+  rpc Return    (ReturnRequest)    returns (ReturnResponse);
+  rpc GetStock  (GetStockRequest)  returns (GetStockResponse);
+  rpc Transfer  (TransferRequest)  returns (TransferResponse);
+  rpc Restock   (RestockRequest)   returns (RestockResponse);
 }
 
 message SeedRequest  {}
@@ -33,4 +35,22 @@ message GetStockRequest  { string product_id = 1; }
 message GetStockResponse {
   string product_id = 1;
   int64  stock      = 2;
+}
+
+message TransferRequest {
+  string from_product_id = 1;
+  string to_product_id   = 2;
+  int64  quantity        = 3;
+}
+message TransferResponse {
+  int64 transferred = 1;
+}
+
+message RestockRequest {
+  string product_id = 1;
+  int64  quantity   = 2;
+}
+message RestockResponse {
+  string product_id = 1;
+  int64  new_stock  = 2;
 }

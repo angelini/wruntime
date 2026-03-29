@@ -30,6 +30,11 @@ pub struct ModuleState {
     /// `Some` only when `fs = "tempdir"` is set; kept alive so it isn't
     /// deleted until the store is dropped.
     _fs_root: Option<TempDir>,
+    /// The `engine.dispatch` span for the current request.
+    /// Captured at `ModuleState` construction time so host functions can create
+    /// child spans even when wasmtime's synchronous call stack is outside the
+    /// async instrumented context.
+    pub active_span: tracing::Span,
 }
 
 impl ModuleState {
@@ -40,6 +45,7 @@ impl ModuleState {
         db_pool: Option<Arc<Pool>>,
         db_schema: Option<String>,
         fs: Option<&FsMode>,
+        active_span: tracing::Span,
     ) -> anyhow::Result<Self> {
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stdio();
@@ -61,6 +67,7 @@ impl ModuleState {
             db_pool,
             db_schema,
             _fs_root: fs_root,
+            active_span,
         })
     }
 }

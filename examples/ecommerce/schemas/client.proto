@@ -5,5 +5,5 @@ service ClientService {
   rpc Run (RunRequest) returns (RunResponse);
 }
 
-message RunRequest  {}
-message RunResponse {}
+message RunRequest  { int64 count = 1; }
+message RunResponse { int64 completed = 1; }

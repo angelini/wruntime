@@ -1,0 +1,22 @@
+package wruntime:tracing;
+
+interface span {
+    /// An active span. Ends when the resource is dropped.
+    resource active-span {
+        /// Record a key/value attribute on the span.
+        set-attribute: func(key: string, value: string);
+
+        /// Record an event (point-in-time annotation).
+        record-event: func(name: string, attrs: list<tuple<string, string>>);
+
+        /// Mark the span as failed with a message.
+        set-error: func(message: string);
+    }
+
+    /// Start a new child span under the current request span.
+    start: func(name: string) -> active-span;
+}
+
+world tracing-access {
+    import span;
+}
