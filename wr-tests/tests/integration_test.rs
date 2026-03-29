@@ -592,6 +592,96 @@ async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_proxy_routes_semver_range_to_highest_satisfying() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-v1").await?;
+    let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-v2").await?;
+    let (e3_addr, e3_shutdown) = spawn_identified_stub("engine-v3").await?;
+
+    for (id, addr, version) in [
+        ("e1", &e1_addr, "1.0.0"),
+        ("e2", &e2_addr, "1.5.0"),
+        ("e3", &e3_addr, "2.0.0"),
+    ] {
+        register_module(
+            &mut mgr,
+            EngineSpec {
+                id,
+                addr,
+                proxy_address: "",
+            },
+            ModuleSpec {
+                namespace: "range-ns",
+                name: "range-service",
+                version,
+                schema: minimal_file_descriptor_set(),
+            },
+        )
+        .await?;
+    }
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+    let proxy = start_proxy_synced(&mgr_addr, table).await?;
+
+    // ^1 should pick the highest 1.x, which is 1.5.0
+    let (s, body) = proxy_get(proxy, "range-ns", "range-service", Some("^1")).await?;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body, "engine-v2", "^1 should route to highest 1.x (1.5.0)");
+
+    // >=1.5.0 should pick 2.0.0 (highest satisfying)
+    let (s, body) = proxy_get(proxy, "range-ns", "range-service", Some(">=1.5.0")).await?;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        body, "engine-v3",
+        ">=1.5.0 should route to highest satisfying (2.0.0)"
+    );
+
+    let _ = e1_shutdown.send(());
+    let _ = e2_shutdown.send(());
+    let _ = e3_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_proxy_returns_503_for_unsatisfiable_range() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    let (e1_addr, _stub) = spawn_identified_stub("engine-v1").await?;
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "e1",
+            addr: &e1_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "range-503-ns",
+            name: "range-503-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+    let proxy = start_proxy(table).await?;
+
+    let (s, _) = proxy_get(proxy, "range-503-ns", "range-503-service", Some("^3")).await?;
+    assert_eq!(
+        s,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unsatisfiable range → 503"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_proxy_load_balances_across_instances() -> Result<()> {
     let mgr_addr = start_manager().await?;
     let mut mgr = manager_client(&mgr_addr).await?;

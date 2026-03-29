@@ -135,14 +135,51 @@ where
                     }
                 };
 
-                if let Some(ref version) = requested_version {
-                    // Exact version match across all healthy rules
-                    let cands: Vec<Destination> = healthy
+                if let Some(ref version_str) = requested_version {
+                    // Parse as a semver VersionReq (supports ^1, ~1.2, >=1.0 <2.0, exact 1.2.3, etc.)
+                    let req = semver::VersionReq::parse(version_str).ok();
+
+                    let satisfying: Vec<_> = healthy
                         .iter()
-                        .filter(|r| r.destination_version == *version)
-                        .map(make_destination)
+                        .filter(
+                            |r| match (&req, semver::Version::parse(&r.destination_version)) {
+                                (Some(req), Ok(v)) => req.matches(&v),
+                                // Unparseable range header: fall back to exact string match
+                                (None, _) => r.destination_version == *version_str,
+                                // Rule version isn't valid semver: skip
+                                _ => false,
+                            },
+                        )
                         .collect();
-                    (version.clone(), cands)
+
+                    // Among satisfying rules, pick the highest semver
+                    let best = satisfying
+                        .iter()
+                        .copied()
+                        .max_by(|a, b| {
+                            let va = semver::Version::parse(&a.destination_version);
+                            let vb = semver::Version::parse(&b.destination_version);
+                            match (va, vb) {
+                                (Ok(a), Ok(b)) => a.cmp(&b),
+                                (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+                                (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+                                _ => a.destination_version.cmp(&b.destination_version),
+                            }
+                        })
+                        .map(|r| r.destination_version.clone());
+
+                    match best {
+                        Some(ver) => {
+                            let cands: Vec<Destination> = satisfying
+                                .iter()
+                                .copied()
+                                .filter(|r| r.destination_version == ver)
+                                .map(make_destination)
+                                .collect();
+                            (ver, cands)
+                        }
+                        None => (version_str.clone(), vec![]),
+                    }
                 } else {
                     // Find highest semver, then collect all rules at that version
                     let best = healthy
@@ -176,7 +213,7 @@ where
             if candidates.is_empty() {
                 let msg = match requested_version {
                     Some(v) => format!(
-                        "no route for module '{module_name}.{dest_namespace}' version '{v}'"
+                        "no route for module '{module_name}.{dest_namespace}' matching version requirement '{v}'"
                     ),
                     None => format!("no route for module '{module_name}.{dest_namespace}'"),
                 };
