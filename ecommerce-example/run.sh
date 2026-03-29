@@ -17,13 +17,6 @@ update_db_url() {
     rm -f "${file}.bak"
 }
 
-# ── Build ──────────────────────────────────────────────────────────────────────
-echo "==> Building WASM components..."
-just build-example
-
-echo "==> Building host services..."
-just build-release
-
 # ── Apply DB URL to engine configs ────────────────────────────────────────────
 cp ecommerce-example/engine-inventory-1.toml /tmp/inv1.toml
 cp ecommerce-example/engine-inventory-2.toml /tmp/inv2.toml
@@ -55,17 +48,17 @@ INV2_PID=$!
 echo "==> Waiting for inventory engines to register..."
 sleep 3
 
-wr-cli engines list
-wr-cli services list
+cargo run -p wr-cli -- engines list
+cargo run -p wr-cli -- services list
 
 # ── Seed inventory via the proxy ───────────────────────────────────────────────
 echo "==> Seeding inventory..."
-wr-cli invoke \
+cargo run -p wr-cli -- invoke \
     --proxy http://127.0.0.1:9001 \
-    --destination http://inventory.ecommerce/seed \
+    --destination http://inventory.ecommerce/ecommerce.InventoryService/Seed \
     --source bootstrap \
     --source-ns ecommerce \
-    --body '{}' || echo " (seed may already exist)"
+    --body '' || echo " (seed may already exist)"
 
 # ── Start client engine ────────────────────────────────────────────────────────
 echo "==> Starting client engine on :9200 (3 concurrent clients)"
@@ -80,9 +73,9 @@ echo "  Inventory: http://127.0.0.1:9100 + :9101 (2 engines, shared Postgres)"
 echo "  Clients  : http://127.0.0.1:9200 (client-a, client-b, client-c)"
 echo ""
 echo "Inspect while running:"
-echo "  wr-cli engines list"
-echo "  wr-cli services list"
-echo "  wr-cli metrics"
+echo "  cargo run -p wr-cli -- engines list"
+echo "  cargo run -p wr-cli -- services list"
+echo "  cargo run -p wr-cli -- metrics"
 
 cleanup() {
     echo "==> Shutting down..."
@@ -93,4 +86,4 @@ trap cleanup EXIT INT TERM
 wait "$CLIENT_PID"
 echo "==> All clients finished."
 
-wr-cli metrics
+cargo run -p wr-cli -- metrics

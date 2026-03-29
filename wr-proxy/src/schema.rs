@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use tracing::{info, warn};
@@ -11,6 +11,19 @@ use wr_common::wruntime::{
 };
 
 use crate::routing::CachedRoutingTable;
+
+/// Outcome of a schema validation check.
+pub enum ValidationOutcome {
+    /// Body decoded successfully against the expected message type.
+    Pass,
+    /// Body failed protobuf decoding against the expected message type.
+    Fail(String),
+    /// No schema is cached for this module yet (proxy still syncing).
+    SchemaNotCached,
+    /// Path does not map to any RPC declared in the module's schema.
+    /// All inter-service traffic must target a known gRPC method.
+    MethodNotFound(String),
+}
 
 /// Caches a `DescriptorPool` per (namespace, module) pair, built from the
 /// `FileDescriptorSet` bytes registered by each engine on startup.
@@ -43,7 +56,7 @@ impl SchemaCache {
         schema_bytes: &[u8],
     ) -> anyhow::Result<()> {
         if schema_bytes.is_empty() {
-            return Ok(());
+            anyhow::bail!("schema bytes for {namespace}.{module} must not be empty");
         }
         let pool = DescriptorPool::decode(schema_bytes)
             .map_err(|e| anyhow::anyhow!("bad FileDescriptorSet for {namespace}.{module}: {e}"))?;
@@ -56,31 +69,38 @@ impl SchemaCache {
 
     /// Validate `body` against the protobuf schema registered for `(namespace, module)`.
     ///
-    /// `path` should be a gRPC-style method path, e.g.
-    /// `/inventory.InventoryService/GetItems`, used to resolve the expected
-    /// input message type.
-    ///
-    /// Returns `Some(error_message)` if validation fails. Returns `None` when
-    /// the body is valid, the schema is absent, or the path cannot be resolved.
+    /// - Returns [`ValidationOutcome::Pass`] when the body is empty or when
+    ///   the path cannot be resolved to a known RPC (schema does not cover it).
+    /// - Returns [`ValidationOutcome::Fail`] when the body is present but
+    ///   does not decode against the expected message type.
+    /// - Returns [`ValidationOutcome::SchemaNotCached`] when no schema has
+    ///   been synced yet for this module.
     pub async fn validate(
         &self,
         namespace: &str,
         module: &str,
         path: &str,
         body: &[u8],
-    ) -> Option<String> {
-        if body.is_empty() {
-            return None;
-        }
+    ) -> ValidationOutcome {
+        // Note: empty body is NOT skipped. An empty proto3 message encodes to
+        // zero bytes, so an empty body is still validated against the schema.
 
         let pools = self.pools.read().await;
-        let pool = pools.get(&(namespace.to_string(), module.to_string()))?;
+        let Some(pool) = pools.get(&(namespace.to_string(), module.to_string())) else {
+            return ValidationOutcome::SchemaNotCached;
+        };
 
-        let message_desc = resolve_input_message(pool, path)?;
+        let Some(message_desc) = resolve_input_message(pool, path) else {
+            return ValidationOutcome::MethodNotFound(format!(
+                "path '{path}' does not match any RPC in the schema for \
+                 {namespace}.{module} — all inter-service calls must use \
+                 gRPC paths (/package.Service/Method)"
+            ));
+        };
 
         match DynamicMessage::decode(message_desc, body) {
-            Ok(_) => None,
-            Err(e) => Some(format!(
+            Ok(_) => ValidationOutcome::Pass,
+            Err(e) => ValidationOutcome::Fail(format!(
                 "schema validation failed for {namespace}.{module}{path}: {e}"
             )),
         }
@@ -89,15 +109,27 @@ impl SchemaCache {
 
 /// Background task: periodically fetches schemas from wr-manager for every
 /// module registered across all known engines and stores them in the cache.
+///
+/// Also wakes immediately when `trigger` is notified (fired by
+/// `sync_routing_table` on every routing table version advance), reducing the
+/// window between a new engine registering and its schema being cached.
 pub async fn sync_schemas(
     mut client: ManagerServiceClient<tonic::transport::Channel>,
     _table: CachedRoutingTable,
     cache: Arc<SchemaCache>,
     ttl_secs: u64,
+    trigger: Arc<Notify>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(ttl_secs));
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = trigger.notified() => {
+                // Reset so the interval doesn't fire again shortly after this
+                // triggered sync.
+                interval.reset();
+            }
+        }
 
         // Enumerate all registered engines to find (module, version) pairs.
         let engines = match client.list_engines(ListEnginesRequest {}).await {
@@ -140,7 +172,14 @@ pub async fn sync_schemas(
                             info!(namespace, module, version, "schema cached");
                         }
                     }
-                    Err(e) if e.code() == tonic::Code::NotFound => {}
+                    Err(e) if e.code() == tonic::Code::NotFound => {
+                        warn!(
+                            namespace,
+                            module,
+                            version,
+                            "schema not found on manager — module must declare a schema"
+                        );
+                    }
                     Err(e) => {
                         warn!(namespace, module, version, error = %e, "schema fetch error");
                     }

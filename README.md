@@ -59,16 +59,21 @@ WASM module makes HTTP call to "http://inventory-service/items"
   │
   ▼
 wr-proxy
-  │  1. MetricsLayer       — records start time
-  │  2. SchemaValidation   — decodes body with prost-reflect against the
-  │                          module's FileDescriptorSet; returns 400 on failure
-  │  3. RoutingLayer       — reads optional x-wr-version header; defaults to
+  │  1. TracingLayer       — opens an OTel span; injects W3C traceparent header
+  │  2. MetricsLayer       — records start time
+  │  3. SchemaValidation   — enforces gRPC path format; decodes body with
+  │                          prost-reflect against the module's FileDescriptorSet;
+  │                          returns 404 if path is not a known RPC,
+  │                          503 if schema not yet synced,
+  │                          400 if body fails protobuf decoding
+  │  4. RoutingLayer       — reads optional x-wr-version header; defaults to
   │                          highest semver among healthy rules for the module;
   │                          returns 503 if no healthy instance matches;
   │                          injects x-wr-module and x-wr-version headers;
   │                          round-robins across multiple healthy instances
   │                          at the same version
-  │  4. ForwardService     — strips x-wr-destination / x-wr-source, forwards
+  │  5. ForwardService     — strips x-wr-destination / x-wr-source, injects
+  │                          traceparent, forwards to destination engine
   │
   ▼
 wr-engine (destination)
@@ -87,7 +92,7 @@ inventory-service WASM module handles the request
 |------|---------|
 | Rust + Cargo (stable) | Build all binaries |
 | [`just`](https://github.com/casey/just) | Run project recipes (see `Justfile`) |
-| `protoc` | Compile `.proto` schemas to `FileDescriptorSet` binaries for schema validation (optional at runtime if modules have no schema) |
+| `protoc` | Compile `.proto` schemas to `FileDescriptorSet` binaries — required for every module |
 | `wasm-tools` or `cargo-component` | Build WASM component modules |
 
 Install Rust via [rustup](https://rustup.rs). Install `just` via `cargo install just` or your system package manager. Install `protoc` via your system package manager or from [github.com/protocolbuffers/protobuf/releases](https://github.com/protocolbuffers/protobuf/releases).
@@ -178,14 +183,16 @@ proxy_address   = "http://127.0.0.1:9001"
 name        = "order-service"
 version     = "1.0.0"
 wasm_path   = "modules/order_service.wasm"
-schema_path = "schemas/order_service.binpb"   # optional
+schema_path = "schemas/order_service.binpb"
 
 [[module]]
-name      = "inventory-service"
-version   = "1.0.0"
-wasm_path = "modules/inventory_service.wasm"
-# schema_path omitted — schema validation skipped for this module
+name        = "inventory-service"
+version     = "1.0.0"
+wasm_path   = "modules/inventory_service.wasm"
+schema_path = "schemas/inventory_service.binpb"
 ```
+
+> **`schema_path` is required.** Every module must declare a compiled `FileDescriptorSet`. The engine will refuse to start if the file is absent, and the proxy will reject requests with `503` until the schema has been synced from the manager.
 
 On startup the engine:
 1. Loads every listed WASM component from disk.
@@ -283,7 +290,12 @@ Each `RequestMetrics` entry records: source module, destination module, duration
 
 ## Protobuf schemas for modules
 
-The proxy validates request bodies against a module's schema when one is registered. Schemas are compiled `FileDescriptorSet` binaries produced by `protoc`.
+Every module **must** declare a protobuf schema. The proxy enforces two rules on every inter-module request:
+
+1. **Path must be a gRPC method** — the path must have the form `/package.ServiceName/MethodName` and must match a method declared in the module's schema. Any other path returns `404`.
+2. **Body must decode as the method's input message** — the raw request body is decoded with `prost-reflect` against the `FileDescriptorSet`. A body that fails decoding returns `400`.
+
+Schemas are compiled `FileDescriptorSet` binaries produced by `protoc`.
 
 ### Writing a schema
 
@@ -323,26 +335,34 @@ When the proxy receives a request with `x-wr-destination: http://inventory-servi
 1. Parses the host (`inventory-service`) as the module name.
 2. Looks up the `DescriptorPool` for that module.
 3. Resolves the input message type for the RPC path (`/inventory.InventoryService/GetItems`).
-4. Attempts to decode the raw request body as that message type using `prost-reflect`.
+4. Decodes the raw request body as that message type using `prost-reflect`.
 
-On failure the proxy returns `400 Bad Request`:
+The proxy returns an error and stops the request at each stage of failure:
+
+| Condition | Status | `"error"` field |
+|---|---|---|
+| Schema not yet synced from manager | `503` | `"schema_not_cached"` |
+| Path not in `/package.Service/Method` format, or method not in schema | `404` | `"method_not_found"` |
+| Body fails protobuf decoding | `400` | `"schema_validation_failed"` |
+
+Example `404` response for an unrecognised path:
 
 ```json
 {
-  "error":       "schema_validation_failed",
-  "detail":      "schema validation failed for inventory-service/inventory.InventoryService/GetItems: ...",
+  "error":       "method_not_found",
+  "detail":      "path '/items' does not match any RPC in the schema for ecommerce.inventory — all inter-service calls must use gRPC paths (/package.Service/Method)",
   "source":      "order-service",
   "destination": "inventory-service"
 }
 ```
-
-If no schema is registered for a module, validation is skipped and the request is forwarded unchanged.
 
 ---
 
 ## Building a compatible WASM module
 
 Modules must be **WASI Preview 2 components** that implement the `wasi:http/incoming-handler` world. They make outbound calls using the standard `wasi:http/outgoing-handler` interface — all routing is transparent.
+
+All inter-module communication **must use gRPC-style paths** and **protobuf-encoded bodies**. The proxy enforces both. Plain HTTP paths and JSON bodies will be rejected.
 
 ### Toolchain
 
@@ -351,6 +371,8 @@ rustup target add wasm32-wasip2
 cargo install cargo-component   # WASI component tooling
 cargo install just              # task runner
 ```
+
+`protoc` must also be installed — it is invoked by `prost-build` at compile time to generate Rust types from your `.proto` file.
 
 ### Cargo.toml
 
@@ -364,10 +386,34 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "0.36"
+wit-bindgen-rt = "0.44"
+prost          = "0.13"   # protobuf encode / decode
+
+[build-dependencies]
+prost-build = "0.13"      # generates Rust types from .proto at compile time
 
 [package.metadata.component]
 package = "wruntime:inventory-service"
+```
+
+### build.rs
+
+```rust
+fn main() {
+    prost_build::compile_protos(
+        &["schemas/inventory_service.proto"],
+        &["schemas"],
+    ).unwrap();
+    println!("cargo:rerun-if-changed=schemas/inventory_service.proto");
+}
+```
+
+Include the generated types in your module:
+
+```rust
+mod proto {
+    include!(concat!(env!("OUT_DIR"), "/inventory.rs"));
+}
 ```
 
 ### WIT world
@@ -382,70 +428,87 @@ world proxy {
 }
 ```
 
-### Example: handling an incoming request
+### Example: making an outbound call to another module
+
+Use `{module}.{namespace}` as the HTTP authority. The engine intercepts the call and routes it via the proxy. The path **must** be a gRPC method path and the body **must** be a protobuf-encoded message:
 
 ```rust
-// src/lib.rs
-wit_bindgen::generate!({ world: "proxy" });
+use prost::Message;
+use wasi::http::{outgoing_handler, types::*};
 
-use exports::wasi::http::incoming_handler::Guest;
-use wasi::http::types::*;
+fn buy_item(product_id: &str, quantity: i64) -> proto::BuyResponse {
+    // Encode the protobuf request body.
+    let body_bytes = proto::BuyRequest {
+        product_id: product_id.to_string(),
+        quantity,
+    }
+    .encode_to_vec();
 
-struct Component;
-export!(Component);
+    let headers = Fields::new();
+    headers.set("content-type", &[b"application/x-protobuf".to_vec()]).unwrap();
+    let req = OutgoingRequest::new(headers);
 
-impl Guest for Component {
-    fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        let headers = Fields::new();
-        let resp = OutgoingResponse::new(headers);
-        resp.set_status_code(200).unwrap();
+    // Authority is "{module}.{namespace}" — routing is automatic.
+    // Omit x-wr-version to reach the latest deployed version, or set it to
+    // pin a specific semver.
+    req.set_authority(Some("inventory-service.myapp")).unwrap();
+    req.set_path_with_query(Some("/inventory.InventoryService/Buy")).unwrap();
+    req.set_scheme(Some(&Scheme::Http)).unwrap();
+    req.set_method(&Method::Post).unwrap();
 
-        let body = resp.body().unwrap();
-        {
-            let stream = body.write().unwrap();
-            stream.write(b"hello from inventory-service").unwrap();
+    let out_body = req.body().unwrap();
+    {
+        let stream = out_body.write().unwrap();
+        stream.blocking_write_and_flush(&body_bytes).unwrap();
+    }
+    OutgoingBody::finish(out_body, None).unwrap();
+
+    let future = outgoing_handler::handle(req, None).unwrap();
+    loop {
+        match future.get() {
+            Some(Ok(Ok(resp))) => {
+                let incoming = resp.consume().unwrap();
+                let stream = incoming.stream().unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    match stream.blocking_read(8192) {
+                        Ok(chunk) if chunk.is_empty() => break,
+                        Ok(chunk) => bytes.extend_from_slice(&chunk),
+                        Err(_) => break,
+                    }
+                }
+                return proto::BuyResponse::decode(bytes.as_slice()).unwrap();
+            }
+            None => future.subscribe().block(),
+            _ => panic!("request failed"),
         }
-        OutgoingBody::finish(body, None).unwrap();
-        ResponseOutparam::set(response_out, Ok(resp));
     }
 }
 ```
 
-### Example: making an outbound call to another module
-
-Use the module name as the HTTP host. The engine intercepts the call and routes it via the proxy:
+### Example: handling an incoming gRPC-style request
 
 ```rust
-use wasi::http::{outgoing_handler, types::*};
+impl Guest for Component {
+    fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
+        let path = request.path_with_query().unwrap_or_default();
+        let body = read_body(request.consume().unwrap());
 
-fn call_inventory(category: &str) -> Vec<u8> {
-    let headers = Fields::new();
-    let req = OutgoingRequest::new(headers);
+        let (status, resp_bytes) = match path.as_str() {
+            "/inventory.InventoryService/Buy" => {
+                match proto::BuyRequest::decode(body.as_slice()) {
+                    Ok(req) => {
+                        let resp = process_buy(req);
+                        (200, resp.encode_to_vec())
+                    }
+                    Err(e) => (400, format!(r#"{{"error":"{e}"}}"#).into_bytes()),
+                }
+            }
+            _ => (404, b"not found".to_vec()),
+        };
 
-    // Use the destination module name as the host — routing is automatic.
-    // Add x-wr-version to pin a specific version; omit it to always reach
-    // the latest deployed version.
-    req.set_authority(Some("inventory-service")).unwrap();
-    req.set_path_with_query(Some(
-        "/inventory.InventoryService/GetItems"
-    )).unwrap();
-    req.set_scheme(Some(&Scheme::Http)).unwrap();
-    req.set_method(&Method::Post).unwrap();
-
-    // Write the serialised protobuf body
-    let body = req.body().unwrap();
-    {
-        let stream = body.write().unwrap();
-        stream.write(category.as_bytes()).unwrap();
+        send_response(response_out, status, resp_bytes);
     }
-    OutgoingBody::finish(body, None).unwrap();
-
-    let future = outgoing_handler::handle(req, None).unwrap();
-    let resp = future.get().unwrap().unwrap().unwrap();
-
-    let body = resp.consume().unwrap();
-    let stream = body.stream().unwrap();
-    stream.read(u64::MAX).unwrap()
 }
 ```
 
@@ -578,8 +641,7 @@ The `wr-tests` crate contains integration tests that spin up in-process instance
 
 - Manager RPC coverage (register, deregister, heartbeat, routing rules, metrics)
 - Proxy routing end-to-end with a stub engine
-- Schema validation: invalid protobuf bodies rejected with structured JSON errors
-- Pass-through when no schema is cached
+- Schema validation: invalid protobuf bodies rejected with `400`; non-gRPC paths rejected with `404`; missing schema returns `503`
 - All three example TOML files parse without error
 - Version routing: `x-wr-version` header routes to the correct instance; no header routes to the highest semver
 - Returns 503 when the requested version has no healthy instance

@@ -101,16 +101,57 @@ db-start-example:
 db-stop:
     pg_ctl -D {{pg_data}} stop
 
+# Check whether Postgres is accepting connections on db_port
+db-status:
+    pg_isready -p {{pg_port}} -U postgres
+
 # ── Ecommerce Example ─────────────────────────────────────────────────────────
 
-# Build WASM components for the ecommerce example
-build-example:
+# Compile ecommerce protobuf schemas to FileDescriptorSet binaries (.binpb)
+build-schemas:
+    protoc --descriptor_set_out=ecommerce-example/schemas/inventory.binpb \
+           --include_imports \
+           ecommerce-example/schemas/inventory.proto
+    protoc --descriptor_set_out=ecommerce-example/schemas/client.binpb \
+           --include_imports \
+           ecommerce-example/schemas/client.proto
+
+# Build WASM components and schemas for the ecommerce example
+build-example: build-schemas
     (cd ecommerce-example/inventory && cargo component build --release --target wasm32-wasip2)
     (cd ecommerce-example/client && cargo component build --release --target wasm32-wasip2)
 
 # Run the full ecommerce example (requires Postgres — see `just db-start-example`)
-example:
+example: build-example build-release
     bash ecommerce-example/run.sh
+
+# ── Observability (LGTM stack) ────────────────────────────────────────────────
+
+lgtm_dir := "observability"
+
+# Start the Grafana LGTM stack (Loki, Grafana, Tempo, Mimir)
+obs-up:
+    docker run --rm -d \
+        --name lgtm \
+        -p 3000:3000 \
+        -p 4317:4317 \
+        -p 4318:4318 \
+        -v $(pwd)/{{lgtm_dir}}/data:/data \
+        grafana/otel-lgtm
+    @echo "Grafana: http://localhost:3000 (admin/admin)"
+    @echo "OTLP gRPC: localhost:4317  OTLP HTTP: localhost:4318"
+
+# Stop the LGTM stack
+obs-down:
+    docker stop lgtm
+
+# Tail logs from the LGTM container
+obs-logs:
+    docker logs -f lgtm
+
+# Print LGTM container status
+obs-status:
+    docker ps --filter name=lgtm
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 

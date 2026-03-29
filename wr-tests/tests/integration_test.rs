@@ -34,7 +34,7 @@ async fn test_register_and_list_engines() -> Result<()> {
                 name: "inventory-service".into(),
                 namespace: "store".into(),
                 version: "1.0.0".into(),
-                proto_schema: vec![],
+                proto_schema: minimal_file_descriptor_set(),
             }],
         }),
     })
@@ -183,12 +183,13 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
         "store",
         "inventory-service",
         "1.0.0",
+        minimal_file_descriptor_set(),
     )
     .await?;
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy(table).await?;
+    let proxy = start_proxy_synced(&mgr_addr, table).await?;
 
     let (status, body) = proxy_get(proxy, "store", "inventory-service", Some("1.0.0")).await?;
     assert_eq!(status, StatusCode::OK);
@@ -298,27 +299,6 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
         resp2.status(),
         StatusCode::BAD_REQUEST,
         "valid body should not fail schema validation"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_schema_validation_passes_when_no_schema_cached() -> Result<()> {
-    // Empty schema cache → validation is skipped; routing then fails with 502.
-    let proxy_addr = start_proxy(wr_proxy::routing::new_routing_table()).await?;
-
-    let req = Request::builder()
-        .uri(format!("http://{proxy_addr}/rpc"))
-        .header("x-wr-destination", "http://unknown-service.test-ns/rpc")
-        .header("x-wr-source", "test")
-        .body(Full::new(invalid_protobuf()))?;
-
-    let resp = http_client().request(req).await?;
-    assert_ne!(
-        resp.status(),
-        StatusCode::BAD_REQUEST,
-        "should not get 400 when no schema is cached"
     );
 
     Ok(())
@@ -459,6 +439,7 @@ async fn test_proxy_routes_to_explicit_version() -> Result<()> {
         "ver-ns",
         "versioned-service",
         "1.0.0",
+        minimal_file_descriptor_set(),
     )
     .await?;
     register_module(
@@ -468,12 +449,13 @@ async fn test_proxy_routes_to_explicit_version() -> Result<()> {
         "ver-ns",
         "versioned-service",
         "2.0.0",
+        minimal_file_descriptor_set(),
     )
     .await?;
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy(table).await?;
+    let proxy = start_proxy_synced(&mgr_addr, table).await?;
 
     let (s, body) = proxy_get(proxy, "ver-ns", "versioned-service", Some("1.0.0")).await?;
     assert_eq!(s, StatusCode::OK);
@@ -503,6 +485,7 @@ async fn test_proxy_routes_to_latest_version() -> Result<()> {
         "latest-ns",
         "latest-service",
         "1.0.0",
+        minimal_file_descriptor_set(),
     )
     .await?;
     register_module(
@@ -512,12 +495,13 @@ async fn test_proxy_routes_to_latest_version() -> Result<()> {
         "latest-ns",
         "latest-service",
         "2.0.0",
+        minimal_file_descriptor_set(),
     )
     .await?;
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy(table).await?;
+    let proxy = start_proxy_synced(&mgr_addr, table).await?;
 
     // No x-wr-version → should route to the highest semver (2.0.0)
     let (s, body) = proxy_get(proxy, "latest-ns", "latest-service", None).await?;
@@ -545,6 +529,7 @@ async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
         "mv-ns",
         "missing-ver-service",
         "1.0.0",
+        minimal_file_descriptor_set(),
     )
     .await?;
 
@@ -567,12 +552,30 @@ async fn test_proxy_load_balances_across_instances() -> Result<()> {
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-a").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-b").await?;
 
-    register_module(&mut mgr, "ea", &e1_addr, "lb-ns", "lb-service", "1.0.0").await?;
-    register_module(&mut mgr, "eb", &e2_addr, "lb-ns", "lb-service", "1.0.0").await?;
+    register_module(
+        &mut mgr,
+        "ea",
+        &e1_addr,
+        "lb-ns",
+        "lb-service",
+        "1.0.0",
+        minimal_file_descriptor_set(),
+    )
+    .await?;
+    register_module(
+        &mut mgr,
+        "eb",
+        &e2_addr,
+        "lb-ns",
+        "lb-service",
+        "1.0.0",
+        minimal_file_descriptor_set(),
+    )
+    .await?;
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy(table).await?;
+    let proxy = start_proxy_synced(&mgr_addr, table).await?;
 
     let mut saw_a = false;
     let mut saw_b = false;
@@ -606,6 +609,7 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
         "fo-ns",
         "failover-service",
         "1.0.0",
+        minimal_file_descriptor_set(),
     )
     .await?;
     register_module(
@@ -615,12 +619,13 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
         "fo-ns",
         "failover-service",
         "1.0.0",
+        minimal_file_descriptor_set(),
     )
     .await?;
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy(table.clone()).await?;
+    let proxy = start_proxy_synced(&mgr_addr, table.clone()).await?;
 
     // Both instances should be reachable before failover.
     let mut saw_a = false;
@@ -661,11 +666,20 @@ async fn test_proxy_503_when_all_instances_unhealthy() -> Result<()> {
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (e1_addr, _stub) = spawn_identified_stub("engine-a").await?;
-    register_module(&mut mgr, "ea", &e1_addr, "gone-ns", "gone-service", "1.0.0").await?;
+    register_module(
+        &mut mgr,
+        "ea",
+        &e1_addr,
+        "gone-ns",
+        "gone-service",
+        "1.0.0",
+        minimal_file_descriptor_set(),
+    )
+    .await?;
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy(table.clone()).await?;
+    let proxy = start_proxy_synced(&mgr_addr, table.clone()).await?;
 
     let (s, _) = proxy_get(proxy, "gone-ns", "gone-service", Some("1.0.0")).await?;
     assert_eq!(s, StatusCode::OK, "should be reachable before deregister");
@@ -735,11 +749,12 @@ fn test_engine_config_module_database_flag_parses() {
         [database]
         url = "postgres://user:pass@localhost:5432/mydb"
         [[module]]
-        name      = "svc"
-        namespace = "my-ns"
-        version   = "1.0.0"
-        wasm_path = "/nonexistent/svc.wasm"
-        database  = true
+        name        = "svc"
+        namespace   = "my-ns"
+        version     = "1.0.0"
+        wasm_path   = "/nonexistent/svc.wasm"
+        schema_path = "/nonexistent/svc.binpb"
+        database    = true
     "#;
     let cfg: EngineConfig = toml::from_str(toml).unwrap();
     assert!(
@@ -757,10 +772,11 @@ fn test_engine_config_module_database_flag_defaults_to_false() {
         manager_address = "http://127.0.0.1:9000"
         proxy_address   = "http://127.0.0.1:9001"
         [[module]]
-        name      = "svc"
-        namespace = "my-ns"
-        version   = "1.0.0"
-        wasm_path = "/nonexistent/svc.wasm"
+        name        = "svc"
+        namespace   = "my-ns"
+        version     = "1.0.0"
+        wasm_path   = "/nonexistent/svc.wasm"
+        schema_path = "/nonexistent/svc.binpb"
     "#;
     let cfg: EngineConfig = toml::from_str(toml).unwrap();
     assert!(!cfg.modules[0].database, "database should default to false");
@@ -995,6 +1011,7 @@ async fn test_proxy_namespaces_are_isolated() -> Result<()> {
         "ns-alpha",
         "shared-service",
         "1.0.0",
+        minimal_file_descriptor_set(),
     )
     .await?;
     register_module(
@@ -1004,12 +1021,13 @@ async fn test_proxy_namespaces_are_isolated() -> Result<()> {
         "ns-beta",
         "shared-service",
         "1.0.0",
+        minimal_file_descriptor_set(),
     )
     .await?;
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy(table).await?;
+    let proxy = start_proxy_synced(&mgr_addr, table).await?;
 
     // ns-alpha routes to engine-alpha, not engine-beta.
     let (s, body) = proxy_get(proxy, "ns-alpha", "shared-service", Some("1.0.0")).await?;

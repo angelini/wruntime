@@ -25,8 +25,8 @@ use tonic::transport::Server;
 
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, manager_service_server::ManagerServiceServer,
-    EngineRegistration, GetRoutingTableRequest, ModuleDescriptor, RegisterEngineRequest,
-    RoutingRule,
+    EngineRegistration, GetRoutingTableRequest, GetSchemaRequest, ListEnginesRequest,
+    ModuleDescriptor, RegisterEngineRequest, RoutingRule,
 };
 use wr_manager::{service::Manager, state::new_state};
 
@@ -56,6 +56,10 @@ pub async fn manager_client(addr: &str) -> Result<ManagerServiceClient<tonic::tr
 // ── Proxy ─────────────────────────────────────────────────────────────────────
 
 /// Register one engine and one routing rule in a single call.
+///
+/// `proto_schema` must be a non-empty serialised `FileDescriptorSet` — the
+/// manager now rejects modules that declare no schema.  Use
+/// [`minimal_file_descriptor_set`] when a real schema is not needed.
 pub async fn register_module(
     c: &mut ManagerServiceClient<tonic::transport::Channel>,
     engine_id: &str,
@@ -63,6 +67,7 @@ pub async fn register_module(
     namespace: &str,
     module: &str,
     version: &str,
+    proto_schema: Vec<u8>,
 ) -> Result<()> {
     c.register_engine(RegisterEngineRequest {
         registration: Some(EngineRegistration {
@@ -72,7 +77,7 @@ pub async fn register_module(
                 name: module.into(),
                 namespace: namespace.into(),
                 version: version.into(),
-                proto_schema: vec![],
+                proto_schema,
             }],
         }),
     })
@@ -109,9 +114,51 @@ pub async fn sync_table(
     Ok(())
 }
 
-/// Build and start a proxy with an **empty** schema cache; returns the bound address.
+/// Build and start a proxy with an empty schema cache (not yet synced); returns the bound address.
 pub async fn start_proxy(table: wr_proxy::routing::CachedRoutingTable) -> Result<SocketAddr> {
     start_proxy_with_schema(table, Arc::new(wr_proxy::schema::SchemaCache::new())).await
+}
+
+/// Fetch all schemas from the manager and populate `cache`.
+pub async fn sync_schema_cache(
+    mgr_addr: &str,
+    cache: &Arc<wr_proxy::schema::SchemaCache>,
+) -> Result<()> {
+    let mut c = manager_client(mgr_addr).await?;
+    let engines = c
+        .list_engines(ListEnginesRequest {})
+        .await?
+        .into_inner()
+        .engines;
+    for engine in &engines {
+        for module in &engine.modules {
+            let schema_bytes = c
+                .get_schema(GetSchemaRequest {
+                    namespace: module.namespace.clone(),
+                    module: module.name.clone(),
+                    version: module.version.clone(),
+                })
+                .await?
+                .into_inner()
+                .proto_schema;
+            if !schema_bytes.is_empty() {
+                let _ = cache
+                    .insert(&module.namespace, &module.name, &schema_bytes)
+                    .await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Start a proxy with routing table and schema cache both synced from the manager.
+pub async fn start_proxy_synced(
+    mgr_addr: &str,
+    table: wr_proxy::routing::CachedRoutingTable,
+) -> Result<SocketAddr> {
+    let schema_cache = Arc::new(wr_proxy::schema::SchemaCache::new());
+    sync_schema_cache(mgr_addr, &schema_cache).await?;
+    start_proxy_with_schema(table, schema_cache).await
 }
 
 /// Build and start a proxy with a **pre-populated** schema cache; returns the bound address.
@@ -140,11 +187,13 @@ pub async fn proxy_get(
     destination_module: &str,
     version: Option<&str>,
 ) -> Result<(StatusCode, String)> {
+    // Use the PingService RPC path that matches minimal_file_descriptor_set().
+    const PATH: &str = "/test.PingService/Ping";
     let mut builder = Request::builder()
-        .uri(format!("http://{proxy_addr}/test"))
+        .uri(format!("http://{proxy_addr}{PATH}"))
         .header(
             "x-wr-destination",
-            format!("http://{destination_module}.{namespace}/test"),
+            format!("http://{destination_module}.{namespace}{PATH}"),
         )
         .header("x-wr-source", "test-caller");
     if let Some(v) = version {

@@ -9,7 +9,7 @@ use wr_common::wruntime::manager_service_server::ManagerServiceServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let _telemetry = wr_common::telemetry::init("wr-manager")?;
 
     let config_path = std::env::args()
         .nth(1)

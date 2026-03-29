@@ -621,7 +621,12 @@ mod tests {
         HostTransaction::commit(&mut state, wasmtime::component::Resource::new_borrow(rep))
             .expect("commit");
 
-        // After commit the row must be visible outside the transaction.
+        // Release the resource first so its connection is returned to the pool.
+        // done=true means no ROLLBACK is issued.
+        HostTransaction::drop(&mut state, tx).expect("drop");
+
+        // After the connection is back in the pool, Host::query reacquires it
+        // and can see the TEMP TABLE (TEMP tables are connection-scoped).
         let rows = Host::query(
             &mut state,
             "SELECT val FROM _wr_tx_commit_test".into(),
@@ -630,9 +635,6 @@ mod tests {
         .expect("query after commit");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].columns[0].value, PgValue::Int4(42));
-
-        // Release the resource; done=true so no ROLLBACK is issued.
-        HostTransaction::drop(&mut state, tx).expect("drop");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -673,7 +675,11 @@ mod tests {
         HostTransaction::rollback(&mut state, wasmtime::component::Resource::new_borrow(rep))
             .expect("rollback");
 
-        // After rollback the row must not be present.
+        // Release the resource first so its connection is returned to the pool.
+        HostTransaction::drop(&mut state, tx).expect("drop");
+
+        // After the connection is back in the pool, Host::query reacquires it
+        // and can see the TEMP TABLE with the rolled-back INSERT absent.
         let rows = Host::query(
             &mut state,
             "SELECT val FROM _wr_tx_rollback_test".into(),
@@ -681,8 +687,6 @@ mod tests {
         )
         .expect("query after rollback");
         assert_eq!(rows.len(), 0);
-
-        HostTransaction::drop(&mut state, tx).expect("drop");
     }
 
     #[tokio::test(flavor = "multi_thread")]

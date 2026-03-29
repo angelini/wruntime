@@ -3,3 +3,5 @@
 pub mod wruntime {
     tonic::include_proto!("wruntime");
 }
+
+pub mod telemetry;

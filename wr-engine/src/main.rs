@@ -4,7 +4,7 @@ mod server;
 
 use wr_engine::config;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::Duration;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "engine.toml".to_string());
 
-    tracing_subscriber::fmt::init();
+    let _telemetry = wr_common::telemetry::init("wr-engine")?;
 
     let config = config::EngineConfig::load(&config_path)?;
     let engine_id = Uuid::new_v4().to_string();
@@ -56,25 +56,18 @@ async fn main() -> Result<()> {
     // ── Connect to wr-manager ─────────────────────────────────────────────
     let mut client = ManagerServiceClient::connect(config.manager_address.clone()).await?;
 
-    // Build module descriptors, loading schema files where available.
-    let module_descriptors: Vec<ModuleDescriptor> = config
-        .modules
-        .iter()
-        .map(|m| {
-            // schema_path is validated to exist at config load time if present.
-            let proto_schema = m
-                .schema_path
-                .as_deref()
-                .map(|p| std::fs::read(p).unwrap_or_default())
-                .unwrap_or_default();
-            ModuleDescriptor {
-                name: m.name.clone(),
-                namespace: m.namespace.clone(),
-                version: m.version.clone(),
-                proto_schema,
-            }
-        })
-        .collect();
+    // Build module descriptors — schema_path is required and validated at config load time.
+    let mut module_descriptors: Vec<ModuleDescriptor> = Vec::new();
+    for m in &config.modules {
+        let proto_schema = std::fs::read(&m.schema_path)
+            .with_context(|| format!("failed to read schema for module '{}'", m.name))?;
+        module_descriptors.push(ModuleDescriptor {
+            name: m.name.clone(),
+            namespace: m.namespace.clone(),
+            version: m.version.clone(),
+            proto_schema,
+        });
+    }
 
     // ── Register with manager ─────────────────────────────────────────────
     client

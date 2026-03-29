@@ -35,9 +35,9 @@ pub struct ModuleConfig {
     pub version: String,
     pub wasm_path: String,
     /// Path to a compiled `FileDescriptorSet` binary for this module's API.
-    /// Optional — if absent the module is registered without a schema and
-    /// schema validation for it is skipped by the proxy.
-    pub schema_path: Option<String>,
+    /// Required — every module must declare a schema so the proxy can validate
+    /// request bodies.
+    pub schema_path: String,
     /// Whether this module has access to the shared database pool.
     /// Requires a `[database]` section in the engine config.
     #[serde(default)]
@@ -75,14 +75,17 @@ impl EngineConfig {
                 module.name,
                 module.wasm_path,
             );
-            if let Some(schema) = &module.schema_path {
-                anyhow::ensure!(
-                    std::path::Path::new(schema).exists(),
-                    "schema_path not found for module '{}': {}",
-                    module.name,
-                    schema,
-                );
-            }
+            anyhow::ensure!(
+                !module.schema_path.is_empty(),
+                "schema_path is required for module '{}'",
+                module.name,
+            );
+            anyhow::ensure!(
+                std::path::Path::new(&module.schema_path).exists(),
+                "schema_path not found for module '{}': {}",
+                module.name,
+                module.schema_path,
+            );
             anyhow::ensure!(
                 !module.database || self.database.is_some(),
                 "module '{}' has database = true but no [database] section is configured",

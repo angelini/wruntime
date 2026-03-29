@@ -8,6 +8,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+prost = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"
 
 [package.metadata.component]
 package = "ecommerce:inventory"

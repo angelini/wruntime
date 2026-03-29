@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use tracing::{info, warn};
 use wr_common::wruntime::{
@@ -17,11 +17,13 @@ pub fn new_routing_table() -> CachedRoutingTable {
 }
 
 /// Background task: polls wr-manager for the routing table and updates the
-/// local cache whenever the version number increments.
+/// local cache whenever the version number increments. Notifies `schema_trigger`
+/// on each version advance so the schema sync can wake immediately.
 pub async fn sync_routing_table(
     mut client: ManagerServiceClient<tonic::transport::Channel>,
     table: CachedRoutingTable,
     ttl_secs: u64,
+    schema_trigger: Arc<Notify>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(ttl_secs));
     loop {
@@ -34,6 +36,7 @@ pub async fn sync_routing_table(
                         let version = incoming.version;
                         *table.write().await = incoming;
                         info!(version, "routing table updated");
+                        schema_trigger.notify_one();
                     }
                 }
             }

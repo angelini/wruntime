@@ -8,6 +8,7 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use tower::Service;
+use tracing::{info_span, Instrument};
 
 use super::{full_body, ResBody, ResolvedDestination};
 
@@ -63,24 +64,46 @@ impl Service<Request<Bytes>> for ForwardService {
             let forward_uri: http::Uri =
                 format!("{}{}", dest.trim_end_matches('/'), path).parse()?;
 
-            // Re-use the original method and headers; replace URI and body type
+            // Re-use the original method and headers; replace URI and body type.
+            // Inject the W3C traceparent header so the engine can link its span
+            // to this proxy span.
             let (mut parts, body) = req.into_parts();
             parts.uri = forward_uri;
+            wr_common::telemetry::inject_context(&mut parts.headers);
             let forward_req = Request::from_parts(parts, Full::new(body));
 
-            // Send
-            let resp = client
-                .request(forward_req)
-                .await
-                .map_err(|e| anyhow::anyhow!("forward failed: {e}"))?;
+            let span = info_span!(
+                "proxy.forward",
+                wr.engine                 = %dest,
+                http.response.status_code = tracing::field::Empty,
+                otel.status_code          = tracing::field::Empty,
+            );
 
-            // Collect the upstream response body and convert to ResBody
-            let (resp_parts, resp_body) = resp.into_parts();
-            let resp_bytes = resp_body
-                .collect()
-                .await
-                .map_err(|e| anyhow::anyhow!("response body error: {e}"))?
-                .to_bytes();
+            // Send and collect — both are part of upstream latency.
+            let (resp_parts, resp_bytes) = async {
+                let resp = client
+                    .request(forward_req)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("forward failed: {e}"))?;
+
+                let (parts, body) = resp.into_parts();
+                let bytes = body
+                    .collect()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("response body error: {e}"))?
+                    .to_bytes();
+
+                Ok::<_, anyhow::Error>((parts, bytes))
+            }
+            .instrument(span.clone())
+            .await?;
+
+            let status = resp_parts.status.as_u16();
+            span.record("http.response.status_code", status);
+            span.record(
+                "otel.status_code",
+                if status >= 500 { "ERROR" } else { "OK" },
+            );
 
             Ok(http::Response::from_parts(
                 resp_parts,

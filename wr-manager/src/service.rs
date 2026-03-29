@@ -48,7 +48,8 @@ impl ManagerService for Manager {
         let engine_id = reg.engine_id.clone();
         let mut state = self.state.write().await;
 
-        // Validate and store the FileDescriptorSet bytes from each module's descriptor
+        // Validate and store the FileDescriptorSet bytes from each module's descriptor.
+        // Every module must declare a schema — empty proto_schema is rejected.
         for module in &reg.modules {
             if module.namespace.is_empty() {
                 return Err(Status::invalid_argument(format!(
@@ -56,16 +57,20 @@ impl ManagerService for Manager {
                     module.name
                 )));
             }
-            if !module.proto_schema.is_empty() {
-                state.schemas.insert(
-                    (
-                        module.namespace.clone(),
-                        module.name.clone(),
-                        module.version.clone(),
-                    ),
-                    module.proto_schema.clone(),
-                );
+            if module.proto_schema.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "module '{}' in namespace '{}' has no schema — proto_schema is required",
+                    module.name, module.namespace
+                )));
             }
+            state.schemas.insert(
+                (
+                    module.namespace.clone(),
+                    module.name.clone(),
+                    module.version.clone(),
+                ),
+                module.proto_schema.clone(),
+            );
         }
 
         // Initialise module health so the monitor doesn't immediately mark

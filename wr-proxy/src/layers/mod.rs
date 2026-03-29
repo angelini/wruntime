@@ -2,11 +2,13 @@ mod forward;
 mod metrics;
 mod routing;
 mod schema;
+mod tracing;
 
 pub use forward::ForwardService;
 pub use metrics::MetricsLayer;
 pub use routing::RoutingLayer;
 pub use schema::SchemaValidationLayer;
+pub use tracing::TracingLayer;
 
 use bytes::Bytes;
 use http::Response;

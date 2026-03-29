@@ -12,13 +12,12 @@ name        = "order-service"
 namespace   = "payments"
 version     = "1.0.0"
 wasm_path   = "modules/order_service.wasm"
-schema_path = "schemas/order_service.binpb"
-database    = true   # opt in to the shared connection pool
+schema_path = "schemas/order_service.binpb"   # required: compiled FileDescriptorSet
+database    = true                             # opt in to the shared connection pool
 
 [[module]]
-name      = "inventory-service"
-namespace = "payments"
-version   = "1.0.0"
-wasm_path = "modules/inventory_service.wasm"
-# schema_path is optional — omit if no proto schema is available
-# database defaults to false — this module has no DB access
+name        = "inventory-service"
+namespace   = "payments"
+version     = "1.0.0"
+wasm_path   = "modules/inventory_service.wasm"
+schema_path = "schemas/inventory_service.binpb"

@@ -8,7 +8,7 @@ use http::{Request, Response, StatusCode};
 use tower::{Layer, Service};
 
 use super::{full_body, ResBody};
-use crate::schema::SchemaCache;
+use crate::schema::{SchemaCache, ValidationOutcome};
 
 pub struct SchemaValidationLayer {
     cache: Arc<SchemaCache>,
@@ -68,23 +68,36 @@ where
                 let path = dest_uri.path().to_string();
 
                 // host format is "{service}.{namespace}"
-                let (module, namespace) = host
+                // If there is no dot the destination is malformed — pass
+                // through so the routing layer can return a 400.
+                let Some((module, namespace)) = host
                     .split_once('.')
                     .map(|(s, n)| (s.to_string(), n.to_string()))
-                    .unwrap_or_else(|| (host.to_string(), String::new()));
+                else {
+                    return inner.call(req).await;
+                };
 
-                if let Some(detail) = cache
+                let source = req
+                    .headers()
+                    .get("x-wr-source")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+
+                match cache
                     .validate(&namespace, &module, &path, req.body().as_ref())
                     .await
                 {
-                    let source = req
-                        .headers()
-                        .get("x-wr-source")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-
-                    return Ok(validation_error(&detail, &source, &module));
+                    ValidationOutcome::Pass => {}
+                    ValidationOutcome::Fail(detail) => {
+                        return Ok(validation_error(&detail, &source, &module));
+                    }
+                    ValidationOutcome::SchemaNotCached => {
+                        return Ok(schema_not_cached_error(&module, &namespace));
+                    }
+                    ValidationOutcome::MethodNotFound(detail) => {
+                        return Ok(method_not_found_error(&detail, &source, &module));
+                    }
                 }
             }
 
@@ -93,8 +106,7 @@ where
     }
 }
 
-/// Build a `400 Bad Request` response with the structured JSON error body
-/// described in the plan.
+/// Build a `400 Bad Request` response for a body that fails schema validation.
 fn validation_error(detail: &str, source: &str, destination: &str) -> Response<ResBody> {
     let body = serde_json::json!({
         "error":       "schema_validation_failed",
@@ -106,6 +118,40 @@ fn validation_error(detail: &str, source: &str, destination: &str) -> Response<R
 
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(body)))
+        .unwrap()
+}
+
+/// Build a `404 Not Found` response when the path doesn't match any RPC in the schema.
+fn method_not_found_error(detail: &str, source: &str, destination: &str) -> Response<ResBody> {
+    let body = serde_json::json!({
+        "error":       "method_not_found",
+        "detail":      detail,
+        "source":      source,
+        "destination": destination,
+    })
+    .to_string();
+
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(full_body(Bytes::from(body)))
+        .unwrap()
+}
+
+/// Build a `503 Service Unavailable` response when no schema is cached yet.
+fn schema_not_cached_error(module: &str, namespace: &str) -> Response<ResBody> {
+    let body = serde_json::json!({
+        "error":  "schema_not_cached",
+        "detail": format!("schema for {namespace}.{module} has not been synced yet"),
+        "module": module,
+        "namespace": namespace,
+    })
+    .to_string();
+
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(full_body(Bytes::from(body)))
         .unwrap()

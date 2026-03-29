@@ -7,8 +7,9 @@ url             = "postgres://user:pass@localhost:5432/ecommerce"
 max_connections = 8
 
 [[module]]
-name      = "inventory"
-namespace = "ecommerce"
-version   = "1.0.0"
-wasm_path = "target/wasm32-wasip2/release/inventory.wasm"
-database  = true
+name        = "inventory"
+namespace   = "ecommerce"
+version     = "1.0.0"
+wasm_path   = "ecommerce-example/inventory/target/wasm32-wasip2/release/inventory.wasm"
+schema_path = "ecommerce-example/schemas/inventory.binpb"
+database    = true

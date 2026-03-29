@@ -4,19 +4,22 @@ proxy_address   = "http://127.0.0.1:9001"
 
 # Three independent client instances — each runs its own `run` export concurrently.
 [[module]]
-name      = "client-a"
-namespace = "ecommerce"
-version   = "1.0.0"
-wasm_path = "target/wasm32-wasip2/release/client.wasm"
+name        = "client-a"
+namespace   = "ecommerce"
+version     = "1.0.0"
+wasm_path   = "ecommerce-example/client/target/wasm32-wasip2/release/client.wasm"
+schema_path = "ecommerce-example/schemas/client.binpb"
 
 [[module]]
-name      = "client-b"
-namespace = "ecommerce"
-version   = "1.0.0"
-wasm_path = "target/wasm32-wasip2/release/client.wasm"
+name        = "client-b"
+namespace   = "ecommerce"
+version     = "1.0.0"
+wasm_path   = "ecommerce-example/client/target/wasm32-wasip2/release/client.wasm"
+schema_path = "ecommerce-example/schemas/client.binpb"
 
 [[module]]
-name      = "client-c"
-namespace = "ecommerce"
-version   = "1.0.0"
-wasm_path = "target/wasm32-wasip2/release/client.wasm"
+name        = "client-c"
+namespace   = "ecommerce"
+version     = "1.0.0"
+wasm_path   = "ecommerce-example/client/target/wasm32-wasip2/release/client.wasm"
+schema_path = "ecommerce-example/schemas/client.binpb"

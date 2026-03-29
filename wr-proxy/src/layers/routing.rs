@@ -7,6 +7,7 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use http::{Request, StatusCode};
 use tower::{Layer, Service};
+use tracing::{info_span, Instrument};
 
 use super::{error_response, ResBody, ResolvedDestination};
 use crate::routing::CachedRoutingTable;
@@ -90,6 +91,15 @@ where
                 }
             };
 
+            let span = info_span!(
+                "proxy.route",
+                wr.module        = %module_name,
+                wr.namespace     = %dest_namespace,
+                wr.version       = tracing::field::Empty,
+                wr.engine        = tracing::field::Empty,
+                otel.status_code = tracing::field::Empty,
+            );
+
             // Optional explicit version requested by the caller
             let requested_version: Option<String> = req
                 .headers()
@@ -156,6 +166,7 @@ where
                     ),
                     None => format!("no route for module '{dest_namespace}.{module_name}'"),
                 };
+                span.record("otel.status_code", "ERROR");
                 return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE, &msg));
             }
 
@@ -187,8 +198,11 @@ where
             if let Ok(v) = http::HeaderValue::from_str(&resolved_version) {
                 req.headers_mut().insert("x-wr-version", v);
             }
+            span.record("wr.version", &resolved_version);
+            span.record("wr.engine", &addr);
+
             req.extensions_mut().insert(ResolvedDestination(addr));
-            inner.call(req).await
+            inner.call(req).instrument(span).await
         })
     }
 }

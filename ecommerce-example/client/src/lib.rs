@@ -1,12 +1,93 @@
 #[allow(warnings)]
 mod bindings;
 
+#[allow(dead_code)]
+mod proto {
+    include!(concat!(env!("OUT_DIR"), "/ecommerce.rs"));
+}
+
 use bindings::wasi::http::outgoing_handler;
 use bindings::wasi::http::types::{Fields, Method, OutgoingBody, OutgoingRequest, Scheme};
 use bindings::wasi::io::streams::StreamError;
+use prost::Message;
 
 struct Component;
 bindings::export!(Component with_types_in bindings);
+
+// ── Inventory service authority: "{module}.{namespace}" ───────────────────────
+const INVENTORY: &str = "inventory.ecommerce";
+
+impl bindings::Guest for Component {
+    fn run() {
+        log("client starting");
+
+        // Seed inventory — idempotent (ON CONFLICT DO NOTHING in inventory service).
+        let seed_bytes = proto::SeedRequest {}.encode_to_vec();
+        match http_rpc(INVENTORY, "/ecommerce.InventoryService/Seed", &seed_bytes) {
+            Ok((200, _)) => log("inventory seeded"),
+            Ok((status, _)) => log(&format!("seed response: {status}")),
+            Err(e) => log(&format!("seed error: {e}")),
+        }
+
+        // Track purchases so we can return some later.
+        let mut purchased: Vec<(&str, i64)> = Vec::new();
+
+        for i in 0u64..100 {
+            // Deterministic pseudo-random selection spread across all 50 products.
+            let product_id = PRODUCTS[((i.wrapping_mul(7).wrapping_add(13)) % 50) as usize];
+            let quantity = (i % 5 + 1) as i64;
+
+            let buy_bytes = proto::BuyRequest {
+                product_id: product_id.to_string(),
+                quantity,
+            }
+            .encode_to_vec();
+
+            match http_rpc(INVENTORY, "/ecommerce.InventoryService/Buy", &buy_bytes) {
+                Ok((200, body)) => {
+                    let detail = proto::BuyResponse::decode(body.as_slice())
+                        .map(|r| format!("bought={} remaining={}", r.bought, r.remaining))
+                        .unwrap_or_else(|_| "ok".to_string());
+                    log(&format!("bought {} x{} — {}", product_id, quantity, detail));
+                    purchased.push((product_id, quantity));
+                }
+                Ok((409, _)) => {
+                    log(&format!("out of stock {} x{}", product_id, quantity));
+                }
+                Ok((status, _)) => {
+                    log(&format!("buy error {} x{}: HTTP {}", product_id, quantity, status));
+                }
+                Err(e) => log(&format!("http error buying {}: {}", product_id, e)),
+            }
+
+            // Return ~30 % of purchases (every 3rd iteration when we have items to return).
+            if i % 10 < 3 && !purchased.is_empty() {
+                let (ret_id, ret_qty) = purchased.remove(0);
+
+                let ret_bytes = proto::ReturnRequest {
+                    product_id: ret_id.to_string(),
+                    quantity: ret_qty,
+                }
+                .encode_to_vec();
+
+                match http_rpc(INVENTORY, "/ecommerce.InventoryService/Return", &ret_bytes) {
+                    Ok((200, body)) => {
+                        let detail = proto::ReturnResponse::decode(body.as_slice())
+                            .map(|r| format!("returned={} product={}", r.returned, r.product_id))
+                            .unwrap_or_else(|_| "ok".to_string());
+                        log(&format!("returned {} x{} — {}", ret_id, ret_qty, detail));
+                    }
+                    Ok((status, _)) => {
+                        log(&format!("return error: HTTP {}", status));
+                    }
+                    Err(e) => log(&format!("http error returning {}: {}", ret_id, e)),
+                }
+            }
+        }
+
+        log("client done");
+    }
+}
 
 // ── Product catalogue ─────────────────────────────────────────────────────────
 
@@ -20,80 +101,12 @@ const PRODUCTS: &[&str] = &[
     "prod-049", "prod-050",
 ];
 
-// ── Inventory service authority: "{module}.{namespace}" ───────────────────────
-// The proxy routing layer splits on '.' to get module=inventory, ns=ecommerce.
-const INVENTORY: &str = "inventory.ecommerce";
-
-impl bindings::Guest for Component {
-    fn run() {
-        log("client starting");
-
-        // Seed inventory — idempotent (ON CONFLICT DO NOTHING in inventory service).
-        match http_post(INVENTORY, "/seed", "{}") {
-            Ok((200, _)) => log("inventory seeded"),
-            Ok((status, body)) => log(&format!("seed response: {} {}", status, body)),
-            Err(e) => log(&format!("seed error: {}", e)),
-        }
-
-        // Track purchases so we can return some later.
-        let mut purchased: Vec<(&str, i64)> = Vec::new();
-
-        for i in 0u64..100 {
-            // Deterministic pseudo-random selection spread across all 50 products.
-            let product_id = PRODUCTS[((i.wrapping_mul(7).wrapping_add(13)) % 50) as usize];
-            let quantity = (i % 5 + 1) as i64;
-
-            let buy_body = format!(
-                r#"{{"product_id":"{}","quantity":{}}}"#,
-                product_id, quantity
-            );
-
-            match http_post(INVENTORY, "/buy", &buy_body) {
-                Ok((200, body)) => {
-                    log(&format!("bought {} x{} — {}", product_id, quantity, body));
-                    purchased.push((product_id, quantity));
-                }
-                Ok((409, body)) => {
-                    log(&format!(
-                        "out of stock {} x{} — {}",
-                        product_id, quantity, body
-                    ));
-                }
-                Ok((status, body)) => {
-                    log(&format!(
-                        "buy error {} x{}: HTTP {} {}",
-                        product_id, quantity, status, body
-                    ));
-                }
-                Err(e) => log(&format!("http error buying {}: {}", product_id, e)),
-            }
-
-            // Return ~30 % of purchases (every 3rd iteration when we have items to return).
-            if i % 10 < 3 && !purchased.is_empty() {
-                let (ret_id, ret_qty) = purchased.remove(0);
-                let ret_body = format!(r#"{{"product_id":"{}","quantity":{}}}"#, ret_id, ret_qty);
-                match http_post(INVENTORY, "/return", &ret_body) {
-                    Ok((200, body)) => {
-                        log(&format!("returned {} x{} — {}", ret_id, ret_qty, body));
-                    }
-                    Ok((status, body)) => {
-                        log(&format!("return error: HTTP {} {}", status, body));
-                    }
-                    Err(e) => log(&format!("http error returning {}: {}", ret_id, e)),
-                }
-            }
-        }
-
-        log("client done");
-    }
-}
-
 // ── HTTP helper ───────────────────────────────────────────────────────────────
 
-fn http_post(authority: &str, path: &str, body: &str) -> Result<(u16, String), String> {
+fn http_rpc(authority: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     let headers = Fields::new();
     headers
-        .set("content-type", &[b"application/json".to_vec()])
+        .set("content-type", &[b"application/x-protobuf".to_vec()])
         .map_err(|e| format!("set header: {:?}", e))?;
 
     let req = OutgoingRequest::new(headers);
@@ -109,7 +122,7 @@ fn http_post(authority: &str, path: &str, body: &str) -> Result<(u16, String), S
     {
         let stream = outgoing_body.write().map_err(|_| "get write stream")?;
         stream
-            .blocking_write_and_flush(body.as_bytes())
+            .blocking_write_and_flush(body)
             .map_err(|e| format!("write: {:?}", e))?;
     }
     OutgoingBody::finish(outgoing_body, None).map_err(|e| format!("finish body: {:?}", e))?;
@@ -117,7 +130,6 @@ fn http_post(authority: &str, path: &str, body: &str) -> Result<(u16, String), S
     let future_resp =
         outgoing_handler::handle(req, None).map_err(|e| format!("handle: {:?}", e))?;
 
-    // Poll until the response arrives.
     loop {
         match future_resp.get() {
             Some(result) => {
@@ -139,7 +151,7 @@ fn http_post(authority: &str, path: &str, body: &str) -> Result<(u16, String), S
                     }
                 }
 
-                return Ok((status, String::from_utf8_lossy(&resp_bytes).to_string()));
+                return Ok((status, resp_bytes));
             }
             None => {
                 future_resp.subscribe().block();

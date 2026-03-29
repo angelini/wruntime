@@ -17,13 +17,15 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower::{Service, ServiceBuilder};
 
-use layers::{ForwardService, MetricsLayer, ResBody, RoutingLayer, SchemaValidationLayer};
+use layers::{
+    ForwardService, MetricsLayer, ResBody, RoutingLayer, SchemaValidationLayer, TracingLayer,
+};
 use tracing::{error, info, warn};
 use wr_common::wruntime::manager_service_client::ManagerServiceClient;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let _telemetry = wr_common::telemetry::init("wr-proxy")?;
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "proxy.toml".to_string());
@@ -39,16 +41,20 @@ async fn main() -> Result<()> {
     info!(address = %config.manager_address, "connected to manager");
 
     // ── Background tasks ──────────────────────────────────────────────────
+    let schema_trigger = Arc::new(tokio::sync::Notify::new());
+
     tokio::spawn(routing::sync_routing_table(
         manager_client.clone(),
         routing_table.clone(),
         config.cache.routing_table_ttl_secs,
+        schema_trigger.clone(),
     ));
     tokio::spawn(schema::sync_schemas(
         manager_client.clone(),
         routing_table.clone(),
         schema_cache.clone(),
         config.cache.schema_ttl_secs,
+        schema_trigger,
     ));
     tokio::spawn(metrics::flush_metrics(
         manager_client,
@@ -58,12 +64,14 @@ async fn main() -> Result<()> {
 
     // ── Tower service stack ───────────────────────────────────────────────
     //
-    //   MetricsLayer
-    //     └─ SchemaValidationLayer
-    //          └─ RoutingLayer
-    //               └─ ForwardService
+    //   TracingLayer          ← root OTel span per request
+    //     └─ MetricsLayer
+    //          └─ SchemaValidationLayer
+    //               └─ RoutingLayer
+    //                    └─ ForwardService
     //
     let svc = ServiceBuilder::new()
+        .layer(TracingLayer)
         .layer(MetricsLayer::new(metrics_tx))
         .layer(SchemaValidationLayer::new(schema_cache))
         .layer(RoutingLayer::new(routing_table))

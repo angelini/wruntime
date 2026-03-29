@@ -8,7 +8,7 @@ use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tracing::{info, warn};
+use tracing::{info, info_span, warn, Instrument};
 
 use crate::registry::{InboundRequest, ModuleRegistry};
 
@@ -27,7 +27,37 @@ pub async fn serve(addr: &str, registry: ModuleRegistry) -> Result<()> {
             let io = TokioIo::new(stream);
             let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
                 let registry = registry.clone();
-                async move { Ok::<_, Infallible>(handle(req, registry).await) }
+                async move {
+                    let namespace = header_owned(req.headers(), "x-wr-namespace");
+                    let module = header_owned(req.headers(), "x-wr-module");
+                    let version = header_owned(req.headers(), "x-wr-version");
+                    let method = req.method().to_string();
+                    let path = req.uri().path().to_string();
+
+                    let span = info_span!(
+                        "engine.dispatch",
+                        otel.name                 = format!("{method} {namespace}.{module}"),
+                        wr.namespace              = %namespace,
+                        wr.module                 = %module,
+                        wr.version                = %version,
+                        http.request.method       = %method,
+                        url.path                  = %path,
+                        http.response.status_code = tracing::field::Empty,
+                        otel.status_code          = tracing::field::Empty,
+                    );
+                    wr_common::telemetry::set_parent_from_headers(&span, req.headers());
+
+                    let resp = handle(req, registry).instrument(span.clone()).await;
+
+                    let status = resp.status().as_u16();
+                    span.record("http.response.status_code", status);
+                    span.record(
+                        "otel.status_code",
+                        if status >= 400 { "ERROR" } else { "OK" },
+                    );
+
+                    Ok::<_, Infallible>(resp)
+                }
             });
             if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
                 warn!(error = %e, "inbound connection error");
@@ -109,6 +139,14 @@ async fn handle(
         }
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "module did not respond"),
     }
+}
+
+fn header_owned(headers: &http::HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_owned()
 }
 
 fn err(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
