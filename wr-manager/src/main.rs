@@ -29,10 +29,21 @@ async fn main() -> Result<()> {
 
     info!(address = %addr, "manager listening");
 
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let shutdown = async move {
+        tokio::select! {
+            _ = sigint.recv()  => {},
+            _ = sigterm.recv() => {},
+        }
+    };
+
     Server::builder()
         .add_service(ManagerServiceServer::new(manager))
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown)
         .await?;
 
+    info!("manager shutting down");
     Ok(())
 }

@@ -21,14 +21,6 @@ impl bindings::Guest for Component {
     fn run() {
         log("client starting");
 
-        // Seed inventory — idempotent (ON CONFLICT DO NOTHING in inventory service).
-        let seed_bytes = proto::SeedRequest {}.encode_to_vec();
-        match http_rpc(INVENTORY, "/ecommerce.InventoryService/Seed", &seed_bytes) {
-            Ok((200, _)) => log("inventory seeded"),
-            Ok((status, _)) => log(&format!("seed response: {status}")),
-            Err(e) => log(&format!("seed error: {e}")),
-        }
-
         // Track purchases so we can return some later.
         let mut purchased: Vec<(&str, i64)> = Vec::new();
 

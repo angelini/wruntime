@@ -81,8 +81,16 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&config.listen_address).await?;
     info!(address = %config.listen_address, "proxy listening");
 
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
+        let (stream, peer_addr) = tokio::select! {
+            res = listener.accept() => res?,
+            _ = sigint.recv()  => break,
+            _ = sigterm.recv() => break,
+        };
         let svc = svc.clone();
 
         tokio::spawn(async move {
@@ -116,6 +124,7 @@ async fn main() -> Result<()> {
             }
         });
     }
+    Ok(())
 }
 
 fn bad_request(msg: &str) -> Response<ResBody> {

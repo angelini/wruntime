@@ -79,7 +79,9 @@ echo "  cargo run -p wr-cli -- metrics"
 
 cleanup() {
     echo "==> Shutting down..."
-    kill "$CLIENT_PID" "$INV1_PID" "$INV2_PID" "$PROXY_PID" "$MANAGER_PID" 2>/dev/null || true
+    kill -INT "$CLIENT_PID" "$INV1_PID" "$INV2_PID" "$PROXY_PID" "$MANAGER_PID" 2>/dev/null || true
+    # Give services time to flush the OTLP batch exporter before exiting.
+    sleep 2
 }
 trap cleanup EXIT INT TERM
 

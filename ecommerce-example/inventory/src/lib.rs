@@ -13,19 +13,14 @@ use bindings::wasi::http::types::{
 use bindings::wasi::io::streams::StreamError;
 use bindings::wruntime::db::database::{self, PgValue};
 use prost::Message;
-use std::sync::OnceLock;
 
 struct Component;
 bindings::export!(Component with_types_in bindings);
-
-static SCHEMA_INIT: OnceLock<()> = OnceLock::new();
 
 impl Guest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         let method = request.method();
         let path = request.path_with_query().unwrap_or_default();
-
-        SCHEMA_INIT.get_or_init(ensure_schema);
 
         let body_bytes = read_body(request.consume().unwrap());
 
@@ -43,28 +38,23 @@ impl Guest for Component {
     }
 }
 
-// ── DB helpers ────────────────────────────────────────────────────────────────
+// ── Route handlers ────────────────────────────────────────────────────────────
 
-fn ensure_schema() -> () {
+fn handle_seed() -> (u16, Vec<u8>) {
+    let _ = database::execute("DROP TABLE IF EXISTS inventory", &[]);
     let _ = database::execute(
-        "CREATE TABLE IF NOT EXISTS inventory (\
+        "CREATE TABLE inventory (\
             product_id TEXT PRIMARY KEY, \
             name       TEXT NOT NULL, \
             stock      BIGINT NOT NULL CHECK (stock >= 0)\
         )",
         &[],
     );
-}
-
-// ── Route handlers ────────────────────────────────────────────────────────────
-
-fn handle_seed() -> (u16, Vec<u8>) {
     for i in 1u32..=50 {
         let id = format!("prod-{:03}", i);
         let name = format!("Product {}", i);
         let _ = database::execute(
-            "INSERT INTO inventory (product_id, name, stock) \
-             VALUES ($1, $2, 10000) ON CONFLICT DO NOTHING",
+            "INSERT INTO inventory (product_id, name, stock) VALUES ($1, $2, 10000)",
             &[PgValue::Text(id), PgValue::Text(name)],
         );
     }
