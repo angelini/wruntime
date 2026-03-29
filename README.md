@@ -215,11 +215,12 @@ proxy_address = "http://127.0.0.1:9001"   # local proxy; WASM outbound calls are
                                            # registration so peers can find this node
 
 [[module]]
-name        = "order-service"
-namespace   = "ecommerce"
-version     = "1.0.0"
-wasm_path   = "modules/order_service.wasm"
-schema_path = "schemas/order_service.binpb"
+name                 = "order-service"
+namespace            = "ecommerce"
+version              = "1.0.0"
+wasm_path            = "modules/order_service.wasm"
+schema_path          = "schemas/order_service.binpb"
+request_timeout_secs = 10   # optional; default 30
 
 [[module]]
 name        = "inventory-service"
@@ -227,9 +228,26 @@ namespace   = "ecommerce"
 version     = "1.0.0"
 wasm_path   = "modules/inventory_service.wasm"
 schema_path = "schemas/inventory_service.binpb"
+# request_timeout_secs omitted — uses the default of 30 seconds
 ```
 
 > **`schema_path` is required.** Every module must declare a compiled `FileDescriptorSet`. The engine will refuse to start if the file is absent, and the proxy will reject requests with `503` until the schema has been synced from the manager.
+
+#### Per-module request timeout
+
+`request_timeout_secs` sets a hard deadline on every request dispatched to a module. If the WASM handler does not produce a response within that window, the engine cancels the request and returns `504 Gateway Timeout` to the proxy. The proxy treats a `504` as a terminal error and does not retry on another instance.
+
+The default is **30 seconds**. Set it lower for latency-sensitive modules, or higher for modules that perform long-running work such as batch imports.
+
+```toml
+[[module]]
+name                 = "batch-processor"
+namespace            = "pipeline"
+version              = "1.0.0"
+wasm_path            = "modules/batch_processor.wasm"
+schema_path          = "schemas/batch_processor.binpb"
+request_timeout_secs = 120
+```
 
 On startup the engine:
 1. Loads every listed WASM component from disk.
@@ -237,6 +255,33 @@ On startup the engine:
 3. Starts an inbound HTTP server on `listen_address`.
 4. Sends a heartbeat to the manager every 10 seconds, reporting all loaded modules as healthy.
 5. Deregisters cleanly on `Ctrl+C`, which immediately marks its routing rules as unhealthy.
+
+#### Module health checks
+
+Every 10 seconds the engine sends `GET /__health` to each loaded module instance. If the module responds with a `2xx` status within 5 seconds it is reported as healthy in the next heartbeat; otherwise it is omitted, and the manager marks its routing rule unhealthy so the proxy stops sending traffic to it.
+
+By default a module does not need to handle `/__health` at all — the `wasi:http/incoming-handler` export just needs to exist. The engine treats any `2xx` as healthy and anything else (including a timeout or a dropped connection) as unhealthy.
+
+To run custom checks — verifying database connectivity, warming caches, or validating internal state — handle the path explicitly in your module:
+
+```rust
+impl wr_sdk::Guest for Component {
+    fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
+        let path = request.path_with_query().unwrap_or_default();
+
+        if path == "/__health" {
+            // Run any checks that make sense for this module.
+            let ok = database::query("SELECT 1", &[]).is_ok();
+            let status = if ok { 200 } else { 503 };
+            return send_response(response_out, status, vec![]);
+        }
+
+        // ... normal request handling
+    }
+}
+```
+
+If the health handler returns a non-`2xx` status or does not respond within 5 seconds, the module is excluded from that heartbeat. The routing rule is marked unhealthy by the manager and will not receive traffic until a subsequent heartbeat reports the module healthy again.
 
 #### Routing rules
 

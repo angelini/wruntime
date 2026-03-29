@@ -139,7 +139,7 @@ build-example: build-schemas
     (cd ecommerce-example/client && cargo component build --release --target wasm32-wasip2)
 
 # Run the full ecommerce example (requires Postgres — see `just db-start-example`)
-example: build-example build-release
+example: build-example build
     bash ecommerce-example/run.sh
 
 # ── Observability (LGTM stack) ────────────────────────────────────────────────

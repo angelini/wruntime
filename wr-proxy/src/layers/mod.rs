@@ -39,5 +39,7 @@ pub enum Destination {
 }
 
 /// Set by [`RoutingLayer`] on the request extensions; read by [`ForwardService`].
+/// Contains up to 3 candidates in round-robin order; [`ForwardService`] tries
+/// each in turn and retries on 429, upgrading to 503 if all are exhausted.
 #[derive(Clone)]
-pub struct ResolvedDestination(pub Destination);
+pub struct ResolvedDestination(pub Vec<Destination>);

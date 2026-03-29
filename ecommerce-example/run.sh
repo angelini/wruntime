@@ -31,23 +31,23 @@ update_db_url /tmp/inv2.toml
 
 # ── Start manager ──────────────────────────────────────────────────────────────
 echo "==> Starting manager on :9000"
-./target/release/wr-manager manager.toml &
+./target/debug/wr-manager manager.toml &
 MANAGER_PID=$!
 sleep 1
 
 # ── Start proxy ────────────────────────────────────────────────────────────────
 echo "==> Starting proxy on :9001"
-./target/release/wr-proxy proxy.toml &
+./target/debug/wr-proxy proxy.toml &
 PROXY_PID=$!
 sleep 1
 
 # ── Start inventory engines ────────────────────────────────────────────────────
 echo "==> Starting inventory engine 1 on :9100"
-./target/release/wr-engine /tmp/inv1.toml &
+./target/debug/wr-engine /tmp/inv1.toml &
 INV1_PID=$!
 
 echo "==> Starting inventory engine 2 on :9101"
-./target/release/wr-engine /tmp/inv2.toml &
+./target/debug/wr-engine /tmp/inv2.toml &
 INV2_PID=$!
 
 # Wait for inventory engines to register with the manager.
@@ -68,7 +68,7 @@ cargo run -p wr-cli -- invoke \
 
 # ── Start client engine ────────────────────────────────────────────────────────
 echo "==> Starting client engine on :9200 (3 concurrent clients)"
-./target/release/wr-engine ecommerce-example/engine-client.toml &
+./target/debug/wr-engine ecommerce-example/engine-client.toml &
 CLIENT_PID=$!
 
 echo ""

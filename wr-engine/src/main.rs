@@ -114,25 +114,43 @@ async fn main() -> Result<()> {
     {
         let mut hb_client = client.clone();
         let hb_id = engine_id.clone();
-        let hb_modules: Vec<ModuleDescriptor> = config
-            .modules
-            .iter()
-            .map(|m| ModuleDescriptor {
-                name: m.name.clone(),
-                namespace: m.namespace.clone(),
-                version: m.version.clone(),
-                proto_schema: vec![],
-            })
-            .collect();
+        let hb_registry = registry.clone();
+        let hb_module_configs = config.modules.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
+
+                // Health-check each module; only include passing ones in the heartbeat.
+                let mut healthy = Vec::new();
+                for m in &hb_module_configs {
+                    if let Some(tx) = hb_registry
+                        .next_sender(&m.namespace, &m.name, &m.version)
+                        .await
+                    {
+                        if engine::check_module_health(&tx).await {
+                            healthy.push(ModuleDescriptor {
+                                name: m.name.clone(),
+                                namespace: m.namespace.clone(),
+                                version: m.version.clone(),
+                                proto_schema: vec![],
+                            });
+                        } else {
+                            warn!(
+                                namespace = %m.namespace,
+                                module    = %m.name,
+                                version   = %m.version,
+                                "module failed health check",
+                            );
+                        }
+                    }
+                }
+
                 if let Err(e) = hb_client
                     .heartbeat(HeartbeatRequest {
                         engine_id: hb_id.clone(),
-                        healthy_modules: hb_modules.clone(),
+                        healthy_modules: healthy,
                     })
                     .await
                 {

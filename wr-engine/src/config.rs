@@ -55,6 +55,14 @@ pub struct ModuleConfig {
     /// writable directory at `/` for the duration of each store's lifetime.
     #[serde(default)]
     pub fs: Option<FsMode>,
+    /// Per-request timeout in seconds. Requests that exceed this are cancelled
+    /// and the caller receives a 504. Defaults to 30.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_request_timeout_secs() -> u64 {
+    30
 }
 
 impl EngineConfig {

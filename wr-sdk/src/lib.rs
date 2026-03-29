@@ -24,16 +24,33 @@ pub mod exports {
         /// handler module.
         pub trait ServiceGuest {
             fn handle(request: IncomingRequest, response_out: ResponseOutparam);
+
+            /// Called by the engine on each heartbeat to determine if this module
+            /// instance is healthy. Return `false` to mark the module unhealthy in
+            /// the routing table. The default implementation always returns `true`.
+            fn health_check() -> bool {
+                true
+            }
         }
 
         #[doc(hidden)]
         pub unsafe fn _export_handle_cabi<T: ServiceGuest>(arg0: i32, arg1: i32) {
+            use crate::bindings::wasi::http::types::Method;
+
             #[cfg(target_arch = "wasm32")]
             ::wit_bindgen_rt::run_ctors_once();
-            T::handle(
-                unsafe { IncomingRequest::from_handle(arg0 as u32) },
-                unsafe { ResponseOutparam::from_handle(arg1 as u32) },
-            );
+            let request = unsafe { IncomingRequest::from_handle(arg0 as u32) };
+            let response_out = unsafe { ResponseOutparam::from_handle(arg1 as u32) };
+
+            let is_health_check = matches!(request.method(), Method::Get)
+                && request.path_with_query().as_deref() == Some("/__health");
+
+            if is_health_check {
+                let status = if T::health_check() { 200 } else { 503 };
+                crate::io::send_response(response_out, status, vec![]);
+            } else {
+                T::handle(request, response_out);
+            }
         }
     }
 }

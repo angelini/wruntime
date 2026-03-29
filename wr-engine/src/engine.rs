@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use deadpool_postgres::Pool;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use std::collections::HashMap;
@@ -18,7 +19,7 @@ use wasmtime_wasi_http::{
     WasiHttpView,
 };
 
-use crate::registry::{InboundRequest, ModuleRegistry};
+use crate::registry::{InboundRequest, ModuleRegistry, ModuleTx};
 use wr_engine::config::{EngineConfig, ModuleConfig};
 use wr_engine::pool::module_schema;
 use wr_engine::state::ModuleState;
@@ -163,6 +164,7 @@ impl EngineRunner {
                     db_pool,
                     db_schema,
                     fs: module_config.fs.clone(),
+                    request_timeout: Duration::from_secs(module_config.request_timeout_secs),
                 };
                 tokio::spawn(http_handler_task(handler, module, rx));
             }
@@ -228,6 +230,7 @@ struct ModuleContext {
     db_pool: Option<Arc<Pool>>,
     db_schema: Option<String>,
     fs: Option<wr_engine::config::FsMode>,
+    request_timeout: Duration,
 }
 
 /// Task that owns the module's channel receiver and spawns a sub-task per
@@ -242,20 +245,49 @@ async fn http_handler_task(
         let module = module.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = dispatch_request(&handler, &module, inbound).await {
-                warn!(module = %module.name, error = %e, "inbound request error");
-            }
+            let InboundRequest {
+                request,
+                response_tx,
+            } = inbound;
+            let timeout = module.request_timeout;
+
+            let response =
+                match tokio::time::timeout(timeout, dispatch_request(&handler, &module, request))
+                    .await
+                {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(e)) => {
+                        warn!(module = %module.name, error = %e, "inbound request error");
+                        http::Response::builder()
+                            .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Bytes::from("internal error"))
+                            .unwrap()
+                    }
+                    Err(_elapsed) => {
+                        warn!(
+                            module = %module.name,
+                            timeout_secs = timeout.as_secs(),
+                            "request timed out"
+                        );
+                        http::Response::builder()
+                            .status(http::StatusCode::GATEWAY_TIMEOUT)
+                            .body(Bytes::from("request timed out"))
+                            .unwrap()
+                    }
+                };
+
+            let _ = response_tx.send(response);
         });
     }
 }
 
 /// Instantiate the component for one request and drive the WASI HTTP
-/// incoming-handler, returning the response through `inbound.response_tx`.
+/// incoming-handler, returning the response to the caller.
 async fn dispatch_request(
     handler: &HandlerContext,
     module: &ModuleContext,
-    inbound: InboundRequest,
-) -> Result<()> {
+    request: http::Request<Bytes>,
+) -> Result<http::Response<Bytes>> {
     let state = ModuleState::new(
         module.name.clone(),
         module.namespace.clone(),
@@ -268,7 +300,7 @@ async fn dispatch_request(
     let proxy = handler.pre.instantiate_async(&mut store).await?;
 
     // ── Build the incoming request resource ──────────────────────────────
-    let (req_parts, req_body) = inbound.request.into_parts();
+    let (req_parts, req_body) = request.into_parts();
 
     // Wrap the buffered Bytes as a HyperIncomingBody
     // (UnsyncBoxBody<Bytes, ErrorCode>).
@@ -305,7 +337,7 @@ async fn dispatch_request(
         .call_handle(&mut store, req_resource, out_resource)
         .await?;
 
-    // ── Collect the response and forward it to the inbound server ────────
+    // ── Collect and return the response ──────────────────────────────────
     match resp_rx.await {
         Ok(Ok(wasm_resp)) => {
             let (rp, rb) = wasm_resp.into_parts();
@@ -314,13 +346,39 @@ async fn dispatch_request(
                 .await
                 .map_err(|e| anyhow::anyhow!("collecting WASM response body: {e:?}"))?
                 .to_bytes();
-            let _ = inbound
-                .response_tx
-                .send(http::Response::from_parts(rp, bytes));
+            Ok(http::Response::from_parts(rp, bytes))
         }
         Ok(Err(e)) => anyhow::bail!("WASM handler returned ErrorCode: {e:?}"),
         Err(_) => anyhow::bail!("WASM handler dropped the response outparam"),
     }
+}
 
-    Ok(())
+/// Send `GET /__health` to a module instance and return whether it responds 2xx.
+/// Returns `false` on send failure, timeout, or a non-2xx status.
+pub async fn check_module_health(tx: &ModuleTx) -> bool {
+    let request = match http::Request::builder()
+        .method("GET")
+        .uri("http://localhost/__health")
+        .body(Bytes::new())
+    {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    if tx
+        .send(InboundRequest {
+            request,
+            response_tx: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
+        Ok(Ok(resp)) => resp.status().is_success(),
+        _ => false,
+    }
 }

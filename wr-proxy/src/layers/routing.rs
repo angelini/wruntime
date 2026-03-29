@@ -184,8 +184,9 @@ where
                 return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE, &msg));
             }
 
-            // Round-robin across candidates using a per-(namespace, module, version) counter
-            let destination = {
+            // Round-robin across candidates using a per-(namespace, module, version) counter.
+            // Rotate the slice so the chosen candidate is first, then take up to 3 for retry.
+            let ordered: Vec<Destination> = {
                 let mut map = counters.lock().unwrap();
                 let counter = map
                     .entry((
@@ -196,10 +197,15 @@ where
                     .or_insert(0);
                 let idx = *counter % candidates.len();
                 *counter = counter.wrapping_add(1);
-                candidates[idx].clone()
+                candidates[idx..]
+                    .iter()
+                    .chain(candidates[..idx].iter())
+                    .take(3)
+                    .cloned()
+                    .collect()
             };
 
-            let dest_addr = match &destination {
+            let first_addr = match &ordered[0] {
                 Destination::LocalEngine(a) => a.clone(),
                 Destination::RemoteProxy(a) => a.clone(),
             };
@@ -219,10 +225,9 @@ where
                 req.headers_mut().insert("x-wr-version", v);
             }
             span.record("wr.version", &resolved_version);
-            span.record("wr.engine", &dest_addr);
+            span.record("wr.engine", &first_addr);
 
-            req.extensions_mut()
-                .insert(ResolvedDestination(destination));
+            req.extensions_mut().insert(ResolvedDestination(ordered));
             inner.call(req).instrument(span).await
         })
     }

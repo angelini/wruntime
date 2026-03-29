@@ -128,8 +128,15 @@ async fn handle(
         response_tx: resp_tx,
     };
 
-    if sender.send(inbound).await.is_err() {
-        return err(StatusCode::SERVICE_UNAVAILABLE, "module channel closed");
+    use tokio::sync::mpsc::error::TrySendError;
+    match sender.try_send(inbound) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            return err(StatusCode::TOO_MANY_REQUESTS, "engine at capacity");
+        }
+        Err(TrySendError::Closed(_)) => {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "module channel closed");
+        }
     }
 
     match resp_rx.await {
