@@ -21,9 +21,9 @@ cargo test -p wr-tests
 cargo check
 
 # Run individual services
-cargo run -p wr-manager -- --config manager.toml
-cargo run -p wr-proxy   -- --config proxy.toml
-cargo run -p wr-engine  -- --config engine.toml
+cargo run -p wr-manager -- --config examples/config/manager.toml
+cargo run -p wr-proxy   -- --config examples/config/proxy.toml
+cargo run -p wr-engine  -- --config examples/config/engine.toml
 
 # CLI management tool
 cargo run -p wr-cli -- --manager http://127.0.0.1:9000 engines list
@@ -76,16 +76,20 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 
 ### Configuration
 
-Each service reads a TOML config file. Examples: `manager.toml`, `proxy.toml`, `engine.toml` in the repo root. Modules and their optional `.binpb` schemas are declared under `[[module]]` in `engine.toml`.
+Each service reads a TOML config file. Examples in `examples/config/` (`manager.toml`, `proxy.toml`, `engine.toml`). Modules and their optional `.binpb` schemas are declared under `[[module]]` in `engine.toml`.
 
 ### Integration Tests
 
 `wr-tests/tests/integration_test.rs` spins up all three services in-process on ephemeral ports. Helpers in `tests/helpers.rs` provide `start_manager()`, `start_proxy()`, `stub_engine()`, and schema/payload builders. Tests cover: manager RPC operations, proxy routing (including round-robin across multiple engines), schema validation, pass-through when no schema is cached, and TOML config parsing.
 
-### Ecommerce Example
+### Examples
 
-`ecommerce-example/` contains two WASM components (separate Cargo workspaces, excluded from the main workspace):
+`examples/ecommerce/` contains two WASM components (separate Cargo workspaces, excluded from the main workspace):
 - **inventory** — PostgreSQL-backed service (seed, stock check, buy, return)
 - **client** — drives 100 buy/return transactions against inventory via `http://ecommerce.inventory/...`
 
 Multiple engine configs (`engine-inventory-1.toml`, `engine-inventory-2.toml`, `engine-client.toml`) demonstrate running several engine instances with load-balanced routing.
+
+`examples/multi-node/` contains `node-a/` and `node-b/` config directories for multi-node deployments.
+
+`examples/config/` contains the base service configs (`manager.toml`, `proxy.toml`, `engine.toml`).

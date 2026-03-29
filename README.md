@@ -9,7 +9,7 @@ A distributed WASM module networking runtime. WASM modules running inside **wr-e
 A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. Nodes are independent — each proxy handles its own inbound traffic and forwards cross-node requests directly to the peer proxy, which then routes locally to its engines.
 
 ```
-                         ┌───────────────────────┐
+                         ┌────────────────────────┐
                          │      wr-manager        │
                          │                        │
                          │  Engine registry       │
@@ -84,15 +84,15 @@ wr-proxy A  (Node A)
   │  5. ForwardService     — strips x-wr-destination / x-wr-source, injects
   │                          traceparent, then:
   │
-  ├── destination is on Node A (LocalEngine) ─────────────────────────────────┐
-  │     strips x-wr-destination / x-wr-source / x-wr-via-proxy                │
+  ├── destination is on Node A (LocalEngine) ──────────────────────────────────┐
+  │     strips x-wr-destination / x-wr-source / x-wr-via-proxy                 │
   │     forwards directly to wr-engine A                                       │
   │                                                                            ▼
   │                                                                    wr-engine A
   │
   └── destination is on Node B (RemoteProxy) ──────────────────────────────────┐
-        sets x-wr-via-proxy: 1                                                  │
-        forwards to wr-proxy B                                                  │
+        sets x-wr-via-proxy: 1                                                 │
+        forwards to wr-proxy B                                                 │
                                                                                ▼
                                                                wr-proxy B  (Node B)
                                                                  SchemaValidation skipped
@@ -313,14 +313,14 @@ To deploy a **new version** alongside the old one, register a new engine with `v
 Node B config files follow the same structure — just use different ports and a matching `proxy_address`:
 
 ```toml
-# node-b/proxy.toml
+# examples/multi-node/node-b/proxy.toml
 listen_address  = "0.0.0.0:9002"
 manager_address = "http://127.0.0.1:9000"
 
 [node]
 proxy_address = "http://node-b-host:9002"
 
-# node-b/engine.toml
+# examples/multi-node/node-b/engine.toml
 listen_address  = "0.0.0.0:9200"
 manager_address = "http://127.0.0.1:9000"
 
@@ -800,10 +800,8 @@ wruntime/
 ├── wr-sdk/                 # WASM module SDK: http_rpc, io, log, export macros
 ├── wr-build/               # build.rs helper: WrClientGenerator for typed gRPC clients
 ├── wr-tests/               # integration tests
-├── ecommerce-example/      # example: inventory (handler) + client (runner) modules
-├── node-a/                 # example multi-node: Node A configs (proxy :9001, engines :9100/:9101)
-├── node-b/                 # example multi-node: Node B configs (proxy :9002, engine :9200)
-├── manager.toml            # example manager config
-├── proxy.toml              # example single-node proxy config
-└── engine.toml             # example single-node engine config
+├── examples/
+│   ├── config/             # example single-node configs (manager, proxy, engine)
+│   ├── ecommerce/          # example: inventory (handler) + client (runner) modules
+│   └── multi-node/         # example multi-node: node-a (proxy :9001, engines :9100/:9101), node-b (proxy :9002, engine :9200)
 ```

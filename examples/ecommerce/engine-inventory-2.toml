@@ -1,4 +1,4 @@
-listen_address  = "0.0.0.0:9100"
+listen_address  = "0.0.0.0:9101"
 manager_address = "http://127.0.0.1:9000"
 
 [node]
@@ -12,6 +12,6 @@ max_connections = 8
 name        = "inventory"
 namespace   = "ecommerce"
 version     = "1.0.0"
-wasm_path   = "ecommerce-example/inventory/target/wasm32-wasip2/release/inventory.wasm"
-schema_path = "ecommerce-example/schemas/inventory.binpb"
+wasm_path   = "examples/ecommerce/inventory/target/wasm32-wasip2/release/inventory.wasm"
+schema_path = "examples/ecommerce/schemas/inventory.binpb"
 database    = true

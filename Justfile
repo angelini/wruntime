@@ -49,49 +49,49 @@ test-one name:
 
 # Run wr-manager
 manager:
-    cargo run -p wr-manager -- --config manager.toml
+    cargo run -p wr-manager -- --config examples/config/manager.toml
 
 # Run wr-proxy
 proxy:
-    cargo run -p wr-proxy -- --config proxy.toml
+    cargo run -p wr-proxy -- --config examples/config/proxy.toml
 
 # Run wr-engine
 engine:
-    cargo run -p wr-engine -- --config engine.toml
+    cargo run -p wr-engine -- --config examples/config/engine.toml
 
 # Run wr-manager (release build)
 manager-release:
-    cargo run --release -p wr-manager -- --config manager.toml
+    cargo run --release -p wr-manager -- --config examples/config/manager.toml
 
 # Run wr-proxy (release build)
 proxy-release:
-    cargo run --release -p wr-proxy -- --config proxy.toml
+    cargo run --release -p wr-proxy -- --config examples/config/proxy.toml
 
 # Run wr-engine (release build)
 engine-release:
-    cargo run --release -p wr-engine -- --config engine.toml
+    cargo run --release -p wr-engine -- --config examples/config/engine.toml
 
 # ── Multi-node local development ──────────────────────────────────────────────
 
 # Start node A proxy (listens :9001, proxy_address = "http://127.0.0.1:9001")
 node-a-proxy:
-    cargo run -p wr-proxy -- --config node-a/proxy.toml
+    cargo run -p wr-proxy -- --config examples/multi-node/node-a/proxy.toml
 
 # Start node A engine 1 (listens :9100)
 node-a-engine-1:
-    cargo run -p wr-engine -- --config node-a/engine-1.toml
+    cargo run -p wr-engine -- --config examples/multi-node/node-a/engine-1.toml
 
 # Start node A engine 2 (listens :9101)
 node-a-engine-2:
-    cargo run -p wr-engine -- --config node-a/engine-2.toml
+    cargo run -p wr-engine -- --config examples/multi-node/node-a/engine-2.toml
 
 # Start node B proxy (listens :9002, proxy_address = "http://127.0.0.1:9002")
 node-b-proxy:
-    cargo run -p wr-proxy -- --config node-b/proxy.toml
+    cargo run -p wr-proxy -- --config examples/multi-node/node-b/proxy.toml
 
 # Start node B engine 1 (listens :9200)
 node-b-engine-1:
-    cargo run -p wr-engine -- --config node-b/engine-1.toml
+    cargo run -p wr-engine -- --config examples/multi-node/node-b/engine-1.toml
 
 # ── Database (test) ───────────────────────────────────────────────────────────
 
@@ -126,21 +126,21 @@ db-status:
 
 # Compile ecommerce protobuf schemas to FileDescriptorSet binaries (.binpb)
 build-schemas:
-    protoc --descriptor_set_out=ecommerce-example/schemas/inventory.binpb \
+    protoc --descriptor_set_out=examples/ecommerce/schemas/inventory.binpb \
            --include_imports \
-           ecommerce-example/schemas/inventory.proto
-    protoc --descriptor_set_out=ecommerce-example/schemas/client.binpb \
+           examples/ecommerce/schemas/inventory.proto
+    protoc --descriptor_set_out=examples/ecommerce/schemas/client.binpb \
            --include_imports \
-           ecommerce-example/schemas/client.proto
+           examples/ecommerce/schemas/client.proto
 
 # Build WASM components and schemas for the ecommerce example
 build-example: build-schemas
-    (cd ecommerce-example/inventory && cargo component build --release --target wasm32-wasip2)
-    (cd ecommerce-example/client && cargo component build --release --target wasm32-wasip2)
+    (cd examples/ecommerce/inventory && cargo component build --release --target wasm32-wasip2)
+    (cd examples/ecommerce/client && cargo component build --release --target wasm32-wasip2)
 
 # Run the full ecommerce example (requires Postgres — see `just db-start-example`)
 example: build-example build
-    bash ecommerce-example/run.sh
+    bash examples/ecommerce/run.sh
 
 # ── Observability (LGTM stack) ────────────────────────────────────────────────
 

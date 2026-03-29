@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Run from the repo root: bash ecommerce-example/run.sh
+# Run from the repo root: bash examples/ecommerce/run.sh
 # Prerequisites: cargo, cargo-component, rustup target add wasm32-wasip2,
 #                Postgres running with an 'ecommerce' database. `just db-start-example`
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 DB_URL="${DB_URL:-${WRUNTIME_EXAMPLE_DB_URL:-postgres://localhost:5432/wruntime_example}}"
@@ -24,20 +24,20 @@ update_db_url() {
 }
 
 # ── Apply DB URL to engine configs ────────────────────────────────────────────
-cp ecommerce-example/engine-inventory-1.toml /tmp/inv1.toml
-cp ecommerce-example/engine-inventory-2.toml /tmp/inv2.toml
+cp examples/ecommerce/engine-inventory-1.toml /tmp/inv1.toml
+cp examples/ecommerce/engine-inventory-2.toml /tmp/inv2.toml
 update_db_url /tmp/inv1.toml
 update_db_url /tmp/inv2.toml
 
 # ── Start manager ──────────────────────────────────────────────────────────────
 echo "==> Starting manager on :9000"
-./target/debug/wr-manager manager.toml &
+./target/debug/wr-manager examples/config/manager.toml &
 MANAGER_PID=$!
 sleep 1
 
 # ── Start proxy ────────────────────────────────────────────────────────────────
 echo "==> Starting proxy on :9001"
-./target/debug/wr-proxy proxy.toml &
+./target/debug/wr-proxy examples/config/proxy.toml &
 PROXY_PID=$!
 sleep 1
 
@@ -68,7 +68,7 @@ cargo run -p wr-cli -- invoke \
 
 # ── Start client engine ────────────────────────────────────────────────────────
 echo "==> Starting client engine on :9200 (3 concurrent clients)"
-./target/debug/wr-engine ecommerce-example/engine-client.toml &
+./target/debug/wr-engine examples/ecommerce/engine-client.toml &
 CLIENT_PID=$!
 
 echo ""
