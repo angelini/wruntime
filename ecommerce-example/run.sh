@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Run from the repo root: bash ecommerce-example/run.sh
 # Prerequisites: cargo, cargo-component, rustup target add wasm32-wasip2,
-#                Postgres running with an 'ecommerce' database.
+#                Postgres running with an 'ecommerce' database. `just db-start-example`
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-DB_URL="${DB_URL:-${WRUNTIME_TEST_DB_URL:-postgres://user:pass@localhost:5432/ecommerce}}"
+DB_URL="${DB_URL:-${WRUNTIME_EXAMPLE_DB_URL:-postgres://localhost:5432/wruntime_example}}"
+echo "DB_URL: ${DB_URL}"
 
 # Substitute the DB URL into the engine configs if DB_URL is set.
 update_db_url() {

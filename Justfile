@@ -24,10 +24,6 @@ check:
 fmt:
     cargo fmt --all
 
-# Check formatting without modifying files
-fmt-check:
-    cargo fmt --all -- --check
-
 # Run Clippy lints across the workspace
 lint:
     cargo clippy --all-targets --all-features -- -D warnings
@@ -79,8 +75,7 @@ engine-release:
 
 pg_data := ".pg-test-data"
 pg_port := "5433"
-db_name := "wruntime_test"
-db_url  := "postgres://postgres@localhost:" + pg_port + "/" + db_name
+db_url  := "postgres://postgres@localhost:" + pg_port
 
 # Initialise a local Postgres data directory — run once before db-start
 db-init:
@@ -88,30 +83,23 @@ db-init:
     echo "port = {{pg_port}}" >> {{pg_data}}/postgresql.conf
     @echo "Initialised — run 'just db-start' to start"
 
-# Start the local Postgres instance
-db-start:
+# Start the local Postgres instance and create the test DB
+db-start-tests:
     pg_ctl -D {{pg_data}} -l {{pg_data}}/postgres.log start
     @until pg_isready -p {{pg_port}} -U postgres -q; do sleep 0.5; done
-    createdb -p {{pg_port}} -U postgres {{db_name}} 2>/dev/null || true
-    @echo "Ready — WRUNTIME_TEST_DB_URL={{db_url}}"
+    createdb -p {{pg_port}} -U postgres wruntime_test 2>/dev/null || true
+    @echo "Ready — WRUNTIME_TEST_DB_URL={{db_url}}/wruntime_test"
+
+# Start the local Postgres instance and create the example DB
+db-start-example:
+    pg_ctl -D {{pg_data}} -l {{pg_data}}/postgres.log start
+    @until pg_isready -p {{pg_port}} -U postgres -q; do sleep 0.5; done
+    createdb -p {{pg_port}} -U postgres wruntime_example 2>/dev/null || true
+    @echo "Ready — WRUNTIME_EXAMPLE_DB_URL={{db_url}}/wruntime_example"
 
 # Stop the local Postgres instance
 db-stop:
     pg_ctl -D {{pg_data}} stop
-
-# Run integration tests with a temporary local Postgres instance (init + start + test + stop)
-test-db:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ ! -d "{{pg_data}}" ]; then
-        initdb -D {{pg_data}} --auth=trust --username=postgres
-        echo "port = {{pg_port}}" >> {{pg_data}}/postgresql.conf
-    fi
-    pg_ctl -D {{pg_data}} -l {{pg_data}}/postgres.log start
-    trap 'pg_ctl -D {{pg_data}} stop -m fast' EXIT
-    until pg_isready -p {{pg_port}} -U postgres -q; do sleep 0.5; done
-    createdb -p {{pg_port}} -U postgres {{db_name}} 2>/dev/null || true
-    WRUNTIME_TEST_DB_URL="{{db_url}}" cargo test -p wr-tests
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 
