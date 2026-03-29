@@ -61,6 +61,7 @@ where
             if req.headers().contains_key("x-wr-via-proxy") {
                 return inner.call(req).await;
             }
+            let mut req = req;
 
             // Parse x-wr-destination to get module name and RPC path.
             let destination = req
@@ -91,19 +92,50 @@ where
                     .unwrap_or("")
                     .to_string();
 
-                match cache
-                    .validate(&namespace, &module, &path, req.body().as_ref())
-                    .await
-                {
-                    ValidationOutcome::Pass => {}
-                    ValidationOutcome::Fail(detail) => {
-                        return Ok(validation_error(&detail, &source, &module));
+                let content_type = req
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+
+                if content_type.starts_with("application/json") {
+                    match cache
+                        .transcode_json(&namespace, &module, &path, req.body().as_ref())
+                        .await
+                    {
+                        Ok(proto_bytes) => {
+                            let (mut parts, _) = req.into_parts();
+                            parts.headers.remove(http::header::CONTENT_TYPE);
+                            parts.headers.remove(http::header::CONTENT_LENGTH);
+                            req = http::Request::from_parts(parts, bytes::Bytes::from(proto_bytes));
+                        }
+                        Err(ValidationOutcome::SchemaNotCached) => {
+                            return Ok(schema_not_cached_error(&module, &namespace));
+                        }
+                        Err(ValidationOutcome::MethodNotFound(detail)) => {
+                            return Ok(method_not_found_error(&detail, &source, &module));
+                        }
+                        Err(ValidationOutcome::Fail(detail)) => {
+                            return Ok(validation_error(&detail, &source, &module));
+                        }
+                        Err(ValidationOutcome::Pass) => unreachable!(),
                     }
-                    ValidationOutcome::SchemaNotCached => {
-                        return Ok(schema_not_cached_error(&module, &namespace));
-                    }
-                    ValidationOutcome::MethodNotFound(detail) => {
-                        return Ok(method_not_found_error(&detail, &source, &module));
+                } else {
+                    match cache
+                        .validate(&namespace, &module, &path, req.body().as_ref())
+                        .await
+                    {
+                        ValidationOutcome::Pass => {}
+                        ValidationOutcome::Fail(detail) => {
+                            return Ok(validation_error(&detail, &source, &module));
+                        }
+                        ValidationOutcome::SchemaNotCached => {
+                            return Ok(schema_not_cached_error(&module, &namespace));
+                        }
+                        ValidationOutcome::MethodNotFound(detail) => {
+                            return Ok(method_not_found_error(&detail, &source, &module));
+                        }
                     }
                 }
             }

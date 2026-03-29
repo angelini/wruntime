@@ -57,19 +57,19 @@ A **node** groups one `wr-proxy` with one or more `wr-engine` instances behind a
 ### Request flow
 
 ```
-WASM module makes HTTP call to "http://inventory-service.ecommerce/items"
+WASM module makes HTTP call to "http://ecommerce.inventory/GetItems"
   │
   ▼  [WasiHttpView::send_request intercepts — transparent to the module]
   │  Adds headers:
-  │    x-wr-source:      "order-service.ecommerce"
-  │    x-wr-destination: "http://inventory-service.ecommerce/items"
+  │    x-wr-source:      "order-service"
+  │    x-wr-destination: "http://ecommerce.inventory/GetItems"
   │  Rewrites URI to the local wr-proxy (Node A)
   │
   ▼
 wr-proxy A  (Node A)
   │  1. TracingLayer       — opens an OTel span; injects W3C traceparent header
   │  2. MetricsLayer       — records start time
-  │  3. SchemaValidation   — enforces gRPC path format; decodes body with
+  │  3. SchemaValidation   — validates path is a known RPC method; decodes body with
   │                          prost-reflect against the module's FileDescriptorSet;
   │                          returns 404 if path is not a known RPC,
   │                          503 if schema not yet synced,
@@ -108,6 +108,45 @@ wr-engine (destination)
   │
   ▼
 inventory-service WASM module handles the request
+```
+
+---
+
+## Request headers (`x-wr-*`)
+
+All internal routing uses a set of reserved `x-wr-*` HTTP headers. The proxy strips every `x-wr-*` header from externally-originated requests (public routes) to prevent spoofing.
+
+| Header | Set by | Read by | Description |
+|--------|--------|---------|-------------|
+| `x-wr-destination` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (public routes) | `wr-proxy` RoutingLayer, SchemaValidationLayer, MetricsLayer, TracingLayer | Full destination URI of the original call — e.g. `http://ecommerce.inventory/GetItems`. The host encodes the destination as `{namespace}.{module}`; the path is the RPC method name. Stripped by ForwardService before reaching the destination engine. |
+| `x-wr-source` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (set to `"external"` for public routes) | `wr-proxy` SchemaValidationLayer, MetricsLayer, TracingLayer | Name of the calling module. Used for metrics attribution and error reporting. Stripped by ForwardService before reaching the destination engine. |
+| `x-wr-source-ns` | `wr-engine` (outbound WASM call) | — | Namespace of the calling module. Carried alongside `x-wr-source` for attribution; not used for routing decisions. Stripped by ForwardService before reaching the destination engine. |
+| `x-wr-version` | Caller (optional — WASM module or `wr-cli`) | `wr-proxy` RoutingLayer | Pins the request to a specific semver of the destination module (e.g. `1.2.0`). When omitted the proxy routes to the highest healthy semver. RoutingLayer overwrites the value with the resolved version before forwarding. |
+| `x-wr-module` | `wr-proxy` RoutingLayer | `wr-engine` inbound server | Resolved destination module name. The engine uses this (together with `x-wr-namespace` and `x-wr-version`) to select the correct WASM instance. |
+| `x-wr-namespace` | `wr-proxy` RoutingLayer | `wr-engine` inbound server | Resolved destination module namespace. |
+| `x-wr-via-proxy` | `wr-proxy` ForwardService (cross-node hop) | `wr-proxy` SchemaValidationLayer | Set to `1` when forwarding to a peer proxy on another node. The receiving proxy's SchemaValidationLayer skips re-validation on requests that carry this header, since validation was already performed at the originating node. Stripped by ForwardService on the local-engine path. |
+
+### Header lifecycle per request
+
+```
+WASM module calls http://ecommerce.inventory/inventory.InventoryService/GetItems
+  │
+  │  WasiHttpView (wr-engine) sets:
+  │    x-wr-destination: http://ecommerce.inventory/inventory.InventoryService/GetItems
+  │    x-wr-source:      order-service
+  │    x-wr-source-ns:   ecommerce
+  │
+  ▼ wr-proxy (same node)
+  │  RoutingLayer injects:
+  │    x-wr-module:    inventory
+  │    x-wr-namespace: ecommerce
+  │    x-wr-version:   1.2.0          ← resolved (or forwarded from caller)
+  │
+  ├─ local engine ──► ForwardService strips x-wr-destination, x-wr-source,
+  │                   x-wr-source-ns, x-wr-via-proxy before sending to wr-engine
+  │
+  └─ peer proxy   ──► ForwardService sets x-wr-via-proxy: 1; preserves
+                      x-wr-destination for peer RoutingLayer to resolve
 ```
 
 ---
@@ -406,7 +445,7 @@ Each `RequestMetrics` entry records: source module, destination module, duration
 
 Every module **must** declare a protobuf schema. The proxy enforces two rules on every inter-module request:
 
-1. **Path must be a gRPC method** — the path must have the form `/package.ServiceName/MethodName` and must match a method declared in the module's schema. Any other path returns `404`.
+1. **Path must be a known RPC method** — the path must be `/MethodName` (e.g. `/GetItems`) and must match a method declared in the module's schema. Any other path returns `404`.
 2. **Body must decode as the method's input message** — the raw request body is decoded with `prost-reflect` against the `FileDescriptorSet`. A body that fails decoding returns `400`.
 
 Schemas are compiled `FileDescriptorSet` binaries produced by `protoc`.
@@ -444,11 +483,11 @@ The resulting `.binpb` file is the value of `schema_path` in `engine.toml`.
 
 ### How validation works
 
-When the proxy receives a request with `x-wr-destination: http://inventory-service/inventory.InventoryService/GetItems` it:
+When the proxy receives a request with `x-wr-destination: http://ecommerce.inventory/GetItems` it:
 
-1. Parses the host (`inventory-service`) as the module name.
+1. Parses the host (`ecommerce.inventory`) as the `namespace.module`.
 2. Looks up the `DescriptorPool` for that module.
-3. Resolves the input message type for the RPC path (`/inventory.InventoryService/GetItems`).
+3. Resolves the input message type for the RPC path (`/GetItems`).
 4. Decodes the raw request body as that message type using `prost-reflect`.
 
 The proxy returns an error and stops the request at each stage of failure:
@@ -456,7 +495,7 @@ The proxy returns an error and stops the request at each stage of failure:
 | Condition | Status | `"error"` field |
 |---|---|---|
 | Schema not yet synced from manager | `503` | `"schema_not_cached"` |
-| Path not in `/package.Service/Method` format, or method not in schema | `404` | `"method_not_found"` |
+| Path `/MethodName` not found in module's schema | `404` | `"method_not_found"` |
 | Body fails protobuf decoding | `400` | `"schema_validation_failed"` |
 
 Example `404` response for an unrecognised path:
@@ -464,7 +503,7 @@ Example `404` response for an unrecognised path:
 ```json
 {
   "error":       "method_not_found",
-  "detail":      "path '/items' does not match any RPC in the schema for ecommerce.inventory — all inter-service calls must use gRPC paths (/package.Service/Method)",
+  "detail":      "path '/items' does not match any RPC in the schema for ecommerce.inventory — use /MethodName (e.g. /GetItems)",
   "source":      "order-service",
   "destination": "inventory-service"
 }
@@ -775,7 +814,7 @@ The `wr-tests` crate contains integration tests that spin up in-process instance
 
 - Manager RPC coverage (register, deregister, heartbeat, routing rules, metrics)
 - Proxy routing end-to-end with a stub engine
-- Schema validation: invalid protobuf bodies rejected with `400`; non-gRPC paths rejected with `404`; missing schema returns `503`
+- Schema validation: invalid protobuf bodies rejected with `400`; unknown method paths rejected with `404`; missing schema returns `503`
 - All three example TOML files parse without error
 - Version routing: `x-wr-version` header routes to the correct instance; no header routes to the highest semver
 - Returns 503 when the requested version has no healthy instance

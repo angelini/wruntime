@@ -76,6 +76,7 @@ where
             for name in &[
                 "x-wr-destination",
                 "x-wr-source",
+                "x-wr-source-ns",
                 "x-wr-module",
                 "x-wr-namespace",
                 "x-wr-version",

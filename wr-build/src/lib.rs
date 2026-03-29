@@ -23,9 +23,8 @@
 /// }
 /// ```
 ///
-/// The RPC path is derived at runtime from the authority (e.g. `ecommerce.inventory`),
-/// producing paths like `/ecommerce.inventory/Seed`.  This keeps the path prefix
-/// consistent with the HTTP hostname used for inter-module addressing.
+/// The RPC path is derived from the proto method name, producing paths like `/Seed`.
+/// The authority (e.g. `ecommerce.inventory`) is used only as the HTTP host.
 pub struct WrClientGenerator;
 
 impl prost_build::ServiceGenerator for WrClientGenerator {
@@ -56,7 +55,7 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
             // Path is /{authority}/{MethodName} — e.g. /ecommerce.inventory/Seed.
             // This mirrors the HTTP hostname format so both use the same namespace.module identifier.
             buf.push_str(&format!(
-                "        let path = format!(\"/{{}}/{{}}\", self.authority, \"{proto_name}\");\n"
+                "        let path = format!(\"/{{}}/{proto_name}\", self.authority);\n"
             ));
             buf.push_str(
                 "        let (status, resp_bytes) = wr_sdk::http::http_rpc(&self.authority, &path, &body)?;\n",

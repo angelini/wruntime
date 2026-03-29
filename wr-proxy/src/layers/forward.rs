@@ -66,9 +66,11 @@ impl Service<Request<Bytes>> for ForwardService {
                 let forward_addr = match destination {
                     Destination::LocalEngine(addr) => {
                         // Strip internal routing headers — engine doesn't need them.
-                        // (x-wr-module is kept so the engine can dispatch correctly)
+                        // (x-wr-module, x-wr-namespace, x-wr-version are kept so the
+                        //  engine can dispatch to the correct WASM instance)
                         headers.remove("x-wr-destination");
                         headers.remove("x-wr-source");
+                        headers.remove("x-wr-source-ns");
                         headers.remove("x-wr-via-proxy");
                         addr.clone()
                     }

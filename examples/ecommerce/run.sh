@@ -61,7 +61,7 @@ cargo run -p wr-cli -- services list
 echo "==> Seeding inventory..."
 cargo run -p wr-cli -- invoke \
     --proxy http://127.0.0.1:9001 \
-    --destination http://inventory.ecommerce/ecommerce.InventoryService/Seed \
+    --destination http://ecommerce.inventory/Seed \
     --source bootstrap \
     --source-ns ecommerce \
     --body '' || echo " (seed may already exist)"

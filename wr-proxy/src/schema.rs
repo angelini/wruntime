@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 
+use prost::Message as _;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use tracing::{info, warn};
 
@@ -96,6 +97,41 @@ impl SchemaCache {
         }
     }
 
+    /// Transcode a JSON `body` to protobuf using the schema for `(namespace, module, path)`.
+    ///
+    /// Returns the protobuf-encoded bytes on success, or a [`ValidationOutcome`] describing
+    /// the failure (one of `SchemaNotCached`, `MethodNotFound`, or `Fail`).
+    pub async fn transcode_json(
+        &self,
+        namespace: &str,
+        module: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, ValidationOutcome> {
+        let pools = self.pools.read().await;
+        let Some(pool) = pools.get(&(namespace.to_string(), module.to_string())) else {
+            return Err(ValidationOutcome::SchemaNotCached);
+        };
+        let Some(message_desc) = resolve_input_message(pool, path) else {
+            return Err(ValidationOutcome::MethodNotFound(format!(
+                "path '{path}' does not match any RPC in the schema for \
+                 {namespace}.{module} — use /MethodName (e.g. /Run)"
+            )));
+        };
+        // An empty body is equivalent to `{}` — an empty proto3 message encodes
+        // to zero bytes, so skip JSON parsing and return the empty encoding directly.
+        if body.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut de = serde_json::Deserializer::from_slice(body);
+        match DynamicMessage::deserialize(message_desc, &mut de) {
+            Ok(msg) => Ok(msg.encode_to_vec()),
+            Err(e) => Err(ValidationOutcome::Fail(format!(
+                "JSON body failed schema validation for {namespace}.{module}{path}: {e}"
+            ))),
+        }
+    }
+
     /// Validate `body` against the protobuf schema registered for `(namespace, module)`.
     ///
     /// - Returns [`ValidationOutcome::Pass`] when the body is empty or when
@@ -122,8 +158,7 @@ impl SchemaCache {
         let Some(message_desc) = resolve_input_message(pool, path) else {
             return ValidationOutcome::MethodNotFound(format!(
                 "path '{path}' does not match any RPC in the schema for \
-                 {namespace}.{module} — all inter-service calls must use \
-                 paths of the form /{namespace}.{module}/MethodName"
+                 {namespace}.{module} — use /MethodName (e.g. /Run)"
             ));
         };
 
@@ -218,12 +253,15 @@ pub async fn sync_schemas(
     }
 }
 
-/// Parse a path (`/{namespace}.{module}/MethodName`) and return the input
-/// `MessageDescriptor` for that RPC by searching all services in the pool for
-/// a method whose name matches the final path segment.
+/// Parse a path (`/MethodName`) and return the input `MessageDescriptor` for
+/// that RPC by searching all services in the pool for a method whose name
+/// matches the final path segment.
 fn resolve_input_message(pool: &DescriptorPool, path: &str) -> Option<MessageDescriptor> {
-    let path = path.trim_start_matches('/');
-    let (_, method_name) = path.split_once('/')?;
+    let method_name = path
+        .trim_start_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())?;
     pool.services()
         .find_map(|s| s.methods().find(|m| m.name() == method_name))
         .map(|m| m.input())

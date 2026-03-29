@@ -251,11 +251,8 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
     // 3. Invalid body → 400 with structured JSON error.
     let bad_req = Request::builder()
         .method("POST")
-        .uri(format!("http://{proxy_addr}/test.PingService/Ping"))
-        .header(
-            "x-wr-destination",
-            "http://svc-ns.ping-service/test.PingService/Ping",
-        )
+        .uri(format!("http://{proxy_addr}/Ping"))
+        .header("x-wr-destination", "http://svc-ns.ping-service/Ping")
         .header("x-wr-source", "caller-service")
         .body(Full::new(invalid_protobuf()))?;
 
@@ -295,11 +292,8 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
     //    with 503 since no engine is registered, not 400).
     let good_req = Request::builder()
         .method("POST")
-        .uri(format!("http://{proxy_addr}/test.PingService/Ping"))
-        .header(
-            "x-wr-destination",
-            "http://svc-ns.ping-service/test.PingService/Ping",
-        )
+        .uri(format!("http://{proxy_addr}/Ping"))
+        .header("x-wr-destination", "http://svc-ns.ping-service/Ping")
         .header("x-wr-source", "caller-service")
         .body(Full::new(valid_ping_request()))?;
 
@@ -310,6 +304,75 @@ async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
         "valid body should not fail schema validation"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_schema_validation_accepts_json_body() -> Result<()> {
+    // Verify that the proxy transcodes an `application/json` body to protobuf
+    // before schema validation, so callers like `wr-cli invoke` can pass
+    // stringified JSON instead of binary-encoded protobuf.
+
+    let mgr_addr = start_manager().await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "json-engine",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "json-ns",
+            name: "ping-service",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+    let proxy_addr = start_proxy_synced(&mgr_addr, table).await?;
+
+    let client = http_client();
+
+    // Valid JSON matching PingRequest { message: string } — should pass.
+    let json_req = Request::builder()
+        .method("POST")
+        .uri(format!("http://{proxy_addr}/Ping"))
+        .header("content-type", "application/json")
+        .header("x-wr-destination", "http://json-ns.ping-service/Ping")
+        .header("x-wr-source", "wr-cli")
+        .body(Full::new(bytes::Bytes::from(r#"{"message":"hello"}"#)))?;
+
+    let resp = client.request(json_req).await?;
+    assert_ne!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "valid JSON body should pass schema validation"
+    );
+
+    // Invalid JSON — should be rejected with 400.
+    let bad_json_req = Request::builder()
+        .method("POST")
+        .uri(format!("http://{proxy_addr}/Ping"))
+        .header("content-type", "application/json")
+        .header("x-wr-destination", "http://json-ns.ping-service/Ping")
+        .header("x-wr-source", "wr-cli")
+        .body(Full::new(bytes::Bytes::from(r#"not json"#)))?;
+
+    let bad_resp = client.request(bad_json_req).await?;
+    assert_eq!(
+        bad_resp.status(),
+        StatusCode::BAD_REQUEST,
+        "invalid JSON body should be rejected"
+    );
+
+    let _ = engine_shutdown.send(());
     Ok(())
 }
 
