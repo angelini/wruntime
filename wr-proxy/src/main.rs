@@ -1,3 +1,4 @@
+mod circuit_breaker;
 mod config;
 mod layers;
 mod metrics;
@@ -10,8 +11,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
-use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
+use hyper::server::conn::http2;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower::{Service, ServiceBuilder};
@@ -35,6 +36,9 @@ async fn main() -> Result<()> {
     let routing_table = routing::new_routing_table();
     let schema_cache = Arc::new(schema::SchemaCache::new());
     let (metrics_tx, metrics_rx) = mpsc::channel(config.metrics.queue_depth);
+    let cb_registry = Arc::new(circuit_breaker::CircuitBreakerRegistry::new(
+        config.circuit_breaker.clone(),
+    ));
 
     // ── Connect to wr-manager ─────────────────────────────────────────────
     let manager_client = ManagerServiceClient::connect(config.manager_address.clone()).await?;
@@ -48,6 +52,7 @@ async fn main() -> Result<()> {
         routing_table.clone(),
         config.cache.routing_table_ttl_secs,
         schema_trigger.clone(),
+        cb_registry.clone(),
     ));
     tokio::spawn(schema::sync_schemas(
         manager_client.clone(),
@@ -78,7 +83,7 @@ async fn main() -> Result<()> {
             routing_table.clone(),
             config.node.proxy_address.clone(),
         ))
-        .service(ForwardService::new());
+        .service(ForwardService::new(cb_registry.clone()));
 
     let internal_listener = TcpListener::bind(&config.listen_address).await?;
     info!(address = %config.listen_address, "proxy listening (internal)");
@@ -105,7 +110,7 @@ async fn main() -> Result<()> {
                 routing_table,
                 config.node.proxy_address.clone(),
             ))
-            .service(ForwardService::new());
+            .service(ForwardService::new(cb_registry.clone()));
 
         let external_listener = TcpListener::bind(&ext.listen_address).await?;
         info!(address = %ext.listen_address, "proxy listening (external)");
@@ -174,7 +179,10 @@ where
                     }
                 });
 
-            if let Err(e) = http1::Builder::new().serve_connection(io, hyper_svc).await {
+            if let Err(e) = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, hyper_svc)
+                .await
+            {
                 warn!(peer = %peer_addr, error = %e, "connection error");
             }
         });

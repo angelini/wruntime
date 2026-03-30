@@ -11,8 +11,8 @@ use anyhow::Result;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
+use hyper::server::conn::http2;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message as _;
 use prost_types::{
     field_descriptor_proto::{Label, Type},
@@ -157,7 +157,9 @@ pub async fn start_ingress_proxy(
         .layer(wr_proxy::layers::IngressLayer::new(routes, schema_cache))
         .layer(wr_proxy::layers::MetricsLayer::new(metrics_tx))
         .layer(wr_proxy::layers::RoutingLayer::new(table, ""))
-        .service(wr_proxy::layers::ForwardService::new());
+        .service(wr_proxy::layers::ForwardService::new(std::sync::Arc::new(
+            wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
+        )));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(proxy_serve(listener, svc));
@@ -225,7 +227,9 @@ pub async fn start_proxy_with_schema(
             table,
             self_proxy_address,
         ))
-        .service(wr_proxy::layers::ForwardService::new());
+        .service(wr_proxy::layers::ForwardService::new(std::sync::Arc::new(
+            wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
+        )));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(proxy_serve(listener, svc));
@@ -270,7 +274,9 @@ pub async fn start_node(mgr_addr: &str) -> Result<Node> {
             table.clone(),
             &proxy_address,
         ))
-        .service(wr_proxy::layers::ForwardService::new());
+        .service(wr_proxy::layers::ForwardService::new(std::sync::Arc::new(
+            wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
+        )));
 
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -363,17 +369,20 @@ where
                     })
                 }
             });
-            let _ = http1::Builder::new().serve_connection(io, svc_fn).await;
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc_fn)
+                .await;
         });
     }
 }
 
-/// Build a legacy HTTP/1.1 client for sending test requests through the proxy.
+/// Build an HTTP/2 client for sending test requests through the proxy.
 pub fn http_client() -> hyper_util::client::legacy::Client<
     hyper_util::client::legacy::connect::HttpConnector,
     Full<Bytes>,
 > {
-    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+    hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+        .http2_only(true)
         .build_http::<Full<Bytes>>()
 }
 
@@ -397,7 +406,9 @@ pub async fn stub_engine(listener: TcpListener) {
                             .unwrap(),
                     )
                 });
-            let _ = http1::Builder::new().serve_connection(io, svc).await;
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await;
         });
     }
 }
@@ -425,7 +436,9 @@ pub async fn proto_stub_engine(listener: TcpListener, response_body: bytes::Byte
                     )
                 }
             });
-            let _ = http1::Builder::new().serve_connection(io, svc).await;
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await;
         });
     }
 }
@@ -467,7 +480,9 @@ pub async fn identified_stub(listener: TcpListener, id: String) {
                     )
                 }
             });
-            let _ = http1::Builder::new().serve_connection(io, svc).await;
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await;
         });
     }
 }
@@ -576,6 +591,7 @@ pub fn db_state(pool_size: usize) -> Option<ModuleState> {
             "test".into(),
             "test-ns".into(),
             "http://127.0.0.1:9001".parse().unwrap(),
+            http_client(),
             Some(pool),
             None,
             None,
@@ -614,6 +630,7 @@ pub async fn db_state_for_module(
             name.into(),
             namespace.into(),
             "http://127.0.0.1:9001".parse().unwrap(),
+            http_client(),
             Some(pool),
             Some(schema),
             None,

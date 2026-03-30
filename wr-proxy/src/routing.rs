@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
@@ -6,6 +7,8 @@ use tracing::{info, warn};
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, GetRoutingTableRequest, RoutingTable,
 };
+
+use crate::circuit_breaker::CircuitBreakerRegistry;
 
 pub type CachedRoutingTable = Arc<RwLock<RoutingTable>>;
 
@@ -24,6 +27,7 @@ pub async fn sync_routing_table(
     table: CachedRoutingTable,
     ttl_secs: u64,
     schema_trigger: Arc<Notify>,
+    cb_registry: Arc<CircuitBreakerRegistry>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(ttl_secs));
     loop {
@@ -34,6 +38,12 @@ pub async fn sync_routing_table(
                     let current_version = table.read().await.version;
                     if incoming.version > current_version {
                         let version = incoming.version;
+                        let active: HashSet<&str> = incoming
+                            .rules
+                            .iter()
+                            .map(|r| r.engine_address.as_str())
+                            .collect();
+                        cb_registry.evict_missing(&active);
                         *table.write().await = incoming;
                         info!(version, "routing table updated");
                         schema_trigger.notify_one();

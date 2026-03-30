@@ -28,7 +28,7 @@ pub struct DatabaseConfig {
 }
 
 fn default_max_connections() -> usize {
-    8
+    20
 }
 
 #[derive(Deserialize, Clone)]
@@ -68,6 +68,10 @@ pub struct ModuleConfig {
     /// Requires a `[database]` section in the engine config.
     #[serde(default)]
     pub database: bool,
+    /// Overrides `[database].max_connections` for this module's pool.
+    /// Falls back to the global value when absent.
+    #[serde(default)]
+    pub db_max_connections: Option<usize>,
     /// Whether this module has access to the shared blobstore client.
     /// Requires a `[blobstore]` section in the engine config.
     #[serde(default)]
@@ -80,10 +84,18 @@ pub struct ModuleConfig {
     /// and the caller receives a 504. Defaults to 30.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// Inbound request channel depth. Requests that arrive when the channel is
+    /// full receive a 429. Defaults to 128.
+    #[serde(default = "default_channel_capacity")]
+    pub channel_capacity: usize,
 }
 
 fn default_request_timeout_secs() -> u64 {
     30
+}
+
+fn default_channel_capacity() -> usize {
+    128
 }
 
 impl EngineConfig {

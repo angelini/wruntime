@@ -3,16 +3,18 @@ use std::sync::Arc;
 use crate::blobstore::BlobstoreRuntime;
 use crate::config::FsMode;
 use deadpool_postgres::Pool;
+use http_body_util::{BodyExt, Full};
 use hyper::header::{HeaderName, HeaderValue};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use tempfile::TempDir;
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{
     p2::{
         bindings::http::types::ErrorCode,
-        body::HyperOutgoingBody,
-        default_send_request,
-        types::{HostFutureIncomingResponse, OutgoingRequestConfig},
+        body::{HyperIncomingBody, HyperOutgoingBody},
+        hyper_request_error,
+        types::{HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig},
         HttpResult, WasiHttpCtxView, WasiHttpHooks, WasiHttpView,
     },
     WasiHttpCtx,
@@ -24,10 +26,14 @@ use wasmtime_wasi_http::{
 ///   wr-proxy can route the request to the correct engine.
 /// - Tags the request with `x-wr-source` for metrics attribution.
 /// - Rewrites the URI to point at wr-proxy.
+/// - Uses a shared, connection-pooled HTTP client to avoid ephemeral port
+///   exhaustion under load (`EADDRNOTAVAIL` / DnsError).
 struct ModuleHttpHooks {
     proxy_uri: hyper::Uri,
     module_name: String,
     module_namespace: String,
+    /// Shared across all requests for this module instance.
+    http_client: Client<HttpConnector, Full<bytes::Bytes>>,
 }
 
 impl WasiHttpHooks for ModuleHttpHooks {
@@ -65,7 +71,40 @@ impl WasiHttpHooks for ModuleHttpHooks {
             .map_err(|_| ErrorCode::InternalError(None))?;
         *request.uri_mut() = new_uri;
 
-        Ok(default_send_request(request, config))
+        let client = self.http_client.clone();
+        let between_bytes_timeout = config.between_bytes_timeout;
+
+        let handle = wasmtime_wasi::runtime::spawn(async move {
+            Ok(async move {
+                // Buffer the outgoing body so we can hand it to the pooled client,
+                // which requires a Send + 'static body type (Full<Bytes>).
+                let (parts, body) = request.into_parts();
+                let body_bytes = body
+                    .collect()
+                    .await
+                    .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))?
+                    .to_bytes();
+                let buffered = hyper::Request::from_parts(parts, Full::new(body_bytes));
+
+                let resp = client.request(buffered).await.map_err(|e| {
+                    tracing::warn!(error = %e, "outgoing http request failed");
+                    ErrorCode::ConnectionRefused
+                })?;
+
+                let (resp_parts, resp_body) = resp.into_parts();
+                let incoming_body: HyperIncomingBody =
+                    resp_body.map_err(hyper_request_error).boxed_unsync();
+
+                Ok::<IncomingResponse, ErrorCode>(IncomingResponse {
+                    resp: hyper::Response::from_parts(resp_parts, incoming_body),
+                    worker: None,
+                    between_bytes_timeout,
+                })
+            }
+            .await)
+        });
+
+        Ok(HostFutureIncomingResponse::pending(handle))
     }
 }
 
@@ -98,6 +137,7 @@ impl ModuleState {
         module_name: String,
         module_namespace: String,
         proxy_uri: hyper::Uri,
+        http_client: Client<HttpConnector, Full<bytes::Bytes>>,
         db_pool: Option<Arc<Pool>>,
         db_schema: Option<String>,
         blobstore: Option<Arc<BlobstoreRuntime>>,
@@ -122,6 +162,7 @@ impl ModuleState {
                 proxy_uri,
                 module_name,
                 module_namespace,
+                http_client,
             },
             db_pool,
             db_schema,

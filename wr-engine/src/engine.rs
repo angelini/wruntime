@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use deadpool_postgres::Pool;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
+use hyper_util::rt::TokioExecutor;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -52,7 +53,10 @@ impl EngineRunner {
         if let Some(db) = &config.database {
             for module in &config.modules {
                 if module.database {
-                    let pool = wr_engine::pool::build_pool(&db.url, db.max_connections)?;
+                    let pool = wr_engine::pool::build_pool(
+                        &db.url,
+                        module.db_max_connections.unwrap_or(db.max_connections),
+                    )?;
                     db_pools.insert(
                         (module.namespace.clone(), module.name.clone()),
                         Arc::new(pool),
@@ -134,6 +138,9 @@ impl EngineRunner {
 
         let component = Component::from_file(&self.engine, &module_config.wasm_path)?;
         let proxy_uri: hyper::Uri = self.config.node.proxy_address.parse()?;
+        let http_client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+            .http2_only(true)
+            .build_http::<http_body_util::Full<bytes::Bytes>>();
         let module_name = module_config.name.clone();
         let module_namespace = module_config.namespace.clone();
         let module_version = module_config.version.clone();
@@ -159,7 +166,7 @@ impl EngineRunner {
         match ProxyPre::new(linker.instantiate_pre(&component)?) {
             Ok(pre) => {
                 let pre = Arc::new(pre);
-                let (tx, rx) = mpsc::channel::<InboundRequest>(32);
+                let (tx, rx) = mpsc::channel::<InboundRequest>(module_config.channel_capacity);
                 registry
                     .register(
                         module_namespace.clone(),
@@ -192,6 +199,7 @@ impl EngineRunner {
                     name: module_name.clone(),
                     namespace: module_namespace.clone(),
                     proxy_uri: proxy_uri.clone(),
+                    http_client: http_client.clone(),
                     db_pool,
                     db_schema,
                     blobstore,
@@ -221,6 +229,7 @@ impl EngineRunner {
                     module_name.clone(),
                     module_namespace.clone(),
                     proxy_uri,
+                    http_client,
                     db_pool,
                     db_schema,
                     blobstore,
@@ -266,6 +275,12 @@ struct ModuleContext {
     name: String,
     namespace: String,
     proxy_uri: hyper::Uri,
+    /// Pooled HTTP client for outgoing WASM → proxy requests.
+    /// `Client` is `Clone` (internally Arc-backed), so this is cheap to clone.
+    http_client: hyper_util::client::legacy::Client<
+        hyper_util::client::legacy::connect::HttpConnector,
+        http_body_util::Full<bytes::Bytes>,
+    >,
     db_pool: Option<Arc<Pool>>,
     db_schema: Option<String>,
     blobstore: Option<Arc<BlobstoreRuntime>>,
@@ -338,6 +353,7 @@ async fn dispatch_request(
         module.name.clone(),
         module.namespace.clone(),
         module.proxy_uri.clone(),
+        module.http_client.clone(),
         module.db_pool.clone(),
         module.db_schema.clone(),
         module.blobstore.clone(),

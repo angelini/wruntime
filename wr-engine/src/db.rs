@@ -427,6 +427,14 @@ mod tests {
         "http://127.0.0.1:9001".parse().unwrap()
     }
 
+    fn test_http_client() -> hyper_util::client::legacy::Client<
+        hyper_util::client::legacy::connect::HttpConnector,
+        http_body_util::Full<bytes::Bytes>,
+    > {
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build_http()
+    }
+
     // ── no-pool tests ────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -435,6 +443,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
+            test_http_client(),
             None,
             None,
             None,
@@ -455,6 +464,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
+            test_http_client(),
             None,
             None,
             None,
@@ -475,6 +485,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
+            test_http_client(),
             None,
             None,
             None,
@@ -508,6 +519,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
+            test_http_client(),
             Some(Arc::new(pool)),
             None,
             None,
@@ -541,6 +553,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
+            test_http_client(),
             Some(Arc::new(pool)),
             None,
             None,
@@ -576,6 +589,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
+            test_http_client(),
             Some(Arc::new(pool)),
             None,
             None,
@@ -611,6 +625,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
+            test_http_client(),
             Some(Arc::new(pool)),
             None,
             None,
@@ -660,6 +675,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
+            test_http_client(),
             Some(Arc::new(pool)),
             None,
             None,
@@ -724,6 +740,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
+            test_http_client(),
             Some(Arc::new(pool)),
             None,
             None,
@@ -785,6 +802,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
+            test_http_client(),
             Some(Arc::new(pool)),
             None,
             None,

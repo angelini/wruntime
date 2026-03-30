@@ -51,6 +51,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
 
     let mut purchased: Vec<(String, i64)> = Vec::new();
     let mut completed: i64 = 0;
+    let mut errors: Vec<String> = Vec::new();
 
     for i in 0u64..count {
         // Spread load evenly across all 50 products via a cheap hash.
@@ -85,6 +86,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                     Err(e) => {
                         sp.set_error(&e);
                         wr_sdk::log::log(&format!("buy error: {e}"));
+                        errors.push(format!("buy {product_id}: {e}"));
                     }
                 }
             }
@@ -108,6 +110,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                         Err(e) => {
                             sp.set_error(&e);
                             wr_sdk::log::log(&format!("return error: {e}"));
+                            errors.push(format!("return {ret_id}: {e}"));
                         }
                     }
                 }
@@ -130,6 +133,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                     Err(e) => {
                         sp.set_error(&e);
                         wr_sdk::log::log(&format!("get_stock error: {e}"));
+                        errors.push(format!("get_stock {product_id}: {e}"));
                     }
                 }
             }
@@ -165,6 +169,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                         Err(e) => {
                             sp.set_error(&e);
                             wr_sdk::log::log(&format!("transfer error: {e}"));
+                            errors.push(format!("transfer {product_id} → {to_product_id}: {e}"));
                         }
                     }
                 }
@@ -189,6 +194,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                     Err(e) => {
                         sp.set_error(&e);
                         wr_sdk::log::log(&format!("restock error: {e}"));
+                        errors.push(format!("restock {product_id}: {e}"));
                     }
                 }
             }
@@ -198,8 +204,14 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
     }
 
     run_span.set_attribute("client.completed", &completed.to_string());
-    wr_sdk::log::log(&format!("client done — {completed} operations"));
-    (200, proto::RunResponse { completed }.encode_to_vec())
+    run_span.set_attribute("client.errors", &errors.len().to_string());
+    wr_sdk::log::log(&format!("client done — {completed} operations, {} errors", errors.len()));
+
+    if errors.is_empty() {
+        (200, proto::RunResponse { completed }.encode_to_vec())
+    } else {
+        err_body(500, &format!("{} operation(s) failed: {}", errors.len(), errors.join("; ")))
+    }
 }
 
 // ── Product catalogue ─────────────────────────────────────────────────────────
