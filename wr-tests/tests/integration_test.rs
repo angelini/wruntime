@@ -1802,7 +1802,7 @@ fn test_tracing_span_start_and_drop() {
     )
     .expect("ModuleState");
 
-    let span = Host::start(&mut state, "my-operation".into());
+    let span = Host::start(&mut state, "my-operation".into(), vec![]);
     HostActiveSpan::drop(&mut state, span).expect("drop span");
 }
 
@@ -1821,7 +1821,7 @@ fn test_tracing_span_set_attribute() {
     )
     .expect("ModuleState");
 
-    let span = Host::start(&mut state, "op".into());
+    let span = Host::start(&mut state, "op".into(), vec![]);
     let rep = span.rep();
     HostActiveSpan::set_attribute(
         &mut state,
@@ -1847,7 +1847,7 @@ fn test_tracing_span_record_event() {
     )
     .expect("ModuleState");
 
-    let span = Host::start(&mut state, "op".into());
+    let span = Host::start(&mut state, "op".into(), vec![]);
     let rep = span.rep();
     HostActiveSpan::record_event(
         &mut state,
@@ -1873,7 +1873,7 @@ fn test_tracing_span_set_error() {
     )
     .expect("ModuleState");
 
-    let span = Host::start(&mut state, "op".into());
+    let span = Host::start(&mut state, "op".into(), vec![]);
     let rep = span.rep();
     HostActiveSpan::set_error(
         &mut state,

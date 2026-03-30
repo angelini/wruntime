@@ -22,7 +22,7 @@ wasmtime::component::bindgen!({
 });
 
 impl wruntime::tracing::span::Host for ModuleState {
-    fn start(&mut self, name: String) -> Resource<SpanState> {
+    fn start(&mut self, name: String, attrs: Vec<(String, String)>) -> Resource<SpanState> {
         let child = self.active_span.in_scope(|| {
             tracing::info_span!(
                 "module",
@@ -31,6 +31,15 @@ impl wruntime::tracing::span::Host for ModuleState {
             )
         });
         child.follows_from(self.active_span.id());
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            for (key, value) in attrs {
+                child.set_attribute(
+                    opentelemetry::Key::new(key),
+                    opentelemetry::Value::String(value.into()),
+                );
+            }
+        }
         self.table()
             .push(SpanState { span: child })
             .expect("ResourceTable capacity exceeded")
@@ -39,12 +48,12 @@ impl wruntime::tracing::span::Host for ModuleState {
 
 impl wruntime::tracing::span::HostActiveSpan for ModuleState {
     fn set_attribute(&mut self, self_: Resource<SpanState>, key: String, value: String) {
-        // tracing doesn't support dynamic field names post-creation;
-        // emit a child event instead, which OTLP exporters record as a span event.
         if let Ok(state) = self.table().get(&self_) {
-            state.span.in_scope(|| {
-                tracing::info!(key = key.as_str(), value = value.as_str(), "attribute");
-            });
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            state.span.set_attribute(
+                opentelemetry::Key::new(key),
+                opentelemetry::Value::String(value.into()),
+            );
         }
     }
 
@@ -104,7 +113,7 @@ mod tests {
             tracing::Span::none(),
         )
         .expect("state");
-        let span = Host::start(&mut state, "my-operation".into());
+        let span = Host::start(&mut state, "my-operation".into(), vec![]);
         HostActiveSpan::drop(&mut state, span).expect("drop");
     }
 
@@ -120,7 +129,7 @@ mod tests {
             tracing::Span::none(),
         )
         .expect("state");
-        let span = Host::start(&mut state, "op".into());
+        let span = Host::start(&mut state, "op".into(), vec![]);
         let rep = span.rep();
         HostActiveSpan::set_attribute(
             &mut state,
@@ -143,7 +152,7 @@ mod tests {
             tracing::Span::none(),
         )
         .expect("state");
-        let span = Host::start(&mut state, "op".into());
+        let span = Host::start(&mut state, "op".into(), vec![]);
         let rep = span.rep();
         HostActiveSpan::record_event(
             &mut state,
@@ -166,7 +175,7 @@ mod tests {
             tracing::Span::none(),
         )
         .expect("state");
-        let span = Host::start(&mut state, "op".into());
+        let span = Host::start(&mut state, "op".into(), vec![]);
         let rep = span.rep();
         HostActiveSpan::set_error(
             &mut state,
