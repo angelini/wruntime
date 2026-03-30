@@ -22,11 +22,11 @@ signed by that CA, enforcing mutual authentication on all peer connections.
 
 ```
 Node A                               Node B
-┌──────────────────────────┐         ┌──────────────────────────┐
-│  proxy :9001  (plain)    │         │  proxy :9002  (plain)    │
-│  proxy :9443  (mTLS) ◄───┼─────────┼─► proxy :9443  (mTLS)   │
-│  engine A1 :9100         │         │  engine B1 :9200         │
-└──────────────────────────┘         └──────────────────────────┘
+┌──────────────────────────────────┐  ┌──────────────────────────────────┐
+│  proxy :9001  (plain HTTP/2)     │  │  proxy :9002  (plain HTTP/2)     │
+│  proxy :9443  (mTLS HTTP/2) ◄────┼──┼──► proxy :9443  (mTLS HTTP/2)   │
+│  engine A1 :9100                 │  │  engine B1 :9200                 │
+└──────────────────────────────────┘  └──────────────────────────────────┘
 ```
 
 The `proxy_address` field introduced in `cross_node_proxy_routing.md` splits into two:
@@ -50,9 +50,9 @@ Add to `wr-proxy/Cargo.toml`:
 rustls         = "0.23"
 rustls-pemfile = "2"
 tokio-rustls   = "0.26"
-hyper-rustls   = { version = "0.27", features = ["http1", "http2"] }
 ```
 
+`hyper-rustls` 0.27 is already present with `native-tokio`, `http1`, and `http2` features.
 No changes to `wr-engine` or `wr-manager` — TLS is proxy-only.
 
 ---
@@ -61,18 +61,18 @@ No changes to `wr-engine` or `wr-manager` — TLS is proxy-only.
 
 ### `NodeConfig` (`wr-common/src/node.rs`)
 
-Extend the struct introduced in `cross_node_proxy_routing.md`:
+Extend the existing struct:
 
 ```rust
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct NodeConfig {
-    pub proxy_address: String,       // plain HTTP, used by engines
-    pub peer_address: String,        // mTLS HTTPS, used by peer proxies
-    pub peer_listen_address: String, // bind address for the mTLS listener
-    pub tls: TlsConfig,
+    pub proxy_address: String,       // plain HTTP, used by engines (existing)
+    pub peer_address: Option<String>,        // mTLS HTTPS, used by peer proxies
+    pub peer_listen_address: Option<String>, // bind address for the mTLS listener
+    pub tls: Option<TlsConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct TlsConfig {
     pub cert_path:    String,   // PEM: this proxy's certificate (chain)
     pub key_path:     String,   // PEM: this proxy's private key
@@ -80,8 +80,28 @@ pub struct TlsConfig {
 }
 ```
 
+`peer_address`, `peer_listen_address`, and `tls` are `Option` so that single-node
+deployments (and `wr-engine`, which also uses `NodeConfig`) continue to work without
+any TLS configuration. The proxy validates at startup that all three are set together
+when any one is present.
+
 `TlsConfig` lives in `wr-common` alongside `NodeConfig` so it can be referenced from
 tests without duplicating the type.
+
+### `ProxyConfig` validation (`wr-proxy/src/config.rs`)
+
+Add validation to the existing `validate()` method:
+
+```rust
+// If any peer/tls field is set, all must be set
+let has_peer = self.node.peer_address.is_some();
+let has_listen = self.node.peer_listen_address.is_some();
+let has_tls = self.node.tls.is_some();
+anyhow::ensure!(
+    (has_peer && has_listen && has_tls) || (!has_peer && !has_listen && !has_tls),
+    "node.peer_address, node.peer_listen_address, and node.tls must all be set together"
+);
+```
 
 ### `proxy.toml`
 
@@ -109,14 +129,14 @@ Engine config is unchanged — engines only reference `node.proxy_address`.
 
 ## Phase 3 — Proto: `proxy_address` stores the peer address
 
-`RoutingRule.proxy_address` (field 10, added in `cross_node_proxy_routing.md`) now holds
-`peer_address` (`https://...`) rather than the plain HTTP address. No field additions are
-needed; only the value semantics change.
+`RoutingRule.proxy_address` (field 10) now holds `peer_address` (`https://...`) rather
+than the plain HTTP address. No proto field additions are needed; only the value
+semantics change.
 
-Update the engine registration in `wr-engine/src/main.rs` to send `config.node.peer_address`
-(read from the engine's config, which it gets from the proxy's peer address for its node)
-rather than `config.node.proxy_address`. The engine config gains a `peer_address` field
-alongside `proxy_address`:
+Update the engine registration in `wr-engine/src/main.rs` to send
+`config.node.peer_address` (read from the engine's config, which mirrors the proxy's
+peer address for its node) rather than `config.node.proxy_address`. The engine config
+gains a `peer_address` field alongside `proxy_address`:
 
 ```toml
 # engine.toml
@@ -128,21 +148,35 @@ peer_address  = "https://127.0.0.1:9443"  # stored in routing rules for peer pro
 ```rust
 // wr-engine/src/main.rs — RoutingRule upsert
 RoutingRule {
-    proxy_address: config.node.peer_address.clone(),  // was proxy_address
+    proxy_address: config.node.peer_address.clone()
+        .unwrap_or_else(|| config.node.proxy_address.clone()),
     ..
 }
+```
+
+Update `RoutingLayer::new()` in `wr-proxy/src/layers/routing.rs` — currently receives
+`config.node.proxy_address` for local-vs-remote comparison. Change to accept
+`config.node.peer_address` (falling back to `proxy_address` when mTLS is not
+configured):
+
+```rust
+// wr-proxy/src/main.rs — both internal and external service stacks
+let self_address = config.node.peer_address.clone()
+    .unwrap_or_else(|| config.node.proxy_address.clone());
+RoutingLayer::new(routing_table.clone(), self_address)
 ```
 
 ---
 
 ## Phase 4 — TLS server: mTLS listener in the proxy
 
-**`wr-proxy/src/tls.rs`** (new file)
+### `wr-proxy/src/tls.rs` (new file)
 
 Encapsulate certificate loading and acceptor construction:
 
 ```rust
 use rustls::{ServerConfig, RootCertStore};
+use rustls::server::WebPkiClientVerifier;
 use rustls_pemfile::{certs, private_key};
 use tokio_rustls::TlsAcceptor;
 
@@ -168,42 +202,72 @@ pub fn build_acceptor(tls: &TlsConfig) -> Result<TlsAcceptor> {
 }
 ```
 
-**`wr-proxy/src/main.rs`**
+### `wr-proxy/src/main.rs`
 
-Spawn a second accept loop alongside the existing plain HTTP one. Both loops feed into
-the same Tower service stack:
+Spawn a second accept loop alongside the existing ones (internal + optional external).
+The existing `accept_loop` function is generic over the TCP stream, so we wrap the
+TLS-accepted stream in `TokioIo` before passing it in. Both loops use the same
+`http2::Builder` and same Tower service stack:
 
 ```rust
-// Existing plain HTTP loop (engines)
-let plain_listener = TcpListener::bind(&config.listen_address).await?;
+// Only start the mTLS listener when TLS is configured
+if let (Some(peer_listen), Some(tls_config)) =
+    (&config.node.peer_listen_address, &config.node.tls)
+{
+    let tls_acceptor = wr_proxy::tls::build_acceptor(tls_config)?;
+    let tls_listener = TcpListener::bind(peer_listen).await?;
+    info!(address = %peer_listen, "proxy listening (mTLS peer)");
 
-// New mTLS loop (peer proxies)
-let tls_listener = TcpListener::bind(&config.node.peer_listen_address).await?;
-let tls_acceptor = wr_proxy::tls::build_acceptor(&config.node.tls)?;
-
-tokio::spawn(async move {
-    loop {
-        let (stream, _) = tls_listener.accept().await?;
-        let tls_stream  = tls_acceptor.accept(stream).await?;
-        let io = TokioIo::new(tls_stream);
-        // same hyper http1::Builder serving as the plain loop
-        tokio::spawn(async move {
-            http1::Builder::new().serve_connection(io, svc).await
-        });
-    }
-});
+    // Clone the internal service stack — both paths use the same layers
+    let peer_svc = internal_svc.clone();
+    tokio::spawn(tls_accept_loop(tls_listener, tls_acceptor, peer_svc));
+}
 ```
 
-The two loops share the same `svc` (Tower stack). The only behavioral difference on the
-server side is that `x-wr-via-proxy` skips schema validation, which the forwarding layer
-already sets (from `cross_node_proxy_routing.md` Phase 6). No additional server-side
-branching is required — mTLS authentication is handled entirely by the TLS handshake.
+A new `tls_accept_loop` function mirrors the existing `accept_loop` but wraps each
+connection through the `TlsAcceptor` before handing off to `http2::Builder`:
+
+```rust
+async fn tls_accept_loop<S>(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    svc: S,
+) where
+    S: Service<Request<Bytes>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Error: std::fmt::Display + Send + 'static,
+    S::Future: Send + 'static,
+{
+    loop {
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => { warn!(error = %e, "tls accept error"); continue; }
+        };
+        let acceptor = acceptor.clone();
+        let svc = svc.clone();
+
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => { warn!(peer = %peer_addr, error = %e, "TLS handshake failed"); return; }
+            };
+            let io = TokioIo::new(tls_stream);
+            // Same hyper http2::Builder as the plain accept_loop
+            // ... serve_connection(io, hyper_svc) ...
+        });
+    }
+}
+```
+
+The two loops share the same `svc` (Tower stack). The `x-wr-via-proxy` header is already
+set by `ForwardService` for cross-node hops, and the `EgressLayer` / `SchemaValidationLayer`
+already respect it. No additional server-side branching is required — mTLS authentication
+is handled entirely by the TLS handshake.
 
 ---
 
 ## Phase 5 — TLS client: mTLS connector for outbound peer requests
 
-**`wr-proxy/src/tls.rs`**
+### `wr-proxy/src/tls.rs`
 
 ```rust
 use hyper_rustls::HttpsConnector;
@@ -224,58 +288,83 @@ pub fn build_peer_client(
 
     // Send client cert (mTLS) and verify server cert against the CA
     let config = ClientConfig::builder()
-        .with_root_certificates(Arc::new(root_store))
+        .with_root_certificates(root_store)
         .with_client_auth_cert(cert_chain, private_key)?;
 
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(config)
         .https_only()
-        .enable_http1()
+        .enable_http2()
         .build();
 
-    Ok(Client::builder(TokioExecutor::new()).build(connector))
+    Ok(Client::builder(TokioExecutor::new())
+        .http2_only(true)
+        .build(connector))
 }
 ```
 
-**`wr-proxy/src/layers/forward.rs`**
+### `wr-proxy/src/layers/forward.rs`
 
-`ForwardService` holds both clients. Selection is based on the `Destination` variant
-already introduced in `cross_node_proxy_routing.md`:
+`ForwardService` gains an optional peer client. Selection is based on the `Destination`
+variant already present in `wr-proxy/src/layers/mod.rs`:
 
 ```rust
+#[derive(Clone)]
 pub struct ForwardService {
-    plain_client: Client<HttpConnector,  Full<Bytes>>,
-    peer_client:  Client<HttpsConnector, Full<Bytes>>,
+    client: Client<HttpConnector, Full<Bytes>>,
+    peer_client: Option<Client<HttpsConnector<HttpConnector>, Full<Bytes>>>,
+    cb_registry: Arc<CircuitBreakerRegistry>,
 }
 
 impl ForwardService {
-    pub fn new(tls: &TlsConfig) -> Result<Self> {
-        Ok(Self {
-            plain_client: Client::builder(TokioExecutor::new()).build_http(),
-            peer_client:  build_peer_client(tls)?,
-        })
+    pub fn new(
+        cb_registry: Arc<CircuitBreakerRegistry>,
+        peer_client: Option<Client<HttpsConnector<HttpConnector>, Full<Bytes>>>,
+    ) -> Self {
+        let client = Client::builder(TokioExecutor::new())
+            .http2_only(true)
+            .build_http();
+        Self { client, peer_client, cb_registry }
     }
 }
+```
 
-// In call():
-match dest {
-    Destination::LocalEngine(addr) => {
-        self.plain_client.request(build_req(addr, req)).await
+In `call()`, the existing candidate loop selects the client based on destination type.
+The circuit breaker logic (`cb_registry`) applies identically to both clients:
+
+```rust
+// Inside the candidate loop (replaces the single client.request call):
+let resp = match destination {
+    Destination::LocalEngine(_) => {
+        client.request(forward_req).await
     }
-    Destination::RemoteProxy(addr) => {
-        // addr is "https://..." — plain_client would reject it
-        self.peer_client.request(build_req(addr, req)).await
+    Destination::RemoteProxy(_) => {
+        let peer = peer_client.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("peer TLS client not configured"))?;
+        peer.request(forward_req).await
     }
-}
+};
+```
+
+Update both `ForwardService::new(...)` call sites in `main.rs` (internal and external
+stacks) to pass the optional peer client:
+
+```rust
+let peer_client = config.node.tls.as_ref()
+    .map(|tls| tls::build_peer_client(tls))
+    .transpose()?;
+
+// ... in both service stacks:
+.service(ForwardService::new(cb_registry.clone(), peer_client.clone()))
 ```
 
 ---
 
 ## Phase 6 — Certificate setup for local simulation
 
-For the local two-node test setup from `cross_node_proxy_routing.md` (Phase 8), a small
-script generates a local CA and two proxy certs using `openssl`. Commit the script and
-the resulting certs alongside the `node-a/` and `node-b/` config directories:
+For the local two-node test setup in `examples/multi-node/`, a small script generates a
+local CA and two proxy certs using `openssl`. Commit the script alongside the `node-a/`
+and `node-b/` config directories:
 
 ```bash
 # scripts/gen-local-certs.sh
@@ -337,7 +426,7 @@ Add to `wr-tests/Cargo.toml`:
 rcgen = "0.13"
 ```
 
-**`wr-tests/tests/helpers.rs`** — new helper:
+### `wr-tests/tests/helpers.rs` — new helper:
 
 ```rust
 pub struct TestPki {
@@ -364,9 +453,9 @@ pub fn generate_test_pki() -> TestPki {
 }
 ```
 
-`start_node` (from `cross_node_proxy_routing.md` Phase 7) gains a `pki: &TestPki`
-parameter and passes the in-memory certs to `build_acceptor` and `build_peer_client`
-via an in-memory variant that accepts `CertificateDer` directly instead of file paths.
+`build_acceptor` and `build_peer_client` in `wr-proxy/src/tls.rs` need an in-memory
+variant that accepts `CertificateDer` directly instead of file paths — either a second
+constructor or a builder that takes pre-loaded cert bytes.
 
 Add a `test_cross_node_mtls` integration test that verifies:
 1. A request from node A to a module on node B succeeds over the mTLS path.
@@ -377,10 +466,32 @@ Add a `test_cross_node_mtls` integration test that verifies:
 
 ## Implementation order
 
-1. Phase 1 — add rustls/hyper-rustls/tokio-rustls dependencies
-2. Phase 2 — extend `NodeConfig` and `TlsConfig`; update `proxy.toml` and `engine.toml` shapes
-3. Phase 3 — engine sends `peer_address` as `proxy_address` in routing rules
-4. Phase 4 — `wr-proxy/src/tls.rs`, second accept loop in `main.rs`
-5. Phase 5 — `build_peer_client`, dual-client `ForwardService`
-6. Phase 6 — cert generation script, Justfile `certs` target, local config files
-7. Phase 7 — `rcgen` test helper, `test_cross_node_mtls` cases
+1. **Phase 1** — add `rustls` / `rustls-pemfile` / `tokio-rustls` dependencies
+2. **Phase 2** — extend `NodeConfig` with optional `peer_address`, `peer_listen_address`, `TlsConfig`; update `ProxyConfig` validation; update TOML examples
+3. **Phase 3** — engine sends `peer_address` as `proxy_address` in routing rules; update `RoutingLayer` self-address
+4. **Phase 4** — `wr-proxy/src/tls.rs` (acceptor), `tls_accept_loop` in `main.rs`
+5. **Phase 5** — `build_peer_client`, optional dual-client `ForwardService`
+6. **Phase 6** — cert generation script, Justfile `certs` target, multi-node config files
+7. **Phase 7** — `rcgen` test helper, `test_cross_node_mtls` cases
+
+---
+
+## File change summary
+
+| File | Change |
+|---|---|
+| `wr-proxy/Cargo.toml` | Add `rustls`, `rustls-pemfile`, `tokio-rustls` |
+| `wr-common/src/node.rs` | Add optional `peer_address`, `peer_listen_address`, `tls: Option<TlsConfig>` to `NodeConfig` |
+| `wr-proxy/src/config.rs` | Add peer/TLS validation to `validate()` |
+| `wr-proxy/src/tls.rs` | **New** — `build_acceptor`, `build_peer_client`, cert loading helpers |
+| `wr-proxy/src/main.rs` | Conditional mTLS listener via `tls_accept_loop`; pass `peer_client` to `ForwardService` |
+| `wr-proxy/src/layers/forward.rs` | Add optional `peer_client` field; branch client selection on `Destination` variant |
+| `wr-proxy/src/layers/routing.rs` | Accept `peer_address` for self-identification (fallback to `proxy_address`) |
+| `wr-engine/src/main.rs` | Send `peer_address` in `RoutingRule.proxy_address` when configured |
+| `examples/config/proxy.toml` | Add `[node.tls]` section |
+| `examples/multi-node/node-a/proxy.toml` | Add `peer_address`, `peer_listen_address`, `[node.tls]` |
+| `examples/multi-node/node-b/proxy.toml` | Add `peer_address`, `peer_listen_address`, `[node.tls]` |
+| `scripts/gen-local-certs.sh` | **New** — generate local CA + proxy certs |
+| `justfile` | Add `certs` target |
+| `wr-tests/Cargo.toml` | Add `rcgen` |
+| `wr-tests/tests/helpers.rs` | Add `TestPki`, `generate_test_pki()` |

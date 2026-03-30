@@ -18,6 +18,9 @@ pub struct ProxyConfig {
     pub circuit_breaker: CircuitBreakerConfig,
     /// Optional external-facing listener with a restricted set of public routes.
     pub external: Option<ExternalConfig>,
+    /// Optional egress allowlist — controls which external domains WASM modules may call.
+    #[serde(default)]
+    pub egress: Option<EgressConfig>,
 }
 
 /// Configuration for the external-facing HTTP listener.
@@ -109,6 +112,16 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+/// Controls which external domains WASM modules are permitted to call via egress.
+#[derive(Deserialize, Clone, Default)]
+pub struct EgressConfig {
+    /// Domains that WASM modules may reach directly.
+    /// Supports a single leading wildcard label: `*.openai.com` matches
+    /// `api.openai.com` but not `openai.com` or `a.b.openai.com`.
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+}
+
 impl ProxyConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -156,6 +169,31 @@ impl ProxyConfig {
             self.circuit_breaker.open_duration_secs > 0,
             "circuit_breaker.open_duration_secs must be > 0"
         );
+        if let Some(egress) = &self.egress {
+            for (i, pattern) in egress.allowed_domains.iter().enumerate() {
+                anyhow::ensure!(
+                    !pattern.is_empty(),
+                    "egress.allowed_domains[{i}] must not be empty"
+                );
+                anyhow::ensure!(
+                    !pattern.starts_with('.') && !pattern.ends_with('.'),
+                    "egress.allowed_domains[{i}] must not start or end with '.'"
+                );
+                anyhow::ensure!(
+                    !pattern.contains(".."),
+                    "egress.allowed_domains[{i}] must not contain '..'"
+                );
+                for (j, label) in pattern.split('.').enumerate() {
+                    if label.contains('*') {
+                        anyhow::ensure!(
+                            j == 0 && label == "*",
+                            "egress.allowed_domains[{i}]: '*' may only appear as \
+                             the entire first label (e.g. '*.example.com')"
+                        );
+                    }
+                }
+            }
+        }
         if let Some(ext) = &self.external {
             anyhow::ensure!(
                 !ext.listen_address.is_empty(),

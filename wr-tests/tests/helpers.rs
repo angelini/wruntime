@@ -33,7 +33,7 @@ use wr_manager::{service::Manager, state::new_state};
 // Re-export DB types so tests using `helpers::*` need no local `use` statements.
 pub use wr_engine::db::wruntime::db::database::{DbError, Host as DbHost, PgValue};
 pub use wr_engine::state::ModuleState;
-pub use wr_proxy::config::ExternalRoute;
+pub use wr_proxy::config::{EgressConfig, ExternalRoute};
 
 // ── Manager ───────────────────────────────────────────────────────────────────
 
@@ -235,6 +235,79 @@ pub async fn start_proxy_with_schema(
     tokio::spawn(proxy_serve(listener, svc));
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     Ok(addr)
+}
+
+/// Build and start a proxy with [`EgressLayer`] configured; returns the bound address.
+///
+/// `egress_cfg` is passed directly to [`EgressLayer::new`]. Pass `None` to
+/// test that egress is disabled (external requests fall through to RoutingLayer
+/// and receive a 503).  Pass `Some(EgressConfig { allowed_domains: … })` to
+/// exercise the allowlist logic.
+pub async fn start_egress_proxy(
+    egress_cfg: Option<EgressConfig>,
+    table: wr_proxy::routing::CachedRoutingTable,
+) -> Result<SocketAddr> {
+    let (metrics_tx, _) = tokio::sync::mpsc::channel(100);
+    let svc = tower::ServiceBuilder::new()
+        .layer(wr_proxy::layers::MetricsLayer::new(metrics_tx))
+        .layer(wr_proxy::layers::EgressLayer::new(
+            egress_cfg,
+            table.clone(),
+        ))
+        .layer(wr_proxy::layers::SchemaValidationLayer::new(Arc::new(
+            wr_proxy::schema::SchemaCache::new(),
+        )))
+        .layer(wr_proxy::layers::RoutingLayer::new(table, ""))
+        .service(wr_proxy::layers::ForwardService::new(Arc::new(
+            wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
+        )));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(proxy_serve(listener, svc));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    Ok(addr)
+}
+
+/// Spawn a minimal HTTP/1.1 stub server.
+///
+/// The stub responds 200 OK with a body of `"egress:<path>"` so the caller can
+/// verify that the request arrived and the correct path was preserved.
+/// Returns the base URL (`http://127.0.0.1:<port>`) and a shutdown sender.
+pub async fn spawn_http1_stub() -> Result<(String, oneshot::Sender<()>)> {
+    let (tx, rx) = oneshot::channel::<()>();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = rx => {}
+            _ = http1_stub(listener) => {}
+        }
+    });
+    Ok((addr, tx))
+}
+
+async fn http1_stub(listener: TcpListener) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc =
+                hyper::service::service_fn(|req: Request<hyper::body::Incoming>| async move {
+                    let path = req.uri().path().to_string();
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::from(format!("egress:{path}"))))
+                            .unwrap(),
+                    )
+                });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .await;
+        });
+    }
 }
 
 /// A running proxy node.
