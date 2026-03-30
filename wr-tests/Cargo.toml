@@ -5,7 +5,7 @@ edition = "2021"
 
 [dev-dependencies]
 tokio          = { version = "1", features = ["full"] }
-tonic          = { version = "0.12", features = ["transport"] }
+tonic          = { version = "0.14", features = ["transport"] }
 hyper          = { version = "1", features = ["http1", "server"] }
 hyper-util     = { version = "0.1", features = ["tokio"] }
 http           = "1"
@@ -14,8 +14,8 @@ bytes          = "1"
 anyhow         = "1"
 tokio-stream   = { version = "0.1", features = ["net"] }
 tower          = { version = "0.5", features = ["full"] }
-prost          = "0.13"
-prost-types    = "0.13"
+prost          = "0.14"
+prost-types    = "0.14"
 serde          = { version = "1", features = ["derive"] }
 toml           = "0.8"
 wr-common      = { path = "../wr-common" }
@@ -24,4 +24,4 @@ wr-manager     = { path = "../wr-manager" }
 wr-proxy       = { path = "../wr-proxy" }
 serde_json     = "1"
 tracing        = "0.1"
-wasmtime       = { version = "41", features = ["component-model"] }
+wasmtime       = { version = "43", features = ["component-model"] }

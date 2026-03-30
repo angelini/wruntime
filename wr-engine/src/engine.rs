@@ -11,12 +11,11 @@ use tracing::{error, info, warn, Instrument};
 use wasmtime::component::{Component, Linker};
 use wasmtime::Store;
 use wasmtime::{Config, Engine};
-use wasmtime_wasi_http::{
+use wasmtime_wasi_http::p2::{
     bindings::http::types::{ErrorCode, Scheme},
     bindings::ProxyPre,
-    body::{HostIncomingBody, HyperIncomingBody, HyperOutgoingBody},
-    types::{HostIncomingRequest, HostResponseOutparam},
-    WasiHttpView,
+    body::{HyperIncomingBody, HyperOutgoingBody},
+    WasiHttpView as _,
 };
 
 use crate::registry::{InboundRequest, ModuleRegistry, ModuleTx};
@@ -39,7 +38,6 @@ pub struct EngineRunner {
 impl EngineRunner {
     pub fn new(config: EngineConfig) -> Result<Self> {
         let mut wt_config = Config::new();
-        wt_config.async_support(true);
         wt_config.wasm_component_model(true);
         let engine = Engine::new(&wt_config)?;
 
@@ -142,7 +140,7 @@ impl EngineRunner {
 
         let mut linker: Linker<ModuleState> = Linker::new(&self.engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-        wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
         wr_engine::db::wruntime::db::database::add_to_linker::<
             ModuleState,
             wasmtime::component::HasSelf<ModuleState>,
@@ -357,29 +355,16 @@ async fn dispatch_request(
     let hyper_body: HyperIncomingBody = UnsyncBoxBody::new(
         Full::new(req_body).map_err(|_: Infallible| ErrorCode::InternalError(None)),
     );
-    let host_body = HostIncomingBody::new(
-        hyper_body,
-        Duration::from_secs(30), // between-bytes timeout
-        usize::MAX,              // field size limit (unconstrained for now)
-    );
-
-    let host_req = HostIncomingRequest::new(
-        store.data_mut(),
-        req_parts,
-        Scheme::Http,
-        Some(host_body),
-        usize::MAX,
-    )?;
-
-    let req_resource = store.data_mut().table().push(host_req)?;
+    let hyper_req = hyper::Request::from_parts(req_parts, hyper_body);
+    let req_resource = store
+        .data_mut()
+        .http()
+        .new_incoming_request(Scheme::Http, hyper_req)?;
 
     // ── Build the response outparam resource ─────────────────────────────
     let (resp_tx, resp_rx) =
         tokio::sync::oneshot::channel::<Result<hyper::Response<HyperOutgoingBody>, ErrorCode>>();
-    let out_resource = store
-        .data_mut()
-        .table()
-        .push(HostResponseOutparam { result: resp_tx })?;
+    let out_resource = store.data_mut().http().new_response_outparam(resp_tx)?;
 
     // ── Call the WASM incoming handler ───────────────────────────────────
     proxy

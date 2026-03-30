@@ -4,36 +4,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+`just` is the task runner. Run `just` with no arguments to list all recipes.
+
 ```bash
-# Build all workspace crates
-cargo build --release
+# Build
+just build           # debug build
+just build-release   # release build
+just check           # compile check only
 
-# Run tests (integration tests only, no external deps needed)
-cargo test
+# Test
+just test            # all tests
+just test-integration # wr-tests only
+just test-one <name> # single test by name
 
-# Run a single test
-cargo test <test_name>
+# Lint & format
+just fmt             # cargo fmt --all
+just lint            # cargo clippy -D warnings
+just tidy            # fmt + lint
 
-# Run tests for a specific crate
-cargo test -p wr-tests
+# Run services (debug)
+just manager
+just proxy
+just engine
 
-# Check for compile errors without building
-cargo check
+# Dev infrastructure (Docker Compose — Postgres, Grafana/LGTM, Garage S3)
+just dev-up
+just dev-down
+just dev-logs [service]
 
-# Run individual services
-cargo run -p wr-manager -- --config examples/config/manager.toml
-cargo run -p wr-proxy   -- --config examples/config/proxy.toml
-cargo run -p wr-engine  -- --config examples/config/engine.toml
-
-# CLI management tool
-cargo run -p wr-cli -- --manager http://127.0.0.1:9000 engines list
-cargo run -p wr-cli -- --manager http://127.0.0.1:9000 engines get <engine_id>
-cargo run -p wr-cli -- --manager http://127.0.0.1:9000 metrics
+# Ecommerce example
+just build-example   # compile WASM components + protobuf schemas
+just example         # build-example + run
 ```
 
-**Prerequisites:** `rustc`, `cargo`, `protoc` (for proto code generation). WASM module development additionally requires `cargo-component` and `wasm-tools`.
+**Prerequisites:** `rustc`, `cargo`, `just`, `protoc` (for proto code generation). WASM module development additionally requires `cargo-component` and `wasm-tools`.
 
-**Integration tests with a real DB:** set `WRUNTIME_TEST_DB_URL=postgres://...` before running tests; omitting it skips DB-backed test cases.
+**Integration tests with a real DB:** set `WRUNTIME_TEST_DB_URL=postgres://postgres@localhost:5433/wruntime_test` before running tests (matches the `just dev-up` Postgres instance); omitting it skips DB-backed test cases.
 
 ## Architecture
 
@@ -66,7 +72,7 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 3. `RoutingLayer` — resolves destination engine from local routing table cache (TTL-based); injects `ResolvedDestination` as a request extension
 4. `ForwardService` — reads `ResolvedDestination` extension, strips internal headers, proxies to engine
 
-**`wr-engine`** — uses wasmtime 41 with the WASI component model. On startup: loads WASM components → registers with manager → starts 10-second heartbeat loop. Modules can optionally have a PostgreSQL pool (`deadpool-postgres`) exposed to WASM via custom `wruntime::db::database` bindings.
+**`wr-engine`** — uses wasmtime 41 with the WASI component model. On startup: loads WASM components → registers with manager → starts 10-second heartbeat loop. Modules can optionally have a PostgreSQL pool (`deadpool-postgres`) and a blobstore (S3-compatible via `rust-s3`) exposed to WASM via custom host bindings.
 
 **`wr-manager` state** — pure in-memory (`state.rs`). No persistence; rebuilt from engine re-registrations after restart. Background task monitors heartbeats every 10 seconds — marks routing rules unhealthy and bumps the routing table version when an engine times out (default 30 s).
 
@@ -74,7 +80,26 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 
 **Schemas** — stored as compiled protobuf `FileDescriptorSet` bytes (`.binpb` files). Declared per module in `engine.toml`; uploaded to the manager on engine registration; fetched by the proxy on demand.
 
-This project targets WASI Preview 2 and and all guest WASM modules should be built to target Preview 2.
+This project targets WASI Preview 2 and all guest WASM modules should be built to target Preview 2.
+
+### WIT Host Bindings (async)
+
+Host interfaces are defined under `wit/` (`db.wit`, `blobstore.wit`, `tracing.wit`) and implemented in `wr-engine`. All host bindings use async — the `bindgen!` macro is invoked with `imports: { default: async }`, and every `Host` / `HostTransaction` trait method is `async fn`. Do not use `block_in_place` or `block_on` in host implementations.
+
+```rust
+wasmtime::component::bindgen!({
+    path:  "../wit/db.wit",
+    world: "db-access",
+    imports: { default: async },
+    // ...
+});
+
+impl Host for ModuleState {
+    async fn query(&mut self, sql: String, params: Vec<PgValue>) -> Result<Vec<Row>, DbError> {
+        // ...
+    }
+}
+```
 
 ### Configuration
 
@@ -82,7 +107,13 @@ Each service reads a TOML config file. Examples in `examples/config/` (`manager.
 
 ### Integration Tests
 
-`wr-tests/tests/integration_test.rs` spins up all three services in-process on ephemeral ports. Helpers in `tests/helpers.rs` provide `start_manager()`, `start_proxy()`, `stub_engine()`, and schema/payload builders. Tests cover: manager RPC operations, proxy routing (including round-robin across multiple engines), schema validation, pass-through when no schema is cached, and TOML config parsing.
+`wr-tests/tests/integration_test.rs` spins up all three services in-process on ephemeral ports. Helpers in `tests/helpers.rs` provide `start_manager()`, `start_proxy()`, `stub_engine()`, and schema/payload builders. Tests cover: manager RPC operations, proxy routing (including round-robin across multiple engines), schema validation, pass-through when no schema is cached, TOML config parsing, and DB/blobstore host bindings.
+
+DB tests that call host methods must `.await` them — all host trait methods are async:
+
+```rust
+let rows = state.query("SELECT 1".into(), vec![]).await.expect("query");
+```
 
 ### Examples
 

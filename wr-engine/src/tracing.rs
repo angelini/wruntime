@@ -1,5 +1,4 @@
 use wasmtime::component::Resource;
-use wasmtime_wasi_http::WasiHttpView as _;
 
 use crate::state::ModuleState;
 

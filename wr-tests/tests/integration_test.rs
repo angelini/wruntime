@@ -1014,8 +1014,8 @@ fn test_engine_config_module_database_flag_defaults_to_false() {
 
 // ─ Host trait — no pool ───────────────────────────────────────────────────────
 
-#[test]
-fn test_db_query_without_pool_returns_connection_error() {
+#[tokio::test]
+async fn test_db_query_without_pool_returns_connection_error() {
     let mut state = ModuleState::new(
         "test".into(),
         "test-ns".into(),
@@ -1027,15 +1027,15 @@ fn test_db_query_without_pool_returns_connection_error() {
         tracing::Span::none(),
     )
     .expect("ModuleState");
-    let err = state.query("SELECT 1".into(), vec![]).unwrap_err();
+    let err = state.query("SELECT 1".into(), vec![]).await.unwrap_err();
     assert!(
         matches!(err, DbError::Connection(_)),
         "expected Connection error, got {err:?}",
     );
 }
 
-#[test]
-fn test_db_execute_without_pool_returns_connection_error() {
+#[tokio::test]
+async fn test_db_execute_without_pool_returns_connection_error() {
     let mut state = ModuleState::new(
         "test".into(),
         "test-ns".into(),
@@ -1049,6 +1049,7 @@ fn test_db_execute_without_pool_returns_connection_error() {
     .expect("ModuleState");
     let err = state
         .execute("INSERT INTO t VALUES (1)".into(), vec![])
+        .await
         .unwrap_err();
     assert!(
         matches!(err, DbError::Connection(_)),
@@ -1067,6 +1068,7 @@ async fn test_db_bytea_roundtrip() {
             "SELECT $1::bytea AS b".into(),
             vec![PgValue::Bytea(payload.clone())],
         )
+        .await
         .expect("query");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].columns[0].value, PgValue::Bytea(payload));
@@ -1080,6 +1082,7 @@ async fn test_db_uuid_roundtrip() {
     let lo: u64 = 0xa716_4466_5544_0000;
     let rows = state
         .query("SELECT $1::uuid AS u".into(), vec![PgValue::Uuid((hi, lo))])
+        .await
         .expect("query");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].columns[0].value, PgValue::Uuid((hi, lo)));
@@ -1095,6 +1098,7 @@ async fn test_db_timestamptz_roundtrip() {
             "SELECT $1::timestamptz AS ts".into(),
             vec![PgValue::Timestamptz(micros)],
         )
+        .await
         .expect("query");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].columns[0].value, PgValue::Timestamptz(micros));
@@ -1106,6 +1110,7 @@ async fn test_db_date_roundtrip() {
     // 10957 days since 1970-01-01 = 2000-01-01.
     let rows = state
         .query("SELECT $1::date AS d".into(), vec![PgValue::Date(10957)])
+        .await
         .expect("query");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].columns[0].value, PgValue::Date(10957));
@@ -1118,6 +1123,7 @@ async fn test_db_time_roundtrip() {
     let micros: i64 = 52_200 * 1_000_000;
     let rows = state
         .query("SELECT $1::time AS t".into(), vec![PgValue::Time(micros)])
+        .await
         .expect("query");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].columns[0].value, PgValue::Time(micros));
@@ -1131,6 +1137,7 @@ async fn test_db_numeric_roundtrip() {
             "SELECT $1::numeric AS n".into(),
             vec![PgValue::Numeric("123.456".into())],
         )
+        .await
         .expect("query");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].columns[0].value, PgValue::Numeric("123.456".into()));
@@ -1145,6 +1152,7 @@ async fn test_db_jsonb_roundtrip() {
             "SELECT $1::jsonb AS j".into(),
             vec![PgValue::Jsonb(input.into())],
         )
+        .await
         .expect("query");
     assert_eq!(rows.len(), 1);
     // JSONB may reorder keys; compare structurally.
@@ -1161,6 +1169,7 @@ async fn test_db_null_param_passes_through_as_null_column() {
     let Some(mut state) = db_state(2) else { return };
     let rows = state
         .query("SELECT $1::text AS v".into(), vec![PgValue::Null])
+        .await
         .expect("query");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].columns[0].value, PgValue::Null);
@@ -1171,6 +1180,7 @@ async fn test_db_query_error_on_invalid_sql() {
     let Some(mut state) = db_state(2) else { return };
     let err = state
         .query("THIS IS NOT VALID SQL".into(), vec![])
+        .await
         .unwrap_err();
     assert!(
         matches!(err, DbError::Query(_)),
@@ -1189,6 +1199,7 @@ async fn test_db_execute_insert_and_query_roundtrip() {
             "CREATE TEMP TABLE _wr_roundtrip (name TEXT, score INT4)".into(),
             vec![],
         )
+        .await
         .expect("create table");
 
     let n = state
@@ -1196,11 +1207,13 @@ async fn test_db_execute_insert_and_query_roundtrip() {
             "INSERT INTO _wr_roundtrip VALUES ($1, $2)".into(),
             vec![PgValue::Text("alice".into()), PgValue::Int4(99)],
         )
+        .await
         .expect("insert");
     assert_eq!(n, 1, "one row should have been inserted");
 
     let rows = state
         .query("SELECT name, score FROM _wr_roundtrip".into(), vec![])
+        .await
         .expect("select");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].columns[0].value, PgValue::Text("alice".into()));
@@ -1214,9 +1227,11 @@ async fn test_db_execute_returns_affected_row_count() {
 
     state
         .execute("CREATE TEMP TABLE _wr_update (v INT4)".into(), vec![])
+        .await
         .expect("create table");
     state
         .execute("INSERT INTO _wr_update VALUES (1), (2), (3)".into(), vec![])
+        .await
         .expect("insert rows");
 
     let n = state
@@ -1224,11 +1239,13 @@ async fn test_db_execute_returns_affected_row_count() {
             "UPDATE _wr_update SET v = v + 10 WHERE v < 3".into(),
             vec![],
         )
+        .await
         .expect("update");
     assert_eq!(n, 2, "two rows should have v < 3");
 
     let deleted = state
         .execute("DELETE FROM _wr_update WHERE v > 10".into(), vec![])
+        .await
         .expect("delete");
     assert_eq!(deleted, 2, "two updated rows should be deleted");
 }
@@ -1361,23 +1378,27 @@ async fn test_db_schema_isolation_between_modules() {
     };
 
     // Drop any table left by a previous test run.
-    let _ = DbHost::execute(&mut bar, format!("DROP TABLE IF EXISTS {TABLE}"), vec![]);
+    let _ = DbHost::execute(&mut bar, format!("DROP TABLE IF EXISTS {TABLE}"), vec![]).await;
 
     // foo.bar creates and populates its own table.
     DbHost::execute(&mut bar, format!("CREATE TABLE {TABLE} (id INT4)"), vec![])
+        .await
         .expect("create table in foo.bar schema");
     DbHost::execute(&mut bar, format!("INSERT INTO {TABLE} VALUES (1)"), vec![])
+        .await
         .expect("insert into foo.bar schema");
 
     // foo.other's schema has no such table — the query must fail.
-    let result = DbHost::query(&mut other, format!("SELECT id FROM {TABLE}"), vec![]);
+    let result = DbHost::query(&mut other, format!("SELECT id FROM {TABLE}"), vec![]).await;
     assert!(
         result.is_err(),
         "foo.other must not see foo.bar's table; got: {result:?}",
     );
 
     // Clean up.
-    DbHost::execute(&mut bar, format!("DROP TABLE {TABLE}"), vec![]).expect("drop");
+    DbHost::execute(&mut bar, format!("DROP TABLE {TABLE}"), vec![])
+        .await
+        .expect("drop");
 }
 
 /// Two engine instances of the same module share the same Postgres schema.
@@ -1395,7 +1416,7 @@ async fn test_db_schema_shared_across_module_instances() {
     };
 
     // Drop any table left by a previous test run.
-    let _ = DbHost::execute(&mut inst1, format!("DROP TABLE IF EXISTS {TABLE}"), vec![]);
+    let _ = DbHost::execute(&mut inst1, format!("DROP TABLE IF EXISTS {TABLE}"), vec![]).await;
 
     // Instance 1 creates the table and inserts a row.
     DbHost::execute(
@@ -1403,17 +1424,20 @@ async fn test_db_schema_shared_across_module_instances() {
         format!("CREATE TABLE {TABLE} (val INT4)"),
         vec![],
     )
+    .await
     .expect("create table");
     DbHost::execute(
         &mut inst1,
         format!("INSERT INTO {TABLE} VALUES (42)"),
         vec![],
     )
+    .await
     .expect("insert");
 
     // Instance 2 reads from the same schema and must see the row.
-    let rows =
-        DbHost::query(&mut inst2, format!("SELECT val FROM {TABLE}"), vec![]).expect("query");
+    let rows = DbHost::query(&mut inst2, format!("SELECT val FROM {TABLE}"), vec![])
+        .await
+        .expect("query");
     assert_eq!(
         rows.len(),
         1,
@@ -1422,7 +1446,9 @@ async fn test_db_schema_shared_across_module_instances() {
     assert_eq!(rows[0].columns[0].value, PgValue::Int4(42));
 
     // Clean up.
-    DbHost::execute(&mut inst1, format!("DROP TABLE {TABLE}"), vec![]).expect("drop");
+    DbHost::execute(&mut inst1, format!("DROP TABLE {TABLE}"), vec![])
+        .await
+        .expect("drop");
 }
 
 // ── cross-node routing tests ──────────────────────────────────────────────────

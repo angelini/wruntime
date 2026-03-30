@@ -1,7 +1,6 @@
 use chrono::DateTime;
 use s3::{creds::Credentials, Bucket, Region};
 use std::sync::Arc;
-use tokio::runtime::Handle;
 
 use crate::config::BlobstoreConfig;
 use crate::state::ModuleState;
@@ -45,6 +44,7 @@ impl BlobstoreRuntime {
 wasmtime::component::bindgen!({
     path:  "../wit/blobstore.wit",
     world: "blobstore-access",
+    imports: { default: async },
 });
 
 use wruntime::blobstore::store::{BlobError, Host, ObjectMeta};
@@ -52,112 +52,97 @@ use wruntime::blobstore::store::{BlobError, Host, ObjectMeta};
 // ── Host implementation ───────────────────────────────────────────────────────
 
 impl Host for ModuleState {
-    fn put_object(&mut self, bucket: String, key: String, data: Vec<u8>) -> Result<(), BlobError> {
+    async fn put_object(
+        &mut self,
+        bucket: String,
+        key: String,
+        data: Vec<u8>,
+    ) -> Result<(), BlobError> {
         let rt = require_blobstore(&self.blobstore)?;
-        tokio::task::block_in_place(|| {
-            Handle::current().block_on(async move {
-                let b = rt
-                    .bucket(&bucket)
-                    .map_err(|e| BlobError::Io(e.to_string()))?;
-                b.put_object(&key, &data)
-                    .await
-                    .map(|_| ())
-                    .map_err(map_s3_err)
-            })
-        })
+        let b = rt
+            .bucket(&bucket)
+            .map_err(|e| BlobError::Io(e.to_string()))?;
+        b.put_object(&key, &data)
+            .await
+            .map(|_| ())
+            .map_err(map_s3_err)
     }
 
-    fn get_object(&mut self, bucket: String, key: String) -> Result<Vec<u8>, BlobError> {
+    async fn get_object(&mut self, bucket: String, key: String) -> Result<Vec<u8>, BlobError> {
         let rt = require_blobstore(&self.blobstore)?;
-        tokio::task::block_in_place(|| {
-            Handle::current().block_on(async move {
-                let b = rt
-                    .bucket(&bucket)
-                    .map_err(|e| BlobError::Io(e.to_string()))?;
-                b.get_object(&key)
-                    .await
-                    .map(|r| r.to_vec())
-                    .map_err(map_s3_err)
-            })
-        })
+        let b = rt
+            .bucket(&bucket)
+            .map_err(|e| BlobError::Io(e.to_string()))?;
+        b.get_object(&key)
+            .await
+            .map(|r| r.to_vec())
+            .map_err(map_s3_err)
     }
 
-    fn delete_object(&mut self, bucket: String, key: String) -> Result<(), BlobError> {
+    async fn delete_object(&mut self, bucket: String, key: String) -> Result<(), BlobError> {
         let rt = require_blobstore(&self.blobstore)?;
-        tokio::task::block_in_place(|| {
-            Handle::current().block_on(async move {
-                let b = rt
-                    .bucket(&bucket)
-                    .map_err(|e| BlobError::Io(e.to_string()))?;
-                b.delete_object(&key).await.map(|_| ()).map_err(map_s3_err)
-            })
-        })
+        let b = rt
+            .bucket(&bucket)
+            .map_err(|e| BlobError::Io(e.to_string()))?;
+        b.delete_object(&key).await.map(|_| ()).map_err(map_s3_err)
     }
 
-    fn list_objects(
+    async fn list_objects(
         &mut self,
         bucket: String,
         prefix: Option<String>,
     ) -> Result<Vec<ObjectMeta>, BlobError> {
         let rt = require_blobstore(&self.blobstore)?;
-        tokio::task::block_in_place(|| {
-            Handle::current().block_on(async move {
-                let b = rt
-                    .bucket(&bucket)
-                    .map_err(|e| BlobError::Io(e.to_string()))?;
-                let prefix_str = prefix.unwrap_or_default();
-                let mut all: Vec<ObjectMeta> = Vec::new();
-                let mut token: Option<String> = None;
-                loop {
-                    let (page, _) = b
-                        .list_page(prefix_str.clone(), None, token, None, None)
-                        .await
-                        .map_err(map_s3_err)?;
-                    for obj in page.contents {
-                        all.push(ObjectMeta {
-                            key: obj.key,
-                            size: obj.size,
-                            last_modified: parse_last_modified(&obj.last_modified),
-                            etag: obj.e_tag.unwrap_or_default(),
-                        });
-                    }
-                    token = page.next_continuation_token;
-                    if token.is_none() {
-                        break;
-                    }
-                }
-                Ok(all)
-            })
-        })
+        let b = rt
+            .bucket(&bucket)
+            .map_err(|e| BlobError::Io(e.to_string()))?;
+        let prefix_str = prefix.unwrap_or_default();
+        let mut all: Vec<ObjectMeta> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let (page, _) = b
+                .list_page(prefix_str.clone(), None, token, None, None)
+                .await
+                .map_err(map_s3_err)?;
+            for obj in page.contents {
+                all.push(ObjectMeta {
+                    key: obj.key,
+                    size: obj.size,
+                    last_modified: parse_last_modified(&obj.last_modified),
+                    etag: obj.e_tag.unwrap_or_default(),
+                });
+            }
+            token = page.next_continuation_token;
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok(all)
     }
 
-    fn head_object(&mut self, bucket: String, key: String) -> Result<ObjectMeta, BlobError> {
+    async fn head_object(&mut self, bucket: String, key: String) -> Result<ObjectMeta, BlobError> {
         let rt = require_blobstore(&self.blobstore)?;
         let key2 = key.clone();
-        tokio::task::block_in_place(|| {
-            Handle::current().block_on(async move {
-                let b = rt
-                    .bucket(&bucket)
-                    .map_err(|e| BlobError::Io(e.to_string()))?;
-                let (head, status) = b.head_object(&key).await.map_err(|e| match e {
-                    s3::error::S3Error::HttpFailWithBody(404, msg) => BlobError::NotFound(msg),
-                    s3::error::S3Error::HttpFailWithBody(403, msg) => BlobError::AccessDenied(msg),
-                    e => BlobError::Io(e.to_string()),
-                })?;
-                if status == 404 {
-                    return Err(BlobError::NotFound(key2));
-                }
-                Ok(ObjectMeta {
-                    key,
-                    size: head.content_length.unwrap_or(0) as u64,
-                    last_modified: head
-                        .last_modified
-                        .as_deref()
-                        .map(parse_last_modified)
-                        .unwrap_or(0),
-                    etag: head.e_tag.unwrap_or_default(),
-                })
-            })
+        let b = rt
+            .bucket(&bucket)
+            .map_err(|e| BlobError::Io(e.to_string()))?;
+        let (head, status) = b.head_object(&key).await.map_err(|e| match e {
+            s3::error::S3Error::HttpFailWithBody(404, msg) => BlobError::NotFound(msg),
+            s3::error::S3Error::HttpFailWithBody(403, msg) => BlobError::AccessDenied(msg),
+            e => BlobError::Io(e.to_string()),
+        })?;
+        if status == 404 {
+            return Err(BlobError::NotFound(key2));
+        }
+        Ok(ObjectMeta {
+            key,
+            size: head.content_length.unwrap_or(0) as u64,
+            last_modified: head
+                .last_modified
+                .as_deref()
+                .map(parse_last_modified)
+                .unwrap_or(0),
+            etag: head.e_tag.unwrap_or_default(),
         })
     }
 }
