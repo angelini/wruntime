@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./dev/postgres-init:/docker-entrypoint-initdb.d
+      - postgres-data:/var/lib/postgresql/data
+
+  lgtm:
+    image: grafana/otel-lgtm:latest
+    ports:
+      - "3000:3000" # Grafana UI
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+    volumes:
+      - ./dev/observability/data:/data
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+    ports:
+      - "8900:9000" # S3 API
+      - "8901:9001" # Web console
+    volumes:
+      - rustfs-data:/data
+    command: --access-key rustfsadmin --secret-key rustfsadmin /data
+
+volumes:
+  postgres-data:
+  rustfs-data:

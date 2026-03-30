@@ -579,6 +579,7 @@ pub fn db_state(pool_size: usize) -> Option<ModuleState> {
             Some(pool),
             None,
             None,
+            None,
             tracing::Span::none(),
         )
         .expect("ModuleState"),
@@ -615,6 +616,7 @@ pub async fn db_state_for_module(
             "http://127.0.0.1:9001".parse().unwrap(),
             Some(pool),
             Some(schema),
+            None,
             None,
             tracing::Span::none(),
         )

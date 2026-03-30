@@ -1023,6 +1023,7 @@ fn test_db_query_without_pool_returns_connection_error() {
         None,
         None,
         None,
+        None,
         tracing::Span::none(),
     )
     .expect("ModuleState");
@@ -1039,6 +1040,7 @@ fn test_db_execute_without_pool_returns_connection_error() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
+        None,
         None,
         None,
         None,
@@ -1798,6 +1800,7 @@ fn test_tracing_span_start_and_drop() {
         None,
         None,
         None,
+        None,
         tracing::Span::none(),
     )
     .expect("ModuleState");
@@ -1814,6 +1817,7 @@ fn test_tracing_span_set_attribute() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
+        None,
         None,
         None,
         None,
@@ -1843,6 +1847,7 @@ fn test_tracing_span_record_event() {
         None,
         None,
         None,
+        None,
         tracing::Span::none(),
     )
     .expect("ModuleState");
@@ -1866,6 +1871,7 @@ fn test_tracing_span_set_error() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
+        None,
         None,
         None,
         None,

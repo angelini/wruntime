@@ -5,7 +5,7 @@ manager_address = "http://127.0.0.1:9000"
 proxy_address = "http://127.0.0.1:9001"
 
 [database]
-url             = "postgres://user:pass@localhost:5432/ecommerce"
+url             = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 8
 
 [[module]]

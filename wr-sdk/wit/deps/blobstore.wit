@@ -1,0 +1,43 @@
+package wruntime:blobstore@0.1.0;
+
+interface store {
+    variant blob-error {
+        /// The object does not exist.
+        not-found(string),
+        /// The caller does not have permission to perform the operation.
+        access-denied(string),
+        /// Any other I/O or transport error.
+        io(string),
+    }
+
+    /// Metadata returned by list-objects and head-object.
+    record object-meta {
+        key: string,
+        /// Object size in bytes.
+        size: u64,
+        /// Seconds since Unix epoch (UTC).
+        last-modified: s64,
+        /// ETag as returned by the server (may include surrounding quotes).
+        etag: string,
+    }
+
+    /// Upload bytes to an object. Creates or overwrites.
+    put-object: func(bucket: string, key: string, data: list<u8>) -> result<_, blob-error>;
+
+    /// Download an object's full contents.
+    get-object: func(bucket: string, key: string) -> result<list<u8>, blob-error>;
+
+    /// Delete an object. Succeeds even if the object does not exist.
+    delete-object: func(bucket: string, key: string) -> result<_, blob-error>;
+
+    /// List objects in a bucket, optionally filtered by key prefix.
+    list-objects: func(bucket: string, prefix: option<string>) -> result<list<object-meta>, blob-error>;
+
+    /// Return metadata for an object without downloading its body.
+    head-object: func(bucket: string, key: string) -> result<object-meta, blob-error>;
+}
+
+/// The world the host exposes to every WASM module that opts in to blobstore access.
+world blobstore-access {
+    import store;
+}

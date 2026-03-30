@@ -461,6 +461,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             tracing::Span::none(),
         )
         .expect("state");
@@ -480,6 +481,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             tracing::Span::none(),
         )
         .expect("state");
@@ -496,6 +498,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
+            None,
             None,
             None,
             None,
@@ -531,6 +534,7 @@ mod tests {
             Some(Arc::new(pool)),
             None,
             None,
+            None,
             tracing::Span::none(),
         )
         .expect("state");
@@ -560,6 +564,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             Some(Arc::new(pool)),
+            None,
             None,
             None,
             tracing::Span::none(),
@@ -594,6 +599,7 @@ mod tests {
             Some(Arc::new(pool)),
             None,
             None,
+            None,
             tracing::Span::none(),
         )
         .expect("state");
@@ -625,6 +631,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             Some(Arc::new(pool)),
+            None,
             None,
             None,
             tracing::Span::none(),
@@ -672,6 +679,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             Some(Arc::new(pool)),
+            None,
             None,
             None,
             tracing::Span::none(),
@@ -733,6 +741,7 @@ mod tests {
             Some(Arc::new(pool)),
             None,
             None,
+            None,
             tracing::Span::none(),
         )
         .expect("state");
@@ -787,6 +796,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             Some(Arc::new(pool)),
+            None,
             None,
             None,
             tracing::Span::none(),

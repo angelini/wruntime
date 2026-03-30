@@ -93,34 +93,35 @@ node-b-proxy:
 node-b-engine-1:
     cargo run -p wr-engine -- --config examples/multi-node/node-b/engine-1.toml
 
-# ── Database (test) ───────────────────────────────────────────────────────────
+# ── Dev infrastructure (Docker Compose) ──────────────────────────────────────
 
-pg_data := ".pg-test-data"
-pg_port := "5433"
-db_url  := "postgres://postgres@localhost:" + pg_port
+db_url_example := "postgres://postgres@localhost:5433/wruntime_example"
+db_url_test    := "postgres://postgres@localhost:5433/wruntime_test"
 
-# Initialise a local Postgres data directory — run once before db-start
-db-init:
-    initdb -D {{pg_data}} --auth=trust --username=postgres
-    echo "port = {{pg_port}}" >> {{pg_data}}/postgresql.conf
-    @echo "Initialised — run 'just db-start' to start"
+# Start all dev services (Postgres, LGTM, Garage)
+dev-up:
+    mkdir -p dev/observability/data
+    docker compose up -d
+    @echo "Postgres:   localhost:5433"
+    @echo "            example: {{db_url_example}}"
+    @echo "            test:    {{db_url_test}}"
+    @echo "Grafana:    http://localhost:3000  (admin/admin)"
+    @echo "OTLP gRPC:  localhost:4317"
+    @echo "OTLP HTTP:  localhost:4318"
+    @echo "Garage S3:  localhost:3900"
+    @echo "Garage adm: localhost:3901"
 
-# Start the local Postgres instance and create the example and test DBs
-db-start:
-    pg_ctl -D {{pg_data}} -l {{pg_data}}/postgres.log start
-    @until pg_isready -p {{pg_port}} -U postgres -q; do sleep 0.5; done
-    createdb -p {{pg_port}} -U postgres wruntime_example 2>/dev/null || true
-    createdb -p {{pg_port}} -U postgres wruntime_test 2>/dev/null || true
-    @echo "Ready — WRUNTIME_EXAMPLE_DB_URL={{db_url}}/wruntime_example"
-    @echo "Ready — WRUNTIME_TEST_DB_URL={{db_url}}/wruntime_test"
+# Stop all dev services
+dev-down:
+    docker compose down
 
-# Stop the local Postgres instance
-db-stop:
-    pg_ctl -D {{pg_data}} stop
+# Tail logs — optionally filter to one service: just dev-logs postgres
+dev-logs service="":
+    docker compose logs -f {{service}}
 
-# Check whether Postgres is accepting connections on db_port
-db-status:
-    pg_isready -p {{pg_port}} -U postgres
+# Show running container status
+dev-ps:
+    docker compose ps
 
 # ── Ecommerce Example ─────────────────────────────────────────────────────────
 
@@ -141,35 +142,6 @@ build-example: build-schemas
 # Run the full ecommerce example (requires Postgres — see `just db-start-example`)
 example: build-example build
     bash examples/ecommerce/run.sh
-
-# ── Observability (LGTM stack) ────────────────────────────────────────────────
-
-lgtm_dir := "observability"
-
-# Start the Grafana LGTM stack (Loki, Grafana, Tempo, Mimir)
-obs-up:
-    mkdir -p {{lgtm_dir}}/data
-    docker run --rm -d \
-        --name lgtm \
-        -p 3000:3000 \
-        -p 4317:4317 \
-        -p 4318:4318 \
-        -v $(pwd)/{{lgtm_dir}}/data:/data \
-        grafana/otel-lgtm
-    @echo "Grafana: http://localhost:3000 (admin/admin)"
-    @echo "OTLP gRPC: localhost:4317  OTLP HTTP: localhost:4318"
-
-# Stop the LGTM stack
-obs-down:
-    docker stop lgtm
-
-# Tail logs from the LGTM container
-obs-logs:
-    docker logs -f lgtm
-
-# Print LGTM container status
-obs-status:
-    docker ps --filter name=lgtm
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 
