@@ -12,6 +12,15 @@ schema_ttl_secs        = 60
 flush_interval_secs = 10
 queue_depth         = 1000
 
+# Circuit breaker — protects downstream engines from overload.
+# Each engine address gets its own independent breaker; one open circuit
+# does not affect routing to the other engines.
+# All fields are optional; the values below are the defaults.
+#
+# [circuit_breaker]
+# failure_threshold  = 5   # consecutive failures (5xx / 429 / network error) before opening
+# open_duration_secs = 30  # seconds the breaker stays open before probing again
+
 # Optional: expose a subset of routes to external callers on a separate port.
 # All x-wr-* headers are stripped from incoming requests before routing.
 #

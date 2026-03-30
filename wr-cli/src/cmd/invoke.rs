@@ -39,7 +39,9 @@ pub async fn run(args: InvokeArgs) -> Result<()> {
     let method = reqwest::Method::from_bytes(args.method.to_uppercase().as_bytes())
         .context("Invalid HTTP method")?;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()?;
     let mut req = client
         .request(method, &proxy_url)
         .header(CONTENT_TYPE, &args.content_type)

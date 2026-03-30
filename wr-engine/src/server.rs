@@ -1,11 +1,13 @@
 use std::convert::Infallible;
 
+use serde_json::json;
+
 use anyhow::Result;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
+use hyper::server::conn::http2;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing::{info, info_span, warn, Instrument};
@@ -59,7 +61,10 @@ pub async fn serve(addr: &str, registry: ModuleRegistry) -> Result<()> {
                     Ok::<_, Infallible>(resp)
                 }
             });
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+            if let Err(e) = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await
+            {
                 warn!(error = %e, "inbound connection error");
             }
         });
@@ -133,7 +138,7 @@ async fn handle(
     match sender.try_send(inbound) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
-            return err(StatusCode::TOO_MANY_REQUESTS, "engine at capacity");
+            return too_many_requests(&module);
         }
         Err(TrySendError::Closed(_)) => {
             return err(StatusCode::SERVICE_UNAVAILABLE, "module channel closed");
@@ -155,6 +160,20 @@ fn header_owned(headers: &http::HeaderMap, name: &str) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown")
         .to_owned()
+}
+
+fn too_many_requests(module: &str) -> Response<Full<Bytes>> {
+    let body = json!({
+        "error": "too_many_requests",
+        "reason": "module channel at capacity",
+        "module": module,
+    });
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header("Retry-After", "1")
+        .body(Full::new(Bytes::from(body.to_string())))
+        .unwrap()
 }
 
 fn err(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {

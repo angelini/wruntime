@@ -950,7 +950,7 @@ fn test_engine_config_database_section_parses() {
 }
 
 #[test]
-fn test_engine_config_database_max_connections_defaults_to_8() {
+fn test_engine_config_database_max_connections_default() {
     use wr_engine::config::EngineConfig;
     let toml = r#"
         listen_address  = "0.0.0.0:9100"
@@ -962,7 +962,7 @@ fn test_engine_config_database_max_connections_defaults_to_8() {
     "#;
     let cfg: EngineConfig = toml::from_str(toml).unwrap();
     let db = cfg.database.expect("database section should be present");
-    assert_eq!(db.max_connections, 8);
+    assert_eq!(db.max_connections, 20);
 }
 
 #[test]
@@ -1020,6 +1020,7 @@ async fn test_db_query_without_pool_returns_connection_error() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
+        http_client(),
         None,
         None,
         None,
@@ -1040,6 +1041,7 @@ async fn test_db_execute_without_pool_returns_connection_error() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
+        http_client(),
         None,
         None,
         None,
@@ -1823,6 +1825,7 @@ fn test_tracing_span_start_and_drop() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
+        http_client(),
         None,
         None,
         None,
@@ -1843,6 +1846,7 @@ fn test_tracing_span_set_attribute() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
+        http_client(),
         None,
         None,
         None,
@@ -1870,6 +1874,7 @@ fn test_tracing_span_record_event() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
+        http_client(),
         None,
         None,
         None,
@@ -1897,6 +1902,7 @@ fn test_tracing_span_set_error() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
+        http_client(),
         None,
         None,
         None,

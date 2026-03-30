@@ -1,5 +1,5 @@
 .claude/settings.local.json
 .pg-test-data
-binding.rs
+bindings.rs
 observability
 target

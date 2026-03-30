@@ -7,7 +7,9 @@ use opentelemetry_sdk::{
     metrics::SdkMeterProvider,
     propagation::TraceContextPropagator,
     runtime,
-    trace::{Config as TraceConfig, RandomIdGenerator, Sampler, TracerProvider},
+    trace::{
+        BatchConfigBuilder, Config as TraceConfig, RandomIdGenerator, Sampler, TracerProvider,
+    },
     Resource,
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -65,6 +67,12 @@ pub fn init(service_name: &'static str) -> Result<TelemetryGuard> {
                 .with_sampler(Sampler::AlwaysOn)
                 .with_id_generator(RandomIdGenerator::default())
                 .with_resource(resource.clone()),
+        )
+        .with_batch_config(
+            BatchConfigBuilder::default()
+                .with_max_queue_size(8192)
+                .with_max_export_batch_size(512)
+                .build(),
         )
         .install_batch(runtime::Tokio)?;
 

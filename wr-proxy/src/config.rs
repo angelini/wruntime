@@ -14,6 +14,8 @@ pub struct ProxyConfig {
     pub cache: CacheConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
     /// Optional external-facing listener with a restricted set of public routes.
     pub external: Option<ExternalConfig>,
 }
@@ -90,6 +92,23 @@ impl Default for MetricsConfig {
     }
 }
 
+#[derive(Deserialize, Clone)]
+pub struct CircuitBreakerConfig {
+    /// Number of consecutive failures before the breaker opens.
+    pub failure_threshold: u32,
+    /// How long (seconds) the breaker stays open before entering half-open.
+    pub open_duration_secs: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            open_duration_secs: 30,
+        }
+    }
+}
+
 impl ProxyConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -128,6 +147,14 @@ impl ProxyConfig {
         anyhow::ensure!(
             self.metrics.queue_depth > 0,
             "metrics.queue_depth must be > 0"
+        );
+        anyhow::ensure!(
+            self.circuit_breaker.failure_threshold > 0,
+            "circuit_breaker.failure_threshold must be > 0"
+        );
+        anyhow::ensure!(
+            self.circuit_breaker.open_duration_secs > 0,
+            "circuit_breaker.open_duration_secs must be > 0"
         );
         if let Some(ext) = &self.external {
             anyhow::ensure!(

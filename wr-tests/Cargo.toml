@@ -6,8 +6,8 @@ edition = "2021"
 [dev-dependencies]
 tokio          = { version = "1", features = ["full"] }
 tonic          = { version = "0.14", features = ["transport"] }
-hyper          = { version = "1", features = ["http1", "server"] }
-hyper-util     = { version = "0.1", features = ["tokio"] }
+hyper          = { version = "1", features = ["http2", "server"] }
+hyper-util     = { version = "0.1", features = ["client-legacy", "http2", "tokio"] }
 http           = "1"
 http-body-util = "0.1"
 bytes          = "1"
