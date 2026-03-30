@@ -21,8 +21,10 @@ toml               = "0.8"
 serde              = { version = "1", features = ["derive"] }
 uuid               = { version = "1", features = ["v4"] }
 wr-common           = { path = "../wr-common" }
-tracing             = "0.1"
-tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+tracing              = "0.1"
+tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.27"
+opentelemetry         = "0.26"
 tokio-postgres      = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
 deadpool-postgres   = { version = "0.14", features = ["rt_tokio_1"] }
 chrono              = "0.4"

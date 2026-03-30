@@ -13,8 +13,8 @@ interface span {
         set-error: func(message: string);
     }
 
-    /// Start a new child span under the current request span.
-    start: func(name: string) -> active-span;
+    /// Start a new child span under the current request span with initial attributes.
+    start: func(name: string, attrs: list<tuple<string, string>>) -> active-span;
 }
 
 world tracing-access {
