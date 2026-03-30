@@ -20,6 +20,7 @@ use wasmtime_wasi_http::{
 };
 
 use crate::registry::{InboundRequest, ModuleRegistry, ModuleTx};
+use wr_engine::blobstore::BlobstoreRuntime;
 use wr_engine::config::{EngineConfig, ModuleConfig};
 use wr_engine::pool::module_schema;
 use wr_engine::state::ModuleState;
@@ -31,6 +32,8 @@ pub struct EngineRunner {
     db_pool: Option<Arc<Pool>>,
     /// One pool per DB-enabled module, keyed by (namespace, name).
     db_pools: HashMap<(String, String), Arc<Pool>>,
+    /// Shared S3-compatible blobstore client, present when `[blobstore]` is configured.
+    blobstore_client: Option<Arc<BlobstoreRuntime>>,
 }
 
 impl EngineRunner {
@@ -60,11 +63,19 @@ impl EngineRunner {
             }
         }
 
+        let blobstore_client = config
+            .blobstore
+            .as_ref()
+            .map(BlobstoreRuntime::new)
+            .transpose()?
+            .map(Arc::new);
+
         Ok(Self {
             engine: Arc::new(engine),
             config,
             db_pool,
             db_pools,
+            blobstore_client,
         })
     }
 
@@ -85,13 +96,22 @@ impl EngineRunner {
                 .get()
                 .await
                 .context("failed to get DB connection for schema provisioning")?;
-            client
+            let result = client
                 .execute(
                     &format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""),
                     &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
                 )
-                .await
-                .with_context(|| format!("failed to provision schema '{schema}'"))?;
+                .await;
+            match result {
+                Ok(_) => {}
+                Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_SCHEMA) => {
+                    // Race condition: another engine instance created the schema concurrently.
+                }
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("failed to provision schema '{schema}'"));
+                }
+            }
             info!(schema, "schema provisioned");
         }
 
@@ -131,6 +151,10 @@ impl EngineRunner {
             &mut linker,
             |s| s,
         )?;
+        wr_engine::blobstore::add_to_linker::<
+            ModuleState,
+            wasmtime::component::HasSelf<ModuleState>,
+        >(&mut linker, |s| s)?;
 
         // Try to pre-link as a WASI HTTP Proxy world component first.
         // This succeeds when the component exports `wasi:http/incoming-handler`.
@@ -157,6 +181,11 @@ impl EngineRunner {
                 } else {
                     (None, None)
                 };
+                let blobstore = if module_config.blobstore {
+                    self.blobstore_client.clone()
+                } else {
+                    None
+                };
                 let handler = HandlerContext {
                     engine: self.engine.clone(),
                     pre,
@@ -167,6 +196,7 @@ impl EngineRunner {
                     proxy_uri: proxy_uri.clone(),
                     db_pool,
                     db_schema,
+                    blobstore,
                     fs: module_config.fs.clone(),
                     request_timeout: Duration::from_secs(module_config.request_timeout_secs),
                 };
@@ -184,12 +214,18 @@ impl EngineRunner {
                 } else {
                     (None, None)
                 };
+                let blobstore = if module_config.blobstore {
+                    self.blobstore_client.clone()
+                } else {
+                    None
+                };
                 let state = ModuleState::new(
                     module_name.clone(),
                     module_namespace.clone(),
                     proxy_uri,
                     db_pool,
                     db_schema,
+                    blobstore,
                     module_config.fs.as_ref(),
                     tracing::Span::current(),
                 )?;
@@ -226,7 +262,7 @@ struct HandlerContext {
     pre: Arc<ProxyPre<ModuleState>>,
 }
 
-/// Module identity and database config — shared across requests.
+/// Module identity and runtime config — shared across requests.
 #[derive(Clone)]
 struct ModuleContext {
     name: String,
@@ -234,6 +270,7 @@ struct ModuleContext {
     proxy_uri: hyper::Uri,
     db_pool: Option<Arc<Pool>>,
     db_schema: Option<String>,
+    blobstore: Option<Arc<BlobstoreRuntime>>,
     fs: Option<wr_engine::config::FsMode>,
     request_timeout: Duration,
 }
@@ -305,6 +342,7 @@ async fn dispatch_request(
         module.proxy_uri.clone(),
         module.db_pool.clone(),
         module.db_schema.clone(),
+        module.blobstore.clone(),
         module.fs.as_ref(),
         tracing::Span::current(),
     )?;

@@ -7,7 +7,7 @@ proxy_address = "http://127.0.0.1:9001"   # local proxy; used to rewrite WASM ou
 
 # Optional — remove this section if no modules need database access.
 [database]
-url             = "postgres://user:pass@localhost:5432/mydb"
+url             = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 8
 
 [[module]]

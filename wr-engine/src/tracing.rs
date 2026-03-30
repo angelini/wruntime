@@ -110,6 +110,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             tracing::Span::none(),
         )
         .expect("state");
@@ -123,6 +124,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
+            None,
             None,
             None,
             None,
@@ -149,6 +151,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             tracing::Span::none(),
         )
         .expect("state");
@@ -169,6 +172,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
+            None,
             None,
             None,
             None,

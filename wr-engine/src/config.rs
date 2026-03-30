@@ -14,6 +14,8 @@ pub struct EngineConfig {
     pub modules: Vec<ModuleConfig>,
     /// Optional PostgreSQL connection pool shared across DB-enabled modules.
     pub database: Option<DatabaseConfig>,
+    /// Optional S3-compatible blobstore shared across blobstore-enabled modules.
+    pub blobstore: Option<BlobstoreConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -27,6 +29,21 @@ pub struct DatabaseConfig {
 
 fn default_max_connections() -> usize {
     8
+}
+
+#[derive(Deserialize, Clone)]
+pub struct BlobstoreConfig {
+    /// S3-compatible endpoint URL, e.g. "http://127.0.0.1:8900"
+    pub endpoint: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    /// S3 region. Defaults to "us-east-1".
+    #[serde(default = "default_bs_region")]
+    pub region: String,
+}
+
+fn default_bs_region() -> String {
+    "us-east-1".into()
 }
 
 /// Filesystem access mode for a module.
@@ -51,6 +68,10 @@ pub struct ModuleConfig {
     /// Requires a `[database]` section in the engine config.
     #[serde(default)]
     pub database: bool,
+    /// Whether this module has access to the shared blobstore client.
+    /// Requires a `[blobstore]` section in the engine config.
+    #[serde(default)]
+    pub blobstore: bool,
     /// Optional filesystem access. Set `fs = "tempdir"` to mount an ephemeral
     /// writable directory at `/` for the duration of each store's lifetime.
     #[serde(default)]
@@ -113,6 +134,11 @@ impl EngineConfig {
             anyhow::ensure!(
                 !module.database || self.database.is_some(),
                 "module '{}' has database = true but no [database] section is configured",
+                module.name,
+            );
+            anyhow::ensure!(
+                !module.blobstore || self.blobstore.is_some(),
+                "module '{}' has blobstore = true but no [blobstore] section is configured",
                 module.name,
             );
         }

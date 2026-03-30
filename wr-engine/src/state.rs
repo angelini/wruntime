@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::blobstore::BlobstoreRuntime;
 use crate::config::FsMode;
 use deadpool_postgres::Pool;
 use hyper::header::{HeaderName, HeaderValue};
@@ -30,6 +31,8 @@ pub struct ModuleState {
     /// `Some` only when `fs = "tempdir"` is set; kept alive so it isn't
     /// deleted until the store is dropped.
     _fs_root: Option<TempDir>,
+    /// Shared S3-compatible blobstore client, present when the module has blobstore access enabled.
+    pub blobstore: Option<Arc<BlobstoreRuntime>>,
     /// The `engine.dispatch` span for the current request.
     /// Captured at `ModuleState` construction time so host functions can create
     /// child spans even when wasmtime's synchronous call stack is outside the
@@ -38,12 +41,14 @@ pub struct ModuleState {
 }
 
 impl ModuleState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         module_name: String,
         module_namespace: String,
         proxy_uri: hyper::Uri,
         db_pool: Option<Arc<Pool>>,
         db_schema: Option<String>,
+        blobstore: Option<Arc<BlobstoreRuntime>>,
         fs: Option<&FsMode>,
         active_span: tracing::Span,
     ) -> anyhow::Result<Self> {
@@ -66,6 +71,7 @@ impl ModuleState {
             proxy_uri,
             db_pool,
             db_schema,
+            blobstore,
             _fs_root: fs_root,
             active_span,
         })
