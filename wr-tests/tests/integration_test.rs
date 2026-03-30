@@ -8,6 +8,7 @@ use helpers::*;
 use std::sync::Arc;
 
 use anyhow::Result;
+use bytes::Bytes;
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 
@@ -205,6 +206,124 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
     assert!(
         body.contains("/store.inventory-service"),
         "expected stub to echo request path, got: {body}"
+    );
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+// ── egress tests ─────────────────────────────────────────────────────────────
+
+/// Allowed domain: proxy forwards the request to the external stub and returns
+/// the stub's 200 response to the caller.
+#[tokio::test]
+async fn test_egress_allowed_domain() -> Result<()> {
+    let (ext_base, ext_shutdown) = spawn_http1_stub().await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    let proxy_addr = start_egress_proxy(
+        Some(EgressConfig {
+            allowed_domains: vec!["127.0.0.1".into()],
+        }),
+        table,
+    )
+    .await?;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/hello"))
+        .header("x-wr-destination", format!("{ext_base}/hello"))
+        .header("x-wr-source", "test-module")
+        .body(Full::new(Bytes::new()))?;
+
+    let resp = http_client().request(req).await?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await?.to_bytes();
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        "egress:/hello",
+        "stub should echo the request path"
+    );
+
+    let _ = ext_shutdown.send(());
+    Ok(())
+}
+
+/// Blocked domain: proxy returns 403 without forwarding the request.
+#[tokio::test]
+async fn test_egress_blocked_domain() -> Result<()> {
+    let table = wr_proxy::routing::new_routing_table();
+    let proxy_addr = start_egress_proxy(
+        Some(EgressConfig {
+            allowed_domains: vec!["127.0.0.1".into()],
+        }),
+        table,
+    )
+    .await?;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/test"))
+        .header(
+            "x-wr-destination",
+            "http://blocked.notallowed.example.com/test",
+        )
+        .header("x-wr-source", "test-module")
+        .body(Full::new(Bytes::new()))?;
+
+    let resp = http_client().request(req).await?;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = resp.into_body().collect().await?.to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(json["error"], "egress_not_allowed");
+
+    Ok(())
+}
+
+/// Internal module calls must still route correctly when egress is configured.
+#[tokio::test]
+async fn test_egress_internal_module_passthrough() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr_c = manager_client(&mgr_addr).await?;
+
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    register_module(
+        &mut mgr_c,
+        EngineSpec {
+            id: "stub-engine",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "store",
+            name: "inventory",
+            version: "1.0.0",
+            schema: vec![],
+        },
+    )
+    .await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+
+    // Egress is enabled but the destination is a registered internal module.
+    let proxy_addr = start_egress_proxy(
+        Some(EgressConfig {
+            allowed_domains: vec!["external.example.com".into()],
+        }),
+        table,
+    )
+    .await?;
+
+    let (status, body) = proxy_get(proxy_addr, "store", "inventory", None).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "internal module call should succeed"
+    );
+    assert!(
+        body.contains("/store.inventory"),
+        "stub should echo the request path, got: {body}"
     );
 
     let _ = engine_shutdown.send(());

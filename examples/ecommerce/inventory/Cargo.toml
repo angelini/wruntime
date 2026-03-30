@@ -7,12 +7,13 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-prost = "0.13"
+prost = "0.14"
 wr-sdk = { path = "../../../wr-sdk" }
 wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
 
 [build-dependencies]
-prost-build = "0.13"
+prost-build = "0.14"
+wr-build = { path = "../../../wr-build" }
 
 [package.metadata.component]
 package = "ecommerce:inventory"

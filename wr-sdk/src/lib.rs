@@ -67,6 +67,46 @@ pub trait RunGuest {
 pub mod http;
 pub mod io;
 pub mod log;
+pub mod tracing;
+
+/// Error type returned by generated service handler traits.
+pub struct ServiceError {
+    pub status: u16,
+    pub message: String,
+}
+
+impl ServiceError {
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self {
+            status: 400,
+            message: msg.into(),
+        }
+    }
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            status: 404,
+            message: msg.into(),
+        }
+    }
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: 409,
+            message: msg.into(),
+        }
+    }
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self {
+            status: 500,
+            message: msg.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {}: {}", self.status, self.message)
+    }
+}
 
 /// Export macro for HTTP handler modules (those that export `wasi:http/incoming-handler`).
 ///

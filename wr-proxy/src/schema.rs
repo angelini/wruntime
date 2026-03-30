@@ -134,12 +134,13 @@ impl SchemaCache {
 
     /// Validate `body` against the protobuf schema registered for `(namespace, module)`.
     ///
-    /// - Returns [`ValidationOutcome::Pass`] when the body is empty or when
-    ///   the path cannot be resolved to a known RPC (schema does not cover it).
-    /// - Returns [`ValidationOutcome::Fail`] when the body is present but
-    ///   does not decode against the expected message type.
+    /// - Returns [`ValidationOutcome::Pass`] when the body decodes successfully.
+    /// - Returns [`ValidationOutcome::Fail`] when the body does not decode
+    ///   against the expected message type.
     /// - Returns [`ValidationOutcome::SchemaNotCached`] when no schema has
-    ///   been synced yet for this module.
+    ///   been synced yet for this module — callers must reject the request.
+    /// - Returns [`ValidationOutcome::MethodNotFound`] when the path does not
+    ///   match any RPC declared in the schema.
     pub async fn validate(
         &self,
         namespace: &str,

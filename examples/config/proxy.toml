@@ -21,6 +21,14 @@ queue_depth         = 1000
 # failure_threshold  = 5   # consecutive failures (5xx / 429 / network error) before opening
 # open_duration_secs = 30  # seconds the breaker stays open before probing again
 
+# Optional: allow WASM modules to make HTTP calls to external domains (egress).
+# Without this section all outbound calls to non-module hosts are blocked (503).
+# Wildcard '*' matches exactly one DNS label:
+#   *.openai.com  →  api.openai.com ✓   openai.com ✗   a.b.openai.com ✗
+#
+# [egress]
+# allowed_domains = ["*.openai.com", "api.github.com"]
+
 # Optional: expose a subset of routes to external callers on a separate port.
 # All x-wr-* headers are stripped from incoming requests before routing.
 #

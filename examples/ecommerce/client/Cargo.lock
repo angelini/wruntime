@@ -586,7 +586,11 @@ dependencies = [
 name = "wr-build"
 version = "0.1.0"
 dependencies = [
+ "prettyplease",
+ "proc-macro2",
  "prost-build",
+ "quote",
+ "syn",
 ]
 
 [[package]]

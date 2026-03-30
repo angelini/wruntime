@@ -18,14 +18,18 @@ use tokio::sync::mpsc;
 use tower::{Service, ServiceBuilder};
 
 use layers::{
-    ForwardService, IngressLayer, MetricsLayer, ResBody, RoutingLayer, SchemaValidationLayer,
-    TracingLayer,
+    EgressLayer, ForwardService, IngressLayer, MetricsLayer, ResBody, RoutingLayer,
+    SchemaValidationLayer, TracingLayer,
 };
 use tracing::{error, info, warn};
 use wr_common::wruntime::manager_service_client::ManagerServiceClient;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     let _telemetry = wr_common::telemetry::init("wr-proxy")?;
     let config_path = std::env::args()
         .nth(1)
@@ -71,13 +75,18 @@ async fn main() -> Result<()> {
     //
     //   TracingLayer          ← root OTel span per request
     //     └─ MetricsLayer
-    //          └─ SchemaValidationLayer
-    //               └─ RoutingLayer
-    //                    └─ ForwardService
+    //          └─ EgressLayer         ← intercepts external calls; passes internal through
+    //               └─ SchemaValidationLayer
+    //                    └─ RoutingLayer
+    //                         └─ ForwardService
     //
     let internal_svc = ServiceBuilder::new()
         .layer(TracingLayer)
         .layer(MetricsLayer::new(metrics_tx.clone()))
+        .layer(EgressLayer::new(
+            config.egress.clone(),
+            routing_table.clone(),
+        ))
         .layer(SchemaValidationLayer::new(schema_cache.clone()))
         .layer(RoutingLayer::new(
             routing_table.clone(),
