@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-prost  = "0.13"
+prost       = "0.14"
+tonic       = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
 serde  = { version = "1", features = ["derive"] }
-tonic  = { version = "0.12", features = ["transport"] }
 http   = "1"
 anyhow = "1"
 tracing            = "0.1"
@@ -20,4 +21,4 @@ opentelemetry-appender-tracing     = "0.26"
 opentelemetry-http                 = "0.26"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"

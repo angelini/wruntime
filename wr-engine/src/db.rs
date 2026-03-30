@@ -1,7 +1,5 @@
 use chrono::Timelike as _;
-use tokio::runtime::Handle;
 use wasmtime::component::Resource;
-use wasmtime_wasi_http::WasiHttpView as _;
 
 /// Host-side state for an active WIT `transaction` resource.
 ///
@@ -20,6 +18,7 @@ wasmtime::component::bindgen!({
     with: {
         "wruntime:db/database.transaction": TxState,
     },
+    imports: { default: async },
 });
 
 use wruntime::db::database::{Column, DbError, Host, HostTransaction, PgValue, Row};
@@ -138,89 +137,84 @@ impl tokio_postgres::types::ToSql for PgParam {
 // ── Host implementation ──────────────────────────────────────────────────────
 
 impl Host for ModuleState {
-    fn query(&mut self, sql: String, params: Vec<PgValue>) -> Result<Vec<Row>, DbError> {
+    fn query(
+        &mut self,
+        sql: String,
+        params: Vec<PgValue>,
+    ) -> impl std::future::Future<Output = Result<Vec<Row>, DbError>> + Send {
         let pool = match &self.db_pool {
             Some(p) => p.clone(),
             None => {
-                return Err(DbError::Connection(
+                return futures::future::Either::Left(std::future::ready(Err(DbError::Connection(
                     "no database configured for this module".into(),
-                ))
+                ))))
             }
         };
         let schema = self.db_schema.clone();
-
-        tokio::task::block_in_place(|| {
-            Handle::current().block_on(async move {
-                let client = pool
-                    .get()
+        futures::future::Either::Right(async move {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| DbError::Connection(e.to_string()))?;
+            if let Some(s) = &schema {
+                client
+                    .execute(
+                        &format!("SET search_path = \"{s}\", public"),
+                        &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
+                    )
                     .await
                     .map_err(|e| DbError::Connection(e.to_string()))?;
-
-                if let Some(s) = &schema {
-                    client
-                        .execute(
-                            &format!("SET search_path = \"{s}\", public"),
-                            &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
-                        )
-                        .await
-                        .map_err(|e| DbError::Connection(e.to_string()))?;
-                }
-
-                let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
-                let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                    pg_params.iter().map(|p| p as _).collect();
-
-                let rows = client
-                    .query(sql.as_str(), &params_ref)
-                    .await
-                    .map_err(|e| DbError::Query(e.to_string()))?;
-
-                Ok(rows.iter().map(pg_row_to_wit).collect())
-            })
+            }
+            let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
+            let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                pg_params.iter().map(|p| p as _).collect();
+            let rows = client
+                .query(sql.as_str(), &params_ref)
+                .await
+                .map_err(|e| DbError::Query(e.to_string()))?;
+            Ok(rows.iter().map(pg_row_to_wit).collect())
         })
     }
 
-    fn execute(&mut self, sql: String, params: Vec<PgValue>) -> Result<u64, DbError> {
+    fn execute(
+        &mut self,
+        sql: String,
+        params: Vec<PgValue>,
+    ) -> impl std::future::Future<Output = Result<u64, DbError>> + Send {
         let pool = match &self.db_pool {
             Some(p) => p.clone(),
             None => {
-                return Err(DbError::Connection(
+                return futures::future::Either::Left(std::future::ready(Err(DbError::Connection(
                     "no database configured for this module".into(),
-                ))
+                ))))
             }
         };
         let schema = self.db_schema.clone();
-
-        tokio::task::block_in_place(|| {
-            Handle::current().block_on(async move {
-                let client = pool
-                    .get()
+        futures::future::Either::Right(async move {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| DbError::Connection(e.to_string()))?;
+            if let Some(s) = &schema {
+                client
+                    .execute(
+                        &format!("SET search_path = \"{s}\", public"),
+                        &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
+                    )
                     .await
                     .map_err(|e| DbError::Connection(e.to_string()))?;
-
-                if let Some(s) = &schema {
-                    client
-                        .execute(
-                            &format!("SET search_path = \"{s}\", public"),
-                            &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
-                        )
-                        .await
-                        .map_err(|e| DbError::Connection(e.to_string()))?;
-                }
-
-                let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
-                let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                    pg_params.iter().map(|p| p as _).collect();
-
-                client
-                    .execute(sql.as_str(), &params_ref)
-                    .await
-                    .map_err(|e| DbError::Query(e.to_string()))
-            })
+            }
+            let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
+            let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                pg_params.iter().map(|p| p as _).collect();
+            client
+                .execute(sql.as_str(), &params_ref)
+                .await
+                .map_err(|e| DbError::Query(e.to_string()))
         })
     }
 
-    fn begin_transaction(&mut self) -> Result<Resource<TxState>, DbError> {
+    async fn begin_transaction(&mut self) -> Result<Resource<TxState>, DbError> {
         let pool = match &self.db_pool {
             Some(p) => p.clone(),
             None => {
@@ -230,30 +224,27 @@ impl Host for ModuleState {
             }
         };
         let schema = self.db_schema.clone();
-
-        let client = tokio::task::block_in_place(|| {
-            Handle::current().block_on(async move {
-                let client = pool
-                    .get()
+        let client = async move {
+            let client = pool
+                .get()
+                .await
+                .map_err(|e| DbError::Connection(e.to_string()))?;
+            client
+                .execute("BEGIN", &[])
+                .await
+                .map_err(|e| DbError::Query(e.to_string()))?;
+            if let Some(s) = &schema {
+                client
+                    .execute(
+                        &format!("SET search_path = \"{s}\", public"),
+                        &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
+                    )
                     .await
                     .map_err(|e| DbError::Connection(e.to_string()))?;
-                client
-                    .execute("BEGIN", &[])
-                    .await
-                    .map_err(|e| DbError::Query(e.to_string()))?;
-                if let Some(s) = &schema {
-                    client
-                        .execute(
-                            &format!("SET search_path = \"{s}\", public"),
-                            &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
-                        )
-                        .await
-                        .map_err(|e| DbError::Connection(e.to_string()))?;
-                }
-                Ok::<_, DbError>(client)
-            })
-        })?;
-
+            }
+            Ok::<_, DbError>(client)
+        }
+        .await?;
         self.table()
             .push(TxState {
                 client,
@@ -266,7 +257,7 @@ impl Host for ModuleState {
 // ── HostTransaction implementation ───────────────────────────────────────────
 
 impl HostTransaction for ModuleState {
-    fn query(
+    async fn query(
         &mut self,
         self_: Resource<TxState>,
         sql: String,
@@ -276,23 +267,18 @@ impl HostTransaction for ModuleState {
             .table()
             .get(&self_)
             .map_err(|e| DbError::Connection(e.to_string()))?;
-
-        tokio::task::block_in_place(|| {
-            Handle::current().block_on(async {
-                let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
-                let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                    pg_params.iter().map(|p| p as _).collect();
-                let rows = state
-                    .client
-                    .query(sql.as_str(), &params_ref)
-                    .await
-                    .map_err(|e| DbError::Query(e.to_string()))?;
-                Ok(rows.iter().map(pg_row_to_wit).collect())
-            })
-        })
+        let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            pg_params.iter().map(|p| p as _).collect();
+        let rows = state
+            .client
+            .query(sql.as_str(), &params_ref)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        Ok(rows.iter().map(pg_row_to_wit).collect())
     }
 
-    fn execute(
+    async fn execute(
         &mut self,
         self_: Resource<TxState>,
         sql: String,
@@ -302,32 +288,26 @@ impl HostTransaction for ModuleState {
             .table()
             .get(&self_)
             .map_err(|e| DbError::Connection(e.to_string()))?;
-
-        tokio::task::block_in_place(|| {
-            Handle::current().block_on(async {
-                let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
-                let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                    pg_params.iter().map(|p| p as _).collect();
-                state
-                    .client
-                    .execute(sql.as_str(), &params_ref)
-                    .await
-                    .map_err(|e| DbError::Query(e.to_string()))
-            })
-        })
+        let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            pg_params.iter().map(|p| p as _).collect();
+        state
+            .client
+            .execute(sql.as_str(), &params_ref)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))
     }
 
-    fn commit(&mut self, self_: Resource<TxState>) -> Result<(), DbError> {
-        {
-            let state = self
-                .table()
-                .get(&self_)
-                .map_err(|e| DbError::Connection(e.to_string()))?;
-            tokio::task::block_in_place(|| {
-                Handle::current().block_on(state.client.execute("COMMIT", &[]))
-            })
+    async fn commit(&mut self, self_: Resource<TxState>) -> Result<(), DbError> {
+        let state = self
+            .table()
+            .get(&self_)
+            .map_err(|e| DbError::Connection(e.to_string()))?;
+        state
+            .client
+            .execute("COMMIT", &[])
+            .await
             .map_err(|e| DbError::Query(e.to_string()))?;
-        }
         self.table()
             .get_mut(&self_)
             .map_err(|e| DbError::Connection(e.to_string()))?
@@ -335,17 +315,16 @@ impl HostTransaction for ModuleState {
         Ok(())
     }
 
-    fn rollback(&mut self, self_: Resource<TxState>) -> Result<(), DbError> {
-        {
-            let state = self
-                .table()
-                .get(&self_)
-                .map_err(|e| DbError::Connection(e.to_string()))?;
-            tokio::task::block_in_place(|| {
-                Handle::current().block_on(state.client.execute("ROLLBACK", &[]))
-            })
+    async fn rollback(&mut self, self_: Resource<TxState>) -> Result<(), DbError> {
+        let state = self
+            .table()
+            .get(&self_)
+            .map_err(|e| DbError::Connection(e.to_string()))?;
+        state
+            .client
+            .execute("ROLLBACK", &[])
+            .await
             .map_err(|e| DbError::Query(e.to_string()))?;
-        }
         self.table()
             .get_mut(&self_)
             .map_err(|e| DbError::Connection(e.to_string()))?
@@ -353,12 +332,10 @@ impl HostTransaction for ModuleState {
         Ok(())
     }
 
-    fn drop(&mut self, rep: Resource<TxState>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, rep: Resource<TxState>) -> wasmtime::Result<()> {
         let state = self.table().delete(rep)?;
         if !state.done {
-            let _ = tokio::task::block_in_place(|| {
-                Handle::current().block_on(state.client.execute("ROLLBACK", &[]))
-            });
+            let _ = state.client.execute("ROLLBACK", &[]).await;
         }
         Ok(())
     }
@@ -450,10 +427,10 @@ mod tests {
         "http://127.0.0.1:9001".parse().unwrap()
     }
 
-    // ── no-pool tests (sync — block_in_place is never reached) ───────────────
+    // ── no-pool tests ────────────────────────────────────────────────────────
 
-    #[test]
-    fn test_query_returns_error_when_no_pool() {
+    #[tokio::test]
+    async fn test_query_returns_error_when_no_pool() {
         let mut state = ModuleState::new(
             "test".into(),
             "test".into(),
@@ -465,15 +442,15 @@ mod tests {
             tracing::Span::none(),
         )
         .expect("state");
-        let result = state.query("SELECT 1".into(), vec![]);
+        let result = state.query("SELECT 1".into(), vec![]).await;
         assert!(
             matches!(result, Err(DbError::Connection(_))),
             "expected Connection error, got {result:?}",
         );
     }
 
-    #[test]
-    fn test_execute_returns_error_when_no_pool() {
+    #[tokio::test]
+    async fn test_execute_returns_error_when_no_pool() {
         let mut state = ModuleState::new(
             "test".into(),
             "test".into(),
@@ -485,15 +462,15 @@ mod tests {
             tracing::Span::none(),
         )
         .expect("state");
-        let result = state.execute("SELECT 1".into(), vec![]);
+        let result = state.execute("SELECT 1".into(), vec![]).await;
         assert!(
             matches!(result, Err(DbError::Connection(_))),
             "expected Connection error, got {result:?}",
         );
     }
 
-    #[test]
-    fn test_begin_transaction_returns_error_when_no_pool() {
+    #[tokio::test]
+    async fn test_begin_transaction_returns_error_when_no_pool() {
         let mut state = ModuleState::new(
             "test".into(),
             "test".into(),
@@ -505,14 +482,14 @@ mod tests {
             tracing::Span::none(),
         )
         .expect("state");
-        let result = state.begin_transaction();
+        let result = state.begin_transaction().await;
         assert!(
             matches!(result, Err(DbError::Connection(_))),
             "expected Connection error, got {result:?}",
         );
     }
 
-    // ── real-Postgres tests (multi-thread runtime required for block_in_place) ─
+    // ── real-Postgres tests ───────────────────────────────────────────────────
 
     /// Skip the test if `WRUNTIME_TEST_DB_URL` is not set.
     fn db_url() -> Option<String> {
@@ -544,6 +521,7 @@ mod tests {
                 "SELECT $1::text AS echo".into(),
                 vec![PgValue::Text("hello".into())],
             )
+            .await
             .expect("query");
 
         assert_eq!(rows.len(), 1);
@@ -574,12 +552,14 @@ mod tests {
         // DDL returns 0 rows affected.
         let n = state
             .execute("CREATE TEMP TABLE _wr_db_test (id INT)".into(), vec![])
+            .await
             .expect("create table");
         assert_eq!(n, 0);
 
         // DML returns the actual affected-row count.
         let n = state
             .execute("INSERT INTO _wr_db_test VALUES (1)".into(), vec![])
+            .await
             .expect("insert");
         assert_eq!(n, 1);
     }
@@ -609,6 +589,7 @@ mod tests {
                 "SELECT $1::text AS a, $2::text AS b".into(),
                 vec![PgValue::Text("foo".into()), PgValue::Text("bar".into())],
             )
+            .await
             .expect("query");
 
         assert_eq!(rows.len(), 1);
@@ -651,6 +632,7 @@ mod tests {
                     .into(),
                 vec![],
             )
+            .await
             .expect("query");
 
         assert_eq!(rows.len(), 1);
@@ -692,9 +674,10 @@ mod tests {
             "CREATE TEMP TABLE _wr_tx_commit_test (val INT)".into(),
             vec![],
         )
+        .await
         .expect("create table");
 
-        let tx = state.begin_transaction().expect("begin");
+        let tx = state.begin_transaction().await.expect("begin");
         let rep = tx.rep();
 
         HostTransaction::execute(
@@ -703,14 +686,16 @@ mod tests {
             "INSERT INTO _wr_tx_commit_test VALUES (42)".into(),
             vec![],
         )
+        .await
         .expect("insert");
 
         HostTransaction::commit(&mut state, wasmtime::component::Resource::new_borrow(rep))
+            .await
             .expect("commit");
 
         // Release the resource first so its connection is returned to the pool.
         // done=true means no ROLLBACK is issued.
-        HostTransaction::drop(&mut state, tx).expect("drop");
+        HostTransaction::drop(&mut state, tx).await.expect("drop");
 
         // After the connection is back in the pool, Host::query reacquires it
         // and can see the TEMP TABLE (TEMP tables are connection-scoped).
@@ -719,6 +704,7 @@ mod tests {
             "SELECT val FROM _wr_tx_commit_test".into(),
             vec![],
         )
+        .await
         .expect("query after commit");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].columns[0].value, PgValue::Int4(42));
@@ -751,9 +737,10 @@ mod tests {
             "CREATE TEMP TABLE _wr_tx_rollback_test (val INT)".into(),
             vec![],
         )
+        .await
         .expect("create table");
 
-        let tx = state.begin_transaction().expect("begin");
+        let tx = state.begin_transaction().await.expect("begin");
         let rep = tx.rep();
 
         HostTransaction::execute(
@@ -762,13 +749,15 @@ mod tests {
             "INSERT INTO _wr_tx_rollback_test VALUES (99)".into(),
             vec![],
         )
+        .await
         .expect("insert");
 
         HostTransaction::rollback(&mut state, wasmtime::component::Resource::new_borrow(rep))
+            .await
             .expect("rollback");
 
         // Release the resource first so its connection is returned to the pool.
-        HostTransaction::drop(&mut state, tx).expect("drop");
+        HostTransaction::drop(&mut state, tx).await.expect("drop");
 
         // After the connection is back in the pool, Host::query reacquires it
         // and can see the TEMP TABLE with the rolled-back INSERT absent.
@@ -777,6 +766,7 @@ mod tests {
             "SELECT val FROM _wr_tx_rollback_test".into(),
             vec![],
         )
+        .await
         .expect("query after rollback");
         assert_eq!(rows.len(), 0);
     }
@@ -808,9 +798,10 @@ mod tests {
             "CREATE TEMP TABLE _wr_tx_drop_test (val INT)".into(),
             vec![],
         )
+        .await
         .expect("create table");
 
-        let tx = state.begin_transaction().expect("begin");
+        let tx = state.begin_transaction().await.expect("begin");
         let rep = tx.rep();
 
         HostTransaction::execute(
@@ -819,16 +810,18 @@ mod tests {
             "INSERT INTO _wr_tx_drop_test VALUES (7)".into(),
             vec![],
         )
+        .await
         .expect("insert");
 
         // Drop without committing — host must issue implicit ROLLBACK.
-        HostTransaction::drop(&mut state, tx).expect("drop");
+        HostTransaction::drop(&mut state, tx).await.expect("drop");
 
         let rows = Host::query(
             &mut state,
             "SELECT val FROM _wr_tx_drop_test".into(),
             vec![],
         )
+        .await
         .expect("query after implicit rollback");
         assert_eq!(rows.len(), 0);
     }
