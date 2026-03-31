@@ -48,12 +48,12 @@ pub async fn run(args: InvokeArgs, manager_addr: &str) -> Result<()> {
         .split_once('.')
         .context("destination host must be {namespace}.{module}")?;
 
-    // Fetch the module's schema from the manager and transcode JSON → protobuf.
+    // Fetch the module's schema from the manager.
+    let schema_bytes = fetch_schema(manager_addr, namespace, module).await?;
+
+    // Transcode JSON request body → protobuf.
     let body_bytes = match &args.body {
-        Some(json_str) => {
-            let schema_bytes = fetch_schema(manager_addr, namespace, module).await?;
-            transcode_json_to_proto(&schema_bytes, path, json_str.as_bytes())?
-        }
+        Some(json_str) => transcode_json_to_proto(&schema_bytes, path, json_str.as_bytes())?,
         None => Vec::new(),
     };
 
@@ -73,11 +73,14 @@ pub async fn run(args: InvokeArgs, manager_addr: &str) -> Result<()> {
         .with_context(|| format!("Request to {proxy_url} failed"))?;
 
     let status = resp.status();
-    let body = resp.text().await?;
+    let body = resp.bytes().await?;
 
     println!("HTTP {status}");
     if !body.is_empty() {
-        println!("{body}");
+        match transcode_proto_to_json(&schema_bytes, path, &body) {
+            Ok(json) => println!("{json}"),
+            Err(_) => println!("{}", String::from_utf8_lossy(&body)),
+        }
     }
 
     if !status.is_success() {
@@ -162,6 +165,36 @@ fn transcode_json_to_proto(schema_bytes: &[u8], path: &str, json_body: &[u8]) ->
     let dynamic_msg = DynamicMessage::deserialize(input_desc, &mut de)
         .context("failed to transcode JSON body to protobuf")?;
     Ok(dynamic_msg.encode_to_vec())
+}
+
+/// Transcode a protobuf response body to JSON using the module's schema.
+fn transcode_proto_to_json(schema_bytes: &[u8], path: &str, proto_body: &[u8]) -> Result<String> {
+    let pool = DescriptorPool::decode(schema_bytes)
+        .context("failed to decode FileDescriptorSet from manager")?;
+
+    let method_name = path
+        .trim_start_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .context("path must contain a method name")?;
+
+    let output_desc = pool
+        .services()
+        .find_map(|s| s.methods().find(|m| m.name() == method_name))
+        .map(|m| m.output())
+        .with_context(|| format!("method '{method_name}' not found in schema"))?;
+
+    let msg = DynamicMessage::decode(output_desc, proto_body)
+        .context("failed to decode protobuf response")?;
+
+    let mut serializer = serde_json::Serializer::pretty(Vec::new());
+    msg.serialize_with_options(
+        &mut serializer,
+        &prost_reflect::SerializeOptions::new().stringify_64_bit_integers(false),
+    )
+    .context("failed to serialize response to JSON")?;
+    Ok(String::from_utf8(serializer.into_inner())?)
 }
 
 /// Build the proxy URL for a destination like `http://ecommerce.inventory/Seed`.

@@ -86,7 +86,11 @@ cargo run -p wr-cli -- services list
 
 cleanup() {
     echo "==> Shutting down..."
-    kill -INT "$CLIENT_PID" "$INV1_PID" "$INV2_PID" "$PROXY_PID" "$MANAGER_PID" 2>/dev/null || true
+    # Stop engines first so they can deregister with the manager before it exits.
+    kill -INT "$CLIENT_PID" "$INV1_PID" "$INV2_PID" 2>/dev/null || true
+    wait "$CLIENT_PID" "$INV1_PID" "$INV2_PID" 2>/dev/null || true
+    # Now stop proxy and manager.
+    kill -INT "$PROXY_PID" "$MANAGER_PID" 2>/dev/null || true
     # Give services time to flush the OTLP batch exporter before exiting.
     sleep 5
 }
@@ -104,28 +108,30 @@ if [ "$INLINE" = true ]; then
     exit $?
 fi
 
-echo ""
-echo "All services running. Press Ctrl-C to stop."
-echo "  Manager  : http://127.0.0.1:9000 (gRPC)"
-echo "  Proxy    : http://127.0.0.1:9001"
-echo "  Inventory: http://127.0.0.1:9100 + :9101 (2 engines, shared Postgres)"
-echo "  Client   : http://127.0.0.1:9200 (3 instances, ServiceGuest)"
-echo ""
-echo "Trigger a load run (default 100 iterations):"
-echo "  cargo run -p wr-cli -- invoke \\"
-echo "    --proxy http://127.0.0.1:9001 \\"
-echo "    --destination http://ecommerce.client/Run \\"
-echo "    --source loadtest --source-ns ecommerce \\"
-echo "    --body ''"
-echo ""
-echo "Trigger with a custom request count (e.g. 1000):"
-echo "  cargo run -p wr-cli -- invoke \\"
-echo "    --proxy http://127.0.0.1:9001 \\"
-echo "    --destination http://ecommerce.client/Run \\"
-echo "    --source loadtest --source-ns ecommerce \\"
-echo "    --body '{\"count\": 1000}'"
-echo ""
-echo "Inspect metrics:"
-echo "  cargo run -p wr-cli -- metrics summary"
+cat <<'USAGE'
+
+All services running. Press Ctrl-C to stop.
+  Manager  : http://127.0.0.1:9000 (gRPC)
+  Proxy    : http://127.0.0.1:9001
+  Inventory: http://127.0.0.1:9100 + :9101 (2 engines, shared Postgres)
+  Client   : http://127.0.0.1:9200 (3 instances, ServiceGuest)
+
+Trigger a load run (default 100 iterations):
+  cargo run -p wr-cli -- invoke \
+    --proxy http://127.0.0.1:9001 \
+    --destination http://ecommerce.client/Run \
+    --source loadtest --source-ns ecommerce \
+    --body ''
+
+Trigger with a custom request count (e.g. 1000):
+  cargo run -p wr-cli -- invoke \
+    --proxy http://127.0.0.1:9001 \
+    --destination http://ecommerce.client/Run \
+    --source loadtest --source-ns ecommerce \
+    --body '{"count": 1000}'
+
+Inspect metrics:
+  cargo run -p wr-cli -- metrics summary
+USAGE
 
 wait

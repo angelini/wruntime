@@ -41,7 +41,7 @@ just example-inline  # build-example + run with single invocation, exits on fail
 
 ## Verification
 
-After refactoring, always run `just tidy` and `just example-inline` to verify formatting, lints, and end-to-end correctness. When changing host bindings (`wr-engine/src/db.rs`, `wr-engine/src/blobstore.rs`, `wr-engine/src/tracing.rs`), WIT interfaces (`wit/`), the SDK (`wr-sdk/`), or the WASM guest test harness (`wr-tests/guests/`, `wr-tests/tests/wasm_host_test.rs`), also run `just test-wasm`.
+After refactoring, always run `just tidy` and `just example-inline` to verify formatting, lints, and end-to-end correctness. Treat any `WARN` log lines in `just example-inline` output as bugs that need to be fixed — a clean run should produce zero warnings. When changing host bindings (`wr-engine/src/db.rs`, `wr-engine/src/blobstore.rs`, `wr-engine/src/tracing.rs`), WIT interfaces (`wit/`), the SDK (`wr-sdk/`), or the WASM guest test harness (`wr-tests/guests/`, `wr-tests/tests/wasm_host_test.rs`), also run `just test-wasm`.
 
 **Keep docs in sync with code changes.** When modifying architecture (adding/removing layers, changing request flow, changing config), update `CLAUDE.md`, `README.md`, and the relevant files in `docs/` (`architecture.md`, `configuration.md`, `schemas.md`, etc.) in the same change. Stale docs are worse than no docs.
 
