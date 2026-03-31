@@ -16,6 +16,7 @@ just check           # compile check only
 just test            # all tests
 just test-integration # wr-tests only
 just test-one <name> # single test by name
+just test-wasm       # build WASM test guests + run host binding tests
 
 # Lint & format
 just fmt             # cargo fmt --all
@@ -27,7 +28,7 @@ just manager
 just proxy
 just engine
 
-# Dev infrastructure (Docker Compose — Postgres, Grafana/LGTM, Garage S3)
+# Dev infrastructure (Docker Compose — Postgres, Grafana/LGTM, RustFS S3)
 just dev-up
 just dev-down
 just dev-logs [service]
@@ -40,11 +41,11 @@ just example-inline  # build-example + run with single invocation, exits on fail
 
 ## Verification
 
-After refactoring, always run `just tidy` and `just example-inline` to verify formatting, lints, and end-to-end correctness.
+After refactoring, always run `just tidy` and `just example-inline` to verify formatting, lints, and end-to-end correctness. When changing host bindings (`wr-engine/src/db.rs`, `wr-engine/src/blobstore.rs`, `wr-engine/src/tracing.rs`), WIT interfaces (`wit/`), the SDK (`wr-sdk/`), or the WASM guest test harness (`wr-tests/guests/`, `wr-tests/tests/wasm_host_test.rs`), also run `just test-wasm`.
 
 **Prerequisites:** `rustc`, `cargo`, `just`, `protoc` (for proto code generation). WASM module development additionally requires `cargo-component` and `wasm-tools`.
 
-**Integration tests with a real DB:** set `WRUNTIME_TEST_DB_URL=postgres://postgres@localhost:5433/wruntime_test` before running tests (matches the `just dev-up` Postgres instance); omitting it skips DB-backed test cases.
+**Integration tests with a real DB:** set `WRUNTIME_TEST_DB_URL=postgres://postgres@localhost:5433/wruntime_test` before running tests (matches the `just dev-up` Postgres instance); omitting it skips DB-backed test cases. `just test-wasm` sets all required env vars (DB + S3) automatically using the `just dev-up` defaults.
 
 ## Architecture
 
@@ -73,9 +74,10 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 
 **`wr-proxy` middleware stack** (Tower layers, evaluated in order):
 1. `TracingLayer` — root OTel span per request (captures source, destination, status, duration)
-2. `SchemaValidationLayer` — validates protobuf bodies via `prost-reflect`; rejects with structured JSON errors; skipped if no schema cached
-3. `RoutingLayer` — resolves destination engine from local routing table cache (TTL-based); injects `ResolvedDestination` as a request extension
-4. `ForwardService` — reads `ResolvedDestination` extension, strips internal headers, proxies to engine
+2. `SchemaValidationLayer` — validates protobuf bodies via `prost-reflect`; rejects with structured JSON errors; passes through uncached schemas when egress is enabled
+3. `RoutingLayer` — single routing table read per request; resolves destination engine from local routing table cache (TTL-based); injects `ResolvedDestination` as a request extension; when egress is enabled and no internal route matches, sets `ExternalEgress` extension
+4. `EgressLayer` — handles `ExternalEgress` requests (domain allowlist, external forward); passes internal requests through
+5. `ForwardService` — reads `ResolvedDestination` extension, strips internal headers, proxies to engine
 
 **`wr-engine`** — uses wasmtime 41 with the WASI component model. On startup: loads WASM components → registers with manager → starts 10-second heartbeat loop. Modules can optionally have a PostgreSQL pool (`deadpool-postgres`) and a blobstore (S3-compatible via `rust-s3`) exposed to WASM via custom host bindings.
 

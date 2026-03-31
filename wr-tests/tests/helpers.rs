@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message as _;
@@ -22,17 +22,27 @@ use prost_types::{
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tonic::transport::Server;
+use wasmtime::component::{Component, Linker};
+use wasmtime::{Config, Engine, Store};
+use wasmtime_wasi_http::p2::{
+    bindings::http::types::{ErrorCode, Scheme},
+    bindings::ProxyPre,
+    body::{HyperIncomingBody, HyperOutgoingBody},
+    WasiHttpView as _,
+};
 
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, manager_service_server::ManagerServiceServer,
     EngineRegistration, GetRoutingTableRequest, GetSchemaRequest, ListEnginesRequest,
     ModuleDescriptor, RegisterEngineRequest, RoutingRule,
 };
+use wr_engine::blobstore::BlobstoreRuntime;
+use wr_engine::config::BlobstoreConfig;
 use wr_manager::{service::Manager, state::new_state};
 
 // Re-export DB types so tests using `helpers::*` need no local `use` statements.
 pub use wr_engine::db::wruntime::db::database::{DbError, Host as DbHost, PgValue};
-pub use wr_engine::state::ModuleState;
+pub use wr_engine::state::{ModuleServices, ModuleState};
 pub use wr_proxy::config::{EgressConfig, ExternalRoute};
 
 // ── Manager ───────────────────────────────────────────────────────────────────
@@ -258,13 +268,13 @@ pub async fn start_egress_proxy_with_schema(
     schema_cache: Arc<wr_proxy::schema::SchemaCache>,
 ) -> Result<SocketAddr> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let egress_enabled = egress_cfg.is_some();
     let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::EgressLayer::new(
-            egress_cfg,
-            table.clone(),
-        ))
-        .layer(wr_proxy::layers::SchemaValidationLayer::new(schema_cache))
-        .layer(wr_proxy::layers::RoutingLayer::new(table, ""))
+        .layer(
+            wr_proxy::layers::SchemaValidationLayer::new(schema_cache).with_egress(egress_enabled),
+        )
+        .layer(wr_proxy::layers::RoutingLayer::new(table, "").with_egress(egress_enabled))
+        .layer(wr_proxy::layers::EgressLayer::new(egress_cfg))
         .service(wr_proxy::layers::ForwardService::new(Arc::new(
             wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
         )));
@@ -670,11 +680,10 @@ pub fn db_state(pool_size: usize) -> Option<ModuleState> {
             "test-ns".into(),
             "http://127.0.0.1:9001".parse().unwrap(),
             http_client(),
-            Some(pool),
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            ModuleServices {
+                db_pool: Some(pool),
+                ..Default::default()
+            },
         )
         .expect("ModuleState"),
     )
@@ -709,12 +718,137 @@ pub async fn db_state_for_module(
             namespace.into(),
             "http://127.0.0.1:9001".parse().unwrap(),
             http_client(),
-            Some(pool),
-            Some(schema),
-            None,
-            None,
-            tracing::Span::none(),
+            ModuleServices {
+                db_pool: Some(pool),
+                db_schema: Some(schema),
+                ..Default::default()
+            },
         )
         .expect("ModuleState"),
     )
+}
+
+// ── WASM guest dispatch ──────────────────────────────────────────────────────
+
+/// Set up a wasmtime `Engine` + `ProxyPre` from a compiled WASM component path.
+///
+/// Replicates the linker setup from `wr-engine/src/engine.rs` so WASM guests
+/// have access to all host bindings (WASI, HTTP, DB, tracing, blobstore).
+pub fn wasm_module_pre(wasm_path: &str) -> Result<(Arc<Engine>, Arc<ProxyPre<ModuleState>>)> {
+    let mut wt_config = Config::new();
+    wt_config.wasm_component_model(true);
+    let engine = Engine::new(&wt_config)?;
+    let component = Component::from_file(&engine, wasm_path)?;
+
+    let mut linker: Linker<ModuleState> = Linker::new(&engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
+    wr_engine::db::wruntime::db::database::add_to_linker::<
+        ModuleState,
+        wasmtime::component::HasSelf<ModuleState>,
+    >(&mut linker, |s| s)?;
+    wr_engine::tracing::add_to_linker::<ModuleState, wasmtime::component::HasSelf<ModuleState>>(
+        &mut linker,
+        |s| s,
+    )?;
+    wr_engine::blobstore::add_to_linker::<ModuleState, wasmtime::component::HasSelf<ModuleState>>(
+        &mut linker,
+        |s| s,
+    )?;
+
+    let pre = ProxyPre::new(linker.instantiate_pre(&component)?)?;
+    Ok((Arc::new(engine), Arc::new(pre)))
+}
+
+/// Dispatch a single HTTP request through a WASM component, returning the response.
+///
+/// Mirrors `wr-engine/src/engine.rs::dispatch_request` — builds a Store,
+/// instantiates the component, calls `wasi:http/incoming-handler#handle`,
+/// and collects the response.
+pub async fn dispatch_to_wasm(
+    engine: &Engine,
+    pre: &ProxyPre<ModuleState>,
+    state: ModuleState,
+    request: http::Request<Bytes>,
+) -> Result<http::Response<Bytes>> {
+    let mut store = Store::new(engine, state);
+    let proxy = pre.instantiate_async(&mut store).await?;
+
+    let (req_parts, req_body) = request.into_parts();
+    let hyper_body: HyperIncomingBody = UnsyncBoxBody::new(
+        Full::new(req_body).map_err(|_: Infallible| ErrorCode::InternalError(None)),
+    );
+    let hyper_req = hyper::Request::from_parts(req_parts, hyper_body);
+    let req_resource = store
+        .data_mut()
+        .http()
+        .new_incoming_request(Scheme::Http, hyper_req)?;
+
+    let (resp_tx, resp_rx) =
+        tokio::sync::oneshot::channel::<Result<hyper::Response<HyperOutgoingBody>, ErrorCode>>();
+    let out_resource = store.data_mut().http().new_response_outparam(resp_tx)?;
+
+    proxy
+        .wasi_http_incoming_handler()
+        .call_handle(&mut store, req_resource, out_resource)
+        .await?;
+
+    match resp_rx.await {
+        Ok(Ok(wasm_resp)) => {
+            let (rp, rb) = wasm_resp.into_parts();
+            let bytes = rb
+                .collect()
+                .await
+                .map_err(|e| anyhow::anyhow!("collecting WASM response body: {e:?}"))?
+                .to_bytes();
+            Ok(http::Response::from_parts(rp, bytes))
+        }
+        Ok(Err(e)) => anyhow::bail!("WASM handler returned ErrorCode: {e:?}"),
+        Err(_) => anyhow::bail!("WASM handler dropped the response outparam"),
+    }
+}
+
+/// Build a `BlobstoreRuntime` from `WRUNTIME_TEST_S3_*` environment variables.
+///
+/// Returns `None` when the env vars are absent so the calling test can skip.
+pub fn blobstore_client() -> Option<Arc<BlobstoreRuntime>> {
+    let endpoint = std::env::var("WRUNTIME_TEST_S3_ENDPOINT").ok()?;
+    let access_key = std::env::var("WRUNTIME_TEST_S3_ACCESS_KEY").ok()?;
+    let secret_key = std::env::var("WRUNTIME_TEST_S3_SECRET_KEY").ok()?;
+    let config = BlobstoreConfig {
+        endpoint,
+        access_key_id: access_key,
+        secret_access_key: secret_key,
+        region: "us-east-1".into(),
+    };
+    Some(Arc::new(
+        BlobstoreRuntime::new(&config).expect("BlobstoreRuntime"),
+    ))
+}
+
+/// Build a `ModuleState` with a blobstore client for WASM guest tests.
+pub fn blobstore_state(blobstore: Arc<BlobstoreRuntime>) -> ModuleState {
+    ModuleState::new(
+        "blobstore-test".into(),
+        "test-ns".into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        http_client(),
+        ModuleServices {
+            blobstore: Some(blobstore),
+            ..Default::default()
+        },
+    )
+    .expect("ModuleState")
+}
+
+/// Build a `ModuleState` with no services (tracing tests only need WASI + HTTP).
+pub fn tracing_state() -> ModuleState {
+    ModuleState::new(
+        "tracing-test".into(),
+        "test-ns".into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        http_client(),
+        ModuleServices::default(),
+    )
+    .expect("ModuleState")
 }

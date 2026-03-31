@@ -115,11 +115,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            None,
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            Default::default(),
         )
         .expect("state");
         let span = Host::start(&mut state, "my-operation".into(), vec![]);
@@ -133,11 +129,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            None,
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            Default::default(),
         )
         .expect("state");
         let span = Host::start(&mut state, "op".into(), vec![]);
@@ -158,11 +150,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            None,
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            Default::default(),
         )
         .expect("state");
         let span = Host::start(&mut state, "op".into(), vec![]);
@@ -183,11 +171,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            None,
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            Default::default(),
         )
         .expect("state");
         let span = Host::start(&mut state, "op".into(), vec![]);

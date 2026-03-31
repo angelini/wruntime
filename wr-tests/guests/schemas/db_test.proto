@@ -1,0 +1,70 @@
+syntax = "proto3";
+package test;
+
+service DbTestService {
+  rpc Execute             (ExecuteRequest)             returns (ExecuteResponse);
+  rpc Query               (QueryRequest)               returns (QueryResponse);
+  rpc QueryTypes          (QueryTypesRequest)          returns (QueryTypesResponse);
+  rpc TransactionCommit   (TransactionCommitRequest)   returns (TransactionCommitResponse);
+  rpc TransactionRollback (TransactionRollbackRequest) returns (TransactionRollbackResponse);
+  rpc TransactionDrop     (TransactionDropRequest)     returns (TransactionDropResponse);
+  rpc Error               (ErrorRequest)               returns (ErrorResponse);
+}
+
+message ExecuteRequest {
+  string sql    = 1;
+  // Params encoded as JSON array of {"type":"text","value":"..."} objects.
+  // The guest decodes these into PgValue variants.
+  string params_json = 2;
+}
+message ExecuteResponse {
+  uint64 affected = 1;
+}
+
+message QueryRequest {
+  string sql         = 1;
+  string params_json = 2;
+}
+message QueryRow {
+  // Each column as JSON: {"name":"col","type":"text","value":"..."}
+  repeated string columns_json = 1;
+}
+message QueryResponse {
+  repeated QueryRow rows = 1;
+}
+
+// Insert one row of every PgValue type, then query it back.
+message QueryTypesRequest {}
+message QueryTypesResponse {
+  // JSON-serialised map of column names to their string representations.
+  string row_json = 1;
+}
+
+message TransactionCommitRequest {
+  string table_name = 1;
+}
+message TransactionCommitResponse {
+  int64 count = 1;
+}
+
+message TransactionRollbackRequest {
+  string table_name = 1;
+}
+message TransactionRollbackResponse {
+  int64 count = 1;
+}
+
+message TransactionDropRequest {
+  string table_name = 1;
+}
+message TransactionDropResponse {
+  int64 count = 1;
+}
+
+message ErrorRequest {
+  string sql = 1;
+}
+message ErrorResponse {
+  string error_kind    = 1;
+  string error_message = 2;
+}

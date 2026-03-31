@@ -25,4 +25,9 @@ wr-proxy       = { path = "../wr-proxy" }
 rustls         = { version = "0.23", features = ["ring"] }
 serde_json     = "1"
 tracing        = "0.1"
-wasmtime       = { version = "43", features = ["component-model"] }
+wasmtime           = { version = "43", features = ["component-model"] }
+wasmtime-wasi      = "43"
+wasmtime-wasi-http = "43"
+
+[build-dependencies]
+prost-build = "0.14"

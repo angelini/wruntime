@@ -28,8 +28,9 @@ A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. 
 │  │  TracingLayer         │  │  HTTP  │  │  TracingLayer         │  │
 │  │  SchemaValidationLayer│  │        │  │  (skipped for relayed │  │
 │  │  RoutingLayer         │  │        │  │   x-wr-via-proxy reqs)│  │
-│  │  ForwardService       │  │        │  │  RoutingLayer         │  │
-│  └──────────┬────────────┘  │        │  │  ForwardService       │  │
+│  │  EgressLayer          │  │        │  │  RoutingLayer         │  │
+│  │  ForwardService       │  │        │  │  ForwardService       │  │
+│  └──────────┬────────────┘  │        │  │                       │  │
 │             │ local         │        │  └──────────┬────────────┘  │
 │             ▼               │        │             │ local         │
 │  ┌───────────────────────┐  │        │  ┌──────────▼────────────┐  │
@@ -70,16 +71,22 @@ wr-proxy A  (Node A)
   │  2. SchemaValidation   — validates path is a known RPC method; decodes body with
   │                          prost-reflect against the module's FileDescriptorSet;
   │                          returns 404 if path is not a known RPC,
-  │                          503 if schema not yet synced,
+  │                          503 if schema not yet synced (pass-through when egress enabled),
   │                          400 if body fails protobuf decoding
-  │  3. RoutingLayer       — reads optional x-wr-version header; defaults to
+  │  3. RoutingLayer       — single routing table read per request;
+  │                          reads optional x-wr-version header; defaults to
   │                          highest semver among healthy rules for the module;
   │                          returns 503 if no healthy instance matches;
   │                          injects x-wr-module, x-wr-namespace, x-wr-version;
   │                          round-robins across multiple healthy instances
   │                          at the same version;
-  │                          resolves destination as LocalEngine or RemoteProxy
-  │  4. ForwardService     — strips x-wr-destination / x-wr-source, injects
+  │                          resolves destination as LocalEngine or RemoteProxy;
+  │                          when egress is enabled and no internal route matches,
+  │                          sets ExternalEgress extension for the egress layer
+  │  4. EgressLayer        — handles ExternalEgress requests: enforces the domain
+  │                          allowlist and forwards to external hosts;
+  │                          passes internal requests through to ForwardService
+  │  5. ForwardService     — strips x-wr-destination / x-wr-source, injects
   │                          traceparent, then:
   │
   ├── destination is on Node A (LocalEngine) ──────────────────────────────────┐

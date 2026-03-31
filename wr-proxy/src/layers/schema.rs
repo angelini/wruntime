@@ -12,11 +12,24 @@ use crate::schema::{SchemaCache, ValidationOutcome};
 
 pub struct SchemaValidationLayer {
     cache: Arc<SchemaCache>,
+    /// When true, requests for modules with no cached schema are passed through
+    /// instead of rejected with 503. This allows external egress destinations
+    /// (which have no schema) to reach [`super::RoutingLayer`] and be forwarded
+    /// externally.
+    egress_enabled: bool,
 }
 
 impl SchemaValidationLayer {
     pub fn new(cache: Arc<SchemaCache>) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            egress_enabled: false,
+        }
+    }
+
+    pub fn with_egress(mut self, enabled: bool) -> Self {
+        self.egress_enabled = enabled;
+        self
     }
 }
 
@@ -26,6 +39,7 @@ impl<S> Layer<S> for SchemaValidationLayer {
         SchemaValidationService {
             inner,
             cache: self.cache.clone(),
+            egress_enabled: self.egress_enabled,
         }
     }
 }
@@ -34,6 +48,7 @@ impl<S> Layer<S> for SchemaValidationLayer {
 pub struct SchemaValidationService<S> {
     inner: S,
     cache: Arc<SchemaCache>,
+    egress_enabled: bool,
 }
 
 impl<S> Service<Request<Bytes>> for SchemaValidationService<S>
@@ -52,6 +67,7 @@ where
 
     fn call(&mut self, req: Request<Bytes>) -> Self::Future {
         let cache = self.cache.clone();
+        let egress_enabled = self.egress_enabled;
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -61,6 +77,7 @@ where
             if req.headers().contains_key("x-wr-via-proxy") {
                 return inner.call(req).await;
             }
+
             let mut req = req;
 
             // Parse x-wr-destination to get module name and RPC path.
@@ -110,6 +127,10 @@ where
                             parts.headers.remove(http::header::CONTENT_LENGTH);
                             req = http::Request::from_parts(parts, bytes::Bytes::from(proto_bytes));
                         }
+                        Err(ValidationOutcome::SchemaNotCached) if egress_enabled => {
+                            // No schema for this module — may be an external host.
+                            // Pass through so RoutingLayer can resolve or egress.
+                        }
                         Err(ValidationOutcome::SchemaNotCached) => {
                             return Ok(schema_not_cached_error(&module, &namespace));
                         }
@@ -129,6 +150,10 @@ where
                         ValidationOutcome::Pass => {}
                         ValidationOutcome::Fail(detail) => {
                             return Ok(validation_error(&detail, &source, &module));
+                        }
+                        ValidationOutcome::SchemaNotCached if egress_enabled => {
+                            // No schema for this module — may be an external host.
+                            // Pass through so RoutingLayer can resolve or egress.
                         }
                         ValidationOutcome::SchemaNotCached => {
                             return Ok(schema_not_cached_error(&module, &namespace));

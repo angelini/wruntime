@@ -118,6 +118,37 @@ impl WasiHttpHooks for ModuleHttpHooks {
     }
 }
 
+/// Optional services and capabilities for a module.
+/// All fields default to `None`/no-op, so tests can simply use `Default::default()`.
+pub struct ModuleServices {
+    /// Shared connection pool, present when the module has DB access enabled.
+    pub db_pool: Option<Arc<Pool>>,
+    /// Postgres schema name for this module (`wr__{namespace}__{name}`).
+    /// Set when DB access is enabled; used to scope all queries to the module's schema.
+    pub db_schema: Option<String>,
+    /// Shared S3-compatible blobstore client, present when the module has blobstore access enabled.
+    pub blobstore: Option<Arc<BlobstoreRuntime>>,
+    /// WASI filesystem mode (e.g. `FsMode::Tempdir`).
+    pub fs: Option<FsMode>,
+    /// The `engine.dispatch` span for the current request.
+    /// Captured at `ModuleState` construction time so host functions can create
+    /// child spans even when wasmtime's synchronous call stack is outside the
+    /// async instrumented context.
+    pub active_span: tracing::Span,
+}
+
+impl Default for ModuleServices {
+    fn default() -> Self {
+        Self {
+            db_pool: None,
+            db_schema: None,
+            blobstore: None,
+            fs: None,
+            active_span: tracing::Span::none(),
+        }
+    }
+}
+
 pub struct ModuleState {
     wasi: WasiCtx,
     http: WasiHttpCtx,
@@ -135,28 +166,20 @@ pub struct ModuleState {
     /// Shared S3-compatible blobstore client, present when the module has blobstore access enabled.
     pub blobstore: Option<Arc<BlobstoreRuntime>>,
     /// The `engine.dispatch` span for the current request.
-    /// Captured at `ModuleState` construction time so host functions can create
-    /// child spans even when wasmtime's synchronous call stack is outside the
-    /// async instrumented context.
     pub active_span: tracing::Span,
 }
 
 impl ModuleState {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         module_name: String,
         module_namespace: String,
         proxy_uri: hyper::Uri,
         http_client: Client<HttpConnector, Full<bytes::Bytes>>,
-        db_pool: Option<Arc<Pool>>,
-        db_schema: Option<String>,
-        blobstore: Option<Arc<BlobstoreRuntime>>,
-        fs: Option<&FsMode>,
-        active_span: tracing::Span,
+        services: ModuleServices,
     ) -> anyhow::Result<Self> {
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stdio();
-        let fs_root = match fs {
+        let fs_root = match services.fs.as_ref() {
             Some(FsMode::Tempdir) => {
                 let dir = tempfile::tempdir()?;
                 builder.preopened_dir(dir.path(), "/", DirPerms::all(), FilePerms::all())?;
@@ -174,11 +197,11 @@ impl ModuleState {
                 module_namespace,
                 http_client,
             },
-            db_pool,
-            db_schema,
-            blobstore,
+            db_pool: services.db_pool,
+            db_schema: services.db_schema,
+            blobstore: services.blobstore,
             _fs_root: fs_root,
-            active_span,
+            active_span: services.active_span,
         })
     }
 

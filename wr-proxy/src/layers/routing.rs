@@ -9,6 +9,7 @@ use http::{Request, StatusCode};
 use tower::{Layer, Service};
 use tracing::{info_span, Instrument};
 
+use super::egress::ExternalEgress;
 use super::{error_response, Destination, ResBody, ResolvedDestination};
 use crate::routing::CachedRoutingTable;
 
@@ -20,6 +21,10 @@ pub struct RoutingLayer {
     self_proxy_address: String,
     /// Monotonic counters per (namespace, module, version) for round-robin selection.
     counters: RoundRobinCounters,
+    /// When true, unroutable destinations are passed through with an
+    /// [`ExternalEgress`] extension instead of returning 503, so the
+    /// egress layer can forward them to external hosts.
+    egress_enabled: bool,
 }
 
 impl RoutingLayer {
@@ -28,7 +33,13 @@ impl RoutingLayer {
             table,
             self_proxy_address: self_proxy_address.into(),
             counters: Arc::new(Mutex::new(HashMap::new())),
+            egress_enabled: false,
         }
+    }
+
+    pub fn with_egress(mut self, enabled: bool) -> Self {
+        self.egress_enabled = enabled;
+        self
     }
 }
 
@@ -40,6 +51,7 @@ impl<S> Layer<S> for RoutingLayer {
             table: self.table.clone(),
             self_proxy_address: self.self_proxy_address.clone(),
             counters: self.counters.clone(),
+            egress_enabled: self.egress_enabled,
         }
     }
 }
@@ -50,6 +62,7 @@ pub struct RoutingService<S> {
     table: CachedRoutingTable,
     self_proxy_address: String,
     counters: RoundRobinCounters,
+    egress_enabled: bool,
 }
 
 impl<S> Service<Request<Bytes>> for RoutingService<S>
@@ -70,6 +83,7 @@ where
         let table = self.table.clone();
         let counters = self.counters.clone();
         let self_proxy_address = self.self_proxy_address.clone();
+        let egress_enabled = self.egress_enabled;
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -211,6 +225,21 @@ where
             };
 
             if candidates.is_empty() {
+                // When egress is enabled, unroutable destinations are passed
+                // through with an ExternalEgress extension so the egress layer
+                // can forward them to external hosts.
+                if egress_enabled {
+                    if let Some(ref uri) = dest_uri {
+                        if let Some(h) = uri.host() {
+                            req.extensions_mut().insert(ExternalEgress {
+                                host: h.to_ascii_lowercase(),
+                                dest_uri: uri.clone(),
+                            });
+                            return inner.call(req).instrument(span).await;
+                        }
+                    }
+                }
+
                 let msg = match requested_version {
                     Some(v) => format!(
                         "no route for module '{module_name}.{dest_namespace}' matching version requirement '{v}'"

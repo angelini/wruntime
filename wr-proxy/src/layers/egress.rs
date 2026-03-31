@@ -14,18 +14,25 @@ use tracing::{info_span, Instrument};
 
 use super::{full_body, ResBody};
 use crate::config::EgressConfig;
-use crate::routing::CachedRoutingTable;
 
 type EgressClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
+/// Resolved by [`super::RoutingLayer`] when the destination is not an internal
+/// module and egress is configured. Consumed by [`EgressService`] to forward
+/// the request to the external host.
+#[derive(Clone)]
+pub struct ExternalEgress {
+    pub host: String,
+    pub dest_uri: http::Uri,
+}
+
 pub struct EgressLayer {
     config: Option<EgressConfig>,
-    table: CachedRoutingTable,
     client: Arc<EgressClient>,
 }
 
 impl EgressLayer {
-    pub fn new(config: Option<EgressConfig>, table: CachedRoutingTable) -> Self {
+    pub fn new(config: Option<EgressConfig>) -> Self {
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_native_roots()
             .expect("failed to load native TLS roots")
@@ -36,7 +43,6 @@ impl EgressLayer {
         let client = Client::builder(TokioExecutor::new()).build(https);
         Self {
             config,
-            table,
             client: Arc::new(client),
         }
     }
@@ -48,7 +54,6 @@ impl<S> Layer<S> for EgressLayer {
         EgressService {
             inner,
             config: self.config.clone(),
-            table: self.table.clone(),
             client: self.client.clone(),
         }
     }
@@ -58,7 +63,6 @@ impl<S> Layer<S> for EgressLayer {
 pub struct EgressService<S> {
     inner: S,
     config: Option<EgressConfig>,
-    table: CachedRoutingTable,
     client: Arc<EgressClient>,
 }
 
@@ -77,132 +81,113 @@ where
     }
 
     fn call(&mut self, req: Request<Bytes>) -> Self::Future {
-        let config = self.config.clone();
-        let table = self.table.clone();
-        let client = self.client.clone();
-        let mut inner = self.inner.clone();
+        // If this request has an ExternalEgress extension, RoutingLayer already
+        // determined it is not an internal module. Handle the external forward
+        // without touching the inner stack (ForwardService).
+        if let Some(egress) = req.extensions().get::<ExternalEgress>().cloned() {
+            let config = self.config.clone();
+            let client = self.client.clone();
 
-        Box::pin(async move {
-            // If egress is not configured, pass through unchanged.
-            let egress_cfg = match config {
-                Some(c) => c,
-                None => return inner.call(req).await.map_err(Into::into),
-            };
+            return Box::pin(async move {
+                let egress_cfg = match config {
+                    Some(c) => c,
+                    None => {
+                        // Should not happen — RoutingLayer only sets ExternalEgress
+                        // when egress is configured. Defensive fallback.
+                        return Ok(super::error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "egress not configured",
+                        ));
+                    }
+                };
 
-            // Parse x-wr-destination to find the intended host.
-            let dest_uri: http::Uri = match req
-                .headers()
-                .get("x-wr-destination")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse().ok())
-            {
-                Some(u) => u,
-                None => return inner.call(req).await.map_err(Into::into),
-            };
+                let host = &egress.host;
 
-            let host = match dest_uri.host() {
-                Some(h) => h.to_ascii_lowercase(),
-                None => return inner.call(req).await.map_err(Into::into),
-            };
+                // Enforce the allowlist.
+                let allowed = egress_cfg
+                    .allowed_domains
+                    .iter()
+                    .any(|pattern| domain_matches(pattern, host));
 
-            // Check the routing table: if this host matches any registered module
-            // it is an internal call — let it flow through to SchemaValidationLayer
-            // and RoutingLayer as normal.
-            let is_internal = {
-                let t = table.read().await;
-                match host.split_once('.') {
-                    Some((ns, module)) => t
-                        .rules
-                        .iter()
-                        .any(|r| r.destination_namespace == ns && r.destination_module == module),
-                    None => false,
+                if !allowed {
+                    let body = serde_json::json!({
+                        "error": "egress_not_allowed",
+                        "detail": format!("domain '{host}' is not in the egress allowlist"),
+                    })
+                    .to_string();
+                    return Ok(http::Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(full_body(Bytes::from(body)))
+                        .unwrap());
                 }
-            };
 
-            if is_internal {
-                return inner.call(req).await.map_err(Into::into);
-            }
+                // Strip all x-wr-* headers before forwarding to the external host.
+                let (mut parts, body_bytes) = req.into_parts();
 
-            // External request — enforce the allowlist.
-            let allowed = egress_cfg
-                .allowed_domains
-                .iter()
-                .any(|pattern| domain_matches(pattern, &host));
+                let source = parts
+                    .headers
+                    .get("x-wr-source")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("unknown")
+                    .to_string();
 
-            if !allowed {
-                let body = serde_json::json!({
-                    "error": "egress_not_allowed",
-                    "detail": format!("domain '{}' is not in the egress allowlist", host),
-                })
-                .to_string();
-                return Ok(http::Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .header(http::header::CONTENT_TYPE, "application/json")
-                    .body(full_body(Bytes::from(body)))
-                    .unwrap());
-            }
+                for name in &[
+                    "x-wr-destination",
+                    "x-wr-source",
+                    "x-wr-source-ns",
+                    "x-wr-module",
+                    "x-wr-namespace",
+                    "x-wr-version",
+                    "x-wr-via-proxy",
+                ] {
+                    parts.headers.remove(*name);
+                }
 
-            // Allowed: strip all x-wr-* headers before forwarding to the external host.
-            let (mut parts, body_bytes) = req.into_parts();
+                parts.uri = egress.dest_uri.clone();
+                // Reset the HTTP version so the client can negotiate freely via
+                // ALPN (HTTPS) or default to HTTP/1.1 (plain HTTP).  The inbound
+                // request may carry HTTP/2 from the proxy listener, which is not
+                // meaningful for the outbound egress connection.
+                parts.version = http::Version::HTTP_11;
+                wr_common::telemetry::inject_context(&mut parts.headers);
 
-            let source = parts
-                .headers
-                .get("x-wr-source")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("unknown")
-                .to_string();
+                let egress_req = Request::from_parts(parts, Full::new(body_bytes));
 
-            for name in &[
-                "x-wr-destination",
-                "x-wr-source",
-                "x-wr-source-ns",
-                "x-wr-module",
-                "x-wr-namespace",
-                "x-wr-version",
-                "x-wr-via-proxy",
-            ] {
-                parts.headers.remove(*name);
-            }
+                let span = info_span!(
+                    "proxy.egress",
+                    wr.source                 = %source,
+                    egress.host               = %host,
+                    http.response.status_code = tracing::field::Empty,
+                    otel.status_code          = tracing::field::Empty,
+                );
 
-            parts.uri = dest_uri.clone();
-            // Reset the HTTP version so the client can negotiate freely via
-            // ALPN (HTTPS) or default to HTTP/1.1 (plain HTTP).  The inbound
-            // request may carry HTTP/2 from the proxy listener, which is not
-            // meaningful for the outbound egress connection.
-            parts.version = http::Version::HTTP_11;
-            wr_common::telemetry::inject_context(&mut parts.headers);
+                let resp = client
+                    .request(egress_req)
+                    .instrument(span.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("egress forward failed: {e}"))?;
 
-            let egress_req = Request::from_parts(parts, Full::new(body_bytes));
+                let (resp_parts, resp_body) = resp.into_parts();
+                span.record("http.response.status_code", resp_parts.status.as_u16());
+                span.record("otel.status_code", "OK");
 
-            let span = info_span!(
-                "proxy.egress",
-                wr.source                 = %source,
-                egress.host               = %host,
-                http.response.status_code = tracing::field::Empty,
-                otel.status_code          = tracing::field::Empty,
-            );
+                let resp_bytes = resp_body
+                    .collect()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("egress response body error: {e}"))?
+                    .to_bytes();
 
-            let resp = client
-                .request(egress_req)
-                .instrument(span.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("egress forward failed: {e}"))?;
+                Ok(http::Response::from_parts(
+                    resp_parts,
+                    full_body(resp_bytes),
+                ))
+            });
+        }
 
-            let (resp_parts, resp_body) = resp.into_parts();
-            span.record("http.response.status_code", resp_parts.status.as_u16());
-            span.record("otel.status_code", "OK");
-
-            let resp_bytes = resp_body
-                .collect()
-                .await
-                .map_err(|e| anyhow::anyhow!("egress response body error: {e}"))?
-                .to_bytes();
-
-            Ok(http::Response::from_parts(
-                resp_parts,
-                full_body(resp_bytes),
-            ))
-        })
+        // Internal request — pass through to ForwardService.
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(req).await.map_err(Into::into) })
     }
 }
 

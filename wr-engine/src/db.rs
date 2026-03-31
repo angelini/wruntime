@@ -421,7 +421,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::wruntime::db::database::{DbError, Host, PgValue};
-    use crate::state::ModuleState;
+    use crate::state::{ModuleServices, ModuleState};
 
     fn proxy_uri() -> hyper::Uri {
         "http://127.0.0.1:9001".parse().unwrap()
@@ -444,11 +444,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            None,
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            Default::default(),
         )
         .expect("state");
         let result = state.query("SELECT 1".into(), vec![]).await;
@@ -465,11 +461,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            None,
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            Default::default(),
         )
         .expect("state");
         let result = state.execute("SELECT 1".into(), vec![]).await;
@@ -486,11 +478,7 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            None,
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            Default::default(),
         )
         .expect("state");
         let result = state.begin_transaction().await;
@@ -520,11 +508,10 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            Some(Arc::new(pool)),
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            ModuleServices {
+                db_pool: Some(Arc::new(pool)),
+                ..Default::default()
+            },
         )
         .expect("state");
 
@@ -554,11 +541,10 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            Some(Arc::new(pool)),
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            ModuleServices {
+                db_pool: Some(Arc::new(pool)),
+                ..Default::default()
+            },
         )
         .expect("state");
 
@@ -590,11 +576,10 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            Some(Arc::new(pool)),
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            ModuleServices {
+                db_pool: Some(Arc::new(pool)),
+                ..Default::default()
+            },
         )
         .expect("state");
 
@@ -626,11 +611,10 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            Some(Arc::new(pool)),
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            ModuleServices {
+                db_pool: Some(Arc::new(pool)),
+                ..Default::default()
+            },
         )
         .expect("state");
 
@@ -676,11 +660,10 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            Some(Arc::new(pool)),
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            ModuleServices {
+                db_pool: Some(Arc::new(pool)),
+                ..Default::default()
+            },
         )
         .expect("state");
 
@@ -741,11 +724,10 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            Some(Arc::new(pool)),
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            ModuleServices {
+                db_pool: Some(Arc::new(pool)),
+                ..Default::default()
+            },
         )
         .expect("state");
 
@@ -803,11 +785,10 @@ mod tests {
             "test".into(),
             proxy_uri(),
             test_http_client(),
-            Some(Arc::new(pool)),
-            None,
-            None,
-            None,
-            tracing::Span::none(),
+            ModuleServices {
+                db_pool: Some(Arc::new(pool)),
+                ..Default::default()
+            },
         )
         .expect("state");
 
