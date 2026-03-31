@@ -97,8 +97,11 @@ node-b-engine-1:
 
 db_url_example := "postgres://postgres@localhost:5433/wruntime_example"
 db_url_test    := "postgres://postgres@localhost:5433/wruntime_test"
+s3_endpoint    := "http://localhost:8900"
+s3_access_key  := "rustfsadmin"
+s3_secret_key  := "rustfsadmin"
 
-# Start all dev services (Postgres, LGTM, Garage)
+# Start all dev services (Postgres, LGTM, RustFS S3) and create test buckets
 dev-up:
     mkdir -p dev/observability/data
     docker compose up -d
@@ -108,8 +111,12 @@ dev-up:
     @echo "Grafana:    http://localhost:3000  (admin/admin)"
     @echo "OTLP gRPC:  localhost:4317"
     @echo "OTLP HTTP:  localhost:4318"
-    @echo "Garage S3:  localhost:3900"
-    @echo "Garage adm: localhost:3901"
+    @echo "RustFS S3:  {{s3_endpoint}}"
+    @echo "RustFS Web: http://localhost:8901"
+    @sleep 2
+    -AWS_ACCESS_KEY_ID={{s3_access_key}} AWS_SECRET_ACCESS_KEY={{s3_secret_key}} \
+        aws --endpoint-url {{s3_endpoint}} s3 mb s3://test-bucket 2>/dev/null
+    @echo "S3 bucket:  test-bucket (created)"
 
 # Stop all dev services
 dev-down:
@@ -122,6 +129,39 @@ dev-logs service="":
 # Show running container status
 dev-ps:
     docker compose ps
+
+# ── WASM Guest Test Harness ───────────────────────────────────────────────────
+
+# Compile test guest protobuf schemas to FileDescriptorSet binaries (.binpb)
+build-test-schemas:
+    protoc --descriptor_set_out=wr-tests/guests/schemas/db_test.binpb \
+           --include_imports wr-tests/guests/schemas/db_test.proto
+    protoc --descriptor_set_out=wr-tests/guests/schemas/tracing_test.binpb \
+           --include_imports wr-tests/guests/schemas/tracing_test.proto
+    protoc --descriptor_set_out=wr-tests/guests/schemas/blobstore_test.binpb \
+           --include_imports wr-tests/guests/schemas/blobstore_test.proto
+
+# Build WASM test guest components
+build-test-guests: build-test-schemas
+    (cd wr-tests/guests/db-guest && cargo component build --release --target wasm32-wasip2)
+    (cd wr-tests/guests/tracing-guest && cargo component build --release --target wasm32-wasip2)
+    (cd wr-tests/guests/blobstore-guest && cargo component build --release --target wasm32-wasip2)
+
+# Run all WASM host binding tests (sets env vars for dev infrastructure automatically)
+test-wasm: build-test-guests
+    WRUNTIME_TEST_DB_URL={{db_url_test}} \
+    WRUNTIME_TEST_S3_ENDPOINT={{s3_endpoint}} \
+    WRUNTIME_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+    WRUNTIME_TEST_S3_SECRET_KEY={{s3_secret_key}} \
+    cargo test -p wr-tests --test wasm_host_test
+
+# Run a subset of WASM tests by filter (e.g. `just test-wasm-one db`, `just test-wasm-one tracing`, `just test-wasm-one blobstore`)
+test-wasm-one filter: build-test-guests
+    WRUNTIME_TEST_DB_URL={{db_url_test}} \
+    WRUNTIME_TEST_S3_ENDPOINT={{s3_endpoint}} \
+    WRUNTIME_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+    WRUNTIME_TEST_S3_SECRET_KEY={{s3_secret_key}} \
+    cargo test -p wr-tests --test wasm_host_test wasm_{{filter}}
 
 # ── Ecommerce Example ─────────────────────────────────────────────────────────
 

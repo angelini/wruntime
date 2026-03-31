@@ -16,6 +16,31 @@ pub struct EngineConfig {
     pub database: Option<DatabaseConfig>,
     /// Optional S3-compatible blobstore shared across blobstore-enabled modules.
     pub blobstore: Option<BlobstoreConfig>,
+    /// WASM instance pooling allocator configuration.
+    /// Wasmtime pre-allocates a pool of instance slots to avoid per-request
+    /// memory mapping overhead. All fields have sensible defaults so an empty
+    /// `[pool]` section (or omitting it entirely) enables pooling with defaults.
+    #[serde(default)]
+    pub pool: PoolConfig,
+}
+
+#[derive(Deserialize, Clone, Default)]
+pub struct PoolConfig {
+    /// Maximum number of concurrent component instances across all modules.
+    /// Defaults to 1000.
+    #[serde(default = "default_total_component_instances")]
+    pub total_component_instances: u32,
+    /// Maximum linear memory size in bytes per instance. Defaults to 10 MiB.
+    #[serde(default = "default_max_memory_size")]
+    pub max_memory_size: usize,
+}
+
+fn default_total_component_instances() -> u32 {
+    1000
+}
+
+fn default_max_memory_size() -> usize {
+    10 * 1024 * 1024 // 10 MiB
 }
 
 #[derive(Deserialize, Clone)]

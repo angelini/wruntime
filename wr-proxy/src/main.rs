@@ -64,23 +64,22 @@ async fn main() -> Result<()> {
     ));
     // ── Internal Tower service stack ──────────────────────────────────────
     //
-    //   TracingLayer          ← root OTel span per request
-    //     └─ EgressLayer         ← intercepts external calls; passes internal through
-    //          └─ SchemaValidationLayer
-    //               └─ RoutingLayer
+    //   TracingLayer               ← root OTel span per request
+    //     └─ SchemaValidationLayer ← validates body; passes through uncached when
+    //          |                     egress is enabled (external host, not a missing sync)
+    //          └─ RoutingLayer     ← single routing table read; sets ExternalEgress
+    //               └─ EgressLayer ← handles ExternalEgress; passes internal to forward
     //                    └─ ForwardService
     //
+    let egress_enabled = config.egress.is_some();
     let internal_svc = ServiceBuilder::new()
         .layer(TracingLayer)
-        .layer(EgressLayer::new(
-            config.egress.clone(),
-            routing_table.clone(),
-        ))
-        .layer(SchemaValidationLayer::new(schema_cache.clone()))
-        .layer(RoutingLayer::new(
-            routing_table.clone(),
-            config.node.proxy_address.clone(),
-        ))
+        .layer(SchemaValidationLayer::new(schema_cache.clone()).with_egress(egress_enabled))
+        .layer(
+            RoutingLayer::new(routing_table.clone(), config.node.proxy_address.clone())
+                .with_egress(egress_enabled),
+        )
+        .layer(EgressLayer::new(config.egress.clone()))
         .service(ForwardService::new(cb_registry.clone()));
 
     let internal_listener = TcpListener::bind(&config.listen_address).await?;

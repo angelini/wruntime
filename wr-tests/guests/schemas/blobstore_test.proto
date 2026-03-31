@@ -1,0 +1,77 @@
+syntax = "proto3";
+package test;
+
+service BlobstoreTestService {
+  rpc Put      (PutRequest)      returns (PutResponse);
+  rpc Get      (GetRequest)      returns (GetResponse);
+  rpc Delete   (DeleteRequest)   returns (DeleteResponse);
+  rpc List     (ListRequest)     returns (ListResponse);
+  rpc Head     (HeadRequest)     returns (HeadResponse);
+  rpc RoundTrip (RoundTripRequest) returns (RoundTripResponse);
+  rpc NotFound (NotFoundRequest) returns (NotFoundResponse);
+}
+
+message PutRequest {
+  string bucket = 1;
+  string key    = 2;
+  bytes  data   = 3;
+}
+message PutResponse {}
+
+message GetRequest {
+  string bucket = 1;
+  string key    = 2;
+}
+message GetResponse {
+  bytes data = 1;
+}
+
+message DeleteRequest {
+  string bucket = 1;
+  string key    = 2;
+}
+message DeleteResponse {}
+
+message ListRequest {
+  string bucket = 1;
+  string prefix = 2;
+}
+message ObjectMeta {
+  string key           = 1;
+  uint64 size          = 2;
+  int64  last_modified = 3;
+  string etag          = 4;
+}
+message ListResponse {
+  repeated ObjectMeta objects = 1;
+}
+
+message HeadRequest {
+  string bucket = 1;
+  string key    = 2;
+}
+message HeadResponse {
+  string key           = 1;
+  uint64 size          = 2;
+  int64  last_modified = 3;
+  string etag          = 4;
+}
+
+message RoundTripRequest {
+  string bucket = 1;
+  string key    = 2;
+  bytes  data   = 3;
+}
+message RoundTripResponse {
+  bytes data    = 1;
+  bool  matches = 2;
+}
+
+message NotFoundRequest {
+  string bucket = 1;
+  string key    = 2;
+}
+message NotFoundResponse {
+  string error_kind    = 1;
+  string error_message = 2;
+}

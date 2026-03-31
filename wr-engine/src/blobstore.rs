@@ -179,3 +179,207 @@ fn parse_last_modified(s: &str) -> i64 {
 }
 
 pub use wruntime::blobstore::store::add_to_linker;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::config::BlobstoreConfig;
+    use crate::state::ModuleState;
+
+    fn proxy_uri() -> hyper::Uri {
+        "http://127.0.0.1:9001".parse().unwrap()
+    }
+
+    fn test_http_client() -> hyper_util::client::legacy::Client<
+        hyper_util::client::legacy::connect::HttpConnector,
+        http_body_util::Full<bytes::Bytes>,
+    > {
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build_http()
+    }
+
+    fn test_config() -> BlobstoreConfig {
+        BlobstoreConfig {
+            endpoint: "http://127.0.0.1:8900".into(),
+            access_key_id: "test-key".into(),
+            secret_access_key: "test-secret".into(),
+            region: "us-east-1".into(),
+        }
+    }
+
+    // ── BlobstoreRuntime tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_new_runtime_from_config() {
+        let config = test_config();
+        let rt = BlobstoreRuntime::new(&config).expect("should create runtime");
+        assert_eq!(rt.endpoint, "http://127.0.0.1:8900");
+        assert_eq!(rt.region, "us-east-1");
+    }
+
+    #[test]
+    fn test_bucket_returns_path_style() {
+        let rt = BlobstoreRuntime::new(&test_config()).unwrap();
+        let bucket = rt.bucket("my-bucket").expect("should create bucket");
+        assert_eq!(bucket.name(), "my-bucket");
+        assert!(bucket.is_path_style());
+    }
+
+    #[test]
+    fn test_bucket_uses_custom_region() {
+        let mut config = test_config();
+        config.region = "eu-west-1".into();
+        config.endpoint = "http://s3.example.com".into();
+        let rt = BlobstoreRuntime::new(&config).unwrap();
+        let bucket = rt.bucket("test").expect("should create bucket");
+        assert_eq!(bucket.region().to_string(), "eu-west-1");
+    }
+
+    // ── require_blobstore tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_require_blobstore_none_returns_error() {
+        let result = require_blobstore(&None);
+        assert!(matches!(result, Err(BlobError::Io(_))));
+        if let Err(BlobError::Io(msg)) = result {
+            assert!(msg.contains("no blobstore configured"));
+        }
+    }
+
+    #[test]
+    fn test_require_blobstore_some_returns_runtime() {
+        let rt = Arc::new(BlobstoreRuntime::new(&test_config()).unwrap());
+        let result = require_blobstore(&Some(rt));
+        assert!(result.is_ok());
+    }
+
+    // ── map_s3_err tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_map_s3_err_404() {
+        let err = map_s3_err(s3::error::S3Error::HttpFailWithBody(
+            404,
+            "not found".into(),
+        ));
+        assert!(matches!(err, BlobError::NotFound(msg) if msg == "not found"));
+    }
+
+    #[test]
+    fn test_map_s3_err_403() {
+        let err = map_s3_err(s3::error::S3Error::HttpFailWithBody(
+            403,
+            "forbidden".into(),
+        ));
+        assert!(matches!(err, BlobError::AccessDenied(msg) if msg == "forbidden"));
+    }
+
+    #[test]
+    fn test_map_s3_err_other() {
+        let err = map_s3_err(s3::error::S3Error::HttpFailWithBody(
+            500,
+            "server error".into(),
+        ));
+        assert!(matches!(err, BlobError::Io(_)));
+    }
+
+    // ── parse_last_modified tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_rfc2822() {
+        // Thu, 28 Mar 2024 12:00:00 GMT
+        let ts = parse_last_modified("Thu, 28 Mar 2024 12:00:00 GMT");
+        assert_eq!(ts, 1711627200);
+    }
+
+    #[test]
+    fn test_parse_rfc3339() {
+        let ts = parse_last_modified("2024-03-28T12:00:00.000Z");
+        assert_eq!(ts, 1711627200);
+    }
+
+    #[test]
+    fn test_parse_rfc3339_no_millis() {
+        let ts = parse_last_modified("2024-03-28T12:00:00Z");
+        assert_eq!(ts, 1711627200);
+    }
+
+    #[test]
+    fn test_parse_invalid_returns_zero() {
+        assert_eq!(parse_last_modified("not-a-date"), 0);
+        assert_eq!(parse_last_modified(""), 0);
+    }
+
+    // ── Host no-blobstore tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_put_object_returns_error_when_no_blobstore() {
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            test_http_client(),
+            Default::default(),
+        )
+        .expect("state");
+        let result = Host::put_object(&mut state, "b".into(), "k".into(), vec![1]).await;
+        assert!(matches!(result, Err(BlobError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn test_get_object_returns_error_when_no_blobstore() {
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            test_http_client(),
+            Default::default(),
+        )
+        .expect("state");
+        let result = Host::get_object(&mut state, "b".into(), "k".into()).await;
+        assert!(matches!(result, Err(BlobError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn test_delete_object_returns_error_when_no_blobstore() {
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            test_http_client(),
+            Default::default(),
+        )
+        .expect("state");
+        let result = Host::delete_object(&mut state, "b".into(), "k".into()).await;
+        assert!(matches!(result, Err(BlobError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_returns_error_when_no_blobstore() {
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            test_http_client(),
+            Default::default(),
+        )
+        .expect("state");
+        let result = Host::list_objects(&mut state, "b".into(), None).await;
+        assert!(matches!(result, Err(BlobError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn test_head_object_returns_error_when_no_blobstore() {
+        let mut state = ModuleState::new(
+            "test".into(),
+            "test".into(),
+            proxy_uri(),
+            test_http_client(),
+            Default::default(),
+        )
+        .expect("state");
+        let result = Host::head_object(&mut state, "b".into(), "k".into()).await;
+        assert!(matches!(result, Err(BlobError::Io(_))));
+    }
+}

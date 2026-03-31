@@ -2,6 +2,7 @@
 ///
 /// Each test spins up real in-process gRPC services / HTTP servers on
 /// ephemeral ports so that no external processes are required.
+#[allow(dead_code, unused_imports)]
 mod helpers;
 use helpers::*;
 
@@ -1088,11 +1089,7 @@ async fn test_db_query_without_pool_returns_connection_error() {
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
         http_client(),
-        None,
-        None,
-        None,
-        None,
-        tracing::Span::none(),
+        Default::default(),
     )
     .expect("ModuleState");
     let err = state.query("SELECT 1".into(), vec![]).await.unwrap_err();
@@ -1109,11 +1106,7 @@ async fn test_db_execute_without_pool_returns_connection_error() {
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
         http_client(),
-        None,
-        None,
-        None,
-        None,
-        tracing::Span::none(),
+        Default::default(),
     )
     .expect("ModuleState");
     let err = state
@@ -1893,11 +1886,7 @@ fn test_tracing_span_start_and_drop() {
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
         http_client(),
-        None,
-        None,
-        None,
-        None,
-        tracing::Span::none(),
+        Default::default(),
     )
     .expect("ModuleState");
 
@@ -1914,11 +1903,7 @@ fn test_tracing_span_set_attribute() {
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
         http_client(),
-        None,
-        None,
-        None,
-        None,
-        tracing::Span::none(),
+        Default::default(),
     )
     .expect("ModuleState");
 
@@ -1942,11 +1927,7 @@ fn test_tracing_span_record_event() {
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
         http_client(),
-        None,
-        None,
-        None,
-        None,
-        tracing::Span::none(),
+        Default::default(),
     )
     .expect("ModuleState");
 
@@ -1970,11 +1951,7 @@ fn test_tracing_span_set_error() {
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
         http_client(),
-        None,
-        None,
-        None,
-        None,
-        tracing::Span::none(),
+        Default::default(),
     )
     .expect("ModuleState");
 

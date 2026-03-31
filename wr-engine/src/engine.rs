@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn, Instrument};
 use wasmtime::component::{Component, Linker};
 use wasmtime::Store;
-use wasmtime::{Config, Engine};
+use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig};
 use wasmtime_wasi_http::p2::{
     bindings::http::types::{ErrorCode, Scheme},
     bindings::ProxyPre,
@@ -23,7 +23,7 @@ use crate::registry::{InboundRequest, ModuleRegistry, ModuleTx};
 use wr_engine::blobstore::BlobstoreRuntime;
 use wr_engine::config::{EngineConfig, ModuleConfig};
 use wr_engine::pool::module_schema;
-use wr_engine::state::ModuleState;
+use wr_engine::state::{ModuleServices, ModuleState};
 
 pub struct EngineRunner {
     engine: Arc<Engine>,
@@ -40,6 +40,14 @@ impl EngineRunner {
     pub fn new(config: EngineConfig) -> Result<Self> {
         let mut wt_config = Config::new();
         wt_config.wasm_component_model(true);
+
+        let mut pool = PoolingAllocationConfig::new();
+        pool.total_component_instances(config.pool.total_component_instances);
+        pool.max_memory_size(config.pool.max_memory_size);
+        pool.total_memories(config.pool.total_component_instances);
+        pool.total_tables(config.pool.total_component_instances);
+        wt_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
+
         let engine = Engine::new(&wt_config)?;
 
         let db_pool = config
@@ -230,11 +238,13 @@ impl EngineRunner {
                     module_namespace.clone(),
                     proxy_uri,
                     http_client,
-                    db_pool,
-                    db_schema,
-                    blobstore,
-                    module_config.fs.as_ref(),
-                    tracing::Span::current(),
+                    ModuleServices {
+                        db_pool,
+                        db_schema,
+                        blobstore,
+                        fs: module_config.fs.clone(),
+                        active_span: tracing::Span::current(),
+                    },
                 )?;
                 let mut store = Store::new(&self.engine, state);
                 let instance = linker.instantiate_async(&mut store, &component).await?;
@@ -354,11 +364,13 @@ async fn dispatch_request(
         module.namespace.clone(),
         module.proxy_uri.clone(),
         module.http_client.clone(),
-        module.db_pool.clone(),
-        module.db_schema.clone(),
-        module.blobstore.clone(),
-        module.fs.as_ref(),
-        tracing::Span::current(),
+        ModuleServices {
+            db_pool: module.db_pool.clone(),
+            db_schema: module.db_schema.clone(),
+            blobstore: module.blobstore.clone(),
+            fs: module.fs.clone(),
+            active_span: tracing::Span::current(),
+        },
     )?;
     let mut store = Store::new(&handler.engine, state);
     let proxy = handler.pre.instantiate_async(&mut store).await?;
