@@ -102,12 +102,28 @@ fn column_to_json(name: &str, col: &database::Column) -> String {
         PgValue::Text(v) => ("text", v.clone()),
         PgValue::Bytea(v) => ("bytea", format!("{:?}", v)),
         PgValue::Timestamptz(v) => ("timestamptz", v.to_string()),
+        PgValue::Timestamp(v) => ("timestamp", v.to_string()),
         PgValue::Date(v) => ("date", v.to_string()),
         PgValue::Time(v) => ("time", v.to_string()),
+        PgValue::Interval(iv) => (
+            "interval",
+            format!("{}m{}d{}us", iv.months, iv.days, iv.microseconds),
+        ),
         PgValue::Numeric(v) => ("numeric", v.clone()),
         PgValue::Uuid((hi, lo)) => ("uuid", format!("{hi:016x}{lo:016x}")),
         PgValue::Jsonb(v) => ("jsonb", v.clone()),
         PgValue::Oid(v) => ("oid", v.to_string()),
+        PgValue::BoolArray(a) => ("bool[]", format!("{:?}", a)),
+        PgValue::Int2Array(a) => ("int2[]", format!("{:?}", a)),
+        PgValue::Int4Array(a) => ("int4[]", format!("{:?}", a)),
+        PgValue::Int8Array(a) => ("int8[]", format!("{:?}", a)),
+        PgValue::Float4Array(a) => ("float4[]", format!("{:?}", a)),
+        PgValue::Float8Array(a) => ("float8[]", format!("{:?}", a)),
+        PgValue::TextArray(a) => ("text[]", format!("{:?}", a)),
+        PgValue::TimestamptzArray(a) => ("timestamptz[]", format!("{:?}", a)),
+        PgValue::TimestampArray(a) => ("timestamp[]", format!("{:?}", a)),
+        PgValue::UuidArray(a) => ("uuid[]", format!("{:?}", a)),
+        PgValue::JsonbArray(a) => ("jsonb[]", format!("{:?}", a)),
     };
     format!("{{\"name\":\"{}\",\"type\":\"{}\",\"value\":\"{}\"}}", name, typ, val)
 }
@@ -333,5 +349,60 @@ impl proto::DbTestService for Component {
                 })
             }
         }
+    }
+
+    fn query_stream(
+        &self,
+        req: proto::QueryStreamRequest,
+    ) -> Result<proto::QueryStreamResponse, ServiceError> {
+        let params = parse_params(&req.params_json);
+        let batch_size = if req.batch_size == 0 { 10 } else { req.batch_size };
+        let cursor = database::query_stream(&req.sql, &params)
+            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        let mut all_rows = vec![];
+        let mut batch_count: u32 = 0;
+        loop {
+            let batch = cursor
+                .next_batch(batch_size)
+                .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            batch_count += 1;
+            if batch.is_empty() {
+                break;
+            }
+            for row in &batch {
+                let cols = row
+                    .columns
+                    .iter()
+                    .map(|c| column_to_json(&c.name, c))
+                    .collect();
+                all_rows.push(proto::QueryRow { columns_json: cols });
+            }
+        }
+        Ok(proto::QueryStreamResponse {
+            rows: all_rows,
+            batch_count,
+        })
+    }
+
+    fn query_stream_drop(
+        &self,
+        req: proto::QueryStreamDropRequest,
+    ) -> Result<proto::QueryStreamDropResponse, ServiceError> {
+        let cursor = database::query_stream(&req.sql, &[])
+            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        let mut fetched: u32 = 0;
+        while fetched < req.fetch_count {
+            let remaining = req.fetch_count - fetched;
+            let batch = cursor
+                .next_batch(remaining)
+                .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            if batch.is_empty() {
+                break;
+            }
+            fetched += batch.len() as u32;
+        }
+        // Drop the cursor without consuming all rows
+        drop(cursor);
+        Ok(proto::QueryStreamDropResponse { fetched })
     }
 }

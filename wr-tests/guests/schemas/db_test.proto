@@ -9,6 +9,8 @@ service DbTestService {
   rpc TransactionRollback (TransactionRollbackRequest) returns (TransactionRollbackResponse);
   rpc TransactionDrop     (TransactionDropRequest)     returns (TransactionDropResponse);
   rpc Error               (ErrorRequest)               returns (ErrorResponse);
+  rpc QueryStream         (QueryStreamRequest)         returns (QueryStreamResponse);
+  rpc QueryStreamDrop     (QueryStreamDropRequest)     returns (QueryStreamDropResponse);
 }
 
 message ExecuteRequest {
@@ -67,4 +69,23 @@ message ErrorRequest {
 message ErrorResponse {
   string error_kind    = 1;
   string error_message = 2;
+}
+
+message QueryStreamRequest {
+  string sql         = 1;
+  string params_json = 2;
+  uint32 batch_size  = 3;
+}
+message QueryStreamResponse {
+  repeated QueryRow rows = 1;
+  // Number of batches fetched (for verifying streaming behavior).
+  uint32 batch_count = 2;
+}
+
+message QueryStreamDropRequest {
+  string sql         = 1;
+  uint32 fetch_count = 2;  // How many rows to fetch before dropping the cursor.
+}
+message QueryStreamDropResponse {
+  uint32 fetched = 1;
 }

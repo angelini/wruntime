@@ -1,25 +1,48 @@
-package wruntime:db@0.2.0;
+package wruntime:db@0.4.0;
 
 interface database {
+    /// A Postgres INTERVAL decomposed into its three stored components.
+    record pg-interval {
+        /// Whole months (may be negative).
+        months: s32,
+        /// Whole days (may be negative, not normalised to months).
+        days: s32,
+        /// Sub-day portion in microseconds (may be negative).
+        microseconds: s64,
+    }
+
     /// A typed Postgres value, including NULL.
     ///
     /// Mapping to Postgres OIDs:
-    ///   null        → SQL NULL (any type)
-    ///   boolean     → BOOL
-    ///   int2        → SMALLINT / INT2
-    ///   int4        → INTEGER  / INT4
-    ///   int8        → BIGINT   / INT8
-    ///   float4      → REAL     / FLOAT4
-    ///   float8      → DOUBLE PRECISION / FLOAT8
-    ///   text        → TEXT / VARCHAR / CHAR / NAME
-    ///   bytea       → BYTEA
-    ///   timestamptz → TIMESTAMPTZ — microseconds since Unix epoch (UTC)
-    ///   date        → DATE  — days since Unix epoch
-    ///   time        → TIME  — microseconds since midnight
-    ///   numeric     → NUMERIC / DECIMAL — preserved as a decimal string
-    ///   uuid        → UUID  — 128-bit value as (high-u64, low-u64)
-    ///   jsonb       → JSON / JSONB — serialised JSON text
-    ///   oid         → OID  — 32-bit object identifier
+    ///   null             → SQL NULL (any type)
+    ///   boolean          → BOOL
+    ///   int2             → SMALLINT / INT2
+    ///   int4             → INTEGER  / INT4
+    ///   int8             → BIGINT   / INT8
+    ///   float4           → REAL     / FLOAT4
+    ///   float8           → DOUBLE PRECISION / FLOAT8
+    ///   text             → TEXT / VARCHAR / CHAR / NAME
+    ///   bytea            → BYTEA
+    ///   timestamptz      → TIMESTAMPTZ — microseconds since Unix epoch (UTC)
+    ///   timestamp        → TIMESTAMP  — naive, microseconds since Unix epoch
+    ///   date             → DATE  — days since Unix epoch
+    ///   time             → TIME  — microseconds since midnight
+    ///   interval         → INTERVAL — months, days, microseconds
+    ///   numeric          → NUMERIC / DECIMAL — preserved as a decimal string
+    ///   uuid             → UUID  — 128-bit value as (high-u64, low-u64)
+    ///   jsonb            → JSON / JSONB — serialised JSON text
+    ///   oid              → OID  — 32-bit object identifier
+    ///   bool-array       → BOOL[]
+    ///   int2-array       → INT2[]
+    ///   int4-array       → INT4[]
+    ///   int8-array       → INT8[]
+    ///   float4-array     → FLOAT4[]
+    ///   float8-array     → FLOAT8[]
+    ///   text-array       → TEXT[]
+    ///   timestamptz-array→ TIMESTAMPTZ[]
+    ///   timestamp-array  → TIMESTAMP[]
+    ///   uuid-array       → UUID[]
+    ///   jsonb-array      → JSONB[]
     variant pg-value {
         null,
         boolean(bool),
@@ -31,12 +54,25 @@ interface database {
         text(string),
         bytea(list<u8>),
         timestamptz(s64),
+        timestamp(s64),
         date(s32),
         time(s64),
+        interval(pg-interval),
         numeric(string),
         uuid(tuple<u64, u64>),
         jsonb(string),
         oid(u32),
+        bool-array(list<option<bool>>),
+        int2-array(list<option<s16>>),
+        int4-array(list<option<s32>>),
+        int8-array(list<option<s64>>),
+        float4-array(list<option<f32>>),
+        float8-array(list<option<f64>>),
+        text-array(list<option<string>>),
+        timestamptz-array(list<option<s64>>),
+        timestamp-array(list<option<s64>>),
+        uuid-array(list<option<tuple<u64, u64>>>),
+        jsonb-array(list<option<string>>),
     }
 
     /// A single column value in a result row.
@@ -89,12 +125,36 @@ interface database {
             params: list<pg-value>,
         ) -> result<u64, db-error>;
 
+        /// Execute a parameterised SELECT and stream results via a cursor.
+        query-stream: func(
+            sql:    string,
+            params: list<pg-value>,
+        ) -> result<row-cursor, db-error>;
+
         /// Commit the transaction.
         commit: func() -> result<_, db-error>;
 
         /// Roll back the transaction explicitly.
         rollback: func() -> result<_, db-error>;
     }
+
+    /// A streaming cursor over query results.
+    ///
+    /// Each call to `next-batch` returns up to `max` rows from the underlying
+    /// Postgres row stream.  An empty list signals that all rows have been
+    /// consumed.  Dropping the handle cancels the in-flight query and returns
+    /// the connection to the pool.
+    resource row-cursor {
+        /// Pull the next batch of rows.  Returns an empty list when exhausted.
+        next-batch: func(max: u32) -> result<list<row>, db-error>;
+    }
+
+    /// Execute a parameterised SELECT and stream results via a cursor.
+    /// Parameters are bound positionally as $1, $2, … in the SQL string.
+    query-stream: func(
+        sql:    string,
+        params: list<pg-value>,
+    ) -> result<row-cursor, db-error>;
 
     /// Acquire a connection and begin a transaction (issues BEGIN).
     begin-transaction: func() -> result<transaction, db-error>;

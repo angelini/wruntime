@@ -262,6 +262,67 @@ async fn wasm_db_error() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn wasm_db_query_stream() -> Result<()> {
+    if skip_if_no_db_wasm() {
+        return Ok(());
+    }
+    let Some(state) = db_state_for_module(1, "test-ns", "db-stream-test").await else {
+        eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
+        return Ok(());
+    };
+    let (engine, pre) = wasm_module_pre(DB_GUEST_WASM)?;
+
+    let req = proto::QueryStreamRequest {
+        sql: "SELECT generate_series(1, 5) AS n".into(),
+        params_json: "".into(),
+        batch_size: 2,
+    };
+    let resp = dispatch_to_wasm(
+        &engine,
+        &pre,
+        state,
+        rpc_request("/test.db_test/QueryStream", req.encode_to_vec()),
+    )
+    .await?;
+    assert_eq!(resp.status(), 200);
+
+    let body = proto::QueryStreamResponse::decode(resp.into_body())?;
+    assert_eq!(body.rows.len(), 5);
+    // With batch_size=2 and 5 rows: batches of 2, 2, 1, then empty = 4 batches
+    assert_eq!(body.batch_count, 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn wasm_db_query_stream_drop() -> Result<()> {
+    if skip_if_no_db_wasm() {
+        return Ok(());
+    }
+    let Some(state) = db_state_for_module(1, "test-ns", "db-stream-drop-test").await else {
+        eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
+        return Ok(());
+    };
+    let (engine, pre) = wasm_module_pre(DB_GUEST_WASM)?;
+
+    let req = proto::QueryStreamDropRequest {
+        sql: "SELECT generate_series(1, 100) AS n".into(),
+        fetch_count: 5,
+    };
+    let resp = dispatch_to_wasm(
+        &engine,
+        &pre,
+        state,
+        rpc_request("/test.db_test/QueryStreamDrop", req.encode_to_vec()),
+    )
+    .await?;
+    assert_eq!(resp.status(), 200);
+
+    let body = proto::QueryStreamDropResponse::decode(resp.into_body())?;
+    assert_eq!(body.fetched, 5);
+    Ok(())
+}
+
 // ── Tracing guest tests ──────────────────────────────────────────────────────
 
 fn skip_if_no_tracing_wasm() -> bool {
