@@ -165,6 +165,11 @@ where
             }
 
             parts.uri = dest_uri.clone();
+            // Reset the HTTP version so the client can negotiate freely via
+            // ALPN (HTTPS) or default to HTTP/1.1 (plain HTTP).  The inbound
+            // request may carry HTTP/2 from the proxy listener, which is not
+            // meaningful for the outbound egress connection.
+            parts.version = http::Version::HTTP_11;
             wr_common::telemetry::inject_context(&mut parts.headers);
 
             let egress_req = Request::from_parts(parts, Full::new(body_bytes));

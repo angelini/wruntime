@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # Run from the repo root: bash examples/ecommerce/run.sh
 # Prerequisites: cargo, cargo-component, rustup target add wasm32-wasip2,
-#                Postgres running with an 'ecommerce' database. `just db-start-example`
+#                Postgres running with an 'ecommerce' database. `just dev-up`
 set -euo pipefail
+
+INLINE=false
+for arg in "$@"; do
+    case "$arg" in
+        --inline) INLINE=true ;;
+    esac
+done
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -11,7 +18,7 @@ DB_URL="${DB_URL:-${WRUNTIME_EXAMPLE_DB_URL:-postgres://localhost:5432/wruntime_
 echo "DB_URL: ${DB_URL}"
 
 # ── Tracing (OpenTelemetry → Grafana LGTM) ────────────────────────────────────
-# OTLP gRPC collector exposed by `just obs-up` (grafana/otel-lgtm) on :4317.
+# OTLP gRPC collector exposed by `just dev-up` (grafana/otel-lgtm) on :4317.
 # The services hard-code localhost:4317 as their OTLP endpoint, so no endpoint
 # override is needed — just set the log level.
 export RUST_LOG="${RUST_LOG:-info}"
@@ -77,6 +84,26 @@ sleep 2
 cargo run -p wr-cli -- engines list
 cargo run -p wr-cli -- services list
 
+cleanup() {
+    echo "==> Shutting down..."
+    kill -INT "$CLIENT_PID" "$INV1_PID" "$INV2_PID" "$PROXY_PID" "$MANAGER_PID" 2>/dev/null || true
+    # Give services time to flush the OTLP batch exporter before exiting.
+    sleep 5
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+
+if [ "$INLINE" = true ]; then
+    echo "==> Running client inline with {\"count\": 1}..."
+    cargo run -p wr-cli -- invoke \
+        --proxy http://127.0.0.1:9001 \
+        --destination http://ecommerce.client/Run \
+        --source loadtest --source-ns ecommerce \
+        --body '{"count": 1}'
+    # cleanup runs via EXIT trap; exit with invoke's exit code
+    exit $?
+fi
+
 echo ""
 echo "All services running. Press Ctrl-C to stop."
 echo "  Manager  : http://127.0.0.1:9000 (gRPC)"
@@ -100,14 +127,5 @@ echo "    --body '{\"count\": 1000}'"
 echo ""
 echo "Inspect metrics:"
 echo "  cargo run -p wr-cli -- metrics summary"
-
-cleanup() {
-    echo "==> Shutting down..."
-    kill -INT "$CLIENT_PID" "$INV1_PID" "$INV2_PID" "$PROXY_PID" "$MANAGER_PID" 2>/dev/null || true
-    # Give services time to flush the OTLP batch exporter before exiting.
-    sleep 5
-}
-trap cleanup EXIT
-trap 'exit 0' INT TERM
 
 wait

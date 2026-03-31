@@ -1,11 +1,11 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use wr_common::wruntime::{EngineRegistration, RequestMetrics, RoutingTable};
+use wr_common::wruntime::{EngineRegistration, RoutingTable};
 
 pub struct ManagerState {
     /// Registered engines, keyed by engine_id
@@ -18,8 +18,6 @@ pub struct ManagerState {
     pub routing_table: RoutingTable,
     /// Module schemas: (namespace, module_name, version) -> FileDescriptorSet bytes
     pub schemas: HashMap<(String, String, String), Vec<u8>>,
-    /// Rolling buffer of request metrics reported by proxies
-    pub metrics: VecDeque<RequestMetrics>,
 }
 
 impl ManagerState {
@@ -33,7 +31,6 @@ impl ManagerState {
                 version: 0,
             },
             schemas: HashMap::new(),
-            metrics: VecDeque::new(),
         }
     }
 }

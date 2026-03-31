@@ -150,12 +150,10 @@ pub async fn start_ingress_proxy(
     schema_cache: Arc<wr_proxy::schema::SchemaCache>,
     routes: Vec<ExternalRoute>,
 ) -> Result<SocketAddr> {
-    let (metrics_tx, _) = tokio::sync::mpsc::channel(100);
     // External traffic bypasses schema validation — the IngressLayer handles
     // transcoding (and therefore any necessary validation) directly.
     let svc = tower::ServiceBuilder::new()
         .layer(wr_proxy::layers::IngressLayer::new(routes, schema_cache))
-        .layer(wr_proxy::layers::MetricsLayer::new(metrics_tx))
         .layer(wr_proxy::layers::RoutingLayer::new(table, ""))
         .service(wr_proxy::layers::ForwardService::new(std::sync::Arc::new(
             wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
@@ -219,9 +217,7 @@ pub async fn start_proxy_with_schema(
     schema_cache: Arc<wr_proxy::schema::SchemaCache>,
     self_proxy_address: &str,
 ) -> Result<SocketAddr> {
-    let (metrics_tx, _) = tokio::sync::mpsc::channel(100);
     let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::MetricsLayer::new(metrics_tx))
         .layer(wr_proxy::layers::SchemaValidationLayer::new(schema_cache))
         .layer(wr_proxy::layers::RoutingLayer::new(
             table,
@@ -247,16 +243,27 @@ pub async fn start_egress_proxy(
     egress_cfg: Option<EgressConfig>,
     table: wr_proxy::routing::CachedRoutingTable,
 ) -> Result<SocketAddr> {
-    let (metrics_tx, _) = tokio::sync::mpsc::channel(100);
+    start_egress_proxy_with_schema(
+        egress_cfg,
+        table,
+        Arc::new(wr_proxy::schema::SchemaCache::new()),
+    )
+    .await
+}
+
+/// Like [`start_egress_proxy`] but with a pre-populated schema cache.
+pub async fn start_egress_proxy_with_schema(
+    egress_cfg: Option<EgressConfig>,
+    table: wr_proxy::routing::CachedRoutingTable,
+    schema_cache: Arc<wr_proxy::schema::SchemaCache>,
+) -> Result<SocketAddr> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::MetricsLayer::new(metrics_tx))
         .layer(wr_proxy::layers::EgressLayer::new(
             egress_cfg,
             table.clone(),
         ))
-        .layer(wr_proxy::layers::SchemaValidationLayer::new(Arc::new(
-            wr_proxy::schema::SchemaCache::new(),
-        )))
+        .layer(wr_proxy::layers::SchemaValidationLayer::new(schema_cache))
         .layer(wr_proxy::layers::RoutingLayer::new(table, ""))
         .service(wr_proxy::layers::ForwardService::new(Arc::new(
             wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
@@ -339,9 +346,7 @@ pub async fn start_node(mgr_addr: &str) -> Result<Node> {
     let table = wr_proxy::routing::new_routing_table();
     sync_table(mgr_addr, &table).await?;
 
-    let (metrics_tx, _) = tokio::sync::mpsc::channel(100);
     let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::MetricsLayer::new(metrics_tx))
         .layer(wr_proxy::layers::SchemaValidationLayer::new(schema_cache))
         .layer(wr_proxy::layers::RoutingLayer::new(
             table.clone(),

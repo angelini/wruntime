@@ -69,6 +69,12 @@ impl WasiHttpHooks for ModuleHttpHooks {
         let new_uri: hyper::Uri = format!("{scheme}://{authority}{path_and_query}")
             .parse()
             .map_err(|_| ErrorCode::InternalError(None))?;
+        tracing::debug!(
+            original = %original_uri,
+            proxy_uri = %self.proxy_uri,
+            rewritten = %new_uri,
+            "outgoing request rewrite"
+        );
         *request.uri_mut() = new_uri;
 
         let client = self.http_client.clone();
@@ -87,8 +93,12 @@ impl WasiHttpHooks for ModuleHttpHooks {
                 let buffered = hyper::Request::from_parts(parts, Full::new(body_bytes));
 
                 let resp = client.request(buffered).await.map_err(|e| {
-                    tracing::warn!(error = %e, "outgoing http request failed");
-                    ErrorCode::ConnectionRefused
+                    tracing::warn!(error = ?e, "outgoing http request failed");
+                    if e.is_connect() {
+                        ErrorCode::ConnectionRefused
+                    } else {
+                        ErrorCode::InternalError(Some(e.to_string()))
+                    }
                 })?;
 
                 let (resp_parts, resp_body) = resp.into_parts();

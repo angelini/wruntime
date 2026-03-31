@@ -139,9 +139,13 @@ build-example: build-schemas
     (cd examples/ecommerce/inventory && cargo component build --release --target wasm32-wasip2)
     (cd examples/ecommerce/client && cargo component build --release --target wasm32-wasip2)
 
-# Run the full ecommerce example (requires Postgres — see `just db-start-example`)
+# Run the full ecommerce example (requires Postgres — see `just dev-up`)
 example: build-example build
     bash examples/ecommerce/run.sh
+
+# Run the ecommerce example inline (single invocation, exits on failure)
+example-inline: build-example build
+    bash examples/ecommerce/run.sh --inline
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 

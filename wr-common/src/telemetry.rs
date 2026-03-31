@@ -115,7 +115,7 @@ pub fn init(service_name: &'static str) -> Result<TelemetryGuard> {
     //   otel tracing  — bridges tracing spans → OTel trace spans
     //   otel logs     — bridges tracing events → OTel log records
     tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(tracing_subscriber::fmt::layer())
         .with(tracing_opentelemetry::layer().with_tracer(tracer))
         .with(OpenTelemetryTracingBridge::new(&logger_provider))
