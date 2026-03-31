@@ -1,7 +1,7 @@
 package ecommerce:inventory@1.0.0;
 
 world inventory {
-  import wruntime:db/database@0.2.0;
+  import wruntime:db/database@0.4.0;
   import wruntime:tracing/span;
   import wasi:cli/stderr@0.2.6;
   import wasi:cli/environment@0.2.6;

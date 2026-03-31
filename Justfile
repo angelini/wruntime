@@ -60,28 +60,28 @@ test-one name:
 # ── Run services ──────────────────────────────────────────────────────────────
 
 # Run wr-manager
-manager:
-    cargo run -p wr-manager -- --config examples/config/manager.toml
+manager config="examples/config/manager.toml":
+    cargo run -p wr-manager -- --config {{config}}
 
 # Run wr-proxy
-proxy:
-    cargo run -p wr-proxy -- --config examples/config/proxy.toml
+proxy config="examples/config/proxy.toml":
+    cargo run -p wr-proxy -- --config {{config}}
 
 # Run wr-engine
-engine:
-    cargo run -p wr-engine -- --config examples/config/engine.toml
+engine config="examples/config/engine.toml":
+    cargo run -p wr-engine -- --config {{config}}
 
 # Run wr-manager (release build)
-manager-release:
-    cargo run --release -p wr-manager -- --config examples/config/manager.toml
+manager-release config="examples/config/manager.toml":
+    cargo run --release -p wr-manager -- --config {{config}}
 
 # Run wr-proxy (release build)
-proxy-release:
-    cargo run --release -p wr-proxy -- --config examples/config/proxy.toml
+proxy-release config="examples/config/proxy.toml":
+    cargo run --release -p wr-proxy -- --config {{config}}
 
 # Run wr-engine (release build)
-engine-release:
-    cargo run --release -p wr-engine -- --config examples/config/engine.toml
+engine-release config="examples/config/engine.toml":
+    cargo run --release -p wr-engine -- --config {{config}}
 
 # ── Multi-node local development ──────────────────────────────────────────────
 

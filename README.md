@@ -164,7 +164,7 @@ cargo component build -p caller
 # Start the services (in separate terminals, or background them)
 just manager
 just proxy
-cargo run -p wr-engine -- --config engine.toml
+just engine ./engine.toml
 
 # Invoke the caller through the proxy
 wr-cli invoke --destination http://example.caller/run
