@@ -7,7 +7,3 @@ proxy_address = "http://127.0.0.1:9002"   # this proxy's own address, as reachab
 [cache]
 routing_table_ttl_secs = 5
 schema_ttl_secs        = 60
-
-[metrics]
-flush_interval_secs = 10
-queue_depth         = 1000

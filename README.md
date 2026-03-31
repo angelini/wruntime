@@ -1,6 +1,6 @@
 # Wruntime
 
-A distributed WASM module networking runtime. WASM modules running inside **wr-engine** make ordinary HTTP calls to each other; Wruntime intercepts those calls, routes them through **wr-proxy**, validates them against their protobuf schemas, and delivers them to the correct destination engine. A central **wr-manager** holds the routing table, module registry, schemas, and metrics.
+A distributed WASM module networking runtime. WASM modules running inside **wr-engine** make ordinary HTTP calls to each other; Wruntime intercepts those calls, routes them through **wr-proxy**, validates them against their protobuf schemas, and delivers them to the correct destination engine. A central **wr-manager** holds the routing table, module registry, and schemas. Request metrics are collected via OpenTelemetry traces and queryable through Tempo.
 
 ---
 
@@ -15,7 +15,6 @@ A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. 
                          │  Engine registry       │
                          │  Routing table         │
                          │  Schema store          │
-                         │  Metrics buffer        │
                          └──────────┬─────────────┘
                                     │ gRPC (all nodes)
                ┌────────────────────┴─────────────────────┐
@@ -27,7 +26,6 @@ A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. 
 │  ┌───────────────────────┐  │        │  ┌───────────────────────┐  │
 │  │      wr-proxy A       │◄─┼────────┼─►│      wr-proxy B       │  │
 │  │  TracingLayer         │  │  HTTP  │  │  TracingLayer         │  │
-│  │  MetricsLayer         │  │        │  │  MetricsLayer         │  │
 │  │  SchemaValidationLayer│  │        │  │  (skipped for relayed │  │
 │  │  RoutingLayer         │  │        │  │   x-wr-via-proxy reqs)│  │
 │  │  ForwardService       │  │        │  │  RoutingLayer         │  │
@@ -67,21 +65,21 @@ WASM module makes HTTP call to "http://ecommerce.inventory/GetItems"
   │
   ▼
 wr-proxy A  (Node A)
-  │  1. TracingLayer       — opens an OTel span; injects W3C traceparent header
-  │  2. MetricsLayer       — records start time
-  │  3. SchemaValidation   — validates path is a known RPC method; decodes body with
+  │  1. TracingLayer       — opens an OTel span (captures source, destination,
+  │                          status, duration); injects W3C traceparent header
+  │  2. SchemaValidation   — validates path is a known RPC method; decodes body with
   │                          prost-reflect against the module's FileDescriptorSet;
   │                          returns 404 if path is not a known RPC,
   │                          503 if schema not yet synced,
   │                          400 if body fails protobuf decoding
-  │  4. RoutingLayer       — reads optional x-wr-version header; defaults to
+  │  3. RoutingLayer       — reads optional x-wr-version header; defaults to
   │                          highest semver among healthy rules for the module;
   │                          returns 503 if no healthy instance matches;
   │                          injects x-wr-module, x-wr-namespace, x-wr-version;
   │                          round-robins across multiple healthy instances
   │                          at the same version;
   │                          resolves destination as LocalEngine or RemoteProxy
-  │  5. ForwardService     — strips x-wr-destination / x-wr-source, injects
+  │  4. ForwardService     — strips x-wr-destination / x-wr-source, injects
   │                          traceparent, then:
   │
   ├── destination is on Node A (LocalEngine) ──────────────────────────────────┐
@@ -118,8 +116,8 @@ All internal routing uses a set of reserved `x-wr-*` HTTP headers. The proxy str
 
 | Header | Set by | Read by | Description |
 |--------|--------|---------|-------------|
-| `x-wr-destination` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (public routes) | `wr-proxy` RoutingLayer, SchemaValidationLayer, MetricsLayer, TracingLayer | Full destination URI of the original call — e.g. `http://ecommerce.inventory/GetItems`. The host encodes the destination as `{namespace}.{module}`; the path is the RPC method name. Stripped by ForwardService before reaching the destination engine. |
-| `x-wr-source` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (set to `"external"` for public routes) | `wr-proxy` SchemaValidationLayer, MetricsLayer, TracingLayer | Name of the calling module. Used for metrics attribution and error reporting. Stripped by ForwardService before reaching the destination engine. |
+| `x-wr-destination` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (public routes) | `wr-proxy` RoutingLayer, SchemaValidationLayer, TracingLayer | Full destination URI of the original call — e.g. `http://ecommerce.inventory/GetItems`. The host encodes the destination as `{namespace}.{module}`; the path is the RPC method name. Stripped by ForwardService before reaching the destination engine. |
+| `x-wr-source` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (set to `"external"` for public routes) | `wr-proxy` SchemaValidationLayer, TracingLayer | Name of the calling module. Recorded as a span attribute for metrics attribution and error reporting. Stripped by ForwardService before reaching the destination engine. |
 | `x-wr-source-ns` | `wr-engine` (outbound WASM call) | — | Namespace of the calling module. Carried alongside `x-wr-source` for attribution; not used for routing decisions. Stripped by ForwardService before reaching the destination engine. |
 | `x-wr-version` | Caller (optional — WASM module or `wr-cli`) | `wr-proxy` RoutingLayer | Pins the request to a specific semver of the destination module (e.g. `1.2.0`). When omitted the proxy routes to the highest healthy semver. RoutingLayer overwrites the value with the resolved version before forwarding. |
 | `x-wr-module` | `wr-proxy` RoutingLayer | `wr-engine` inbound server | Resolved destination module name. The engine uses this (together with `x-wr-namespace` and `x-wr-version`) to select the correct WASM instance. |
@@ -227,9 +225,6 @@ proxy_address = "http://127.0.0.1:9001"   # this proxy's own address, as reachab
 routing_table_ttl_secs = 5   # how often to poll the manager for routing updates
 schema_ttl_secs        = 60  # how often to sync module schemas
 
-[metrics]
-flush_interval_secs = 10
-queue_depth         = 1000
 ```
 
 `proxy_address` must match how peer nodes (and engines on this node) will reach this proxy. The routing layer uses it to distinguish rules whose `proxy_address` matches this node — those are forwarded directly to the local engine; all others are forwarded to the peer proxy that owns that address.
@@ -430,14 +425,22 @@ grpcurl -plaintext -d "{
 }" 127.0.0.1:9000 wruntime.ManagerService/UploadSchema
 ```
 
-### Metrics
+### Metrics (OpenTelemetry)
 
-| RPC | Description |
-|-----|-------------|
-| `ReportMetrics` | Proxy sends a batch of `RequestMetrics` |
-| `GetMetricsSummary` | Returns up to 10 000 most-recent entries |
+Request metrics are collected via OpenTelemetry traces rather than a custom gRPC pipeline. The `TracingLayer` emits a `proxy.request` span for every request with attributes: `wr.source`, `wr.destination`, `http.response.status_code`, and `otel.status_code`. Span duration captures request latency.
 
-Each `RequestMetrics` entry records: source module, destination module, duration (ms), HTTP status, and any error string.
+Query metrics via the CLI:
+
+```bash
+wr-cli metrics summary                          # default: Tempo at localhost:3200, last 1h
+wr-cli metrics summary --tempo http://tempo:3200 --since 6h
+```
+
+Or query Tempo directly with [TraceQL](https://grafana.com/docs/tempo/latest/traceql/):
+
+```
+{name = "proxy.request" && span.wr.source = "order-service"}
+```
 
 ---
 

@@ -1,7 +1,6 @@
 mod egress;
 mod forward;
 mod ingress;
-mod metrics;
 mod routing;
 mod schema;
 mod tracing;
@@ -9,7 +8,6 @@ mod tracing;
 pub use egress::EgressLayer;
 pub use forward::ForwardService;
 pub use ingress::IngressLayer;
-pub use metrics::MetricsLayer;
 pub use routing::RoutingLayer;
 pub use schema::SchemaValidationLayer;
 pub use tracing::TracingLayer;

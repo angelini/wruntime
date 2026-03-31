@@ -35,7 +35,12 @@ just dev-logs [service]
 # Ecommerce example
 just build-example   # compile WASM components + protobuf schemas
 just example         # build-example + run
+just example-inline  # build-example + run with single invocation, exits on failure
 ```
+
+## Verification
+
+After refactoring, always run `just tidy` and `just example-inline` to verify formatting, lints, and end-to-end correctness.
 
 **Prerequisites:** `rustc`, `cargo`, `just`, `protoc` (for proto code generation). WASM module development additionally requires `cargo-component` and `wasm-tools`.
 
@@ -67,7 +72,7 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 **`wr-common`** — generated gRPC types from `proto/wruntime.proto` via `tonic-build` in `build.rs`. Shared by all other crates.
 
 **`wr-proxy` middleware stack** (Tower layers, evaluated in order):
-1. `MetricsLayer` — records request start time
+1. `TracingLayer` — root OTel span per request (captures source, destination, status, duration)
 2. `SchemaValidationLayer` — validates protobuf bodies via `prost-reflect`; rejects with structured JSON errors; skipped if no schema cached
 3. `RoutingLayer` — resolves destination engine from local routing table cache (TTL-based); injects `ResolvedDestination` as a request extension
 4. `ForwardService` — reads `ResolvedDestination` extension, strips internal headers, proxies to engine
@@ -76,7 +81,7 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 
 **`wr-manager` state** — pure in-memory (`state.rs`). No persistence; rebuilt from engine re-registrations after restart. Background task monitors heartbeats every 10 seconds — marks routing rules unhealthy and bumps the routing table version when an engine times out (default 30 s).
 
-**`wr-proxy` sync** — two background tasks: `sync_routing_table()` polls manager every `routing_table_ttl_secs`; `flush_metrics()` batches and sends `RequestMetrics` every `flush_interval_secs`.
+**`wr-proxy` sync** — two background tasks: `sync_routing_table()` polls manager every `routing_table_ttl_secs`; `sync_schemas()` fetches module schemas on demand. Request metrics are collected via OpenTelemetry traces (no custom metrics pipeline).
 
 **Schemas** — stored as compiled protobuf `FileDescriptorSet` bytes (`.binpb` files). Declared per module in `engine.toml`; uploaded to the manager on engine registration; fetched by the proxy on demand.
 

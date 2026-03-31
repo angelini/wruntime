@@ -1,7 +1,6 @@
 mod circuit_breaker;
 mod config;
 mod layers;
-mod metrics;
 mod routing;
 mod schema;
 
@@ -14,12 +13,11 @@ use http::{Request, Response, StatusCode};
 use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 use tower::{Service, ServiceBuilder};
 
 use layers::{
-    EgressLayer, ForwardService, IngressLayer, MetricsLayer, ResBody, RoutingLayer,
-    SchemaValidationLayer, TracingLayer,
+    EgressLayer, ForwardService, IngressLayer, ResBody, RoutingLayer, SchemaValidationLayer,
+    TracingLayer,
 };
 use tracing::{error, info, warn};
 use wr_common::wruntime::manager_service_client::ManagerServiceClient;
@@ -39,7 +37,6 @@ async fn main() -> Result<()> {
     // ── Shared state ──────────────────────────────────────────────────────
     let routing_table = routing::new_routing_table();
     let schema_cache = Arc::new(schema::SchemaCache::new());
-    let (metrics_tx, metrics_rx) = mpsc::channel(config.metrics.queue_depth);
     let cb_registry = Arc::new(circuit_breaker::CircuitBreakerRegistry::new(
         config.circuit_breaker.clone(),
     ));
@@ -65,24 +62,16 @@ async fn main() -> Result<()> {
         config.cache.schema_ttl_secs,
         schema_trigger,
     ));
-    tokio::spawn(metrics::flush_metrics(
-        manager_client,
-        metrics_rx,
-        config.metrics.flush_interval_secs,
-    ));
-
     // ── Internal Tower service stack ──────────────────────────────────────
     //
     //   TracingLayer          ← root OTel span per request
-    //     └─ MetricsLayer
-    //          └─ EgressLayer         ← intercepts external calls; passes internal through
-    //               └─ SchemaValidationLayer
-    //                    └─ RoutingLayer
-    //                         └─ ForwardService
+    //     └─ EgressLayer         ← intercepts external calls; passes internal through
+    //          └─ SchemaValidationLayer
+    //               └─ RoutingLayer
+    //                    └─ ForwardService
     //
     let internal_svc = ServiceBuilder::new()
         .layer(TracingLayer)
-        .layer(MetricsLayer::new(metrics_tx.clone()))
         .layer(EgressLayer::new(
             config.egress.clone(),
             routing_table.clone(),
@@ -103,10 +92,9 @@ async fn main() -> Result<()> {
     //   IngressLayer          ← strips x-wr-* headers, matches public routes,
     //     |                     injects x-wr-destination + x-wr-source: external
     //     └─ TracingLayer
-    //          └─ MetricsLayer
-    //               └─ SchemaValidationLayer
-    //                    └─ RoutingLayer
-    //                         └─ ForwardService
+    //          └─ SchemaValidationLayer
+    //               └─ RoutingLayer
+    //                    └─ ForwardService
     //
     if let Some(ext) = &config.external {
         // External traffic is plain HTTP, not protobuf-over-proxy, so schema
@@ -114,7 +102,6 @@ async fn main() -> Result<()> {
         let external_svc = ServiceBuilder::new()
             .layer(IngressLayer::new(ext.routes.clone(), schema_cache))
             .layer(TracingLayer)
-            .layer(MetricsLayer::new(metrics_tx))
             .layer(RoutingLayer::new(
                 routing_table,
                 config.node.proxy_address.clone(),

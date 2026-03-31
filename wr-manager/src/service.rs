@@ -5,18 +5,14 @@ use tracing::info;
 
 use wr_common::wruntime::{
     manager_service_server::ManagerService, DeleteRoutingRuleRequest, DeleteRoutingRuleResponse,
-    DeregisterEngineRequest, DeregisterEngineResponse, GetMetricsSummaryRequest,
-    GetMetricsSummaryResponse, GetRoutingTableRequest, GetRoutingTableResponse, GetSchemaRequest,
-    GetSchemaResponse, HeartbeatRequest, HeartbeatResponse, ListEnginesRequest,
-    ListEnginesResponse, RegisterEngineRequest, RegisterEngineResponse, ReportMetricsRequest,
-    ReportMetricsResponse, RoutingRule, UploadSchemaRequest, UploadSchemaResponse,
+    DeregisterEngineRequest, DeregisterEngineResponse, GetRoutingTableRequest,
+    GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse, HeartbeatRequest,
+    HeartbeatResponse, ListEnginesRequest, ListEnginesResponse, RegisterEngineRequest,
+    RegisterEngineResponse, RoutingRule, UploadSchemaRequest, UploadSchemaResponse,
     UpsertRoutingRuleResponse,
 };
 
 use crate::state::SharedState;
-
-/// Maximum number of `RequestMetrics` entries held in memory.
-const MAX_METRICS: usize = 10_000;
 
 pub struct Manager {
     state: SharedState,
@@ -283,33 +279,5 @@ impl ManagerService for Manager {
 
         info!(namespace = %req.namespace, module = %req.module, version = %req.version, "schema stored");
         Ok(Response::new(UploadSchemaResponse {}))
-    }
-
-    // ── Metrics ───────────────────────────────────────────────────────────
-
-    async fn report_metrics(
-        &self,
-        request: Request<ReportMetricsRequest>,
-    ) -> Result<Response<ReportMetricsResponse>, Status> {
-        let incoming = request.into_inner().metrics;
-        let mut state = self.state.write().await;
-
-        for metric in incoming {
-            if state.metrics.len() >= MAX_METRICS {
-                state.metrics.pop_front(); // evict oldest
-            }
-            state.metrics.push_back(metric);
-        }
-
-        Ok(Response::new(ReportMetricsResponse {}))
-    }
-
-    async fn get_metrics_summary(
-        &self,
-        _request: Request<GetMetricsSummaryRequest>,
-    ) -> Result<Response<GetMetricsSummaryResponse>, Status> {
-        let state = self.state.read().await;
-        let metrics = state.metrics.iter().cloned().collect();
-        Ok(Response::new(GetMetricsSummaryResponse { metrics }))
     }
 }

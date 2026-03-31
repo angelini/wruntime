@@ -35,14 +35,6 @@ message RoutingTable {
   uint64               version = 2; // incremented on every write
 }
 
-message RequestMetrics {
-  string source      = 1;
-  string destination = 2;
-  uint64 duration_ms = 3;
-  uint32 status      = 4;
-  string error       = 5;
-}
-
 // ── Engine lifecycle ──────────────────────────────────────────────────────
 
 message RegisterEngineRequest    { EngineRegistration registration = 1; }
@@ -72,13 +64,6 @@ message GetSchemaResponse   { bytes proto_schema = 1; }
 message UploadSchemaRequest { string module = 1; string version = 2; bytes proto_schema = 3; string namespace = 4; }
 message UploadSchemaResponse{}
 
-// ── Metrics ───────────────────────────────────────────────────────────────
-
-message ReportMetricsRequest      { repeated RequestMetrics metrics = 1; }
-message ReportMetricsResponse     {}
-message GetMetricsSummaryRequest  {}
-message GetMetricsSummaryResponse { repeated RequestMetrics metrics = 1; }
-
 // ── ManagerService ────────────────────────────────────────────────────────
 
 service ManagerService {
@@ -96,8 +81,4 @@ service ManagerService {
   // Schemas
   rpc GetSchema         (GetSchemaRequest)         returns (GetSchemaResponse);
   rpc UploadSchema      (UploadSchemaRequest)      returns (UploadSchemaResponse);
-
-  // Metrics
-  rpc ReportMetrics     (ReportMetricsRequest)     returns (ReportMetricsResponse);
-  rpc GetMetricsSummary (GetMetricsSummaryRequest) returns (GetMetricsSummaryResponse);
 }

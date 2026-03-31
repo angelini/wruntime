@@ -188,7 +188,7 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
                 quote! {
                     pub fn #method_ident(&self, req: #input) -> Result<#output, String> {
                         let body = prost::Message::encode_to_vec(&req);
-                        let path = format!("{}/{}", self.authority, #proto_name);
+                        let path = format!("/{}/{}", self.authority, #proto_name);
                         let (status, resp_bytes) =
                             wr_sdk::http::http_rpc(&self.authority, &path, &body)?;
                         if status != 200 {

@@ -13,9 +13,8 @@ use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 
 use wr_common::wruntime::{
-    DeregisterEngineRequest, EngineRegistration, GetMetricsSummaryRequest, GetRoutingTableRequest,
-    HeartbeatRequest, ListEnginesRequest, ModuleDescriptor, RegisterEngineRequest,
-    ReportMetricsRequest, RequestMetrics, RoutingRule,
+    DeregisterEngineRequest, EngineRegistration, GetRoutingTableRequest, HeartbeatRequest,
+    ListEnginesRequest, ModuleDescriptor, RegisterEngineRequest, RoutingRule,
 };
 use wr_manager::config::ManagerConfig;
 use wr_proxy::config::ProxyConfig;
@@ -139,35 +138,6 @@ async fn test_routing_table_upsert_and_get() -> Result<()> {
     assert_eq!(table.rules[0].destination_namespace, "store");
     assert!(table.rules[0].healthy, "upserted rule should be healthy");
     assert_eq!(table.version, 1);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_metrics_report_and_summary() -> Result<()> {
-    let addr = start_manager().await?;
-    let mut c = manager_client(&addr).await?;
-
-    c.report_metrics(ReportMetricsRequest {
-        metrics: vec![RequestMetrics {
-            source: "order-service".into(),
-            destination: "inventory-service".into(),
-            duration_ms: 42,
-            status: 200,
-            error: String::new(),
-        }],
-    })
-    .await?;
-
-    let summary = c
-        .get_metrics_summary(GetMetricsSummaryRequest {})
-        .await?
-        .into_inner()
-        .metrics;
-
-    assert_eq!(summary.len(), 1);
-    assert_eq!(summary[0].source, "order-service");
-    assert_eq!(summary[0].duration_ms, 42);
 
     Ok(())
 }
@@ -298,7 +268,7 @@ async fn test_egress_internal_module_passthrough() -> Result<()> {
             namespace: "store",
             name: "inventory",
             version: "1.0.0",
-            schema: vec![],
+            schema: minimal_file_descriptor_set(),
         },
     )
     .await?;
@@ -306,12 +276,16 @@ async fn test_egress_internal_module_passthrough() -> Result<()> {
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
 
+    let schema_cache = std::sync::Arc::new(wr_proxy::schema::SchemaCache::new());
+    sync_schema_cache(&mgr_addr, &schema_cache).await?;
+
     // Egress is enabled but the destination is a registered internal module.
-    let proxy_addr = start_egress_proxy(
+    let proxy_addr = start_egress_proxy_with_schema(
         Some(EgressConfig {
             allowed_domains: vec!["external.example.com".into()],
         }),
         table,
+        schema_cache,
     )
     .await?;
 
@@ -528,18 +502,12 @@ fn test_proxy_config_valid() {
         [cache]
         routing_table_ttl_secs = 5
         schema_ttl_secs        = 60
-
-        [metrics]
-        flush_interval_secs = 10
-        queue_depth         = 1000
     "#;
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
     assert_eq!(cfg.listen_address, "0.0.0.0:9001");
     assert_eq!(cfg.manager_address, "http://127.0.0.1:9000");
     assert_eq!(cfg.cache.routing_table_ttl_secs, 5);
     assert_eq!(cfg.cache.schema_ttl_secs, 60);
-    assert_eq!(cfg.metrics.flush_interval_secs, 10);
-    assert_eq!(cfg.metrics.queue_depth, 1000);
 }
 
 #[test]
@@ -553,8 +521,6 @@ fn test_proxy_config_defaults() {
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
     assert_eq!(cfg.cache.routing_table_ttl_secs, 5);
     assert_eq!(cfg.cache.schema_ttl_secs, 60);
-    assert_eq!(cfg.metrics.flush_interval_secs, 10);
-    assert_eq!(cfg.metrics.queue_depth, 1000);
 }
 
 #[test]
@@ -574,24 +540,6 @@ fn test_proxy_config_rejects_zero_ttl() {
     assert!(
         cfg.cache.routing_table_ttl_secs == 0,
         "zero ttl should be rejected"
-    );
-}
-
-#[test]
-fn test_proxy_config_rejects_zero_queue_depth() {
-    let toml = r#"
-        listen_address  = "0.0.0.0:9001"
-        manager_address = "http://127.0.0.1:9000"
-        [node]
-        proxy_address   = "http://127.0.0.1:9001"
-        [metrics]
-        flush_interval_secs = 10
-        queue_depth         = 0
-    "#;
-    let cfg: ProxyConfig = toml::from_str(toml).unwrap();
-    assert_eq!(
-        cfg.metrics.queue_depth, 0,
-        "precondition for validation guard"
     );
 }
 
@@ -765,7 +713,7 @@ async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy(table).await?;
+    let proxy = start_proxy_synced(&mgr_addr, table).await?;
 
     let (s, _) = proxy_get(proxy, "mv-ns", "missing-ver-service", Some("9.0.0")).await?;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "unknown version → 503");
@@ -851,7 +799,7 @@ async fn test_proxy_returns_503_for_unsatisfiable_range() -> Result<()> {
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy(table).await?;
+    let proxy = start_proxy_synced(&mgr_addr, table).await?;
 
     let (s, _) = proxy_get(proxy, "range-503-ns", "range-503-service", Some("^3")).await?;
     assert_eq!(

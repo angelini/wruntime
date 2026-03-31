@@ -13,8 +13,6 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
-    pub metrics: MetricsConfig,
-    #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
     /// Optional external-facing listener with a restricted set of public routes.
     pub external: Option<ExternalConfig>,
@@ -79,23 +77,6 @@ impl Default for CacheConfig {
 }
 
 #[derive(Deserialize, Clone)]
-pub struct MetricsConfig {
-    /// How often (seconds) to flush buffered metrics to wr-manager
-    pub flush_interval_secs: u64,
-    /// Capacity of the in-process metrics channel
-    pub queue_depth: usize,
-}
-
-impl Default for MetricsConfig {
-    fn default() -> Self {
-        Self {
-            flush_interval_secs: 10,
-            queue_depth: 1000,
-        }
-    }
-}
-
-#[derive(Deserialize, Clone)]
 pub struct CircuitBreakerConfig {
     /// Number of consecutive failures before the breaker opens.
     pub failure_threshold: u32,
@@ -152,14 +133,6 @@ impl ProxyConfig {
         anyhow::ensure!(
             self.cache.schema_ttl_secs > 0,
             "cache.schema_ttl_secs must be > 0"
-        );
-        anyhow::ensure!(
-            self.metrics.flush_interval_secs > 0,
-            "metrics.flush_interval_secs must be > 0"
-        );
-        anyhow::ensure!(
-            self.metrics.queue_depth > 0,
-            "metrics.queue_depth must be > 0"
         );
         anyhow::ensure!(
             self.circuit_breaker.failure_threshold > 0,
