@@ -41,6 +41,6 @@ async fn main() -> Result<()> {
         Commands::Engines(args) => cmd::engines::run(args, &cli.manager).await,
         Commands::Services(args) => cmd::services::run(args, &cli.manager).await,
         Commands::Metrics(args) => cmd::metrics::run(args).await,
-        Commands::Invoke(args) => cmd::invoke::run(args).await,
+        Commands::Invoke(args) => cmd::invoke::run(args, &cli.manager).await,
     }
 }

@@ -24,7 +24,7 @@ pub struct EngineConfig {
     pub pool: PoolConfig,
 }
 
-#[derive(Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone)]
 pub struct PoolConfig {
     /// Maximum number of concurrent component instances across all modules.
     /// Defaults to 1000.
@@ -33,6 +33,15 @@ pub struct PoolConfig {
     /// Maximum linear memory size in bytes per instance. Defaults to 10 MiB.
     #[serde(default = "default_max_memory_size")]
     pub max_memory_size: usize,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            total_component_instances: default_total_component_instances(),
+            max_memory_size: default_max_memory_size(),
+        }
+    }
 }
 
 fn default_total_component_instances() -> u32 {

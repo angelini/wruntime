@@ -4,13 +4,12 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
 use http::{Request, StatusCode};
 use tower::{Layer, Service};
 use tracing::{info_span, Instrument};
 
 use super::egress::ExternalEgress;
-use super::{error_response, Destination, ResBody, ResolvedDestination};
+use super::{error_response, Destination, ProxyBody, ResBody, ResolvedDestination};
 use crate::routing::CachedRoutingTable;
 
 type RoundRobinCounters = Arc<Mutex<HashMap<(String, String, String), usize>>>;
@@ -65,9 +64,9 @@ pub struct RoutingService<S> {
     egress_enabled: bool,
 }
 
-impl<S> Service<Request<Bytes>> for RoutingService<S>
+impl<S> Service<Request<ProxyBody>> for RoutingService<S>
 where
-    S: Service<Request<Bytes>, Response = http::Response<ResBody>> + Clone + Send + 'static,
+    S: Service<Request<ProxyBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
     S::Error: Send + 'static,
     S::Future: Send + 'static,
 {
@@ -79,7 +78,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, mut req: Request<Bytes>) -> Self::Future {
+    fn call(&mut self, mut req: Request<ProxyBody>) -> Self::Future {
         let table = self.table.clone();
         let counters = self.counters.clone();
         let self_proxy_address = self.self_proxy_address.clone();
@@ -250,9 +249,8 @@ where
                 return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE, &msg));
             }
 
-            // Round-robin across candidates using a per-(namespace, module, version) counter.
-            // Rotate the slice so the chosen candidate is first, then take up to 3 for retry.
-            let ordered: Vec<Destination> = {
+            // Round-robin: pick one candidate.
+            let chosen = {
                 let mut map = counters.lock().unwrap();
                 let counter = map
                     .entry((
@@ -263,15 +261,10 @@ where
                     .or_insert(0);
                 let idx = *counter % candidates.len();
                 *counter = counter.wrapping_add(1);
-                candidates[idx..]
-                    .iter()
-                    .chain(candidates[..idx].iter())
-                    .take(3)
-                    .cloned()
-                    .collect()
+                candidates[idx].clone()
             };
 
-            let first_addr = match &ordered[0] {
+            let first_addr = match &chosen {
                 Destination::LocalEngine(a) => a.clone(),
                 Destination::RemoteProxy(a) => a.clone(),
             };
@@ -293,7 +286,7 @@ where
             span.record("wr.version", &resolved_version);
             span.record("wr.engine", &first_addr);
 
-            req.extensions_mut().insert(ResolvedDestination(ordered));
+            req.extensions_mut().insert(ResolvedDestination(chosen));
             inner.call(req).instrument(span).await
         })
     }

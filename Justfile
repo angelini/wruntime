@@ -35,14 +35,26 @@ tidy: fmt lint
 
 # Run all tests
 test:
+    WRUNTIME_TEST_DB_URL={{db_url_test}} \
+    WRUNTIME_TEST_S3_ENDPOINT={{s3_endpoint}} \
+    WRUNTIME_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+    WRUNTIME_TEST_S3_SECRET_KEY={{s3_secret_key}} \
     cargo test
 
 # Run integration tests only
 test-integration:
+    WRUNTIME_TEST_DB_URL={{db_url_test}} \
+    WRUNTIME_TEST_S3_ENDPOINT={{s3_endpoint}} \
+    WRUNTIME_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+    WRUNTIME_TEST_S3_SECRET_KEY={{s3_secret_key}} \
     cargo test -p wr-tests
 
 # Run a single test by name
 test-one name:
+    WRUNTIME_TEST_DB_URL={{db_url_test}} \
+    WRUNTIME_TEST_S3_ENDPOINT={{s3_endpoint}} \
+    WRUNTIME_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+    WRUNTIME_TEST_S3_SECRET_KEY={{s3_secret_key}} \
     cargo test {{name}}
 
 # ── Run services ──────────────────────────────────────────────────────────────
@@ -181,11 +193,11 @@ build-example: build-schemas
 
 # Run the full ecommerce example (requires Postgres — see `just dev-up`)
 example: build-example build
-    bash examples/ecommerce/run.sh
+    DB_URL={{db_url_example}} bash examples/ecommerce/run.sh
 
 # Run the ecommerce example inline (single invocation, exits on failure)
 example-inline: build-example build
-    bash examples/ecommerce/run.sh --inline
+    DB_URL={{db_url_example}} bash examples/ecommerce/run.sh --inline
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 

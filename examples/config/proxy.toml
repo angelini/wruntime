@@ -6,7 +6,6 @@ proxy_address = "http://127.0.0.1:9001"   # this proxy's own address, as reachab
 
 [cache]
 routing_table_ttl_secs = 1
-schema_ttl_secs        = 60
 
 # Circuit breaker — protects downstream engines from overload.
 # Each engine address gets its own independent breaker; one open circuit

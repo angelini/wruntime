@@ -44,34 +44,18 @@ pub struct ExternalRoute {
     pub module: String,
     /// Target namespace.
     pub namespace: String,
-    /// RPC method path to forward to, e.g. "/ecommerce.inventory/GetItem".
-    /// Uses the `{namespace}.{module}/MethodName` format, consistent with the
-    /// HTTP hostname used for inter-module addressing.
-    /// When set together with `request_type` and `response_type`, the ingress
-    /// layer transcodes the JSON request body to protobuf before forwarding and
-    /// transcodes the protobuf response back to JSON before returning.
-    pub grpc_path: Option<String>,
-    /// Fully-qualified protobuf message type for the request body,
-    /// e.g. "ecommerce.GetItemRequest". Required when `grpc_path` is set.
-    pub request_type: Option<String>,
-    /// Fully-qualified protobuf message type for the response body,
-    /// e.g. "ecommerce.GetItemResponse". Required when `grpc_path` is set.
-    pub response_type: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
 pub struct CacheConfig {
     /// How often (seconds) to poll wr-manager for routing table updates
     pub routing_table_ttl_secs: u64,
-    /// How often (seconds) to re-fetch module schemas from wr-manager
-    pub schema_ttl_secs: u64,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             routing_table_ttl_secs: 5,
-            schema_ttl_secs: 60,
         }
     }
 }
@@ -131,10 +115,6 @@ impl ProxyConfig {
             "cache.routing_table_ttl_secs must be > 0"
         );
         anyhow::ensure!(
-            self.cache.schema_ttl_secs > 0,
-            "cache.schema_ttl_secs must be > 0"
-        );
-        anyhow::ensure!(
             self.circuit_breaker.failure_threshold > 0,
             "circuit_breaker.failure_threshold must be > 0"
         );
@@ -185,20 +165,6 @@ impl ProxyConfig {
                     !route.namespace.is_empty(),
                     "external.routes[{i}].namespace is required"
                 );
-                let has_grpc = route.grpc_path.is_some();
-                let has_req = route.request_type.is_some();
-                let has_resp = route.response_type.is_some();
-                anyhow::ensure!(
-                    has_grpc == has_req && has_req == has_resp,
-                    "external.routes[{i}]: grpc_path, request_type, and response_type \
-                     must all be set together or all omitted"
-                );
-                if let Some(p) = &route.grpc_path {
-                    anyhow::ensure!(
-                        p.starts_with('/'),
-                        "external.routes[{i}].grpc_path must start with '/'"
-                    );
-                }
             }
         }
         Ok(())

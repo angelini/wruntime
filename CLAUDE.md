@@ -43,6 +43,8 @@ just example-inline  # build-example + run with single invocation, exits on fail
 
 After refactoring, always run `just tidy` and `just example-inline` to verify formatting, lints, and end-to-end correctness. When changing host bindings (`wr-engine/src/db.rs`, `wr-engine/src/blobstore.rs`, `wr-engine/src/tracing.rs`), WIT interfaces (`wit/`), the SDK (`wr-sdk/`), or the WASM guest test harness (`wr-tests/guests/`, `wr-tests/tests/wasm_host_test.rs`), also run `just test-wasm`.
 
+**Keep docs in sync with code changes.** When modifying architecture (adding/removing layers, changing request flow, changing config), update `CLAUDE.md`, `README.md`, and the relevant files in `docs/` (`architecture.md`, `configuration.md`, `schemas.md`, etc.) in the same change. Stale docs are worse than no docs.
+
 **Prerequisites:** `rustc`, `cargo`, `just`, `protoc` (for proto code generation). WASM module development additionally requires `cargo-component` and `wasm-tools`.
 
 **Integration tests with a real DB:** set `WRUNTIME_TEST_DB_URL=postgres://postgres@localhost:5433/wruntime_test` before running tests (matches the `just dev-up` Postgres instance); omitting it skips DB-backed test cases. `just test-wasm` sets all required env vars (DB + S3) automatically using the `just dev-up` defaults.
@@ -55,15 +57,15 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 
 | Service | Default Port | Role |
 |---|---|---|
-| `wr-manager` | 9000 (gRPC) | Central registry — routing table, schemas, metrics, heartbeat monitor |
-| `wr-proxy` | 9001 (HTTP) | Intercepts inter-module traffic, validates schemas, routes to engines |
+| `wr-manager` | 9000 (gRPC) | Central registry — routing table, schemas, heartbeat monitor |
+| `wr-proxy` | 9001 (HTTP) | Streaming header-based router — intercepts inter-module traffic, routes to engines; bodies flow through without buffering |
 | `wr-engine` | 9100 (HTTP) | Runs WASM modules via wasmtime WASI component model |
 
 ### Request Flow
 
 1. A WASM module makes an HTTP call to another module (e.g., `http://ecommerce.inventory/items`)
 2. `WasiHttpView` intercepts it, attaches `x-wr-source` / `x-wr-destination` (format: `namespace.module`) headers, rewrites the URI to point at `wr-proxy`
-3. `wr-proxy` validates the body against a cached protobuf schema, resolves the destination engine from its cached routing table, injects `x-wr-module` / `x-wr-namespace` / `x-wr-version`, then forwards to the target `wr-engine`
+3. `wr-proxy` resolves the destination engine from its cached routing table (header-only inspection), injects `x-wr-module` / `x-wr-namespace` / `x-wr-version`, then streams the request body through to the target `wr-engine`
 4. The destination `wr-engine` dispatches to the correct WASM instance via `ModuleRegistry` (round-robin across instances)
 
 ### Key Design Details
@@ -74,18 +76,19 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 
 **`wr-proxy` middleware stack** (Tower layers, evaluated in order):
 1. `TracingLayer` — root OTel span per request (captures source, destination, status, duration)
-2. `SchemaValidationLayer` — validates protobuf bodies via `prost-reflect`; rejects with structured JSON errors; passes through uncached schemas when egress is enabled
-3. `RoutingLayer` — single routing table read per request; resolves destination engine from local routing table cache (TTL-based); injects `ResolvedDestination` as a request extension; when egress is enabled and no internal route matches, sets `ExternalEgress` extension
-4. `EgressLayer` — handles `ExternalEgress` requests (domain allowlist, external forward); passes internal requests through
-5. `ForwardService` — reads `ResolvedDestination` extension, strips internal headers, proxies to engine
+2. `RoutingLayer` — single routing table read per request; resolves destination engine from local routing table cache (TTL-based); injects `ResolvedDestination` as a request extension; when egress is enabled and no internal route matches, sets `ExternalEgress` extension
+3. `EgressLayer` — handles `ExternalEgress` requests (domain allowlist, external forward); passes internal requests through
+4. `ForwardService` — reads `ResolvedDestination` extension, strips internal headers, streams request/response bodies to/from engine without buffering
+
+The proxy uses a custom `ProxyBody` type that wraps `hyper::body::Incoming` behind a `Pin<Box<dyn Body + Send>>`, enabling streaming without the `Sync` requirement that `BoxBody` imposes. All layers only inspect headers — bodies flow through untouched.
 
 **`wr-engine`** — uses wasmtime 41 with the WASI component model. On startup: loads WASM components → registers with manager → starts 10-second heartbeat loop. Modules can optionally have a PostgreSQL pool (`deadpool-postgres`) and a blobstore (S3-compatible via `rust-s3`) exposed to WASM via custom host bindings.
 
 **`wr-manager` state** — pure in-memory (`state.rs`). No persistence; rebuilt from engine re-registrations after restart. Background task monitors heartbeats every 10 seconds — marks routing rules unhealthy and bumps the routing table version when an engine times out (default 30 s).
 
-**`wr-proxy` sync** — two background tasks: `sync_routing_table()` polls manager every `routing_table_ttl_secs`; `sync_schemas()` fetches module schemas on demand. Request metrics are collected via OpenTelemetry traces (no custom metrics pipeline).
+**`wr-proxy` sync** — one background task: `sync_routing_table()` polls manager every `routing_table_ttl_secs`. Request metrics are collected via OpenTelemetry traces (no custom metrics pipeline).
 
-**Schemas** — stored as compiled protobuf `FileDescriptorSet` bytes (`.binpb` files). Declared per module in `engine.toml`; uploaded to the manager on engine registration; fetched by the proxy on demand.
+**Schemas** — stored as compiled protobuf `FileDescriptorSet` bytes (`.binpb` files). Declared per module in `engine.toml`; uploaded to the manager on engine registration. Schemas are used for code generation (`wr-build`) and discovery, but are **not** validated by the proxy at runtime — the proxy is a streaming router that never inspects request or response bodies.
 
 This project targets WASI Preview 2 and all guest WASM modules should be built to target Preview 2.
 
@@ -114,7 +117,7 @@ Each service reads a TOML config file. Examples in `examples/config/` (`manager.
 
 ### Integration Tests
 
-`wr-tests/tests/integration_test.rs` spins up all three services in-process on ephemeral ports. Helpers in `tests/helpers.rs` provide `start_manager()`, `start_proxy()`, `stub_engine()`, and schema/payload builders. Tests cover: manager RPC operations, proxy routing (including round-robin across multiple engines), schema validation, pass-through when no schema is cached, TOML config parsing, and DB/blobstore host bindings.
+`wr-tests/tests/integration_test.rs` spins up all three services in-process on ephemeral ports. Helpers in `tests/helpers.rs` provide `start_manager()`, `start_proxy()`, `stub_engine()`, and schema/payload builders. Tests cover: manager RPC operations, proxy routing (including round-robin across multiple engines), cross-node forwarding, egress, external ingress, TOML config parsing, and DB/blobstore host bindings.
 
 DB tests that call host methods must `.await` them — all host trait methods are async:
 

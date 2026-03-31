@@ -202,7 +202,7 @@ impl proto::DbTestService for Component {
         };
 
         database::execute(
-            &format!("CREATE TEMP TABLE IF NOT EXISTS {table} (id integer)"),
+            &format!("CREATE TABLE IF NOT EXISTS {table} (id integer)"),
             &[],
         )
         .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
@@ -244,7 +244,7 @@ impl proto::DbTestService for Component {
         };
 
         database::execute(
-            &format!("CREATE TEMP TABLE IF NOT EXISTS {table} (id integer)"),
+            &format!("CREATE TABLE IF NOT EXISTS {table} (id integer)"),
             &[],
         )
         .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
@@ -285,7 +285,7 @@ impl proto::DbTestService for Component {
         };
 
         database::execute(
-            &format!("CREATE TEMP TABLE IF NOT EXISTS {table} (id integer)"),
+            &format!("CREATE TABLE IF NOT EXISTS {table} (id integer)"),
             &[],
         )
         .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
