@@ -16,7 +16,7 @@ use wr_common::wruntime::{
     ListEnginesRequest, ModuleDescriptor, RegisterEngineRequest, RoutingRule,
 };
 use wr_manager::config::ManagerConfig;
-use wr_proxy::config::ProxyConfig;
+use wr_proxy::config::{CircuitBreakerConfig, ProxyConfig};
 
 // ── manager RPC tests ─────────────────────────────────────────────────────────
 
@@ -1630,4 +1630,762 @@ fn test_tracing_span_set_error() {
         "connection refused".into(),
     );
     HostActiveSpan::drop(&mut state, span).expect("drop");
+}
+
+// ── circuit breaker tests ────────────────────────────────────────────────────
+
+/// After `failure_threshold` consecutive 500s the circuit opens and subsequent
+/// requests are rejected with 503 + `Retry-After` without reaching the engine.
+#[tokio::test]
+async fn test_circuit_breaker_opens_after_consecutive_failures() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    // Stub engine that always returns 500.
+    let (engine_addr, engine_shutdown) =
+        spawn_status_stub(StatusCode::INTERNAL_SERVER_ERROR).await?;
+
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "cb-e1",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "cb-ns",
+            name: "failing-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+
+    // threshold=3 so we can test quickly; open_duration_secs=2 for recovery test.
+    let proxy = start_proxy_with_cb(
+        table,
+        CircuitBreakerConfig {
+            failure_threshold: 3,
+            open_duration_secs: 2,
+        },
+    )
+    .await?;
+
+    // First 3 requests hit the engine and get 503 (forwarded 500 counted as failure).
+    for _ in 0..3 {
+        let (status, _) = proxy_get(proxy, "cb-ns", "failing-svc", Some("1.0.0")).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // 4th request: circuit is now OPEN — rejected without reaching engine.
+    let (status, body) = proxy_get(proxy, "cb-ns", "failing-svc", Some("1.0.0")).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        body.contains("circuit open"),
+        "expected circuit open body, got: {body}"
+    );
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+/// Verify the 503 response includes a `Retry-After` header matching the
+/// configured `open_duration_secs`.
+#[tokio::test]
+async fn test_circuit_breaker_retry_after_header() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    let (engine_addr, engine_shutdown) =
+        spawn_status_stub(StatusCode::INTERNAL_SERVER_ERROR).await?;
+
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "cb-retry-e1",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "cb-retry-ns",
+            name: "retry-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+
+    let proxy = start_proxy_with_cb(
+        table,
+        CircuitBreakerConfig {
+            failure_threshold: 2,
+            open_duration_secs: 7,
+        },
+    )
+    .await?;
+
+    // Trip the circuit.
+    for _ in 0..2 {
+        proxy_get(proxy, "cb-retry-ns", "retry-svc", Some("1.0.0")).await?;
+    }
+
+    // Next request is rejected — check the raw response for Retry-After.
+    let path = "/cb-retry-ns.retry-svc/Ping";
+    let req = Request::builder()
+        .uri(format!("http://{proxy}{path}"))
+        .header(
+            "x-wr-destination",
+            format!("http://cb-retry-ns.retry-svc{path}"),
+        )
+        .header("x-wr-source", "test-caller")
+        .body(Full::new(Bytes::new()))?;
+    let resp = http_client().request(req).await?;
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let retry_after = resp
+        .headers()
+        .get(http::header::RETRY_AFTER)
+        .expect("Retry-After header missing");
+    assert_eq!(retry_after.to_str()?, "7");
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+/// 429 Too Many Requests counts as a failure and can trip the circuit.
+#[tokio::test]
+async fn test_circuit_breaker_429_counts_as_failure() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    let (engine_addr, engine_shutdown) = spawn_status_stub(StatusCode::TOO_MANY_REQUESTS).await?;
+
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "cb-429-e1",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "cb-429-ns",
+            name: "rate-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+
+    let proxy = start_proxy_with_cb(
+        table,
+        CircuitBreakerConfig {
+            failure_threshold: 2,
+            open_duration_secs: 2,
+        },
+    )
+    .await?;
+
+    // Trip the circuit with 429s.
+    for _ in 0..2 {
+        proxy_get(proxy, "cb-429-ns", "rate-svc", Some("1.0.0")).await?;
+    }
+
+    // Circuit should be open.
+    let (status, body) = proxy_get(proxy, "cb-429-ns", "rate-svc", Some("1.0.0")).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        body.contains("circuit open"),
+        "expected circuit open, got: {body}"
+    );
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+/// Successful responses keep the circuit closed — no spurious opens.
+#[tokio::test]
+async fn test_circuit_breaker_stays_closed_on_success() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "cb-ok-e1",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "cb-ok-ns",
+            name: "ok-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+
+    let proxy = start_proxy_with_cb(
+        table,
+        CircuitBreakerConfig {
+            failure_threshold: 2,
+            open_duration_secs: 2,
+        },
+    )
+    .await?;
+
+    // 10 successful requests — all should return 200.
+    for _ in 0..10 {
+        let (status, _) = proxy_get(proxy, "cb-ok-ns", "ok-svc", Some("1.0.0")).await?;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+/// After the open duration elapses the circuit enters half-open: a successful
+/// probe closes the circuit and restores normal traffic.
+#[tokio::test]
+async fn test_circuit_breaker_half_open_recovery() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    // Start with a switchable stub returning 500.
+    let (engine_addr, engine_shutdown, status_ctl) = spawn_switchable_stub(500).await?;
+
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "cb-ho-e1",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "cb-ho-ns",
+            name: "recover-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+
+    let proxy = start_proxy_with_cb(
+        table,
+        CircuitBreakerConfig {
+            failure_threshold: 2,
+            open_duration_secs: 1,
+        },
+    )
+    .await?;
+
+    // Trip the circuit.
+    for _ in 0..2 {
+        proxy_get(proxy, "cb-ho-ns", "recover-svc", Some("1.0.0")).await?;
+    }
+
+    // Confirm it's open.
+    let (status, body) = proxy_get(proxy, "cb-ho-ns", "recover-svc", Some("1.0.0")).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("circuit open"));
+
+    // Switch the stub to return 200 and wait for the open duration to elapse.
+    status_ctl.store(200, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // The circuit should now be half-open and the next request should succeed,
+    // transitioning back to closed.
+    let (status, _) = proxy_get(proxy, "cb-ho-ns", "recover-svc", Some("1.0.0")).await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // Subsequent requests should also succeed (fully closed again).
+    let (status, _) = proxy_get(proxy, "cb-ho-ns", "recover-svc", Some("1.0.0")).await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+/// Circuit breakers are per-engine: one failing engine doesn't affect another.
+#[tokio::test]
+async fn test_circuit_breaker_per_engine_isolation() -> Result<()> {
+    let mgr_addr = start_manager().await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    // Engine A: always fails.
+    let (engine_a_addr, engine_a_shutdown) =
+        spawn_status_stub(StatusCode::INTERNAL_SERVER_ERROR).await?;
+    // Engine B: always succeeds (different module in same namespace).
+    let (engine_b_addr, engine_b_shutdown) = spawn_stub_engine().await?;
+
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "cb-iso-ea",
+            addr: &engine_a_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "cb-iso-ns",
+            name: "bad-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "cb-iso-eb",
+            addr: &engine_b_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "cb-iso-ns",
+            name: "good-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+
+    let proxy = start_proxy_with_cb(
+        table,
+        CircuitBreakerConfig {
+            failure_threshold: 2,
+            open_duration_secs: 30,
+        },
+    )
+    .await?;
+
+    // Trip engine A's circuit.
+    for _ in 0..3 {
+        proxy_get(proxy, "cb-iso-ns", "bad-svc", Some("1.0.0")).await?;
+    }
+
+    // Engine B should be unaffected.
+    let (status, _) = proxy_get(proxy, "cb-iso-ns", "good-svc", Some("1.0.0")).await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let _ = engine_a_shutdown.send(());
+    let _ = engine_b_shutdown.send(());
+    Ok(())
+}
+
+// ── engine health check tests ────────────────────────────────────────────────
+
+/// When a module stops sending heartbeats, the monitor marks its routing rule
+/// unhealthy and bumps the routing table version.
+#[tokio::test]
+async fn test_heartbeat_timeout_marks_module_unhealthy() -> Result<()> {
+    // 1-second timeout + 10-second monitor interval → we override the monitor
+    // by directly checking state after manipulating timestamps.
+    let (mgr_addr, state) = start_manager_with_monitor(1).await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "hc-e1",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "hc-ns",
+            name: "heartbeat-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    // The module is initially healthy (registration sets module_health timestamp).
+    {
+        let s = state.read().await;
+        let rule = s
+            .routing_table
+            .rules
+            .iter()
+            .find(|r| r.destination_module == "heartbeat-svc")
+            .expect("rule exists");
+        assert!(rule.healthy, "module should be healthy after registration");
+    }
+
+    // Backdate the module_health timestamp so the monitor considers it stale.
+    {
+        let mut s = state.write().await;
+        let key = (
+            "hc-e1".to_string(),
+            "hc-ns".to_string(),
+            "heartbeat-svc".to_string(),
+            "1.0.0".to_string(),
+        );
+        if let Some(ts) = s.module_health.get_mut(&key) {
+            *ts = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        }
+    }
+
+    // Wait for the monitor to run (10-second tick) — add padding.
+    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+
+    // The module should now be marked unhealthy.
+    {
+        let s = state.read().await;
+        let rule = s
+            .routing_table
+            .rules
+            .iter()
+            .find(|r| r.destination_module == "heartbeat-svc")
+            .expect("rule exists");
+        assert!(
+            !rule.healthy,
+            "module should be unhealthy after heartbeat timeout"
+        );
+    }
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+/// A heartbeat with the module listed in `healthy_modules` refreshes the
+/// timestamp and prevents the monitor from marking it unhealthy.
+#[tokio::test]
+async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
+    let (mgr_addr, state) = start_manager_with_monitor(2).await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "hc-keep-e1",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "hc-keep-ns",
+            name: "kept-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    // Send heartbeats continuously for 15 seconds (through the monitor tick).
+    for _ in 0..5 {
+        mgr.heartbeat(HeartbeatRequest {
+            engine_id: "hc-keep-e1".into(),
+            healthy_modules: vec![ModuleDescriptor {
+                name: "kept-svc".into(),
+                namespace: "hc-keep-ns".into(),
+                version: "1.0.0".into(),
+                proto_schema: vec![],
+            }],
+        })
+        .await?;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+
+    // Module should still be healthy.
+    {
+        let s = state.read().await;
+        let rule = s
+            .routing_table
+            .rules
+            .iter()
+            .find(|r| r.destination_module == "kept-svc")
+            .expect("rule exists");
+        assert!(rule.healthy, "module should remain healthy with heartbeats");
+    }
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+/// When a heartbeat omits a module from `healthy_modules`, the module's
+/// timestamp stales and the monitor marks the routing rule unhealthy.
+#[tokio::test]
+async fn test_heartbeat_missing_module_becomes_unhealthy() -> Result<()> {
+    let (mgr_addr, state) = start_manager_with_monitor(1).await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "hc-miss-e1",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "hc-miss-ns",
+            name: "missed-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    // Backdate the health timestamp so it's already stale.
+    {
+        let mut s = state.write().await;
+        let key = (
+            "hc-miss-e1".to_string(),
+            "hc-miss-ns".to_string(),
+            "missed-svc".to_string(),
+            "1.0.0".to_string(),
+        );
+        if let Some(ts) = s.module_health.get_mut(&key) {
+            *ts = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        }
+    }
+
+    // Send heartbeat but omit the module from the healthy list.
+    mgr.heartbeat(HeartbeatRequest {
+        engine_id: "hc-miss-e1".into(),
+        healthy_modules: vec![], // module not listed
+    })
+    .await?;
+
+    // Wait for monitor.
+    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+
+    // The module should be unhealthy because its timestamp was never refreshed.
+    {
+        let s = state.read().await;
+        let rule = s
+            .routing_table
+            .rules
+            .iter()
+            .find(|r| r.destination_module == "missed-svc")
+            .expect("rule exists");
+        assert!(
+            !rule.healthy,
+            "module omitted from heartbeat should become unhealthy"
+        );
+    }
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+/// After a module is marked unhealthy, a fresh heartbeat that includes it
+/// causes the monitor to restore the healthy status.
+#[tokio::test]
+async fn test_module_health_recovery_after_heartbeat() -> Result<()> {
+    // Use a 30-second timeout so the freshly-set heartbeat timestamp doesn't
+    // expire before the monitor's 10-second tick runs.
+    let (mgr_addr, state) = start_manager_with_monitor(30).await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "hc-rec-e1",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "hc-rec-ns",
+            name: "recovering-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    // Backdate module health so the monitor marks it unhealthy.
+    {
+        let mut s = state.write().await;
+        let key = (
+            "hc-rec-e1".to_string(),
+            "hc-rec-ns".to_string(),
+            "recovering-svc".to_string(),
+            "1.0.0".to_string(),
+        );
+        if let Some(ts) = s.module_health.get_mut(&key) {
+            *ts = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        }
+    }
+
+    // Wait for the monitor to mark it unhealthy.
+    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+
+    {
+        let s = state.read().await;
+        let rule = s
+            .routing_table
+            .rules
+            .iter()
+            .find(|r| r.destination_module == "recovering-svc")
+            .expect("rule exists");
+        assert!(!rule.healthy, "module should be unhealthy before recovery");
+    }
+
+    // Send a heartbeat that includes the module.
+    mgr.heartbeat(HeartbeatRequest {
+        engine_id: "hc-rec-e1".into(),
+        healthy_modules: vec![ModuleDescriptor {
+            name: "recovering-svc".into(),
+            namespace: "hc-rec-ns".into(),
+            version: "1.0.0".into(),
+            proto_schema: vec![],
+        }],
+    })
+    .await?;
+
+    // Wait for the next monitor tick to pick up the fresh timestamp.
+    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+
+    {
+        let s = state.read().await;
+        let rule = s
+            .routing_table
+            .rules
+            .iter()
+            .find(|r| r.destination_module == "recovering-svc")
+            .expect("rule exists");
+        assert!(rule.healthy, "module should recover after heartbeat");
+    }
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+/// An unhealthy module is excluded from proxy routing — requests get 503.
+#[tokio::test]
+async fn test_unhealthy_module_excluded_from_routing() -> Result<()> {
+    let (mgr_addr, state) = start_manager_with_monitor(1).await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "hc-route-e1",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "hc-route-ns",
+            name: "routed-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+    let proxy = start_proxy(table.clone()).await?;
+
+    // Module is healthy — routing should work.
+    let (status, _) = proxy_get(proxy, "hc-route-ns", "routed-svc", Some("1.0.0")).await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // Backdate health and wait for monitor to mark unhealthy.
+    {
+        let mut s = state.write().await;
+        let key = (
+            "hc-route-e1".to_string(),
+            "hc-route-ns".to_string(),
+            "routed-svc".to_string(),
+            "1.0.0".to_string(),
+        );
+        if let Some(ts) = s.module_health.get_mut(&key) {
+            *ts = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        }
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+
+    // Re-sync the routing table — the rule should now be unhealthy.
+    sync_table(&mgr_addr, &table).await?;
+
+    // Request should get 503 because no healthy instances remain.
+    let (status, _) = proxy_get(proxy, "hc-route-ns", "routed-svc", Some("1.0.0")).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+/// Routing table version is incremented when health status changes.
+#[tokio::test]
+async fn test_health_change_bumps_routing_table_version() -> Result<()> {
+    let (mgr_addr, state) = start_manager_with_monitor(1).await?;
+    let mut mgr = manager_client(&mgr_addr).await?;
+
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "hc-ver-e1",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "hc-ver-ns",
+            name: "ver-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    // Record the initial version.
+    let version_before = {
+        let s = state.read().await;
+        s.routing_table.version
+    };
+
+    // Backdate health so the monitor marks the module unhealthy.
+    {
+        let mut s = state.write().await;
+        let key = (
+            "hc-ver-e1".to_string(),
+            "hc-ver-ns".to_string(),
+            "ver-svc".to_string(),
+            "1.0.0".to_string(),
+        );
+        if let Some(ts) = s.module_health.get_mut(&key) {
+            *ts = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        }
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+
+    let version_after = {
+        let s = state.read().await;
+        s.routing_table.version
+    };
+
+    assert!(
+        version_after > version_before,
+        "routing table version should increase on health change: before={version_before}, after={version_after}"
+    );
+
+    let _ = engine_shutdown.send(());
+    Ok(())
 }
