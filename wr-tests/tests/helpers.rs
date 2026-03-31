@@ -458,6 +458,141 @@ pub async fn spawn_identified_stub(id: &str) -> Result<(String, oneshot::Sender<
     Ok((addr, tx))
 }
 
+// ── Configurable stub engines ────────────────────────────────────────────────
+
+/// A stub engine that always responds with a fixed HTTP status code.
+pub async fn status_stub(listener: TcpListener, status_code: StatusCode) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc = hyper::service::service_fn(move |_req: Request<hyper::body::Incoming>| {
+                let status = status_code;
+                async move {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(status)
+                            .body(Full::new(Bytes::from(format!("{}", status.as_u16()))))
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await;
+        });
+    }
+}
+
+/// Spawn a stub engine that always responds with `status_code`.
+pub async fn spawn_status_stub(status_code: StatusCode) -> Result<(String, oneshot::Sender<()>)> {
+    let (tx, rx) = oneshot::channel::<()>();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = rx => {}
+            _ = status_stub(listener, status_code) => {}
+        }
+    });
+    Ok((addr, tx))
+}
+
+/// A stub engine whose response status can be switched at runtime via an
+/// `Arc<std::sync::atomic::AtomicU16>`.
+pub async fn switchable_stub(listener: TcpListener, status: Arc<std::sync::atomic::AtomicU16>) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
+        let status = status.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc = hyper::service::service_fn(move |_req: Request<hyper::body::Incoming>| {
+                let code = status.load(std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(code)
+                            .body(Full::new(Bytes::from(format!("{code}"))))
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await;
+        });
+    }
+}
+
+/// Spawn a stub engine whose status can be switched at runtime.
+/// Returns the engine address, a shutdown sender, and the status control.
+pub async fn spawn_switchable_stub(
+    initial_status: u16,
+) -> Result<(
+    String,
+    oneshot::Sender<()>,
+    Arc<std::sync::atomic::AtomicU16>,
+)> {
+    let (tx, rx) = oneshot::channel::<()>();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = format!("http://{}", listener.local_addr()?);
+    let status = Arc::new(std::sync::atomic::AtomicU16::new(initial_status));
+    let s = status.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = rx => {}
+            _ = switchable_stub(listener, s) => {}
+        }
+    });
+    Ok((addr, tx, status))
+}
+
+// ── Proxy with custom circuit breaker ────────────────────────────────────────
+
+/// Build and start a proxy with a custom [`CircuitBreakerConfig`]; returns the bound address.
+pub async fn start_proxy_with_cb(
+    table: wr_proxy::routing::CachedRoutingTable,
+    cb_config: wr_proxy::config::CircuitBreakerConfig,
+) -> Result<SocketAddr> {
+    let svc = tower::ServiceBuilder::new()
+        .layer(wr_proxy::layers::RoutingLayer::new(table, ""))
+        .service(wr_proxy::layers::ForwardService::new(Arc::new(
+            wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(cb_config),
+        )));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(proxy_serve(listener, svc));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    Ok(addr)
+}
+
+// ── Manager with heartbeat monitor ──────────────────────────────────────────
+
+/// Start an in-process wr-manager that also runs the heartbeat monitor background
+/// task.  `timeout_secs` controls how long before a module is marked unhealthy.
+/// Returns the gRPC address and the shared state handle for assertions.
+pub async fn start_manager_with_monitor(
+    timeout_secs: u64,
+) -> Result<(String, wr_manager::state::SharedState)> {
+    let state = new_state();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(
+        Server::builder()
+            .add_service(ManagerServiceServer::new(Manager::new(state.clone())))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    tokio::spawn(wr_manager::state::monitor_heartbeats(
+        state.clone(),
+        timeout_secs,
+    ));
+    Ok((format!("http://{addr}"), state))
+}
+
 // ── Schema fixtures ───────────────────────────────────────────────────────────
 
 /// Build a minimal `FileDescriptorSet` binary containing a `PingService` with
