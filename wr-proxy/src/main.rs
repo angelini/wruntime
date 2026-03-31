@@ -2,13 +2,11 @@ mod circuit_breaker;
 mod config;
 mod layers;
 mod routing;
-mod schema;
 
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -16,8 +14,7 @@ use tokio::net::TcpListener;
 use tower::{Service, ServiceBuilder};
 
 use layers::{
-    EgressLayer, ForwardService, IngressLayer, ResBody, RoutingLayer, SchemaValidationLayer,
-    TracingLayer,
+    EgressLayer, ForwardService, IngressLayer, ProxyBody, ResBody, RoutingLayer, TracingLayer,
 };
 use tracing::{error, info, warn};
 use wr_common::wruntime::manager_service_client::ManagerServiceClient;
@@ -36,7 +33,6 @@ async fn main() -> Result<()> {
 
     // ── Shared state ──────────────────────────────────────────────────────
     let routing_table = routing::new_routing_table();
-    let schema_cache = Arc::new(schema::SchemaCache::new());
     let cb_registry = Arc::new(circuit_breaker::CircuitBreakerRegistry::new(
         config.circuit_breaker.clone(),
     ));
@@ -46,35 +42,23 @@ async fn main() -> Result<()> {
     info!(address = %config.manager_address, "connected to manager");
 
     // ── Background tasks ──────────────────────────────────────────────────
-    let schema_trigger = Arc::new(tokio::sync::Notify::new());
-
     tokio::spawn(routing::sync_routing_table(
         manager_client.clone(),
         routing_table.clone(),
         config.cache.routing_table_ttl_secs,
-        schema_trigger.clone(),
         cb_registry.clone(),
     ));
-    tokio::spawn(schema::sync_schemas(
-        manager_client.clone(),
-        routing_table.clone(),
-        schema_cache.clone(),
-        config.cache.schema_ttl_secs,
-        schema_trigger,
-    ));
+
     // ── Internal Tower service stack ──────────────────────────────────────
     //
     //   TracingLayer               ← root OTel span per request
-    //     └─ SchemaValidationLayer ← validates body; passes through uncached when
-    //          |                     egress is enabled (external host, not a missing sync)
-    //          └─ RoutingLayer     ← single routing table read; sets ExternalEgress
-    //               └─ EgressLayer ← handles ExternalEgress; passes internal to forward
-    //                    └─ ForwardService
+    //     └─ RoutingLayer          ← single routing table read; sets ExternalEgress
+    //          └─ EgressLayer      ← handles ExternalEgress; passes internal to forward
+    //               └─ ForwardService
     //
     let egress_enabled = config.egress.is_some();
     let internal_svc = ServiceBuilder::new()
         .layer(TracingLayer)
-        .layer(SchemaValidationLayer::new(schema_cache.clone()).with_egress(egress_enabled))
         .layer(
             RoutingLayer::new(routing_table.clone(), config.node.proxy_address.clone())
                 .with_egress(egress_enabled),
@@ -91,15 +75,12 @@ async fn main() -> Result<()> {
     //   IngressLayer          ← strips x-wr-* headers, matches public routes,
     //     |                     injects x-wr-destination + x-wr-source: external
     //     └─ TracingLayer
-    //          └─ SchemaValidationLayer
-    //               └─ RoutingLayer
-    //                    └─ ForwardService
+    //          └─ RoutingLayer
+    //               └─ ForwardService
     //
     if let Some(ext) = &config.external {
-        // External traffic is plain HTTP, not protobuf-over-proxy, so schema
-        // validation is omitted from this stack.
         let external_svc = ServiceBuilder::new()
-            .layer(IngressLayer::new(ext.routes.clone(), schema_cache))
+            .layer(IngressLayer::new(ext.routes.clone()))
             .layer(TracingLayer)
             .layer(RoutingLayer::new(
                 routing_table,
@@ -125,10 +106,11 @@ async fn main() -> Result<()> {
 }
 
 /// Accepts connections on `listener` and spawns a task per connection that
-/// drives `svc` for each HTTP/1.1 request.
+/// drives `svc` for each HTTP/2 request.  Request bodies are streamed through
+/// as [`ProxyBody`] — no buffering occurs at the accept layer.
 async fn accept_loop<S>(listener: TcpListener, svc: S)
 where
-    S: Service<Request<Bytes>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S: Service<Request<ProxyBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Error: std::fmt::Display + Send + 'static,
     S::Future: Send + 'static,
 {
@@ -149,19 +131,10 @@ where
                 hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
                     let mut svc = svc.clone();
                     async move {
-                        let (parts, body) = req.into_parts();
-                        let bytes = match http_body_util::BodyExt::collect(body).await {
-                            Ok(c) => c.to_bytes(),
-                            Err(e) => {
-                                warn!(error = %e, "body read error");
-                                return Ok::<_, Infallible>(layers::error_response(
-                                    StatusCode::BAD_REQUEST,
-                                    "failed to read body",
-                                ));
-                            }
-                        };
+                        // Wrap the streaming Incoming body into ProxyBody — no buffering.
+                        let req = req.map(ProxyBody::streaming);
 
-                        match svc.call(Request::from_parts(parts, bytes)).await {
+                        match svc.call(req).await {
                             Ok(resp) => Ok::<_, Infallible>(resp),
                             Err(e) => {
                                 error!(error = %e, "service error");

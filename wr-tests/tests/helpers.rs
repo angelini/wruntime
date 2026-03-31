@@ -33,8 +33,8 @@ use wasmtime_wasi_http::p2::{
 
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, manager_service_server::ManagerServiceServer,
-    EngineRegistration, GetRoutingTableRequest, GetSchemaRequest, ListEnginesRequest,
-    ModuleDescriptor, RegisterEngineRequest, RoutingRule,
+    EngineRegistration, GetRoutingTableRequest, ModuleDescriptor, RegisterEngineRequest,
+    RoutingRule,
 };
 use wr_engine::blobstore::BlobstoreRuntime;
 use wr_engine::config::BlobstoreConfig;
@@ -141,94 +141,17 @@ pub async fn sync_table(
     Ok(())
 }
 
-/// Build and start a proxy with an empty schema cache (not yet synced); returns the bound address.
+/// Build and start a proxy; returns the bound address.
 pub async fn start_proxy(table: wr_proxy::routing::CachedRoutingTable) -> Result<SocketAddr> {
-    start_proxy_with_schema(table, Arc::new(wr_proxy::schema::SchemaCache::new()), "").await
+    start_proxy_on(table, "").await
 }
 
-/// Build and start an external-facing ingress proxy on an ephemeral port.
-///
-/// The proxy strips all `x-wr-*` headers from incoming requests, matches the
-/// request path and method against `routes`, and — if a route matches — injects
-/// `x-wr-destination` before forwarding through the normal routing stack.
-/// Requests that match no route receive a 404 response.
-///
-/// Pass a pre-populated `schema_cache` when testing transcoding routes; pass
-/// an empty cache (`Arc::new(SchemaCache::new())`) for plain HTTP routes.
-pub async fn start_ingress_proxy(
+/// Build and start a proxy with a custom `self_proxy_address`; returns the bound address.
+pub async fn start_proxy_on(
     table: wr_proxy::routing::CachedRoutingTable,
-    schema_cache: Arc<wr_proxy::schema::SchemaCache>,
-    routes: Vec<ExternalRoute>,
-) -> Result<SocketAddr> {
-    // External traffic bypasses schema validation — the IngressLayer handles
-    // transcoding (and therefore any necessary validation) directly.
-    let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::IngressLayer::new(routes, schema_cache))
-        .layer(wr_proxy::layers::RoutingLayer::new(table, ""))
-        .service(wr_proxy::layers::ForwardService::new(std::sync::Arc::new(
-            wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
-        )));
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    tokio::spawn(proxy_serve(listener, svc));
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    Ok(addr)
-}
-
-/// Fetch all schemas from the manager and populate `cache`.
-pub async fn sync_schema_cache(
-    mgr_addr: &str,
-    cache: &Arc<wr_proxy::schema::SchemaCache>,
-) -> Result<()> {
-    let mut c = manager_client(mgr_addr).await?;
-    let engines = c
-        .list_engines(ListEnginesRequest {})
-        .await?
-        .into_inner()
-        .engines;
-    for engine in &engines {
-        for module in &engine.modules {
-            let schema_bytes = c
-                .get_schema(GetSchemaRequest {
-                    namespace: module.namespace.clone(),
-                    module: module.name.clone(),
-                    version: module.version.clone(),
-                })
-                .await?
-                .into_inner()
-                .proto_schema;
-            if !schema_bytes.is_empty() {
-                let _ = cache
-                    .insert(&module.namespace, &module.name, &schema_bytes)
-                    .await;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Start a proxy with routing table and schema cache both synced from the manager.
-pub async fn start_proxy_synced(
-    mgr_addr: &str,
-    table: wr_proxy::routing::CachedRoutingTable,
-) -> Result<SocketAddr> {
-    let schema_cache = Arc::new(wr_proxy::schema::SchemaCache::new());
-    sync_schema_cache(mgr_addr, &schema_cache).await?;
-    start_proxy_with_schema(table, schema_cache, "").await
-}
-
-/// Build and start a proxy with a **pre-populated** schema cache; returns the bound address.
-///
-/// `self_proxy_address` is the address this proxy considers its own — used to
-/// distinguish local (same-node) engine rules from remote (cross-node) rules.
-/// Pass `""` for single-node tests.
-pub async fn start_proxy_with_schema(
-    table: wr_proxy::routing::CachedRoutingTable,
-    schema_cache: Arc<wr_proxy::schema::SchemaCache>,
     self_proxy_address: &str,
 ) -> Result<SocketAddr> {
     let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::SchemaValidationLayer::new(schema_cache))
         .layer(wr_proxy::layers::RoutingLayer::new(
             table,
             self_proxy_address,
@@ -243,36 +166,32 @@ pub async fn start_proxy_with_schema(
     Ok(addr)
 }
 
+/// Build and start an external-facing ingress proxy on an ephemeral port.
+pub async fn start_ingress_proxy(
+    table: wr_proxy::routing::CachedRoutingTable,
+    routes: Vec<ExternalRoute>,
+) -> Result<SocketAddr> {
+    let svc = tower::ServiceBuilder::new()
+        .layer(wr_proxy::layers::IngressLayer::new(routes))
+        .layer(wr_proxy::layers::RoutingLayer::new(table, ""))
+        .service(wr_proxy::layers::ForwardService::new(std::sync::Arc::new(
+            wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
+        )));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(proxy_serve(listener, svc));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    Ok(addr)
+}
+
 /// Build and start a proxy with [`EgressLayer`] configured; returns the bound address.
-///
-/// `egress_cfg` is passed directly to [`EgressLayer::new`]. Pass `None` to
-/// test that egress is disabled (external requests fall through to RoutingLayer
-/// and receive a 503).  Pass `Some(EgressConfig { allowed_domains: … })` to
-/// exercise the allowlist logic.
 pub async fn start_egress_proxy(
     egress_cfg: Option<EgressConfig>,
     table: wr_proxy::routing::CachedRoutingTable,
 ) -> Result<SocketAddr> {
-    start_egress_proxy_with_schema(
-        egress_cfg,
-        table,
-        Arc::new(wr_proxy::schema::SchemaCache::new()),
-    )
-    .await
-}
-
-/// Like [`start_egress_proxy`] but with a pre-populated schema cache.
-pub async fn start_egress_proxy_with_schema(
-    egress_cfg: Option<EgressConfig>,
-    table: wr_proxy::routing::CachedRoutingTable,
-    schema_cache: Arc<wr_proxy::schema::SchemaCache>,
-) -> Result<SocketAddr> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let egress_enabled = egress_cfg.is_some();
     let svc = tower::ServiceBuilder::new()
-        .layer(
-            wr_proxy::layers::SchemaValidationLayer::new(schema_cache).with_egress(egress_enabled),
-        )
         .layer(wr_proxy::layers::RoutingLayer::new(table, "").with_egress(egress_enabled))
         .layer(wr_proxy::layers::EgressLayer::new(egress_cfg))
         .service(wr_proxy::layers::ForwardService::new(Arc::new(
@@ -340,24 +259,15 @@ pub struct Node {
 }
 
 /// Spin up a proxy node on an ephemeral port.
-///
-/// The node derives its own `proxy_address` from the bound port, so callers
-/// can pass `node.proxy_address` to [`register_module`] without knowing the
-/// port in advance.  After registering engines call [`sync_table`] with
-/// `node.table` so the node picks up the new routing rules.
 pub async fn start_node(mgr_addr: &str) -> Result<Node> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let proxy_address = format!("http://{addr}");
 
-    let schema_cache = Arc::new(wr_proxy::schema::SchemaCache::new());
-    sync_schema_cache(mgr_addr, &schema_cache).await?;
-
     let table = wr_proxy::routing::new_routing_table();
     sync_table(mgr_addr, &table).await?;
 
     let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::SchemaValidationLayer::new(schema_cache))
         .layer(wr_proxy::layers::RoutingLayer::new(
             table.clone(),
             &proxy_address,
@@ -416,7 +326,7 @@ pub async fn proxy_get(
 pub async fn proxy_serve<S>(listener: TcpListener, svc: S)
 where
     S: tower::Service<
-            Request<Bytes>,
+            Request<wr_proxy::layers::ProxyBody>,
             Response = Response<wr_proxy::layers::ResBody>,
             Error = anyhow::Error,
         > + Clone
@@ -434,20 +344,8 @@ where
             let svc_fn = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
                 let mut svc = svc.clone();
                 async move {
-                    let (parts, body) = req.into_parts();
-                    let bytes = match BodyExt::collect(body).await {
-                        Ok(c) => c.to_bytes(),
-                        Err(_) => {
-                            return Ok::<_, Infallible>(
-                                Response::builder()
-                                    .status(400)
-                                    .body(wr_proxy::layers::full_body(Bytes::from("body error")))
-                                    .unwrap(),
-                            )
-                        }
-                    };
-                    let result =
-                        tower::Service::call(&mut svc, Request::from_parts(parts, bytes)).await;
+                    let req = req.map(wr_proxy::layers::ProxyBody::streaming);
+                    let result = tower::Service::call(&mut svc, req).await;
                     Ok::<_, Infallible>(match result {
                         Ok(r) => r,
                         Err(_) => Response::builder()
@@ -499,52 +397,6 @@ pub async fn stub_engine(listener: TcpListener) {
                 .await;
         });
     }
-}
-
-/// Like `stub_engine` but responds with a fixed protobuf-encoded body.
-///
-/// Used when testing transcoding: the ingress layer will attempt to decode the
-/// response as the configured `response_type`.
-pub async fn proto_stub_engine(listener: TcpListener, response_body: bytes::Bytes) {
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            break;
-        };
-        let body = response_body.clone();
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let svc = hyper::service::service_fn(move |_req: Request<hyper::body::Incoming>| {
-                let body = body.clone();
-                async move {
-                    Ok::<_, Infallible>(
-                        Response::builder()
-                            .status(StatusCode::OK)
-                            .body(Full::new(body))
-                            .unwrap(),
-                    )
-                }
-            });
-            let _ = http2::Builder::new(TokioExecutor::new())
-                .serve_connection(io, svc)
-                .await;
-        });
-    }
-}
-
-/// Spawn a `proto_stub_engine`; returns the engine's HTTP address and a shutdown sender.
-pub async fn spawn_proto_stub_engine(
-    response_body: bytes::Bytes,
-) -> Result<(String, oneshot::Sender<()>)> {
-    let (tx, rx) = oneshot::channel::<()>();
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = format!("http://{}", listener.local_addr()?);
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = rx => {}
-            _ = proto_stub_engine(listener, response_body) => {}
-        }
-    });
-    Ok((addr, tx))
 }
 
 /// Like `stub_engine` but responds with a fixed `id` string so callers can
@@ -609,7 +461,7 @@ pub async fn spawn_identified_stub(id: &str) -> Result<(String, oneshot::Sender<
 // ── Schema fixtures ───────────────────────────────────────────────────────────
 
 /// Build a minimal `FileDescriptorSet` binary containing a `PingService` with
-/// one RPC so schema validation can be exercised without running `protoc`.
+/// one RPC so engine registration can include a schema.
 pub fn minimal_file_descriptor_set() -> Vec<u8> {
     let req_msg = DescriptorProto {
         name: Some("PingRequest".into()),
@@ -663,14 +515,6 @@ pub fn invalid_protobuf() -> Bytes {
 // ── Database ──────────────────────────────────────────────────────────────────
 
 /// Build a `ModuleState` backed by a connection pool at `WRUNTIME_TEST_DB_URL`.
-///
-/// Returns `None` when the environment variable is absent so the calling test
-/// can return early and skip all DB-dependent assertions — making the test
-/// suite pass in CI without a running Postgres instance.
-///
-/// Use `pool_size = 1` when the test creates `TEMP TABLE`s, which are
-/// connection-local: a pool of one guarantees every `pool.get()` call reuses
-/// the same underlying connection.
 pub fn db_state(pool_size: usize) -> Option<ModuleState> {
     let url = std::env::var("WRUNTIME_TEST_DB_URL").ok()?;
     let pool = Arc::new(wr_engine::pool::build_pool(&url, pool_size).expect("build_pool"));
@@ -692,9 +536,6 @@ pub fn db_state(pool_size: usize) -> Option<ModuleState> {
 /// Build a `ModuleState` for a specific `(namespace, name)` pair, provisioning
 /// the module's Postgres schema (`wr__{namespace}__{name}`) if it does not
 /// already exist.
-///
-/// Returns `None` when `WRUNTIME_TEST_DB_URL` is absent so the calling test
-/// can skip DB-dependent assertions without a running Postgres instance.
 pub async fn db_state_for_module(
     pool_size: usize,
     namespace: &str,
@@ -731,9 +572,6 @@ pub async fn db_state_for_module(
 // ── WASM guest dispatch ──────────────────────────────────────────────────────
 
 /// Set up a wasmtime `Engine` + `ProxyPre` from a compiled WASM component path.
-///
-/// Replicates the linker setup from `wr-engine/src/engine.rs` so WASM guests
-/// have access to all host bindings (WASI, HTTP, DB, tracing, blobstore).
 pub fn wasm_module_pre(wasm_path: &str) -> Result<(Arc<Engine>, Arc<ProxyPre<ModuleState>>)> {
     let mut wt_config = Config::new();
     wt_config.wasm_component_model(true);
@@ -761,10 +599,6 @@ pub fn wasm_module_pre(wasm_path: &str) -> Result<(Arc<Engine>, Arc<ProxyPre<Mod
 }
 
 /// Dispatch a single HTTP request through a WASM component, returning the response.
-///
-/// Mirrors `wr-engine/src/engine.rs::dispatch_request` — builds a Store,
-/// instantiates the component, calls `wasi:http/incoming-handler#handle`,
-/// and collects the response.
 pub async fn dispatch_to_wasm(
     engine: &Engine,
     pre: &ProxyPre<ModuleState>,
@@ -809,8 +643,6 @@ pub async fn dispatch_to_wasm(
 }
 
 /// Build a `BlobstoreRuntime` from `WRUNTIME_TEST_S3_*` environment variables.
-///
-/// Returns `None` when the env vars are absent so the calling test can skip.
 pub fn blobstore_client() -> Option<Arc<BlobstoreRuntime>> {
     let endpoint = std::env::var("WRUNTIME_TEST_S3_ENDPOINT").ok()?;
     let access_key = std::env::var("WRUNTIME_TEST_S3_ACCESS_KEY").ok()?;

@@ -3,27 +3,20 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
 use http::{Request, Response, StatusCode};
-use http_body_util::BodyExt as _;
-use prost::Message as _;
-use prost_reflect::DynamicMessage;
 use tower::{Layer, Service};
 
-use super::{error_response, full_body, ResBody};
+use super::{error_response, ProxyBody, ResBody};
 use crate::config::ExternalRoute;
-use crate::schema::{MessageLookup, SchemaCache};
 
 pub struct IngressLayer {
     routes: Arc<Vec<ExternalRoute>>,
-    schema_cache: Arc<SchemaCache>,
 }
 
 impl IngressLayer {
-    pub fn new(routes: Vec<ExternalRoute>, schema_cache: Arc<SchemaCache>) -> Self {
+    pub fn new(routes: Vec<ExternalRoute>) -> Self {
         Self {
             routes: Arc::new(routes),
-            schema_cache,
         }
     }
 }
@@ -34,7 +27,6 @@ impl<S> Layer<S> for IngressLayer {
         IngressService {
             inner,
             routes: self.routes.clone(),
-            schema_cache: self.schema_cache.clone(),
         }
     }
 }
@@ -43,12 +35,11 @@ impl<S> Layer<S> for IngressLayer {
 pub struct IngressService<S> {
     inner: S,
     routes: Arc<Vec<ExternalRoute>>,
-    schema_cache: Arc<SchemaCache>,
 }
 
-impl<S> Service<Request<Bytes>> for IngressService<S>
+impl<S> Service<Request<ProxyBody>> for IngressService<S>
 where
-    S: Service<Request<Bytes>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S: Service<Request<ProxyBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Error: Send + 'static,
     S::Future: Send + 'static,
 {
@@ -60,19 +51,17 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<Bytes>) -> Self::Future {
+    fn call(&mut self, req: Request<ProxyBody>) -> Self::Future {
         let routes = self.routes.clone();
-        let schema_cache = self.schema_cache.clone();
         let mut inner = self.inner.clone();
         let method = req.method().as_str().to_uppercase();
         let path = req.uri().path().to_string();
 
         Box::pin(async move {
-            // Decompose up front so we can strip internal headers before anything else.
             let (mut parts, body) = req.into_parts();
 
             // Strip all x-wr-* headers to prevent external callers from spoofing
-            // internal routing identity or bypassing schema validation.
+            // internal routing identity.
             for name in &[
                 "x-wr-destination",
                 "x-wr-source",
@@ -103,126 +92,15 @@ where
             let module = &route.module;
             let namespace = &route.namespace;
 
-            match (&route.grpc_path, &route.request_type, &route.response_type) {
-                // ── Transcoding path ─────────────────────────────────────────
-                (Some(grpc_path), Some(req_type), Some(resp_type)) => {
-                    // Resolve both message descriptors before doing any I/O.
-                    let req_desc = match schema_cache
-                        .message_descriptor(namespace, module, req_type)
-                        .await
-                    {
-                        MessageLookup::Found(d) => d,
-                        MessageLookup::SchemaNotCached => {
-                            return Ok(error_response(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                &format!("schema for {module}.{namespace} has not been synced yet"),
-                            ));
-                        }
-                        MessageLookup::TypeNotFound => {
-                            return Ok(error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                &format!(
-                                    "request type '{req_type}' not found in schema \
-                                         for {module}.{namespace}"
-                                ),
-                            ));
-                        }
-                    };
-                    let resp_desc = match schema_cache
-                        .message_descriptor(namespace, module, resp_type)
-                        .await
-                    {
-                        MessageLookup::Found(d) => d,
-                        MessageLookup::SchemaNotCached => {
-                            return Ok(error_response(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                &format!("schema for {module}.{namespace} has not been synced yet"),
-                            ));
-                        }
-                        MessageLookup::TypeNotFound => {
-                            return Ok(error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                &format!(
-                                    "response type '{resp_type}' not found in schema \
-                                         for {module}.{namespace}"
-                                ),
-                            ));
-                        }
-                    };
-
-                    // JSON → protobuf
-                    let mut de = serde_json::Deserializer::from_slice(&body);
-                    let dynamic_req = match DynamicMessage::deserialize(req_desc, &mut de) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            return Ok(error_response(
-                                StatusCode::BAD_REQUEST,
-                                &format!("invalid JSON body: {e}"),
-                            ));
-                        }
-                    };
-                    let proto_bytes = Bytes::from(dynamic_req.encode_to_vec());
-
-                    // Inject routing headers; gRPC path goes into x-wr-destination so
-                    // the schema validation layer (on the internal stack) can resolve
-                    // the RPC method if it's present.
-                    let dest = format!("http://{namespace}.{module}{grpc_path}");
-                    if let Ok(v) = http::HeaderValue::from_str(&dest) {
-                        parts.headers.insert("x-wr-destination", v);
-                    }
-                    parts
-                        .headers
-                        .insert("x-wr-source", http::HeaderValue::from_static("external"));
-                    parts.headers.remove(http::header::CONTENT_TYPE);
-                    // Body size changed: remove Content-Length so hyper recomputes it.
-                    parts.headers.remove(http::header::CONTENT_LENGTH);
-
-                    let transcoded_req = Request::from_parts(parts, proto_bytes);
-                    let response = inner.call(transcoded_req).await?;
-
-                    // Protobuf → JSON
-                    let (mut resp_parts, resp_body) = response.into_parts();
-                    // ResBody error is Infallible, so collect() never fails.
-                    let resp_bytes = resp_body.collect().await.unwrap().to_bytes();
-
-                    match DynamicMessage::decode(resp_desc, resp_bytes.as_ref()) {
-                        Ok(dynamic_resp) => match serde_json::to_string(&dynamic_resp) {
-                            Ok(json) => {
-                                resp_parts.headers.insert(
-                                    http::header::CONTENT_TYPE,
-                                    http::HeaderValue::from_static("application/json"),
-                                );
-                                // Body size changed: remove Content-Length so hyper recomputes it.
-                                resp_parts.headers.remove(http::header::CONTENT_LENGTH);
-                                Ok(Response::from_parts(
-                                    resp_parts,
-                                    full_body(Bytes::from(json)),
-                                ))
-                            }
-                            Err(e) => Ok(error_response(
-                                StatusCode::BAD_GATEWAY,
-                                &format!("response serialization failed: {e}"),
-                            )),
-                        },
-                        Err(e) => Ok(error_response(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("response protobuf decode failed: {e}"),
-                        )),
-                    }
-                }
-
-                // ── Plain HTTP pass-through ───────────────────────────────────
-                _ => {
-                    let dest = format!("http://{namespace}.{module}/");
-                    if let Ok(v) = http::HeaderValue::from_str(&dest) {
-                        parts.headers.insert("x-wr-destination", v);
-                    }
-                    parts
-                        .headers
-                        .insert("x-wr-source", http::HeaderValue::from_static("external"));
-                    inner.call(Request::from_parts(parts, body)).await
-                }
+            // Set routing headers and pass through to the inner stack.
+            let dest = format!("http://{namespace}.{module}/");
+            if let Ok(v) = http::HeaderValue::from_str(&dest) {
+                parts.headers.insert("x-wr-destination", v);
             }
+            parts
+                .headers
+                .insert("x-wr-source", http::HeaderValue::from_static("external"));
+            inner.call(Request::from_parts(parts, body)).await
         })
     }
 }

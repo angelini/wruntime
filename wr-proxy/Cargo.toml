@@ -10,11 +10,10 @@ hyper          = { version = "1", features = ["http2", "server"] }
 hyper-util     = { version = "0.1", features = ["client-legacy", "http2", "tokio"] }
 hyper-rustls   = { version = "0.27", features = ["native-tokio", "http1", "http2"] }
 rustls         = { version = "0.23", features = ["ring"] }
+http-body      = "1"
 http-body-util = "0.1"
 tokio          = { version = "1", features = ["full"] }
 tonic          = { version = "0.14", features = ["transport"] }
-prost          = "0.14"
-prost-reflect  = { version = "0.16", features = ["serde"] }
 bytes          = "1"
 anyhow         = "1"
 semver         = "1"

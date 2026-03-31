@@ -151,7 +151,7 @@ async fn wasm_db_transaction_commit() -> Result<()> {
     if skip_if_no_db_wasm() {
         return Ok(());
     }
-    let Some(state) = db_state_for_module(1, "test-ns", "db-txcommit-test").await else {
+    let Some(state) = db_state_for_module(2, "test-ns", "db-txcommit-test").await else {
         eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
         return Ok(());
     };
@@ -179,7 +179,7 @@ async fn wasm_db_transaction_rollback() -> Result<()> {
     if skip_if_no_db_wasm() {
         return Ok(());
     }
-    let Some(state) = db_state_for_module(1, "test-ns", "db-txrollback-test").await else {
+    let Some(state) = db_state_for_module(2, "test-ns", "db-txrollback-test").await else {
         eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
         return Ok(());
     };
@@ -207,7 +207,7 @@ async fn wasm_db_transaction_drop() -> Result<()> {
     if skip_if_no_db_wasm() {
         return Ok(());
     }
-    let Some(state) = db_state_for_module(1, "test-ns", "db-txdrop-test").await else {
+    let Some(state) = db_state_for_module(2, "test-ns", "db-txdrop-test").await else {
         eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
         return Ok(());
     };

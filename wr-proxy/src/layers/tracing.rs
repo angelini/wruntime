@@ -2,12 +2,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
 use http::Request;
 use tower::{Layer, Service};
 use tracing::{info_span, Instrument};
 
-use super::ResBody;
+use super::{ProxyBody, ResBody};
 
 pub struct TracingLayer;
 
@@ -23,9 +22,9 @@ pub struct TracingService<S> {
     inner: S,
 }
 
-impl<S> Service<Request<Bytes>> for TracingService<S>
+impl<S> Service<Request<ProxyBody>> for TracingService<S>
 where
-    S: Service<Request<Bytes>, Response = http::Response<ResBody>> + Clone + Send + 'static,
+    S: Service<Request<ProxyBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
     S::Error: std::fmt::Display + Send + 'static,
     S::Future: Send + 'static,
 {
@@ -37,7 +36,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<Bytes>) -> Self::Future {
+    fn call(&mut self, req: Request<ProxyBody>) -> Self::Future {
         let method = req.method().as_str().to_string();
         let path = req
             .uri()

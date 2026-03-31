@@ -3,19 +3,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
 use http::{Request, StatusCode};
-use http_body_util::{BodyExt, Full};
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use tower::{Layer, Service};
 use tracing::{info_span, Instrument};
 
-use super::{full_body, ResBody};
+use super::{full_body, ProxyBody, ResBody};
 use crate::config::EgressConfig;
 
-type EgressClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+type EgressClient = Client<HttpsConnector<HttpConnector>, ProxyBody>;
 
 /// Resolved by [`super::RoutingLayer`] when the destination is not an internal
 /// module and egress is configured. Consumed by [`EgressService`] to forward
@@ -66,9 +64,9 @@ pub struct EgressService<S> {
     client: Arc<EgressClient>,
 }
 
-impl<S> Service<Request<Bytes>> for EgressService<S>
+impl<S> Service<Request<ProxyBody>> for EgressService<S>
 where
-    S: Service<Request<Bytes>, Response = http::Response<ResBody>> + Clone + Send + 'static,
+    S: Service<Request<ProxyBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
     S::Error: Into<anyhow::Error> + Send + 'static,
     S::Future: Send + 'static,
 {
@@ -80,7 +78,7 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, req: Request<Bytes>) -> Self::Future {
+    fn call(&mut self, req: Request<ProxyBody>) -> Self::Future {
         // If this request has an ExternalEgress extension, RoutingLayer already
         // determined it is not an internal module. Handle the external forward
         // without touching the inner stack (ForwardService).
@@ -92,8 +90,6 @@ where
                 let egress_cfg = match config {
                     Some(c) => c,
                     None => {
-                        // Should not happen — RoutingLayer only sets ExternalEgress
-                        // when egress is configured. Defensive fallback.
                         return Ok(super::error_response(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "egress not configured",
@@ -118,12 +114,12 @@ where
                     return Ok(http::Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .header(http::header::CONTENT_TYPE, "application/json")
-                        .body(full_body(Bytes::from(body)))
+                        .body(full_body(bytes::Bytes::from(body)))
                         .unwrap());
                 }
 
                 // Strip all x-wr-* headers before forwarding to the external host.
-                let (mut parts, body_bytes) = req.into_parts();
+                let (mut parts, body) = req.into_parts();
 
                 let source = parts
                     .headers
@@ -146,13 +142,11 @@ where
 
                 parts.uri = egress.dest_uri.clone();
                 // Reset the HTTP version so the client can negotiate freely via
-                // ALPN (HTTPS) or default to HTTP/1.1 (plain HTTP).  The inbound
-                // request may carry HTTP/2 from the proxy listener, which is not
-                // meaningful for the outbound egress connection.
+                // ALPN (HTTPS) or default to HTTP/1.1 (plain HTTP).
                 parts.version = http::Version::HTTP_11;
                 wr_common::telemetry::inject_context(&mut parts.headers);
 
-                let egress_req = Request::from_parts(parts, Full::new(body_bytes));
+                let egress_req = Request::from_parts(parts, body);
 
                 let span = info_span!(
                     "proxy.egress",
@@ -172,15 +166,9 @@ where
                 span.record("http.response.status_code", resp_parts.status.as_u16());
                 span.record("otel.status_code", "OK");
 
-                let resp_bytes = resp_body
-                    .collect()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("egress response body error: {e}"))?
-                    .to_bytes();
-
                 Ok(http::Response::from_parts(
                     resp_parts,
-                    full_body(resp_bytes),
+                    ProxyBody::streaming(resp_body),
                 ))
             });
         }

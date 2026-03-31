@@ -6,8 +6,6 @@
 mod helpers;
 use helpers::*;
 
-use std::sync::Arc;
-
 use anyhow::Result;
 use bytes::Bytes;
 use http::{Request, StatusCode};
@@ -170,7 +168,7 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy_synced(&mgr_addr, table).await?;
+    let proxy = start_proxy(table).await?;
 
     let (status, body) = proxy_get(proxy, "store", "inventory-service", Some("1.0.0")).await?;
     assert_eq!(status, StatusCode::OK);
@@ -277,16 +275,12 @@ async fn test_egress_internal_module_passthrough() -> Result<()> {
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
 
-    let schema_cache = std::sync::Arc::new(wr_proxy::schema::SchemaCache::new());
-    sync_schema_cache(&mgr_addr, &schema_cache).await?;
-
     // Egress is enabled but the destination is a registered internal module.
-    let proxy_addr = start_egress_proxy_with_schema(
+    let proxy_addr = start_egress_proxy(
         Some(EgressConfig {
             allowed_domains: vec!["external.example.com".into()],
         }),
         table,
-        schema_cache,
     )
     .await?;
 
@@ -299,171 +293,6 @@ async fn test_egress_internal_module_passthrough() -> Result<()> {
     assert!(
         body.contains("/store.inventory"),
         "stub should echo the request path, got: {body}"
-    );
-
-    let _ = engine_shutdown.send(());
-    Ok(())
-}
-
-// ── schema validation tests ───────────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_schema_validation_rejects_invalid_body() -> Result<()> {
-    // 1. Start manager and upload a schema for "ping-service".
-    let mgr_addr = start_manager().await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
-
-    mgr.upload_schema(wr_common::wruntime::UploadSchemaRequest {
-        namespace: "svc-ns".into(),
-        module: "ping-service".into(),
-        version: "1.0.0".into(),
-        proto_schema: minimal_file_descriptor_set(),
-    })
-    .await?;
-
-    // 2. Pre-populate a schema cache and start a proxy backed by it.
-    let schema_cache = Arc::new(wr_proxy::schema::SchemaCache::new());
-    let schema_bytes = manager_client(&mgr_addr)
-        .await?
-        .get_schema(wr_common::wruntime::GetSchemaRequest {
-            namespace: "svc-ns".into(),
-            module: "ping-service".into(),
-            version: "1.0.0".into(),
-        })
-        .await?
-        .into_inner()
-        .proto_schema;
-    schema_cache
-        .insert("svc-ns", "ping-service", &schema_bytes)
-        .await?;
-
-    let proxy_addr =
-        start_proxy_with_schema(wr_proxy::routing::new_routing_table(), schema_cache, "").await?;
-
-    let client = http_client();
-
-    // 3. Invalid body → 400 with structured JSON error.
-    let bad_req = Request::builder()
-        .method("POST")
-        .uri(format!("http://{proxy_addr}/Ping"))
-        .header("x-wr-destination", "http://svc-ns.ping-service/Ping")
-        .header("x-wr-source", "caller-service")
-        .body(Full::new(invalid_protobuf()))?;
-
-    let resp = client.request(bad_req).await?;
-    assert_eq!(
-        resp.status(),
-        StatusCode::BAD_REQUEST,
-        "expected 400 for invalid protobuf"
-    );
-
-    let (resp_parts, resp_body) = resp.into_parts();
-    let body_bytes = resp_body.collect().await?.to_bytes();
-    let body_str = std::str::from_utf8(&body_bytes)?;
-
-    assert!(
-        body_str.contains(r#""error":"schema_validation_failed""#),
-        "expected structured JSON error, got: {body_str}"
-    );
-    assert!(
-        body_str.contains(r#""source":"caller-service""#),
-        "expected source in error, got: {body_str}"
-    );
-    assert!(
-        body_str.contains(r#""destination":"ping-service""#),
-        "expected destination in error, got: {body_str}"
-    );
-    assert!(
-        resp_parts
-            .headers
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_none_or(|v| v.starts_with("application/json")),
-        "expected application/json content-type"
-    );
-
-    // 4. Valid protobuf body → passes schema validation (routing then fails
-    //    with 503 since no engine is registered, not 400).
-    let good_req = Request::builder()
-        .method("POST")
-        .uri(format!("http://{proxy_addr}/Ping"))
-        .header("x-wr-destination", "http://svc-ns.ping-service/Ping")
-        .header("x-wr-source", "caller-service")
-        .body(Full::new(valid_ping_request()))?;
-
-    let resp2 = client.request(good_req).await?;
-    assert_ne!(
-        resp2.status(),
-        StatusCode::BAD_REQUEST,
-        "valid body should not fail schema validation"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_schema_validation_accepts_json_body() -> Result<()> {
-    // Verify that the proxy transcodes an `application/json` body to protobuf
-    // before schema validation, so callers like `wr-cli invoke` can pass
-    // stringified JSON instead of binary-encoded protobuf.
-
-    let mgr_addr = start_manager().await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
-
-    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-
-    register_module(
-        &mut mgr,
-        EngineSpec {
-            id: "json-engine",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "json-ns",
-            name: "ping-service",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
-    )
-    .await?;
-
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
-    let proxy_addr = start_proxy_synced(&mgr_addr, table).await?;
-
-    let client = http_client();
-
-    // Valid JSON matching PingRequest { message: string } — should pass.
-    let json_req = Request::builder()
-        .method("POST")
-        .uri(format!("http://{proxy_addr}/Ping"))
-        .header("content-type", "application/json")
-        .header("x-wr-destination", "http://json-ns.ping-service/Ping")
-        .header("x-wr-source", "wr-cli")
-        .body(Full::new(bytes::Bytes::from(r#"{"message":"hello"}"#)))?;
-
-    let resp = client.request(json_req).await?;
-    assert_ne!(
-        resp.status(),
-        StatusCode::BAD_REQUEST,
-        "valid JSON body should pass schema validation"
-    );
-
-    // Invalid JSON — should be rejected with 400.
-    let bad_json_req = Request::builder()
-        .method("POST")
-        .uri(format!("http://{proxy_addr}/Ping"))
-        .header("content-type", "application/json")
-        .header("x-wr-destination", "http://json-ns.ping-service/Ping")
-        .header("x-wr-source", "wr-cli")
-        .body(Full::new(bytes::Bytes::from(r#"not json"#)))?;
-
-    let bad_resp = client.request(bad_json_req).await?;
-    assert_eq!(
-        bad_resp.status(),
-        StatusCode::BAD_REQUEST,
-        "invalid JSON body should be rejected"
     );
 
     let _ = engine_shutdown.send(());
@@ -502,13 +331,11 @@ fn test_proxy_config_valid() {
 
         [cache]
         routing_table_ttl_secs = 5
-        schema_ttl_secs        = 60
     "#;
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
     assert_eq!(cfg.listen_address, "0.0.0.0:9001");
     assert_eq!(cfg.manager_address, "http://127.0.0.1:9000");
     assert_eq!(cfg.cache.routing_table_ttl_secs, 5);
-    assert_eq!(cfg.cache.schema_ttl_secs, 60);
 }
 
 #[test]
@@ -521,7 +348,6 @@ fn test_proxy_config_defaults() {
     "#;
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
     assert_eq!(cfg.cache.routing_table_ttl_secs, 5);
-    assert_eq!(cfg.cache.schema_ttl_secs, 60);
 }
 
 #[test]
@@ -533,7 +359,6 @@ fn test_proxy_config_rejects_zero_ttl() {
         proxy_address   = "http://127.0.0.1:9001"
         [cache]
         routing_table_ttl_secs = 0
-        schema_ttl_secs        = 60
     "#;
     // Deserialisation succeeds; validate() catches the bad value.
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
@@ -619,7 +444,7 @@ async fn test_proxy_routes_to_explicit_version() -> Result<()> {
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy_synced(&mgr_addr, table).await?;
+    let proxy = start_proxy(table).await?;
 
     let (s, body) = proxy_get(proxy, "ver-ns", "versioned-service", Some("1.0.0")).await?;
     assert_eq!(s, StatusCode::OK);
@@ -675,7 +500,7 @@ async fn test_proxy_routes_to_latest_version() -> Result<()> {
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy_synced(&mgr_addr, table).await?;
+    let proxy = start_proxy(table).await?;
 
     // No x-wr-version → should route to the highest semver (2.0.0)
     let (s, body) = proxy_get(proxy, "latest-ns", "latest-service", None).await?;
@@ -714,7 +539,7 @@ async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy_synced(&mgr_addr, table).await?;
+    let proxy = start_proxy(table).await?;
 
     let (s, _) = proxy_get(proxy, "mv-ns", "missing-ver-service", Some("9.0.0")).await?;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "unknown version → 503");
@@ -755,7 +580,7 @@ async fn test_proxy_routes_semver_range_to_highest_satisfying() -> Result<()> {
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy_synced(&mgr_addr, table).await?;
+    let proxy = start_proxy(table).await?;
 
     // ^1 should pick the highest 1.x, which is 1.5.0
     let (s, body) = proxy_get(proxy, "range-ns", "range-service", Some("^1")).await?;
@@ -800,7 +625,7 @@ async fn test_proxy_returns_503_for_unsatisfiable_range() -> Result<()> {
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy_synced(&mgr_addr, table).await?;
+    let proxy = start_proxy(table).await?;
 
     let (s, _) = proxy_get(proxy, "range-503-ns", "range-503-service", Some("^3")).await?;
     assert_eq!(
@@ -854,7 +679,7 @@ async fn test_proxy_load_balances_across_instances() -> Result<()> {
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy_synced(&mgr_addr, table).await?;
+    let proxy = start_proxy(table).await?;
 
     let mut saw_a = false;
     let mut saw_b = false;
@@ -914,7 +739,7 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy_synced(&mgr_addr, table.clone()).await?;
+    let proxy = start_proxy(table.clone()).await?;
 
     // Both instances should be reachable before failover.
     let mut saw_a = false;
@@ -973,7 +798,7 @@ async fn test_proxy_503_when_all_instances_unhealthy() -> Result<()> {
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy_synced(&mgr_addr, table.clone()).await?;
+    let proxy = start_proxy(table.clone()).await?;
 
     let (s, _) = proxy_get(proxy, "gone-ns", "gone-service", Some("1.0.0")).await?;
     assert_eq!(s, StatusCode::OK, "should be reachable before deregister");
@@ -1356,7 +1181,7 @@ async fn test_proxy_namespaces_are_isolated() -> Result<()> {
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
-    let proxy = start_proxy_synced(&mgr_addr, table).await?;
+    let proxy = start_proxy(table).await?;
 
     // ns-alpha routes to engine-alpha, not engine-beta.
     let (s, body) = proxy_get(proxy, "ns-alpha", "shared-service", Some("1.0.0")).await?;
@@ -1592,8 +1417,7 @@ async fn ingress_fixture(
     let table = wr_proxy::routing::new_routing_table();
     sync_table(&mgr_addr, &table).await?;
 
-    let schema_cache = Arc::new(wr_proxy::schema::SchemaCache::new());
-    let ingress_addr = start_ingress_proxy(table, schema_cache, routes).await?;
+    let ingress_addr = start_ingress_proxy(table, routes).await?;
     Ok((ingress_addr, engine_shutdown))
 }
 
@@ -1629,7 +1453,6 @@ async fn test_external_route_dispatches_to_engine() -> Result<()> {
         methods: vec![],
         module: "inventory".into(),
         namespace: "ecommerce".into(),
-        ..Default::default()
     }];
     let (addr, _shutdown) = ingress_fixture("inventory", "ecommerce", routes).await?;
 
@@ -1646,7 +1469,6 @@ async fn test_external_route_wildcard_segment() -> Result<()> {
         methods: vec![],
         module: "inventory".into(),
         namespace: "ecommerce".into(),
-        ..Default::default()
     }];
     let (addr, _shutdown) = ingress_fixture("inventory", "ecommerce", routes).await?;
 
@@ -1663,7 +1485,6 @@ async fn test_external_route_unmatched_path_returns_404() -> Result<()> {
         methods: vec![],
         module: "inventory".into(),
         namespace: "ecommerce".into(),
-        ..Default::default()
     }];
     let (addr, _shutdown) = ingress_fixture("inventory", "ecommerce", routes).await?;
 
@@ -1679,7 +1500,6 @@ async fn test_external_route_method_filter() -> Result<()> {
         methods: vec!["GET".into()],
         module: "inventory".into(),
         namespace: "ecommerce".into(),
-        ..Default::default()
     }];
     let (addr, _shutdown) = ingress_fixture("inventory", "ecommerce", routes).await?;
 
@@ -1702,7 +1522,6 @@ async fn test_external_route_strips_spoofed_internal_headers() -> Result<()> {
         methods: vec![],
         module: "inventory".into(),
         namespace: "ecommerce".into(),
-        ..Default::default()
     }];
     let (addr, _shutdown) = ingress_fixture("inventory", "ecommerce", routes).await?;
 
@@ -1720,158 +1539,6 @@ async fn test_external_route_strips_spoofed_internal_headers() -> Result<()> {
         StatusCode::OK,
         "spoofed x-wr-destination must be overwritten by ingress layer"
     );
-    Ok(())
-}
-
-// ── JSON↔protobuf transcoding tests ──────────────────────────────────────────
-
-/// Set up an ingress proxy with a transcoding route and a proto-aware stub engine.
-///
-/// The module uses [`minimal_file_descriptor_set`] which declares:
-///   - `PingRequest  { string message = 1; }`
-///   - `PingResponse {}`  (empty, but still a valid message)
-///   - `PingService.Ping(PingRequest) returns (PingResponse)`
-///
-/// Returns `(ingress_addr, engine_shutdown)`.
-async fn transcoding_fixture() -> Result<(std::net::SocketAddr, tokio::sync::oneshot::Sender<()>)> {
-    // An empty `PingResponse` encodes to zero bytes in proto3.
-    let proto_response = bytes::Bytes::new();
-    let (engine_addr, engine_shutdown) = spawn_proto_stub_engine(proto_response).await?;
-
-    let mgr_addr = start_manager().await?;
-    let mut mgr_c = manager_client(&mgr_addr).await?;
-
-    register_module(
-        &mut mgr_c,
-        EngineSpec {
-            id: "e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "test",
-            name: "ping",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
-    )
-    .await?;
-
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
-
-    // Populate the schema cache so the ingress layer can resolve message descriptors.
-    let schema_cache = Arc::new(wr_proxy::schema::SchemaCache::new());
-    sync_schema_cache(&mgr_addr, &schema_cache).await?;
-
-    let routes = vec![ExternalRoute {
-        path: "/ping".into(),
-        methods: vec!["POST".into()],
-        module: "ping".into(),
-        namespace: "test".into(),
-        grpc_path: Some("/test.ping/Ping".into()),
-        request_type: Some("test.PingRequest".into()),
-        response_type: Some("test.PingResponse".into()),
-    }];
-    let ingress_addr = start_ingress_proxy(table, schema_cache, routes).await?;
-    Ok((ingress_addr, engine_shutdown))
-}
-
-#[tokio::test]
-async fn test_transcoding_json_to_proto_and_back() -> Result<()> {
-    let (addr, _shutdown) = transcoding_fixture().await?;
-
-    // Send a JSON body matching `PingRequest { message: "hello" }`.
-    let resp = http_client()
-        .request(
-            Request::builder()
-                .method("POST")
-                .uri(format!("http://{addr}/ping"))
-                .header("content-type", "application/json")
-                .body(Full::new(bytes::Bytes::from(r#"{"message":"hello"}"#)))?,
-        )
-        .await?;
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok()),
-        Some("application/json"),
-        "response must be JSON"
-    );
-
-    // An empty PingResponse serialises to `{}` in proto3 JSON.
-    let body = resp.into_body().collect().await?.to_bytes();
-    let json: serde_json::Value = serde_json::from_slice(&body)?;
-    assert!(json.is_object(), "response should be a JSON object");
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_transcoding_invalid_json_returns_400() -> Result<()> {
-    let (addr, _shutdown) = transcoding_fixture().await?;
-
-    let (status, _) = external_request(
-        addr,
-        "POST",
-        "/ping",
-        &[("content-type", "application/json")],
-    )
-    .await?;
-
-    // Empty body is not valid JSON for a DynamicMessage deserializer.
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_transcoding_schema_not_cached_returns_503() -> Result<()> {
-    // Build the proxy with an EMPTY schema cache — schema sync is intentionally skipped.
-    let mgr_addr = start_manager().await?;
-    let mut mgr_c = manager_client(&mgr_addr).await?;
-
-    let (engine_addr, _shutdown) = spawn_stub_engine().await?;
-    register_module(
-        &mut mgr_c,
-        EngineSpec {
-            id: "e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "test",
-            name: "ping",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
-    )
-    .await?;
-
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
-
-    let routes = vec![ExternalRoute {
-        path: "/ping".into(),
-        methods: vec![],
-        module: "ping".into(),
-        namespace: "test".into(),
-        grpc_path: Some("/test.ping/Ping".into()),
-        request_type: Some("test.PingRequest".into()),
-        response_type: Some("test.PingResponse".into()),
-    }];
-    // Deliberately pass an empty (unsynced) cache.
-    let empty_cache = Arc::new(wr_proxy::schema::SchemaCache::new());
-    let addr = start_ingress_proxy(table, empty_cache, routes).await?;
-
-    let (status, _) = external_request(
-        addr,
-        "POST",
-        "/ping",
-        &[("content-type", "application/json")],
-    )
-    .await?;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     Ok(())
 }
 
