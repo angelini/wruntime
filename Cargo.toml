@@ -1,4 +1,4 @@
 [workspace]
 members = ["wr-common", "wr-engine", "wr-proxy", "wr-manager", "wr-tests", "wr-cli", "wr-sdk", "wr-build"]
-exclude = ["examples/ecommerce/client", "examples/ecommerce/inventory", "wr-tests/guests/db-guest", "wr-tests/guests/tracing-guest", "wr-tests/guests/blobstore-guest"]
+exclude = ["examples/ecommerce/client", "examples/ecommerce/inventory", "examples/stockmarket/exchange", "examples/stockmarket/ledger", "examples/stockmarket/simulator", "wr-tests/guests/db-guest", "wr-tests/guests/tracing-guest", "wr-tests/guests/blobstore-guest"]
 resolver = "2"

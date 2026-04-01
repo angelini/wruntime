@@ -29,15 +29,8 @@ impl wr_sdk::ServiceGuest for Component {
 impl proto::InventoryService for Component {
     fn seed(&self, _req: proto::SeedRequest) -> Result<proto::SeedResponse, ServiceError> {
         let sp = tracing::start("inventory.seed", &[]);
-        let _ = database::execute(
-            "CREATE TABLE IF NOT EXISTS inventory (\
-                product_id TEXT PRIMARY KEY, \
-                name       TEXT NOT NULL, \
-                stock      BIGINT NOT NULL CHECK (stock >= 0)\
-            )",
-            &[],
-        );
 
+        // Table is created by engine-side migrations; seed data only.
         for i in 1u32..=50 {
             let id = format!("prod-{:03}", i);
             let name = format!("Product {}", i);

@@ -8,6 +8,7 @@ fn main() {
                 "guests/schemas/db_test.proto",
                 "guests/schemas/tracing_test.proto",
                 "guests/schemas/blobstore_test.proto",
+                "guests/schemas/http_test.proto",
             ],
             &["guests/schemas"],
         )
@@ -16,4 +17,5 @@ fn main() {
     println!("cargo:rerun-if-changed=guests/schemas/db_test.proto");
     println!("cargo:rerun-if-changed=guests/schemas/tracing_test.proto");
     println!("cargo:rerun-if-changed=guests/schemas/blobstore_test.proto");
+    println!("cargo:rerun-if-changed=guests/schemas/http_test.proto");
 }

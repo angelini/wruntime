@@ -1,0 +1,13 @@
+listen_address  = "0.0.0.0:9200"
+manager_address = "http://127.0.0.1:9000"
+
+[node]
+proxy_address = "http://127.0.0.1:9001"
+
+[[module]]
+name                 = "simulator"
+namespace            = "stockmarket"
+version              = "1.0.0"
+wasm_path            = "examples/stockmarket/simulator/target/wasm32-wasip2/release/simulator.wasm"
+schema_path          = "examples/stockmarket/schemas/simulator.binpb"
+request_timeout_secs = 240

@@ -777,6 +777,100 @@ pub async fn dispatch_to_wasm(
     }
 }
 
+/// Spawn a WASM-backed HTTP/2 engine on an ephemeral port.
+///
+/// Each incoming request is dispatched through a fresh `ModuleState` + `Store`
+/// using the provided pre-compiled WASM component.  Returns the engine base URL
+/// and a shutdown sender.
+pub async fn spawn_wasm_stub_engine(
+    engine: Arc<Engine>,
+    pre: Arc<ProxyPre<ModuleState>>,
+    proxy_uri: &str,
+    module_name: &str,
+    module_namespace: &str,
+) -> Result<(String, oneshot::Sender<()>)> {
+    let (tx, rx) = oneshot::channel::<()>();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = format!("http://{}", listener.local_addr()?);
+    let proxy_uri: hyper::Uri = proxy_uri.parse()?;
+    let module_name = module_name.to_string();
+    let module_namespace = module_namespace.to_string();
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = rx => {}
+            _ = wasm_engine_serve(listener, engine, pre, proxy_uri, module_name, module_namespace) => {}
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    Ok((addr, tx))
+}
+
+async fn wasm_engine_serve(
+    listener: TcpListener,
+    engine: Arc<Engine>,
+    pre: Arc<ProxyPre<ModuleState>>,
+    proxy_uri: hyper::Uri,
+    module_name: String,
+    module_namespace: String,
+) {
+    let client = http_client();
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
+        let engine = engine.clone();
+        let pre = pre.clone();
+        let proxy_uri = proxy_uri.clone();
+        let module_name = module_name.clone();
+        let module_namespace = module_namespace.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                let engine = engine.clone();
+                let pre = pre.clone();
+                let proxy_uri = proxy_uri.clone();
+                let module_name = module_name.clone();
+                let module_namespace = module_namespace.clone();
+                let client = client.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let body_bytes = body
+                        .collect()
+                        .await
+                        .map(|c| c.to_bytes())
+                        .unwrap_or_default();
+                    let request = Request::from_parts(parts, body_bytes);
+
+                    let state = ModuleState::new(
+                        module_name,
+                        module_namespace,
+                        proxy_uri,
+                        client,
+                        ModuleServices::default(),
+                    )
+                    .expect("ModuleState");
+
+                    match dispatch_to_wasm(&engine, &pre, state, request).await {
+                        Ok(resp) => {
+                            let (parts, body) = resp.into_parts();
+                            Ok::<_, Infallible>(Response::from_parts(parts, Full::new(body)))
+                        }
+                        Err(e) => Ok(Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Full::new(Bytes::from(format!("WASM error: {e}"))))
+                            .unwrap()),
+                    }
+                }
+            });
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await;
+        });
+    }
+}
+
 /// Build a `BlobstoreRuntime` from `WRUNTIME_TEST_S3_*` environment variables.
 pub fn blobstore_client() -> Option<Arc<BlobstoreRuntime>> {
     let endpoint = std::env::var("WRUNTIME_TEST_S3_ENDPOINT").ok()?;

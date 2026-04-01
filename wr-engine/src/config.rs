@@ -122,6 +122,11 @@ pub struct ModuleConfig {
     /// full receive a 429. Defaults to 128.
     #[serde(default = "default_channel_capacity")]
     pub channel_capacity: usize,
+    /// Path to a directory containing V-prefixed SQL migration files
+    /// (e.g., `V1__create_tables.sql`). When set, migrations run at engine
+    /// startup before the module handles traffic.
+    #[serde(default)]
+    pub migrations_path: Option<String>,
 }
 
 fn default_request_timeout_secs() -> u64 {
@@ -187,6 +192,19 @@ impl EngineConfig {
                 "module '{}' has blobstore = true but no [blobstore] section is configured",
                 module.name,
             );
+            if let Some(mig_path) = &module.migrations_path {
+                anyhow::ensure!(
+                    module.database,
+                    "module '{}' has migrations_path but database is not enabled",
+                    module.name,
+                );
+                anyhow::ensure!(
+                    std::path::Path::new(mig_path).is_dir(),
+                    "migrations_path for module '{}' is not a directory: {}",
+                    module.name,
+                    mig_path,
+                );
+            }
         }
 
         Ok(())

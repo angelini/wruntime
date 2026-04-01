@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
     let registry = registry::ModuleRegistry::new();
     let runner = engine::EngineRunner::new(config.clone())?;
     runner.provision_schemas().await?;
+    runner.run_migrations().await?;
     runner.load_modules(&registry).await?;
     info!("all modules loaded");
 

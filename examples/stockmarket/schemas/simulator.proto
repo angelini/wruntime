@@ -1,0 +1,21 @@
+syntax = "proto3";
+package stockmarket;
+
+service SimulatorService {
+  rpc Run (SimRunRequest) returns (SimRunResponse);
+}
+
+message SimRunRequest {
+  int32 num_traders       = 1;
+  int32 orders_per_trader = 2;
+  int32 num_symbols       = 3;
+}
+
+message SimRunResponse {
+  int64  total_orders          = 1;
+  int64  total_trades          = 2;
+  int64  total_volume          = 3;
+  bool   ledger_valid          = 4;
+  string verification_details  = 5;
+  int32  errors                = 6;
+}

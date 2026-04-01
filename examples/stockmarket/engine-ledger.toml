@@ -1,0 +1,24 @@
+listen_address  = "0.0.0.0:9101"
+manager_address = "http://127.0.0.1:9000"
+
+[node]
+proxy_address = "http://127.0.0.1:9001"
+
+[database]
+url             = "postgres://user:pass@localhost:5432/stockmarket"
+max_connections = 100
+
+[blobstore]
+endpoint          = "http://127.0.0.1:8900"
+access_key_id     = "rustfsadmin"
+secret_access_key = "rustfsadmin"
+
+[[module]]
+name        = "ledger"
+namespace   = "stockmarket"
+version     = "1.0.0"
+wasm_path   = "examples/stockmarket/ledger/target/wasm32-wasip2/release/ledger.wasm"
+schema_path = "examples/stockmarket/schemas/ledger.binpb"
+database        = true
+blobstore       = true
+migrations_path = "examples/stockmarket/ledger/migrations"

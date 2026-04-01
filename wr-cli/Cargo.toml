@@ -18,3 +18,5 @@ prost         = "0.14"
 prost-reflect = { version = "0.16", features = ["serde"] }
 serde_json    = "1"
 wr-common     = { path = "../wr-common" }
+wr-engine     = { path = "../wr-engine" }
+tokio-postgres = "0.7"

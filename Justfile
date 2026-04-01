@@ -152,12 +152,15 @@ build-test-schemas:
            --include_imports wr-tests/guests/schemas/tracing_test.proto
     protoc --descriptor_set_out=wr-tests/guests/schemas/blobstore_test.binpb \
            --include_imports wr-tests/guests/schemas/blobstore_test.proto
+    protoc --descriptor_set_out=wr-tests/guests/schemas/http_test.binpb \
+           --include_imports wr-tests/guests/schemas/http_test.proto
 
 # Build WASM test guest components
 build-test-guests: build-test-schemas
     (cd wr-tests/guests/db-guest && cargo component build --release --target wasm32-wasip2)
     (cd wr-tests/guests/tracing-guest && cargo component build --release --target wasm32-wasip2)
     (cd wr-tests/guests/blobstore-guest && cargo component build --release --target wasm32-wasip2)
+    (cd wr-tests/guests/http-guest && cargo component build --release --target wasm32-wasip2)
 
 # Run all WASM host binding tests (sets env vars for dev infrastructure automatically)
 test-wasm: build-test-guests
@@ -198,6 +201,34 @@ example: build-example build
 # Run the ecommerce example inline (single invocation, exits on failure)
 example-inline: build-example build
     DB_URL={{db_url_example}} bash examples/ecommerce/run.sh --inline
+
+# ── Stock Market Example ──────────────────────────────────────────────────────
+
+# Compile stockmarket protobuf schemas to FileDescriptorSet binaries (.binpb)
+build-stockmarket-schemas:
+    protoc --descriptor_set_out=examples/stockmarket/schemas/exchange.binpb \
+           --include_imports \
+           examples/stockmarket/schemas/exchange.proto
+    protoc --descriptor_set_out=examples/stockmarket/schemas/ledger.binpb \
+           --include_imports \
+           examples/stockmarket/schemas/ledger.proto
+    protoc --descriptor_set_out=examples/stockmarket/schemas/simulator.binpb \
+           --include_imports \
+           examples/stockmarket/schemas/simulator.proto
+
+# Build WASM components and schemas for the stockmarket example
+build-stockmarket: build-stockmarket-schemas
+    (cd examples/stockmarket/exchange && cargo component build --release --target wasm32-wasip2)
+    (cd examples/stockmarket/ledger && cargo component build --release --target wasm32-wasip2)
+    (cd examples/stockmarket/simulator && cargo component build --release --target wasm32-wasip2)
+
+# Run the full stockmarket example (requires Postgres + RustFS S3 — see `just dev-up`)
+stockmarket: build-stockmarket build
+    DB_URL={{db_url_example}} bash examples/stockmarket/run.sh
+
+# Run the stockmarket example inline (single invocation, exits on failure)
+stockmarket-inline: build-stockmarket build
+    DB_URL={{db_url_example}} bash examples/stockmarket/run.sh --inline
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 
