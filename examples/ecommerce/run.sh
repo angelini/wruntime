@@ -14,6 +14,16 @@ done
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# ── Kill stale processes from a previous run ─────────────────────────────
+for port in 9000 9001 9100 9101 9200; do
+    pid=$(lsof -ti ":$port" 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+        echo "   killing stale process on :$port (pid $pid)"
+        kill -INT $pid 2>/dev/null || true
+    fi
+done
+sleep 1
+
 DB_URL="${DB_URL:-${WRT_EXAMPLE_DB_URL:-postgres://localhost:5432/wruntime_example}}"
 echo "DB_URL: ${DB_URL}"
 
@@ -100,8 +110,7 @@ cleanup() {
     wait "$CLIENT_PID" "$INV1_PID" "$INV2_PID" 2>/dev/null || true
     # Now stop proxy and manager.
     kill -INT "$PROXY_PID" "$MANAGER_PID" 2>/dev/null || true
-    # Give services time to flush the OTLP batch exporter before exiting.
-    sleep 5
+    wait "$PROXY_PID" "$MANAGER_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'exit 0' INT TERM

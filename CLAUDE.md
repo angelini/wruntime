@@ -34,14 +34,19 @@ just dev-down
 just dev-logs [service]
 
 # Ecommerce example
-just build-example   # compile WASM components + protobuf schemas
-just example         # build-example + run
-just example-inline  # build-example + run with single invocation, exits on failure
+just build-ecommerce   # compile WASM components + protobuf schemas
+just ecommerce         # build + run
+just ecommerce-inline  # build + run with single invocation, exits on failure
+
+# Codegen example (LLM agent sandbox)
+just build-codegen   # compile WASM components + protobuf schemas
+just codegen         # build + run
+just codegen-inline  # build + run with single invocation, exits on failure
 ```
 
 ## Verification
 
-After refactoring, always run `just tidy` and `just example-inline` to verify formatting, lints, and end-to-end correctness. Treat any `WARN` log lines in `just example-inline` output as bugs that need to be fixed — a clean run should produce zero warnings. When changing host bindings (`wr-engine/src/db.rs`, `wr-engine/src/blobstore.rs`, `wr-engine/src/tracing.rs`), WIT interfaces (`wit/`), the SDK (`wr-sdk/`), or the WASM guest test harness (`wr-tests/guests/`, `wr-tests/tests/wasm_host_test.rs`), also run `just test-wasm`.
+After refactoring, always run `just tidy` and `just ecommerce-inline` to verify formatting, lints, and end-to-end correctness. Treat any `WARN` log lines in `just ecommerce-inline` output as bugs that need to be fixed — a clean run should produce zero warnings. When changing host bindings (`wr-engine/src/db.rs`, `wr-engine/src/blobstore.rs`, `wr-engine/src/tracing.rs`), WIT interfaces (`wit/`), the SDK (`wr-sdk/`), or the WASM guest test harness (`wr-tests/guests/`, `wr-tests/tests/wasm_host_test.rs`), also run `just test-wasm`.
 
 **Keep docs in sync with code changes.** When modifying architecture (adding/removing layers, changing request flow, changing config), update `CLAUDE.md`, `README.md`, and the relevant files in `docs/` (`architecture.md`, `configuration.md`, `schemas.md`, etc.) in the same change. Stale docs are worse than no docs. **When modifying `wr-sdk/`, `wr-build/`, or `wit/` interfaces, also update `docs/agents/api_reference.md`** — this is the authoritative API reference used by agents building guest modules.
 

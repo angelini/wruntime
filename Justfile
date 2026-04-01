@@ -184,7 +184,7 @@ test-wasm-one filter: build-test-guests
 # ── Ecommerce Example ─────────────────────────────────────────────────────────
 
 # Compile ecommerce protobuf schemas to FileDescriptorSet binaries (.binpb)
-build-schemas:
+build-ecommerce-schemas:
     protoc --descriptor_set_out=examples/ecommerce/schemas/inventory.binpb \
            --include_imports \
            examples/ecommerce/schemas/inventory.proto
@@ -193,16 +193,16 @@ build-schemas:
            examples/ecommerce/schemas/client.proto
 
 # Build WASM components and schemas for the ecommerce example
-build-example: build-schemas
+build-ecommerce: build-ecommerce-schemas
     (cd examples/ecommerce/inventory && cargo component build --release --target wasm32-wasip2)
     (cd examples/ecommerce/client && cargo component build --release --target wasm32-wasip2)
 
 # Run the full ecommerce example (requires Postgres — see `just dev-up`)
-example: build-example build
+ecommerce: build-ecommerce build
     DB_URL={{db_url_example}} bash examples/ecommerce/run.sh
 
 # Run the ecommerce example inline (single invocation, exits on failure)
-example-inline: build-example build
+ecommerce-inline: build-ecommerce build
     DB_URL={{db_url_example}} bash examples/ecommerce/run.sh --inline
 
 # ── Stock Market Example ──────────────────────────────────────────────────────
@@ -232,6 +232,34 @@ stockmarket: build-stockmarket build
 # Run the stockmarket example inline (single invocation, exits on failure)
 stockmarket-inline: build-stockmarket build
     DB_URL={{db_url_example}} bash examples/stockmarket/run.sh --inline
+
+# ── Codegen Example ───────────────────────────────────────────────────────────
+
+# Compile codegen protobuf schemas to FileDescriptorSet binaries (.binpb)
+build-codegen-schemas:
+    protoc --descriptor_set_out=examples/codegen/schemas/collector.binpb \
+           --include_imports \
+           examples/codegen/schemas/collector.proto
+    protoc --descriptor_set_out=examples/codegen/schemas/agent.binpb \
+           --include_imports \
+           examples/codegen/schemas/agent.proto
+    protoc --descriptor_set_out=examples/codegen/schemas/coordinator.binpb \
+           --include_imports \
+           examples/codegen/schemas/coordinator.proto
+
+# Build WASM components and schemas for the codegen example
+build-codegen: build-codegen-schemas
+    (cd examples/codegen/collector && cargo component build --release --target wasm32-wasip2)
+    (cd examples/codegen/agent && cargo component build --release --target wasm32-wasip2)
+    (cd examples/codegen/coordinator && cargo component build --release --target wasm32-wasip2)
+
+# Run the full codegen example (requires Postgres + RustFS S3 — see `just dev-up`)
+codegen: build-codegen build
+    DB_URL={{db_url_example}} bash examples/codegen/run.sh
+
+# Run the codegen example inline (single invocation, exits on failure)
+codegen-inline: build-codegen build
+    DB_URL={{db_url_example}} bash examples/codegen/run.sh --inline
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 
