@@ -1,0 +1,38 @@
+syntax = "proto3";
+package codegen;
+
+service CollectorService {
+  rpc FetchDocs (FetchDocsRequest) returns (FetchDocsResponse);
+  rpc ListDocs  (ListDocsRequest)  returns (ListDocsResponse);
+}
+
+message DocSource {
+  string source_type = 1;  // "github_tarball", "docs_rs", "crates_io"
+  string owner       = 2;  // GitHub owner or crate name
+  string repo        = 3;  // GitHub repo name (empty for crates.io/docs.rs)
+  string ref_or_ver  = 4;  // git ref or crate version
+}
+
+message FetchDocsRequest {
+  repeated DocSource sources = 1;
+}
+
+message FetchDocsResponse {
+  int32           sources_fetched = 1;
+  int64           total_bytes     = 2;
+  repeated string doc_prefixes    = 3;
+}
+
+message ListDocsRequest {
+  string doc_prefix = 1;
+}
+
+message DocChunkMeta {
+  string key   = 1;
+  int64  size  = 2;
+  string label = 3;
+}
+
+message ListDocsResponse {
+  repeated DocChunkMeta chunks = 1;
+}
