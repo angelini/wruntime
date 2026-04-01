@@ -10,6 +10,13 @@ proxy_address = "http://127.0.0.1:9001"   # local proxy; used to rewrite WASM ou
 url             = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 20   # default pool size for all DB-enabled modules
 
+# Optional — remove this section if no modules need LLM inference.
+# [llm]
+# provider         = "anthropic"
+# api_key_env      = "ANTHROPIC_API_KEY"   # env var read at startup
+# base_url         = "https://api.anthropic.com"  # default
+# max_tokens_limit = 8192                  # host-enforced ceiling
+
 # Optional — remove this section to use the default on-demand allocator.
 [pool]
 total_component_instances = 1000   # max concurrent WASM instances across all modules

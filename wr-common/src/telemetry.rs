@@ -1,15 +1,13 @@
 use anyhow::Result;
+use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::{global, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
+    logs::SdkLoggerProvider,
     metrics::SdkMeterProvider,
     propagation::TraceContextPropagator,
-    runtime,
-    trace::{
-        BatchConfigBuilder, Config as TraceConfig, RandomIdGenerator, Sampler, TracerProvider,
-    },
+    trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
     Resource,
 };
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -19,17 +17,15 @@ const OTLP_ENDPOINT: &str = "http://localhost:4317";
 
 /// Holds provider handles and shuts them down cleanly when dropped.
 pub struct TelemetryGuard {
-    tracer_provider: TracerProvider,
+    tracer_provider: SdkTracerProvider,
     meter_provider: SdkMeterProvider,
-    logger_provider: opentelemetry_sdk::logs::LoggerProvider,
+    logger_provider: SdkLoggerProvider,
 }
 
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
-        for result in self.tracer_provider.force_flush() {
-            if let Err(e) = result {
-                eprintln!("tracer force_flush error: {e}");
-            }
+        if let Err(e) = self.tracer_provider.force_flush() {
+            eprintln!("tracer force_flush error: {e}");
         }
         if let Err(e) = self.tracer_provider.shutdown() {
             eprintln!("tracer provider shutdown error: {e}");
@@ -49,32 +45,20 @@ impl Drop for TelemetryGuard {
 /// The returned [`TelemetryGuard`] must be kept alive for the duration of the
 /// process — dropping it flushes and shuts down all providers.
 pub fn init(service_name: &'static str) -> Result<TelemetryGuard> {
-    let resource = Resource::new(vec![KeyValue::new(
-        opentelemetry_semantic_conventions::resource::SERVICE_NAME,
-        service_name,
-    )]);
+    let resource = Resource::builder().with_service_name(service_name).build();
 
     // ── Traces ────────────────────────────────────────────────────────────
-    let tracer_provider = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(
-            opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_endpoint(OTLP_ENDPOINT),
-        )
-        .with_trace_config(
-            TraceConfig::default()
-                .with_sampler(Sampler::AlwaysOn)
-                .with_id_generator(RandomIdGenerator::default())
-                .with_resource(resource.clone()),
-        )
-        .with_batch_config(
-            BatchConfigBuilder::default()
-                .with_max_queue_size(8192)
-                .with_max_export_batch_size(512)
-                .build(),
-        )
-        .install_batch(runtime::Tokio)?;
+    let trace_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(OTLP_ENDPOINT)
+        .build()?;
+
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_sampler(Sampler::AlwaysOn)
+        .with_id_generator(RandomIdGenerator::default())
+        .with_resource(resource.clone())
+        .with_batch_exporter(trace_exporter)
+        .build();
 
     global::set_tracer_provider(tracer_provider.clone());
 
@@ -82,32 +66,31 @@ pub fn init(service_name: &'static str) -> Result<TelemetryGuard> {
     global::set_text_map_propagator(TraceContextPropagator::new());
 
     // Obtain a concrete tracer to pass to the tracing_opentelemetry layer.
-    // tracing_opentelemetry::layer() defaults to NoopTracer in 0.27 — with_tracer() is required.
     let tracer = tracer_provider.tracer(service_name);
 
     // ── Metrics ───────────────────────────────────────────────────────────
-    let meter_provider = opentelemetry_otlp::new_pipeline()
-        .metrics(runtime::Tokio)
-        .with_exporter(
-            opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_endpoint(OTLP_ENDPOINT),
-        )
-        .with_resource(resource.clone())
+    let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(OTLP_ENDPOINT)
         .build()?;
+
+    let meter_provider = SdkMeterProvider::builder()
+        .with_resource(resource.clone())
+        .with_periodic_exporter(metric_exporter)
+        .build();
 
     global::set_meter_provider(meter_provider.clone());
 
     // ── Logs ──────────────────────────────────────────────────────────────
-    let logger_provider = opentelemetry_otlp::new_pipeline()
-        .logging()
-        .with_exporter(
-            opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_endpoint(OTLP_ENDPOINT),
-        )
+    let log_exporter = opentelemetry_otlp::LogExporter::builder()
+        .with_tonic()
+        .with_endpoint(OTLP_ENDPOINT)
+        .build()?;
+
+    let logger_provider = SdkLoggerProvider::builder()
         .with_resource(resource.clone())
-        .install_batch(runtime::Tokio)?;
+        .with_batch_exporter(log_exporter)
+        .build();
 
     // ── tracing subscriber ────────────────────────────────────────────────
     // Three layers:
@@ -146,5 +129,5 @@ pub fn set_parent_from_headers(span: &tracing::Span, headers: &http::HeaderMap) 
     let cx = global::get_text_map_propagator(|propagator| {
         propagator.extract(&opentelemetry_http::HeaderExtractor(headers))
     });
-    span.set_parent(cx);
+    let _ = span.set_parent(cx);
 }

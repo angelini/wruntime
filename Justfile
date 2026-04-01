@@ -35,26 +35,26 @@ tidy: fmt lint
 
 # Run all tests
 test:
-    WRUNTIME_TEST_DB_URL={{db_url_test}} \
-    WRUNTIME_TEST_S3_ENDPOINT={{s3_endpoint}} \
-    WRUNTIME_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-    WRUNTIME_TEST_S3_SECRET_KEY={{s3_secret_key}} \
+    WRT_TEST_DB_URL={{db_url_test}} \
+    WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
+    WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+    WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
     cargo test
 
 # Run integration tests only
 test-integration:
-    WRUNTIME_TEST_DB_URL={{db_url_test}} \
-    WRUNTIME_TEST_S3_ENDPOINT={{s3_endpoint}} \
-    WRUNTIME_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-    WRUNTIME_TEST_S3_SECRET_KEY={{s3_secret_key}} \
+    WRT_TEST_DB_URL={{db_url_test}} \
+    WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
+    WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+    WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
     cargo test -p wr-tests
 
 # Run a single test by name
 test-one name:
-    WRUNTIME_TEST_DB_URL={{db_url_test}} \
-    WRUNTIME_TEST_S3_ENDPOINT={{s3_endpoint}} \
-    WRUNTIME_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-    WRUNTIME_TEST_S3_SECRET_KEY={{s3_secret_key}} \
+    WRT_TEST_DB_URL={{db_url_test}} \
+    WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
+    WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+    WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
     cargo test {{name}}
 
 # ── Run services ──────────────────────────────────────────────────────────────
@@ -154,6 +154,8 @@ build-test-schemas:
            --include_imports wr-tests/guests/schemas/blobstore_test.proto
     protoc --descriptor_set_out=wr-tests/guests/schemas/http_test.binpb \
            --include_imports wr-tests/guests/schemas/http_test.proto
+    protoc --descriptor_set_out=wr-tests/guests/schemas/llm_test.binpb \
+           --include_imports wr-tests/guests/schemas/llm_test.proto
 
 # Build WASM test guest components
 build-test-guests: build-test-schemas
@@ -161,21 +163,22 @@ build-test-guests: build-test-schemas
     (cd wr-tests/guests/tracing-guest && cargo component build --release --target wasm32-wasip2)
     (cd wr-tests/guests/blobstore-guest && cargo component build --release --target wasm32-wasip2)
     (cd wr-tests/guests/http-guest && cargo component build --release --target wasm32-wasip2)
+    (cd wr-tests/guests/llm-guest && cargo component build --release --target wasm32-wasip2)
 
 # Run all WASM host binding tests (sets env vars for dev infrastructure automatically)
 test-wasm: build-test-guests
-    WRUNTIME_TEST_DB_URL={{db_url_test}} \
-    WRUNTIME_TEST_S3_ENDPOINT={{s3_endpoint}} \
-    WRUNTIME_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-    WRUNTIME_TEST_S3_SECRET_KEY={{s3_secret_key}} \
+    WRT_TEST_DB_URL={{db_url_test}} \
+    WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
+    WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+    WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
     cargo test -p wr-tests --test wasm_host_test
 
 # Run a subset of WASM tests by filter (e.g. `just test-wasm-one db`, `just test-wasm-one tracing`, `just test-wasm-one blobstore`)
 test-wasm-one filter: build-test-guests
-    WRUNTIME_TEST_DB_URL={{db_url_test}} \
-    WRUNTIME_TEST_S3_ENDPOINT={{s3_endpoint}} \
-    WRUNTIME_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-    WRUNTIME_TEST_S3_SECRET_KEY={{s3_secret_key}} \
+    WRT_TEST_DB_URL={{db_url_test}} \
+    WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
+    WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+    WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
     cargo test -p wr-tests --test wasm_host_test wasm_{{filter}}
 
 # ── Ecommerce Example ─────────────────────────────────────────────────────────

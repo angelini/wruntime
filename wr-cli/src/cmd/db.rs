@@ -18,7 +18,7 @@ pub enum DbCommand {
         /// Path to an engine TOML config file
         config: String,
         /// Override the database URL from the config file
-        #[arg(long, env = "WRUNTIME_EXAMPLE_DB_URL")]
+        #[arg(long, env = "WRT_EXAMPLE_DB_URL")]
         database_url: Option<String>,
     },
 }

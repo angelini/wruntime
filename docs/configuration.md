@@ -23,7 +23,13 @@ just manager
 ```toml
 listen_address                = "0.0.0.0:9000"
 engine_heartbeat_timeout_secs = 30
+
+[database]
+url             = "postgres://postgres@localhost:5433/wruntime_example"
+max_connections = 10
 ```
+
+The `[database]` section is required. The manager persists engines, routing rules, and schemas to Postgres. Migrations run automatically on startup.
 
 ## wr-proxy
 
@@ -139,6 +145,32 @@ wasm_path            = "modules/batch_processor.wasm"
 schema_path          = "schemas/batch_processor.binpb"
 request_timeout_secs = 120
 ```
+
+### LLM inference
+
+Modules can call the Claude API (or other LLM providers) through a host binding. The engine holds the API key — guests never see credentials.
+
+```toml
+[llm]
+provider        = "anthropic"
+api_key_env     = "ANTHROPIC_API_KEY"   # env var read at startup
+base_url        = "https://api.anthropic.com"  # optional, this is the default
+max_tokens_limit = 8192                 # host-enforced ceiling per request
+
+[[module]]
+name        = "my-agent"
+namespace   = "example"
+version     = "1.0.0"
+wasm_path   = "modules/my_agent.wasm"
+schema_path = "schemas/my_agent.binpb"
+llm         = true
+```
+
+Key behaviors:
+- **Credential isolation:** The API key is resolved from an environment variable at engine startup and never enters the WASM sandbox.
+- **Host-enforced token limit:** `max_tokens_limit` caps the `max_tokens` field on every request before forwarding to the API, preventing runaway generation.
+- **Provider mapping:** Currently only `"anthropic"` is supported. The WIT interface is provider-agnostic so future providers can be added without changing guest code.
+- **Streaming:** Guests can use `complete-stream` to get a cursor that yields text deltas, following the same resource pattern as `row-cursor` for database queries.
 
 ### Module health checks
 

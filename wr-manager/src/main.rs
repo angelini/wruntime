@@ -1,6 +1,9 @@
-mod config;
-mod service;
-mod state;
+pub mod config;
+pub mod db;
+pub mod migrate;
+pub mod pool;
+pub mod service;
+pub mod state;
 
 use anyhow::Result;
 use tonic::transport::Server;
@@ -18,12 +21,19 @@ async fn main() -> Result<()> {
     let config = config::ManagerConfig::load(&config_path)?;
     let addr = config.listen_address.parse()?;
 
+    // Database
+    let db_pool = pool::build_pool(&config.database.url, config.database.max_connections)?;
+    let client = db_pool.get().await?;
+    migrate::run_migrations(&client).await?;
+    drop(client);
+
     let shared = state::new_state();
-    let manager = service::Manager::new(shared.clone());
+    let manager = service::Manager::new(shared.clone(), db_pool.clone());
 
     // Monitor for engines that miss their heartbeat deadline
     tokio::spawn(state::monitor_heartbeats(
         shared,
+        db_pool,
         config.engine_heartbeat_timeout_secs,
     ));
 

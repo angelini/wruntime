@@ -22,7 +22,8 @@ use wr_proxy::config::{CircuitBreakerConfig, ProxyConfig};
 
 #[tokio::test]
 async fn test_register_and_list_engines() -> Result<()> {
-    let addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
     let mut c = manager_client(&addr).await?;
 
     c.register_engine(RegisterEngineRequest {
@@ -54,7 +55,8 @@ async fn test_register_and_list_engines() -> Result<()> {
 
 #[tokio::test]
 async fn test_deregister_engine() -> Result<()> {
-    let addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
     let mut c = manager_client(&addr).await?;
 
     c.register_engine(RegisterEngineRequest {
@@ -84,7 +86,8 @@ async fn test_deregister_engine() -> Result<()> {
 
 #[tokio::test]
 async fn test_heartbeat() -> Result<()> {
-    let addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
     let mut c = manager_client(&addr).await?;
 
     c.register_engine(RegisterEngineRequest {
@@ -108,7 +111,8 @@ async fn test_heartbeat() -> Result<()> {
 
 #[tokio::test]
 async fn test_routing_table_upsert_and_get() -> Result<()> {
-    let addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
     let mut c = manager_client(&addr).await?;
 
     c.upsert_routing_rule(RoutingRule {
@@ -145,7 +149,8 @@ async fn test_routing_table_upsert_and_get() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_routes_to_engine() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr_c = manager_client(&mgr_addr).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
@@ -252,7 +257,8 @@ async fn test_egress_blocked_domain() -> Result<()> {
 /// Internal module calls must still route correctly when egress is configured.
 #[tokio::test]
 async fn test_egress_internal_module_passthrough() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr_c = manager_client(&mgr_addr).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
@@ -306,16 +312,26 @@ fn test_manager_config_valid() {
     let toml = r#"
         listen_address                = "0.0.0.0:9000"
         engine_heartbeat_timeout_secs = 30
+
+        [database]
+        url = "postgres://localhost/test"
     "#;
     let cfg: ManagerConfig = toml::from_str(toml).unwrap();
     assert_eq!(cfg.listen_address, "0.0.0.0:9000");
     assert_eq!(cfg.engine_heartbeat_timeout_secs, 30);
+    assert_eq!(cfg.database.url, "postgres://localhost/test");
+    assert_eq!(cfg.database.max_connections, 10);
 }
 
 #[test]
 fn test_manager_config_default_heartbeat() {
     // engine_heartbeat_timeout_secs should default to 30 when omitted.
-    let toml = r#"listen_address = "0.0.0.0:9000""#;
+    let toml = r#"
+        listen_address = "0.0.0.0:9000"
+
+        [database]
+        url = "postgres://localhost/test"
+    "#;
     let cfg: ManagerConfig = toml::from_str(toml).unwrap();
     assert_eq!(cfg.engine_heartbeat_timeout_secs, 30);
 }
@@ -405,7 +421,8 @@ fn test_example_config_files_parse() {
 
 #[tokio::test]
 async fn test_proxy_routes_to_explicit_version() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-v1").await?;
@@ -461,7 +478,8 @@ async fn test_proxy_routes_to_explicit_version() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_routes_to_latest_version() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-v1").await?;
@@ -517,7 +535,8 @@ async fn test_proxy_routes_to_latest_version() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (e1_addr, _stub) = spawn_identified_stub("engine-v1").await?;
@@ -549,7 +568,8 @@ async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_routes_semver_range_to_highest_satisfying() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-v1").await?;
@@ -603,7 +623,8 @@ async fn test_proxy_routes_semver_range_to_highest_satisfying() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_returns_503_for_unsatisfiable_range() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (e1_addr, _stub) = spawn_identified_stub("engine-v1").await?;
@@ -639,7 +660,8 @@ async fn test_proxy_returns_503_for_unsatisfiable_range() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_load_balances_across_instances() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     // Two engines both hosting the same (module, version).
@@ -700,7 +722,8 @@ async fn test_proxy_load_balances_across_instances() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_failover_after_deregister() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-a").await?;
@@ -776,7 +799,8 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_503_when_all_instances_unhealthy() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (e1_addr, _stub) = spawn_identified_stub("engine-a").await?;
@@ -818,9 +842,8 @@ async fn test_proxy_503_when_all_instances_unhealthy() -> Result<()> {
 // ── DB integration tests ──────────────────────────────────────────────────────
 //
 // Config-parsing tests run unconditionally.
-// Host-trait tests that hit a real Postgres instance are gated on
-// WRUNTIME_TEST_DB_URL — `db_state()` returns None when it is absent and
-// the test returns early, so `cargo test` works without a database.
+// Host-trait tests that hit a real Postgres instance require
+// WRT_TEST_DB_URL — `db_state()` panics when it is absent.
 
 // ─ EngineConfig / DatabaseConfig parsing ─────────────────────────────────────
 
@@ -948,7 +971,7 @@ async fn test_db_execute_without_pool_returns_connection_error() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_db_bytea_roundtrip() {
-    let Some(mut state) = db_state(2) else { return };
+    let mut state = db_state(2);
     let payload = vec![0u8, 1, 127, 128, 255];
     let rows = state
         .query(
@@ -963,7 +986,7 @@ async fn test_db_bytea_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_db_uuid_roundtrip() {
-    let Some(mut state) = db_state(2) else { return };
+    let mut state = db_state(2);
     // UUID 550e8400-e29b-41d4-a716-446655440000 split into (hi, lo) at bit 64.
     let hi: u64 = 0x550e_8400_e29b_41d4;
     let lo: u64 = 0xa716_4466_5544_0000;
@@ -977,7 +1000,7 @@ async fn test_db_uuid_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_db_timestamptz_roundtrip() {
-    let Some(mut state) = db_state(2) else { return };
+    let mut state = db_state(2);
     // 2001-09-09 01:46:40 UTC — a clean million-second boundary.
     let micros: i64 = 1_000_000_000 * 1_000_000;
     let rows = state
@@ -993,7 +1016,7 @@ async fn test_db_timestamptz_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_db_date_roundtrip() {
-    let Some(mut state) = db_state(2) else { return };
+    let mut state = db_state(2);
     // 10957 days since 1970-01-01 = 2000-01-01.
     let rows = state
         .query("SELECT $1::date AS d".into(), vec![PgValue::Date(10957)])
@@ -1005,7 +1028,7 @@ async fn test_db_date_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_db_time_roundtrip() {
-    let Some(mut state) = db_state(2) else { return };
+    let mut state = db_state(2);
     // 14:30:00.000000 — 52 200 seconds from midnight in microseconds.
     let micros: i64 = 52_200 * 1_000_000;
     let rows = state
@@ -1018,7 +1041,7 @@ async fn test_db_time_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_db_numeric_roundtrip() {
-    let Some(mut state) = db_state(2) else { return };
+    let mut state = db_state(2);
     let rows = state
         .query(
             "SELECT $1::numeric AS n".into(),
@@ -1032,7 +1055,7 @@ async fn test_db_numeric_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_db_jsonb_roundtrip() {
-    let Some(mut state) = db_state(2) else { return };
+    let mut state = db_state(2);
     let input = r#"{"key":"value","num":42}"#;
     let rows = state
         .query(
@@ -1053,7 +1076,7 @@ async fn test_db_jsonb_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_db_null_param_passes_through_as_null_column() {
-    let Some(mut state) = db_state(2) else { return };
+    let mut state = db_state(2);
     let rows = state
         .query("SELECT $1::text AS v".into(), vec![PgValue::Null])
         .await
@@ -1064,7 +1087,7 @@ async fn test_db_null_param_passes_through_as_null_column() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_db_query_error_on_invalid_sql() {
-    let Some(mut state) = db_state(2) else { return };
+    let mut state = db_state(2);
     let err = state
         .query("THIS IS NOT VALID SQL".into(), vec![])
         .await
@@ -1079,7 +1102,7 @@ async fn test_db_query_error_on_invalid_sql() {
 async fn test_db_execute_insert_and_query_roundtrip() {
     // Pool size 1: TEMP TABLEs are connection-local, so all operations must
     // share the same underlying connection.
-    let Some(mut state) = db_state(1) else { return };
+    let mut state = db_state(1);
 
     state
         .execute(
@@ -1110,7 +1133,7 @@ async fn test_db_execute_insert_and_query_roundtrip() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_db_execute_returns_affected_row_count() {
     // Pool size 1 for TEMP TABLE visibility (see above).
-    let Some(mut state) = db_state(1) else { return };
+    let mut state = db_state(1);
 
     state
         .execute("CREATE TEMP TABLE _wr_update (v INT4)".into(), vec![])
@@ -1142,7 +1165,8 @@ async fn test_db_execute_returns_affected_row_count() {
 #[tokio::test]
 async fn test_proxy_namespaces_are_isolated() -> Result<()> {
     // Two engines host the same module name in different namespaces.
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (e_alpha_addr, e_alpha_shutdown) = spawn_identified_stub("engine-alpha").await?;
@@ -1224,7 +1248,8 @@ async fn test_proxy_returns_400_when_namespace_missing() -> Result<()> {
 
 #[tokio::test]
 async fn test_manager_rejects_module_without_namespace() -> Result<()> {
-    let addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
     let mut c = manager_client(&addr).await?;
 
     let result = c
@@ -1249,7 +1274,7 @@ async fn test_manager_rejects_module_without_namespace() -> Result<()> {
 
 // ── per-module DB schema isolation tests ──────────────────────────────────────
 //
-// These tests require WRUNTIME_TEST_DB_URL; they skip silently when it is absent.
+// These tests require WRT_TEST_DB_URL; they panic when it is absent.
 
 /// `foo.bar` and `foo.other` each get their own Postgres schema.
 /// A table created by `foo.bar` must not be visible to `foo.other`.
@@ -1257,12 +1282,8 @@ async fn test_manager_rejects_module_without_namespace() -> Result<()> {
 async fn test_db_schema_isolation_between_modules() {
     const TABLE: &str = "_wr_isol_items";
 
-    let Some(mut bar) = db_state_for_module(1, "foo", "bar").await else {
-        return;
-    };
-    let Some(mut other) = db_state_for_module(1, "foo", "other").await else {
-        return;
-    };
+    let mut bar = db_state_for_module(1, "foo", "bar").await;
+    let mut other = db_state_for_module(1, "foo", "other").await;
 
     // Drop any table left by a previous test run.
     let _ = DbHost::execute(&mut bar, format!("DROP TABLE IF EXISTS {TABLE}"), vec![]).await;
@@ -1295,12 +1316,8 @@ async fn test_db_schema_shared_across_module_instances() {
     const TABLE: &str = "_wr_shared_items";
 
     // Two separate pools simulate two independent engine processes.
-    let Some(mut inst1) = db_state_for_module(1, "foo", "bar").await else {
-        return;
-    };
-    let Some(mut inst2) = db_state_for_module(1, "foo", "bar").await else {
-        return;
-    };
+    let mut inst1 = db_state_for_module(1, "foo", "bar").await;
+    let mut inst2 = db_state_for_module(1, "foo", "bar").await;
 
     // Drop any table left by a previous test run.
     let _ = DbHost::execute(&mut inst1, format!("DROP TABLE IF EXISTS {TABLE}"), vec![]).await;
@@ -1345,7 +1362,8 @@ async fn test_db_schema_shared_across_module_instances() {
 /// dispatches it to the engine registered on node B.
 #[tokio::test]
 async fn test_cross_node_routing() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (engine_b_addr, engine_b_shutdown) = spawn_identified_stub("engine-b").await?;
@@ -1394,7 +1412,8 @@ async fn ingress_fixture(
     namespace: &str,
     routes: Vec<ExternalRoute>,
 ) -> Result<(std::net::SocketAddr, tokio::sync::oneshot::Sender<()>)> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr_c = manager_client(&mgr_addr).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
@@ -1638,7 +1657,8 @@ fn test_tracing_span_set_error() {
 /// requests are rejected with 503 + `Retry-After` without reaching the engine.
 #[tokio::test]
 async fn test_circuit_breaker_opens_after_consecutive_failures() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     // Stub engine that always returns 500.
@@ -1696,7 +1716,8 @@ async fn test_circuit_breaker_opens_after_consecutive_failures() -> Result<()> {
 /// configured `open_duration_secs`.
 #[tokio::test]
 async fn test_circuit_breaker_retry_after_header() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (engine_addr, engine_shutdown) =
@@ -1761,7 +1782,8 @@ async fn test_circuit_breaker_retry_after_header() -> Result<()> {
 /// 429 Too Many Requests counts as a failure and can trip the circuit.
 #[tokio::test]
 async fn test_circuit_breaker_429_counts_as_failure() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (engine_addr, engine_shutdown) = spawn_status_stub(StatusCode::TOO_MANY_REQUESTS).await?;
@@ -1814,7 +1836,8 @@ async fn test_circuit_breaker_429_counts_as_failure() -> Result<()> {
 /// Successful responses keep the circuit closed — no spurious opens.
 #[tokio::test]
 async fn test_circuit_breaker_stays_closed_on_success() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
@@ -1861,7 +1884,8 @@ async fn test_circuit_breaker_stays_closed_on_success() -> Result<()> {
 /// probe closes the circuit and restores normal traffic.
 #[tokio::test]
 async fn test_circuit_breaker_half_open_recovery() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     // Start with a switchable stub returning 500.
@@ -1925,7 +1949,8 @@ async fn test_circuit_breaker_half_open_recovery() -> Result<()> {
 /// Circuit breakers are per-engine: one failing engine doesn't affect another.
 #[tokio::test]
 async fn test_circuit_breaker_per_engine_isolation() -> Result<()> {
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     // Engine A: always fails.
@@ -1999,7 +2024,8 @@ async fn test_circuit_breaker_per_engine_isolation() -> Result<()> {
 async fn test_heartbeat_timeout_marks_module_unhealthy() -> Result<()> {
     // 1-second timeout + 10-second monitor interval → we override the monitor
     // by directly checking state after manipulating timestamps.
-    let (mgr_addr, state) = start_manager_with_monitor(1).await?;
+    let pool = manager_pool().await;
+    let (mgr_addr, state) = start_manager_with_monitor(pool, 1).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
@@ -2020,16 +2046,8 @@ async fn test_heartbeat_timeout_marks_module_unhealthy() -> Result<()> {
     .await?;
 
     // The module is initially healthy (registration sets module_health timestamp).
-    {
-        let s = state.read().await;
-        let rule = s
-            .routing_table
-            .rules
-            .iter()
-            .find(|r| r.destination_module == "heartbeat-svc")
-            .expect("rule exists");
-        assert!(rule.healthy, "module should be healthy after registration");
-    }
+    let (healthy, _) = get_rule_health(&mut mgr, "heartbeat-svc").await?;
+    assert!(healthy, "module should be healthy after registration");
 
     // Backdate the module_health timestamp so the monitor considers it stale.
     {
@@ -2049,19 +2067,11 @@ async fn test_heartbeat_timeout_marks_module_unhealthy() -> Result<()> {
     tokio::time::sleep(std::time::Duration::from_secs(12)).await;
 
     // The module should now be marked unhealthy.
-    {
-        let s = state.read().await;
-        let rule = s
-            .routing_table
-            .rules
-            .iter()
-            .find(|r| r.destination_module == "heartbeat-svc")
-            .expect("rule exists");
-        assert!(
-            !rule.healthy,
-            "module should be unhealthy after heartbeat timeout"
-        );
-    }
+    let (healthy, _) = get_rule_health(&mut mgr, "heartbeat-svc").await?;
+    assert!(
+        !healthy,
+        "module should be unhealthy after heartbeat timeout"
+    );
 
     let _ = engine_shutdown.send(());
     Ok(())
@@ -2071,7 +2081,8 @@ async fn test_heartbeat_timeout_marks_module_unhealthy() -> Result<()> {
 /// timestamp and prevents the monitor from marking it unhealthy.
 #[tokio::test]
 async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
-    let (mgr_addr, state) = start_manager_with_monitor(2).await?;
+    let pool = manager_pool().await;
+    let (mgr_addr, _state) = start_manager_with_monitor(pool, 2).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
@@ -2107,16 +2118,8 @@ async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
     }
 
     // Module should still be healthy.
-    {
-        let s = state.read().await;
-        let rule = s
-            .routing_table
-            .rules
-            .iter()
-            .find(|r| r.destination_module == "kept-svc")
-            .expect("rule exists");
-        assert!(rule.healthy, "module should remain healthy with heartbeats");
-    }
+    let (healthy, _) = get_rule_health(&mut mgr, "kept-svc").await?;
+    assert!(healthy, "module should remain healthy with heartbeats");
 
     let _ = engine_shutdown.send(());
     Ok(())
@@ -2126,7 +2129,8 @@ async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
 /// timestamp stales and the monitor marks the routing rule unhealthy.
 #[tokio::test]
 async fn test_heartbeat_missing_module_becomes_unhealthy() -> Result<()> {
-    let (mgr_addr, state) = start_manager_with_monitor(1).await?;
+    let pool = manager_pool().await;
+    let (mgr_addr, state) = start_manager_with_monitor(pool, 1).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
@@ -2171,19 +2175,11 @@ async fn test_heartbeat_missing_module_becomes_unhealthy() -> Result<()> {
     tokio::time::sleep(std::time::Duration::from_secs(12)).await;
 
     // The module should be unhealthy because its timestamp was never refreshed.
-    {
-        let s = state.read().await;
-        let rule = s
-            .routing_table
-            .rules
-            .iter()
-            .find(|r| r.destination_module == "missed-svc")
-            .expect("rule exists");
-        assert!(
-            !rule.healthy,
-            "module omitted from heartbeat should become unhealthy"
-        );
-    }
+    let (healthy, _) = get_rule_health(&mut mgr, "missed-svc").await?;
+    assert!(
+        !healthy,
+        "module omitted from heartbeat should become unhealthy"
+    );
 
     let _ = engine_shutdown.send(());
     Ok(())
@@ -2195,7 +2191,8 @@ async fn test_heartbeat_missing_module_becomes_unhealthy() -> Result<()> {
 async fn test_module_health_recovery_after_heartbeat() -> Result<()> {
     // Use a 30-second timeout so the freshly-set heartbeat timestamp doesn't
     // expire before the monitor's 10-second tick runs.
-    let (mgr_addr, state) = start_manager_with_monitor(30).await?;
+    let pool = manager_pool().await;
+    let (mgr_addr, state) = start_manager_with_monitor(pool, 30).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
@@ -2232,16 +2229,8 @@ async fn test_module_health_recovery_after_heartbeat() -> Result<()> {
     // Wait for the monitor to mark it unhealthy.
     tokio::time::sleep(std::time::Duration::from_secs(12)).await;
 
-    {
-        let s = state.read().await;
-        let rule = s
-            .routing_table
-            .rules
-            .iter()
-            .find(|r| r.destination_module == "recovering-svc")
-            .expect("rule exists");
-        assert!(!rule.healthy, "module should be unhealthy before recovery");
-    }
+    let (healthy, _) = get_rule_health(&mut mgr, "recovering-svc").await?;
+    assert!(!healthy, "module should be unhealthy before recovery");
 
     // Send a heartbeat that includes the module.
     mgr.heartbeat(HeartbeatRequest {
@@ -2258,16 +2247,8 @@ async fn test_module_health_recovery_after_heartbeat() -> Result<()> {
     // Wait for the next monitor tick to pick up the fresh timestamp.
     tokio::time::sleep(std::time::Duration::from_secs(12)).await;
 
-    {
-        let s = state.read().await;
-        let rule = s
-            .routing_table
-            .rules
-            .iter()
-            .find(|r| r.destination_module == "recovering-svc")
-            .expect("rule exists");
-        assert!(rule.healthy, "module should recover after heartbeat");
-    }
+    let (healthy, _) = get_rule_health(&mut mgr, "recovering-svc").await?;
+    assert!(healthy, "module should recover after heartbeat");
 
     let _ = engine_shutdown.send(());
     Ok(())
@@ -2276,7 +2257,8 @@ async fn test_module_health_recovery_after_heartbeat() -> Result<()> {
 /// An unhealthy module is excluded from proxy routing — requests get 503.
 #[tokio::test]
 async fn test_unhealthy_module_excluded_from_routing() -> Result<()> {
-    let (mgr_addr, state) = start_manager_with_monitor(1).await?;
+    let pool = manager_pool().await;
+    let (mgr_addr, state) = start_manager_with_monitor(pool, 1).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
@@ -2334,7 +2316,8 @@ async fn test_unhealthy_module_excluded_from_routing() -> Result<()> {
 /// Routing table version is incremented when health status changes.
 #[tokio::test]
 async fn test_health_change_bumps_routing_table_version() -> Result<()> {
-    let (mgr_addr, state) = start_manager_with_monitor(1).await?;
+    let pool = manager_pool().await;
+    let (mgr_addr, state) = start_manager_with_monitor(pool, 1).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
@@ -2355,10 +2338,7 @@ async fn test_health_change_bumps_routing_table_version() -> Result<()> {
     .await?;
 
     // Record the initial version.
-    let version_before = {
-        let s = state.read().await;
-        s.routing_table.version
-    };
+    let version_before = get_routing_table_version(&mut mgr).await?;
 
     // Backdate health so the monitor marks the module unhealthy.
     {
@@ -2376,10 +2356,7 @@ async fn test_health_change_bumps_routing_table_version() -> Result<()> {
 
     tokio::time::sleep(std::time::Duration::from_secs(12)).await;
 
-    let version_after = {
-        let s = state.read().await;
-        s.routing_table.version
-    };
+    let version_after = get_routing_table_version(&mut mgr).await?;
 
     assert!(
         version_after > version_before,

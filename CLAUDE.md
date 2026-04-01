@@ -58,7 +58,7 @@ After refactoring, always run `just tidy` and `just example-inline` to verify fo
 
 **Prerequisites:** `rustc`, `cargo`, `just`, `protoc` (for proto code generation). WASM module development additionally requires `cargo-component` and `wasm-tools`.
 
-**Integration tests with a real DB:** set `WRUNTIME_TEST_DB_URL=postgres://postgres@localhost:5433/wruntime_test` before running tests (matches the `just dev-up` Postgres instance); omitting it skips DB-backed test cases. `just test-wasm` sets all required env vars (DB + S3) automatically using the `just dev-up` defaults.
+**Integration tests with a real DB:** set `WRT_TEST_DB_URL=postgres://postgres@localhost:5433/wruntime_test` before running tests (matches the `just dev-up` Postgres instance); omitting it skips DB-backed test cases. `just test-wasm` sets all required env vars (DB + S3) automatically using the `just dev-up` defaults.
 
 ## Architecture
 
@@ -97,7 +97,7 @@ The proxy uses a custom `ProxyBody` type that wraps `hyper::body::Incoming` behi
 
 **Database migrations** — modules can declare `migrations_path` in `engine.toml` pointing to a directory of `V{n}__description.sql` files. Migrations run on the engine (host side) at startup using [refinery](https://github.com/rust-db/refinery) with tokio-postgres. Each module's migrations are schema-isolated (`search_path` set to the module's schema only) and serialized across engine replicas via Postgres advisory locks. Routing rules are not registered until migrations complete. See `docs/configuration.md` for details.
 
-**`wr-manager` state** — pure in-memory (`state.rs`). No persistence; rebuilt from engine re-registrations after restart. Background task monitors heartbeats every 10 seconds — marks routing rules unhealthy and bumps the routing table version when an engine times out (default 30 s).
+**`wr-manager` state** — persisted to Postgres (`db.rs`). Engines, routing rules, and schemas are stored in database tables; ephemeral state (heartbeats, module health timestamps) remains in-memory (`state.rs`). Migrations run automatically on startup (`migrate.rs`). Multiple manager instances can run active-active behind a load balancer — concurrent writes are serialized via `SELECT ... FOR UPDATE NOWAIT` on a lock sentinel row. Background task monitors heartbeats every 10 seconds — marks routing rules unhealthy and bumps the routing table version when an engine times out (default 30 s).
 
 **`wr-proxy` sync** — one background task: `sync_routing_table()` polls manager every `routing_table_ttl_secs`. Request metrics are collected via OpenTelemetry traces (no custom metrics pipeline).
 
@@ -107,7 +107,7 @@ This project targets WASI Preview 2 and all guest WASM modules should be built t
 
 ### WIT Host Bindings (async)
 
-Host interfaces are defined under `wit/` (`db.wit`, `blobstore.wit`, `tracing.wit`) and implemented in `wr-engine`. All host bindings use async — the `bindgen!` macro is invoked with `imports: { default: async }`, and every `Host` / `HostTransaction` trait method is `async fn`. Do not use `block_in_place` or `block_on` in host implementations.
+Host interfaces are defined under `wit/` (`db.wit`, `blobstore.wit`, `tracing.wit`, `llm.wit`) and implemented in `wr-engine`. All host bindings use async — the `bindgen!` macro is invoked with `imports: { default: async }`, and every `Host` / `HostTransaction` trait method is `async fn`. Do not use `block_in_place` or `block_on` in host implementations.
 
 ```rust
 wasmtime::component::bindgen!({

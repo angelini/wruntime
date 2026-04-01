@@ -57,10 +57,7 @@ async fn wasm_db_execute() -> Result<()> {
     if skip_if_no_db_wasm() {
         return Ok(());
     }
-    let Some(state) = db_state_for_module(1, "test-ns", "db-test").await else {
-        eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
-        return Ok(());
-    };
+    let state = db_state_for_module(1, "test-ns", "db-test").await;
     let (engine, pre) = wasm_module_pre(DB_GUEST_WASM)?;
 
     // Create a table via Execute
@@ -88,10 +85,7 @@ async fn wasm_db_query() -> Result<()> {
     if skip_if_no_db_wasm() {
         return Ok(());
     }
-    let Some(state) = db_state_for_module(1, "test-ns", "db-query-test").await else {
-        eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
-        return Ok(());
-    };
+    let state = db_state_for_module(1, "test-ns", "db-query-test").await;
     let (engine, pre) = wasm_module_pre(DB_GUEST_WASM)?;
 
     let req = proto::QueryRequest {
@@ -120,10 +114,7 @@ async fn wasm_db_query_types() -> Result<()> {
     if skip_if_no_db_wasm() {
         return Ok(());
     }
-    let Some(state) = db_state_for_module(1, "test-ns", "db-types-test").await else {
-        eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
-        return Ok(());
-    };
+    let state = db_state_for_module(1, "test-ns", "db-types-test").await;
     let (engine, pre) = wasm_module_pre(DB_GUEST_WASM)?;
 
     let req = proto::QueryTypesRequest {};
@@ -152,10 +143,7 @@ async fn wasm_db_transaction_commit() -> Result<()> {
     if skip_if_no_db_wasm() {
         return Ok(());
     }
-    let Some(state) = db_state_for_module(2, "test-ns", "db-txcommit-test").await else {
-        eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
-        return Ok(());
-    };
+    let state = db_state_for_module(2, "test-ns", "db-txcommit-test").await;
     let (engine, pre) = wasm_module_pre(DB_GUEST_WASM)?;
 
     let req = proto::TransactionCommitRequest {
@@ -180,10 +168,7 @@ async fn wasm_db_transaction_rollback() -> Result<()> {
     if skip_if_no_db_wasm() {
         return Ok(());
     }
-    let Some(state) = db_state_for_module(2, "test-ns", "db-txrollback-test").await else {
-        eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
-        return Ok(());
-    };
+    let state = db_state_for_module(2, "test-ns", "db-txrollback-test").await;
     let (engine, pre) = wasm_module_pre(DB_GUEST_WASM)?;
 
     let req = proto::TransactionRollbackRequest {
@@ -208,10 +193,7 @@ async fn wasm_db_transaction_drop() -> Result<()> {
     if skip_if_no_db_wasm() {
         return Ok(());
     }
-    let Some(state) = db_state_for_module(2, "test-ns", "db-txdrop-test").await else {
-        eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
-        return Ok(());
-    };
+    let state = db_state_for_module(2, "test-ns", "db-txdrop-test").await;
     let (engine, pre) = wasm_module_pre(DB_GUEST_WASM)?;
 
     let req = proto::TransactionDropRequest {
@@ -239,10 +221,7 @@ async fn wasm_db_error() -> Result<()> {
     if skip_if_no_db_wasm() {
         return Ok(());
     }
-    let Some(state) = db_state_for_module(1, "test-ns", "db-error-test").await else {
-        eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
-        return Ok(());
-    };
+    let state = db_state_for_module(1, "test-ns", "db-error-test").await;
     let (engine, pre) = wasm_module_pre(DB_GUEST_WASM)?;
 
     let req = proto::ErrorRequest {
@@ -268,10 +247,7 @@ async fn wasm_db_query_stream() -> Result<()> {
     if skip_if_no_db_wasm() {
         return Ok(());
     }
-    let Some(state) = db_state_for_module(1, "test-ns", "db-stream-test").await else {
-        eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
-        return Ok(());
-    };
+    let state = db_state_for_module(1, "test-ns", "db-stream-test").await;
     let (engine, pre) = wasm_module_pre(DB_GUEST_WASM)?;
 
     let req = proto::QueryStreamRequest {
@@ -300,10 +276,7 @@ async fn wasm_db_query_stream_drop() -> Result<()> {
     if skip_if_no_db_wasm() {
         return Ok(());
     }
-    let Some(state) = db_state_for_module(1, "test-ns", "db-stream-drop-test").await else {
-        eprintln!("SKIP: WRUNTIME_TEST_DB_URL not set");
-        return Ok(());
-    };
+    let state = db_state_for_module(1, "test-ns", "db-stream-drop-test").await;
     let (engine, pre) = wasm_module_pre(DB_GUEST_WASM)?;
 
     let req = proto::QueryStreamDropRequest {
@@ -491,10 +464,7 @@ async fn wasm_blobstore_put_get() -> Result<()> {
     if skip_if_no_blobstore_wasm() {
         return Ok(());
     }
-    let Some(bs) = blobstore_client() else {
-        eprintln!("SKIP: WRUNTIME_TEST_S3_* env vars not set");
-        return Ok(());
-    };
+    let bs = blobstore_client();
     let (engine, pre) = wasm_module_pre(BLOBSTORE_GUEST_WASM)?;
     let key = unique_prefix("put-get");
 
@@ -539,10 +509,7 @@ async fn wasm_blobstore_delete() -> Result<()> {
     if skip_if_no_blobstore_wasm() {
         return Ok(());
     }
-    let Some(bs) = blobstore_client() else {
-        eprintln!("SKIP: WRUNTIME_TEST_S3_* env vars not set");
-        return Ok(());
-    };
+    let bs = blobstore_client();
     let (engine, pre) = wasm_module_pre(BLOBSTORE_GUEST_WASM)?;
     let key = unique_prefix("delete-me");
 
@@ -602,10 +569,7 @@ async fn wasm_blobstore_list() -> Result<()> {
     if skip_if_no_blobstore_wasm() {
         return Ok(());
     }
-    let Some(bs) = blobstore_client() else {
-        eprintln!("SKIP: WRUNTIME_TEST_S3_* env vars not set");
-        return Ok(());
-    };
+    let bs = blobstore_client();
     let (engine, pre) = wasm_module_pre(BLOBSTORE_GUEST_WASM)?;
     let prefix = unique_prefix("list");
 
@@ -657,10 +621,7 @@ async fn wasm_blobstore_head() -> Result<()> {
     if skip_if_no_blobstore_wasm() {
         return Ok(());
     }
-    let Some(bs) = blobstore_client() else {
-        eprintln!("SKIP: WRUNTIME_TEST_S3_* env vars not set");
-        return Ok(());
-    };
+    let bs = blobstore_client();
     let (engine, pre) = wasm_module_pre(BLOBSTORE_GUEST_WASM)?;
 
     let key = unique_prefix("head-obj");
@@ -705,10 +666,7 @@ async fn wasm_blobstore_round_trip() -> Result<()> {
     if skip_if_no_blobstore_wasm() {
         return Ok(());
     }
-    let Some(bs) = blobstore_client() else {
-        eprintln!("SKIP: WRUNTIME_TEST_S3_* env vars not set");
-        return Ok(());
-    };
+    let bs = blobstore_client();
     let (engine, pre) = wasm_module_pre(BLOBSTORE_GUEST_WASM)?;
     let key = unique_prefix("round-trip");
     let state = blobstore_state(bs.clone());
@@ -738,10 +696,7 @@ async fn wasm_blobstore_not_found() -> Result<()> {
     if skip_if_no_blobstore_wasm() {
         return Ok(());
     }
-    let Some(bs) = blobstore_client() else {
-        eprintln!("SKIP: WRUNTIME_TEST_S3_* env vars not set");
-        return Ok(());
-    };
+    let bs = blobstore_client();
     let (engine, pre) = wasm_module_pre(BLOBSTORE_GUEST_WASM)?;
     let state = blobstore_state(bs.clone());
 
@@ -760,6 +715,192 @@ async fn wasm_blobstore_not_found() -> Result<()> {
 
     let body = proto::NotFoundResponse::decode(resp.into_body())?;
     assert_eq!(body.error_kind, "not-found");
+    Ok(())
+}
+
+// ── LLM guest tests ─────────────────────────────────────────────────────────
+
+const LLM_GUEST_WASM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/guests/llm-guest/target/wasm32-wasip2/release/llm_guest.wasm"
+);
+
+fn skip_if_no_llm_wasm() -> bool {
+    if !std::path::Path::new(LLM_GUEST_WASM).exists() {
+        eprintln!("SKIP: llm-guest WASM not built — run `just build-test-guests`");
+        return true;
+    }
+    false
+}
+
+#[tokio::test]
+async fn wasm_llm_complete() -> Result<()> {
+    if skip_if_no_llm_wasm() {
+        return Ok(());
+    }
+    let (base_url, _shutdown) = spawn_mock_llm_server(MockLlmMode::Text {
+        text: "Hello from mock Claude!".into(),
+        input_tokens: 10,
+        output_tokens: 7,
+    })
+    .await?;
+    let llm = mock_llm_runtime(&base_url);
+    let (engine, pre) = wasm_module_pre(LLM_GUEST_WASM)?;
+    let state = llm_state(llm);
+
+    let req = proto::CompleteRequest {
+        model: "claude-sonnet-4-6".into(),
+        system: "You are a test assistant.".into(),
+        user_message: "Say hello".into(),
+        max_tokens: 100,
+    };
+    let resp = dispatch_to_wasm(
+        &engine,
+        &pre,
+        state,
+        rpc_request("/test.llm_test/Complete", req.encode_to_vec()),
+    )
+    .await?;
+    assert_eq!(resp.status(), 200);
+
+    let body = proto::CompleteResponse::decode(resp.into_body())?;
+    assert_eq!(body.text, "Hello from mock Claude!");
+    assert_eq!(body.stop_reason, "end_turn");
+    assert_eq!(body.input_tokens, 10);
+    assert_eq!(body.output_tokens, 7);
+    Ok(())
+}
+
+#[tokio::test]
+async fn wasm_llm_complete_text() -> Result<()> {
+    if skip_if_no_llm_wasm() {
+        return Ok(());
+    }
+    let (base_url, _shutdown) = spawn_mock_llm_server(MockLlmMode::Text {
+        text: "Short answer".into(),
+        input_tokens: 5,
+        output_tokens: 2,
+    })
+    .await?;
+    let llm = mock_llm_runtime(&base_url);
+    let (engine, pre) = wasm_module_pre(LLM_GUEST_WASM)?;
+    let state = llm_state(llm);
+
+    let req = proto::CompleteTextRequest {
+        user_message: "Give me a short answer".into(),
+    };
+    let resp = dispatch_to_wasm(
+        &engine,
+        &pre,
+        state,
+        rpc_request("/test.llm_test/CompleteText", req.encode_to_vec()),
+    )
+    .await?;
+    assert_eq!(resp.status(), 200);
+
+    let body = proto::CompleteTextResponse::decode(resp.into_body())?;
+    assert_eq!(body.text, "Short answer");
+    Ok(())
+}
+
+#[tokio::test]
+async fn wasm_llm_tool_use() -> Result<()> {
+    if skip_if_no_llm_wasm() {
+        return Ok(());
+    }
+    let (base_url, _shutdown) = spawn_mock_llm_server(MockLlmMode::ToolUse {
+        tool_id: "toolu_mock_001".into(),
+        tool_name: "get_weather".into(),
+        tool_input: r#"{"location":"San Francisco"}"#.into(),
+    })
+    .await?;
+    let llm = mock_llm_runtime(&base_url);
+    let (engine, pre) = wasm_module_pre(LLM_GUEST_WASM)?;
+    let state = llm_state(llm);
+
+    let req = proto::ToolUseRequest {
+        user_message: "What's the weather in San Francisco?".into(),
+        tool_name: "get_weather".into(),
+        tool_description: "Get current weather for a location".into(),
+        tool_schema: r#"{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}"#.into(),
+    };
+    let resp = dispatch_to_wasm(
+        &engine,
+        &pre,
+        state,
+        rpc_request("/test.llm_test/ToolUse", req.encode_to_vec()),
+    )
+    .await?;
+    assert_eq!(resp.status(), 200);
+
+    let body = proto::ToolUseResponse::decode(resp.into_body())?;
+    assert_eq!(body.tool_name, "get_weather");
+    assert_eq!(body.tool_id, "toolu_mock_001");
+    assert!(body.tool_input.contains("San Francisco"));
+    assert_eq!(body.stop_reason, "tool_use");
+    Ok(())
+}
+
+#[tokio::test]
+async fn wasm_llm_error() -> Result<()> {
+    if skip_if_no_llm_wasm() {
+        return Ok(());
+    }
+    let (base_url, _shutdown) = spawn_mock_llm_server(MockLlmMode::Error {
+        status: 401,
+        body: r#"{"error":{"type":"authentication_error","message":"invalid api key"}}"#.into(),
+    })
+    .await?;
+    let llm = mock_llm_runtime(&base_url);
+    let (engine, pre) = wasm_module_pre(LLM_GUEST_WASM)?;
+    let state = llm_state(llm);
+
+    let req = proto::LlmErrorRequest {
+        user_message: "This should fail".into(),
+    };
+    let resp = dispatch_to_wasm(
+        &engine,
+        &pre,
+        state,
+        rpc_request("/test.llm_test/Error", req.encode_to_vec()),
+    )
+    .await?;
+    assert_eq!(resp.status(), 200);
+
+    let body = proto::LlmErrorResponse::decode(resp.into_body())?;
+    assert_eq!(body.error_kind, "auth");
+    assert!(!body.error_message.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn wasm_llm_stream() -> Result<()> {
+    if skip_if_no_llm_wasm() {
+        return Ok(());
+    }
+    let (base_url, _shutdown) = spawn_mock_llm_server(MockLlmMode::Stream {
+        chunks: vec!["Hello".into(), " from".into(), " streaming!".into()],
+    })
+    .await?;
+    let llm = mock_llm_runtime(&base_url);
+    let (engine, pre) = wasm_module_pre(LLM_GUEST_WASM)?;
+    let state = llm_state(llm);
+
+    let req = proto::StreamRequest {
+        user_message: "Stream me a response".into(),
+    };
+    let resp = dispatch_to_wasm(
+        &engine,
+        &pre,
+        state,
+        rpc_request("/test.llm_test/Stream", req.encode_to_vec()),
+    )
+    .await?;
+    assert_eq!(resp.status(), 200);
+
+    let body = proto::StreamResponse::decode(resp.into_body())?;
+    assert_eq!(body.text, "Hello from streaming!");
+    assert_eq!(body.chunk_count, 3);
     Ok(())
 }
 
@@ -843,7 +984,8 @@ async fn wasm_http_ingress() -> Result<()> {
         spawn_wasm_stub_engine(engine, pre, "http://127.0.0.1:9001", "http-svc", "test-ns").await?;
 
     // Manager + registration.
-    let mgr_addr = start_manager().await?;
+    let pool = manager_pool().await;
+    let mgr_addr = start_manager(pool).await?;
     let mut client = manager_client(&mgr_addr).await?;
     register_module(
         &mut client,

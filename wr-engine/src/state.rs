@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::blobstore::BlobstoreRuntime;
 use crate::config::FsMode;
+use crate::llm::LlmRuntime;
 use deadpool_postgres::Pool;
 use http_body_util::{BodyExt, Full};
 use hyper::header::{HeaderName, HeaderValue};
@@ -128,6 +129,8 @@ pub struct ModuleServices {
     pub db_schema: Option<String>,
     /// Shared S3-compatible blobstore client, present when the module has blobstore access enabled.
     pub blobstore: Option<Arc<BlobstoreRuntime>>,
+    /// Shared LLM inference client, present when the module has LLM access enabled.
+    pub llm: Option<Arc<LlmRuntime>>,
     /// WASI filesystem mode (e.g. `FsMode::Tempdir`).
     pub fs: Option<FsMode>,
     /// The `engine.dispatch` span for the current request.
@@ -143,6 +146,7 @@ impl Default for ModuleServices {
             db_pool: None,
             db_schema: None,
             blobstore: None,
+            llm: None,
             fs: None,
             active_span: tracing::Span::none(),
         }
@@ -165,6 +169,8 @@ pub struct ModuleState {
     _fs_root: Option<TempDir>,
     /// Shared S3-compatible blobstore client, present when the module has blobstore access enabled.
     pub blobstore: Option<Arc<BlobstoreRuntime>>,
+    /// Shared LLM inference client, present when the module has LLM access enabled.
+    pub llm: Option<Arc<LlmRuntime>>,
     /// The `engine.dispatch` span for the current request.
     pub active_span: tracing::Span,
 }
@@ -200,6 +206,7 @@ impl ModuleState {
             db_pool: services.db_pool,
             db_schema: services.db_schema,
             blobstore: services.blobstore,
+            llm: services.llm,
             _fs_root: fs_root,
             active_span: services.active_span,
         })

@@ -61,17 +61,6 @@ CREATE TABLE IF NOT EXISTS wr_schemas (
     PRIMARY KEY (namespace, module_name, version)
 );
 
--- Metrics: pruned by timestamp, not count
-CREATE TABLE IF NOT EXISTS wr_request_metrics (
-    id          BIGSERIAL PRIMARY KEY,
-    source      TEXT NOT NULL DEFAULT '',
-    destination TEXT NOT NULL DEFAULT '',
-    duration_ms BIGINT NOT NULL DEFAULT 0,
-    status      INT NOT NULL DEFAULT 0,
-    error       TEXT NOT NULL DEFAULT '',
-    reported_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_metrics_time ON wr_request_metrics (reported_at DESC);
 ```
 
 ### 1.2 Create embedded migration runner
@@ -92,7 +81,6 @@ CREATE INDEX IF NOT EXISTS idx_metrics_time ON wr_request_metrics (reported_at D
 ```toml
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
 tokio-postgres    = { version = "0.7",  features = ["with-chrono-0_4"] }
-chrono            = "0.4"
 ```
 
 ### 2.2 Add config structs
@@ -104,16 +92,11 @@ pub struct DatabaseConfig {
     pub url: String,
     pub max_connections: usize,   // default 10
 }
-
-pub struct MetricsConfig {
-    pub retention_hours: u64,     // default 24
-}
 ```
 
 Add to `ManagerConfig`:
 ```rust
 pub database: DatabaseConfig,        // required
-pub metrics: Option<MetricsConfig>,
 ```
 
 ### 2.3 Update example config
@@ -124,9 +107,6 @@ pub metrics: Option<MetricsConfig>,
 [database]
 url             = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 10
-
-[metrics]
-retention_hours = 24
 ```
 
 ---
@@ -168,13 +148,6 @@ pub async fn upsert_schema(pool: &Pool, ns: &str, module: &str, ver: &str, data:
 pub async fn get_schema(pool: &Pool, ns: &str, module: &str, ver: &str) -> Result<Vec<u8>, Status>
 ```
 
-#### Metrics operations
-```rust
-pub async fn insert_metrics(pool: &Pool, metrics: &[RequestMetrics]) -> Result<(), Status>
-pub async fn get_metrics(pool: &Pool, limit: i64) -> Result<Vec<RequestMetrics>, Status>
-pub async fn prune_metrics(pool: &Pool, retention_hours: u64) -> Result<(), Status>
-```
-
 #### Private helpers
 ```rust
 async fn acquire_global_lock(txn: &Transaction<'_>) -> Result<u64, Status>
@@ -198,6 +171,7 @@ COMMIT;
 ```
 
 - **`RegisterEngine`** locks its own engine row (`SELECT engine_id ... FOR UPDATE NOWAIT`) but does **not** bump the routing table version (schemas and engine registration don't affect routing)
+- **`DeregisterEngine`** acquires the global lock, marks all routing rules for the engine as unhealthy (UPDATE, not DELETE — matches current in-memory behavior), removes the engine from `wr_engines`, cleans up heartbeat/module_health in-memory state, and bumps the routing table version
 - **`monitor_heartbeats`** uses `NOWAIT` too — on contention it logs a warning and skips, retrying on the next 10-second tick
 
 ---
@@ -214,7 +188,6 @@ Remove persisted fields (`engines`, `routing_table`, `schemas`). Retain only eph
 pub struct ManagerState {
     pub heartbeats:    HashMap<String, Instant>,
     pub module_health: HashMap<(String, String, String, String), Instant>,
-    pub metrics:       VecDeque<RequestMetrics>,  // in-memory fast path for GetMetricsSummary
 }
 ```
 
@@ -242,10 +215,9 @@ Replace all in-memory read/write operations with `db::*` calls.
 1. Load `ManagerConfig`
 2. `build_pool(&config.database.url, max_connections)`
 3. `run_migrations(&pool.get().await?.client())`
-4. Warm metrics cache: `db::get_metrics(&pool, 10_000)` → push into `state.metrics`
-5. `Manager::new(shared_state, pool)`
-6. Spawn `monitor_heartbeats(state, pool, timeout_secs, retention_hours)`
-7. Serve gRPC
+4. `Manager::new(shared_state, pool)`
+5. Spawn `monitor_heartbeats(state, pool, timeout_secs)`
+6. Serve gRPC
 
 ---
 
@@ -253,8 +225,11 @@ Replace all in-memory read/write operations with `db::*` calls.
 
 **File:** `wr-tests/tests/helpers.rs`
 
-- `start_manager()` gains a `pool` parameter gated on `WRUNTIME_TEST_DB_URL`
-- Same pattern as engine DB tests: skip if env var absent, run migrations if set
+Two helpers need updating:
+- `start_manager()` — simple startup, gains a `pool` parameter gated on `WRUNTIME_TEST_DB_URL`
+- `start_manager_with_monitor(timeout_secs)` — starts manager + heartbeat monitor, returns `(addr, SharedState)`; gains a `pool` parameter passed through to both `Manager::new` and `monitor_heartbeats`
+
+Same pattern as engine DB tests: skip if env var absent, run migrations if set
 
 ---
 
@@ -273,11 +248,11 @@ Replace all in-memory read/write operations with `db::*` calls.
 
 | File | Change |
 |---|---|
-| `wr-manager/Cargo.toml` | Add `deadpool-postgres`, `tokio-postgres`, `chrono` |
-| `wr-manager/src/config.rs` | Add `DatabaseConfig`, `MetricsConfig` |
+| `wr-manager/Cargo.toml` | Add `deadpool-postgres`, `tokio-postgres` |
+| `wr-manager/src/config.rs` | Add `DatabaseConfig` |
 | `wr-manager/src/state.rs` | Remove persisted fields; add `pool` to `monitor_heartbeats` signature |
 | `wr-manager/src/service.rs` | Add `pool: Pool`; replace in-memory ops with `db::*` calls |
-| `wr-manager/src/main.rs` | Pool init, migrations, metrics warm-up |
+| `wr-manager/src/main.rs` | Pool init, migrations |
 | `wr-manager/src/pool.rs` | **New** — `build_pool` |
 | `wr-manager/src/migrate.rs` | **New** — embedded migration runner |
 | `wr-manager/src/db.rs` | **New** — all DB operations |
