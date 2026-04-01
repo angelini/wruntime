@@ -1,5 +1,7 @@
 # Host Bindings
 
+> **Building a new guest module?** See [`docs/agents/api_reference.md`](agents/api_reference.md) for exact function signatures of all host bindings.
+
 WASM modules running in `wr-engine` can access host-provided capabilities through WIT interfaces defined under `wit/`. When using `wr-sdk`, these types are available via `wr_sdk::bindings` — no separate `wit_bindgen::generate!` call is required.
 
 ## Database (Postgres)

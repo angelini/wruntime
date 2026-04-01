@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
 use prost::Message;
 
 /// Proto types generated from the test .proto files (message types only).
@@ -759,5 +760,137 @@ async fn wasm_blobstore_not_found() -> Result<()> {
 
     let body = proto::NotFoundResponse::decode(resp.into_body())?;
     assert_eq!(body.error_kind, "not-found");
+    Ok(())
+}
+
+// ── HTTP guest tests (egress & ingress) ─────────────────────────────────────
+
+const HTTP_GUEST_WASM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/guests/http-guest/target/wasm32-wasip2/release/http_guest.wasm"
+);
+
+fn skip_if_no_http_wasm() -> bool {
+    if !std::path::Path::new(HTTP_GUEST_WASM).exists() {
+        eprintln!("SKIP: http-guest WASM not built — run `just build-test-guests`");
+        return true;
+    }
+    false
+}
+
+/// Verify a WASM guest can make an outbound HTTP request that exits the
+/// network via the proxy egress layer to an allowed external domain.
+#[tokio::test]
+async fn wasm_http_egress() -> Result<()> {
+    if skip_if_no_http_wasm() {
+        return Ok(());
+    }
+
+    // External HTTP/1.1 stub (stands in for example.com).
+    let (ext_addr, _ext_shutdown) = spawn_http1_stub().await?;
+    let ext_uri: http::Uri = ext_addr.parse()?;
+    let ext_authority = ext_uri.authority().unwrap().to_string();
+
+    // Egress proxy with 127.0.0.1 in the allowlist.
+    let table = wr_proxy::routing::new_routing_table();
+    let egress_cfg = EgressConfig {
+        allowed_domains: vec!["127.0.0.1".into()],
+    };
+    let proxy_addr = start_egress_proxy(Some(egress_cfg), table).await?;
+
+    // ModuleState pointed at the egress proxy.
+    let proxy_uri: hyper::Uri = format!("http://{proxy_addr}").parse()?;
+    let state = ModuleState::new(
+        "http-test".into(),
+        "test-ns".into(),
+        proxy_uri,
+        http_client(),
+        ModuleServices::default(),
+    )?;
+
+    let (engine, pre) = wasm_module_pre(HTTP_GUEST_WASM)?;
+    let req = proto::EgressRequest {
+        authority: ext_authority,
+        path: "/hello-egress".into(),
+    };
+    let resp = dispatch_to_wasm(
+        &engine,
+        &pre,
+        state,
+        rpc_request("/test.http_test/Egress", req.encode_to_vec()),
+    )
+    .await?;
+    assert_eq!(resp.status(), 200);
+
+    let body = proto::EgressResponse::decode(resp.into_body())?;
+    assert_eq!(body.status, 200);
+    assert_eq!(body.body, "egress:/hello-egress");
+    Ok(())
+}
+
+/// Verify an external HTTP client (no x-wr-* headers) can reach a WASM guest
+/// through the proxy ingress layer.
+#[tokio::test]
+async fn wasm_http_ingress() -> Result<()> {
+    if skip_if_no_http_wasm() {
+        return Ok(());
+    }
+
+    let (engine, pre) = wasm_module_pre(HTTP_GUEST_WASM)?;
+
+    // WASM-backed HTTP/2 engine.
+    let (engine_addr, _engine_shutdown) =
+        spawn_wasm_stub_engine(engine, pre, "http://127.0.0.1:9001", "http-svc", "test-ns").await?;
+
+    // Manager + registration.
+    let mgr_addr = start_manager().await?;
+    let mut client = manager_client(&mgr_addr).await?;
+    register_module(
+        &mut client,
+        EngineSpec {
+            id: "wasm-engine-1",
+            addr: &engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace: "test-ns",
+            name: "http-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    // Ingress proxy with a public route for Echo.
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(&mgr_addr, &table).await?;
+    let ingress_addr = start_ingress_proxy(
+        table,
+        vec![ExternalRoute {
+            path: "/test.http_test/Echo".into(),
+            methods: vec!["POST".into()],
+            module: "http-svc".into(),
+            namespace: "test-ns".into(),
+        }],
+    )
+    .await?;
+
+    // Plain HTTP request — no x-wr-* headers — simulates external caller.
+    let req_body = proto::EchoRequest {
+        message: "hello from outside".into(),
+    };
+    let resp = http_client()
+        .request(
+            http::Request::builder()
+                .method("POST")
+                .uri(format!("http://{ingress_addr}/test.http_test/Echo"))
+                .body(Full::new(Bytes::from(req_body.encode_to_vec())))?,
+        )
+        .await?;
+
+    assert_eq!(resp.status(), 200);
+    let body_bytes = resp.into_body().collect().await?.to_bytes();
+    let echo_resp = proto::EchoResponse::decode(body_bytes)?;
+    assert_eq!(echo_resp.message, "echo:hello from outside");
     Ok(())
 }

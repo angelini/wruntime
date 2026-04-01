@@ -128,6 +128,25 @@ impl EngineRunner {
         Ok(())
     }
 
+    /// Run database migrations for every module that declares a `migrations_path`.
+    /// Uses advisory locks to serialize across engine replicas and restricts
+    /// `search_path` so migrations can only touch the module's own schema.
+    pub async fn run_migrations(&self) -> Result<()> {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        for module in &self.config.modules {
+            if let Some(mig_path) = &module.migrations_path {
+                let schema = module_schema(&module.namespace, &module.name);
+                wr_engine::migration::run_module_migrations(pool, &schema, mig_path, &module.name)
+                    .await
+                    .with_context(|| format!("migration failed for module '{}'", module.name))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Load and spawn a task for every module listed in the config, registering
     /// HTTP-handler modules in `registry` so the inbound server can route to them.
     pub async fn load_modules(&self, registry: &ModuleRegistry) -> Result<()> {

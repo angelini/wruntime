@@ -1,5 +1,7 @@
 # Protobuf Schemas
 
+> **Building a new guest module?** See [`docs/agents/codegen.md`](agents/codegen.md) for the exact mapping from proto definitions to generated Rust code.
+
 Every module **must** declare a protobuf schema. Schemas serve two purposes:
 
 1. **Code generation** — `wr-build` generates service traits and client stubs from the proto definitions, giving modules type-safe RPC interfaces.

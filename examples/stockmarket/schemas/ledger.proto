@@ -1,0 +1,72 @@
+syntax = "proto3";
+package stockmarket;
+
+service LedgerService {
+  rpc Reset        (ResetRequest)         returns (ResetResponse);
+  rpc RecordTrade  (RecordTradeRequest)   returns (RecordTradeResponse);
+  rpc Snapshot     (SnapshotRequest)      returns (SnapshotResponse);
+  rpc Verify       (VerifyRequest)        returns (VerifyResponse);
+  rpc GetTradeCount(GetTradeCountRequest) returns (GetTradeCountResponse);
+}
+
+message ResetRequest {}
+
+message ResetResponse {
+  int64 trades_deleted   = 1;
+  int64 snapshots_deleted = 2;
+}
+
+message RecordTradeRequest {
+  string buyer_id  = 1;
+  string seller_id = 2;
+  string symbol    = 3;
+  int64  quantity  = 4;
+  int64  price     = 5;
+  int64  order_id  = 6;
+}
+
+message RecordTradeResponse {
+  int64 trade_id = 1;
+}
+
+message SnapshotRequest {
+  string label = 1;
+}
+
+message SnapshotResponse {
+  string snapshot_key   = 1;
+  int64  trade_count    = 2;
+  int64  snapshot_bytes = 3;
+}
+
+message VerifyRequest {}
+
+message VerifyResponse {
+  bool   valid        = 1;
+  int64  total_trades = 2;
+  int64  total_volume = 3;
+  string details      = 4;
+}
+
+message GetTradeCountRequest {}
+
+message GetTradeCountResponse {
+  int64 count = 1;
+}
+
+// Used for blobstore snapshots — serialized as protobuf binary.
+message LedgerSnapshot {
+  string label       = 1;
+  int64  trade_count = 2;
+  repeated TradeRecord trades = 3;
+}
+
+message TradeRecord {
+  int64  trade_id  = 1;
+  string buyer_id  = 2;
+  string seller_id = 3;
+  string symbol    = 4;
+  int64  quantity  = 5;
+  int64  price     = 6;
+  int64  order_id  = 7;
+}

@@ -1,5 +1,7 @@
 # Module SDK (`wr-sdk` + `wr-build`)
 
+> **Building a new guest module?** See [`docs/agents/`](agents/README.md) for copy-paste templates, exact API signatures, and a decision matrix. That directory is the primary reference for generating modules.
+
 Two crates eliminate boilerplate from wruntime WASM modules:
 
 - **`wr-sdk`** — shared WASI helpers that every module links against: `http_rpc`, `read_body`, `send_response`, `err_body`, `log`, export macros, and the `ServiceGuest` / `RunGuest` traits.

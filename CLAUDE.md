@@ -43,7 +43,18 @@ just example-inline  # build-example + run with single invocation, exits on fail
 
 After refactoring, always run `just tidy` and `just example-inline` to verify formatting, lints, and end-to-end correctness. Treat any `WARN` log lines in `just example-inline` output as bugs that need to be fixed — a clean run should produce zero warnings. When changing host bindings (`wr-engine/src/db.rs`, `wr-engine/src/blobstore.rs`, `wr-engine/src/tracing.rs`), WIT interfaces (`wit/`), the SDK (`wr-sdk/`), or the WASM guest test harness (`wr-tests/guests/`, `wr-tests/tests/wasm_host_test.rs`), also run `just test-wasm`.
 
-**Keep docs in sync with code changes.** When modifying architecture (adding/removing layers, changing request flow, changing config), update `CLAUDE.md`, `README.md`, and the relevant files in `docs/` (`architecture.md`, `configuration.md`, `schemas.md`, etc.) in the same change. Stale docs are worse than no docs.
+**Keep docs in sync with code changes.** When modifying architecture (adding/removing layers, changing request flow, changing config), update `CLAUDE.md`, `README.md`, and the relevant files in `docs/` (`architecture.md`, `configuration.md`, `schemas.md`, etc.) in the same change. Stale docs are worse than no docs. **When modifying `wr-sdk/`, `wr-build/`, or `wit/` interfaces, also update `docs/agents/api_reference.md`** — this is the authoritative API reference used by agents building guest modules.
+
+### Agent Documentation (`docs/agents/`)
+
+`docs/agents/` contains structured documentation for AI agents building WASM guest modules. When creating new guest modules, consult these docs for templates, API signatures, and patterns. The key files are:
+
+- `module_template.md` — fill-in-the-blank skeleton for new modules
+- `api_reference.md` — exact function signatures for all guest-callable APIs (**must be kept in sync with code**)
+- `constraints.md` — hard rules and common mistakes
+- `decision_matrix.md` — choose handler vs. runner vs. combined
+- `codegen.md` — proto-to-Rust code generation mapping
+- `examples.md` — index of real code in the repo
 
 **Prerequisites:** `rustc`, `cargo`, `just`, `protoc` (for proto code generation). WASM module development additionally requires `cargo-component` and `wasm-tools`.
 
@@ -82,7 +93,9 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 
 The proxy uses a custom `ProxyBody` type that wraps `hyper::body::Incoming` behind a `Pin<Box<dyn Body + Send>>`, enabling streaming without the `Sync` requirement that `BoxBody` imposes. All layers only inspect headers — bodies flow through untouched.
 
-**`wr-engine`** — uses wasmtime 41 with the WASI component model. On startup: loads WASM components → registers with manager → starts 10-second heartbeat loop. Modules can optionally have a PostgreSQL pool (`deadpool-postgres`) and a blobstore (S3-compatible via `rust-s3`) exposed to WASM via custom host bindings.
+**`wr-engine`** — uses wasmtime 41 with the WASI component model. On startup: provisions DB schemas → runs migrations (via `refinery`) → loads WASM components → registers with manager → starts 10-second heartbeat loop. Modules can optionally have a PostgreSQL pool (`deadpool-postgres`) and a blobstore (S3-compatible via `rust-s3`) exposed to WASM via custom host bindings.
+
+**Database migrations** — modules can declare `migrations_path` in `engine.toml` pointing to a directory of `V{n}__description.sql` files. Migrations run on the engine (host side) at startup using [refinery](https://github.com/rust-db/refinery) with tokio-postgres. Each module's migrations are schema-isolated (`search_path` set to the module's schema only) and serialized across engine replicas via Postgres advisory locks. Routing rules are not registered until migrations complete. See `docs/configuration.md` for details.
 
 **`wr-manager` state** — pure in-memory (`state.rs`). No persistence; rebuilt from engine re-registrations after restart. Background task monitors heartbeats every 10 seconds — marks routing rules unhealthy and bumps the routing table version when an engine times out (default 30 s).
 

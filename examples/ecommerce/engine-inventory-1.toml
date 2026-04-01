@@ -14,4 +14,5 @@ namespace   = "ecommerce"
 version     = "1.0.0"
 wasm_path   = "examples/ecommerce/inventory/target/wasm32-wasip2/release/inventory.wasm"
 schema_path = "examples/ecommerce/schemas/inventory.binpb"
-database    = true
+database        = true
+migrations_path = "examples/ecommerce/inventory/migrations"

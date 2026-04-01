@@ -91,6 +91,39 @@ On startup the engine:
 4. Sends a heartbeat to the manager every 10 seconds, reporting all loaded modules as healthy.
 5. Deregisters cleanly on `Ctrl+C`, which immediately marks its routing rules as unhealthy.
 
+### Database migrations
+
+Modules that use a database can declare a `migrations_path` pointing to a directory of SQL migration files. Migrations run on the engine (host side) at startup — after the Postgres schema is provisioned but before the WASM module loads and before routing rules are registered. This means no traffic reaches a module until its database is fully migrated.
+
+```toml
+[database]
+url             = "postgres://user:pass@localhost:5432/mydb"
+max_connections = 20
+
+[[module]]
+name            = "inventory"
+namespace       = "ecommerce"
+version         = "1.0.0"
+wasm_path       = "modules/inventory.wasm"
+schema_path     = "schemas/inventory.binpb"
+database        = true
+migrations_path = "modules/inventory/migrations"
+```
+
+Migration files follow the [refinery](https://github.com/rust-db/refinery) naming convention:
+
+```
+modules/inventory/migrations/
+    V1__create_tables.sql
+    V2__add_indexes.sql
+```
+
+Key behaviors:
+- **Schema isolation:** `search_path` is set to the module's own schema before migrations run. A migration cannot modify tables belonging to another module.
+- **Advisory locking:** An engine acquires a Postgres advisory lock before running migrations, preventing concurrent execution across engine replicas for the same module.
+- **Idempotent:** Refinery tracks applied migrations in a `refinery_schema_history` table inside the module's schema. Already-applied migrations are skipped on subsequent startups.
+- **Fail-fast:** If any migration fails, the engine exits before registering routing rules — the module never receives traffic.
+
 ### Per-module request timeout
 
 `request_timeout_secs` sets a hard deadline on every request dispatched to a module. If the WASM handler does not produce a response within that window, the engine cancels the request and returns `504 Gateway Timeout` to the proxy. The proxy treats a `504` as a terminal error and does not retry on another instance.
@@ -161,7 +194,23 @@ To deploy a **new version** alongside the old one, register a new engine with `v
 
 ### Multi-node deployment
 
-Node B config files follow the same structure — just use different ports and a matching `proxy_address`:
+Each node uses different ports and a matching `proxy_address`:
+
+```toml
+# examples/multi-node/node-a/proxy.toml
+listen_address  = "0.0.0.0:9001"
+manager_address = "http://127.0.0.1:9000"
+
+[node]
+proxy_address = "http://node-a-host:9001"
+
+# examples/multi-node/node-a/engine-1.toml
+listen_address  = "0.0.0.0:9100"
+manager_address = "http://127.0.0.1:9000"
+
+[node]
+proxy_address = "http://node-a-host:9001"
+```
 
 ```toml
 # examples/multi-node/node-b/proxy.toml
@@ -171,7 +220,7 @@ manager_address = "http://127.0.0.1:9000"
 [node]
 proxy_address = "http://node-b-host:9002"
 
-# examples/multi-node/node-b/engine.toml
+# examples/multi-node/node-b/engine-1.toml
 listen_address  = "0.0.0.0:9200"
 manager_address = "http://127.0.0.1:9000"
 
