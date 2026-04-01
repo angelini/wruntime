@@ -47,13 +47,84 @@ pub use wr_proxy::config::{EgressConfig, ExternalRoute};
 
 // ── Manager ───────────────────────────────────────────────────────────────────
 
+/// Return the test DB URL, panicking if `WRT_TEST_DB_URL` is not set.
+pub fn require_db_url() -> String {
+    std::env::var("WRT_TEST_DB_URL").expect("WRT_TEST_DB_URL must be set for this test")
+}
+
+/// Build a `deadpool_postgres::Pool` for the manager in an isolated Postgres
+/// schema so parallel tests don't collide.  Runs migrations inside the schema,
+/// returns a pool whose connections have `search_path` permanently set.
+///
+/// The first call in a test run drops all leftover `mgr_test_*` schemas from
+/// previous runs (including failed ones), so schemas don't accumulate.
+pub async fn manager_pool() -> deadpool_postgres::Pool {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static CLEANED: AtomicBool = AtomicBool::new(false);
+    static CLEANUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    let base_url = require_db_url();
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let schema = format!("mgr_test_{n}");
+
+    // Create the schema using a one-shot connection to the base DB.
+    let setup_pool =
+        wr_manager::pool::build_pool(&base_url, 1).expect("failed to build setup pool");
+    let client = setup_pool.get().await.expect("setup connection");
+
+    // On the first call only, drop all leftover mgr_test_* schemas from
+    // previous (possibly failed) test runs.
+    if !CLEANED.load(Ordering::SeqCst) {
+        let _guard = CLEANUP_LOCK.lock().await;
+        if !CLEANED.load(Ordering::SeqCst) {
+            let rows = client
+                .query(
+                    "SELECT schema_name FROM information_schema.schemata
+                     WHERE schema_name LIKE 'mgr_test_%'",
+                    &[],
+                )
+                .await
+                .expect("list mgr_test schemas");
+            for row in &rows {
+                let name: &str = row.get(0);
+                client
+                    .batch_execute(&format!("DROP SCHEMA \"{name}\" CASCADE"))
+                    .await
+                    .expect("drop leftover schema");
+            }
+            CLEANED.store(true, Ordering::SeqCst);
+        }
+    }
+
+    client
+        .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+        .await
+        .expect("create schema");
+    drop(client);
+    drop(setup_pool);
+
+    // Build the real pool with search_path pinned to the new schema.
+    let sep = if base_url.contains('?') { "&" } else { "?" };
+    let url = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
+    let pool = wr_manager::pool::build_pool(&url, 5).expect("failed to build manager test pool");
+
+    let client = pool.get().await.expect("migration connection");
+    wr_manager::migrate::run_migrations(&client)
+        .await
+        .expect("manager migrations failed");
+    drop(client);
+
+    pool
+}
+
 /// Start an in-process wr-manager on a random port; returns its gRPC address.
-pub async fn start_manager() -> Result<String> {
+pub async fn start_manager(pool: deadpool_postgres::Pool) -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(
         Server::builder()
-            .add_service(ManagerServiceServer::new(Manager::new(new_state())))
+            .add_service(ManagerServiceServer::new(Manager::new(new_state(), pool)))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
     );
     Ok(format!("http://{addr}"))
@@ -62,6 +133,39 @@ pub async fn start_manager() -> Result<String> {
 /// Return a connected manager gRPC client.
 pub async fn manager_client(addr: &str) -> Result<ManagerServiceClient<tonic::transport::Channel>> {
     Ok(ManagerServiceClient::connect(addr.to_string()).await?)
+}
+
+/// Query the routing table via gRPC and find a rule by destination module name.
+/// Returns `(healthy, version)`.
+pub async fn get_rule_health(
+    mgr: &mut ManagerServiceClient<tonic::transport::Channel>,
+    destination_module: &str,
+) -> Result<(bool, u64)> {
+    let table = mgr
+        .get_routing_table(GetRoutingTableRequest {})
+        .await?
+        .into_inner()
+        .table
+        .expect("routing table present");
+    let rule = table
+        .rules
+        .iter()
+        .find(|r| r.destination_module == destination_module)
+        .unwrap_or_else(|| panic!("no rule for destination_module={destination_module}"));
+    Ok((rule.healthy, table.version))
+}
+
+/// Query the routing table version via gRPC.
+pub async fn get_routing_table_version(
+    mgr: &mut ManagerServiceClient<tonic::transport::Channel>,
+) -> Result<u64> {
+    let table = mgr
+        .get_routing_table(GetRoutingTableRequest {})
+        .await?
+        .into_inner()
+        .table
+        .expect("routing table present");
+    Ok(table.version)
 }
 
 // ── Proxy ─────────────────────────────────────────────────────────────────────
@@ -576,6 +680,7 @@ pub async fn start_proxy_with_cb(
 /// task.  `timeout_secs` controls how long before a module is marked unhealthy.
 /// Returns the gRPC address and the shared state handle for assertions.
 pub async fn start_manager_with_monitor(
+    pool: deadpool_postgres::Pool,
     timeout_secs: u64,
 ) -> Result<(String, wr_manager::state::SharedState)> {
     let state = new_state();
@@ -583,11 +688,15 @@ pub async fn start_manager_with_monitor(
     let addr = listener.local_addr()?;
     tokio::spawn(
         Server::builder()
-            .add_service(ManagerServiceServer::new(Manager::new(state.clone())))
+            .add_service(ManagerServiceServer::new(Manager::new(
+                state.clone(),
+                pool.clone(),
+            )))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
     );
     tokio::spawn(wr_manager::state::monitor_heartbeats(
         state.clone(),
+        pool,
         timeout_secs,
     ));
     Ok((format!("http://{addr}"), state))
@@ -649,34 +758,29 @@ pub fn invalid_protobuf() -> Bytes {
 
 // ── Database ──────────────────────────────────────────────────────────────────
 
-/// Build a `ModuleState` backed by a connection pool at `WRUNTIME_TEST_DB_URL`.
-pub fn db_state(pool_size: usize) -> Option<ModuleState> {
-    let url = std::env::var("WRUNTIME_TEST_DB_URL").ok()?;
+/// Build a `ModuleState` backed by a connection pool at `WRT_TEST_DB_URL`.
+/// Panics if the env var is not set.
+pub fn db_state(pool_size: usize) -> ModuleState {
+    let url = require_db_url();
     let pool = Arc::new(wr_engine::pool::build_pool(&url, pool_size).expect("build_pool"));
-    Some(
-        ModuleState::new(
-            "test".into(),
-            "test-ns".into(),
-            "http://127.0.0.1:9001".parse().unwrap(),
-            http_client(),
-            ModuleServices {
-                db_pool: Some(pool),
-                ..Default::default()
-            },
-        )
-        .expect("ModuleState"),
+    ModuleState::new(
+        "test".into(),
+        "test-ns".into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        http_client(),
+        ModuleServices {
+            db_pool: Some(pool),
+            ..Default::default()
+        },
     )
+    .expect("ModuleState")
 }
 
 /// Build a `ModuleState` for a specific `(namespace, name)` pair, provisioning
 /// the module's Postgres schema (`wr__{namespace}__{name}`) if it does not
-/// already exist.
-pub async fn db_state_for_module(
-    pool_size: usize,
-    namespace: &str,
-    name: &str,
-) -> Option<ModuleState> {
-    let url = std::env::var("WRUNTIME_TEST_DB_URL").ok()?;
+/// already exist. Panics if `WRT_TEST_DB_URL` is not set.
+pub async fn db_state_for_module(pool_size: usize, namespace: &str, name: &str) -> ModuleState {
+    let url = require_db_url();
     let schema = wr_engine::pool::module_schema(namespace, name);
     let pool = Arc::new(wr_engine::pool::build_pool(&url, pool_size).expect("build_pool"));
     let client = pool
@@ -688,20 +792,18 @@ pub async fn db_state_for_module(
         .await
         .expect("provision schema");
     drop(client);
-    Some(
-        ModuleState::new(
-            name.into(),
-            namespace.into(),
-            "http://127.0.0.1:9001".parse().unwrap(),
-            http_client(),
-            ModuleServices {
-                db_pool: Some(pool),
-                db_schema: Some(schema),
-                ..Default::default()
-            },
-        )
-        .expect("ModuleState"),
+    ModuleState::new(
+        name.into(),
+        namespace.into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        http_client(),
+        ModuleServices {
+            db_pool: Some(pool),
+            db_schema: Some(schema),
+            ..Default::default()
+        },
     )
+    .expect("ModuleState")
 }
 
 // ── WASM guest dispatch ──────────────────────────────────────────────────────
@@ -725,6 +827,10 @@ pub fn wasm_module_pre(wasm_path: &str) -> Result<(Arc<Engine>, Arc<ProxyPre<Mod
         |s| s,
     )?;
     wr_engine::blobstore::add_to_linker::<ModuleState, wasmtime::component::HasSelf<ModuleState>>(
+        &mut linker,
+        |s| s,
+    )?;
+    wr_engine::llm::add_to_linker::<ModuleState, wasmtime::component::HasSelf<ModuleState>>(
         &mut linker,
         |s| s,
     )?;
@@ -871,20 +977,22 @@ async fn wasm_engine_serve(
     }
 }
 
-/// Build a `BlobstoreRuntime` from `WRUNTIME_TEST_S3_*` environment variables.
-pub fn blobstore_client() -> Option<Arc<BlobstoreRuntime>> {
-    let endpoint = std::env::var("WRUNTIME_TEST_S3_ENDPOINT").ok()?;
-    let access_key = std::env::var("WRUNTIME_TEST_S3_ACCESS_KEY").ok()?;
-    let secret_key = std::env::var("WRUNTIME_TEST_S3_SECRET_KEY").ok()?;
+/// Build a `BlobstoreRuntime` from `WRT_TEST_S3_*` environment variables.
+/// Panics if the env vars are not set.
+pub fn blobstore_client() -> Arc<BlobstoreRuntime> {
+    let endpoint = std::env::var("WRT_TEST_S3_ENDPOINT")
+        .expect("WRT_TEST_S3_ENDPOINT must be set for this test");
+    let access_key = std::env::var("WRT_TEST_S3_ACCESS_KEY")
+        .expect("WRT_TEST_S3_ACCESS_KEY must be set for this test");
+    let secret_key = std::env::var("WRT_TEST_S3_SECRET_KEY")
+        .expect("WRT_TEST_S3_SECRET_KEY must be set for this test");
     let config = BlobstoreConfig {
         endpoint,
         access_key_id: access_key,
         secret_access_key: secret_key,
         region: "us-east-1".into(),
     };
-    Some(Arc::new(
-        BlobstoreRuntime::new(&config).expect("BlobstoreRuntime"),
-    ))
+    Arc::new(BlobstoreRuntime::new(&config).expect("BlobstoreRuntime"))
 }
 
 /// Build a `ModuleState` with a blobstore client for WASM guest tests.
@@ -910,6 +1018,198 @@ pub fn tracing_state() -> ModuleState {
         "http://127.0.0.1:9001".parse().unwrap(),
         http_client(),
         ModuleServices::default(),
+    )
+    .expect("ModuleState")
+}
+
+// ── LLM mock helpers ────────────────────────────────────────────────────────
+
+use wr_engine::llm::LlmRuntime;
+
+/// The mock response mode determines what the mock Claude API server returns.
+#[derive(Clone)]
+pub enum MockLlmMode {
+    /// Return a simple text completion.
+    Text {
+        text: String,
+        input_tokens: u32,
+        output_tokens: u32,
+    },
+    /// Return a tool_use response.
+    ToolUse {
+        tool_id: String,
+        tool_name: String,
+        tool_input: String,
+    },
+    /// Return an HTTP error status.
+    Error { status: u16, body: String },
+    /// Return a streaming SSE response with the given text chunks.
+    Stream { chunks: Vec<String> },
+}
+
+/// Spawn a mock Claude API HTTP server that returns canned responses.
+/// Returns the base URL (e.g. "http://127.0.0.1:PORT") and a shutdown handle.
+pub async fn spawn_mock_llm_server(
+    mode: MockLlmMode,
+) -> Result<(String, tokio::sync::oneshot::Sender<()>)> {
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            let mode = mode.clone();
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, _) = match accepted {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let io = TokioIo::new(stream);
+                    let mode = mode.clone();
+                    tokio::spawn(async move {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(
+                                io,
+                                service_fn(move |req| {
+                                    let mode = mode.clone();
+                                    async move {
+                                        handle_mock_llm_request(req, mode).await
+                                    }
+                                }),
+                            )
+                            .await;
+                    });
+                }
+                _ = &mut shutdown_rx => break,
+            }
+        }
+    });
+
+    Ok((format!("http://127.0.0.1:{}", addr.port()), shutdown_tx))
+}
+
+async fn handle_mock_llm_request(
+    _req: hyper::Request<hyper::body::Incoming>,
+    mode: MockLlmMode,
+) -> Result<hyper::Response<http_body_util::Full<Bytes>>, std::convert::Infallible> {
+    match mode {
+        MockLlmMode::Text {
+            text,
+            input_tokens,
+            output_tokens,
+        } => {
+            let body = serde_json::json!({
+                "id": "msg_mock_001",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens
+                }
+            });
+            Ok(hyper::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
+                .unwrap())
+        }
+        MockLlmMode::ToolUse {
+            tool_id,
+            tool_name,
+            tool_input,
+        } => {
+            let input_value: serde_json::Value =
+                serde_json::from_str(&tool_input).unwrap_or(serde_json::json!({}));
+            let body = serde_json::json!({
+                "id": "msg_mock_002",
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": tool_name,
+                    "input": input_value
+                }],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 50, "output_tokens": 30}
+            });
+            Ok(hyper::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
+                .unwrap())
+        }
+        MockLlmMode::Error { status, body } => Ok(hyper::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap()),
+        MockLlmMode::Stream { chunks } => {
+            let mut sse = String::new();
+            // message_start
+            sse.push_str("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_mock_003\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"usage\":{\"input_tokens\":25,\"output_tokens\":0}}}\n\n");
+            // content_block_start
+            sse.push_str("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
+            // content_block_delta for each chunk
+            for chunk in &chunks {
+                let escaped = chunk.replace('\\', "\\\\").replace('"', "\\\"");
+                sse.push_str(&format!(
+                    "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n"
+                ));
+            }
+            // content_block_stop
+            sse.push_str("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+            // message_delta with usage
+            let output_tokens = chunks.iter().map(|c| c.len() as u32).sum::<u32>();
+            sse.push_str(&format!(
+                "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":{output_tokens}}}}}\n\n"
+            ));
+            // message_stop
+            sse.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+
+            Ok(hyper::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Full::new(Bytes::from(sse)))
+                .unwrap())
+        }
+    }
+}
+
+/// Build an `LlmRuntime` pointing at the given mock base URL.
+pub fn mock_llm_runtime(base_url: &str) -> Arc<LlmRuntime> {
+    use wr_engine::config::LlmConfig;
+    // Set a temp env var for the API key
+    std::env::set_var("WRT_TEST_LLM_KEY", "mock-key");
+    let config = LlmConfig {
+        provider: "anthropic".into(),
+        api_key_env: "WRT_TEST_LLM_KEY".into(),
+        base_url: base_url.into(),
+        max_tokens_limit: 8192,
+    };
+    Arc::new(LlmRuntime::new(&config).expect("LlmRuntime"))
+}
+
+/// Build a `ModuleState` with an LLM runtime for WASM guest tests.
+pub fn llm_state(llm: Arc<LlmRuntime>) -> ModuleState {
+    ModuleState::new(
+        "llm-test".into(),
+        "test-ns".into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        http_client(),
+        ModuleServices {
+            llm: Some(llm),
+            ..Default::default()
+        },
     )
     .expect("ModuleState")
 }

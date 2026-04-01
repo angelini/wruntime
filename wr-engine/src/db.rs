@@ -822,9 +822,9 @@ mod tests {
 
     // ── real-Postgres tests ───────────────────────────────────────────────────
 
-    /// Skip the test if `WRUNTIME_TEST_DB_URL` is not set.
+    /// Skip the test if `WRT_TEST_DB_URL` is not set.
     fn db_url() -> Option<String> {
-        std::env::var("WRUNTIME_TEST_DB_URL").ok()
+        std::env::var("WRT_TEST_DB_URL").ok()
     }
 
     #[tokio::test(flavor = "multi_thread")]

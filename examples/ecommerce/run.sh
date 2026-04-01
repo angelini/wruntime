@@ -14,7 +14,7 @@ done
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-DB_URL="${DB_URL:-${WRUNTIME_EXAMPLE_DB_URL:-postgres://localhost:5432/wruntime_example}}"
+DB_URL="${DB_URL:-${WRT_EXAMPLE_DB_URL:-postgres://localhost:5432/wruntime_example}}"
 echo "DB_URL: ${DB_URL}"
 
 # ── Tracing (OpenTelemetry → Grafana LGTM) ────────────────────────────────────
@@ -30,15 +30,24 @@ update_db_url() {
     rm -f "${file}.bak"
 }
 
-# ── Apply DB URL to engine configs ────────────────────────────────────────────
+# ── Apply DB URL to engine and manager configs ────────────────────────────────
 cp examples/ecommerce/engine-inventory-1.toml /tmp/inv1.toml
 cp examples/ecommerce/engine-inventory-2.toml /tmp/inv2.toml
 update_db_url /tmp/inv1.toml
 update_db_url /tmp/inv2.toml
 
+cp examples/config/manager.toml /tmp/wr-manager.toml
+sed -i.bak "s|postgres://postgres@localhost:5433/wruntime_example|${DB_URL}|g" /tmp/wr-manager.toml
+rm -f /tmp/wr-manager.toml.bak
+
+# ── Clean stale manager state ─────────────────────────────────────────────────
+echo "==> Cleaning manager state..."
+psql "${DB_URL}" -c "TRUNCATE wr_engines, wr_routing_rules, wr_schemas CASCADE" 2>/dev/null \
+    || echo "   (tables may not exist yet — first run)"
+
 # ── Start manager ──────────────────────────────────────────────────────────────
 echo "==> Starting manager on :9000"
-./target/debug/wr-manager examples/config/manager.toml &
+./target/debug/wr-manager /tmp/wr-manager.toml &
 MANAGER_PID=$!
 sleep 1
 

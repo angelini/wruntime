@@ -260,6 +260,113 @@ impl ActiveSpan {
 
 Note: the `wr_sdk::tracing` helpers accept `&[(&str, &str)]` and convert to owned strings internally. Prefer using `wr_sdk::tracing::start()` over the raw WIT binding.
 
+## wruntime:llm/inference@0.1.0
+
+Source: `wit/llm.wit`. Import path: `wr_sdk::bindings::wruntime::llm::inference`.
+
+### Top-level functions
+
+```rust
+/// Single-shot completion.
+inference::complete(req: &CompletionRequest) -> Result<CompletionResponse, LlmError>
+
+/// Streaming completion — returns a cursor that yields text deltas.
+inference::complete_stream(req: &CompletionRequest) -> Result<CompletionStream, LlmError>
+```
+
+### CompletionStream resource
+
+```rust
+impl CompletionStream {
+    /// Pull the next text chunk. Returns None when stream is finished.
+    fn next(&self) -> Result<Option<String>, LlmError>
+
+    /// Final usage stats (available after stream exhausted).
+    fn usage(&self) -> Option<TokenUsage>
+}
+// Dropping cancels the stream.
+```
+
+### Types
+
+```rust
+struct CompletionRequest {
+    model: String,                // e.g. "claude-sonnet-4-6"
+    messages: Vec<Message>,
+    system: Option<String>,
+    max_tokens: u32,
+    temperature: Option<f32>,
+    tools: Vec<ToolDef>,
+}
+
+struct Message {
+    role: MessageRole,   // User | Assistant
+    content: String,
+}
+
+struct ToolDef {
+    name: String,
+    description: String,
+    input_schema: String,   // JSON Schema string
+}
+
+struct CompletionResponse {
+    completion: Completion,
+    usage: TokenUsage,
+    stop_reason: String,    // "end_turn" | "tool_use" | "max_tokens"
+}
+
+enum Completion {
+    Text(String),
+    ToolCalls(Vec<ToolUse>),
+}
+
+struct ToolUse {
+    id: String,
+    name: String,
+    input: String,   // JSON-encoded arguments
+}
+
+struct TokenUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+enum LlmError {
+    InvalidRequest(String),
+    Auth(String),
+    RateLimited(Option<u32>),   // retry-after seconds
+    Api(String),
+}
+```
+
+## wr_sdk::llm
+
+Source: `wr-sdk/src/llm.rs`
+
+```rust
+/// Builder for completion requests.
+pub struct CompletionBuilder { /* ... */ }
+
+impl CompletionBuilder {
+    pub fn new(model: &str) -> Self
+    pub fn sonnet() -> Self              // claude-sonnet-4-6
+    pub fn haiku() -> Self               // claude-haiku-4-5-20251001
+    pub fn system(self, s: impl Into<String>) -> Self
+    pub fn user(self, content: impl Into<String>) -> Self
+    pub fn assistant(self, content: impl Into<String>) -> Self
+    pub fn max_tokens(self, n: u32) -> Self
+    pub fn temperature(self, t: f32) -> Self
+    pub fn tool(self, name: &str, description: &str, schema: &str) -> Self
+    pub fn complete(self) -> Result<CompletionResponse, LlmError>
+    pub fn stream(self) -> Result<CompletionStream, LlmError>
+    pub fn complete_text(self) -> Result<String, LlmError>  // text-only shorthand
+}
+
+/// Collect a stream into a single string.
+pub fn collect_stream(stream: CompletionStream) -> Result<String, LlmError>
+```
+
 ## wr-build code generators
 
 Source: `wr-build/src/lib.rs`. Used in `build.rs`.

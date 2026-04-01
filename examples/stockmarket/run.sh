@@ -14,7 +14,7 @@ done
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-DB_URL="${DB_URL:-${WRUNTIME_EXAMPLE_DB_URL:-postgres://postgres@localhost:5433/wruntime_example}}"
+DB_URL="${DB_URL:-${WRT_EXAMPLE_DB_URL:-postgres://postgres@localhost:5433/wruntime_example}}"
 S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:8900}"
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-rustfsadmin}"
@@ -39,14 +39,23 @@ cp examples/stockmarket/engine-ledger.toml /tmp/sm-ledger.toml
 update_config /tmp/sm-exchange.toml
 update_config /tmp/sm-ledger.toml
 
+cp examples/config/manager.toml /tmp/wr-manager.toml
+sed -i.bak "s|postgres://postgres@localhost:5433/wruntime_example|${DB_URL}|g" /tmp/wr-manager.toml
+rm -f /tmp/wr-manager.toml.bak
+
 # ── Create S3 bucket ──────────────────────────────────────────────────────────
 echo "==> Creating S3 bucket 'stockmarket'"
 AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${S3_SECRET_KEY}" \
     aws --endpoint-url "${S3_ENDPOINT}" s3 mb s3://stockmarket 2>/dev/null || true
 
+# ── Clean stale manager state ─────────────────────────────────────────────────
+echo "==> Cleaning manager state..."
+psql "${DB_URL}" -c "TRUNCATE wr_engines, wr_routing_rules, wr_schemas CASCADE" 2>/dev/null \
+    || echo "   (tables may not exist yet — first run)"
+
 # ── Start manager ──────────────────────────────────────────────────────────────
 echo "==> Starting manager on :9000"
-./target/debug/wr-manager examples/config/manager.toml &
+./target/debug/wr-manager /tmp/wr-manager.toml &
 MANAGER_PID=$!
 sleep 1
 

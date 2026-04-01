@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use deadpool_postgres::Pool;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
@@ -12,15 +13,17 @@ use wr_common::wruntime::{
     UpsertRoutingRuleResponse,
 };
 
+use crate::db;
 use crate::state::SharedState;
 
 pub struct Manager {
     state: SharedState,
+    pool: Pool,
 }
 
 impl Manager {
-    pub fn new(state: SharedState) -> Self {
-        Self { state }
+    pub fn new(state: SharedState, pool: Pool) -> Self {
+        Self { state, pool }
     }
 }
 
@@ -41,11 +44,7 @@ impl ManagerService for Manager {
             return Err(Status::invalid_argument("engine_id is required"));
         }
 
-        let engine_id = reg.engine_id.clone();
-        let mut state = self.state.write().await;
-
-        // Validate and store the FileDescriptorSet bytes from each module's descriptor.
-        // Every module must declare a schema — empty proto_schema is rejected.
+        // Validate modules
         for module in &reg.modules {
             if module.namespace.is_empty() {
                 return Err(Status::invalid_argument(format!(
@@ -59,18 +58,15 @@ impl ManagerService for Manager {
                     module.name, module.namespace
                 )));
             }
-            state.schemas.insert(
-                (
-                    module.namespace.clone(),
-                    module.name.clone(),
-                    module.version.clone(),
-                ),
-                module.proto_schema.clone(),
-            );
         }
 
-        // Initialise module health so the monitor doesn't immediately mark
-        // modules as unhealthy before their first heartbeat arrives.
+        let engine_id = reg.engine_id.clone();
+
+        // Persist to DB
+        db::upsert_engine_and_schemas(&self.pool, &reg).await?;
+
+        // Update ephemeral state
+        let mut state = self.state.write().await;
         for module in &reg.modules {
             state.module_health.insert(
                 (
@@ -82,8 +78,6 @@ impl ManagerService for Manager {
                 Instant::now(),
             );
         }
-
-        state.engines.insert(engine_id.clone(), reg);
         state.heartbeats.insert(engine_id.clone(), Instant::now());
 
         info!(engine_id, "engine registered");
@@ -95,26 +89,16 @@ impl ManagerService for Manager {
         request: Request<DeregisterEngineRequest>,
     ) -> Result<Response<DeregisterEngineResponse>, Status> {
         let engine_id = request.into_inner().engine_id;
-        let mut state = self.state.write().await;
 
-        state.engines.remove(&engine_id);
+        // Persist to DB (marks rules unhealthy, deletes engine)
+        db::deregister_engine(&self.pool, &engine_id).await?;
+
+        // Clean up ephemeral state
+        let mut state = self.state.write().await;
         state.heartbeats.remove(&engine_id);
         state
             .module_health
             .retain(|(eid, _, _, _), _| eid != &engine_id);
-
-        // Mark all routing rules for this engine as unhealthy so proxies
-        // stop sending traffic before the next routing table sync.
-        let mut changed = false;
-        for rule in &mut state.routing_table.rules {
-            if rule.engine_id == engine_id && rule.healthy {
-                rule.healthy = false;
-                changed = true;
-            }
-        }
-        if changed {
-            state.routing_table.version += 1;
-        }
 
         info!(engine_id, "engine deregistered");
         Ok(Response::new(DeregisterEngineResponse {}))
@@ -150,8 +134,7 @@ impl ManagerService for Manager {
         &self,
         _request: Request<ListEnginesRequest>,
     ) -> Result<Response<ListEnginesResponse>, Status> {
-        let state = self.state.read().await;
-        let engines = state.engines.values().cloned().collect();
+        let engines = db::list_engines(&self.pool).await?;
         Ok(Response::new(ListEnginesResponse { engines }))
     }
 
@@ -161,9 +144,9 @@ impl ManagerService for Manager {
         &self,
         _request: Request<GetRoutingTableRequest>,
     ) -> Result<Response<GetRoutingTableResponse>, Status> {
-        let state = self.state.read().await;
+        let table = db::get_routing_table(&self.pool).await?;
         Ok(Response::new(GetRoutingTableResponse {
-            table: Some(state.routing_table.clone()),
+            table: Some(table),
         }))
     }
 
@@ -178,30 +161,18 @@ impl ManagerService for Manager {
             return Err(Status::invalid_argument("rule_id is required"));
         }
 
-        let mut state = self.state.write().await;
-        let rules = &mut state.routing_table.rules;
+        info!(
+            rule_id              = %rule.rule_id,
+            source               = %rule.source_module,
+            source_namespace     = %rule.source_namespace,
+            destination          = %rule.destination_module,
+            destination_namespace = %rule.destination_namespace,
+            version              = %rule.destination_version,
+            engine_id            = %rule.engine_id,
+            "routing rule upserted",
+        );
 
-        match rules.iter_mut().find(|r| r.rule_id == rule.rule_id) {
-            Some(existing) => {
-                info!(rule_id = rule.rule_id, "routing rule updated");
-                *existing = rule;
-            }
-            None => {
-                info!(
-                    rule_id              = %rule.rule_id,
-                    source               = %rule.source_module,
-                    source_namespace     = %rule.source_namespace,
-                    destination          = %rule.destination_module,
-                    destination_namespace = %rule.destination_namespace,
-                    version              = %rule.destination_version,
-                    engine_id            = %rule.engine_id,
-                    "routing rule added",
-                );
-                rules.push(rule);
-            }
-        }
-        state.routing_table.version += 1;
-
+        db::upsert_routing_rule(&self.pool, &rule).await?;
         Ok(Response::new(UpsertRoutingRuleResponse {}))
     }
 
@@ -210,13 +181,8 @@ impl ManagerService for Manager {
         request: Request<DeleteRoutingRuleRequest>,
     ) -> Result<Response<DeleteRoutingRuleResponse>, Status> {
         let rule_id = request.into_inner().rule_id;
-        let mut state = self.state.write().await;
-        let before = state.routing_table.rules.len();
 
-        state.routing_table.rules.retain(|r| r.rule_id != rule_id);
-
-        if state.routing_table.rules.len() < before {
-            state.routing_table.version += 1;
+        if db::delete_routing_rule(&self.pool, &rule_id).await? {
             info!(rule_id, "routing rule deleted");
         }
 
@@ -230,30 +196,14 @@ impl ManagerService for Manager {
         request: Request<GetSchemaRequest>,
     ) -> Result<Response<GetSchemaResponse>, Status> {
         let req = request.into_inner();
-        let state = self.state.read().await;
 
         if req.namespace.is_empty() {
             return Err(Status::invalid_argument("namespace is required"));
         }
 
-        let schema = state
-            .schemas
-            .get(&(
-                req.namespace.clone(),
-                req.module.clone(),
-                req.version.clone(),
-            ))
-            .cloned()
-            .ok_or_else(|| {
-                Status::not_found(format!(
-                    "no schema for {}/{}/{}",
-                    req.namespace, req.module, req.version
-                ))
-            })?;
-
-        Ok(Response::new(GetSchemaResponse {
-            proto_schema: schema,
-        }))
+        let proto_schema =
+            db::get_schema(&self.pool, &req.namespace, &req.module, &req.version).await?;
+        Ok(Response::new(GetSchemaResponse { proto_schema }))
     }
 
     async fn upload_schema(
@@ -268,14 +218,14 @@ impl ManagerService for Manager {
             ));
         }
 
-        self.state.write().await.schemas.insert(
-            (
-                req.namespace.clone(),
-                req.module.clone(),
-                req.version.clone(),
-            ),
-            req.proto_schema,
-        );
+        db::upsert_schema(
+            &self.pool,
+            &req.namespace,
+            &req.module,
+            &req.version,
+            &req.proto_schema,
+        )
+        .await?;
 
         info!(namespace = %req.namespace, module = %req.module, version = %req.version, "schema stored");
         Ok(Response::new(UploadSchemaResponse {}))

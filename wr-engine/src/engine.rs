@@ -22,6 +22,7 @@ use wasmtime_wasi_http::p2::{
 use crate::registry::{InboundRequest, ModuleRegistry, ModuleTx};
 use wr_engine::blobstore::BlobstoreRuntime;
 use wr_engine::config::{EngineConfig, ModuleConfig};
+use wr_engine::llm::LlmRuntime;
 use wr_engine::pool::module_schema;
 use wr_engine::state::{ModuleServices, ModuleState};
 
@@ -34,6 +35,8 @@ pub struct EngineRunner {
     db_pools: HashMap<(String, String), Arc<Pool>>,
     /// Shared S3-compatible blobstore client, present when `[blobstore]` is configured.
     blobstore_client: Option<Arc<BlobstoreRuntime>>,
+    /// Shared LLM inference client, present when `[llm]` is configured.
+    llm_client: Option<Arc<LlmRuntime>>,
 }
 
 impl EngineRunner {
@@ -80,12 +83,20 @@ impl EngineRunner {
             .transpose()?
             .map(Arc::new);
 
+        let llm_client = config
+            .llm
+            .as_ref()
+            .map(LlmRuntime::new)
+            .transpose()?
+            .map(Arc::new);
+
         Ok(Self {
             engine: Arc::new(engine),
             config,
             db_pool,
             db_pools,
             blobstore_client,
+            llm_client,
         })
     }
 
@@ -187,6 +198,10 @@ impl EngineRunner {
             ModuleState,
             wasmtime::component::HasSelf<ModuleState>,
         >(&mut linker, |s| s)?;
+        wr_engine::llm::add_to_linker::<ModuleState, wasmtime::component::HasSelf<ModuleState>>(
+            &mut linker,
+            |s| s,
+        )?;
 
         // Try to pre-link as a WASI HTTP Proxy world component first.
         // This succeeds when the component exports `wasi:http/incoming-handler`.
@@ -218,6 +233,11 @@ impl EngineRunner {
                 } else {
                     None
                 };
+                let llm = if module_config.llm {
+                    self.llm_client.clone()
+                } else {
+                    None
+                };
                 let handler = HandlerContext {
                     engine: self.engine.clone(),
                     pre,
@@ -230,6 +250,7 @@ impl EngineRunner {
                     db_pool,
                     db_schema,
                     blobstore,
+                    llm,
                     fs: module_config.fs.clone(),
                     request_timeout: Duration::from_secs(module_config.request_timeout_secs),
                 };
@@ -252,6 +273,11 @@ impl EngineRunner {
                 } else {
                     None
                 };
+                let llm = if module_config.llm {
+                    self.llm_client.clone()
+                } else {
+                    None
+                };
                 let state = ModuleState::new(
                     module_name.clone(),
                     module_namespace.clone(),
@@ -261,6 +287,7 @@ impl EngineRunner {
                         db_pool,
                         db_schema,
                         blobstore,
+                        llm,
                         fs: module_config.fs.clone(),
                         active_span: tracing::Span::current(),
                     },
@@ -313,6 +340,7 @@ struct ModuleContext {
     db_pool: Option<Arc<Pool>>,
     db_schema: Option<String>,
     blobstore: Option<Arc<BlobstoreRuntime>>,
+    llm: Option<Arc<LlmRuntime>>,
     fs: Option<wr_engine::config::FsMode>,
     request_timeout: Duration,
 }
@@ -387,6 +415,7 @@ async fn dispatch_request(
             db_pool: module.db_pool.clone(),
             db_schema: module.db_schema.clone(),
             blobstore: module.blobstore.clone(),
+            llm: module.llm.clone(),
             fs: module.fs.clone(),
             active_span: tracing::Span::current(),
         },

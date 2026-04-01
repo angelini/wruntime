@@ -11,5 +11,7 @@ anyhow   = "1"
 toml     = "0.8"
 serde    = { version = "1", features = ["derive"] }
 wr-common          = { path = "../wr-common" }
+deadpool-postgres  = { version = "0.14", features = ["rt_tokio_1"] }
+tokio-postgres     = { version = "0.7", features = ["with-chrono-0_4"] }
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

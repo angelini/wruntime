@@ -16,6 +16,8 @@ pub struct EngineConfig {
     pub database: Option<DatabaseConfig>,
     /// Optional S3-compatible blobstore shared across blobstore-enabled modules.
     pub blobstore: Option<BlobstoreConfig>,
+    /// Optional LLM provider for inference-enabled modules.
+    pub llm: Option<LlmConfig>,
     /// WASM instance pooling allocator configuration.
     /// Wasmtime pre-allocates a pool of instance slots to avoid per-request
     /// memory mapping overhead. All fields have sensible defaults so an empty
@@ -80,6 +82,29 @@ fn default_bs_region() -> String {
     "us-east-1".into()
 }
 
+#[derive(Deserialize, Clone)]
+pub struct LlmConfig {
+    /// LLM provider. Currently only "anthropic" is supported.
+    pub provider: String,
+    /// Environment variable name that holds the API key.
+    /// Resolved at engine startup, never passed to guests.
+    pub api_key_env: String,
+    /// Base URL for the API. Defaults to "https://api.anthropic.com".
+    #[serde(default = "default_llm_base_url")]
+    pub base_url: String,
+    /// Host-enforced ceiling on max_tokens per request.
+    #[serde(default = "default_max_tokens_limit")]
+    pub max_tokens_limit: u32,
+}
+
+fn default_llm_base_url() -> String {
+    "https://api.anthropic.com".into()
+}
+
+fn default_max_tokens_limit() -> u32 {
+    8192
+}
+
 /// Filesystem access mode for a module.
 #[derive(Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -110,6 +135,10 @@ pub struct ModuleConfig {
     /// Requires a `[blobstore]` section in the engine config.
     #[serde(default)]
     pub blobstore: bool,
+    /// Whether this module has access to the LLM inference API.
+    /// Requires an `[llm]` section in the engine config.
+    #[serde(default)]
+    pub llm: bool,
     /// Optional filesystem access. Set `fs = "tempdir"` to mount an ephemeral
     /// writable directory at `/` for the duration of each store's lifetime.
     #[serde(default)]
@@ -190,6 +219,11 @@ impl EngineConfig {
             anyhow::ensure!(
                 !module.blobstore || self.blobstore.is_some(),
                 "module '{}' has blobstore = true but no [blobstore] section is configured",
+                module.name,
+            );
+            anyhow::ensure!(
+                !module.llm || self.llm.is_some(),
+                "module '{}' has llm = true but no [llm] section is configured",
                 module.name,
             );
             if let Some(mig_path) = &module.migrations_path {

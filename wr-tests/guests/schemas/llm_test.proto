@@ -1,0 +1,74 @@
+syntax = "proto3";
+package test;
+
+// ── Complete ────────────────────────────────────────────────────────────────
+
+message CompleteRequest {
+  string model = 1;
+  string system = 2;
+  string user_message = 3;
+  uint32 max_tokens = 4;
+}
+
+message CompleteResponse {
+  string text = 1;
+  string stop_reason = 2;
+  uint32 input_tokens = 3;
+  uint32 output_tokens = 4;
+}
+
+// ── CompleteText ────────────────────────────────────────────────────────────
+
+message CompleteTextRequest {
+  string user_message = 1;
+}
+
+message CompleteTextResponse {
+  string text = 1;
+}
+
+// ── ToolUse ─────────────────────────────────────────────────────────────────
+
+message ToolUseRequest {
+  string user_message = 1;
+  string tool_name = 2;
+  string tool_description = 3;
+  string tool_schema = 4;
+}
+
+message ToolUseResponse {
+  string tool_name = 1;
+  string tool_id = 2;
+  string tool_input = 3;
+  string stop_reason = 4;
+}
+
+// ── Error ───────────────────────────────────────────────────────────────────
+
+message LlmErrorRequest {
+  string user_message = 1;
+}
+
+message LlmErrorResponse {
+  string error_kind = 1;
+  string error_message = 2;
+}
+
+// ── Stream ──────────────────────────────────────────────────────────────────
+
+message StreamRequest {
+  string user_message = 1;
+}
+
+message StreamResponse {
+  string text = 1;
+  uint32 chunk_count = 2;
+}
+
+service LlmTestService {
+  rpc Complete(CompleteRequest) returns (CompleteResponse);
+  rpc CompleteText(CompleteTextRequest) returns (CompleteTextResponse);
+  rpc ToolUse(ToolUseRequest) returns (ToolUseResponse);
+  rpc Error(LlmErrorRequest) returns (LlmErrorResponse);
+  rpc Stream(StreamRequest) returns (StreamResponse);
+}
