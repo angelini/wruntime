@@ -94,10 +94,8 @@ impl Service<Request<ProxyBody>> for ForwardService {
             if !cb.is_call_permitted() {
                 warn!(parent: &span, engine = %forward_addr, "circuit open");
                 span.record("otel.status_code", "circuit_open");
-                let mut resp = super::error_response(
-                    http::StatusCode::SERVICE_UNAVAILABLE,
-                    "circuit open",
-                );
+                let mut resp =
+                    super::error_response(http::StatusCode::SERVICE_UNAVAILABLE, "circuit open");
                 let secs = cb_registry.open_duration_secs();
                 if let Ok(val) = http::HeaderValue::from_str(&secs.to_string()) {
                     resp.headers_mut().insert(http::header::RETRY_AFTER, val);

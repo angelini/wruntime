@@ -8,7 +8,7 @@ use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use tower::{Layer, Service};
-use tracing::{info_span, Instrument};
+use tracing::{info_span, warn, Instrument};
 
 use super::{full_body, ProxyBody, ResBody};
 use crate::config::EgressConfig;
@@ -86,10 +86,22 @@ where
             let config = self.config.clone();
             let client = self.client.clone();
 
+            let source = req
+                .headers()
+                .get("x-wr-source")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown")
+                .to_string();
+
             return Box::pin(async move {
                 let egress_cfg = match config {
                     Some(c) => c,
                     None => {
+                        warn!(
+                            source = %source,
+                            host = %egress.host,
+                            "egress blocked: not configured",
+                        );
                         return Ok(super::error_response(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "egress not configured",
@@ -106,6 +118,11 @@ where
                     .any(|pattern| domain_matches(pattern, host));
 
                 if !allowed {
+                    warn!(
+                        source = %source,
+                        host = %host,
+                        "egress blocked: domain not in allowlist",
+                    );
                     let body = serde_json::json!({
                         "error": "egress_not_allowed",
                         "detail": format!("domain '{host}' is not in the egress allowlist"),
@@ -120,13 +137,6 @@ where
 
                 // Strip all x-wr-* headers before forwarding to the external host.
                 let (mut parts, body) = req.into_parts();
-
-                let source = parts
-                    .headers
-                    .get("x-wr-source")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("unknown")
-                    .to_string();
 
                 for name in &[
                     "x-wr-destination",
@@ -184,7 +194,7 @@ where
 /// `*` matches exactly one DNS label:
 /// - `*.openai.com` matches `api.openai.com` ✓
 /// - `*.openai.com` does NOT match `openai.com` or `a.b.openai.com`
-fn domain_matches(pattern: &str, host: &str) -> bool {
+pub fn domain_matches(pattern: &str, host: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
     let host = host.to_ascii_lowercase();
 

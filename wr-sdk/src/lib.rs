@@ -66,6 +66,7 @@ pub trait RunGuest {
 
 pub mod http;
 pub mod io;
+pub mod jobs;
 pub mod llm;
 pub mod log;
 pub mod tracing;

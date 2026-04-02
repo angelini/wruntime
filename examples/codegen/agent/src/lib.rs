@@ -7,18 +7,46 @@ mod proto {
 mod bindings;
 
 use serde::Deserialize;
+use wr_sdk::bindings::wasi::clocks::monotonic_clock;
 use wr_sdk::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
 use wr_sdk::bindings::wruntime::blobstore::store;
 use wr_sdk::bindings::wruntime::db::database::{self, PgValue};
+use wr_sdk::bindings::wruntime::llm::inference::{CompletionResponse, LlmError};
 use wr_sdk::io::{read_body, send_response};
 use wr_sdk::llm::CompletionBuilder;
+use wr_sdk::tracing;
 use wr_sdk::ServiceError;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
 const BUCKET: &str = "codegen";
-const MAX_CONTEXT_BYTES: usize = 500 * 1024; // ~500 KB context budget
+const MAX_CONTEXT_BYTES: usize = 300 * 1024; // ~300 KB context budget
+const MAX_RETRIES: u32 = 3;
+
+/// Call a builder-producing closure, retrying on rate-limit errors with a
+/// sleep based on the retry-after hint from the API.
+fn complete_with_retry(
+    mut build: impl FnMut() -> CompletionBuilder,
+) -> Result<CompletionResponse, LlmError> {
+    for attempt in 0..=MAX_RETRIES {
+        match build().complete() {
+            Ok(resp) => return Ok(resp),
+            Err(LlmError::RateLimited(retry_after)) if attempt < MAX_RETRIES => {
+                let secs = retry_after.unwrap_or(30);
+                wr_sdk::log::log(&format!(
+                    "rate limited, retrying in {secs}s (attempt {}/{})",
+                    attempt + 1,
+                    MAX_RETRIES
+                ));
+                let nanos = secs as u64 * 1_000_000_000;
+                monotonic_clock::subscribe_duration(nanos).block();
+            }
+            other => return other,
+        }
+    }
+    unreachable!()
+}
 
 impl wr_sdk::ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
@@ -45,12 +73,18 @@ struct ManifestEntry {
 // ── Service implementation ───────────────────────────────────────────────────
 
 impl proto::AgentService for Component {
-    fn run_task(
-        &self,
-        req: proto::RunTaskRequest,
-    ) -> Result<proto::RunTaskResponse, ServiceError> {
+    fn run_task(&self, req: proto::RunTaskRequest) -> Result<proto::RunTaskResponse, ServiceError> {
         let session_id = &req.session_id;
         let max_turns = if req.max_turns > 0 { req.max_turns } else { 3 };
+
+        let span = tracing::start(
+            "agent.run_task",
+            &[
+                ("session.id", session_id.as_str()),
+                ("agent.max_turns", &max_turns.to_string()),
+                ("agent.doc_prefixes", &req.doc_prefixes.len().to_string()),
+            ],
+        );
 
         // Create session in DB.
         database::execute(
@@ -74,11 +108,18 @@ impl proto::AgentService for Component {
         }
 
         // Load relevant documentation from blobstore.
+        let ctx_span = tracing::start("agent.build_context", &[]);
         let context = build_context(&req.doc_prefixes, &req.task_description)?;
+        tracing::set_attribute(&ctx_span, "context.length", &context.len().to_string());
+        drop(ctx_span);
 
         let system_prompt = format!(
             "You are a code generation agent. You produce unified diffs (patches) for code changes.\n\n\
-             ## Documentation Context\n{context}\n\n\
+             ## Context\n\
+             The context below includes both source code files (from the repository) and \
+             documentation. Use the source code to understand the existing codebase and produce \
+             accurate diffs against the actual file contents.\n\n\
+             {context}\n\n\
              ## Output Format\n\
              Produce a unified diff that can be applied with `patch -p1`. \
              Include file paths relative to the repository root. \
@@ -91,16 +132,22 @@ impl proto::AgentService for Component {
         let mut latest_diff;
         let mut turn = 0;
 
-        // Build conversation history for multi-turn.
-        let mut builder = CompletionBuilder::sonnet()
-            .system(&system_prompt)
-            .max_tokens(8192);
-
         // Turn 1: initial generation.
         let user_prompt = format!("## Task\n{}", req.task_description);
-        builder = builder.user(&user_prompt);
 
-        let resp = builder.complete().map_err(|e| {
+        let turn_span = tracing::start("agent.llm_turn", &[("turn", "1")]);
+        wr_sdk::log::log(&format!(
+            "llm call: turn=1 model=claude-sonnet-4-6 messages=1 max_tokens=8192 system_len={}",
+            system_prompt.len()
+        ));
+        let resp = complete_with_retry(|| {
+            CompletionBuilder::sonnet()
+                .system(&system_prompt)
+                .max_tokens(8192)
+                .user(&user_prompt)
+        })
+        .map_err(|e| {
+            tracing::set_error(&turn_span, &format!("llm complete: {e:?}"));
             ServiceError::internal(format!("llm complete: {e:?}"))
         })?;
 
@@ -116,6 +163,24 @@ impl proto::AgentService for Component {
         latest_diff = text.clone();
         turn += 1;
 
+        wr_sdk::log::log(&format!(
+            "llm response: turn=1 input_tokens={} output_tokens={} response_len={}",
+            resp.usage.input_tokens,
+            resp.usage.output_tokens,
+            text.len()
+        ));
+        tracing::set_attribute(
+            &turn_span,
+            "tokens.input",
+            &resp.usage.input_tokens.to_string(),
+        );
+        tracing::set_attribute(
+            &turn_span,
+            "tokens.output",
+            &resp.usage.output_tokens.to_string(),
+        );
+        drop(turn_span);
+
         store_turn(session_id, turn, &user_prompt, &text, &resp.usage)?;
 
         // Subsequent turns: review and refine.
@@ -126,21 +191,35 @@ impl proto::AgentService for Component {
                 If improvements are needed, produce an updated unified diff. \
                 If the diff is already correct, respond with exactly: LGTM";
 
-            // Rebuild with full conversation history.
-            let refine_builder = CompletionBuilder::sonnet()
-                .system(&system_prompt)
-                .max_tokens(8192)
-                .user(&user_prompt)
-                .assistant(&prev_assistant)
-                .user(refine_prompt);
-
-            let resp = refine_builder.complete().map_err(|e| {
+            let turn_span = tracing::start(
+                "agent.llm_turn",
+                &[("turn", &(turn + 1).to_string()), ("type", "refine")],
+            );
+            wr_sdk::log::log(&format!(
+                "llm call: turn={} type=refine model=claude-sonnet-4-6 messages=2 max_tokens=8192",
+                turn + 1,
+            ));
+            // Refinement turns don't resend the full context — the model's
+            // own diff output contains everything needed for self-review.
+            let resp = complete_with_retry(|| {
+                CompletionBuilder::sonnet()
+                    .max_tokens(8192)
+                    .user(&format!("Here is a unified diff I produced:\n\n{prev_assistant}"))
+                    .user(refine_prompt)
+            })
+            .map_err(|e| {
+                tracing::set_error(&turn_span, &format!("llm refine: {e:?}"));
                 ServiceError::internal(format!("llm refine: {e:?}"))
             })?;
 
             let text = match resp.completion {
                 wr_sdk::bindings::wruntime::llm::inference::Completion::Text(s) => s,
                 wr_sdk::bindings::wruntime::llm::inference::Completion::ToolCalls(_) => {
+                    wr_sdk::log::log(&format!(
+                        "llm response: turn={} unexpected tool_use, stopping",
+                        turn + 1
+                    ));
+                    drop(turn_span);
                     break;
                 }
             };
@@ -149,11 +228,29 @@ impl proto::AgentService for Component {
             total_output += resp.usage.output_tokens as i32;
             turn += 1;
 
+            wr_sdk::log::log(&format!(
+                "llm response: turn={turn} type=refine input_tokens={} output_tokens={} response_len={} lgtm={}",
+                resp.usage.input_tokens, resp.usage.output_tokens, text.len(), text.trim() == "LGTM"
+            ));
+            tracing::set_attribute(
+                &turn_span,
+                "tokens.input",
+                &resp.usage.input_tokens.to_string(),
+            );
+            tracing::set_attribute(
+                &turn_span,
+                "tokens.output",
+                &resp.usage.output_tokens.to_string(),
+            );
+
             store_turn(session_id, turn, refine_prompt, &text, &resp.usage)?;
 
             if text.trim() == "LGTM" {
+                tracing::record_event(&turn_span, "lgtm", &[]);
+                drop(turn_span);
                 break;
             }
+            drop(turn_span);
 
             latest_diff = text.clone();
             prev_assistant = text;
@@ -169,6 +266,16 @@ impl proto::AgentService for Component {
             ],
         )
         .map_err(|e| ServiceError::internal(format!("update session: {e:?}")))?;
+
+        tracing::set_attribute(&span, "agent.turns_used", &turn.to_string());
+        tracing::set_attribute(&span, "agent.total_input_tokens", &total_input.to_string());
+        tracing::set_attribute(
+            &span,
+            "agent.total_output_tokens",
+            &total_output.to_string(),
+        );
+        tracing::set_attribute(&span, "agent.diff_bytes", &latest_diff.len().to_string());
+        drop(span);
 
         Ok(proto::RunTaskResponse {
             session_id: session_id.clone(),
@@ -256,10 +363,7 @@ impl proto::AgentService for Component {
 
 // ── Context builder ──────────────────────────────────────────────────────────
 
-fn build_context(
-    doc_prefixes: &[String],
-    task_description: &str,
-) -> Result<String, ServiceError> {
+fn build_context(doc_prefixes: &[String], task_description: &str) -> Result<String, ServiceError> {
     let task_lower = task_description.to_lowercase();
     let mut context = String::new();
     let mut total_size: usize = 0;
@@ -290,6 +394,13 @@ fn build_context(
                 if key_lower.ends_with(".md") {
                     score += 5;
                 }
+                // Boost source code files so the agent has real code to diff against.
+                if key_lower.ends_with(".rs")
+                    || key_lower.ends_with(".toml")
+                    || key_lower.ends_with(".proto")
+                {
+                    score += 6;
+                }
 
                 // Boost files whose names match task keywords.
                 for word in task_lower.split_whitespace() {
@@ -317,14 +428,14 @@ fn build_context(
             match store::get_object(BUCKET, &entry.key) {
                 Ok(data) => {
                     if let Ok(text) = String::from_utf8(data.clone()) {
-                        // Extract a short label from the key.
+                        // Extract the path after "files/" for a meaningful label.
                         let label = entry
                             .key
-                            .rsplit('/')
-                            .next()
+                            .find("/files/")
+                            .map(|i| &entry.key[i + 7..])
                             .unwrap_or(&entry.key);
 
-                        context.push_str(&format!("<doc: {label}>\n{text}\n</doc>\n\n"));
+                        context.push_str(&format!("<file: {label}>\n{text}\n</file>\n\n"));
                         total_size += data.len();
                     }
                 }

@@ -306,9 +306,12 @@ pub async fn start_egress_proxy(
     table: wr_proxy::routing::CachedRoutingTable,
 ) -> Result<SocketAddr> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let egress_enabled = egress_cfg.is_some();
+    let egress_domains = egress_cfg
+        .as_ref()
+        .map(|e| e.allowed_domains.clone())
+        .unwrap_or_default();
     let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::RoutingLayer::new(table, "").with_egress(egress_enabled))
+        .layer(wr_proxy::layers::RoutingLayer::new(table, "").with_egress(egress_domains))
         .layer(wr_proxy::layers::EgressLayer::new(egress_cfg))
         .service(wr_proxy::layers::ForwardService::new(Arc::new(
             wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
@@ -1232,4 +1235,78 @@ pub fn llm_state(llm: Arc<LlmRuntime>) -> ModuleState {
         },
     )
     .expect("ModuleState")
+}
+
+// ── Worker helpers ───────────────────────────────────────────────────────────
+
+/// Build a `deadpool_postgres::Pool` for worker integration tests and provision
+/// the `wr__jobs` schema exactly once. Does NOT clean the jobs table — use unique
+/// namespaces for test isolation.
+pub async fn worker_pool() -> deadpool_postgres::Pool {
+    use tokio::sync::OnceCell;
+    static PROVISIONED: OnceCell<()> = OnceCell::const_new();
+
+    let url = require_db_url();
+    let pool = wr_engine::pool::build_pool(&url, 2).expect("build pool");
+
+    PROVISIONED
+        .get_or_init(|| async {
+            wr_engine::worker::provision_job_schema(&pool)
+                .await
+                .expect("provision wr__jobs");
+        })
+        .await;
+
+    pool
+}
+
+/// Spawn a stub engine that processes worker job requests.
+///
+/// For each inbound request, the stub reads the path (job_type) and body (payload),
+/// then responds with 200 OK and the body `"processed:{path}"`.
+/// If the path contains "fail", responds with 500 instead.
+pub async fn spawn_worker_stub_engine() -> Result<(String, oneshot::Sender<()>)> {
+    let (tx, rx) = oneshot::channel::<()>();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = rx => {}
+            _ = worker_stub_engine(listener) => {}
+        }
+    });
+    Ok((addr, tx))
+}
+
+async fn worker_stub_engine(listener: TcpListener) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc =
+                hyper::service::service_fn(|req: Request<hyper::body::Incoming>| async move {
+                    let path = req.uri().path().to_string();
+                    let status = if path.contains("fail") { 500 } else { 200 };
+                    let body_bytes = BodyExt::collect(req.into_body())
+                        .await
+                        .map(|c| c.to_bytes())
+                        .unwrap_or_default();
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(status)
+                            .body(Full::new(Bytes::from(format!(
+                                "processed:{}:{}",
+                                path,
+                                body_bytes.len()
+                            ))))
+                            .unwrap(),
+                    )
+                });
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await;
+        });
+    }
 }

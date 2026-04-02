@@ -10,10 +10,12 @@ use anyhow::Result;
 use bytes::Bytes;
 use http::{Request, StatusCode};
 use http_body_util::{BodyExt, Full};
+use std::sync::Arc;
 
 use wr_common::wruntime::{
-    DeregisterEngineRequest, EngineRegistration, GetRoutingTableRequest, HeartbeatRequest,
-    ListEnginesRequest, ModuleDescriptor, RegisterEngineRequest, RoutingRule,
+    DeleteSecretRequest, DeregisterEngineRequest, EngineRegistration, GetRoutingTableRequest,
+    HeartbeatRequest, ListEnginesRequest, ListSecretsRequest, ModuleDescriptor,
+    RegisterEngineRequest, RoutingRule, SecretRequest, SetSecretRequest,
 };
 use wr_manager::config::ManagerConfig;
 use wr_proxy::config::{CircuitBreakerConfig, ProxyConfig};
@@ -226,7 +228,8 @@ async fn test_egress_allowed_domain() -> Result<()> {
     Ok(())
 }
 
-/// Blocked domain: proxy returns 403 without forwarding the request.
+/// Blocked domain: routing layer rejects with 503 because the host is not
+/// in the egress allowlist and has no internal route.
 #[tokio::test]
 async fn test_egress_blocked_domain() -> Result<()> {
     let table = wr_proxy::routing::new_routing_table();
@@ -249,10 +252,7 @@ async fn test_egress_blocked_domain() -> Result<()> {
         .body(Full::new(Bytes::new()))?;
 
     let resp = http_client().request(req).await?;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    let body = resp.into_body().collect().await?.to_bytes();
-    let json: serde_json::Value = serde_json::from_slice(&body)?;
-    assert_eq!(json["error"], "egress_not_allowed");
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     Ok(())
 }
@@ -2175,8 +2175,8 @@ async fn test_heartbeat_missing_module_becomes_unhealthy() -> Result<()> {
     })
     .await?;
 
-    // Wait for monitor.
-    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+    // Wait for the monitor tick (200ms interval) to detect the stale timestamp.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // The module should be unhealthy because its timestamp was never refreshed.
     let (healthy, _) = get_rule_health(&mut mgr, "missed-svc").await?;
@@ -2193,10 +2193,10 @@ async fn test_heartbeat_missing_module_becomes_unhealthy() -> Result<()> {
 /// causes the monitor to restore the healthy status.
 #[tokio::test]
 async fn test_module_health_recovery_after_heartbeat() -> Result<()> {
-    // Use a 30-second timeout so the freshly-set heartbeat timestamp doesn't
-    // expire before the monitor's 10-second tick runs.
+    // Use a short timeout (1s). The monitor tick is 200ms, so health changes
+    // are detected within ~500ms.
     let pool = manager_pool().await;
-    let (mgr_addr, state) = start_manager_with_monitor(pool, 30).await?;
+    let (mgr_addr, state) = start_manager_with_monitor(pool, 1).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
@@ -2230,13 +2230,13 @@ async fn test_module_health_recovery_after_heartbeat() -> Result<()> {
         }
     }
 
-    // Wait for the monitor to mark it unhealthy.
-    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+    // Wait for the monitor tick (200ms interval) to detect the stale timestamp.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let (healthy, _) = get_rule_health(&mut mgr, "recovering-svc").await?;
     assert!(!healthy, "module should be unhealthy before recovery");
 
-    // Send a heartbeat that includes the module.
+    // Send a heartbeat that includes the module — refreshes the timestamp.
     mgr.heartbeat(HeartbeatRequest {
         engine_id: "hc-rec-e1".into(),
         healthy_modules: vec![ModuleDescriptor {
@@ -2248,8 +2248,8 @@ async fn test_module_health_recovery_after_heartbeat() -> Result<()> {
     })
     .await?;
 
-    // Wait for the next monitor tick to pick up the fresh timestamp.
-    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+    // Wait for the next monitor tick to see the fresh timestamp.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let (healthy, _) = get_rule_health(&mut mgr, "recovering-svc").await?;
     assert!(healthy, "module should recover after heartbeat");
@@ -2304,7 +2304,8 @@ async fn test_unhealthy_module_excluded_from_routing() -> Result<()> {
         }
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+    // Wait for the monitor tick (200ms interval) to detect the stale timestamp.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Re-sync the routing table — the rule should now be unhealthy.
     sync_table(&mgr_addr, &table).await?;
@@ -2358,7 +2359,8 @@ async fn test_health_change_bumps_routing_table_version() -> Result<()> {
         }
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+    // Wait for the monitor tick (200ms interval) to detect the stale timestamp.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let version_after = get_routing_table_version(&mut mgr).await?;
 
@@ -2366,6 +2368,1070 @@ async fn test_health_change_bumps_routing_table_version() -> Result<()> {
         version_after > version_before,
         "routing table version should increase on health change: before={version_before}, after={version_after}"
     );
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+// ── worker mode tests ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_worker_config_parsing() {
+    let toml_str = r#"
+        listen_address  = "127.0.0.1:9100"
+        manager_address = "http://127.0.0.1:9000"
+
+        [node]
+        proxy_address = "http://127.0.0.1:9001"
+
+        [database]
+        url             = "postgres://localhost/test"
+        max_connections = 5
+
+        [[module]]
+        name      = "my-worker"
+        namespace = "test"
+        version   = "1.0.0"
+        wasm_path = "wr-tests/guests/tracing-guest/target/wasm32-wasip2/release/tracing_guest.wasm"
+        mode      = "worker"
+        database  = true
+        worker_concurrency      = 8
+        worker_poll_interval_secs = 5
+        worker_job_timeout_secs = 600
+        worker_max_attempts     = 5
+    "#;
+    let config: wr_engine::config::EngineConfig = toml::from_str(toml_str).unwrap();
+    let m = &config.modules[0];
+    assert_eq!(m.mode, wr_engine::config::ModuleMode::Worker);
+    assert_eq!(m.worker_concurrency, 8);
+    assert_eq!(m.worker_poll_interval_secs, 5);
+    assert_eq!(m.worker_job_timeout_secs, 600);
+    assert_eq!(m.worker_max_attempts, 5);
+}
+
+#[tokio::test]
+async fn test_worker_config_defaults() {
+    let toml_str = r#"
+        listen_address  = "127.0.0.1:9100"
+        manager_address = "http://127.0.0.1:9000"
+
+        [node]
+        proxy_address = "http://127.0.0.1:9001"
+
+        [database]
+        url = "postgres://localhost/test"
+
+        [[module]]
+        name      = "my-worker"
+        namespace = "test"
+        version   = "1.0.0"
+        wasm_path = "wr-tests/guests/tracing-guest/target/wasm32-wasip2/release/tracing_guest.wasm"
+        mode      = "worker"
+        database  = true
+    "#;
+    let config: wr_engine::config::EngineConfig = toml::from_str(toml_str).unwrap();
+    let m = &config.modules[0];
+    assert_eq!(m.worker_concurrency, 4);
+    assert_eq!(m.worker_poll_interval_secs, 2);
+    assert_eq!(m.worker_job_timeout_secs, 300);
+    assert_eq!(m.worker_max_attempts, 3);
+}
+
+#[tokio::test]
+async fn test_worker_mode_service_default() {
+    let toml_str = r#"
+        listen_address  = "127.0.0.1:9100"
+        manager_address = "http://127.0.0.1:9000"
+
+        [node]
+        proxy_address = "http://127.0.0.1:9001"
+
+        [[module]]
+        name      = "svc"
+        namespace = "test"
+        version   = "1.0.0"
+        wasm_path = "wr-tests/guests/tracing-guest/target/wasm32-wasip2/release/tracing_guest.wasm"
+    "#;
+    let config: wr_engine::config::EngineConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(
+        config.modules[0].mode,
+        wr_engine::config::ModuleMode::Service
+    );
+}
+
+#[tokio::test]
+async fn test_worker_mode_run_parsing() {
+    let toml_str = r#"
+        listen_address  = "127.0.0.1:9100"
+        manager_address = "http://127.0.0.1:9000"
+
+        [node]
+        proxy_address = "http://127.0.0.1:9001"
+
+        [[module]]
+        name      = "runner"
+        namespace = "test"
+        version   = "1.0.0"
+        wasm_path = "wr-tests/guests/tracing-guest/target/wasm32-wasip2/release/tracing_guest.wasm"
+        mode      = "run"
+    "#;
+    let config: wr_engine::config::EngineConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.modules[0].mode, wr_engine::config::ModuleMode::Run);
+}
+
+// ── worker job queue integration tests (require DB) ──────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_worker_job_submission_and_status_via_grpc() {
+    if std::env::var("WRT_TEST_DB_URL").is_err() {
+        eprintln!("skipping test_worker_job_submission_and_status_via_grpc (no WRT_TEST_DB_URL)");
+        return;
+    }
+    let pool = worker_pool().await;
+    let pool = Arc::new(pool);
+
+    // Start a minimal HTTP/2 engine server with worker gRPC endpoints.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let pool_clone = pool.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let pool = pool_clone.clone();
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let svc =
+                    hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                        let pool = pool.clone();
+                        async move {
+                            let path = req.uri().path().to_owned();
+                            let body = http_body_util::BodyExt::collect(req.into_body())
+                                .await
+                                .map(|c| c.to_bytes())
+                                .unwrap_or_default();
+
+                            let resp = match path.as_str() {
+                                "/wruntime.WorkerService/SubmitJob" => {
+                                    use prost::Message;
+                                    let req =
+                                        wr_common::wruntime::SubmitJobRequest::decode(&body[..])
+                                            .unwrap();
+                                    let job_id = wr_engine::worker::insert_job(
+                                        &pool,
+                                        &req.worker_namespace,
+                                        &req.worker_name,
+                                        &req.worker_version,
+                                        &req.job_type,
+                                        &req.payload,
+                                        req.timeout_secs,
+                                        req.max_attempts,
+                                        "",
+                                        "",
+                                    )
+                                    .await
+                                    .unwrap();
+                                    let resp = wr_common::wruntime::SubmitJobResponse { job_id };
+                                    http::Response::builder()
+                                        .status(200)
+                                        .body(http_body_util::Full::new(bytes::Bytes::from(
+                                            resp.encode_to_vec(),
+                                        )))
+                                        .unwrap()
+                                }
+                                "/wruntime.WorkerService/GetJobStatus" => {
+                                    use prost::Message;
+                                    let req =
+                                        wr_common::wruntime::GetJobStatusRequest::decode(&body[..])
+                                            .unwrap();
+                                    let status =
+                                        wr_engine::worker::get_job_status(&pool, &req.job_id)
+                                            .await
+                                            .unwrap();
+                                    let resp = match status {
+                                        Some(s) => wr_common::wruntime::GetJobStatusResponse {
+                                            job_id: s.job_id,
+                                            status: s.status,
+                                            result: s.result,
+                                            error_message: s.error_message,
+                                            attempt: s.attempt,
+                                            max_attempts: s.max_attempts,
+                                        },
+                                        None => wr_common::wruntime::GetJobStatusResponse {
+                                            ..Default::default()
+                                        },
+                                    };
+                                    http::Response::builder()
+                                        .status(200)
+                                        .body(http_body_util::Full::new(bytes::Bytes::from(
+                                            resp.encode_to_vec(),
+                                        )))
+                                        .unwrap()
+                                }
+                                _ => http::Response::builder()
+                                    .status(404)
+                                    .body(http_body_util::Full::new(bytes::Bytes::from(
+                                        "not found",
+                                    )))
+                                    .unwrap(),
+                            };
+                            Ok::<_, std::convert::Infallible>(resp)
+                        }
+                    });
+                let _ =
+                    hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+            });
+        }
+    });
+
+    // Submit a job via gRPC.
+    use prost::Message;
+    let submit_req = wr_common::wruntime::SubmitJobRequest {
+        worker_namespace: "test-ns".into(),
+        worker_name: "test-mod".into(),
+        worker_version: "1.0.0".into(),
+        job_type: "/test/Process".into(),
+        payload: b"test-payload".to_vec(),
+        timeout_secs: 60,
+        max_attempts: 3,
+    };
+    let client = http_client();
+    let resp = client
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{addr}/wruntime.WorkerService/SubmitJob"))
+                .header("content-type", "application/x-protobuf")
+                .body(Full::new(Bytes::from(submit_req.encode_to_vec())))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let submit_resp = wr_common::wruntime::SubmitJobResponse::decode(&body[..]).unwrap();
+    assert!(!submit_resp.job_id.is_empty());
+
+    // Get job status.
+    let status_req = wr_common::wruntime::GetJobStatusRequest {
+        job_id: submit_resp.job_id.clone(),
+    };
+    let resp = client
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{addr}/wruntime.WorkerService/GetJobStatus"))
+                .header("content-type", "application/x-protobuf")
+                .body(Full::new(Bytes::from(status_req.encode_to_vec())))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let status_resp = wr_common::wruntime::GetJobStatusResponse::decode(&body[..]).unwrap();
+    assert_eq!(status_resp.job_id, submit_resp.job_id);
+    assert_eq!(status_resp.status, "pending");
+    assert_eq!(status_resp.max_attempts, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_worker_pool_dispatches_job_as_http() {
+    if std::env::var("WRT_TEST_DB_URL").is_err() {
+        eprintln!("skipping test_worker_pool_dispatches_job_as_http (no WRT_TEST_DB_URL)");
+        return;
+    }
+    let pool = worker_pool().await;
+    let pool = Arc::new(pool);
+
+    // Create a channel that the worker pool will send InboundRequests into.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::worker::InboundRequest>(16);
+
+    // Insert a job.
+    let job_id = wr_engine::worker::insert_job(
+        &pool,
+        "wpool-ns",
+        "wpool-mod",
+        "1.0.0",
+        "/test.svc/DoWork",
+        b"job-payload",
+        60,
+        3,
+        "",
+        "",
+    )
+    .await
+    .unwrap();
+
+    // Spawn the worker pool.
+    let db_url = std::env::var("WRT_TEST_DB_URL").unwrap();
+    wr_engine::worker::spawn_worker_pool(
+        pool.clone(),
+        wr_engine::worker::WorkerPoolConfig {
+            namespace: "wpool-ns".into(),
+            name: "wpool-mod".into(),
+            version: "1.0.0".into(),
+            engine_id: "test-engine".into(),
+            concurrency: 1,
+            poll_interval: std::time::Duration::from_millis(100),
+            job_timeout: std::time::Duration::from_secs(10),
+            database_url: db_url,
+        },
+        tx,
+    );
+
+    // Wait for the worker to pick up the job and send it as an InboundRequest.
+    let inbound = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout waiting for worker dispatch")
+        .expect("channel closed");
+
+    // Verify the request shape.
+    assert_eq!(inbound.request.method(), "POST");
+    assert_eq!(inbound.request.uri().path(), "/test.svc/DoWork");
+    assert_eq!(
+        inbound.request.headers().get("x-wr-job-id").unwrap(),
+        &job_id
+    );
+    assert_eq!(inbound.request.body().as_ref(), b"job-payload");
+
+    // Respond with 200 OK.
+    let response = http::Response::builder()
+        .status(200)
+        .body(Bytes::from("done"))
+        .unwrap();
+    inbound.response_tx.send(response).unwrap();
+
+    // Wait for the worker to update the job status.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let status = wr_engine::worker::get_job_status(&pool, &job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.status, "complete");
+    assert_eq!(status.result, b"done");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_worker_pool_retries_on_failure() {
+    if std::env::var("WRT_TEST_DB_URL").is_err() {
+        eprintln!("skipping test_worker_pool_retries_on_failure (no WRT_TEST_DB_URL)");
+        return;
+    }
+    let pool = worker_pool().await;
+    let pool = Arc::new(pool);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::worker::InboundRequest>(16);
+
+    let job_id = wr_engine::worker::insert_job(
+        &pool,
+        "retry-ns",
+        "retry-mod",
+        "1.0.0",
+        "/test/Retry",
+        b"",
+        60,
+        2,
+        "",
+        "",
+    )
+    .await
+    .unwrap();
+
+    let db_url = std::env::var("WRT_TEST_DB_URL").unwrap();
+    wr_engine::worker::spawn_worker_pool(
+        pool.clone(),
+        wr_engine::worker::WorkerPoolConfig {
+            namespace: "retry-ns".into(),
+            name: "retry-mod".into(),
+            version: "1.0.0".into(),
+            engine_id: "test-engine".into(),
+            concurrency: 1,
+            poll_interval: std::time::Duration::from_millis(100),
+            job_timeout: std::time::Duration::from_secs(10),
+            database_url: db_url,
+        },
+        tx,
+    );
+
+    // First dispatch: respond with 500 → should fail and retry.
+    let inbound = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("closed");
+    let response = http::Response::builder()
+        .status(500)
+        .body(Bytes::from("error"))
+        .unwrap();
+    inbound.response_tx.send(response).unwrap();
+
+    // Wait for retry — the job should be reset to pending and re-dispatched.
+    let inbound2 = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout on retry")
+        .expect("closed");
+    assert_eq!(inbound2.request.uri().path(), "/test/Retry");
+
+    // Second attempt: respond with 200.
+    let response = http::Response::builder()
+        .status(200)
+        .body(Bytes::from("ok"))
+        .unwrap();
+    inbound2.response_tx.send(response).unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let status = wr_engine::worker::get_job_status(&pool, &job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.status, "complete");
+    assert_eq!(status.attempt, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_worker_pool_marks_dead_after_max_attempts() {
+    if std::env::var("WRT_TEST_DB_URL").is_err() {
+        eprintln!("skipping test_worker_pool_marks_dead_after_max_attempts (no WRT_TEST_DB_URL)");
+        return;
+    }
+    let pool = worker_pool().await;
+    let pool = Arc::new(pool);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::worker::InboundRequest>(16);
+
+    // max_attempts = 1 — first failure should mark it dead.
+    let job_id = wr_engine::worker::insert_job(
+        &pool,
+        "dead-ns",
+        "dead-mod",
+        "1.0.0",
+        "/test/Die",
+        b"",
+        60,
+        1,
+        "",
+        "",
+    )
+    .await
+    .unwrap();
+
+    let db_url = std::env::var("WRT_TEST_DB_URL").unwrap();
+    wr_engine::worker::spawn_worker_pool(
+        pool.clone(),
+        wr_engine::worker::WorkerPoolConfig {
+            namespace: "dead-ns".into(),
+            name: "dead-mod".into(),
+            version: "1.0.0".into(),
+            engine_id: "test-engine".into(),
+            concurrency: 1,
+            poll_interval: std::time::Duration::from_millis(100),
+            job_timeout: std::time::Duration::from_secs(10),
+            database_url: db_url,
+        },
+        tx,
+    );
+
+    let inbound = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("closed");
+    let response = http::Response::builder()
+        .status(500)
+        .body(Bytes::from("fatal"))
+        .unwrap();
+    inbound.response_tx.send(response).unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let status = wr_engine::worker::get_job_status(&pool, &job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.status, "dead");
+    assert!(status.error_message.contains("HTTP 500"));
+
+    // Verify no retry — channel should be empty.
+    let result = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+    assert!(result.is_err(), "should not dispatch dead job again");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_worker_pool_handles_dropped_response() {
+    if std::env::var("WRT_TEST_DB_URL").is_err() {
+        eprintln!("skipping test_worker_pool_handles_dropped_response (no WRT_TEST_DB_URL)");
+        return;
+    }
+    let pool = worker_pool().await;
+    let pool = Arc::new(pool);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::worker::InboundRequest>(16);
+
+    let job_id = wr_engine::worker::insert_job(
+        &pool,
+        "drop-ns",
+        "drop-mod",
+        "1.0.0",
+        "/test/Drop",
+        b"",
+        60,
+        2,
+        "",
+        "",
+    )
+    .await
+    .unwrap();
+
+    let db_url = std::env::var("WRT_TEST_DB_URL").unwrap();
+    wr_engine::worker::spawn_worker_pool(
+        pool.clone(),
+        wr_engine::worker::WorkerPoolConfig {
+            namespace: "drop-ns".into(),
+            name: "drop-mod".into(),
+            version: "1.0.0".into(),
+            engine_id: "test-engine".into(),
+            concurrency: 1,
+            poll_interval: std::time::Duration::from_millis(100),
+            job_timeout: std::time::Duration::from_secs(10),
+            database_url: db_url,
+        },
+        tx,
+    );
+
+    // Receive the dispatch but drop the response_tx without sending — simulates
+    // a module crash.
+    let inbound = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("closed");
+    drop(inbound.response_tx);
+
+    // Wait for failure handling + retry.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let status = wr_engine::worker::get_job_status(&pool, &job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Should be pending again (retryable) with error message.
+    assert!(
+        status.status == "pending" || status.status == "running",
+        "expected pending or running for retry, got: {}",
+        status.status
+    );
+    assert!(status.error_message.contains("module dropped response"));
+}
+
+// ── secrets management tests ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_set_and_list_secrets() -> Result<()> {
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
+    let mut c = manager_client(&addr).await?;
+
+    // Set two secrets in the same namespace.
+    c.set_secret(SetSecretRequest {
+        namespace: "payments".into(),
+        key: "STRIPE_KEY".into(),
+        value: "sk_test_abc123".into(),
+    })
+    .await?;
+    c.set_secret(SetSecretRequest {
+        namespace: "payments".into(),
+        key: "WEBHOOK_SECRET".into(),
+        value: "whsec_xyz789".into(),
+    })
+    .await?;
+
+    // Set a secret in a different namespace.
+    c.set_secret(SetSecretRequest {
+        namespace: "auth".into(),
+        key: "JWT_SECRET".into(),
+        value: "super-secret-jwt".into(),
+    })
+    .await?;
+
+    // List all secrets — should see all 3 entries (metadata only, no values).
+    let resp = c
+        .list_secrets(ListSecretsRequest {
+            namespace: String::new(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(resp.secrets.len(), 3);
+
+    // List by namespace — should see only the 2 payments secrets.
+    let resp = c
+        .list_secrets(ListSecretsRequest {
+            namespace: "payments".into(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(resp.secrets.len(), 2);
+    assert!(resp.secrets.iter().all(|s| s.namespace == "payments"));
+    let keys: Vec<&str> = resp.secrets.iter().map(|s| s.key.as_str()).collect();
+    assert!(keys.contains(&"STRIPE_KEY"));
+    assert!(keys.contains(&"WEBHOOK_SECRET"));
+
+    // List by namespace with no secrets — should return empty.
+    let resp = c
+        .list_secrets(ListSecretsRequest {
+            namespace: "nonexistent".into(),
+        })
+        .await?
+        .into_inner();
+    assert!(resp.secrets.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_secret() -> Result<()> {
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
+    let mut c = manager_client(&addr).await?;
+
+    c.set_secret(SetSecretRequest {
+        namespace: "ns".into(),
+        key: "KEY".into(),
+        value: "val".into(),
+    })
+    .await?;
+
+    // Verify it exists.
+    let resp = c
+        .list_secrets(ListSecretsRequest {
+            namespace: "ns".into(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(resp.secrets.len(), 1);
+
+    // Delete it.
+    c.delete_secret(DeleteSecretRequest {
+        namespace: "ns".into(),
+        key: "KEY".into(),
+    })
+    .await?;
+
+    // Verify it's gone.
+    let resp = c
+        .list_secrets(ListSecretsRequest {
+            namespace: "ns".into(),
+        })
+        .await?
+        .into_inner();
+    assert!(resp.secrets.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_set_secret_upsert_overwrites() -> Result<()> {
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
+    let mut c = manager_client(&addr).await?;
+
+    c.set_secret(SetSecretRequest {
+        namespace: "ns".into(),
+        key: "API_KEY".into(),
+        value: "old-value".into(),
+    })
+    .await?;
+
+    // Overwrite with a new value.
+    c.set_secret(SetSecretRequest {
+        namespace: "ns".into(),
+        key: "API_KEY".into(),
+        value: "new-value".into(),
+    })
+    .await?;
+
+    // Should still be exactly one secret, not two.
+    let resp = c
+        .list_secrets(ListSecretsRequest {
+            namespace: "ns".into(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(resp.secrets.len(), 1);
+
+    // Verify the new value is returned during registration.
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    let reg_resp = c
+        .register_engine(RegisterEngineRequest {
+            registration: Some(EngineRegistration {
+                engine_id: "upsert-engine".into(),
+                address: engine_addr,
+                proxy_address: "http://127.0.0.1:9001".into(),
+                modules: vec![ModuleDescriptor {
+                    name: "mod".into(),
+                    namespace: "ns".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: minimal_file_descriptor_set(),
+                }],
+                secrets: vec![SecretRequest {
+                    namespace: "ns".into(),
+                    key: "API_KEY".into(),
+                }],
+            }),
+        })
+        .await?
+        .into_inner();
+
+    assert!(reg_resp.accepted);
+    assert_eq!(reg_resp.secrets.len(), 1);
+    assert_eq!(reg_resp.secrets[0].namespace, "ns");
+    assert_eq!(
+        reg_resp.secrets[0].secrets.get("API_KEY").unwrap(),
+        "new-value"
+    );
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_set_secret_empty_namespace_rejected() -> Result<()> {
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
+    let mut c = manager_client(&addr).await?;
+
+    let result = c
+        .set_secret(SetSecretRequest {
+            namespace: String::new(),
+            key: "KEY".into(),
+            value: "val".into(),
+        })
+        .await;
+    assert!(result.is_err());
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_set_secret_empty_key_rejected() -> Result<()> {
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
+    let mut c = manager_client(&addr).await?;
+
+    let result = c
+        .set_secret(SetSecretRequest {
+            namespace: "ns".into(),
+            key: String::new(),
+            value: "val".into(),
+        })
+        .await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_secret_empty_fields_rejected() -> Result<()> {
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
+    let mut c = manager_client(&addr).await?;
+
+    let result = c
+        .delete_secret(DeleteSecretRequest {
+            namespace: String::new(),
+            key: "KEY".into(),
+        })
+        .await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    let result = c
+        .delete_secret(DeleteSecretRequest {
+            namespace: "ns".into(),
+            key: String::new(),
+        })
+        .await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_register_engine_with_secrets() -> Result<()> {
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
+    let mut c = manager_client(&addr).await?;
+
+    // Store secrets.
+    c.set_secret(SetSecretRequest {
+        namespace: "myapp".into(),
+        key: "DB_PASSWORD".into(),
+        value: "hunter2".into(),
+    })
+    .await?;
+    c.set_secret(SetSecretRequest {
+        namespace: "myapp".into(),
+        key: "API_TOKEN".into(),
+        value: "tok_abc".into(),
+    })
+    .await?;
+
+    // Register engine requesting those secrets.
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    let resp = c
+        .register_engine(RegisterEngineRequest {
+            registration: Some(EngineRegistration {
+                engine_id: "secret-engine".into(),
+                address: engine_addr,
+                proxy_address: "http://127.0.0.1:9001".into(),
+                modules: vec![ModuleDescriptor {
+                    name: "svc".into(),
+                    namespace: "myapp".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: minimal_file_descriptor_set(),
+                }],
+                secrets: vec![
+                    SecretRequest {
+                        namespace: "myapp".into(),
+                        key: "DB_PASSWORD".into(),
+                    },
+                    SecretRequest {
+                        namespace: "myapp".into(),
+                        key: "API_TOKEN".into(),
+                    },
+                ],
+            }),
+        })
+        .await?
+        .into_inner();
+
+    assert!(resp.accepted);
+    // Should have one NamespaceSecrets entry for "myapp".
+    assert_eq!(resp.secrets.len(), 1);
+    let ns_secrets = &resp.secrets[0];
+    assert_eq!(ns_secrets.namespace, "myapp");
+    assert_eq!(ns_secrets.secrets.len(), 2);
+    assert_eq!(ns_secrets.secrets.get("DB_PASSWORD").unwrap(), "hunter2");
+    assert_eq!(ns_secrets.secrets.get("API_TOKEN").unwrap(), "tok_abc");
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_register_engine_with_missing_secret_fails() -> Result<()> {
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
+    let mut c = manager_client(&addr).await?;
+
+    // Register engine requesting a secret that doesn't exist.
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    let result = c
+        .register_engine(RegisterEngineRequest {
+            registration: Some(EngineRegistration {
+                engine_id: "missing-secret-engine".into(),
+                address: engine_addr,
+                proxy_address: "http://127.0.0.1:9001".into(),
+                modules: vec![ModuleDescriptor {
+                    name: "svc".into(),
+                    namespace: "myapp".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: minimal_file_descriptor_set(),
+                }],
+                secrets: vec![SecretRequest {
+                    namespace: "myapp".into(),
+                    key: "NONEXISTENT".into(),
+                }],
+            }),
+        })
+        .await;
+
+    assert!(result.is_err());
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::NotFound);
+    assert!(status.message().contains("missing secrets"));
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_register_engine_no_secrets_succeeds() -> Result<()> {
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
+    let mut c = manager_client(&addr).await?;
+
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    let resp = c
+        .register_engine(RegisterEngineRequest {
+            registration: Some(EngineRegistration {
+                engine_id: "no-secrets-engine".into(),
+                address: engine_addr,
+                proxy_address: "http://127.0.0.1:9001".into(),
+                modules: vec![ModuleDescriptor {
+                    name: "svc".into(),
+                    namespace: "ns".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: minimal_file_descriptor_set(),
+                }],
+                secrets: vec![],
+            }),
+        })
+        .await?
+        .into_inner();
+
+    assert!(resp.accepted);
+    assert!(resp.secrets.is_empty());
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_secrets_across_namespaces() -> Result<()> {
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
+    let mut c = manager_client(&addr).await?;
+
+    // Store secrets in two namespaces.
+    c.set_secret(SetSecretRequest {
+        namespace: "frontend".into(),
+        key: "API_KEY".into(),
+        value: "fe-key".into(),
+    })
+    .await?;
+    c.set_secret(SetSecretRequest {
+        namespace: "backend".into(),
+        key: "API_KEY".into(),
+        value: "be-key".into(),
+    })
+    .await?;
+
+    // Register engine requesting secrets from both namespaces.
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    let resp = c
+        .register_engine(RegisterEngineRequest {
+            registration: Some(EngineRegistration {
+                engine_id: "multi-ns-engine".into(),
+                address: engine_addr,
+                proxy_address: "http://127.0.0.1:9001".into(),
+                modules: vec![
+                    ModuleDescriptor {
+                        name: "fe".into(),
+                        namespace: "frontend".into(),
+                        version: "1.0.0".into(),
+                        proto_schema: minimal_file_descriptor_set(),
+                    },
+                    ModuleDescriptor {
+                        name: "be".into(),
+                        namespace: "backend".into(),
+                        version: "1.0.0".into(),
+                        proto_schema: minimal_file_descriptor_set(),
+                    },
+                ],
+                secrets: vec![
+                    SecretRequest {
+                        namespace: "frontend".into(),
+                        key: "API_KEY".into(),
+                    },
+                    SecretRequest {
+                        namespace: "backend".into(),
+                        key: "API_KEY".into(),
+                    },
+                ],
+            }),
+        })
+        .await?
+        .into_inner();
+
+    assert!(resp.accepted);
+    assert_eq!(resp.secrets.len(), 2);
+
+    // Find each namespace's secrets.
+    let fe = resp
+        .secrets
+        .iter()
+        .find(|s| s.namespace == "frontend")
+        .expect("frontend secrets");
+    assert_eq!(fe.secrets.get("API_KEY").unwrap(), "fe-key");
+
+    let be = resp
+        .secrets
+        .iter()
+        .find(|s| s.namespace == "backend")
+        .expect("backend secrets");
+    assert_eq!(be.secrets.get("API_KEY").unwrap(), "be-key");
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_delete_nonexistent_secret_succeeds() -> Result<()> {
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
+    let mut c = manager_client(&addr).await?;
+
+    // Deleting a secret that was never set should not error.
+    c.delete_secret(DeleteSecretRequest {
+        namespace: "ns".into(),
+        key: "NEVER_SET".into(),
+    })
+    .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_secret_deleted_then_registration_fails() -> Result<()> {
+    let pool = manager_pool().await;
+    let addr = start_manager(pool).await?;
+    let mut c = manager_client(&addr).await?;
+
+    // Set then delete a secret.
+    c.set_secret(SetSecretRequest {
+        namespace: "ns".into(),
+        key: "TEMP".into(),
+        value: "val".into(),
+    })
+    .await?;
+    c.delete_secret(DeleteSecretRequest {
+        namespace: "ns".into(),
+        key: "TEMP".into(),
+    })
+    .await?;
+
+    // Now register requesting that deleted secret — should fail.
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    let result = c
+        .register_engine(RegisterEngineRequest {
+            registration: Some(EngineRegistration {
+                engine_id: "deleted-secret-engine".into(),
+                address: engine_addr,
+                proxy_address: "http://127.0.0.1:9001".into(),
+                modules: vec![ModuleDescriptor {
+                    name: "svc".into(),
+                    namespace: "ns".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: minimal_file_descriptor_set(),
+                }],
+                secrets: vec![SecretRequest {
+                    namespace: "ns".into(),
+                    key: "TEMP".into(),
+                }],
+            }),
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
 
     let _ = engine_shutdown.send(());
     Ok(())

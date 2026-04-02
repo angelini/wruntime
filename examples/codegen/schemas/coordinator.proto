@@ -2,9 +2,14 @@ syntax = "proto3";
 package codegen;
 
 service CoordinatorService {
-  rpc CreateTask (CreateTaskRequest) returns (CreateTaskResponse);
-  rpc GetTask    (GetTaskRequest)    returns (GetTaskResponse);
-  rpc ListTasks  (ListTasksRequest)  returns (ListTasksResponse);
+  rpc CreateTask  (CreateTaskRequest)  returns (CreateTaskResponse);
+  rpc GetTask     (GetTaskRequest)     returns (GetTaskResponse);
+  rpc ListTasks   (ListTasksRequest)   returns (ListTasksResponse);
+
+  // Used by the worker runner to claim and complete tasks.
+  rpc ClaimTask        (ClaimTaskRequest)        returns (ClaimTaskResponse);
+  rpc UpdateTaskStatus (UpdateTaskStatusRequest) returns (UpdateTaskStatusResponse);
+  rpc CompleteTask     (CompleteTaskRequest)      returns (CompleteTaskResponse);
 }
 
 message DocSourceSpec {
@@ -51,3 +56,37 @@ message ListTasksRequest {
 message ListTasksResponse {
   repeated GetTaskResponse tasks = 1;
 }
+
+// ── Worker RPCs ─────────────────────────────────────────────────────────────
+
+message ClaimTaskRequest {}
+
+message ClaimTaskResponse {
+  bool                   found            = 1;
+  string                 task_id          = 2;
+  string                 session_id       = 3;
+  string                 repo_url         = 4;
+  string                 ref              = 5;
+  repeated DocSourceSpec doc_sources      = 6;
+  string                 task_description = 7;
+  int32                  max_agent_turns  = 8;
+}
+
+message UpdateTaskStatusRequest {
+  string task_id = 1;
+  string status  = 2;
+}
+
+message UpdateTaskStatusResponse {}
+
+message CompleteTaskRequest {
+  string task_id              = 1;
+  string status               = 2;  // "complete" or "error"
+  string unified_diff         = 3;
+  string message              = 4;
+  int32  agent_turns          = 5;
+  int32  total_input_tokens   = 6;
+  int32  total_output_tokens  = 7;
+}
+
+message CompleteTaskResponse {}

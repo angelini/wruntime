@@ -55,7 +55,7 @@ impl LlmRuntime {
             return Err(match status.as_u16() {
                 400 => LlmErrorKind::InvalidRequest(body),
                 401 | 403 => LlmErrorKind::Auth(body),
-                429 => LlmErrorKind::RateLimited(retry_after),
+                429 | 529 => LlmErrorKind::RateLimited(retry_after),
                 _ => LlmErrorKind::Api(format!("HTTP {status}: {body}")),
             });
         }
@@ -95,7 +95,7 @@ impl LlmRuntime {
             return Err(match status.as_u16() {
                 400 => LlmErrorKind::InvalidRequest(body),
                 401 | 403 => LlmErrorKind::Auth(body),
-                429 => LlmErrorKind::RateLimited(retry_after),
+                429 | 529 => LlmErrorKind::RateLimited(retry_after),
                 _ => LlmErrorKind::Api(format!("HTTP {status}: {body}")),
             });
         }

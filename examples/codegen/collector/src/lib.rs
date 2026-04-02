@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use wr_sdk::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
 use wr_sdk::bindings::wruntime::blobstore::store;
 use wr_sdk::io::{read_body, send_response};
+use wr_sdk::tracing;
 use wr_sdk::ServiceError;
 
 struct Component;
@@ -51,36 +52,66 @@ impl proto::CollectorService for Component {
         &self,
         req: proto::FetchDocsRequest,
     ) -> Result<proto::FetchDocsResponse, ServiceError> {
+        let span = tracing::start("collector.fetch_docs", &[
+            ("sources.count", &req.sources.len().to_string()),
+        ]);
+
         let mut sources_fetched: i32 = 0;
         let mut total_bytes: i64 = 0;
         let mut doc_prefixes = Vec::new();
 
         for source in &req.sources {
-            let prefix = doc_prefix(source);
+            // For github_tarball sources with an empty ref, resolve the default
+            // branch up front so the blobstore prefix includes the real ref.
+            let mut source = source.clone();
+            if source.source_type == "github_tarball" && source.ref_or_ver.is_empty() {
+                source.ref_or_ver =
+                    resolve_github_ref(&source.owner, &source.repo)?;
+            }
+
+            let prefix = doc_prefix(&source);
             let manifest_key = format!("{prefix}/manifest.json");
 
             // Check if already fetched (idempotent).
             if store::head_object(BUCKET, &manifest_key).is_ok() {
                 wr_sdk::log::log(&format!("skipping already-fetched: {prefix}"));
+                tracing::record_event(&span, "cache_hit", &[("prefix", prefix.as_str())]);
                 doc_prefixes.push(prefix);
                 continue;
             }
 
+            let fetch_span = tracing::start("collector.fetch_source", &[
+                ("source.type", source.source_type.as_str()),
+                ("source.owner", source.owner.as_str()),
+                ("source.repo", source.repo.as_str()),
+            ]);
             let bytes = match source.source_type.as_str() {
-                "github_tarball" => fetch_github_tarball(source, &prefix)?,
-                "docs_rs" => fetch_docs_rs(source, &prefix)?,
-                "crates_io" => fetch_crates_io(source, &prefix)?,
+                "github_tarball" => fetch_github_tarball(&source, &prefix),
+                "docs_rs" => fetch_docs_rs(&source, &prefix),
+                "crates_io" => fetch_crates_io(&source, &prefix),
                 other => {
+                    tracing::set_error(&fetch_span, &format!("unknown source_type: {other}"));
                     return Err(ServiceError::bad_request(format!(
                         "unknown source_type: {other}"
                     )))
                 }
-            };
+            }
+            .map_err(|e| {
+                tracing::set_error(&fetch_span, &e.message);
+                e
+            })?;
+
+            tracing::set_attribute(&fetch_span, "source.bytes", &bytes.to_string());
+            drop(fetch_span);
 
             total_bytes += bytes as i64;
             sources_fetched += 1;
             doc_prefixes.push(prefix);
         }
+
+        tracing::set_attribute(&span, "sources.fetched", &sources_fetched.to_string());
+        tracing::set_attribute(&span, "total_bytes", &total_bytes.to_string());
+        drop(span);
 
         Ok(proto::FetchDocsResponse {
             sources_fetched,
@@ -111,7 +142,44 @@ impl proto::CollectorService for Component {
 
 // ── HTTP egress helper ───────────────────────────────────────────────────────
 
+const MAX_REDIRECTS: u8 = 10;
+
 fn http_get(url: &str) -> Result<(u16, Vec<u8>), String> {
+    let mut current_url = url.to_string();
+
+    for _ in 0..MAX_REDIRECTS {
+        let (status, headers, body) = http_get_raw(&current_url)?;
+
+        match status {
+            301 | 302 | 303 | 307 | 308 => {
+                let location = headers
+                    .ok_or_else(|| format!("{status} redirect with no Location header"))?;
+                // Handle relative redirects.
+                current_url = if location.starts_with("http://") || location.starts_with("https://") {
+                    location
+                } else {
+                    // Build absolute URL from current authority + relative path.
+                    let (scheme_str, rest) = if current_url.starts_with("https://") {
+                        ("https://", &current_url[8..])
+                    } else {
+                        ("http://", &current_url[7..])
+                    };
+                    let authority = match rest.find('/') {
+                        Some(i) => &rest[..i],
+                        None => rest,
+                    };
+                    format!("{scheme_str}{authority}{location}")
+                };
+                wr_sdk::log::log(&format!("following {status} redirect to: {current_url}"));
+            }
+            _ => return Ok((status, body)),
+        }
+    }
+
+    Err(format!("too many redirects (max {MAX_REDIRECTS})"))
+}
+
+fn http_get_raw(url: &str) -> Result<(u16, Option<String>, Vec<u8>), String> {
     use wr_sdk::bindings::wasi::http::{
         outgoing_handler,
         types::{Fields, Method, OutgoingBody, OutgoingRequest, Scheme},
@@ -159,6 +227,14 @@ fn http_get(url: &str) -> Result<(u16, Vec<u8>), String> {
                     .map_err(|e| format!("http error: {e:?}"))?;
 
                 let status = response.status();
+
+                // Extract Location header for redirects.
+                let location = response
+                    .headers()
+                    .get("location")
+                    .first()
+                    .and_then(|v| String::from_utf8(v.clone()).ok());
+
                 let incoming_body = response.consume().map_err(|_| "consume response")?;
                 let stream = incoming_body.stream().map_err(|_| "response body stream")?;
 
@@ -172,7 +248,7 @@ fn http_get(url: &str) -> Result<(u16, Vec<u8>), String> {
                     }
                 }
 
-                return Ok((status, resp_bytes));
+                return Ok((status, location, resp_bytes));
             }
             None => {
                 future_resp.subscribe().block();
@@ -212,6 +288,32 @@ fn store_file(key: &str, data: &[u8]) -> Result<(), ServiceError> {
 
 // ── GitHub tarball fetcher ───────────────────────────────────────────────────
 
+/// Query the GitHub API to discover a repository's default branch.
+fn resolve_github_ref(owner: &str, repo: &str) -> Result<String, ServiceError> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}");
+    wr_sdk::log::log(&format!("resolving default branch: {url}"));
+
+    let (status, body) = http_get(&url)
+        .map_err(|e| ServiceError::internal(format!("GitHub API: {e}")))?;
+
+    if status != 200 {
+        return Err(ServiceError::internal(format!(
+            "GitHub API returned {status} for {url}"
+        )));
+    }
+
+    #[derive(Deserialize)]
+    struct RepoInfo {
+        default_branch: String,
+    }
+
+    let info: RepoInfo = serde_json::from_slice(&body)
+        .map_err(|e| ServiceError::internal(format!("parse repo info: {e}")))?;
+
+    wr_sdk::log::log(&format!("resolved default branch: {}", info.default_branch));
+    Ok(info.default_branch)
+}
+
 fn fetch_github_tarball(
     source: &proto::DocSource,
     prefix: &str,
@@ -221,7 +323,7 @@ fn fetch_github_tarball(
     use tar::Archive;
 
     let url = format!(
-        "https://api.github.com/repos/{}/{}/tarball/{}",
+        "https://codeload.github.com/{}/{}/tar.gz/{}",
         source.owner, source.repo, source.ref_or_ver
     );
     wr_sdk::log::log(&format!("fetching tarball: {url}"));
@@ -231,7 +333,7 @@ fn fetch_github_tarball(
 
     if status != 200 {
         return Err(ServiceError::internal(format!(
-            "GitHub API returned {status}"
+            "GitHub tarball download returned {status}"
         )));
     }
 

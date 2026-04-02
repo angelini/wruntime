@@ -1,34 +1,42 @@
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use serde_json::json;
 
 use anyhow::Result;
 use bytes::Bytes;
+use deadpool_postgres::Pool;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use prost::Message;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing::{info, info_span, warn, Instrument};
 
 use crate::registry::{InboundRequest, ModuleRegistry};
+use wr_common::wruntime::{
+    GetJobStatusRequest, GetJobStatusResponse, SubmitJobRequest, SubmitJobResponse,
+};
 
 /// Start the engine's inbound HTTP server.  The proxy forwards module-to-module
 /// requests here; we route each request to the appropriate WASM module task
 /// via the registry.
-pub async fn serve(addr: &str, registry: ModuleRegistry) -> Result<()> {
+pub async fn serve(addr: &str, registry: ModuleRegistry, db_pool: Option<Arc<Pool>>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(address = %addr, "inbound server listening");
 
     loop {
         let (stream, _peer) = listener.accept().await?;
         let registry = registry.clone();
+        let db_pool = db_pool.clone();
 
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
                 let registry = registry.clone();
+                let db_pool = db_pool.clone();
                 async move {
                     let namespace = header_owned(req.headers(), "x-wr-namespace");
                     let module = header_owned(req.headers(), "x-wr-module");
@@ -38,7 +46,7 @@ pub async fn serve(addr: &str, registry: ModuleRegistry) -> Result<()> {
 
                     let span = info_span!(
                         "engine.dispatch",
-                        otel.name                 = format!("{method} {module}.{namespace}"),
+                        otel.name                 = format!("{method} {namespace}.{module}"),
                         wr.namespace              = %namespace,
                         wr.module                 = %module,
                         wr.version                = %version,
@@ -49,7 +57,9 @@ pub async fn serve(addr: &str, registry: ModuleRegistry) -> Result<()> {
                     );
                     wr_common::telemetry::set_parent_from_headers(&span, req.headers());
 
-                    let resp = handle(req, registry).instrument(span.clone()).await;
+                    let resp = handle(req, registry, db_pool)
+                        .instrument(span.clone())
+                        .await;
 
                     let status = resp.status().as_u16();
                     span.record("http.response.status_code", status);
@@ -74,6 +84,7 @@ pub async fn serve(addr: &str, registry: ModuleRegistry) -> Result<()> {
 async fn handle(
     req: Request<hyper::body::Incoming>,
     registry: ModuleRegistry,
+    db_pool: Option<Arc<Pool>>,
 ) -> Response<Full<Bytes>> {
     // ── Health check — no headers required ────────────────────────────────
     if req.uri().path() == "/healthz" {
@@ -81,6 +92,14 @@ async fn handle(
             .status(StatusCode::OK)
             .body(Full::new(Bytes::from("ok")))
             .unwrap();
+    }
+
+    // ── Worker job queue gRPC endpoints ──────────────────────────────────
+    if req.uri().path() == "/wruntime.WorkerService/SubmitJob"
+        || req.uri().path() == "/wruntime.WorkerService/GetJobStatus"
+    {
+        let path = req.uri().path().to_owned();
+        return handle_worker_grpc(req, &path, db_pool).await;
     }
 
     // The proxy injects x-wr-namespace, x-wr-module, and x-wr-version so we
@@ -189,4 +208,95 @@ fn err(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
         .status(status)
         .body(Full::new(Bytes::from(msg.to_string())))
         .unwrap()
+}
+
+async fn handle_worker_grpc(
+    req: Request<hyper::body::Incoming>,
+    path: &str,
+    db_pool: Option<Arc<Pool>>,
+) -> Response<Full<Bytes>> {
+    let pool = match db_pool {
+        Some(p) => p,
+        None => return err(StatusCode::SERVICE_UNAVAILABLE, "no database configured"),
+    };
+
+    let body = match BodyExt::collect(req.into_body()).await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => {
+            warn!(error = %e, "worker grpc body read error");
+            return err(StatusCode::BAD_REQUEST, "failed to read body");
+        }
+    };
+
+    match path {
+        "/wruntime.WorkerService/SubmitJob" => handle_submit_job(&pool, &body).await,
+        "/wruntime.WorkerService/GetJobStatus" => handle_get_job_status(&pool, &body).await,
+        _ => err(StatusCode::NOT_FOUND, "unknown worker endpoint"),
+    }
+}
+
+async fn handle_submit_job(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>> {
+    let req = match SubmitJobRequest::decode(body) {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("decode: {e}")),
+    };
+
+    // Extract source from gRPC headers (set by the proxy).
+    match wr_engine::worker::insert_job(
+        pool,
+        &req.worker_namespace,
+        &req.worker_name,
+        &req.worker_version,
+        &req.job_type,
+        &req.payload,
+        req.timeout_secs,
+        req.max_attempts,
+        "", // source_namespace — could be extracted from headers
+        "", // source_module
+    )
+    .await
+    {
+        Ok(job_id) => {
+            let resp = SubmitJobResponse { job_id };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/x-protobuf")
+                .body(Full::new(Bytes::from(resp.encode_to_vec())))
+                .unwrap()
+        }
+        Err(e) => {
+            warn!(error = %e, "submit job failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, &format!("insert: {e}"))
+        }
+    }
+}
+
+async fn handle_get_job_status(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>> {
+    let req = match GetJobStatusRequest::decode(body) {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("decode: {e}")),
+    };
+
+    match wr_engine::worker::get_job_status(pool, &req.job_id).await {
+        Ok(Some(status)) => {
+            let resp = GetJobStatusResponse {
+                job_id: status.job_id,
+                status: status.status,
+                result: status.result,
+                error_message: status.error_message,
+                attempt: status.attempt,
+                max_attempts: status.max_attempts,
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/x-protobuf")
+                .body(Full::new(Bytes::from(resp.encode_to_vec())))
+                .unwrap()
+        }
+        Ok(None) => err(StatusCode::NOT_FOUND, "job not found"),
+        Err(e) => {
+            warn!(error = %e, "get job status failed");
+            err(StatusCode::INTERNAL_SERVER_ERROR, &format!("query: {e}"))
+        }
+    }
 }

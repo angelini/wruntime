@@ -25,6 +25,8 @@ struct Cli {
 enum Commands {
     /// Database management (reset schemas, migrations)
     Db(cmd::db::DbArgs),
+    /// Local development workflow (start infra, build, deploy)
+    Dev(cmd::dev::DevArgs),
     /// Manage wruntime engines
     Engines(cmd::engines::EnginesArgs),
     /// View logical services derived from the routing table
@@ -43,6 +45,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Db(args) => cmd::db::run(args).await,
+        Commands::Dev(args) => cmd::dev::run(args, &cli.manager).await,
         Commands::Engines(args) => cmd::engines::run(args, &cli.manager).await,
         Commands::Services(args) => cmd::services::run(args, &cli.manager).await,
         Commands::Metrics(args) => cmd::metrics::run(args).await,

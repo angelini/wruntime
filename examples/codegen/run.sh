@@ -14,6 +14,17 @@ done
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# ── Kill stale processes from a previous run ─────────────────────────────
+./target/debug/wr-cli dev down 2>/dev/null || true
+for port in 9000 9001 9100 8080; do
+    pid=$(lsof -ti ":$port" 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+        echo "   killing stale process on :$port (pid $pid)"
+        kill -INT $pid 2>/dev/null || true
+    fi
+done
+sleep 1
+
 DB_URL="${DB_URL:-${WRT_EXAMPLE_DB_URL:-postgres://postgres@localhost:5433/wruntime_example}}"
 S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:8900}"
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
@@ -47,7 +58,7 @@ cp examples/config/proxy.toml /tmp/cg-proxy.toml
 cat >> /tmp/cg-proxy.toml << 'PROXY'
 
 [egress]
-allowed_domains = ["api.github.com", "codeload.github.com", "*.docs.rs", "crates.io", "static.crates.io"]
+allowed_domains = ["api.github.com", "codeload.github.com", "docs.rs", "*.docs.rs", "crates.io", "static.crates.io"]
 
 [external]
 listen_address = "0.0.0.0:8080"
@@ -75,47 +86,64 @@ echo "==> Cleaning manager state..."
 psql "${DB_URL}" -c "TRUNCATE wr_engines, wr_routing_rules, wr_schemas CASCADE" 2>/dev/null \
     || echo "   (tables may not exist yet — first run)"
 
-# ── Start manager ──────────────────────────────────────────────────────────────
-echo "==> Starting manager on :9000"
-./target/debug/wr-manager /tmp/wr-manager.toml &
-MANAGER_PID=$!
-sleep 1
+# ── Start manager + proxy ─────────────────────────────────────────────────────
+echo "==> Starting manager + proxy (external on :8080)..."
+./target/debug/wr-cli dev up \
+    --manager-config /tmp/wr-manager.toml \
+    --proxy-config /tmp/cg-proxy.toml
 
-# ── Start proxy ────────────────────────────────────────────────────────────────
-echo "==> Starting proxy on :9001 (external on :8080)"
-./target/debug/wr-proxy /tmp/cg-proxy.toml &
-PROXY_PID=$!
-sleep 1
-
-# ── Start engine (all 3 modules) ──────────────────────────────────────────────
-echo "==> Starting engine on :9100 (collector + agent + coordinator)"
-./target/debug/wr-engine /tmp/cg-engine.toml &
-ENGINE_PID=$!
-
-echo "==> Waiting for engine to register..."
-sleep 3
+# ── Deploy engine (all 3 modules) ────────────────────────────────────────────
+echo "==> Deploying engine on :9100 (collector + agent + coordinator)"
+./target/debug/wr-cli dev deploy /tmp/cg-engine.toml --skip-build
 
 cargo run -p wr-cli -- engines list
 cargo run -p wr-cli -- services list
 
 cleanup() {
     echo "==> Shutting down..."
-    kill -INT "$ENGINE_PID" 2>/dev/null || true
-    wait "$ENGINE_PID" 2>/dev/null || true
-    kill -INT "$PROXY_PID" "$MANAGER_PID" 2>/dev/null || true
-    sleep 5
+    ./target/debug/wr-cli dev down
 }
 trap cleanup EXIT
 trap 'exit 0' INT TERM
 
 if [ "$INLINE" = true ]; then
-    echo "==> Running sample codegen task..."
-    cargo run -p wr-cli -- invoke \
+    echo "==> Creating codegen task (worker will process it automatically)..."
+    CREATE_OUTPUT=$(cargo run -p wr-cli -- invoke \
         --proxy http://127.0.0.1:9001 \
         --destination http://codegen.coordinator/CreateTask \
         --source test --source-ns codegen \
-        --body '{"repo_url":"https://github.com/dtolnay/anyhow","ref":"main","doc_sources":[{"source_type":"docs_rs","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}'
-    exit $?
+        --body '{"repo_url":"https://github.com/dtolnay/anyhow","doc_sources":[{"source_type":"docs_rs","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}')
+    echo "$CREATE_OUTPUT"
+
+    TASK_ID=$(echo "$CREATE_OUTPUT" | grep -o '"taskId": *"[^"]*"' | head -1 | sed 's/"taskId": *"//;s/"//')
+    if [ -z "$TASK_ID" ]; then
+        echo "ERROR: failed to extract task_id from create response"
+        exit 1
+    fi
+    echo "==> Polling task ${TASK_ID}..."
+
+    while true; do
+        TASK_OUTPUT=$(cargo run -p wr-cli -- invoke \
+            --proxy http://127.0.0.1:9001 \
+            --destination http://codegen.coordinator/GetTask \
+            --source test --source-ns codegen \
+            --body "{\"task_id\":\"${TASK_ID}\"}" 2>/dev/null)
+        STATUS=$(echo "$TASK_OUTPUT" | grep -o '"status": *"[^"]*"' | head -1 | sed 's/"status": *"//;s/"//')
+        case "$STATUS" in
+            complete)
+                echo "$TASK_OUTPUT"
+                exit 0
+                ;;
+            error)
+                echo "$TASK_OUTPUT"
+                exit 1
+                ;;
+            *)
+                echo "   status: ${STATUS:-unknown}"
+                sleep 5
+                ;;
+        esac
+    done
 fi
 
 cat <<'USAGE'
@@ -126,20 +154,14 @@ All services running. Press Ctrl-C to stop.
   External API: http://127.0.0.1:8080
   Engine      : http://127.0.0.1:9100 (collector + agent + coordinator)
 
-Create a task via external API:
+Create a task (returns immediately, processing starts in background):
   curl -X POST http://localhost:8080/tasks \
     -H 'Content-Type: application/json' \
-    -d '{"repo_url":"https://github.com/dtolnay/anyhow","ref":"main","doc_sources":[{"source_type":"docs_rs","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}'
+    -d '{"repo_url":"https://github.com/dtolnay/anyhow","doc_sources":[{"source_type":"docs_rs","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}'
 
-Check task status:
+Poll task status until complete:
   curl http://localhost:8080/tasks/{task_id}
-
-Create a task via internal RPC:
-  cargo run -p wr-cli -- invoke \
-    --proxy http://127.0.0.1:9001 \
-    --destination http://codegen.coordinator/CreateTask \
-    --source test --source-ns codegen \
-    --body '{"repo_url":"https://github.com/dtolnay/anyhow","ref":"main","doc_sources":[{"source_type":"docs_rs","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}'
 USAGE
 
-wait
+# Block until Ctrl-C (no child PIDs to wait on — processes are managed by wr dev)
+while true; do sleep 60; done

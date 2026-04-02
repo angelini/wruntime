@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn, Instrument};
 use wasmtime::component::{Component, Linker};
 use wasmtime::Store;
@@ -21,7 +21,7 @@ use wasmtime_wasi_http::p2::{
 
 use crate::registry::{InboundRequest, ModuleRegistry, ModuleTx};
 use wr_engine::blobstore::BlobstoreRuntime;
-use wr_engine::config::{EngineConfig, ModuleConfig};
+use wr_engine::config::{EngineConfig, ModuleConfig, ModuleMode};
 use wr_engine::llm::LlmRuntime;
 use wr_engine::pool::{blob_key_prefix, module_schema};
 use wr_engine::state::{ModuleServices, ModuleState};
@@ -37,6 +37,9 @@ pub struct EngineRunner {
     blobstore_client: Option<Arc<BlobstoreRuntime>>,
     /// Shared LLM inference client, present when `[llm]` is configured.
     llm_client: Option<Arc<LlmRuntime>>,
+    /// Limits concurrent WASM instantiations to stay within the pooling
+    /// allocator's `total_component_instances`.
+    instance_semaphore: Arc<Semaphore>,
 }
 
 impl EngineRunner {
@@ -90,6 +93,10 @@ impl EngineRunner {
             .transpose()?
             .map(Arc::new);
 
+        let instance_semaphore = Arc::new(Semaphore::new(
+            config.pool.total_component_instances as usize,
+        ));
+
         Ok(Self {
             engine: Arc::new(engine),
             config,
@@ -97,6 +104,7 @@ impl EngineRunner {
             db_pools,
             blobstore_client,
             llm_client,
+            instance_semaphore,
         })
     }
 
@@ -164,13 +172,15 @@ impl EngineRunner {
         &self,
         registry: &ModuleRegistry,
         resolved_envs: &HashMap<(String, String), HashMap<String, String>>,
+        engine_id: &str,
     ) -> Result<()> {
         for module_config in &self.config.modules {
             let env_vars = resolved_envs
                 .get(&(module_config.namespace.clone(), module_config.name.clone()))
                 .cloned()
                 .unwrap_or_default();
-            self.spawn_module(module_config, registry, env_vars).await?;
+            self.spawn_module(module_config, registry, env_vars, engine_id)
+                .await?;
         }
         Ok(())
     }
@@ -180,6 +190,7 @@ impl EngineRunner {
         module_config: &ModuleConfig,
         registry: &ModuleRegistry,
         env_vars: HashMap<String, String>,
+        engine_id: &str,
     ) -> Result<()> {
         info!(module = %module_config.name, "loading module");
 
@@ -212,89 +223,33 @@ impl EngineRunner {
             |s| s,
         )?;
 
-        // Try to pre-link as a WASI HTTP Proxy world component first.
-        // This succeeds when the component exports `wasi:http/incoming-handler`.
-        match ProxyPre::new(linker.instantiate_pre(&component)?) {
-            Ok(pre) => {
-                let pre = Arc::new(pre);
-                let (tx, rx) = mpsc::channel::<InboundRequest>(module_config.channel_capacity);
-                registry
-                    .register(
-                        module_namespace.clone(),
-                        module_name.clone(),
-                        module_version.clone(),
-                        tx,
-                    )
-                    .await;
+        // Resolve common host-binding resources for this module.
+        let (db_pool, db_schema) = if module_config.database {
+            let schema = module_schema(&module_namespace, &module_name);
+            let pool = self
+                .db_pools
+                .get(&(module_namespace.clone(), module_name.clone()))
+                .cloned();
+            (pool, Some(schema))
+        } else {
+            (None, None)
+        };
+        let (blobstore, blob_prefix) = if module_config.blobstore {
+            (
+                self.blobstore_client.clone(),
+                Some(blob_key_prefix(&module_namespace)),
+            )
+        } else {
+            (None, None)
+        };
+        let llm = if module_config.llm {
+            self.llm_client.clone()
+        } else {
+            None
+        };
 
-                let (db_pool, db_schema) = if module_config.database {
-                    let schema = module_schema(&module_namespace, &module_name);
-                    let pool = self
-                        .db_pools
-                        .get(&(module_namespace.clone(), module_name.clone()))
-                        .cloned();
-                    (pool, Some(schema))
-                } else {
-                    (None, None)
-                };
-                let (blobstore, blob_prefix) = if module_config.blobstore {
-                    (
-                        self.blobstore_client.clone(),
-                        Some(blob_key_prefix(&module_namespace)),
-                    )
-                } else {
-                    (None, None)
-                };
-                let llm = if module_config.llm {
-                    self.llm_client.clone()
-                } else {
-                    None
-                };
-                let handler = HandlerContext {
-                    engine: self.engine.clone(),
-                    pre,
-                };
-                let module = ModuleContext {
-                    name: module_name.clone(),
-                    namespace: module_namespace.clone(),
-                    proxy_uri: proxy_uri.clone(),
-                    http_client: http_client.clone(),
-                    db_pool,
-                    db_schema,
-                    blobstore,
-                    blob_prefix,
-                    llm,
-                    fs: module_config.fs.clone(),
-                    env_vars: env_vars.clone(),
-                    request_timeout: Duration::from_secs(module_config.request_timeout_secs),
-                };
-                tokio::spawn(http_handler_task(handler, module, rx));
-            }
-            Err(_) => {
-                // Fall back: spawn as a long-running task that calls `run`.
-                let (db_pool, db_schema) = if module_config.database {
-                    let schema = module_schema(&module_namespace, &module_name);
-                    let pool = self
-                        .db_pools
-                        .get(&(module_namespace.clone(), module_name.clone()))
-                        .cloned();
-                    (pool, Some(schema))
-                } else {
-                    (None, None)
-                };
-                let (blobstore, blob_prefix) = if module_config.blobstore {
-                    (
-                        self.blobstore_client.clone(),
-                        Some(blob_key_prefix(&module_namespace)),
-                    )
-                } else {
-                    (None, None)
-                };
-                let llm = if module_config.llm {
-                    self.llm_client.clone()
-                } else {
-                    None
-                };
+        match module_config.mode {
+            ModuleMode::Run => {
                 let state = ModuleState::new(
                     module_name.clone(),
                     module_namespace.clone(),
@@ -314,21 +269,98 @@ impl EngineRunner {
                 let mut store = Store::new(&self.engine, state);
                 let instance = linker.instantiate_async(&mut store, &component).await?;
 
+                let mn = module_name.clone();
                 tokio::spawn(async move {
                     match instance.get_func(&mut store, "run") {
                         Some(func) => {
+                            info!(module = %mn, "starting runner module");
                             if let Err(e) = func.call_async(&mut store, &[], &mut []).await {
-                                error!(module = %module_name, error = %e, "module exited with error");
+                                error!(module = %mn, error = %e, "runner module exited with error");
                             } else {
-                                info!(module = %module_name, "module exited cleanly");
+                                info!(module = %mn, "runner module exited cleanly");
                             }
                         }
                         None => {
-                            info!(module = %module_name, "no `run` export, module is idle");
+                            info!(module = %mn, "no `run` export, module is idle");
                             std::future::pending::<()>().await;
                         }
                     }
                 });
+            }
+
+            ModuleMode::Service | ModuleMode::Worker => {
+                let pre = ProxyPre::new(linker.instantiate_pre(&component)?).map_err(|e| {
+                    let mode_str = if module_config.mode == ModuleMode::Worker {
+                        "worker"
+                    } else {
+                        "service"
+                    };
+                    anyhow::anyhow!(
+                        "module '{}' (mode {mode_str}) must export wasi:http/incoming-handler: {e}",
+                        module_config.name,
+                    )
+                })?;
+                let pre = Arc::new(pre);
+
+                let (tx, rx) = mpsc::channel::<InboundRequest>(module_config.channel_capacity);
+                registry
+                    .register(
+                        module_namespace.clone(),
+                        module_name.clone(),
+                        module_version.clone(),
+                        tx.clone(),
+                    )
+                    .await;
+
+                let handler = HandlerContext {
+                    engine: self.engine.clone(),
+                    pre,
+                    instance_semaphore: self.instance_semaphore.clone(),
+                };
+                let module = ModuleContext {
+                    name: module_name.clone(),
+                    namespace: module_namespace.clone(),
+                    proxy_uri: proxy_uri.clone(),
+                    http_client: http_client.clone(),
+                    db_pool: db_pool.clone(),
+                    db_schema: db_schema.clone(),
+                    blobstore,
+                    blob_prefix,
+                    llm,
+                    fs: module_config.fs.clone(),
+                    env_vars: env_vars.clone(),
+                    request_timeout: Duration::from_secs(module_config.request_timeout_secs),
+                };
+                tokio::spawn(http_handler_task(handler, module, rx));
+
+                // For worker mode, also spawn the worker pool that pulls jobs from
+                // the Postgres queue and dispatches them as HTTP requests.
+                if module_config.mode == ModuleMode::Worker {
+                    let admin_pool = self.db_pool.clone().expect("worker mode requires database");
+                    let db_url = self
+                        .config
+                        .database
+                        .as_ref()
+                        .expect("worker mode requires database")
+                        .url
+                        .clone();
+                    wr_engine::worker::spawn_worker_pool(
+                        admin_pool,
+                        wr_engine::worker::WorkerPoolConfig {
+                            namespace: module_namespace.clone(),
+                            name: module_name.clone(),
+                            version: module_version.clone(),
+                            engine_id: engine_id.to_string(),
+                            concurrency: module_config.worker_concurrency,
+                            poll_interval: Duration::from_secs(
+                                module_config.worker_poll_interval_secs,
+                            ),
+                            job_timeout: Duration::from_secs(module_config.worker_job_timeout_secs),
+                            database_url: db_url,
+                        },
+                        tx,
+                    );
+                }
             }
         }
 
@@ -342,6 +374,9 @@ impl EngineRunner {
 struct HandlerContext {
     engine: Arc<Engine>,
     pre: Arc<ProxyPre<ModuleState>>,
+    /// Shared semaphore that gates WASM instantiation to prevent pooling
+    /// allocator exhaustion.
+    instance_semaphore: Arc<Semaphore>,
 }
 
 /// Module identity and runtime config — shared across requests.
@@ -384,7 +419,15 @@ async fn http_handler_task(
 
         tokio::spawn(
             async move {
-                let timeout = module.request_timeout;
+                // Worker-dispatched jobs carry x-wr-timeout with the job-level
+                // timeout; use it instead of the default request_timeout_secs.
+                let timeout = request
+                    .headers()
+                    .get("x-wr-timeout")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(Duration::from_secs)
+                    .unwrap_or(module.request_timeout);
 
                 let response = match tokio::time::timeout(
                     timeout,
@@ -422,11 +465,31 @@ async fn http_handler_task(
 
 /// Instantiate the component for one request and drive the WASI HTTP
 /// incoming-handler, returning the response to the caller.
+///
+/// Acquires an instance permit from the shared semaphore before
+/// instantiation to prevent pooling allocator exhaustion.
 async fn dispatch_request(
     handler: &HandlerContext,
     module: &ModuleContext,
     request: http::Request<Bytes>,
 ) -> Result<http::Response<Bytes>> {
+    // Acquire an instance slot — wait up to 1 s, then reject with 503.
+    let _permit =
+        match tokio::time::timeout(Duration::from_secs(1), handler.instance_semaphore.acquire())
+            .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => anyhow::bail!("instance semaphore closed"),
+            Err(_) => {
+                warn!(module = %module.name, "instance pool exhausted, rejecting request");
+                return Ok(http::Response::builder()
+                    .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                    .header("Retry-After", "1")
+                    .body(Bytes::from("instance pool exhausted"))
+                    .unwrap());
+            }
+        };
+
     let state = ModuleState::new(
         module.name.clone(),
         module.namespace.clone(),
@@ -472,6 +535,7 @@ async fn dispatch_request(
         .await?;
 
     // ── Collect and return the response ──────────────────────────────────
+    // The `_permit` is held until this point, released on drop.
     match resp_rx.await {
         Ok(Ok(wasm_resp)) => {
             let (rp, rb) = wasm_resp.into_parts();

@@ -52,4 +52,14 @@ wasm_path   = "examples/codegen/coordinator/target/wasm32-wasip2/release/coordin
 schema_path = "examples/codegen/schemas/coordinator.binpb"
 database    = true
 migrations_path = "examples/codegen/coordinator/migrations"
-request_timeout_secs = 600
+
+[[module]]
+name        = "worker"
+namespace   = "codegen"
+version     = "1.0.0"
+wasm_path   = "examples/codegen/worker/target/wasm32-wasip2/release/worker.wasm"
+schema_path = "examples/codegen/schemas/worker.binpb"
+mode        = "worker"
+database    = true
+worker_concurrency       = 1
+worker_job_timeout_secs  = 900
