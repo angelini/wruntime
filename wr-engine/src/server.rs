@@ -75,6 +75,14 @@ async fn handle(
     req: Request<hyper::body::Incoming>,
     registry: ModuleRegistry,
 ) -> Response<Full<Bytes>> {
+    // ── Health check — no headers required ────────────────────────────────
+    if req.uri().path() == "/healthz" {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::from("ok")))
+            .unwrap();
+    }
+
     // The proxy injects x-wr-namespace, x-wr-module, and x-wr-version so we
     // know which module instance to dispatch to.
     let namespace = match req

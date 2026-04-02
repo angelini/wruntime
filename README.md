@@ -190,6 +190,7 @@ See [docs/host-bindings.md](docs/host-bindings.md) for configuration and usage e
 | [`just`](https://github.com/casey/just) | Run project recipes (see `Justfile`) |
 | `protoc` | Compile `.proto` schemas to `FileDescriptorSet` binaries |
 | `cargo-component` | Build WASM component modules |
+| [`sccache`](https://github.com/mozilla/sccache) | Compilation cache — speeds up rebuilds and fresh clones (install: `cargo install sccache`) |
 
 ```bash
 just build          # debug build
