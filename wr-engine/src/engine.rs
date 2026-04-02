@@ -23,7 +23,7 @@ use crate::registry::{InboundRequest, ModuleRegistry, ModuleTx};
 use wr_engine::blobstore::BlobstoreRuntime;
 use wr_engine::config::{EngineConfig, ModuleConfig};
 use wr_engine::llm::LlmRuntime;
-use wr_engine::pool::module_schema;
+use wr_engine::pool::{blob_key_prefix, module_schema};
 use wr_engine::state::{ModuleServices, ModuleState};
 
 pub struct EngineRunner {
@@ -237,10 +237,13 @@ impl EngineRunner {
                 } else {
                     (None, None)
                 };
-                let blobstore = if module_config.blobstore {
-                    self.blobstore_client.clone()
+                let (blobstore, blob_prefix) = if module_config.blobstore {
+                    (
+                        self.blobstore_client.clone(),
+                        Some(blob_key_prefix(&module_namespace)),
+                    )
                 } else {
-                    None
+                    (None, None)
                 };
                 let llm = if module_config.llm {
                     self.llm_client.clone()
@@ -259,6 +262,7 @@ impl EngineRunner {
                     db_pool,
                     db_schema,
                     blobstore,
+                    blob_prefix,
                     llm,
                     fs: module_config.fs.clone(),
                     env_vars: env_vars.clone(),
@@ -278,10 +282,13 @@ impl EngineRunner {
                 } else {
                     (None, None)
                 };
-                let blobstore = if module_config.blobstore {
-                    self.blobstore_client.clone()
+                let (blobstore, blob_prefix) = if module_config.blobstore {
+                    (
+                        self.blobstore_client.clone(),
+                        Some(blob_key_prefix(&module_namespace)),
+                    )
                 } else {
-                    None
+                    (None, None)
                 };
                 let llm = if module_config.llm {
                     self.llm_client.clone()
@@ -297,6 +304,7 @@ impl EngineRunner {
                         db_pool,
                         db_schema,
                         blobstore,
+                        blob_prefix,
                         env_vars,
                         llm,
                         fs: module_config.fs.clone(),
@@ -351,6 +359,7 @@ struct ModuleContext {
     db_pool: Option<Arc<Pool>>,
     db_schema: Option<String>,
     blobstore: Option<Arc<BlobstoreRuntime>>,
+    blob_prefix: Option<String>,
     llm: Option<Arc<LlmRuntime>>,
     fs: Option<wr_engine::config::FsMode>,
     env_vars: HashMap<String, String>,
@@ -427,6 +436,7 @@ async fn dispatch_request(
             db_pool: module.db_pool.clone(),
             db_schema: module.db_schema.clone(),
             blobstore: module.blobstore.clone(),
+            blob_prefix: module.blob_prefix.clone(),
             llm: module.llm.clone(),
             fs: module.fs.clone(),
             env_vars: module.env_vars.clone(),

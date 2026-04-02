@@ -11,6 +11,19 @@ pub fn module_schema(namespace: &str, name: &str) -> String {
     format!("wr__{}__{}", sanitize(namespace), sanitize(name))
 }
 
+/// Returns the S3 key prefix for a module's blobstore namespace.
+/// Format: `wr/{namespace}/` with non-alphanumeric chars replaced by `_`.
+/// Scoped to namespace only (not module name) so modules within the same
+/// namespace can share blobstore data.
+pub fn blob_key_prefix(namespace: &str) -> String {
+    let sanitize = |s: &str| {
+        s.chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+    };
+    format!("wr/{}/", sanitize(namespace))
+}
+
 pub fn build_pool(database_url: &str, max_size: usize) -> anyhow::Result<Pool> {
     let mut cfg = Config::new();
     cfg.url = Some(database_url.to_string());
@@ -24,7 +37,17 @@ pub fn build_pool(database_url: &str, max_size: usize) -> anyhow::Result<Pool> {
 
 #[cfg(test)]
 mod tests {
-    use super::module_schema;
+    use super::{blob_key_prefix, module_schema};
+
+    #[test]
+    fn test_blob_key_prefix_simple() {
+        assert_eq!(blob_key_prefix("ecommerce"), "wr/ecommerce/");
+    }
+
+    #[test]
+    fn test_blob_key_prefix_special_chars() {
+        assert_eq!(blob_key_prefix("my-ns"), "wr/my_ns/");
+    }
 
     #[test]
     fn test_module_schema_simple() {
