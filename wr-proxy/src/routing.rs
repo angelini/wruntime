@@ -19,6 +19,31 @@ pub fn new_routing_table() -> CachedRoutingTable {
     }))
 }
 
+/// Perform a single routing-table sync from wr-manager.  Returns `true` if
+/// the table was updated (or was already up-to-date).
+pub async fn sync_once(
+    client: &mut ManagerServiceClient<tonic::transport::Channel>,
+    table: &CachedRoutingTable,
+    cb_registry: &CircuitBreakerRegistry,
+) -> Result<(), tonic::Status> {
+    let resp = client.get_routing_table(GetRoutingTableRequest {}).await?;
+    if let Some(incoming) = resp.into_inner().table {
+        let current_version = table.read().await.version;
+        if incoming.version > current_version {
+            let version = incoming.version;
+            let active: HashSet<&str> = incoming
+                .rules
+                .iter()
+                .map(|r| r.engine_address.as_str())
+                .collect();
+            cb_registry.evict_missing(&active);
+            *table.write().await = incoming;
+            info!(version, "routing table updated");
+        }
+    }
+    Ok(())
+}
+
 /// Background task: polls wr-manager for the routing table and updates the
 /// local cache whenever the version number increments.
 pub async fn sync_routing_table(
@@ -30,24 +55,8 @@ pub async fn sync_routing_table(
     let mut interval = tokio::time::interval(Duration::from_secs(ttl_secs));
     loop {
         interval.tick().await;
-        match client.get_routing_table(GetRoutingTableRequest {}).await {
-            Ok(resp) => {
-                if let Some(incoming) = resp.into_inner().table {
-                    let current_version = table.read().await.version;
-                    if incoming.version > current_version {
-                        let version = incoming.version;
-                        let active: HashSet<&str> = incoming
-                            .rules
-                            .iter()
-                            .map(|r| r.engine_address.as_str())
-                            .collect();
-                        cb_registry.evict_missing(&active);
-                        *table.write().await = incoming;
-                        info!(version, "routing table updated");
-                    }
-                }
-            }
-            Err(e) => warn!(error = %e, "routing table sync failed"),
+        if let Err(e) = sync_once(&mut client, &table, &cb_registry).await {
+            warn!(error = %e, "routing table sync failed");
         }
     }
 }

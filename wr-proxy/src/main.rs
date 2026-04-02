@@ -6,7 +6,7 @@ mod routing;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use http::{Request, Response, StatusCode};
 use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -40,6 +40,15 @@ async fn main() -> Result<()> {
     // ── Connect to wr-manager ─────────────────────────────────────────────
     let manager_client = ManagerServiceClient::connect(config.manager_address.clone()).await?;
     info!(address = %config.manager_address, "connected to manager");
+
+    // ── Initial routing table sync (blocks until first fetch succeeds) ──
+    {
+        let mut client = manager_client.clone();
+        routing::sync_once(&mut client, &routing_table, &cb_registry)
+            .await
+            .context("initial routing table sync failed")?;
+        info!("initial routing table sync complete");
+    }
 
     // ── Background tasks ──────────────────────────────────────────────────
     tokio::spawn(routing::sync_routing_table(

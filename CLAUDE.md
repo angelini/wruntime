@@ -61,7 +61,7 @@ After refactoring, always run `just tidy` and `just ecommerce-inline` to verify 
 - `codegen.md` — proto-to-Rust code generation mapping
 - `examples.md` — index of real code in the repo
 
-**Prerequisites:** `rustc`, `cargo`, `just`, `protoc` (for proto code generation). WASM module development additionally requires `cargo-component` and `wasm-tools`.
+**Prerequisites:** `rustc`, `cargo`, `just`, `protoc` (for proto code generation), `sccache` (compilation cache — `cargo install sccache`). WASM module development additionally requires `cargo-component` and `wasm-tools`.
 
 **Integration tests with a real DB:** set `WRT_TEST_DB_URL=postgres://postgres@localhost:5433/wruntime_test` before running tests (matches the `just dev-up` Postgres instance); omitting it skips DB-backed test cases. `just test-wasm` sets all required env vars (DB + S3) automatically using the `just dev-up` defaults.
 
