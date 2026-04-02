@@ -39,7 +39,7 @@ test:
     WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
     WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
     WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-    cargo test
+    cargo test --timings
 
 # Run integration tests only
 test-integration:
@@ -141,6 +141,24 @@ dev-logs service="":
 # Show running container status
 dev-ps:
     docker compose ps
+
+# Reset example DB — drops all module schemas, manager tables, and refinery migration history
+dev-reset-db:
+    @echo "==> Resetting example database..."
+    psql "{{db_url_example}}" -c " \
+        DO \$\$DECLARE r RECORD; \
+        BEGIN \
+            FOR r IN SELECT schema_name FROM information_schema.schemata \
+                     WHERE schema_name LIKE 'wr__%' \
+            LOOP \
+                EXECUTE 'DROP SCHEMA \"' || r.schema_name || '\" CASCADE'; \
+                RAISE NOTICE 'dropped schema %', r.schema_name; \
+            END LOOP; \
+        END\$\$; \
+        DROP TABLE IF EXISTS refinery_schema_history CASCADE; \
+        TRUNCATE wr_engines, wr_routing_rules, wr_schemas CASCADE; \
+    "
+    @echo "Done."
 
 # ── WASM Guest Test Harness ───────────────────────────────────────────────────
 
@@ -255,10 +273,12 @@ build-codegen: build-codegen-schemas
 
 # Run the full codegen example (requires Postgres + RustFS S3 — see `just dev-up`)
 codegen: build-codegen build
+    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
     DB_URL={{db_url_example}} bash examples/codegen/run.sh
 
 # Run the codegen example inline (single invocation, exits on failure)
 codegen-inline: build-codegen build
+    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
     DB_URL={{db_url_example}} bash examples/codegen/run.sh --inline
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────

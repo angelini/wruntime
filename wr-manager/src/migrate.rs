@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use tracing::info;
 
 const V1_SQL: &str = include_str!("../migrations/V1__initial.sql");
+const V2_SQL: &str = include_str!("../migrations/V2__secrets.sql");
 
-const MIGRATIONS: &[(i32, &str)] = &[(1, V1_SQL)];
+const MIGRATIONS: &[(i32, &str)] = &[(1, V1_SQL), (2, V2_SQL)];
 
 /// Run all pending manager migrations.
 ///

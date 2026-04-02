@@ -6,8 +6,8 @@ edition = "2021"
 [dependencies]
 tower          = { version = "0.5", features = ["full"] }
 http           = "1"
-hyper          = { version = "1", features = ["http2", "server"] }
-hyper-util     = { version = "0.1", features = ["client-legacy", "http2", "tokio"] }
+hyper          = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util     = { version = "0.1", features = ["client-legacy", "http1", "http2", "server-auto", "tokio"] }
 hyper-rustls   = { version = "0.27", features = ["native-tokio", "http1", "http2"] }
 rustls         = { version = "0.23", features = ["ring"] }
 http-body      = "1"

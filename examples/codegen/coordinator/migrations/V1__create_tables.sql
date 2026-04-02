@@ -1,7 +1,7 @@
 CREATE TABLE tasks (
     task_id             TEXT PRIMARY KEY,
     repo_url            TEXT NOT NULL,
-    ref                 TEXT NOT NULL,
+    "ref"               TEXT NOT NULL,
     doc_sources         JSONB NOT NULL DEFAULT '[]',
     task_description    TEXT NOT NULL,
     max_agent_turns     INTEGER NOT NULL DEFAULT 3,

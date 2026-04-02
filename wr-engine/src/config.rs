@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use wr_common::node::NodeConfig;
@@ -113,6 +115,16 @@ pub enum FsMode {
     Tempdir,
 }
 
+/// An environment variable value: either a plain string or a secret reference.
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+pub enum EnvValue {
+    /// Inline plaintext value, e.g. `LOG_LEVEL = "debug"`
+    Plain(String),
+    /// Secret fetched from the manager, e.g. `API_KEY = { secret = true }`
+    Secret { secret: bool },
+}
+
 #[derive(Deserialize, Clone)]
 pub struct ModuleConfig {
     pub name: String,
@@ -156,6 +168,11 @@ pub struct ModuleConfig {
     /// startup before the module handles traffic.
     #[serde(default)]
     pub migrations_path: Option<String>,
+    /// Environment variables injected into the WASI context.
+    /// Plain values are used directly; `{ secret = true }` values are
+    /// resolved from secrets delivered by the manager at registration time.
+    #[serde(default)]
+    pub env: HashMap<String, EnvValue>,
 }
 
 fn default_request_timeout_secs() -> u64 {

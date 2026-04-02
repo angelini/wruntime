@@ -1,9 +1,12 @@
 pub mod config;
+pub mod crypto;
 pub mod db;
 pub mod migrate;
 pub mod pool;
 pub mod service;
 pub mod state;
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use tonic::transport::Server;
@@ -27,14 +30,16 @@ async fn main() -> Result<()> {
     migrate::run_migrations(&client).await?;
     drop(client);
 
+    let crypto = Arc::new(crypto::SecretCrypto::from_env()?);
     let shared = state::new_state();
-    let manager = service::Manager::new(shared.clone(), db_pool.clone());
+    let manager = service::Manager::new(shared.clone(), db_pool.clone(), crypto);
 
     // Monitor for engines that miss their heartbeat deadline
     tokio::spawn(state::monitor_heartbeats(
         shared,
         db_pool,
         config.engine_heartbeat_timeout_secs,
+        std::time::Duration::from_secs(10),
     ));
 
     info!(address = %addr, "manager listening");

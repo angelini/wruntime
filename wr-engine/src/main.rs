@@ -2,16 +2,17 @@ mod engine;
 mod registry;
 mod server;
 
-use wr_engine::config;
+use wr_engine::config::{self, EnvValue};
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, DeregisterEngineRequest, EngineRegistration,
-    HeartbeatRequest, ModuleDescriptor, RegisterEngineRequest, RoutingRule,
+    HeartbeatRequest, ModuleDescriptor, RegisterEngineRequest, RoutingRule, SecretRequest,
 };
 
 #[tokio::main]
@@ -36,13 +37,11 @@ async fn main() -> Result<()> {
     };
     info!(engine_id, "engine starting");
 
-    // ── Load WASM modules ─────────────────────────────────────────────────
+    // ── Prepare WASM runtime (schemas + migrations, but don't load modules yet)
     let registry = registry::ModuleRegistry::new();
     let runner = engine::EngineRunner::new(config.clone())?;
     runner.provision_schemas().await?;
     runner.run_migrations().await?;
-    runner.load_modules(&registry).await?;
-    info!("all modules loaded");
 
     // ── Start inbound HTTP server ─────────────────────────────────────────
     {
@@ -71,18 +70,72 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Build secret requests from module env configs
+    let mut secret_requests: Vec<SecretRequest> = Vec::new();
+    for m in &config.modules {
+        for (key, val) in &m.env {
+            if matches!(val, EnvValue::Secret { secret: true }) {
+                secret_requests.push(SecretRequest {
+                    namespace: m.namespace.clone(),
+                    key: key.clone(),
+                });
+            }
+        }
+    }
+
     // ── Register with manager ─────────────────────────────────────────────
-    client
+    let reg_response = client
         .register_engine(RegisterEngineRequest {
             registration: Some(EngineRegistration {
                 engine_id: engine_id.clone(),
                 address: advertise_address.clone(),
                 proxy_address: config.node.proxy_address.clone(),
                 modules: module_descriptors,
+                secrets: secret_requests,
             }),
         })
-        .await?;
+        .await?
+        .into_inner();
     info!(address = %config.manager_address, engine_id, "registered with manager");
+
+    // ── Resolve secrets into env vars per module ──────────────────────────
+    // Build a lookup: (namespace, key) → plaintext value
+    let mut secrets_map: HashMap<(String, String), String> = HashMap::new();
+    for ns_secrets in &reg_response.secrets {
+        for (key, value) in &ns_secrets.secrets {
+            secrets_map.insert((ns_secrets.namespace.clone(), key.clone()), value.clone());
+        }
+    }
+
+    // Resolve each module's env block into a flat HashMap<String, String>
+    let mut resolved_envs: HashMap<(String, String), HashMap<String, String>> = HashMap::new();
+    for module in &config.modules {
+        let mut env = HashMap::new();
+        for (key, val) in &module.env {
+            match val {
+                EnvValue::Plain(v) => {
+                    env.insert(key.clone(), v.clone());
+                }
+                EnvValue::Secret { secret: true } => {
+                    let plaintext = secrets_map
+                        .get(&(module.namespace.clone(), key.clone()))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "secret '{key}' not found for namespace '{}'",
+                                module.namespace
+                            )
+                        })?;
+                    env.insert(key.clone(), plaintext.clone());
+                }
+                EnvValue::Secret { secret: false } => {}
+            }
+        }
+        resolved_envs.insert((module.namespace.clone(), module.name.clone()), env);
+    }
+
+    // ── Load WASM modules (now that secrets are resolved) ─────────────────
+    runner.load_modules(&registry, &resolved_envs).await?;
+    info!("all modules loaded");
 
     // ── Upsert routing rules for every hosted module ──────────────────────
     for module in &config.modules {

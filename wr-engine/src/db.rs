@@ -2,6 +2,24 @@ use chrono::Timelike as _;
 use futures::StreamExt as _;
 use wasmtime::component::Resource;
 
+/// Format a tokio-postgres error with its full source chain.
+///
+/// `tokio_postgres::Error::fmt` just prints "db error" for database errors —
+/// the actual message (column name, constraint, syntax detail) lives in the
+/// `source()` chain.  This helper walks the chain so callers see the real
+/// Postgres error instead of the opaque "db error" string.
+fn pg_error_string(e: &tokio_postgres::Error) -> String {
+    use std::error::Error;
+    let mut msg = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        msg.push_str(": ");
+        msg.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    msg
+}
+
 /// Host-side state for an active WIT `transaction` resource.
 ///
 /// Holds the dedicated pooled connection for the duration of the transaction.
@@ -311,7 +329,7 @@ impl Host for ModuleState {
             let rows = client
                 .query(sql.as_str(), &params_ref)
                 .await
-                .map_err(|e| DbError::Query(e.to_string()))?;
+                .map_err(|e| DbError::Query(pg_error_string(&e)))?;
             Ok(rows.iter().map(pg_row_to_wit).collect())
         })
     }
@@ -350,7 +368,7 @@ impl Host for ModuleState {
             client
                 .execute(sql.as_str(), &params_ref)
                 .await
-                .map_err(|e| DbError::Query(e.to_string()))
+                .map_err(|e| DbError::Query(pg_error_string(&e)))
         })
     }
 
@@ -387,7 +405,7 @@ impl Host for ModuleState {
         let stream = client
             .query_raw(sql.as_str(), params_ref)
             .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
+            .map_err(|e| DbError::Query(pg_error_string(&e)))?;
         self.table()
             .push(CursorState {
                 stream: Box::pin(stream),
@@ -415,7 +433,7 @@ impl Host for ModuleState {
             client
                 .execute("BEGIN", &[])
                 .await
-                .map_err(|e| DbError::Query(e.to_string()))?;
+                .map_err(|e| DbError::Query(pg_error_string(&e)))?;
             if let Some(s) = &schema {
                 client
                     .execute(
@@ -457,7 +475,7 @@ impl HostTransaction for ModuleState {
             .client
             .query(sql.as_str(), &params_ref)
             .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
+            .map_err(|e| DbError::Query(pg_error_string(&e)))?;
         Ok(rows.iter().map(pg_row_to_wit).collect())
     }
 
@@ -478,7 +496,7 @@ impl HostTransaction for ModuleState {
             .client
             .execute(sql.as_str(), &params_ref)
             .await
-            .map_err(|e| DbError::Query(e.to_string()))
+            .map_err(|e| DbError::Query(pg_error_string(&e)))
     }
 
     async fn query_stream(
@@ -498,7 +516,7 @@ impl HostTransaction for ModuleState {
             .client
             .query_raw(sql.as_str(), params_ref)
             .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
+            .map_err(|e| DbError::Query(pg_error_string(&e)))?;
         self.table()
             .push(CursorState {
                 stream: Box::pin(stream),
@@ -517,7 +535,7 @@ impl HostTransaction for ModuleState {
             .client
             .execute("COMMIT", &[])
             .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
+            .map_err(|e| DbError::Query(pg_error_string(&e)))?;
         self.table()
             .get_mut(&self_)
             .map_err(|e| DbError::Connection(e.to_string()))?
@@ -534,7 +552,7 @@ impl HostTransaction for ModuleState {
             .client
             .execute("ROLLBACK", &[])
             .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
+            .map_err(|e| DbError::Query(pg_error_string(&e)))?;
         self.table()
             .get_mut(&self_)
             .map_err(|e| DbError::Connection(e.to_string()))?

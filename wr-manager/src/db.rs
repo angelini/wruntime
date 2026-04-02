@@ -328,6 +328,95 @@ pub async fn upsert_schema(
     Ok(())
 }
 
+// ── Secret operations ────────────────────────────────────────────────────────
+
+/// Insert or update an encrypted secret.
+pub async fn upsert_secret(
+    pool: &Pool,
+    namespace: &str,
+    key: &str,
+    ciphertext: &[u8],
+    nonce: &[u8],
+) -> Result<(), Status> {
+    let client = pool.get().await.map_err(internal)?;
+    client
+        .execute(
+            "INSERT INTO wr_secrets (namespace, key, ciphertext, nonce)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (namespace, key) DO UPDATE
+               SET ciphertext = EXCLUDED.ciphertext,
+                   nonce = EXCLUDED.nonce,
+                   updated_at = NOW()",
+            &[&namespace, &key, &ciphertext, &nonce],
+        )
+        .await
+        .map_err(internal)?;
+    Ok(())
+}
+
+/// Delete a secret by (namespace, key). Returns true if a row was deleted.
+pub async fn delete_secret(pool: &Pool, namespace: &str, key: &str) -> Result<bool, Status> {
+    let client = pool.get().await.map_err(internal)?;
+    let deleted = client
+        .execute(
+            "DELETE FROM wr_secrets WHERE namespace = $1 AND key = $2",
+            &[&namespace, &key],
+        )
+        .await
+        .map_err(internal)?;
+    Ok(deleted > 0)
+}
+
+/// List secret metadata (namespace + key only, no values).
+/// If namespace is empty, return all secrets across all namespaces.
+pub async fn list_secrets(pool: &Pool, namespace: &str) -> Result<Vec<(String, String)>, Status> {
+    let client = pool.get().await.map_err(internal)?;
+    let rows = if namespace.is_empty() {
+        client
+            .query(
+                "SELECT namespace, key FROM wr_secrets ORDER BY namespace, key",
+                &[],
+            )
+            .await
+            .map_err(internal)?
+    } else {
+        client
+            .query(
+                "SELECT namespace, key FROM wr_secrets WHERE namespace = $1 ORDER BY key",
+                &[&namespace],
+            )
+            .await
+            .map_err(internal)?
+    };
+    Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+}
+
+/// Fetch encrypted secrets for specific (namespace, key) pairs.
+pub async fn get_secrets(
+    pool: &Pool,
+    requests: &[(String, String)],
+) -> Result<Vec<(String, String, Vec<u8>, Vec<u8>)>, Status> {
+    if requests.is_empty() {
+        return Ok(vec![]);
+    }
+    let client = pool.get().await.map_err(internal)?;
+    let mut results = Vec::with_capacity(requests.len());
+    for (namespace, key) in requests {
+        let row = client
+            .query_opt(
+                "SELECT namespace, key, ciphertext, nonce FROM wr_secrets
+                 WHERE namespace = $1 AND key = $2",
+                &[namespace, key],
+            )
+            .await
+            .map_err(internal)?;
+        if let Some(row) = row {
+            results.push((row.get(0), row.get(1), row.get(2), row.get(3)));
+        }
+    }
+    Ok(results)
+}
+
 /// Get a schema by (namespace, module, version).
 pub async fn get_schema(
     pool: &Pool,

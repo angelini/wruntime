@@ -192,7 +192,10 @@ impl proto::CoordinatorService for Component {
              FROM tasks ORDER BY created_at DESC LIMIT $1 OFFSET $2",
             &[PgValue::Int4(limit), PgValue::Int4(offset)],
         )
-        .map_err(|e| ServiceError::internal(format!("query tasks: {e:?}")))?;
+        .map_err(|e| {
+            wr_sdk::log::log(&format!("query tasks failed: {e:?}"));
+            ServiceError::internal(format!("query tasks: {e:?}"))
+        })?;
 
         let tasks = rows.into_iter().map(row_to_task_response).collect();
         Ok(proto::ListTasksResponse { tasks })
@@ -229,7 +232,7 @@ impl Component {
 
         // Insert task record.
         database::execute(
-            "INSERT INTO tasks (task_id, repo_url, ref, doc_sources, task_description, \
+            "INSERT INTO tasks (task_id, repo_url, \"ref\", doc_sources, task_description, \
              max_agent_turns, status, session_id) \
              VALUES ($1, $2, $3, $4::jsonb, $5, $6, 'pending', $7)",
             &[
@@ -242,7 +245,10 @@ impl Component {
                 PgValue::Text(session_id.clone()),
             ],
         )
-        .map_err(|e| ServiceError::internal(format!("insert task: {e:?}")))?;
+        .map_err(|e| {
+            wr_sdk::log::log(&format!("insert task failed: {e:?}"));
+            ServiceError::internal(format!("insert task: {e:?}"))
+        })?;
 
         // Phase 1: Collect docs.
         update_task_status(&task_id, "collecting")?;
@@ -301,7 +307,10 @@ impl Component {
                 PgValue::Int4(agent_resp.output_tokens),
             ],
         )
-        .map_err(|e| ServiceError::internal(format!("update task: {e:?}")))?;
+        .map_err(|e| {
+            wr_sdk::log::log(&format!("update task failed: {e:?}"));
+            ServiceError::internal(format!("update task: {e:?}"))
+        })?;
 
         Ok(proto::CreateTaskResponse {
             task_id,
@@ -317,7 +326,10 @@ impl Component {
              FROM tasks WHERE task_id = $1",
             &[PgValue::Text(task_id.into())],
         )
-        .map_err(|e| ServiceError::internal(format!("query task: {e:?}")))?;
+        .map_err(|e| {
+            wr_sdk::log::log(&format!("query task failed: {e:?}"));
+            ServiceError::internal(format!("query task: {e:?}"))
+        })?;
 
         if rows.is_empty() {
             return Err(ServiceError::not_found("task not found"));
@@ -370,7 +382,10 @@ fn update_task_status(task_id: &str, status: &str) -> Result<(), ServiceError> {
             PgValue::Text(status.into()),
         ],
     )
-    .map_err(|e| ServiceError::internal(format!("update status: {e:?}")))?;
+    .map_err(|e| {
+        wr_sdk::log::log(&format!("update status failed: {e:?}"));
+        ServiceError::internal(format!("update status: {e:?}"))
+    })?;
     Ok(())
 }
 
@@ -387,6 +402,9 @@ fn update_task_status_with_message(
             PgValue::Text(message.into()),
         ],
     )
-    .map_err(|e| ServiceError::internal(format!("update status: {e:?}")))?;
+    .map_err(|e| {
+        wr_sdk::log::log(&format!("update status failed: {e:?}"));
+        ServiceError::internal(format!("update status: {e:?}"))
+    })?;
     Ok(())
 }

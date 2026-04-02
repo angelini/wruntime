@@ -15,6 +15,7 @@ message EngineRegistration {
   string                    address       = 2; // host:port wr-proxy uses to reach this engine
   repeated ModuleDescriptor modules       = 3;
   string                    proxy_address = 4; // local proxy address (node identity)
+  repeated SecretRequest    secrets       = 5; // secrets this engine needs (resolved from config)
 }
 
 message RoutingRule {
@@ -38,7 +39,10 @@ message RoutingTable {
 // ── Engine lifecycle ──────────────────────────────────────────────────────
 
 message RegisterEngineRequest    { EngineRegistration registration = 1; }
-message RegisterEngineResponse   { bool accepted = 1; }
+message RegisterEngineResponse   {
+  bool                       accepted = 1;
+  repeated NamespaceSecrets  secrets  = 2; // only the requested secrets, decrypted
+}
 message DeregisterEngineRequest  { string engine_id = 1; }
 message DeregisterEngineResponse {}
 message HeartbeatRequest {
@@ -56,6 +60,26 @@ message GetRoutingTableResponse   { RoutingTable table = 1; }
 message UpsertRoutingRuleResponse {}
 message DeleteRoutingRuleRequest  { string rule_id = 1; }
 message DeleteRoutingRuleResponse {}
+
+// ── Secrets ───────────────────────────────────────────────────────────────
+
+message SecretRequest {
+  string namespace = 1;
+  string key       = 2;
+}
+
+message NamespaceSecrets {
+  string              namespace = 1;
+  map<string, string> secrets   = 2; // key → plaintext value
+}
+
+message SetSecretRequest    { string namespace = 1; string key = 2; string value = 3; }
+message SetSecretResponse   {}
+message DeleteSecretRequest { string namespace = 1; string key = 2; }
+message DeleteSecretResponse{}
+message ListSecretsRequest  { string namespace = 1; } // empty = all namespaces
+message SecretEntry         { string namespace = 1; string key = 2; }
+message ListSecretsResponse { repeated SecretEntry secrets = 1; }
 
 // ── Schemas ───────────────────────────────────────────────────────────────
 
@@ -81,4 +105,9 @@ service ManagerService {
   // Schemas
   rpc GetSchema         (GetSchemaRequest)         returns (GetSchemaResponse);
   rpc UploadSchema      (UploadSchemaRequest)      returns (UploadSchemaResponse);
+
+  // Secrets
+  rpc SetSecret         (SetSecretRequest)         returns (SetSecretResponse);
+  rpc DeleteSecret      (DeleteSecretRequest)      returns (DeleteSecretResponse);
+  rpc ListSecrets       (ListSecretsRequest)       returns (ListSecretsResponse);
 }

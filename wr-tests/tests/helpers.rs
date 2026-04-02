@@ -122,9 +122,20 @@ pub async fn manager_pool() -> deadpool_postgres::Pool {
 pub async fn start_manager(pool: deadpool_postgres::Pool) -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    // Use a fixed test key (32 bytes = 64 hex chars)
+    let crypto = std::sync::Arc::new(
+        wr_manager::crypto::SecretCrypto::from_hex(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("test encryption key"),
+    );
     tokio::spawn(
         Server::builder()
-            .add_service(ManagerServiceServer::new(Manager::new(new_state(), pool)))
+            .add_service(ManagerServiceServer::new(Manager::new(
+                new_state(),
+                pool,
+                crypto,
+            )))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
     );
     Ok(format!("http://{addr}"))
@@ -206,6 +217,7 @@ pub async fn register_module(
                 version: module.version.into(),
                 proto_schema: module.schema,
             }],
+            secrets: vec![],
         }),
     })
     .await?;
@@ -684,6 +696,12 @@ pub async fn start_manager_with_monitor(
     timeout_secs: u64,
 ) -> Result<(String, wr_manager::state::SharedState)> {
     let state = new_state();
+    let crypto = std::sync::Arc::new(
+        wr_manager::crypto::SecretCrypto::from_hex(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("test encryption key"),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(
@@ -691,6 +709,7 @@ pub async fn start_manager_with_monitor(
             .add_service(ManagerServiceServer::new(Manager::new(
                 state.clone(),
                 pool.clone(),
+                crypto,
             )))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
     );
@@ -698,6 +717,7 @@ pub async fn start_manager_with_monitor(
         state.clone(),
         pool,
         timeout_secs,
+        std::time::Duration::from_millis(200),
     ));
     Ok((format!("http://{addr}"), state))
 }
