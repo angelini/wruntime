@@ -37,6 +37,7 @@ async fn test_register_and_list_engines() -> Result<()> {
                 version: "1.0.0".into(),
                 proto_schema: minimal_file_descriptor_set(),
             }],
+            secrets: vec![],
         }),
     })
     .await?;
@@ -65,6 +66,7 @@ async fn test_deregister_engine() -> Result<()> {
             address: "http://127.0.0.1:9101".into(),
             proxy_address: String::new(),
             modules: vec![],
+            secrets: vec![],
         }),
     })
     .await?;
@@ -96,6 +98,7 @@ async fn test_heartbeat() -> Result<()> {
             address: "http://127.0.0.1:9102".into(),
             proxy_address: String::new(),
             modules: vec![],
+            secrets: vec![],
         }),
     })
     .await?;
@@ -1264,6 +1267,7 @@ async fn test_manager_rejects_module_without_namespace() -> Result<()> {
                     version: "1.0.0".into(),
                     proto_schema: vec![],
                 }],
+                secrets: vec![],
             }),
         })
         .await;
@@ -1694,10 +1698,10 @@ async fn test_circuit_breaker_opens_after_consecutive_failures() -> Result<()> {
     )
     .await?;
 
-    // First 3 requests hit the engine and get 503 (forwarded 500 counted as failure).
+    // First 3 requests hit the engine and get 500 passed through (counted as failure).
     for _ in 0..3 {
         let (status, _) = proxy_get(proxy, "cb-ns", "failing-svc", Some("1.0.0")).await?;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     // 4th request: circuit is now OPEN — rejected without reaching engine.
@@ -2063,8 +2067,8 @@ async fn test_heartbeat_timeout_marks_module_unhealthy() -> Result<()> {
         }
     }
 
-    // Wait for the monitor to run (10-second tick) — add padding.
-    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+    // Wait for the monitor to run (200ms tick in tests) — add padding.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // The module should now be marked unhealthy.
     let (healthy, _) = get_rule_health(&mut mgr, "heartbeat-svc").await?;
@@ -2102,7 +2106,7 @@ async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
     )
     .await?;
 
-    // Send heartbeats continuously for 15 seconds (through the monitor tick).
+    // Send heartbeats continuously through several monitor ticks (200ms each).
     for _ in 0..5 {
         mgr.heartbeat(HeartbeatRequest {
             engine_id: "hc-keep-e1".into(),
@@ -2114,7 +2118,7 @@ async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
             }],
         })
         .await?;
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
     // Module should still be healthy.

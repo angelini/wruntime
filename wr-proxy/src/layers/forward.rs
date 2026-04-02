@@ -3,7 +3,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use failsafe::futures::CircuitBreaker as _;
 use http::Request;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
@@ -12,14 +11,6 @@ use tracing::{info_span, warn, Instrument};
 
 use super::{Destination, ProxyBody, ResBody, ResolvedDestination};
 use crate::circuit_breaker::CircuitBreakerRegistry;
-
-/// Parses the `Retry-After` header as delta-seconds, ignoring HTTP-date values.
-fn parse_retry_after(headers: &http::HeaderMap) -> Option<u64> {
-    headers
-        .get(http::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-}
 
 #[derive(Clone)]
 pub struct ForwardService {
@@ -99,57 +90,55 @@ impl Service<Request<ProxyBody>> for ForwardService {
 
             let cb = cb_registry.get_or_create(&forward_addr);
 
-            let outcome = cb
-                .call(
-                    async {
-                        let resp = client
-                            .request(forward_req)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("forward failed: {e}"))?;
+            // Check circuit breaker before forwarding.
+            if !cb.is_call_permitted() {
+                warn!(parent: &span, engine = %forward_addr, "circuit open");
+                span.record("otel.status_code", "circuit_open");
+                let mut resp = super::error_response(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    "circuit open",
+                );
+                let secs = cb_registry.open_duration_secs();
+                if let Ok(val) = http::HeaderValue::from_str(&secs.to_string()) {
+                    resp.headers_mut().insert(http::header::RETRY_AFTER, val);
+                }
+                return Ok(resp);
+            }
 
-                        let (resp_parts, resp_body) = resp.into_parts();
+            let result = async {
+                client
+                    .request(forward_req)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("forward failed: {e}"))
+            }
+            .instrument(span.clone())
+            .await;
 
-                        if resp_parts.status.is_server_error()
-                            || resp_parts.status == http::StatusCode::TOO_MANY_REQUESTS
-                        {
-                            let retry_after = parse_retry_after(&resp_parts.headers);
-                            return Err(anyhow::anyhow!(
-                                "engine overloaded: {} (retry-after: {:?})",
-                                resp_parts.status,
-                                retry_after
-                            ));
-                        }
-
-                        Ok::<_, anyhow::Error>((resp_parts, resp_body))
-                    }
-                    .instrument(span.clone()),
-                )
-                .await;
-
-            match outcome {
-                Ok((resp_parts, resp_body)) => {
+            match result {
+                Ok(resp) => {
+                    let (resp_parts, resp_body) = resp.into_parts();
                     let status = resp_parts.status.as_u16();
                     span.record("http.response.status_code", status);
-                    span.record("otel.status_code", "OK");
+
+                    // Record failure for circuit breaker on 5xx/429, but still
+                    // pass the original response through to the caller.
+                    if resp_parts.status.is_server_error()
+                        || resp_parts.status == http::StatusCode::TOO_MANY_REQUESTS
+                    {
+                        cb.on_error();
+                        span.record("otel.status_code", "ERROR");
+                    } else {
+                        cb.on_success();
+                        span.record("otel.status_code", "OK");
+                    }
+
                     Ok(http::Response::from_parts(
                         resp_parts,
                         ProxyBody::streaming(resp_body),
                     ))
                 }
-                Err(failsafe::Error::Rejected) => {
-                    warn!(parent: &span, engine = %forward_addr, "circuit open");
-                    span.record("otel.status_code", "circuit_open");
-                    let mut resp = super::error_response(
-                        http::StatusCode::SERVICE_UNAVAILABLE,
-                        "circuit open",
-                    );
-                    let secs = cb_registry.open_duration_secs();
-                    if let Ok(val) = http::HeaderValue::from_str(&secs.to_string()) {
-                        resp.headers_mut().insert(http::header::RETRY_AFTER, val);
-                    }
-                    Ok(resp)
-                }
-                Err(failsafe::Error::Inner(e)) => {
+                Err(e) => {
+                    cb.on_error();
                     span.record("otel.status_code", "ERROR");
                     Ok(super::error_response(
                         http::StatusCode::SERVICE_UNAVAILABLE,

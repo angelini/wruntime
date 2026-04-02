@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use http::{Request, Response, StatusCode};
-use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
 use tower::{Service, ServiceBuilder};
 
@@ -156,7 +156,7 @@ where
                     }
                 });
 
-            if let Err(e) = http2::Builder::new(TokioExecutor::new())
+            if let Err(e) = auto::Builder::new(TokioExecutor::new())
                 .serve_connection(io, hyper_svc)
                 .await
             {

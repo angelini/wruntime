@@ -27,7 +27,7 @@ pub struct ExternalConfig {
     /// TCP address to bind the external listener, e.g. "0.0.0.0:8080"
     pub listen_address: String,
     /// Routes accessible to external callers.
-    #[serde(default)]
+    #[serde(default, alias = "route")]
     pub routes: Vec<ExternalRoute>,
 }
 

@@ -33,6 +33,8 @@ enum Commands {
     Metrics(cmd::metrics::MetricsArgs),
     /// Send an HTTP request through the proxy to a module
     Invoke(cmd::invoke::InvokeArgs),
+    /// Manage namespace-scoped secrets
+    Secrets(cmd::secrets::SecretsArgs),
 }
 
 #[tokio::main]
@@ -45,5 +47,6 @@ async fn main() -> Result<()> {
         Commands::Services(args) => cmd::services::run(args, &cli.manager).await,
         Commands::Metrics(args) => cmd::metrics::run(args).await,
         Commands::Invoke(args) => cmd::invoke::run(args, &cli.manager).await,
+        Commands::Secrets(args) => cmd::secrets::run(args, &cli.manager).await,
     }
 }

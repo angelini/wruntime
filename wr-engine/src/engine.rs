@@ -160,9 +160,17 @@ impl EngineRunner {
 
     /// Load and spawn a task for every module listed in the config, registering
     /// HTTP-handler modules in `registry` so the inbound server can route to them.
-    pub async fn load_modules(&self, registry: &ModuleRegistry) -> Result<()> {
+    pub async fn load_modules(
+        &self,
+        registry: &ModuleRegistry,
+        resolved_envs: &HashMap<(String, String), HashMap<String, String>>,
+    ) -> Result<()> {
         for module_config in &self.config.modules {
-            self.spawn_module(module_config, registry).await?;
+            let env_vars = resolved_envs
+                .get(&(module_config.namespace.clone(), module_config.name.clone()))
+                .cloned()
+                .unwrap_or_default();
+            self.spawn_module(module_config, registry, env_vars).await?;
         }
         Ok(())
     }
@@ -171,6 +179,7 @@ impl EngineRunner {
         &self,
         module_config: &ModuleConfig,
         registry: &ModuleRegistry,
+        env_vars: HashMap<String, String>,
     ) -> Result<()> {
         info!(module = %module_config.name, "loading module");
 
@@ -252,6 +261,7 @@ impl EngineRunner {
                     blobstore,
                     llm,
                     fs: module_config.fs.clone(),
+                    env_vars: env_vars.clone(),
                     request_timeout: Duration::from_secs(module_config.request_timeout_secs),
                 };
                 tokio::spawn(http_handler_task(handler, module, rx));
@@ -287,6 +297,7 @@ impl EngineRunner {
                         db_pool,
                         db_schema,
                         blobstore,
+                        env_vars,
                         llm,
                         fs: module_config.fs.clone(),
                         active_span: tracing::Span::current(),
@@ -342,6 +353,7 @@ struct ModuleContext {
     blobstore: Option<Arc<BlobstoreRuntime>>,
     llm: Option<Arc<LlmRuntime>>,
     fs: Option<wr_engine::config::FsMode>,
+    env_vars: HashMap<String, String>,
     request_timeout: Duration,
 }
 
@@ -417,6 +429,7 @@ async fn dispatch_request(
             blobstore: module.blobstore.clone(),
             llm: module.llm.clone(),
             fs: module.fs.clone(),
+            env_vars: module.env_vars.clone(),
             active_span: tracing::Span::current(),
         },
     )?;

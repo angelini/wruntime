@@ -133,6 +133,8 @@ pub struct ModuleServices {
     pub llm: Option<Arc<LlmRuntime>>,
     /// WASI filesystem mode (e.g. `FsMode::Tempdir`).
     pub fs: Option<FsMode>,
+    /// Resolved environment variables for this module (plain + decrypted secrets).
+    pub env_vars: std::collections::HashMap<String, String>,
     /// The `engine.dispatch` span for the current request.
     /// Captured at `ModuleState` construction time so host functions can create
     /// child spans even when wasmtime's synchronous call stack is outside the
@@ -148,6 +150,7 @@ impl Default for ModuleServices {
             blobstore: None,
             llm: None,
             fs: None,
+            env_vars: std::collections::HashMap::new(),
             active_span: tracing::Span::none(),
         }
     }
@@ -185,6 +188,9 @@ impl ModuleState {
     ) -> anyhow::Result<Self> {
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stdio();
+        for (key, value) in &services.env_vars {
+            builder.env(key, value);
+        }
         let fs_root = match services.fs.as_ref() {
             Some(FsMode::Tempdir) => {
                 let dir = tempfile::tempdir()?;

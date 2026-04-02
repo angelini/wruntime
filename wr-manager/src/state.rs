@@ -32,12 +32,17 @@ pub fn new_state() -> SharedState {
     Arc::new(RwLock::new(ManagerState::new()))
 }
 
-/// Background task: checks engine and module-level health every 10 seconds.
+/// Background task: checks engine and module-level health on a regular interval.
 /// Reads the routing table from Postgres, computes health changes from
 /// in-memory timestamps, and writes updates back to Postgres.
-pub async fn monitor_heartbeats(state: SharedState, pool: Pool, timeout_secs: u64) {
+pub async fn monitor_heartbeats(
+    state: SharedState,
+    pool: Pool,
+    timeout_secs: u64,
+    interval: Duration,
+) {
     let timeout = Duration::from_secs(timeout_secs);
-    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    let mut tick = tokio::time::interval(interval);
 
     loop {
         tick.tick().await;
