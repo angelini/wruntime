@@ -115,6 +115,19 @@ pub enum FsMode {
     Tempdir,
 }
 
+/// Module execution mode.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModuleMode {
+    /// HTTP request handler with per-request instantiation (exports `wasi:http/incoming-handler`).
+    #[default]
+    Service,
+    /// Single long-running instance (exports `run`).
+    Run,
+    /// Service guest driven by an engine-managed job queue instead of external HTTP traffic.
+    Worker,
+}
+
 /// An environment variable value: either a plain string or a secret reference.
 #[derive(Deserialize, Clone)]
 #[serde(untagged)]
@@ -132,8 +145,8 @@ pub struct ModuleConfig {
     pub version: String,
     pub wasm_path: String,
     /// Path to a compiled `FileDescriptorSet` binary for this module's API.
-    /// Required — every module must declare a schema so the proxy can validate
-    /// request bodies.
+    /// Optional — runner modules that don't expose an HTTP interface may omit this.
+    #[serde(default)]
     pub schema_path: String,
     /// Whether this module has access to the shared database pool.
     /// Requires a `[database]` section in the engine config.
@@ -173,6 +186,21 @@ pub struct ModuleConfig {
     /// resolved from secrets delivered by the manager at registration time.
     #[serde(default)]
     pub env: HashMap<String, EnvValue>,
+    /// Module execution mode: service (default), run, or worker.
+    #[serde(default)]
+    pub mode: ModuleMode,
+    /// Number of concurrent worker tasks polling the job queue. Only used when `mode = "worker"`.
+    #[serde(default = "default_worker_concurrency")]
+    pub worker_concurrency: usize,
+    /// Fallback poll interval in seconds when no LISTEN notification arrives. Only used when `mode = "worker"`.
+    #[serde(default = "default_worker_poll_interval_secs")]
+    pub worker_poll_interval_secs: u64,
+    /// Per-job timeout in seconds. Only used when `mode = "worker"`.
+    #[serde(default = "default_worker_job_timeout_secs")]
+    pub worker_job_timeout_secs: u64,
+    /// Maximum delivery attempts before a job is marked dead. Only used when `mode = "worker"`.
+    #[serde(default = "default_worker_max_attempts")]
+    pub worker_max_attempts: i32,
 }
 
 fn default_request_timeout_secs() -> u64 {
@@ -181,6 +209,22 @@ fn default_request_timeout_secs() -> u64 {
 
 fn default_channel_capacity() -> usize {
     128
+}
+
+fn default_worker_concurrency() -> usize {
+    4
+}
+
+fn default_worker_poll_interval_secs() -> u64 {
+    2
+}
+
+fn default_worker_job_timeout_secs() -> u64 {
+    300
+}
+
+fn default_worker_max_attempts() -> i32 {
+    3
 }
 
 impl EngineConfig {
@@ -217,17 +261,14 @@ impl EngineConfig {
                 module.name,
                 module.wasm_path,
             );
-            anyhow::ensure!(
-                !module.schema_path.is_empty(),
-                "schema_path is required for module '{}'",
-                module.name,
-            );
-            anyhow::ensure!(
-                std::path::Path::new(&module.schema_path).exists(),
-                "schema_path not found for module '{}': {}",
-                module.name,
-                module.schema_path,
-            );
+            if !module.schema_path.is_empty() {
+                anyhow::ensure!(
+                    std::path::Path::new(&module.schema_path).exists(),
+                    "schema_path not found for module '{}': {}",
+                    module.name,
+                    module.schema_path,
+                );
+            }
             anyhow::ensure!(
                 !module.database || self.database.is_some(),
                 "module '{}' has database = true but no [database] section is configured",
@@ -243,6 +284,13 @@ impl EngineConfig {
                 "module '{}' has llm = true but no [llm] section is configured",
                 module.name,
             );
+            if module.mode == ModuleMode::Worker {
+                anyhow::ensure!(
+                    module.database,
+                    "module '{}' has mode = \"worker\" but database is not enabled (job queue requires database)",
+                    module.name,
+                );
+            }
             if let Some(mig_path) = &module.migrations_path {
                 anyhow::ensure!(
                     module.database,

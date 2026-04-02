@@ -31,7 +31,9 @@ pub fn send_response(response_out: ResponseOutparam, status: u16, body: Vec<u8>)
     let out_body = resp.body().unwrap();
     {
         let stream = out_body.write().unwrap();
-        let _ = stream.blocking_write_and_flush(&body);
+        for chunk in body.chunks(4096) {
+            let _ = stream.blocking_write_and_flush(chunk);
+        }
     }
 
     ResponseOutparam::set(response_out, Ok(resp));

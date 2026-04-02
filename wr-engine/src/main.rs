@@ -41,14 +41,36 @@ async fn main() -> Result<()> {
     let registry = registry::ModuleRegistry::new();
     let runner = engine::EngineRunner::new(config.clone())?;
     runner.provision_schemas().await?;
+
+    // Provision the wr__jobs schema if any module uses worker mode.
+    let has_workers = config
+        .modules
+        .iter()
+        .any(|m| m.mode == config::ModuleMode::Worker);
+    if has_workers {
+        let db = config
+            .database
+            .as_ref()
+            .expect("worker mode requires [database] section");
+        let admin_pool = wr_engine::pool::build_pool(&db.url, db.max_connections)?;
+        wr_engine::worker::provision_job_schema(&admin_pool).await?;
+    }
+
     runner.run_migrations().await?;
 
     // ── Start inbound HTTP server ─────────────────────────────────────────
     {
         let reg = registry.clone();
         let addr = config.listen_address.clone();
+        let server_db_pool = config
+            .database
+            .as_ref()
+            .map(|db| {
+                wr_engine::pool::build_pool(&db.url, db.max_connections).map(std::sync::Arc::new)
+            })
+            .transpose()?;
         tokio::spawn(async move {
-            if let Err(e) = server::serve(&addr, reg).await {
+            if let Err(e) = server::serve(&addr, reg, server_db_pool).await {
                 error!(error = %e, "inbound server error");
             }
         });
@@ -57,9 +79,13 @@ async fn main() -> Result<()> {
     // ── Connect to wr-manager ─────────────────────────────────────────────
     let mut client = ManagerServiceClient::connect(config.manager_address.clone()).await?;
 
-    // Build module descriptors — schema_path is required and validated at config load time.
+    // Build module descriptors — only modules with a schema_path are registered
+    // with the manager (runner modules without schemas are skipped).
     let mut module_descriptors: Vec<ModuleDescriptor> = Vec::new();
     for m in &config.modules {
+        if m.schema_path.is_empty() {
+            continue;
+        }
         let proto_schema = std::fs::read(&m.schema_path)
             .with_context(|| format!("failed to read schema for module '{}'", m.name))?;
         module_descriptors.push(ModuleDescriptor {
@@ -134,11 +160,19 @@ async fn main() -> Result<()> {
     }
 
     // ── Load WASM modules (now that secrets are resolved) ─────────────────
-    runner.load_modules(&registry, &resolved_envs).await?;
+    runner
+        .load_modules(&registry, &resolved_envs, &engine_id)
+        .await?;
     info!("all modules loaded");
 
     // ── Upsert routing rules for every hosted module ──────────────────────
+    // Runner modules (no schema_path) are not externally HTTP-routable, so
+    // skip them. Worker modules need routing rules so submit_job calls from
+    // other modules can reach this engine via the proxy.
     for module in &config.modules {
+        if module.schema_path.is_empty() {
+            continue;
+        }
         client
             .upsert_routing_rule(RoutingRule {
                 rule_id: format!(

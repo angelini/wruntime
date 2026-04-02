@@ -8,7 +8,7 @@ use http::{Request, StatusCode};
 use tower::{Layer, Service};
 use tracing::{info_span, Instrument};
 
-use super::egress::ExternalEgress;
+use super::egress::{domain_matches, ExternalEgress};
 use super::{error_response, Destination, ProxyBody, ResBody, ResolvedDestination};
 use crate::routing::CachedRoutingTable;
 
@@ -20,10 +20,10 @@ pub struct RoutingLayer {
     self_proxy_address: String,
     /// Monotonic counters per (namespace, module, version) for round-robin selection.
     counters: RoundRobinCounters,
-    /// When true, unroutable destinations are passed through with an
-    /// [`ExternalEgress`] extension instead of returning 503, so the
-    /// egress layer can forward them to external hosts.
-    egress_enabled: bool,
+    /// Egress allowlist patterns. Only destinations matching one of these
+    /// patterns are forwarded via egress; all other unroutable destinations
+    /// get a 503. Empty means egress is disabled.
+    egress_allowed_domains: Arc<Vec<String>>,
 }
 
 impl RoutingLayer {
@@ -32,12 +32,12 @@ impl RoutingLayer {
             table,
             self_proxy_address: self_proxy_address.into(),
             counters: Arc::new(Mutex::new(HashMap::new())),
-            egress_enabled: false,
+            egress_allowed_domains: Arc::new(Vec::new()),
         }
     }
 
-    pub fn with_egress(mut self, enabled: bool) -> Self {
-        self.egress_enabled = enabled;
+    pub fn with_egress(mut self, allowed_domains: Vec<String>) -> Self {
+        self.egress_allowed_domains = Arc::new(allowed_domains);
         self
     }
 }
@@ -50,7 +50,7 @@ impl<S> Layer<S> for RoutingLayer {
             table: self.table.clone(),
             self_proxy_address: self.self_proxy_address.clone(),
             counters: self.counters.clone(),
-            egress_enabled: self.egress_enabled,
+            egress_allowed_domains: self.egress_allowed_domains.clone(),
         }
     }
 }
@@ -61,7 +61,7 @@ pub struct RoutingService<S> {
     table: CachedRoutingTable,
     self_proxy_address: String,
     counters: RoundRobinCounters,
-    egress_enabled: bool,
+    egress_allowed_domains: Arc<Vec<String>>,
 }
 
 impl<S> Service<Request<ProxyBody>> for RoutingService<S>
@@ -82,7 +82,7 @@ where
         let table = self.table.clone();
         let counters = self.counters.clone();
         let self_proxy_address = self.self_proxy_address.clone();
-        let egress_enabled = self.egress_enabled;
+        let egress_allowed_domains = self.egress_allowed_domains.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -224,17 +224,23 @@ where
             };
 
             if candidates.is_empty() {
-                // When egress is enabled, unroutable destinations are passed
-                // through with an ExternalEgress extension so the egress layer
-                // can forward them to external hosts.
-                if egress_enabled {
+                // Only forward to egress if the destination host explicitly
+                // matches the egress allowlist. Unroutable internal
+                // destinations (typos, unregistered modules) stay as 503.
+                if !egress_allowed_domains.is_empty() {
                     if let Some(ref uri) = dest_uri {
                         if let Some(h) = uri.host() {
-                            req.extensions_mut().insert(ExternalEgress {
-                                host: h.to_ascii_lowercase(),
-                                dest_uri: uri.clone(),
-                            });
-                            return inner.call(req).instrument(span).await;
+                            let host = h.to_ascii_lowercase();
+                            let allowed = egress_allowed_domains
+                                .iter()
+                                .any(|pattern| domain_matches(pattern, &host));
+                            if allowed {
+                                req.extensions_mut().insert(ExternalEgress {
+                                    host,
+                                    dest_uri: uri.clone(),
+                                });
+                                return inner.call(req).instrument(span).await;
+                            }
                         }
                     }
                 }

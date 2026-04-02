@@ -160,6 +160,12 @@ dev-reset-db:
     "
     @echo "Done."
 
+# Clear all objects from the codegen S3 bucket
+dev-reset-blobstore bucket="codegen":
+    AWS_ACCESS_KEY_ID={{s3_access_key}} AWS_SECRET_ACCESS_KEY={{s3_secret_key}} \
+        aws --endpoint-url {{s3_endpoint}} s3 rm s3://{{bucket}} --recursive
+    @echo "Cleared s3://{{bucket}}"
+
 # ── WASM Guest Test Harness ───────────────────────────────────────────────────
 
 # Compile test guest protobuf schemas to FileDescriptorSet binaries (.binpb)
@@ -217,10 +223,12 @@ build-ecommerce: build-ecommerce-schemas
 
 # Run the full ecommerce example (requires Postgres — see `just dev-up`)
 ecommerce: build-ecommerce build
+    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
     DB_URL={{db_url_example}} bash examples/ecommerce/run.sh
 
 # Run the ecommerce example inline (single invocation, exits on failure)
 ecommerce-inline: build-ecommerce build
+    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
     DB_URL={{db_url_example}} bash examples/ecommerce/run.sh --inline
 
 # ── Stock Market Example ──────────────────────────────────────────────────────
@@ -245,10 +253,12 @@ build-stockmarket: build-stockmarket-schemas
 
 # Run the full stockmarket example (requires Postgres + RustFS S3 — see `just dev-up`)
 stockmarket: build-stockmarket build
+    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
     DB_URL={{db_url_example}} bash examples/stockmarket/run.sh
 
 # Run the stockmarket example inline (single invocation, exits on failure)
 stockmarket-inline: build-stockmarket build
+    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
     DB_URL={{db_url_example}} bash examples/stockmarket/run.sh --inline
 
 # ── Codegen Example ───────────────────────────────────────────────────────────
@@ -264,12 +274,17 @@ build-codegen-schemas:
     protoc --descriptor_set_out=examples/codegen/schemas/coordinator.binpb \
            --include_imports \
            examples/codegen/schemas/coordinator.proto
+    protoc --descriptor_set_out=examples/codegen/schemas/worker.binpb \
+           --include_imports \
+           --proto_path=examples/codegen/schemas \
+           examples/codegen/schemas/worker.proto
 
 # Build WASM components and schemas for the codegen example
 build-codegen: build-codegen-schemas
     (cd examples/codegen/collector && cargo component build --release --target wasm32-wasip2)
     (cd examples/codegen/agent && cargo component build --release --target wasm32-wasip2)
     (cd examples/codegen/coordinator && cargo component build --release --target wasm32-wasip2)
+    (cd examples/codegen/worker && cargo component build --release --target wasm32-wasip2)
 
 # Run the full codegen example (requires Postgres + RustFS S3 — see `just dev-up`)
 codegen: build-codegen build

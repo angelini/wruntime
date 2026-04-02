@@ -51,12 +51,31 @@ use wruntime::blobstore::store::{BlobError, Host, ObjectMeta};
 
 // ── Namespace isolation helpers ───────────────────────────────────────────────
 
-/// Prepend the namespace prefix to a key. Returns the key unchanged when no
-/// prefix is configured.
-fn scoped_key(prefix: &Option<String>, key: &str) -> String {
+/// Normalize a path by resolving `.`, `..`, and collapsing duplicate `/`
+/// separators. Returns `None` if the result would escape above the root
+/// (more `..` segments than real segments).
+fn normalize_key(key: &str) -> Option<String> {
+    let mut segments: Vec<&str> = Vec::new();
+    for seg in key.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            s => segments.push(s),
+        }
+    }
+    Some(segments.join("/"))
+}
+
+/// Prepend the namespace prefix to a key after normalizing it. Returns an
+/// error if the key attempts path traversal.
+fn scoped_key(prefix: &Option<String>, key: &str) -> Result<String, BlobError> {
+    let clean = normalize_key(key)
+        .ok_or_else(|| BlobError::AccessDenied("path traversal in key".into()))?;
     match prefix {
-        Some(p) => format!("{p}{key}"),
-        None => key.to_string(),
+        Some(p) => Ok(format!("{p}{clean}")),
+        None => Ok(clean),
     }
 }
 
@@ -81,11 +100,12 @@ impl Host for ModuleState {
         let b = rt
             .bucket(&bucket)
             .map_err(|e| BlobError::Io(e.to_string()))?;
-        let full_key = scoped_key(&self.blob_prefix, &key);
-        b.put_object(&full_key, &data)
-            .await
-            .map(|_| ())
-            .map_err(map_s3_err)
+        let full_key = scoped_key(&self.blob_prefix, &key)?;
+        let resp = b.put_object(&full_key, &data).await.map_err(map_s3_err)?;
+        if resp.status_code() >= 400 {
+            return Err(map_status(resp.status_code(), key));
+        }
+        Ok(())
     }
 
     async fn get_object(&mut self, bucket: String, key: String) -> Result<Vec<u8>, BlobError> {
@@ -93,11 +113,15 @@ impl Host for ModuleState {
         let b = rt
             .bucket(&bucket)
             .map_err(|e| BlobError::Io(e.to_string()))?;
-        let full_key = scoped_key(&self.blob_prefix, &key);
-        b.get_object(&full_key)
-            .await
-            .map(|r| r.to_vec())
-            .map_err(map_s3_err)
+        let full_key = scoped_key(&self.blob_prefix, &key)?;
+        let resp = b.get_object(&full_key).await.map_err(map_s3_err)?;
+        if resp.status_code() == 404 {
+            return Err(BlobError::NotFound(key));
+        }
+        if resp.status_code() == 403 {
+            return Err(BlobError::AccessDenied(key));
+        }
+        Ok(resp.to_vec())
     }
 
     async fn delete_object(&mut self, bucket: String, key: String) -> Result<(), BlobError> {
@@ -105,11 +129,12 @@ impl Host for ModuleState {
         let b = rt
             .bucket(&bucket)
             .map_err(|e| BlobError::Io(e.to_string()))?;
-        let full_key = scoped_key(&self.blob_prefix, &key);
-        b.delete_object(&full_key)
-            .await
-            .map(|_| ())
-            .map_err(map_s3_err)
+        let full_key = scoped_key(&self.blob_prefix, &key)?;
+        let resp = b.delete_object(&full_key).await.map_err(map_s3_err)?;
+        if resp.status_code() >= 400 {
+            return Err(map_status(resp.status_code(), key));
+        }
+        Ok(())
     }
 
     async fn list_objects(
@@ -121,7 +146,7 @@ impl Host for ModuleState {
         let b = rt
             .bucket(&bucket)
             .map_err(|e| BlobError::Io(e.to_string()))?;
-        let scoped_prefix = scoped_key(&self.blob_prefix, &prefix.unwrap_or_default());
+        let scoped_prefix = scoped_key(&self.blob_prefix, &prefix.unwrap_or_default())?;
         let mut all: Vec<ObjectMeta> = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -150,7 +175,7 @@ impl Host for ModuleState {
         let b = rt
             .bucket(&bucket)
             .map_err(|e| BlobError::Io(e.to_string()))?;
-        let full_key = scoped_key(&self.blob_prefix, &key);
+        let full_key = scoped_key(&self.blob_prefix, &key)?;
         let (head, status) = b.head_object(&full_key).await.map_err(|e| match e {
             s3::error::S3Error::HttpFailWithBody(404, msg) => BlobError::NotFound(msg),
             s3::error::S3Error::HttpFailWithBody(403, msg) => BlobError::AccessDenied(msg),
@@ -187,6 +212,14 @@ fn map_s3_err(e: s3::error::S3Error) -> BlobError {
         s3::error::S3Error::HttpFailWithBody(404, msg) => BlobError::NotFound(msg),
         s3::error::S3Error::HttpFailWithBody(403, msg) => BlobError::AccessDenied(msg),
         e => BlobError::Io(e.to_string()),
+    }
+}
+
+fn map_status(status: u16, key: String) -> BlobError {
+    match status {
+        404 => BlobError::NotFound(key),
+        403 => BlobError::AccessDenied(key),
+        _ => BlobError::Io(format!("S3 returned status {status} for key '{key}'")),
     }
 }
 
@@ -234,17 +267,60 @@ mod tests {
         }
     }
 
+    // ── normalize_key tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_normalize_key_simple() {
+        assert_eq!(normalize_key("a/b/c"), Some("a/b/c".into()));
+    }
+
+    #[test]
+    fn test_normalize_key_dot_segments() {
+        assert_eq!(normalize_key("a/./b/../c"), Some("a/c".into()));
+    }
+
+    #[test]
+    fn test_normalize_key_double_slash() {
+        assert_eq!(normalize_key("a//b///c"), Some("a/b/c".into()));
+    }
+
+    #[test]
+    fn test_normalize_key_traversal_blocked() {
+        assert_eq!(normalize_key("../etc/passwd"), None);
+        assert_eq!(normalize_key("a/../../b"), None);
+    }
+
+    #[test]
+    fn test_normalize_key_leading_dot_dot_in_subpath() {
+        assert_eq!(normalize_key("a/b/../c"), Some("a/c".into()));
+    }
+
     // ── scoped_key / unscoped_key tests ───────────────────────────────────────
 
     #[test]
     fn test_scoped_key_with_prefix() {
         let prefix = Some("wr/ecommerce/".to_string());
-        assert_eq!(scoped_key(&prefix, "file.txt"), "wr/ecommerce/file.txt");
+        assert_eq!(
+            scoped_key(&prefix, "file.txt").unwrap(),
+            "wr/ecommerce/file.txt"
+        );
     }
 
     #[test]
     fn test_scoped_key_without_prefix() {
-        assert_eq!(scoped_key(&None, "file.txt"), "file.txt");
+        assert_eq!(scoped_key(&None, "file.txt").unwrap(), "file.txt");
+    }
+
+    #[test]
+    fn test_scoped_key_rejects_traversal() {
+        let prefix = Some("wr/ecommerce/".to_string());
+        assert!(scoped_key(&prefix, "../../other/secret").is_err());
+    }
+
+    #[test]
+    fn test_scoped_key_normalizes_dots() {
+        let prefix = Some("wr/ecommerce/".to_string());
+        assert_eq!(scoped_key(&prefix, "a/../b").unwrap(), "wr/ecommerce/b");
     }
 
     #[test]

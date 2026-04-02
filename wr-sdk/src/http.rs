@@ -26,9 +26,11 @@ pub fn http_rpc(authority: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8
     let outgoing_body = req.body().map_err(|_| "get body")?;
     {
         let stream = outgoing_body.write().map_err(|_| "get write stream")?;
-        stream
-            .blocking_write_and_flush(body)
-            .map_err(|e| format!("write: {:?}", e))?;
+        for chunk in body.chunks(4096) {
+            stream
+                .blocking_write_and_flush(chunk)
+                .map_err(|e| format!("write: {:?}", e))?;
+        }
     }
     OutgoingBody::finish(outgoing_body, None).map_err(|e| format!("finish body: {:?}", e))?;
 

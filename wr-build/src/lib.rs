@@ -175,6 +175,10 @@ pub struct WrClientGenerator;
 
 impl prost_build::ServiceGenerator for WrClientGenerator {
     fn generate(&mut self, service: prost_build::Service, buf: &mut String) {
+        // Skip worker services — those are handled by WrWorkerClientGenerator.
+        if service.name.ends_with("WorkerService") {
+            return;
+        }
         let struct_ident = format_ident!("{}Client", service.name);
 
         let methods: Vec<_> = service
@@ -196,6 +200,71 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
                         }
                         prost::Message::decode(resp_bytes.as_slice())
                             .map_err(|e| e.to_string())
+                    }
+                }
+            })
+            .collect();
+
+        let tokens = quote! {
+            pub struct #struct_ident {
+                authority: String,
+            }
+
+            impl #struct_ident {
+                pub fn new(authority: impl Into<String>) -> Self {
+                    Self {
+                        authority: authority.into(),
+                    }
+                }
+
+                #(#methods)*
+            }
+        };
+
+        buf.push_str(&pretty(tokens));
+    }
+}
+
+// ── WrWorkerClientGenerator ────────────────────────────────────────────────
+
+/// A `prost_build::ServiceGenerator` that emits typed job submission clients
+/// for worker modules.  Each RPC method becomes a function that serializes the
+/// request, submits a job via `wr_sdk::jobs::submit_job`, and returns the job_id.
+///
+/// For a service `TaskWorker` with RPC `ProcessTask`:
+///
+/// ```rust,ignore
+/// pub struct TaskWorkerClient { authority: String }
+///
+/// impl TaskWorkerClient {
+///     pub fn new(authority: impl Into<String>) -> Self { ... }
+///     pub fn process_task(&self, req: ProcessTaskRequest) -> Result<String, String> { ... }
+/// }
+/// ```
+pub struct WrWorkerClientGenerator;
+
+impl prost_build::ServiceGenerator for WrWorkerClientGenerator {
+    fn generate(&mut self, service: prost_build::Service, buf: &mut String) {
+        // Only generate for worker services.
+        if !service.name.ends_with("WorkerService") {
+            return;
+        }
+        let struct_ident = format_ident!("{}Client", service.name);
+        let service_snake = to_snake(&service.name)
+            .trim_end_matches("_service")
+            .to_string();
+
+        let methods: Vec<_> = service
+            .methods
+            .iter()
+            .map(|m| {
+                let method_name = method_ident(&m.name);
+                let input = parse_type(&m.input_type);
+                let job_type = format!("/{}.{}/{}", service.package, service_snake, m.proto_name);
+                quote! {
+                    pub fn #method_name(&self, req: #input) -> Result<String, String> {
+                        let payload = prost::Message::encode_to_vec(&req);
+                        wr_sdk::jobs::submit_job(&self.authority, #job_type, &payload)
                     }
                 }
             })

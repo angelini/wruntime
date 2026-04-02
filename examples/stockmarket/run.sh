@@ -15,6 +15,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 # ── Kill stale processes from a previous run ─────────────────────────────
+./target/debug/wr-cli dev down 2>/dev/null || true
 for port in 9000 9001 9100 9101 9200; do
     pid=$(lsof -ti ":$port" 2>/dev/null || true)
     if [ -n "$pid" ]; then
@@ -63,49 +64,31 @@ echo "==> Cleaning manager state..."
 psql "${DB_URL}" -c "TRUNCATE wr_engines, wr_routing_rules, wr_schemas CASCADE" 2>/dev/null \
     || echo "   (tables may not exist yet — first run)"
 
-# ── Start manager ──────────────────────────────────────────────────────────────
-echo "==> Starting manager on :9000"
-./target/debug/wr-manager /tmp/wr-manager.toml &
-MANAGER_PID=$!
-sleep 1
+# ── Start manager + proxy ─────────────────────────────────────────────────────
+echo "==> Starting manager + proxy..."
+./target/debug/wr-cli dev up \
+    --manager-config /tmp/wr-manager.toml \
+    --proxy-config examples/config/proxy.toml
 
-# ── Start proxy ────────────────────────────────────────────────────────────────
-echo "==> Starting proxy on :9001"
-./target/debug/wr-proxy examples/config/proxy.toml &
-PROXY_PID=$!
-sleep 1
+# ── Deploy engines ────────────────────────────────────────────────────────────
+echo "==> Deploying exchange engine on :9100"
+./target/debug/wr-cli dev deploy /tmp/sm-exchange.toml --skip-build
 
-# ── Start exchange engine ─────────────────────────────────────────────────────
-echo "==> Starting exchange engine on :9100"
-./target/debug/wr-engine /tmp/sm-exchange.toml &
-EXCHANGE_PID=$!
-
-# ── Start ledger engine ───────────────────────────────────────────────────────
-echo "==> Starting ledger engine on :9101"
-./target/debug/wr-engine /tmp/sm-ledger.toml &
-LEDGER_PID=$!
-
-echo "==> Waiting for engines to register..."
-sleep 3
+echo "==> Deploying ledger engine on :9101"
+./target/debug/wr-cli dev deploy /tmp/sm-ledger.toml --skip-build
 
 cargo run -p wr-cli -- engines list
 cargo run -p wr-cli -- services list
 
-# ── Start simulator engine ────────────────────────────────────────────────────
-echo "==> Starting simulator engine on :9200"
-./target/debug/wr-engine examples/stockmarket/engine-simulator.toml &
-SIMULATOR_PID=$!
-sleep 2
+echo "==> Deploying simulator engine on :9200"
+./target/debug/wr-cli dev deploy examples/stockmarket/engine-simulator.toml --skip-build
 
 cargo run -p wr-cli -- engines list
 cargo run -p wr-cli -- services list
 
 cleanup() {
     echo "==> Shutting down..."
-    kill -INT "$SIMULATOR_PID" "$EXCHANGE_PID" "$LEDGER_PID" 2>/dev/null || true
-    wait "$SIMULATOR_PID" "$EXCHANGE_PID" "$LEDGER_PID" 2>/dev/null || true
-    kill -INT "$PROXY_PID" "$MANAGER_PID" 2>/dev/null || true
-    wait "$PROXY_PID" "$MANAGER_PID" 2>/dev/null || true
+    ./target/debug/wr-cli dev down
 }
 trap cleanup EXIT
 trap 'exit 0' INT TERM
@@ -147,4 +130,5 @@ Inspect metrics:
   cargo run -p wr-cli -- metrics summary
 USAGE
 
-wait
+# Block until Ctrl-C (no child PIDs to wait on — processes are managed by wr dev)
+while true; do sleep 60; done

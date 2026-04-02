@@ -1,0 +1,28 @@
+syntax = "proto3";
+package codegen;
+
+import "coordinator.proto";
+
+// Worker service — defines the job types the worker handles.
+// The engine dispatches these as HTTP requests via the job queue.
+service WorkerService {
+  rpc ProcessTask (ProcessTaskRequest) returns (ProcessTaskResponse);
+}
+
+message ProcessTaskRequest {
+  string                 task_id          = 1;
+  string                 session_id       = 2;
+  string                 repo_url         = 3;
+  string                 ref              = 4;
+  repeated DocSourceSpec doc_sources      = 5;
+  string                 task_description = 6;
+  int32                  max_agent_turns  = 7;
+}
+
+message ProcessTaskResponse {
+  string unified_diff         = 1;
+  string message              = 2;
+  int32  agent_turns          = 3;
+  int32  total_input_tokens   = 4;
+  int32  total_output_tokens  = 5;
+}

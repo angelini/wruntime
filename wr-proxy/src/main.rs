@@ -65,12 +65,16 @@ async fn main() -> Result<()> {
     //          └─ EgressLayer      ← handles ExternalEgress; passes internal to forward
     //               └─ ForwardService
     //
-    let egress_enabled = config.egress.is_some();
+    let egress_domains = config
+        .egress
+        .as_ref()
+        .map(|e| e.allowed_domains.clone())
+        .unwrap_or_default();
     let internal_svc = ServiceBuilder::new()
         .layer(TracingLayer)
         .layer(
             RoutingLayer::new(routing_table.clone(), config.node.proxy_address.clone())
-                .with_egress(egress_enabled),
+                .with_egress(egress_domains),
         )
         .layer(EgressLayer::new(config.egress.clone()))
         .service(ForwardService::new(cb_registry.clone()));

@@ -88,6 +88,35 @@ message GetSchemaResponse   { bytes proto_schema = 1; }
 message UploadSchemaRequest { string module = 1; string version = 2; bytes proto_schema = 3; string namespace = 4; }
 message UploadSchemaResponse{}
 
+// ── Worker job queue ──────────────────────────────────────────────────────
+
+message SubmitJobRequest {
+  string worker_namespace = 1;
+  string worker_name      = 2;
+  string worker_version   = 3;
+  string job_type         = 4;
+  bytes  payload          = 5;
+  int32  timeout_secs     = 6;
+  int32  max_attempts     = 7;
+}
+
+message SubmitJobResponse {
+  string job_id = 1;
+}
+
+message GetJobStatusRequest {
+  string job_id = 1;
+}
+
+message GetJobStatusResponse {
+  string job_id        = 1;
+  string status        = 2;
+  bytes  result        = 3;
+  string error_message = 4;
+  int32  attempt       = 5;
+  int32  max_attempts  = 6;
+}
+
 // ── ManagerService ────────────────────────────────────────────────────────
 
 service ManagerService {

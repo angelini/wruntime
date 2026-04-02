@@ -1,13 +1,10 @@
 fn main() {
-    // Generate CoordinatorService trait + router, AND client stubs for
-    // CollectorService, AgentService, and WorkerService.
+    // Generate service handler (WrServiceGenerator) for the worker's own proto,
+    // plus client stubs for coordinator, collector, and agent.
     prost_build::Config::new()
         .service_generator(Box::new(wr_build::WrCombinedGenerator::new(
             wr_build::WrServiceGenerator,
-            wr_build::WrCombinedGenerator::new(
-                wr_build::WrClientGenerator,
-                wr_build::WrWorkerClientGenerator,
-            ),
+            wr_build::WrClientGenerator,
         )))
         .compile_protos(
             &[

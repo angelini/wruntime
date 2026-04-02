@@ -6,3 +6,4 @@ pub mod migration;
 pub mod pool;
 pub mod state;
 pub mod tracing;
+pub mod worker;

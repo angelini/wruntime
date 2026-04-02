@@ -2,6 +2,8 @@
 pub fn log(msg: &str) {
     use crate::bindings::wasi::cli::stderr;
     let err = stderr::get_stderr();
-    let _ = err.blocking_write_and_flush(msg.as_bytes());
+    for chunk in msg.as_bytes().chunks(4096) {
+        let _ = err.blocking_write_and_flush(chunk);
+    }
     let _ = err.blocking_write_and_flush(b"\n");
 }

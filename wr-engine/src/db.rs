@@ -317,7 +317,7 @@ impl Host for ModuleState {
             if let Some(s) = &schema {
                 client
                     .execute(
-                        &format!("SET search_path = \"{s}\", public"),
+                        &format!("SET search_path = \"{s}\""),
                         &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
                     )
                     .await
@@ -356,7 +356,7 @@ impl Host for ModuleState {
             if let Some(s) = &schema {
                 client
                     .execute(
-                        &format!("SET search_path = \"{s}\", public"),
+                        &format!("SET search_path = \"{s}\""),
                         &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
                     )
                     .await
@@ -393,7 +393,7 @@ impl Host for ModuleState {
         if let Some(s) = &schema {
             client
                 .execute(
-                    &format!("SET search_path = \"{s}\", public"),
+                    &format!("SET search_path = \"{s}\""),
                     &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
                 )
                 .await
@@ -437,7 +437,7 @@ impl Host for ModuleState {
             if let Some(s) = &schema {
                 client
                     .execute(
-                        &format!("SET search_path = \"{s}\", public"),
+                        &format!("SET search_path = \"{s}\""),
                         &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
                     )
                     .await

@@ -2,20 +2,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::RwLock;
 
-/// A single inbound HTTP request dispatched from the engine's inbound server
-/// to a WASM module task.
-pub struct InboundRequest {
-    pub request: http::Request<Bytes>,
-    pub response_tx: oneshot::Sender<http::Response<Bytes>>,
-    /// The `engine.dispatch` span from the inbound server, carried through the
-    /// channel so that WASM-side child spans are attached to the correct trace.
-    pub span: tracing::Span,
-}
-
-pub type ModuleTx = mpsc::Sender<InboundRequest>;
+pub use wr_engine::worker::{InboundRequest, ModuleTx};
 
 struct InstanceList {
     senders: Vec<ModuleTx>,
