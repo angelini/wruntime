@@ -49,6 +49,25 @@ wasmtime::component::bindgen!({
 
 use wruntime::blobstore::store::{BlobError, Host, ObjectMeta};
 
+// ── Namespace isolation helpers ───────────────────────────────────────────────
+
+/// Prepend the namespace prefix to a key. Returns the key unchanged when no
+/// prefix is configured.
+fn scoped_key(prefix: &Option<String>, key: &str) -> String {
+    match prefix {
+        Some(p) => format!("{p}{key}"),
+        None => key.to_string(),
+    }
+}
+
+/// Strip the namespace prefix from a key returned by S3.
+fn unscoped_key(prefix: &Option<String>, key: &str) -> String {
+    match prefix {
+        Some(p) => key.strip_prefix(p.as_str()).unwrap_or(key).to_string(),
+        None => key.to_string(),
+    }
+}
+
 // ── Host implementation ───────────────────────────────────────────────────────
 
 impl Host for ModuleState {
@@ -62,7 +81,8 @@ impl Host for ModuleState {
         let b = rt
             .bucket(&bucket)
             .map_err(|e| BlobError::Io(e.to_string()))?;
-        b.put_object(&key, &data)
+        let full_key = scoped_key(&self.blob_prefix, &key);
+        b.put_object(&full_key, &data)
             .await
             .map(|_| ())
             .map_err(map_s3_err)
@@ -73,7 +93,8 @@ impl Host for ModuleState {
         let b = rt
             .bucket(&bucket)
             .map_err(|e| BlobError::Io(e.to_string()))?;
-        b.get_object(&key)
+        let full_key = scoped_key(&self.blob_prefix, &key);
+        b.get_object(&full_key)
             .await
             .map(|r| r.to_vec())
             .map_err(map_s3_err)
@@ -84,7 +105,11 @@ impl Host for ModuleState {
         let b = rt
             .bucket(&bucket)
             .map_err(|e| BlobError::Io(e.to_string()))?;
-        b.delete_object(&key).await.map(|_| ()).map_err(map_s3_err)
+        let full_key = scoped_key(&self.blob_prefix, &key);
+        b.delete_object(&full_key)
+            .await
+            .map(|_| ())
+            .map_err(map_s3_err)
     }
 
     async fn list_objects(
@@ -96,17 +121,17 @@ impl Host for ModuleState {
         let b = rt
             .bucket(&bucket)
             .map_err(|e| BlobError::Io(e.to_string()))?;
-        let prefix_str = prefix.unwrap_or_default();
+        let scoped_prefix = scoped_key(&self.blob_prefix, &prefix.unwrap_or_default());
         let mut all: Vec<ObjectMeta> = Vec::new();
         let mut token: Option<String> = None;
         loop {
             let (page, _) = b
-                .list_page(prefix_str.clone(), None, token, None, None)
+                .list_page(scoped_prefix.clone(), None, token, None, None)
                 .await
                 .map_err(map_s3_err)?;
             for obj in page.contents {
                 all.push(ObjectMeta {
-                    key: obj.key,
+                    key: unscoped_key(&self.blob_prefix, &obj.key),
                     size: obj.size,
                     last_modified: parse_last_modified(&obj.last_modified),
                     etag: obj.e_tag.unwrap_or_default(),
@@ -122,17 +147,17 @@ impl Host for ModuleState {
 
     async fn head_object(&mut self, bucket: String, key: String) -> Result<ObjectMeta, BlobError> {
         let rt = require_blobstore(&self.blobstore)?;
-        let key2 = key.clone();
         let b = rt
             .bucket(&bucket)
             .map_err(|e| BlobError::Io(e.to_string()))?;
-        let (head, status) = b.head_object(&key).await.map_err(|e| match e {
+        let full_key = scoped_key(&self.blob_prefix, &key);
+        let (head, status) = b.head_object(&full_key).await.map_err(|e| match e {
             s3::error::S3Error::HttpFailWithBody(404, msg) => BlobError::NotFound(msg),
             s3::error::S3Error::HttpFailWithBody(403, msg) => BlobError::AccessDenied(msg),
             e => BlobError::Io(e.to_string()),
         })?;
         if status == 404 {
-            return Err(BlobError::NotFound(key2));
+            return Err(BlobError::NotFound(key));
         }
         Ok(ObjectMeta {
             key,
@@ -207,6 +232,36 @@ mod tests {
             secret_access_key: "test-secret".into(),
             region: "us-east-1".into(),
         }
+    }
+
+    // ── scoped_key / unscoped_key tests ───────────────────────────────────────
+
+    #[test]
+    fn test_scoped_key_with_prefix() {
+        let prefix = Some("wr/ecommerce/".to_string());
+        assert_eq!(scoped_key(&prefix, "file.txt"), "wr/ecommerce/file.txt");
+    }
+
+    #[test]
+    fn test_scoped_key_without_prefix() {
+        assert_eq!(scoped_key(&None, "file.txt"), "file.txt");
+    }
+
+    #[test]
+    fn test_unscoped_key_strips_prefix() {
+        let prefix = Some("wr/ecommerce/".to_string());
+        assert_eq!(unscoped_key(&prefix, "wr/ecommerce/file.txt"), "file.txt");
+    }
+
+    #[test]
+    fn test_unscoped_key_without_prefix() {
+        assert_eq!(unscoped_key(&None, "file.txt"), "file.txt");
+    }
+
+    #[test]
+    fn test_unscoped_key_missing_prefix_is_passthrough() {
+        let prefix = Some("wr/other/".to_string());
+        assert_eq!(unscoped_key(&prefix, "file.txt"), "file.txt");
     }
 
     // ── BlobstoreRuntime tests ───────────────────────────────────────────────

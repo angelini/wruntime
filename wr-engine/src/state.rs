@@ -129,6 +129,9 @@ pub struct ModuleServices {
     pub db_schema: Option<String>,
     /// Shared S3-compatible blobstore client, present when the module has blobstore access enabled.
     pub blobstore: Option<Arc<BlobstoreRuntime>>,
+    /// S3 key prefix for namespace isolation (e.g. `wr/ecommerce/`).
+    /// Set when blobstore access is enabled; transparently prepended to all object keys.
+    pub blob_prefix: Option<String>,
     /// Shared LLM inference client, present when the module has LLM access enabled.
     pub llm: Option<Arc<LlmRuntime>>,
     /// WASI filesystem mode (e.g. `FsMode::Tempdir`).
@@ -148,6 +151,7 @@ impl Default for ModuleServices {
             db_pool: None,
             db_schema: None,
             blobstore: None,
+            blob_prefix: None,
             llm: None,
             fs: None,
             env_vars: std::collections::HashMap::new(),
@@ -172,6 +176,8 @@ pub struct ModuleState {
     _fs_root: Option<TempDir>,
     /// Shared S3-compatible blobstore client, present when the module has blobstore access enabled.
     pub blobstore: Option<Arc<BlobstoreRuntime>>,
+    /// S3 key prefix for namespace isolation (e.g. `wr/ecommerce/`).
+    pub blob_prefix: Option<String>,
     /// Shared LLM inference client, present when the module has LLM access enabled.
     pub llm: Option<Arc<LlmRuntime>>,
     /// The `engine.dispatch` span for the current request.
@@ -212,6 +218,7 @@ impl ModuleState {
             db_pool: services.db_pool,
             db_schema: services.db_schema,
             blobstore: services.blobstore,
+            blob_prefix: services.blob_prefix,
             llm: services.llm,
             _fs_root: fs_root,
             active_span: services.active_span,

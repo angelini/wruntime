@@ -114,7 +114,7 @@ if [ "$INLINE" = true ]; then
         --proxy http://127.0.0.1:9001 \
         --destination http://codegen.coordinator/CreateTask \
         --source test --source-ns codegen \
-        --body ''
+        --body '{"repo_url":"https://github.com/dtolnay/anyhow","ref":"main","doc_sources":[{"source_type":"docs_rs","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}'
     exit $?
 fi
 
@@ -139,7 +139,7 @@ Create a task via internal RPC:
     --proxy http://127.0.0.1:9001 \
     --destination http://codegen.coordinator/CreateTask \
     --source test --source-ns codegen \
-    --body ''
+    --body '{"repo_url":"https://github.com/dtolnay/anyhow","ref":"main","doc_sources":[{"source_type":"docs_rs","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}'
 USAGE
 
 wait
