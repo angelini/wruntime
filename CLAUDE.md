@@ -73,7 +73,7 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 
 | Service | Default Port | Role |
 |---|---|---|
-| `wr-manager` | 9000 (gRPC) | Central registry — routing table, schemas, heartbeat monitor |
+| `wr-manager` | 9000 (gRPC) + 9010 (gossip) | Registry — routing table, schemas, heartbeat monitor. Runs active-active; chitchat gossip for manager liveness |
 | `wr-proxy` | 9001 (HTTP) | Streaming header-based router — intercepts inter-module traffic, routes to engines; bodies flow through without buffering |
 | `wr-engine` | 9100 (HTTP) | Runs WASM modules via wasmtime WASI component model |
 
@@ -102,7 +102,9 @@ The proxy uses a custom `ProxyBody` type that wraps `hyper::body::Incoming` behi
 
 **Database migrations** — modules can declare `migrations_path` in `engine.toml` pointing to a directory of `V{n}__description.sql` files. Migrations run on the engine (host side) at startup using [refinery](https://github.com/rust-db/refinery) with tokio-postgres. Each module's migrations are schema-isolated (`search_path` set to the module's schema only) and serialized across engine replicas via Postgres advisory locks. Routing rules are not registered until migrations complete. See `docs/configuration.md` for details.
 
-**`wr-manager` state** — persisted to Postgres (`db.rs`). Engines, routing rules, and schemas are stored in database tables; ephemeral state (heartbeats, module health timestamps) remains in-memory (`state.rs`). Migrations run automatically on startup (`migrate.rs`). Multiple manager instances can run active-active behind a load balancer — concurrent writes are serialized via `SELECT ... FOR UPDATE NOWAIT` on a lock sentinel row. Background task monitors heartbeats every 10 seconds — marks routing rules unhealthy and bumps the routing table version when an engine times out (default 30 s).
+**`wr-manager` state** — persisted to Postgres (`db.rs`). Engines, routing rules, schemas, and secrets are stored in database tables; ephemeral state (heartbeats, module health timestamps) remains in-memory (`state.rs`). Migrations run automatically on startup (`migrate.rs`). Multiple manager instances can run active-active — concurrent writes are serialized via `SELECT ... FOR UPDATE NOWAIT` on a lock sentinel row. Each manager registers in the `wr_managers` table, heartbeats every 15 s, and participates in a [chitchat](https://docs.rs/chitchat) gossip mesh (UDP) for phi-accrual failure detection. The `ListManagers` gRPC RPC returns all healthy managers, enabling peer discovery from any seed. Manager config requires a `[cluster]` section with `cluster_id` and `gossip_listen_address`. Background task monitors engine heartbeats every 5 seconds — marks routing rules unhealthy and bumps the routing table version when an engine times out (default 30 s).
+
+**`wr-cli`** — requires `--manager` (or `WR_MANAGER` env var) pointing at any single manager. The CLI does **not** have database access — all communication is via gRPC. Use `ListManagers` RPC for peer discovery from a seed address.
 
 **`wr-proxy` sync** — one background task: `sync_routing_table()` polls manager every `routing_table_ttl_secs`. Request metrics are collected via OpenTelemetry traces (no custom metrics pipeline).
 

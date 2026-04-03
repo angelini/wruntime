@@ -166,12 +166,20 @@ impl EngineRunner {
                 }
             }
 
-            // Grant the guest role access to this module's schema.
+            // Grant the guest role full access to this module's schema:
+            // - Schema usage + creation rights
+            // - All existing tables, sequences, and functions
+            // - Default privileges so future objects (created by migrations) are also accessible
             if let Some(role) = &guest_role {
                 client
                     .batch_execute(&format!(
                         "GRANT ALL ON SCHEMA \"{schema}\" TO \"{role}\"; \
-                         ALTER DEFAULT PRIVILEGES IN SCHEMA \"{schema}\" GRANT ALL ON TABLES TO \"{role}\";"
+                         GRANT ALL ON ALL TABLES IN SCHEMA \"{schema}\" TO \"{role}\"; \
+                         GRANT ALL ON ALL SEQUENCES IN SCHEMA \"{schema}\" TO \"{role}\"; \
+                         GRANT ALL ON ALL FUNCTIONS IN SCHEMA \"{schema}\" TO \"{role}\"; \
+                         ALTER DEFAULT PRIVILEGES IN SCHEMA \"{schema}\" GRANT ALL ON TABLES TO \"{role}\"; \
+                         ALTER DEFAULT PRIVILEGES IN SCHEMA \"{schema}\" GRANT ALL ON SEQUENCES TO \"{role}\"; \
+                         ALTER DEFAULT PRIVILEGES IN SCHEMA \"{schema}\" GRANT ALL ON FUNCTIONS TO \"{role}\";"
                     ))
                     .await
                     .with_context(|| {

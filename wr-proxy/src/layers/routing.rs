@@ -11,6 +11,7 @@ use tracing::{info_span, Instrument};
 use super::egress::{domain_matches, ExternalEgress};
 use super::{error_response, Destination, ProxyBody, ResBody, ResolvedDestination};
 use crate::routing::CachedRoutingTable;
+use wr_common::wruntime::RoutingRule;
 
 type RoundRobinCounters = Arc<Mutex<HashMap<(String, String, String), usize>>>;
 
@@ -62,6 +63,49 @@ pub struct RoutingService<S> {
     self_proxy_address: String,
     counters: RoundRobinCounters,
     egress_allowed_domains: Arc<Vec<String>>,
+}
+
+/// Compare two routing rules by their semver version, falling back to string comparison.
+fn cmp_rule_version(a: &RoutingRule, b: &RoutingRule) -> std::cmp::Ordering {
+    let va = semver::Version::parse(&a.destination_version);
+    let vb = semver::Version::parse(&b.destination_version);
+    match (va, vb) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+        _ => a.destination_version.cmp(&b.destination_version),
+    }
+}
+
+/// Given a set of rules, pick the highest version and collect all candidates at that version.
+fn best_version_candidates(
+    rules: &[&RoutingRule],
+    self_proxy_address: &str,
+) -> (String, Vec<Destination>) {
+    let best = rules
+        .iter()
+        .max_by(|a, b| cmp_rule_version(a, b))
+        .map(|r| r.destination_version.clone());
+
+    match best {
+        Some(ver) => {
+            let cands = rules
+                .iter()
+                .filter(|r| r.destination_version == ver)
+                .map(|r| make_destination(r, self_proxy_address))
+                .collect();
+            (ver, cands)
+        }
+        None => (String::new(), vec![]),
+    }
+}
+
+fn make_destination(rule: &RoutingRule, self_proxy_address: &str) -> Destination {
+    if rule.proxy_address == self_proxy_address {
+        Destination::LocalEngine(rule.engine_address.clone())
+    } else {
+        Destination::RemoteProxy(rule.proxy_address.clone())
+    }
 }
 
 impl<S> Service<Request<ProxyBody>> for RoutingService<S>
@@ -140,109 +184,52 @@ where
                     })
                     .collect();
 
-                let make_destination = |r: &&wr_common::wruntime::RoutingRule| {
-                    if r.proxy_address == self_proxy_address {
-                        Destination::LocalEngine(r.engine_address.clone())
-                    } else {
-                        Destination::RemoteProxy(r.proxy_address.clone())
-                    }
-                };
-
                 if let Some(ref version_str) = requested_version {
-                    // Parse as a semver VersionReq (supports ^1, ~1.2, >=1.0 <2.0, exact 1.2.3, etc.)
+                    // Filter to rules satisfying the requested version (semver range or exact match)
                     let req = semver::VersionReq::parse(version_str).ok();
-
                     let satisfying: Vec<_> = healthy
                         .iter()
+                        .copied()
                         .filter(
                             |r| match (&req, semver::Version::parse(&r.destination_version)) {
                                 (Some(req), Ok(v)) => req.matches(&v),
-                                // Unparseable range header: fall back to exact string match
                                 (None, _) => r.destination_version == *version_str,
-                                // Rule version isn't valid semver: skip
                                 _ => false,
                             },
                         )
                         .collect();
 
-                    // Among satisfying rules, pick the highest semver
-                    let best = satisfying
-                        .iter()
-                        .copied()
-                        .max_by(|a, b| {
-                            let va = semver::Version::parse(&a.destination_version);
-                            let vb = semver::Version::parse(&b.destination_version);
-                            match (va, vb) {
-                                (Ok(a), Ok(b)) => a.cmp(&b),
-                                (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
-                                (Err(_), Ok(_)) => std::cmp::Ordering::Less,
-                                _ => a.destination_version.cmp(&b.destination_version),
-                            }
-                        })
-                        .map(|r| r.destination_version.clone());
-
-                    match best {
-                        Some(ver) => {
-                            let cands: Vec<Destination> = satisfying
-                                .iter()
-                                .copied()
-                                .filter(|r| r.destination_version == ver)
-                                .map(make_destination)
-                                .collect();
-                            (ver, cands)
-                        }
-                        None => (version_str.clone(), vec![]),
+                    let (ver, cands) = best_version_candidates(&satisfying, &self_proxy_address);
+                    if cands.is_empty() {
+                        (version_str.clone(), vec![])
+                    } else {
+                        (ver, cands)
                     }
                 } else {
-                    // Find highest semver, then collect all rules at that version
-                    let best = healthy
-                        .iter()
-                        .max_by(|a, b| {
-                            let va = semver::Version::parse(&a.destination_version);
-                            let vb = semver::Version::parse(&b.destination_version);
-                            match (va, vb) {
-                                (Ok(a), Ok(b)) => a.cmp(&b),
-                                (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
-                                (Err(_), Ok(_)) => std::cmp::Ordering::Less,
-                                _ => a.destination_version.cmp(&b.destination_version),
-                            }
-                        })
-                        .map(|r| r.destination_version.clone());
-
-                    match best {
-                        Some(ver) => {
-                            let cands: Vec<Destination> = healthy
-                                .iter()
-                                .filter(|r| r.destination_version == ver)
-                                .map(make_destination)
-                                .collect();
-                            (ver, cands)
-                        }
-                        None => (String::new(), vec![]),
-                    }
+                    best_version_candidates(&healthy, &self_proxy_address)
                 }
             };
 
             if candidates.is_empty() {
-                // Only forward to egress if the destination host explicitly
-                // matches the egress allowlist. Unroutable internal
-                // destinations (typos, unregistered modules) stay as 503.
-                if !egress_allowed_domains.is_empty() {
-                    if let Some(ref uri) = dest_uri {
-                        if let Some(h) = uri.host() {
-                            let host = h.to_ascii_lowercase();
-                            let allowed = egress_allowed_domains
-                                .iter()
-                                .any(|pattern| domain_matches(pattern, &host));
-                            if allowed {
-                                req.extensions_mut().insert(ExternalEgress {
-                                    host,
-                                    dest_uri: uri.clone(),
-                                });
-                                return inner.call(req).instrument(span).await;
-                            }
-                        }
-                    }
+                // Check egress allowlist before returning 503.
+                let egress_host = dest_uri
+                    .as_ref()
+                    .and_then(|u| u.host())
+                    .map(|h| h.to_ascii_lowercase());
+
+                let egress_allowed = egress_host.as_ref().is_some_and(|host| {
+                    egress_allowed_domains
+                        .iter()
+                        .any(|pattern| domain_matches(pattern, host))
+                });
+
+                if egress_allowed {
+                    let host = egress_host.unwrap();
+                    req.extensions_mut().insert(ExternalEgress {
+                        host,
+                        dest_uri: dest_uri.unwrap().clone(),
+                    });
+                    return inner.call(req).instrument(span).await;
                 }
 
                 let msg = match requested_version {
@@ -270,10 +257,7 @@ where
                 candidates[idx].clone()
             };
 
-            let first_addr = match &chosen {
-                Destination::LocalEngine(a) => a.clone(),
-                Destination::RemoteProxy(a) => a.clone(),
-            };
+            let first_addr = chosen.address();
 
             // Inject x-wr-namespace, x-wr-module, and x-wr-version so the
             // destination engine (or peer proxy's routing layer) knows which
@@ -290,7 +274,7 @@ where
                 req.headers_mut().insert("x-wr-version", v);
             }
             span.record("wr.version", &resolved_version);
-            span.record("wr.engine", &first_addr);
+            span.record("wr.engine", first_addr);
 
             req.extensions_mut().insert(ResolvedDestination(chosen));
             inner.call(req).instrument(span).await

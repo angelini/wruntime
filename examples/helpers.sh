@@ -18,6 +18,7 @@ cd "$REPO_ROOT"
 
 # ── Environment defaults ─────────────────────────────────────────────────────
 DB_URL="${DB_URL:-${WRT_EXAMPLE_DB_URL:-postgres://postgres@localhost:5433/wruntime_example}}"
+GUEST_DB_URL="${GUEST_DB_URL:-postgres://wr_guest@localhost:5433/wruntime_example}"
 S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:8900}"
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-rustfsadmin}"

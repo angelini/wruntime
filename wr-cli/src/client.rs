@@ -1,6 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tonic::transport::Channel;
 use wr_common::wruntime::manager_service_client::ManagerServiceClient;
+use wr_common::wruntime::ListManagersRequest;
 
 /// Connect to a specific manager address.
 pub async fn connect(addr: &str) -> Result<ManagerServiceClient<Channel>> {
@@ -8,28 +9,16 @@ pub async fn connect(addr: &str) -> Result<ManagerServiceClient<Channel>> {
     Ok(client)
 }
 
-/// Discover a manager gRPC address from the `wr_managers` Postgres table.
-pub async fn discover_manager(database_url: &str) -> Result<String> {
-    let pg_config = deadpool_postgres::Config {
-        url: Some(database_url.to_string()),
-        ..Default::default()
-    };
-    let pool = pg_config
-        .create_pool(
-            Some(deadpool_postgres::Runtime::Tokio1),
-            tokio_postgres::NoTls,
-        )
-        .context("failed to create discovery pool")?;
-
-    let client = pool.get().await.context("failed to connect to Postgres")?;
-    let row = client
-        .query_opt(
-            "SELECT grpc_address FROM wr_managers WHERE last_heartbeat > NOW() - INTERVAL '60 seconds' ORDER BY random() LIMIT 1",
-            &[],
-        )
-        .await
-        .context("failed to query wr_managers")?
-        .ok_or_else(|| anyhow::anyhow!("no active managers found in wr_managers table"))?;
-
-    Ok(row.get::<_, String>(0))
+/// List all active managers in the cluster via a seed manager.
+pub async fn list_managers(addr: &str) -> Result<Vec<(String, String)>> {
+    let mut client = connect(addr).await?;
+    let resp = client
+        .list_managers(ListManagersRequest {})
+        .await?
+        .into_inner();
+    Ok(resp
+        .managers
+        .into_iter()
+        .map(|m| (m.manager_id, m.grpc_address))
+        .collect())
 }

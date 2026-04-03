@@ -10,9 +10,9 @@ use wr_common::wruntime::{
     DeleteSecretRequest, DeleteSecretResponse, DeregisterEngineRequest, DeregisterEngineResponse,
     GetRoutingTableRequest, GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse,
     HeartbeatRequest, HeartbeatResponse, ListEnginesRequest, ListEnginesResponse,
-    ListSecretsRequest, ListSecretsResponse, NamespaceSecrets, RegisterEngineRequest,
-    RegisterEngineResponse, RoutingRule, SecretEntry, SetSecretRequest, SetSecretResponse,
-    UpsertRoutingRuleResponse,
+    ListManagersRequest, ListManagersResponse, ListSecretsRequest, ListSecretsResponse,
+    ManagerInfo, NamespaceSecrets, RegisterEngineRequest, RegisterEngineResponse, RoutingRule,
+    SecretEntry, SetSecretRequest, SetSecretResponse, UpsertRoutingRuleResponse,
 };
 
 use crate::crypto::SecretCrypto;
@@ -149,6 +149,23 @@ impl ManagerService for Manager {
     ) -> Result<Response<ListEnginesResponse>, Status> {
         let engines = db::list_engines(&self.pool).await?;
         Ok(Response::new(ListEnginesResponse { engines }))
+    }
+
+    // ── Manager discovery ─────────────────────────────────────────────────
+
+    async fn list_managers(
+        &self,
+        _request: Request<ListManagersRequest>,
+    ) -> Result<Response<ListManagersResponse>, Status> {
+        let records = db::list_managers(&self.pool).await?;
+        let managers = records
+            .into_iter()
+            .map(|r| ManagerInfo {
+                manager_id: r.manager_id,
+                grpc_address: r.grpc_address,
+            })
+            .collect();
+        Ok(Response::new(ListManagersResponse { managers }))
     }
 
     // ── Routing table ─────────────────────────────────────────────────────

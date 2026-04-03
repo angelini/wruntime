@@ -27,9 +27,17 @@ engine_heartbeat_timeout_secs = 30
 [database]
 url             = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 10
+
+[cluster]
+cluster_id            = "default"           # all managers in the same cluster must match
+gossip_listen_address = "0.0.0.0:9010"      # UDP address for chitchat gossip
+# advertise_grpc_address = "http://manager-1:9000"  # optional; defaults to listen_address
+# gossip_interval_ms = 500                           # optional; default 500
 ```
 
 The `[database]` section is required. The manager persists engines, routing rules, and schemas to Postgres. Migrations run automatically on startup.
+
+The `[cluster]` section is required. Multiple managers can run active-active against the same Postgres database. Each manager registers itself in the `wr_managers` table, heartbeats every 15 seconds, and participates in a chitchat gossip mesh for failure detection. Concurrent writes are serialized via Postgres row locks. Set `advertise_grpc_address` when the manager is behind a load balancer or NAT.
 
 ## wr-proxy
 
@@ -261,3 +269,50 @@ proxy_address = "http://node-b-host:9002"
 ```
 
 When a module on Node A calls a module whose routing rule has `proxy_address = "http://node-b-host:9002"`, Node A's proxy adds `x-wr-via-proxy: 1` and forwards the request to Node B's proxy. Node B's `RoutingLayer` resolves the destination as a local engine and forwards to it.
+
+### Manager high availability
+
+Run multiple managers against the same Postgres database for active-active HA. Each manager needs a unique `gossip_listen_address` and should set `advertise_grpc_address` to its externally-reachable gRPC address:
+
+```toml
+# manager-1.toml
+listen_address = "0.0.0.0:9000"
+
+[database]
+url = "postgres://postgres@db-host:5432/wruntime"
+
+[cluster]
+cluster_id             = "prod"
+gossip_listen_address  = "0.0.0.0:9010"
+advertise_grpc_address = "http://manager-1:9000"
+
+# manager-2.toml
+listen_address = "0.0.0.0:9000"
+
+[database]
+url = "postgres://postgres@db-host:5432/wruntime"
+
+[cluster]
+cluster_id             = "prod"
+gossip_listen_address  = "0.0.0.0:9010"
+advertise_grpc_address = "http://manager-2:9000"
+```
+
+Proxies and engines can point at any single manager — they all share the same Postgres state. For production, use a load balancer or DNS round-robin in front of the managers.
+
+### CLI access
+
+The CLI requires a manager address and does **not** require database access:
+
+```bash
+# Via flag
+wr-cli --manager http://manager-1:9000 engines list
+
+# Via environment variable
+export WR_MANAGER=http://manager-1:9000
+wr-cli engines list
+
+# Discover all managers in the cluster from any seed
+wr-cli --manager http://manager-1:9000 engines list
+# The ListManagers RPC returns all active managers if peer discovery is needed
+```

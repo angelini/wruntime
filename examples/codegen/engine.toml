@@ -6,6 +6,7 @@ control_address = "http://127.0.0.1:9002"
 
 [database]
 url             = "postgres://user:pass@localhost:5432/codegen"
+guest_url       = "postgres://wr_guest:pass@localhost:5432/codegen"
 max_connections = 20
 
 [blobstore]

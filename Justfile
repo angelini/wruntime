@@ -154,9 +154,14 @@ dev-reset-db:
                 EXECUTE 'DROP SCHEMA \"' || r.schema_name || '\" CASCADE'; \
                 RAISE NOTICE 'dropped schema %', r.schema_name; \
             END LOOP; \
+            DROP TABLE IF EXISTS refinery_schema_history CASCADE; \
+            FOR r IN SELECT tablename FROM pg_tables \
+                     WHERE schemaname = 'public' AND tablename LIKE 'wr_%' \
+            LOOP \
+                EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; \
+                RAISE NOTICE 'dropped table %', r.tablename; \
+            END LOOP; \
         END\$\$; \
-        DROP TABLE IF EXISTS refinery_schema_history CASCADE; \
-        TRUNCATE wr_engines, wr_routing_rules, wr_schemas CASCADE; \
     "
     @echo "Done."
 

@@ -167,7 +167,7 @@ just proxy
 just engine ./engine.toml
 
 # Invoke the caller through the proxy
-wr-cli invoke --destination http://example.caller/run
+wr-cli --manager http://127.0.0.1:9000 invoke --destination http://example.caller/run
 ```
 
 ## Host bindings
@@ -210,7 +210,7 @@ wruntime/
 ├── wr-engine/              # WASM runtime (wasmtime) + inbound HTTP server
 ├── wr-sdk/                 # WASM module SDK: http_rpc, io, log, export macros
 ├── wr-build/               # build.rs helper: service/client generators from proto
-├── wr-cli/                 # CLI: invoke modules, list engines/services, query metrics
+├── wr-cli/                 # CLI: invoke modules, list engines/services, query metrics (requires --manager or WR_MANAGER)
 ├── wr-tests/               # integration tests
 ├── wit/                    # WIT interfaces (db, blobstore, tracing)
 ├── examples/

@@ -86,6 +86,14 @@ pub enum Destination {
     RemoteProxy(String),
 }
 
+impl Destination {
+    pub fn address(&self) -> &str {
+        match self {
+            Destination::LocalEngine(a) | Destination::RemoteProxy(a) => a,
+        }
+    }
+}
+
 /// Set by [`RoutingLayer`] on the request extensions; read by [`ForwardService`].
 /// Contains the single round-robin-selected candidate to forward to.
 #[derive(Clone)]
