@@ -24,7 +24,7 @@ use wr_engine::blobstore::BlobstoreRuntime;
 use wr_engine::config::{EngineConfig, ModuleConfig, ModuleMode};
 use wr_engine::llm::LlmRuntime;
 use wr_engine::pool::{blob_key_prefix, module_schema};
-use wr_engine::state::{ModuleServices, ModuleState};
+use wr_engine::state::{DbTimeouts, ModuleServices, ModuleState};
 
 pub struct EngineRunner {
     engine: Arc<Engine>,
@@ -65,10 +65,11 @@ impl EngineRunner {
 
         let mut db_pools: HashMap<(String, String), Arc<Pool>> = HashMap::new();
         if let Some(db) = &config.database {
+            let guest_db_url = db.guest_url.as_deref().unwrap_or(&db.url);
             for module in &config.modules {
                 if module.database {
                     let pool = wr_engine::pool::build_pool(
-                        &db.url,
+                        guest_db_url,
                         module.db_max_connections.unwrap_or(db.max_connections),
                     )?;
                     db_pools.insert(
@@ -109,12 +110,35 @@ impl EngineRunner {
     }
 
     /// For every DB-enabled module, ensure its Postgres schema exists.
+    /// When a separate `guest_url` is configured, also GRANTs the guest role
+    /// full access to the module's schema so the lower-privilege role can
+    /// create/modify tables within it.
     /// Idempotent — safe to run on every startup.
     pub async fn provision_schemas(&self) -> Result<()> {
         let pool = match &self.db_pool {
             Some(p) => p,
             None => return Ok(()),
         };
+
+        // Extract the guest role name from guest_url (if configured) so we can
+        // GRANT schema access to the lower-privilege role.
+        // Parses the username from `postgres://user:pass@host/db` without
+        // pulling in a full URL parser.
+        let guest_role = self
+            .config
+            .database
+            .as_ref()
+            .and_then(|db| db.guest_url.as_ref())
+            .and_then(|url| {
+                let after_scheme = url.split("://").nth(1)?;
+                let userinfo = after_scheme.split('@').next()?;
+                let user = userinfo.split(':').next()?;
+                if user.is_empty() {
+                    None
+                } else {
+                    Some(user.to_string())
+                }
+            });
 
         for module in &self.config.modules {
             if !module.database {
@@ -141,6 +165,20 @@ impl EngineRunner {
                         .with_context(|| format!("failed to provision schema '{schema}'"));
                 }
             }
+
+            // Grant the guest role access to this module's schema.
+            if let Some(role) = &guest_role {
+                client
+                    .batch_execute(&format!(
+                        "GRANT ALL ON SCHEMA \"{schema}\" TO \"{role}\"; \
+                         ALTER DEFAULT PRIVILEGES IN SCHEMA \"{schema}\" GRANT ALL ON TABLES TO \"{role}\";"
+                    ))
+                    .await
+                    .with_context(|| {
+                        format!("failed to grant schema '{schema}' access to role '{role}'")
+                    })?;
+            }
+
             info!(schema, "schema provisioned");
         }
 
@@ -276,6 +314,15 @@ impl EngineRunner {
             pre,
             instance_semaphore: self.instance_semaphore.clone(),
         };
+        let db_timeouts = self
+            .config
+            .database
+            .as_ref()
+            .map(|db| DbTimeouts {
+                statement_timeout_secs: db.statement_timeout_secs,
+                idle_in_transaction_timeout_secs: db.idle_in_transaction_timeout_secs,
+            })
+            .unwrap_or_default();
         let module = ModuleContext {
             name: module_name.clone(),
             namespace: module_namespace.clone(),
@@ -283,6 +330,7 @@ impl EngineRunner {
             http_client: http_client.clone(),
             db_pool: db_pool.clone(),
             db_schema: db_schema.clone(),
+            db_timeouts,
             blobstore,
             blob_prefix,
             llm,
@@ -348,6 +396,7 @@ struct ModuleContext {
     >,
     db_pool: Option<Arc<Pool>>,
     db_schema: Option<String>,
+    db_timeouts: DbTimeouts,
     blobstore: Option<Arc<BlobstoreRuntime>>,
     blob_prefix: Option<String>,
     llm: Option<Arc<LlmRuntime>>,
@@ -453,6 +502,7 @@ async fn dispatch_request(
         ModuleServices {
             db_pool: module.db_pool.clone(),
             db_schema: module.db_schema.clone(),
+            db_timeouts: module.db_timeouts.clone(),
             blobstore: module.blobstore.clone(),
             blob_prefix: module.blob_prefix.clone(),
             llm: module.llm.clone(),

@@ -155,12 +155,11 @@ impl ManagerService for Manager {
 
     async fn get_routing_table(
         &self,
-        _request: Request<GetRoutingTableRequest>,
+        request: Request<GetRoutingTableRequest>,
     ) -> Result<Response<GetRoutingTableResponse>, Status> {
-        let table = db::get_routing_table(&self.pool).await?;
-        Ok(Response::new(GetRoutingTableResponse {
-            table: Some(table),
-        }))
+        let known_version = request.into_inner().known_version;
+        let table = db::get_routing_table(&self.pool, known_version).await?;
+        Ok(Response::new(GetRoutingTableResponse { table }))
     }
 
     async fn upsert_routing_rule(

@@ -122,7 +122,7 @@ async fn test_routing_table_upsert_and_get() -> Result<()> {
     .await?;
 
     let table = c
-        .get_routing_table(GetRoutingTableRequest {})
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
         .await?
         .into_inner()
         .table

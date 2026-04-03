@@ -310,8 +310,13 @@ pub async fn delete_routing_rule(pool: &Pool, rule_id: &str) -> Result<bool, Sta
     Ok(deleted > 0)
 }
 
-/// Read the full routing table from the database.
-pub async fn get_routing_table(pool: &Pool) -> Result<RoutingTable, Status> {
+/// Read the routing table from the database.
+/// If `known_version` is non-zero and matches the current version, returns `None`
+/// (the caller's copy is up to date). Otherwise returns the full table.
+pub async fn get_routing_table(
+    pool: &Pool,
+    known_version: u64,
+) -> Result<Option<RoutingTable>, Status> {
     let client = pool.get().await.map_err(internal)?;
 
     let version: i64 = client
@@ -319,6 +324,10 @@ pub async fn get_routing_table(pool: &Pool) -> Result<RoutingTable, Status> {
         .await
         .map_err(internal)?
         .get(0);
+
+    if known_version != 0 && known_version == version as u64 {
+        return Ok(None);
+    }
 
     let rows = client
         .query(
@@ -347,10 +356,10 @@ pub async fn get_routing_table(pool: &Pool) -> Result<RoutingTable, Status> {
         })
         .collect();
 
-    Ok(RoutingTable {
+    Ok(Some(RoutingTable {
         rules,
         version: version as u64,
-    })
+    }))
 }
 
 // ── Schema operations ────────────────────────────────────────────────────────

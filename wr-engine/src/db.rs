@@ -58,7 +58,31 @@ use wruntime::db::database::{
     Column, DbError, Host, HostRowCursor, HostTransaction, PgInterval, PgValue, Row,
 };
 
-use crate::state::ModuleState;
+use crate::state::{DbTimeouts, ModuleState};
+
+/// Configure a pooled connection for guest use: set the search_path to the
+/// module's schema and apply statement/idle-in-transaction timeouts.
+///
+/// Uses `batch_execute` so all SET commands travel in a single round-trip.
+async fn prepare_connection(
+    client: &deadpool_postgres::Object,
+    schema: &Option<String>,
+    timeouts: &DbTimeouts,
+) -> Result<(), DbError> {
+    let mut sql = String::new();
+    if let Some(s) = schema {
+        sql.push_str(&format!("SET search_path = \"{s}\"; "));
+    }
+    sql.push_str(&format!(
+        "SET statement_timeout = '{}s'; SET idle_in_transaction_session_timeout = '{}s';",
+        timeouts.statement_timeout_secs, timeouts.idle_in_transaction_timeout_secs
+    ));
+    client
+        .batch_execute(&sql)
+        .await
+        .map_err(|e| DbError::Connection(e.to_string()))?;
+    Ok(())
+}
 
 // ── PgParam ──────────────────────────────────────────────────────────────────
 
@@ -309,20 +333,13 @@ impl Host for ModuleState {
             }
         };
         let schema = self.db_schema.clone();
+        let timeouts = self.db_timeouts.clone();
         futures::future::Either::Right(async move {
             let client = pool
                 .get()
                 .await
                 .map_err(|e| DbError::Connection(e.to_string()))?;
-            if let Some(s) = &schema {
-                client
-                    .execute(
-                        &format!("SET search_path = \"{s}\""),
-                        &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
-                    )
-                    .await
-                    .map_err(|e| DbError::Connection(e.to_string()))?;
-            }
+            prepare_connection(&client, &schema, &timeouts).await?;
             let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
             let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
                 pg_params.iter().map(|p| p as _).collect();
@@ -348,20 +365,13 @@ impl Host for ModuleState {
             }
         };
         let schema = self.db_schema.clone();
+        let timeouts = self.db_timeouts.clone();
         futures::future::Either::Right(async move {
             let client = pool
                 .get()
                 .await
                 .map_err(|e| DbError::Connection(e.to_string()))?;
-            if let Some(s) = &schema {
-                client
-                    .execute(
-                        &format!("SET search_path = \"{s}\""),
-                        &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
-                    )
-                    .await
-                    .map_err(|e| DbError::Connection(e.to_string()))?;
-            }
+            prepare_connection(&client, &schema, &timeouts).await?;
             let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
             let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
                 pg_params.iter().map(|p| p as _).collect();
@@ -386,19 +396,12 @@ impl Host for ModuleState {
             }
         };
         let schema = self.db_schema.clone();
+        let timeouts = self.db_timeouts.clone();
         let client = pool
             .get()
             .await
             .map_err(|e| DbError::Connection(e.to_string()))?;
-        if let Some(s) = &schema {
-            client
-                .execute(
-                    &format!("SET search_path = \"{s}\""),
-                    &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
-                )
-                .await
-                .map_err(|e| DbError::Connection(e.to_string()))?;
-        }
+        prepare_connection(&client, &schema, &timeouts).await?;
         let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             pg_params.iter().map(|p| p as _).collect();
@@ -425,6 +428,7 @@ impl Host for ModuleState {
             }
         };
         let schema = self.db_schema.clone();
+        let timeouts = self.db_timeouts.clone();
         let client = async move {
             let client = pool
                 .get()
@@ -434,15 +438,7 @@ impl Host for ModuleState {
                 .execute("BEGIN", &[])
                 .await
                 .map_err(|e| DbError::Query(pg_error_string(&e)))?;
-            if let Some(s) = &schema {
-                client
-                    .execute(
-                        &format!("SET search_path = \"{s}\""),
-                        &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
-                    )
-                    .await
-                    .map_err(|e| DbError::Connection(e.to_string()))?;
-            }
+            prepare_connection(&client, &schema, &timeouts).await?;
             Ok::<_, DbError>(client)
         }
         .await?;
