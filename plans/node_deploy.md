@@ -29,24 +29,37 @@ wr-cli node init ./node-c \
 
 ### `wr-cli node bundle`
 
-Builds WASM + schemas, cross-compiles host binaries, and packages everything into a deployable tarball.
+Builds WASM + schemas, cross-compiles host binaries, and packages everything into a deployable bundle. The `--format` flag controls the output format.
 
 ```
 wr-cli node bundle \
     --proxy-config ./node-c/proxy.toml \
     --engine-config ./node-c/engine.toml  # repeatable
     --target x86_64-unknown-linux-gnu     # cargo target triple
+    --format systemd                      # output format (default: systemd)
+    --remote-dir /opt/wruntime            # install path for systemd units (default: /opt/wruntime)
     --output node-c.tar.gz
     --skip-build                          # optional: skip WASM/schema compilation
 ```
 
-**Steps:**
+**Output formats:**
+
+| Format | Status | Description |
+|--------|--------|-------------|
+| `systemd` | Planned | Tarball with pre-built systemd unit files for bare-metal / VM deployment |
+| `docker` | Future | Dockerfile + context for container image builds |
+| `k8s` | Future | Kubernetes manifests (Deployment, Service, ConfigMap) |
+
+The `--format` flag is an enum that will be extended as new formats are added. Format-specific flags (e.g., `--remote-dir` for systemd) are validated per format.
+
+**Steps (systemd format):**
 1. Compile `.proto` → `.binpb` for each module with `schema_path` (via `protoc`)
 2. Build WASM modules (`cargo component build --release --target wasm32-wasip2`)
 3. Build host binaries (`cargo build --release --target <target> -p wr-proxy -p wr-engine`)
-4. Collect artifacts into tarball
+4. Generate systemd unit files from config (see below)
+5. Collect artifacts into tarball
 
-**Bundle layout:**
+**Bundle layout (systemd):**
 ```
 wr-node/
   bin/
@@ -63,29 +76,37 @@ wr-node/
   migrations/
     inventory/
       V1__create_tables.sql
-  manifest.json           # metadata: modules, checksums, target triple
+  systemd/
+    wr-proxy.service                # WorkingDirectory=<remote-dir>, Restart=on-failure
+    wr-engine-inventory.service     # one per engine config, After=wr-proxy.service
+  manifest.json           # metadata: modules, checksums, target triple, format
 ```
+
+**Systemd unit generation** — units are built at bundle time using `--remote-dir` to set `WorkingDirectory` and binary/config paths. Each unit file is a rendered template:
+- `wr-proxy.service` — `ExecStart=<remote-dir>/wr-node/bin/wr-proxy <remote-dir>/wr-node/config/proxy.toml`, `Restart=on-failure`
+- `wr-engine-<name>.service` — one per engine config, `After=wr-proxy.service`, same pattern
+
+This means the bundle is fully self-contained — deploy does not need to generate any files on the remote host.
 
 Engine configs inside the tarball have paths rewritten to be relative to `wr-node/` (e.g., `wasm_path = "modules/inventory.wasm"`).
 
 ### `wr-cli node deploy`
 
-Pushes a bundle to a remote host, installs systemd units, and starts services.
+Pushes a bundle to a remote host, installs pre-built systemd units, and starts services. The deploy command reads `manifest.json` to determine the bundle format and runs the appropriate installation steps.
 
 ```
 wr-cli node deploy node-c.tar.gz deploy@10.0.1.50 \
-    --remote-dir /opt/wruntime        # default: /opt/wruntime
     --ssh-key ~/.ssh/id_ed25519       # optional
     --ssh-port 22                     # default: 22
 ```
 
-**Steps:**
+Note: `--remote-dir` is no longer a deploy flag — it is baked into the bundle at `bundle` time (systemd unit paths are pre-rendered).
+
+**Steps (systemd format):**
 1. `scp` tarball to remote `/tmp/`
-2. `ssh`: unpack to `<remote-dir>/`
-3. `ssh`: generate systemd unit files:
-   - `wr-proxy.service` — runs `wr-node/bin/wr-proxy wr-node/config/proxy.toml`, `WorkingDirectory=<remote-dir>`, `Restart=on-failure`
-   - `wr-engine-<name>.service` — one per engine config, `After=wr-proxy.service`
-4. `ssh`: install units to `/etc/systemd/system/`, `systemctl daemon-reload`, `systemctl enable --now` each service
+2. `ssh`: unpack to install directory (read from `manifest.json`)
+3. `ssh`: copy pre-built unit files from `wr-node/systemd/` to `/etc/systemd/system/`
+4. `ssh`: `systemctl daemon-reload`, `systemctl enable --now` each service
 5. Poll manager gRPC (`ListEngines`) until new engine appears or timeout (60s)
 
 ### `wr-cli node status`
@@ -96,7 +117,7 @@ Inspect a bundle without deploying.
 wr-cli node status node-c.tar.gz
 ```
 
-Reads `manifest.json` and prints: target triple, included modules (namespace/name/version), binary checksums, config files.
+Reads `manifest.json` and prints: bundle format, target triple, remote install directory, included modules (namespace/name/version), binary checksums, config files, and (for systemd format) included unit files.
 
 ## Workflow Example
 
@@ -110,14 +131,16 @@ wr-cli node init ./node-c \
 # 2. (Optional) Edit generated configs
 vim ./node-c/engine.toml
 
-# 3. Build + package (cross-compile for Linux)
+# 3. Build + package (cross-compile for Linux, systemd format)
 wr-cli node bundle \
     --proxy-config ./node-c/proxy.toml \
     --engine-config ./node-c/engine.toml \
     --target x86_64-unknown-linux-gnu \
+    --format systemd \
+    --remote-dir /opt/wruntime \
     --output node-c.tar.gz
 
-# 4. Deploy to VM
+# 4. Deploy to VM (reads format + remote-dir from manifest)
 wr-cli node deploy node-c.tar.gz deploy@10.0.1.50
 
 # 5. Verify
@@ -146,18 +169,21 @@ New command module with four subcommands: `init`, `bundle`, `deploy`, `status`.
 - Serialize back to TOML via `toml::to_string_pretty` (add `toml` as a dep if not already present)
 
 **`bundle` implementation:**
+- Accept `--format` flag (`BundleFormat` enum: `Systemd`, future `Docker`, `K8s`)
 - Reuse schema compilation logic from `cmd/dev.rs` (the `protoc` invocation) — extract to shared helper
 - Reuse WASM build logic from `cmd/dev.rs` (`cargo component build`) — extract to shared helper
 - Run `cargo build --release --target <triple> -p wr-proxy -p wr-engine` for host binaries
 - Walk engine configs, collect all referenced artifacts
-- Build tarball with `tar` + `flate2` crates
+- **Systemd format:** render unit file templates using `--remote-dir` to produce absolute paths in `ExecStart`/`WorkingDirectory`; include rendered `.service` files in `systemd/` directory
 - Rewrite paths in configs before adding to tarball
-- Generate and include `manifest.json`
+- Build tarball with `tar` + `flate2` crates
+- Generate and include `manifest.json` (includes `format`, `remote_dir`, checksums, target triple)
 
 **`deploy` implementation:**
+- Read `manifest.json` from tarball to determine format and install directory
 - Shell out to `scp` via `std::process::Command`
-- Shell out to `ssh` for: unpack, generate systemd units, install + start
-- Systemd unit template is a const string with placeholder substitution
+- Shell out to `ssh` for: unpack, copy pre-built units from `systemd/` to `/etc/systemd/system/`, daemon-reload + enable
+- No file generation on the remote host — all artifacts are pre-built in the bundle
 - Poll manager gRPC (`ListEngines`) until new engine appears or timeout (60s)
 
 **`status` implementation:**
