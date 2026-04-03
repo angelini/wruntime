@@ -119,6 +119,24 @@ impl WasiHttpHooks for ModuleHttpHooks {
     }
 }
 
+/// Postgres timeout configuration applied to every guest connection.
+#[derive(Clone, Debug)]
+pub struct DbTimeouts {
+    /// `SET statement_timeout` value in seconds.
+    pub statement_timeout_secs: u32,
+    /// `SET idle_in_transaction_session_timeout` value in seconds.
+    pub idle_in_transaction_timeout_secs: u32,
+}
+
+impl Default for DbTimeouts {
+    fn default() -> Self {
+        Self {
+            statement_timeout_secs: 30,
+            idle_in_transaction_timeout_secs: 60,
+        }
+    }
+}
+
 /// Optional services and capabilities for a module.
 /// All fields default to `None`/no-op, so tests can simply use `Default::default()`.
 pub struct ModuleServices {
@@ -127,6 +145,8 @@ pub struct ModuleServices {
     /// Postgres schema name for this module (`wr__{namespace}__{name}`).
     /// Set when DB access is enabled; used to scope all queries to the module's schema.
     pub db_schema: Option<String>,
+    /// Timeout configuration for guest DB connections.
+    pub db_timeouts: DbTimeouts,
     /// Shared S3-compatible blobstore client, present when the module has blobstore access enabled.
     pub blobstore: Option<Arc<BlobstoreRuntime>>,
     /// S3 key prefix for namespace isolation (e.g. `wr/ecommerce/`).
@@ -150,6 +170,7 @@ impl Default for ModuleServices {
         Self {
             db_pool: None,
             db_schema: None,
+            db_timeouts: DbTimeouts::default(),
             blobstore: None,
             blob_prefix: None,
             llm: None,
@@ -170,6 +191,8 @@ pub struct ModuleState {
     /// Postgres schema name for this module (`wr__{namespace}__{name}`).
     /// Set when DB access is enabled; used to scope all queries to the module's schema.
     pub db_schema: Option<String>,
+    /// Timeout configuration for guest DB connections.
+    pub db_timeouts: DbTimeouts,
     /// Ephemeral temp directory backing the module's WASI filesystem.
     /// `Some` only when `fs = "tempdir"` is set; kept alive so it isn't
     /// deleted until the store is dropped.
@@ -217,6 +240,7 @@ impl ModuleState {
             },
             db_pool: services.db_pool,
             db_schema: services.db_schema,
+            db_timeouts: services.db_timeouts,
             blobstore: services.blobstore,
             blob_prefix: services.blob_prefix,
             llm: services.llm,

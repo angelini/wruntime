@@ -8,6 +8,9 @@ control_address = "http://127.0.0.1:9002"  # proxy gRPC control plane for regist
 [database]
 url             = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 20   # default pool size for all DB-enabled modules
+# guest_url     = "postgres://wr_guest:pass@localhost:5433/wruntime_example"  # optional lower-privilege role for module pools
+# statement_timeout_secs              = 30   # per-statement timeout for guest queries (default: 30)
+# idle_in_transaction_timeout_secs    = 60   # kill idle-in-transaction sessions (default: 60)
 
 # Optional — remove this section if no modules need LLM inference.
 # [llm]

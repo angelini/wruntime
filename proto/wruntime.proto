@@ -55,7 +55,9 @@ message ListEnginesResponse      { repeated EngineRegistration engines = 1; }
 
 // ── Routing table ─────────────────────────────────────────────────────────
 
-message GetRoutingTableRequest    {}
+message GetRoutingTableRequest    {
+  uint64 known_version = 1; // if set and matches current version, server returns no table
+}
 message GetRoutingTableResponse   { RoutingTable table = 1; }
 message UpsertRoutingRuleResponse {}
 message DeleteRoutingRuleRequest  { string rule_id = 1; }

@@ -33,7 +33,7 @@ pub async fn run(args: ServicesArgs, manager: &str) -> Result<()> {
 async fn list(manager: &str) -> Result<()> {
     let mut client = client::connect(manager).await?;
     let resp = client
-        .get_routing_table(GetRoutingTableRequest {})
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
         .await?
         .into_inner();
 
@@ -84,7 +84,7 @@ async fn get(manager: &str, service: &str) -> Result<()> {
 
     let mut client = client::connect(manager).await?;
     let resp = client
-        .get_routing_table(GetRoutingTableRequest {})
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
         .await?
         .into_inner();
 

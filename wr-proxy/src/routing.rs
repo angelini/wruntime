@@ -26,20 +26,20 @@ pub async fn sync_once(
     table: &CachedRoutingTable,
     cb_registry: &CircuitBreakerRegistry,
 ) -> Result<(), tonic::Status> {
-    let resp = client.get_routing_table(GetRoutingTableRequest {}).await?;
+    let known_version = table.read().await.version;
+    let resp = client
+        .get_routing_table(GetRoutingTableRequest { known_version })
+        .await?;
     if let Some(incoming) = resp.into_inner().table {
-        let current_version = table.read().await.version;
-        if incoming.version > current_version {
-            let version = incoming.version;
-            let active: HashSet<&str> = incoming
-                .rules
-                .iter()
-                .map(|r| r.engine_address.as_str())
-                .collect();
-            cb_registry.evict_missing(&active);
-            *table.write().await = incoming;
-            info!(version, "routing table updated");
-        }
+        let version = incoming.version;
+        let active: HashSet<&str> = incoming
+            .rules
+            .iter()
+            .map(|r| r.engine_address.as_str())
+            .collect();
+        cb_registry.evict_missing(&active);
+        *table.write().await = incoming;
+        info!(version, "routing table updated");
     }
     Ok(())
 }

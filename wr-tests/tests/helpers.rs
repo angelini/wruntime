@@ -149,7 +149,7 @@ pub async fn get_rule_health(
     destination_module: &str,
 ) -> Result<(bool, u64)> {
     let table = mgr
-        .get_routing_table(GetRoutingTableRequest {})
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
         .await?
         .into_inner()
         .table
@@ -167,7 +167,7 @@ pub async fn get_routing_table_version(
     mgr: &mut ManagerServiceClient<tonic::transport::Channel>,
 ) -> Result<u64> {
     let table = mgr
-        .get_routing_table(GetRoutingTableRequest {})
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
         .await?
         .into_inner()
         .table
@@ -243,7 +243,7 @@ pub async fn sync_table(
 ) -> Result<()> {
     let mut c = manager_client(mgr_addr).await?;
     if let Some(incoming) = c
-        .get_routing_table(GetRoutingTableRequest {})
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
         .await?
         .into_inner()
         .table

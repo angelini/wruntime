@@ -57,14 +57,39 @@ fn default_max_memory_size() -> usize {
 #[derive(Deserialize, Clone)]
 pub struct DatabaseConfig {
     /// `postgres://user:pass@host:port/dbname` connection string.
+    /// Used for admin operations (schema provisioning, migrations).
     pub url: String,
-    /// Maximum number of pooled connections. Defaults to 8.
+    /// Optional connection string for guest module pools.
+    /// When set, module runtime pools connect as this (typically lower-privilege)
+    /// role while provisioning/migrations continue using `url`.
+    /// Falls back to `url` when absent.
+    #[serde(default)]
+    pub guest_url: Option<String>,
+    /// Maximum number of pooled connections. Defaults to 20.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+    /// Per-statement timeout in seconds applied to every guest connection.
+    /// Prevents runaway queries from consuming CPU/IO indefinitely.
+    /// Defaults to 30.
+    #[serde(default = "default_db_statement_timeout_secs")]
+    pub statement_timeout_secs: u32,
+    /// Timeout in seconds for idle-in-transaction sessions.
+    /// Kills connections that hold a transaction open without activity.
+    /// Defaults to 60.
+    #[serde(default = "default_db_idle_in_transaction_timeout_secs")]
+    pub idle_in_transaction_timeout_secs: u32,
 }
 
 fn default_max_connections() -> usize {
     20
+}
+
+fn default_db_statement_timeout_secs() -> u32 {
+    30
+}
+
+fn default_db_idle_in_transaction_timeout_secs() -> u32 {
+    60
 }
 
 #[derive(Deserialize, Clone)]
