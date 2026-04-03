@@ -3,14 +3,16 @@
 A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. Nodes are independent — each proxy handles its own inbound traffic and forwards cross-node requests directly to the peer proxy, which then routes locally to its engines.
 
 ```
-                         ┌────────────────────────┐
-                         │      wr-manager        │
-                         │                        │
-                         │  Engine registry       │
-                         │  Routing table         │
-                         └──────────┬─────────────┘
-                                    │ gRPC (all nodes)
-               ┌────────────────────┴─────────────────────┐
+              ┌────────────────────────┐    gossip    ┌────────────────────────┐
+              │    wr-manager (1)     │◄───(UDP)───►│    wr-manager (2)     │
+              │  Engine registry      │             │  Engine registry      │
+              │  Routing table        │             │  Routing table        │
+              └──────────┬───────────┘             └──────────┬───────────┘
+                         │          shared Postgres           │
+                         │     (serialized via row locks)     │
+                         └────────────────┬───────────────────┘
+                                          │ gRPC (all nodes)
+               ┌──────────────────────────┴───────────────────────┐
                │                                          │
                ▼                                          ▼
 ┌─────────────────────────────┐        ┌─────────────────────────────┐
@@ -39,11 +41,22 @@ A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. 
 
 | Binary | Default port | Role |
 |--------|-------------|------|
-| `wr-manager` | `9000` (gRPC) | Central registry — engines register here, proxies sync routing tables from here |
+| `wr-manager` | `9000` (gRPC) + `9010` (gossip) | Registry — engines register here, proxies sync routing tables from here. Runs active-active behind shared Postgres; chitchat gossip provides manager-to-manager liveness detection |
 | `wr-proxy` | `9001` (HTTP) | Streaming header-based router — intercepts and routes inter-module traffic; forwards cross-node requests to peer proxies; request and response bodies flow through without buffering |
 | `wr-engine` | `9100` (HTTP) | Loads WASM modules, runs them, and receives forwarded requests |
 
 A **node** groups one `wr-proxy` with one or more `wr-engine` instances behind a shared externally-reachable proxy address. Each node knows its own address via `[node] proxy_address` in its config files; the engine sends this value to the manager on registration so the routing table can distinguish local from remote destinations.
+
+## Manager clustering (active-active)
+
+Multiple `wr-manager` instances can run simultaneously for high availability. All managers share the same Postgres database — concurrent writes are serialized via `SELECT ... FOR UPDATE NOWAIT` on a lock sentinel row. Each manager:
+
+1. Registers itself in the `wr_managers` table on startup (UUID, gRPC address, gossip address).
+2. Heartbeats every 15 seconds; cleans up stale managers (60 s timeout).
+3. Participates in a [chitchat](https://docs.rs/chitchat) gossip mesh (UDP) for phi-accrual failure detection between managers.
+4. Deregisters itself on graceful shutdown.
+
+Proxies and engines can point at any single manager. Clients (including `wr-cli`) can discover all active managers via the `ListManagers` gRPC RPC — connect to any one seed manager and get back the full set of healthy peers.
 
 ## Request flow
 

@@ -83,6 +83,12 @@ message ListSecretsRequest  { string namespace = 1; } // empty = all namespaces
 message SecretEntry         { string namespace = 1; string key = 2; }
 message ListSecretsResponse { repeated SecretEntry secrets = 1; }
 
+// ── Manager discovery ─────────────────────────────────────────────────────
+
+message ListManagersRequest  {}
+message ManagerInfo          { string manager_id = 1; string grpc_address = 2; }
+message ListManagersResponse { repeated ManagerInfo managers = 1; }
+
 // ── Schemas ───────────────────────────────────────────────────────────────
 
 message GetSchemaRequest    { string module = 1; string version = 2; string namespace = 3; }
@@ -140,6 +146,9 @@ service ManagerService {
   rpc GetRoutingTable   (GetRoutingTableRequest)   returns (GetRoutingTableResponse);
   rpc UpsertRoutingRule (RoutingRule)              returns (UpsertRoutingRuleResponse);
   rpc DeleteRoutingRule (DeleteRoutingRuleRequest) returns (DeleteRoutingRuleResponse);
+
+  // Manager discovery
+  rpc ListManagers      (ListManagersRequest)      returns (ListManagersResponse);
 
   // Schemas
   rpc GetSchema         (GetSchemaRequest)         returns (GetSchemaResponse);
