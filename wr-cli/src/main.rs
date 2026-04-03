@@ -24,6 +24,8 @@ enum Commands {
     Dev(cmd::dev::DevArgs),
     /// Manage wruntime engines
     Engines(cmd::engines::EnginesArgs),
+    /// Manage cluster managers
+    Managers(cmd::managers::ManagersArgs),
     /// View logical services derived from the routing table
     Services(cmd::services::ServicesArgs),
     /// View aggregated request metrics
@@ -42,6 +44,7 @@ async fn main() -> Result<()> {
         Commands::Db(args) => cmd::db::run(args).await,
         Commands::Dev(args) => cmd::dev::run(args, &cli.manager).await,
         Commands::Engines(args) => cmd::engines::run(args, &cli.manager).await,
+        Commands::Managers(args) => cmd::managers::run(args, &cli.manager).await,
         Commands::Services(args) => cmd::services::run(args, &cli.manager).await,
         Commands::Metrics(args) => cmd::metrics::run(args).await,
         Commands::Invoke(args) => cmd::invoke::run(args, &cli.manager).await,
