@@ -47,10 +47,10 @@ wr-cli node bundle \
 | Format | Status | Description |
 |--------|--------|-------------|
 | `systemd` | Planned | Tarball with pre-built systemd unit files for bare-metal / VM deployment |
-| `docker` | Future | Dockerfile + context for container image builds |
+| `docker` | Planned | Dockerfiles + docker-compose.yml + build context for container image builds |
 | `k8s` | Future | Kubernetes manifests (Deployment, Service, ConfigMap) |
 
-The `--format` flag is an enum that will be extended as new formats are added. Format-specific flags (e.g., `--remote-dir` for systemd) are validated per format.
+The `--format` flag is an enum that will be extended as new formats are added. Format-specific flags (e.g., `--remote-dir` for systemd, `--image-prefix` for docker) are validated per format.
 
 **Steps (systemd format):**
 1. Compile `.proto` → `.binpb` for each module with `schema_path` (via `protoc`)
@@ -90,6 +90,102 @@ This means the bundle is fully self-contained — deploy does not need to genera
 
 Engine configs inside the tarball have paths rewritten to be relative to `wr-node/` (e.g., `wasm_path = "modules/inventory.wasm"`).
 
+#### Docker format
+
+```
+wr-cli node bundle \
+    --proxy-config ./node-c/proxy.toml \
+    --engine-config ./node-c/engine.toml  # repeatable
+    --format docker
+    --image-prefix myregistry.io/wruntime  # optional: image name prefix (default: wr)
+    --output node-c-docker/                # output directory (not a tarball)
+    --skip-build                           # optional: skip WASM/schema compilation
+```
+
+Note: `--target` is not needed for docker format — the Dockerfile handles the build target via its base image. `--remote-dir` is not needed — container paths are fixed at `/app`.
+
+**Design: one process per container, no init system.** Containers use Google's [distroless](https://github.com/GoogleContainerTools/distroless) `cc-debian12` as the runtime base image. This image contains only the runtime libraries needed for C/C++/Rust binaries — no shell, no package manager, no init system. Process supervision and restarts are handled by the container runtime (`docker run --restart=on-failure`) or orchestrator (Kubernetes `restartPolicy`). This is the standard container pattern and aligns cleanly with the future K8s format.
+
+Each service gets its own Dockerfile producing a separate image:
+- `wr-proxy` — one container, one image
+- `wr-engine-<name>` — one container per engine config, one image each
+
+A generated `docker-compose.yml` wires up the topology with `depends_on` ordering (proxy starts before engines) and `restart: on-failure`.
+
+**Steps (docker format):**
+1. Compile `.proto` → `.binpb` for each module with `schema_path` (via `protoc`)
+2. Build WASM modules (`cargo component build --release --target wasm32-wasip2`)
+3. Generate Dockerfiles, `docker-compose.yml`, and `.dockerignore`
+4. Collect all artifacts into the output directory
+
+Host binaries are **not** cross-compiled by the CLI. Instead, the generated Dockerfiles use a multi-stage build: a `rust:latest` builder stage compiles the binaries inside the container, then copies them into the distroless runtime stage. This avoids cross-compilation issues and ensures the binary matches the container OS exactly.
+
+**Bundle layout (docker):**
+```
+node-c-docker/
+  Dockerfile.proxy
+  Dockerfile.engine-inventory     # one per engine config
+  docker-compose.yml
+  .dockerignore
+  config/
+    proxy.toml
+    engine-inventory.toml         # (paths rewritten to /app/...)
+  modules/
+    inventory.wasm
+    client.wasm
+  schemas/
+    inventory.binpb
+  migrations/
+    inventory/
+      V1__create_tables.sql
+  src/                            # Rust source needed for the builder stage
+    ...                           # (or a Cargo workspace reference)
+  manifest.json                   # metadata: modules, checksums, format, image_prefix
+```
+
+**Generated Dockerfile (example — `Dockerfile.engine-inventory`):**
+```dockerfile
+# Builder stage
+FROM rust:latest AS builder
+WORKDIR /build
+COPY src/ ./
+RUN cargo build --release -p wr-engine
+
+# Runtime stage
+FROM gcr.io/distroless/cc-debian12
+COPY --from=builder /build/target/release/wr-engine /app/bin/wr-engine
+COPY config/engine-inventory.toml /app/config/engine.toml
+COPY modules/ /app/modules/
+COPY schemas/ /app/schemas/
+COPY migrations/ /app/migrations/
+ENTRYPOINT ["/app/bin/wr-engine", "/app/config/engine.toml"]
+```
+
+**Generated `docker-compose.yml` (example):**
+```yaml
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    ports:
+      - "9001:9001"
+      - "9002:9002"
+    restart: on-failure
+
+  engine-inventory:
+    build:
+      context: .
+      dockerfile: Dockerfile.engine-inventory
+    ports:
+      - "9100:9100"
+    depends_on:
+      - proxy
+    restart: on-failure
+```
+
+**Why not systemd inside the container?** Systemd requires `--privileged` or `CAP_SYS_ADMIN`, fights with the container runtime's PID 1 lifecycle, and is incompatible with distroless (no init, no shell). The container runtime already handles restarts, health checks, and signal forwarding — duplicating this with systemd adds complexity for no benefit.
+
 ### `wr-cli node deploy`
 
 Pushes a bundle to a remote host, installs pre-built systemd units, and starts services. The deploy command reads `manifest.json` to determine the bundle format and runs the appropriate installation steps.
@@ -109,6 +205,13 @@ Note: `--remote-dir` is no longer a deploy flag — it is baked into the bundle 
 4. `ssh`: `systemctl daemon-reload`, `systemctl enable --now` each service
 5. Poll manager gRPC (`ListEngines`) until new engine appears or timeout (60s)
 
+**Steps (docker format):**
+1. `scp` bundle directory to remote host
+2. `ssh`: `docker compose up -d --build` in the bundle directory
+3. Poll manager gRPC (`ListEngines`) until new engine appears or timeout (60s)
+
+Alternatively, for docker format, users may skip `node deploy` entirely and run `docker compose up` themselves (locally or in CI). The bundle is a self-contained build context.
+
 ### `wr-cli node status`
 
 Inspect a bundle without deploying.
@@ -117,9 +220,11 @@ Inspect a bundle without deploying.
 wr-cli node status node-c.tar.gz
 ```
 
-Reads `manifest.json` and prints: bundle format, target triple, remote install directory, included modules (namespace/name/version), binary checksums, config files, and (for systemd format) included unit files.
+Reads `manifest.json` and prints: bundle format, target triple (systemd) or base image (docker), remote install directory, included modules (namespace/name/version), checksums, config files, and format-specific artifacts (systemd unit files, Dockerfiles).
 
-## Workflow Example
+## Workflow Examples
+
+### Systemd (bare-metal / VM)
 
 ```bash
 # 1. Generate configs for new node
@@ -148,6 +253,36 @@ wr-cli engines list
 wr-cli services list
 ```
 
+### Docker
+
+```bash
+# 1. Generate configs for new node
+wr-cli node init ./node-c \
+    --host 10.0.1.50 \
+    --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
+    --engine-config examples/ecommerce/engine-inventory-1.toml
+
+# 2. (Optional) Edit generated configs
+vim ./node-c/engine.toml
+
+# 3. Build WASM + generate Docker context
+wr-cli node bundle \
+    --proxy-config ./node-c/proxy.toml \
+    --engine-config ./node-c/engine.toml \
+    --format docker \
+    --output node-c-docker/
+
+# 4a. Deploy to remote host via SSH
+wr-cli node deploy node-c-docker/ deploy@10.0.1.50
+
+# 4b. Or build and run locally / in CI
+cd node-c-docker && docker compose up -d --build
+
+# 5. Verify
+wr-cli engines list
+wr-cli services list
+```
+
 ## Implementation
 
 ### Step 1: Add dependencies to `wr-cli/Cargo.toml`
@@ -169,20 +304,19 @@ New command module with four subcommands: `init`, `bundle`, `deploy`, `status`.
 - Serialize back to TOML via `toml::to_string_pretty` (add `toml` as a dep if not already present)
 
 **`bundle` implementation:**
-- Accept `--format` flag (`BundleFormat` enum: `Systemd`, future `Docker`, `K8s`)
+- Accept `--format` flag (`BundleFormat` enum: `Systemd`, `Docker`, future `K8s`)
 - Reuse schema compilation logic from `cmd/dev.rs` (the `protoc` invocation) — extract to shared helper
 - Reuse WASM build logic from `cmd/dev.rs` (`cargo component build`) — extract to shared helper
-- Run `cargo build --release --target <triple> -p wr-proxy -p wr-engine` for host binaries
 - Walk engine configs, collect all referenced artifacts
-- **Systemd format:** render unit file templates using `--remote-dir` to produce absolute paths in `ExecStart`/`WorkingDirectory`; include rendered `.service` files in `systemd/` directory
-- Rewrite paths in configs before adding to tarball
-- Build tarball with `tar` + `flate2` crates
-- Generate and include `manifest.json` (includes `format`, `remote_dir`, checksums, target triple)
+- Rewrite paths in configs (to bundle-relative for systemd, to `/app/...` for docker)
+- **Systemd format:** cross-compile host binaries (`cargo build --release --target <triple>`); render systemd unit file templates using `--remote-dir`; package into tarball with `tar` + `flate2`
+- **Docker format:** generate Dockerfiles (multi-stage: `rust:latest` builder → `gcr.io/distroless/cc-debian12` runtime), `docker-compose.yml`, and `.dockerignore`; write output directory (no tarball, no host binary cross-compilation — the Dockerfile builder stage handles it)
+- Generate and include `manifest.json` (includes `format`, format-specific metadata, checksums)
 
 **`deploy` implementation:**
-- Read `manifest.json` from tarball to determine format and install directory
-- Shell out to `scp` via `std::process::Command`
-- Shell out to `ssh` for: unpack, copy pre-built units from `systemd/` to `/etc/systemd/system/`, daemon-reload + enable
+- Read `manifest.json` from bundle to determine format
+- **Systemd:** `scp` tarball → `ssh` unpack → copy pre-built units to `/etc/systemd/system/` → daemon-reload + enable
+- **Docker:** `scp` bundle directory → `ssh` `docker compose up -d --build`
 - No file generation on the remote host — all artifacts are pre-built in the bundle
 - Poll manager gRPC (`ListEngines`) until new engine appears or timeout (60s)
 
@@ -227,10 +361,15 @@ Functions to extract:
 ## Verification
 
 1. **`node init`** — Generate configs, verify TOML is valid by parsing with the existing config structs
-2. **`node bundle`** — Create tarball, extract it, verify all referenced paths exist and configs parse
-3. **`node status`** — Run against generated bundle, verify output matches contents
-4. **`node deploy`** — Test against a local VM or Docker container with SSH enabled:
+2. **`node bundle` (systemd)** — Create tarball, extract it, verify all referenced paths exist, configs parse, and systemd unit files contain correct paths
+3. **`node bundle` (docker)** — Generate output directory, verify Dockerfiles parse (`docker build --check` or equivalent), `docker-compose.yml` is valid, all referenced artifacts exist
+4. **`node status`** — Run against generated bundle, verify output matches contents
+5. **`node deploy` (systemd)** — Test against a local VM or Docker container with SSH enabled:
    - Verify tarball is copied and unpacked
    - Verify systemd units are installed and services start
    - Verify `wr-cli engines list` shows the new engine
-5. **Integration** — Run `just tidy` to verify formatting and lints pass
+6. **`node deploy` (docker)** — Test with `docker compose up -d --build` locally:
+   - Verify images build successfully on distroless base
+   - Verify containers start and stay healthy
+   - Verify `wr-cli engines list` shows the new engine
+7. **Integration** — Run `just tidy` to verify formatting and lints pass
