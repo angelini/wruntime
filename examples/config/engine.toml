@@ -1,9 +1,8 @@
-listen_address  = "0.0.0.0:9100"
-manager_address = "http://127.0.0.1:9000"
+listen_address = "0.0.0.0:9100"
 
 [node]
-proxy_address = "http://127.0.0.1:9001"   # local proxy; used to rewrite WASM outbound calls
-                                            # and sent to the manager on registration
+proxy_address   = "http://127.0.0.1:9001"  # local proxy; used to rewrite WASM outbound calls
+control_address = "http://127.0.0.1:9002"  # proxy gRPC control plane for registration/heartbeats
 
 # Optional — remove this section if no modules need database access.
 [database]

@@ -6,8 +6,6 @@ use wr_common::node::NodeConfig;
 
 #[derive(Deserialize, Clone)]
 pub struct EngineConfig {
-    /// gRPC address of wr-manager, e.g. "http://127.0.0.1:9000"
-    pub manager_address: String,
     /// Address this engine listens on for inbound requests from the proxy
     pub listen_address: String,
     /// Node configuration — identifies the local proxy for this engine.
@@ -122,8 +120,6 @@ pub enum ModuleMode {
     /// HTTP request handler with per-request instantiation (exports `wasi:http/incoming-handler`).
     #[default]
     Service,
-    /// Single long-running instance (exports `run`).
-    Run,
     /// Service guest driven by an engine-managed job queue instead of external HTTP traffic.
     Worker,
 }
@@ -145,7 +141,7 @@ pub struct ModuleConfig {
     pub version: String,
     pub wasm_path: String,
     /// Path to a compiled `FileDescriptorSet` binary for this module's API.
-    /// Optional — runner modules that don't expose an HTTP interface may omit this.
+    /// Optional — modules may omit this if they don't expose a schema.
     #[serde(default)]
     pub schema_path: String,
     /// Whether this module has access to the shared database pool.
@@ -186,7 +182,7 @@ pub struct ModuleConfig {
     /// resolved from secrets delivered by the manager at registration time.
     #[serde(default)]
     pub env: HashMap<String, EnvValue>,
-    /// Module execution mode: service (default), run, or worker.
+    /// Module execution mode: service (default) or worker.
     #[serde(default)]
     pub mode: ModuleMode,
     /// Number of concurrent worker tasks polling the job queue. Only used when `mode = "worker"`.
@@ -243,12 +239,12 @@ impl EngineConfig {
             "listen_address is required"
         );
         anyhow::ensure!(
-            !self.manager_address.is_empty(),
-            "manager_address is required"
-        );
-        anyhow::ensure!(
             !self.node.proxy_address.is_empty(),
             "node.proxy_address is required"
+        );
+        anyhow::ensure!(
+            !self.node.control_address.is_empty(),
+            "node.control_address is required"
         );
 
         for module in &self.modules {

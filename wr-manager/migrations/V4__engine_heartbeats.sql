@@ -1,0 +1,1 @@
+ALTER TABLE wr_engines ADD COLUMN last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT NOW();

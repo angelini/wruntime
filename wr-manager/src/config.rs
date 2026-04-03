@@ -10,6 +10,27 @@ pub struct ManagerConfig {
     pub engine_heartbeat_timeout_secs: u64,
     /// PostgreSQL connection pool configuration.
     pub database: DatabaseConfig,
+    /// Cluster configuration for multi-manager HA.
+    pub cluster: ClusterConfig,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct ClusterConfig {
+    /// Unique cluster identifier. All managers in the same cluster must match.
+    pub cluster_id: String,
+    /// UDP address for chitchat gossip, e.g. "0.0.0.0:9010"
+    pub gossip_listen_address: String,
+    /// This manager's gRPC address as reachable by proxies.
+    /// Defaults to listen_address if not set.
+    #[serde(default)]
+    pub advertise_grpc_address: Option<String>,
+    /// Gossip interval in milliseconds. Defaults to 500.
+    #[serde(default = "default_gossip_interval_ms")]
+    pub gossip_interval_ms: u64,
+}
+
+fn default_gossip_interval_ms() -> u64 {
+    500
 }
 
 #[derive(Deserialize, Clone)]
@@ -22,7 +43,7 @@ pub struct DatabaseConfig {
 }
 
 fn default_heartbeat_timeout() -> u64 {
-    30
+    10
 }
 
 fn default_max_connections() -> usize {
@@ -52,6 +73,14 @@ impl ManagerConfig {
         anyhow::ensure!(
             self.database.max_connections > 0,
             "database.max_connections must be > 0"
+        );
+        anyhow::ensure!(
+            !self.cluster.cluster_id.is_empty(),
+            "cluster.cluster_id is required"
+        );
+        anyhow::ensure!(
+            !self.cluster.gossip_listen_address.is_empty(),
+            "cluster.gossip_listen_address is required"
         );
         Ok(())
     }

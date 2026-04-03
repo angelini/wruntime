@@ -119,7 +119,7 @@ world {{MODULE_NAME}} {
   // Handler modules export incoming-handler:
   export wasi:http/incoming-handler@0.2.6;
 
-  // Runner modules: remove the export above and use wr_sdk::export_run! instead
+
 }
 ```
 
@@ -137,7 +137,7 @@ fn main() {
 }
 ```
 
-### For client/runner modules (WrClientGenerator)
+### For client modules (WrClientGenerator)
 
 ```rust
 fn main() {
@@ -195,34 +195,6 @@ impl proto::{{ServiceName}} for Component {
     fn {{method_name}}(&self, req: proto::{{MethodName}}Request) -> Result<proto::{{MethodName}}Response, ServiceError> {
         // Implementation here
         Ok(proto::{{MethodName}}Response { /* fields */ })
-    }
-}
-```
-
-## src/lib.rs — Runner module
-
-```rust
-#[allow(dead_code)]
-mod proto {
-    include!(concat!(env!("OUT_DIR"), "/{{PROTO_PACKAGE}}.rs"));
-}
-
-#[allow(dead_code, unused_imports)]
-mod bindings;
-
-use proto::{{ServiceName}}Client;
-
-struct Component;
-wr_sdk::export_run!(Component);
-
-impl wr_sdk::RunGuest for Component {
-    fn run() {
-        let client = {{ServiceName}}Client::new("{{NAMESPACE}}.{{TARGET_MODULE}}");
-
-        match client.{{method_name}}(proto::{{MethodName}}Request { /* fields */ }) {
-            Ok(resp) => wr_sdk::log::log(&format!("success: {:?}", resp)),
-            Err(e) => wr_sdk::log::log(&format!("error: {e}")),
-        }
     }
 }
 ```

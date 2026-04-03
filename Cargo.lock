@@ -511,6 +511,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "chitchat"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "735f8a51f68b353b17e351b38317433d6afcaa9cc04f4d0f6c9e9125c49c1efe"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "itertools",
+ "lru",
+ "rand 0.9.2",
+ "serde",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1363,6 +1382,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -1903,6 +1924,15 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "lru"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "227748d55f2f0ab4735d87fd623798cb6b664512fe979705f829c9f81c934465"
+dependencies = [
+ "hashbrown 0.15.5",
+]
 
 [[package]]
 name = "lru-slab"
@@ -3909,6 +3939,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -5487,6 +5518,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "deadpool-postgres",
  "libc",
  "prost",
  "prost-reflect",
@@ -5507,6 +5539,7 @@ name = "wr-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "deadpool-postgres",
  "http",
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -5515,7 +5548,10 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "prost",
+ "rand 0.9.2",
  "serde",
+ "tokio",
+ "tokio-postgres",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -5566,6 +5602,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "chitchat",
  "deadpool-postgres",
  "hex",
  "prost",
@@ -5576,6 +5613,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "wr-common",
 ]
 
@@ -5585,6 +5623,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "deadpool-postgres",
  "failsafe",
  "http",
  "http-body",
@@ -5592,11 +5631,13 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "prost",
  "rustls 0.23.37",
  "semver",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-postgres",
  "toml 0.8.23",
  "tonic",
  "tower",
@@ -5619,6 +5660,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "chitchat",
  "deadpool-postgres",
  "http",
  "http-body-util",
@@ -5636,6 +5678,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "uuid",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",

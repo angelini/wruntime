@@ -7,7 +7,6 @@ Choose the right pattern based on what your module needs to do.
 | Need | Type | Export Macro | build.rs Generator | Trait to Implement |
 |------|------|-------------|--------------------|--------------------|
 | Handle HTTP requests from other modules | Handler | `wr_sdk::export!` | `WrServiceGenerator` | `ServiceGuest` |
-| Call other modules (batch job, orchestrator) | Runner | `wr_sdk::export_run!` | `WrClientGenerator` | `RunGuest` |
 | Handle HTTP requests AND call other modules | Handler+Client | `wr_sdk::export!` | `WrCombinedGenerator` | `ServiceGuest` |
 
 ## Capabilities

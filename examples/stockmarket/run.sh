@@ -2,47 +2,21 @@
 # Run from the repo root: bash examples/stockmarket/run.sh
 # Prerequisites: cargo, cargo-component, rustup target add wasm32-wasip2,
 #                Postgres + RustFS S3 running. `just dev-up`
-set -euo pipefail
-
-INLINE=false
-for arg in "$@"; do
-    case "$arg" in
-        --inline) INLINE=true ;;
-    esac
-done
-
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-cd "$REPO_ROOT"
+source "$(dirname "$0")/../helpers.sh" "$@"
 
 # ── Kill stale processes from a previous run ─────────────────────────────
-./target/debug/wr-cli dev down 2>/dev/null || true
-for port in 9000 9001 9100 9101 9200; do
-    pid=$(lsof -ti ":$port" 2>/dev/null || true)
-    if [ -n "$pid" ]; then
-        echo "   killing stale process on :$port (pid $pid)"
-        kill -INT $pid 2>/dev/null || true
-    fi
-done
-sleep 1
+kill_stale_ports 9000 9001 9002 9010 9100 9101 9200
 
-DB_URL="${DB_URL:-${WRT_EXAMPLE_DB_URL:-postgres://postgres@localhost:5433/wruntime_example}}"
-S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:8900}"
-S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
-S3_SECRET_KEY="${S3_SECRET_KEY:-rustfsadmin}"
 echo "DB_URL: ${DB_URL}"
 echo "S3_ENDPOINT: ${S3_ENDPOINT}"
 
-# ── Tracing (OpenTelemetry → Grafana LGTM) ────────────────────────────────────
-export RUST_LOG="${RUST_LOG:-info}"
-
-# ── Substitute DB and S3 URLs into engine configs ─────────────────────────────
+# ── Substitute DB and S3 URLs into engine configs ────────────────────────
 update_config() {
     local file="$1"
-    sed -i.bak "s|postgres://user:pass@localhost:5432/stockmarket|${DB_URL}|g" "$file"
-    sed -i.bak "s|http://127.0.0.1:8900|${S3_ENDPOINT}|g" "$file"
-    sed -i.bak "s|access_key_id     = \"rustfsadmin\"|access_key_id     = \"${S3_ACCESS_KEY}\"|g" "$file"
-    sed -i.bak "s|secret_access_key = \"rustfsadmin\"|secret_access_key = \"${S3_SECRET_KEY}\"|g" "$file"
-    rm -f "${file}.bak"
+    sed_replace "$file" "postgres://user:pass@localhost:5432/stockmarket" "${DB_URL}"
+    sed_replace "$file" "http://127.0.0.1:8900" "${S3_ENDPOINT}"
+    sed_replace "$file" "access_key_id     = \"rustfsadmin\"" "access_key_id     = \"${S3_ACCESS_KEY}\""
+    sed_replace "$file" "secret_access_key = \"rustfsadmin\"" "secret_access_key = \"${S3_SECRET_KEY}\""
 }
 
 cp examples/stockmarket/engine-exchange.toml /tmp/sm-exchange.toml
@@ -50,48 +24,28 @@ cp examples/stockmarket/engine-ledger.toml /tmp/sm-ledger.toml
 update_config /tmp/sm-exchange.toml
 update_config /tmp/sm-ledger.toml
 
-cp examples/config/manager.toml /tmp/wr-manager.toml
-sed -i.bak "s|postgres://postgres@localhost:5433/wruntime_example|${DB_URL}|g" /tmp/wr-manager.toml
-rm -f /tmp/wr-manager.toml.bak
+# ── Prepare manager + proxy configs ──────────────────────────────────────
+MANAGER_CFG=$(prepare_manager_config)
+PROXY_CFG=$(prepare_proxy_config)
 
-# ── Create S3 bucket ──────────────────────────────────────────────────────────
-echo "==> Creating S3 bucket 'stockmarket'"
-AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${S3_SECRET_KEY}" \
-    aws --endpoint-url "${S3_ENDPOINT}" s3 mb s3://stockmarket 2>/dev/null || true
+# ── Create S3 bucket ─────────────────────────────────────────────────────
+create_s3_bucket stockmarket
 
-# ── Clean stale manager state ─────────────────────────────────────────────────
-echo "==> Cleaning manager state..."
-psql "${DB_URL}" -c "TRUNCATE wr_engines, wr_routing_rules, wr_schemas CASCADE" 2>/dev/null \
-    || echo "   (tables may not exist yet — first run)"
+# ── Clean stale manager state ────────────────────────────────────────────
+clean_manager_state
 
-# ── Start manager + proxy ─────────────────────────────────────────────────────
-echo "==> Starting manager + proxy..."
-./target/debug/wr-cli dev up \
-    --manager-config /tmp/wr-manager.toml \
-    --proxy-config examples/config/proxy.toml
+# ── Start manager + proxy ────────────────────────────────────────────────
+start_manager_proxy "$MANAGER_CFG" "$PROXY_CFG"
 
-# ── Deploy engines ────────────────────────────────────────────────────────────
-echo "==> Deploying exchange engine on :9100"
-./target/debug/wr-cli dev deploy /tmp/sm-exchange.toml --skip-build
+# ── Deploy engines ───────────────────────────────────────────────────────
+deploy_engine /tmp/sm-exchange.toml "exchange engine" 9100
+deploy_engine /tmp/sm-ledger.toml "ledger engine" 9101
+list_services
 
-echo "==> Deploying ledger engine on :9101"
-./target/debug/wr-cli dev deploy /tmp/sm-ledger.toml --skip-build
+deploy_engine examples/stockmarket/engine-simulator.toml "simulator engine" 9200
+list_services
 
-cargo run -p wr-cli -- engines list
-cargo run -p wr-cli -- services list
-
-echo "==> Deploying simulator engine on :9200"
-./target/debug/wr-cli dev deploy examples/stockmarket/engine-simulator.toml --skip-build
-
-cargo run -p wr-cli -- engines list
-cargo run -p wr-cli -- services list
-
-cleanup() {
-    echo "==> Shutting down..."
-    ./target/debug/wr-cli dev down
-}
-trap cleanup EXIT
-trap 'exit 0' INT TERM
+setup_cleanup_trap
 
 if [ "$INLINE" = true ]; then
     echo "==> Running simulator inline (10 traders, 20 orders each, 5 symbols)..."
@@ -130,5 +84,4 @@ Inspect metrics:
   cargo run -p wr-cli -- metrics summary
 USAGE
 
-# Block until Ctrl-C (no child PIDs to wait on — processes are managed by wr dev)
-while true; do sleep 60; done
+wait_forever

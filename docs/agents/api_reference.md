@@ -73,11 +73,6 @@ pub trait ServiceGuest {
     fn health_check() -> bool { true }
 }
 
-/// Trait for runner modules.
-pub trait RunGuest {
-    fn run();
-}
-
 /// Error type returned by generated service traits.
 pub struct ServiceError {
     pub status: u16,
@@ -98,8 +93,6 @@ Export macros:
 // Register T as wasi:http/incoming-handler (handler modules)
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
-// Register T::run() as the WASM run export (runner modules)
-wr_sdk::export_run!(Component);
 ```
 
 ## wruntime:db/database@0.4.0

@@ -4,3 +4,7 @@ engine_heartbeat_timeout_secs = 30
 [database]
 url             = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 10
+
+[cluster]
+cluster_id             = "default"
+gossip_listen_address  = "0.0.0.0:9010"

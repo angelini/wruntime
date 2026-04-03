@@ -4,5 +4,7 @@ pub mod wruntime {
     tonic::include_proto!("wruntime");
 }
 
+#[cfg(feature = "discovery")]
+pub mod discovery;
 pub mod node;
 pub mod telemetry;

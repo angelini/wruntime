@@ -44,18 +44,9 @@ The `healthy` field is managed entirely by the manager — it is always set to `
 
 | RPC | Description |
 |-----|-------------|
-| `UploadSchema` | Store a `FileDescriptorSet` for `(module, version)` |
 | `GetSchema` | Retrieve the stored schema bytes |
 
-Schemas are automatically uploaded when engines register (if `schema_path` is set in `engine.toml`). You can also push a schema independently:
-
-```bash
-grpcurl -plaintext -d "{
-  \"module\": \"inventory-service\",
-  \"version\": \"1.0.0\",
-  \"proto_schema\": \"$(base64 -i schemas/inventory_service.binpb)\"
-}" 127.0.0.1:9000 wruntime.ManagerService/UploadSchema
-```
+Schemas are automatically uploaded when engines register (if `schema_path` is set in `engine.toml`).
 
 ## Metrics (OpenTelemetry)
 

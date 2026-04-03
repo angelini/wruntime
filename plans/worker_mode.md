@@ -106,7 +106,6 @@ Add `ModuleMode` enum and worker-specific fields to `ModuleConfig`:
 pub enum ModuleMode {
     #[default]
     Service,
-    Run,
     Worker,
 }
 
@@ -265,9 +264,9 @@ The engine needs the DB pool passed to the server for these endpoints.
 
 ### 10. Codegen Worker Migration — `examples/codegen/worker/`
 
-Convert from run guest to service guest with worker mode:
-- **`wit/world.wit`**: Export `wasi:http/incoming-handler` instead of `run`
-- **`src/lib.rs`**: Replace `RunGuest::run()` polling loop with `ServiceGuest::handle()` + typed handlers via `WrServiceGenerator`. The handlers are identical to any service module — the engine delivers jobs as HTTP requests.
+Convert to service guest with worker mode:
+- **`wit/world.wit`**: Export `wasi:http/incoming-handler`
+- **`src/lib.rs`**: Use `ServiceGuest::handle()` + typed handlers via `WrServiceGenerator`. The handlers are identical to any service module — the engine delivers jobs as HTTP requests.
 - **`build.rs`**: Switch from `WrClientGenerator` to `WrServiceGenerator` (for the handler trait) + keep `WrClientGenerator` for outbound calls to collector/agent
 - **`engine.toml`**: Set `mode = "worker"`
 - **Coordinator changes**: The coordinator's `ClaimTask`/`UpdateTaskStatus` RPCs can be simplified — the engine handles job lifecycle. The coordinator still owns the external REST API for task creation, but submits jobs to the engine's `SubmitJob` endpoint instead of maintaining its own queue.

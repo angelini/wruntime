@@ -85,8 +85,6 @@ message ListSecretsResponse { repeated SecretEntry secrets = 1; }
 
 message GetSchemaRequest    { string module = 1; string version = 2; string namespace = 3; }
 message GetSchemaResponse   { bytes proto_schema = 1; }
-message UploadSchemaRequest { string module = 1; string version = 2; bytes proto_schema = 3; string namespace = 4; }
-message UploadSchemaResponse{}
 
 // ── Worker job queue ──────────────────────────────────────────────────────
 
@@ -117,6 +115,16 @@ message GetJobStatusResponse {
   int32  max_attempts  = 6;
 }
 
+// ── NodeService ──────────────────────────────────────────────────────────
+// Local gRPC service exposed by wr-proxy for engines on the same node.
+// Engines use this instead of connecting directly to wr-manager.
+
+service NodeService {
+  rpc RegisterEngine   (RegisterEngineRequest)   returns (RegisterEngineResponse);
+  rpc DeregisterEngine (DeregisterEngineRequest)  returns (DeregisterEngineResponse);
+  rpc Heartbeat        (HeartbeatRequest)          returns (HeartbeatResponse);
+}
+
 // ── ManagerService ────────────────────────────────────────────────────────
 
 service ManagerService {
@@ -133,7 +141,6 @@ service ManagerService {
 
   // Schemas
   rpc GetSchema         (GetSchemaRequest)         returns (GetSchemaResponse);
-  rpc UploadSchema      (UploadSchemaRequest)      returns (UploadSchemaResponse);
 
   // Secrets
   rpc SetSecret         (SetSecretRequest)         returns (SetSecretResponse);

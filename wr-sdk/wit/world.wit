@@ -1,7 +1,6 @@
 package wruntime:sdk@0.1.0;
 
-// Import-only world for SDK utilities. Does NOT export wasi:http/incoming-handler
-// so that linking into client-style modules (which export `run`) does not conflict.
+// Import-only world for SDK utilities. Does NOT export wasi:http/incoming-handler.
 // Each module's own cargo-component metadata declares its specific world and exports.
 world sdk {
     import wruntime:db/database@0.4.0;

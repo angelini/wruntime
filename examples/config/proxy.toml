@@ -1,8 +1,11 @@
 listen_address  = "0.0.0.0:9001"
-manager_address = "http://127.0.0.1:9000"
+control_address = "0.0.0.0:9002"
 
 [node]
 proxy_address = "http://127.0.0.1:9001"   # this proxy's own address, as reachable by peers
+
+[database]
+url = "postgres://postgres@localhost:5433/wruntime_example"
 
 [cache]
 routing_table_ttl_secs = 1

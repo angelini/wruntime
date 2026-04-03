@@ -114,14 +114,14 @@ mod proto { include!(concat!(env!("OUT_DIR"), "/echo.rs")); }
 use proto::EchoServiceClient;
 
 struct Component;
-wr_sdk::export_run!(Component);
+wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
-impl wr_sdk::RunGuest for Component {
-    fn run() {
+impl wr_sdk::ServiceGuest for Component {
+    fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         let client = EchoServiceClient::new("example.echo");
 
         match client.echo(proto::EchoRequest { message: "hello".into() }) {
-            Ok(resp) => wr_sdk::log::log(&format!("echo: {}", resp.message)),
+            Ok(resp) => wr_sdk::io::send_response(response_out, 200, resp.encode_to_vec()),
             Err(e)   => wr_sdk::log::log(&format!("error: {e}")),
         }
     }
