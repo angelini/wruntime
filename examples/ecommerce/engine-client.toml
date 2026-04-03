@@ -1,8 +1,8 @@
 listen_address  = "0.0.0.0:9200"
-manager_address = "http://127.0.0.1:9000"
 
 [node]
-proxy_address = "http://127.0.0.1:9001"
+proxy_address   = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
 
 # Three instances of the same client module — the proxy load-balances Run requests
 # across all three, so concurrent callers each land on a different WASM instance.

@@ -58,12 +58,6 @@ pub mod exports {
 /// Convenience re-export of the HTTP handler `ServiceGuest` trait.
 pub use exports::incoming_handler::ServiceGuest;
 
-/// Implement this trait and use `wr_sdk::export_run!` to register a runner module
-/// (one that exports `run` rather than `wasi:http/incoming-handler`).
-pub trait RunGuest {
-    fn run();
-}
-
 pub mod http;
 pub mod io;
 pub mod jobs;
@@ -130,28 +124,6 @@ macro_rules! export {
                 unsafe {
                     $crate::exports::incoming_handler::_export_handle_cabi::<$ty>(arg0, arg1)
                 }
-            }
-        };
-    };
-}
-
-/// Export macro for runner modules (those that export `run`).
-///
-/// Usage (in the module's `lib.rs`):
-/// ```rust,ignore
-/// struct MyComponent;
-/// wr_sdk::export_run!(MyComponent);
-/// impl wr_sdk::RunGuest for MyComponent { fn run() { ... } }
-/// ```
-#[macro_export]
-macro_rules! export_run {
-    ($ty:ident) => {
-        const _: () = {
-            #[unsafe(export_name = "run")]
-            unsafe extern "C" fn wr_sdk_export_run() {
-                #[cfg(target_arch = "wasm32")]
-                $crate::_rt::run_ctors_once();
-                <$ty as $crate::RunGuest>::run();
             }
         };
     };

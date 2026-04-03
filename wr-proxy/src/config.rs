@@ -6,10 +6,12 @@ use wr_common::node::NodeConfig;
 pub struct ProxyConfig {
     /// TCP address to listen on for inbound HTTP, e.g. "0.0.0.0:9001"
     pub listen_address: String,
-    /// gRPC address of wr-manager, e.g. "http://127.0.0.1:9000"
-    pub manager_address: String,
+    /// gRPC listen address for the NodeService control plane (engines connect here).
+    pub control_address: String,
     /// Node configuration — this proxy's own address as reachable by peer proxies.
     pub node: NodeConfig,
+    /// PostgreSQL connection for manager discovery via `wr_managers` table.
+    pub database: DatabaseConfig,
     #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
@@ -19,6 +21,19 @@ pub struct ProxyConfig {
     /// Optional egress allowlist — controls which external domains WASM modules may call.
     #[serde(default)]
     pub egress: Option<EgressConfig>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct DatabaseConfig {
+    /// `postgres://user:pass@host:port/dbname` connection string.
+    pub url: String,
+    /// Maximum number of pooled connections. Defaults to 2.
+    #[serde(default = "default_discovery_max_connections")]
+    pub max_connections: usize,
+}
+
+fn default_discovery_max_connections() -> usize {
+    2
 }
 
 /// Configuration for the external-facing HTTP listener.
@@ -55,7 +70,7 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            routing_table_ttl_secs: 5,
+            routing_table_ttl_secs: 2,
         }
     }
 }
@@ -103,9 +118,10 @@ impl ProxyConfig {
             "listen_address is required"
         );
         anyhow::ensure!(
-            !self.manager_address.is_empty(),
-            "manager_address is required"
+            !self.control_address.is_empty(),
+            "control_address is required"
         );
+        anyhow::ensure!(!self.database.url.is_empty(), "database.url is required");
         anyhow::ensure!(
             !self.node.proxy_address.is_empty(),
             "node.proxy_address is required"

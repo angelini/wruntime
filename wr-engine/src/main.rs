@@ -11,8 +11,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use wr_common::wruntime::{
-    manager_service_client::ManagerServiceClient, DeregisterEngineRequest, EngineRegistration,
-    HeartbeatRequest, ModuleDescriptor, RegisterEngineRequest, RoutingRule, SecretRequest,
+    node_service_client::NodeServiceClient, DeregisterEngineRequest, EngineRegistration,
+    HeartbeatRequest, ModuleDescriptor, RegisterEngineRequest, SecretRequest,
 };
 
 #[tokio::main]
@@ -76,8 +76,8 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── Connect to wr-manager ─────────────────────────────────────────────
-    let mut client = ManagerServiceClient::connect(config.manager_address.clone()).await?;
+    // ── Connect to proxy NodeService ───────────────────────────────────────
+    let mut client = NodeServiceClient::connect(config.node.control_address.clone()).await?;
 
     // Build module descriptors — only modules with a schema_path are registered
     // with the manager (runner modules without schemas are skipped).
@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
         })
         .await?
         .into_inner();
-    info!(address = %config.manager_address, engine_id, "registered with manager");
+    info!(address = %config.node.control_address, engine_id, "registered via proxy");
 
     // ── Resolve secrets into env vars per module ──────────────────────────
     // Build a lookup: (namespace, key) → plaintext value
@@ -165,39 +165,6 @@ async fn main() -> Result<()> {
         .await?;
     info!("all modules loaded");
 
-    // ── Upsert routing rules for every hosted module ──────────────────────
-    // Runner modules (no schema_path) are not externally HTTP-routable, so
-    // skip them. Worker modules need routing rules so submit_job calls from
-    // other modules can reach this engine via the proxy.
-    for module in &config.modules {
-        if module.schema_path.is_empty() {
-            continue;
-        }
-        client
-            .upsert_routing_rule(RoutingRule {
-                rule_id: format!(
-                    "{}/{}/{}/{}",
-                    engine_id, module.namespace, module.name, module.version
-                ),
-                source_module: String::new(),
-                source_namespace: String::new(),
-                destination_module: module.name.clone(),
-                destination_namespace: module.namespace.clone(),
-                destination_version: module.version.clone(),
-                engine_id: engine_id.clone(),
-                engine_address: advertise_address.clone(),
-                proxy_address: config.node.proxy_address.clone(),
-                healthy: false, // manager overrides to true on upsert
-            })
-            .await?;
-        info!(
-            namespace = %module.namespace,
-            module    = %module.name,
-            version   = %module.version,
-            "routing rule registered",
-        );
-    }
-
     // ── Heartbeat background task ─────────────────────────────────────────
     {
         let mut hb_client = client.clone();
@@ -206,7 +173,7 @@ async fn main() -> Result<()> {
         let hb_module_configs = config.modules.clone();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            let mut interval = tokio::time::interval(Duration::from_secs(3));
             loop {
                 interval.tick().await;
 
@@ -269,7 +236,7 @@ async fn main() -> Result<()> {
         })
         .await
     {
-        warn!(error = %e, "deregister failed (manager may be down)");
+        warn!(error = %e, "deregister failed (proxy may be down)");
     } else {
         info!(engine_id, "engine deregistered");
     }

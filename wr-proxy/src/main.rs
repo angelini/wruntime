@@ -1,23 +1,27 @@
 mod circuit_breaker;
-mod config;
+pub mod config;
 mod layers;
-mod routing;
+pub mod node_service;
+pub mod routing;
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use http::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
+use tonic::transport::Server;
 use tower::{Service, ServiceBuilder};
 
 use layers::{
     EgressLayer, ForwardService, IngressLayer, ProxyBody, ResBody, RoutingLayer, TracingLayer,
 };
 use tracing::{error, info, warn};
-use wr_common::wruntime::manager_service_client::ManagerServiceClient;
+use wr_common::discovery::ManagerDiscovery;
+use wr_common::wruntime::node_service_server::NodeServiceServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -37,13 +41,34 @@ async fn main() -> Result<()> {
         config.circuit_breaker.clone(),
     ));
 
-    // ── Connect to wr-manager ─────────────────────────────────────────────
-    let manager_client = ManagerServiceClient::connect(config.manager_address.clone()).await?;
-    info!(address = %config.manager_address, "connected to manager");
+    // ── Manager discovery via Postgres ────────────────────────────────────
+    let db_pool = {
+        let pg_config = deadpool_postgres::Config {
+            url: Some(config.database.url.clone()),
+            pool: Some(deadpool_postgres::PoolConfig {
+                max_size: config.database.max_connections,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        pg_config
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .context("failed to create discovery pool")?
+    };
+    let discovery = Arc::new(ManagerDiscovery::new(db_pool));
+    discovery.refresh().await;
+    discovery.spawn_refresh_task();
+    info!("manager discovery initialized");
 
     // ── Initial routing table sync (blocks until first fetch succeeds) ──
     {
-        let mut client = manager_client.clone();
+        let mut client = discovery
+            .get_client()
+            .await
+            .map_err(|e| anyhow::anyhow!("initial manager connect failed: {e}"))?;
         routing::sync_once(&mut client, &routing_table, &cb_registry)
             .await
             .context("initial routing table sync failed")?;
@@ -52,11 +77,26 @@ async fn main() -> Result<()> {
 
     // ── Background tasks ──────────────────────────────────────────────────
     tokio::spawn(routing::sync_routing_table(
-        manager_client.clone(),
+        discovery.clone(),
         routing_table.clone(),
         config.cache.routing_table_ttl_secs,
         cb_registry.clone(),
     ));
+
+    // ── NodeService gRPC control plane ───────────────────────────────────
+    let node_agent = Arc::new(node_service::NodeAgent::new(discovery));
+    node_agent.spawn_heartbeat_loop(Duration::from_secs(3));
+
+    let control_addr = config
+        .control_address
+        .parse()
+        .context("invalid control_address")?;
+    tokio::spawn(
+        Server::builder()
+            .add_service(NodeServiceServer::from_arc(node_agent))
+            .serve(control_addr),
+    );
+    info!(address = %config.control_address, "proxy control plane listening");
 
     // ── Internal Tower service stack ──────────────────────────────────────
     //

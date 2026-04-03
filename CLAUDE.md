@@ -57,7 +57,7 @@ After refactoring, always run `just tidy` and `just ecommerce-inline` to verify 
 - `module_template.md` — fill-in-the-blank skeleton for new modules
 - `api_reference.md` — exact function signatures for all guest-callable APIs (**must be kept in sync with code**)
 - `constraints.md` — hard rules and common mistakes
-- `decision_matrix.md` — choose handler vs. runner vs. combined
+- `decision_matrix.md` — choose handler vs. handler+client
 - `codegen.md` — proto-to-Rust code generation mapping
 - `examples.md` — index of real code in the repo
 

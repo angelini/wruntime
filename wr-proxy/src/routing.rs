@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 use tracing::{info, warn};
+use wr_common::discovery::ManagerDiscovery;
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, GetRoutingTableRequest, RoutingTable,
 };
@@ -19,8 +20,7 @@ pub fn new_routing_table() -> CachedRoutingTable {
     }))
 }
 
-/// Perform a single routing-table sync from wr-manager.  Returns `true` if
-/// the table was updated (or was already up-to-date).
+/// Perform a single routing-table sync from wr-manager.
 pub async fn sync_once(
     client: &mut ManagerServiceClient<tonic::transport::Channel>,
     table: &CachedRoutingTable,
@@ -44,10 +44,9 @@ pub async fn sync_once(
     Ok(())
 }
 
-/// Background task: polls wr-manager for the routing table and updates the
-/// local cache whenever the version number increments.
+/// Background task: polls a random manager for the routing table via discovery.
 pub async fn sync_routing_table(
-    mut client: ManagerServiceClient<tonic::transport::Channel>,
+    discovery: Arc<ManagerDiscovery>,
     table: CachedRoutingTable,
     ttl_secs: u64,
     cb_registry: Arc<CircuitBreakerRegistry>,
@@ -55,8 +54,15 @@ pub async fn sync_routing_table(
     let mut interval = tokio::time::interval(Duration::from_secs(ttl_secs));
     loop {
         interval.tick().await;
-        if let Err(e) = sync_once(&mut client, &table, &cb_registry).await {
-            warn!(error = %e, "routing table sync failed");
+        match discovery.get_client().await {
+            Ok(mut client) => {
+                if let Err(e) = sync_once(&mut client, &table, &cb_registry).await {
+                    warn!(error = %e, "routing table sync failed");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "routing table sync: all managers unreachable");
+            }
         }
     }
 }

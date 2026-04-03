@@ -20,5 +20,15 @@ opentelemetry-semantic-conventions = "0.31"
 opentelemetry-appender-tracing     = "0.31"
 opentelemetry-http                 = "0.31"
 
+# Optional: manager discovery via Postgres
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"], optional = true }
+tokio-postgres    = { version = "0.7", optional = true }
+tokio             = { version = "1", features = ["sync", "time", "rt"], optional = true }
+rand              = { version = "0.9", optional = true }
+
+[features]
+default = []
+discovery = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio", "dep:rand"]
+
 [build-dependencies]
 tonic-prost-build = "0.14"

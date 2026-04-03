@@ -4,7 +4,7 @@
 
 Two crates eliminate boilerplate from wruntime WASM modules:
 
-- **`wr-sdk`** — shared WASI helpers that every module links against: `http_rpc`, `read_body`, `send_response`, `err_body`, `log`, export macros, and the `ServiceGuest` / `RunGuest` traits.
+- **`wr-sdk`** — shared WASI helpers that every module links against: `http_rpc`, `read_body`, `send_response`, `err_body`, `log`, export macros, and the `ServiceGuest` trait.
 - **`wr-build`** — a `build.rs` library providing `prost-build` service generators that emit typed server traits/routers (`WrServiceGenerator`) and typed client structs (`WrClientGenerator`) from `.proto` files.
 
 ## Building a handler module (HTTP request/response)
@@ -95,78 +95,6 @@ pub fn inventory_service_router<T: InventoryService>(
 ) -> (u16, Vec<u8>) { /* decode → dispatch → encode */ }
 ```
 
-## Building a runner module (long-running task that calls other services)
-
-Add `wr-build` as a build dependency to get generated typed clients from your `.proto` file.
-
-`Cargo.toml`:
-
-```toml
-[dependencies]
-prost   = "0.13"
-wr-sdk  = { path = "../../wr-sdk" }
-
-[build-dependencies]
-prost-build = "0.13"
-wr-build    = { path = "../../wr-build" }
-
-[package.metadata.component]
-package = "wruntime:client"
-
-[package.metadata.component.target]
-world = "wruntime:client/client"
-```
-
-`build.rs`:
-
-```rust
-fn main() {
-    prost_build::Config::new()
-        .service_generator(Box::new(wr_build::WrClientGenerator))
-        .compile_protos(&["schemas/inventory_service.proto"], &["schemas"])
-        .unwrap();
-}
-```
-
-`WrClientGenerator` appends a typed `{ServiceName}Client` struct to the generated file. For a service `InventoryService` in package `inventory`, the generated client looks like:
-
-```rust
-pub struct InventoryServiceClient { authority: String }
-
-impl InventoryServiceClient {
-    pub fn new(authority: impl Into<String>) -> Self { ... }
-
-    pub fn get_items(&self, req: GetItemsRequest) -> Result<GetItemsResponse, String> { ... }
-    // one method per RPC; keyword names are escaped (e.g. r#return)
-}
-```
-
-`src/lib.rs`:
-
-```rust
-mod proto {
-    include!(concat!(env!("OUT_DIR"), "/inventory.rs"));
-}
-
-use proto::InventoryServiceClient;
-
-struct Component;
-wr_sdk::export_run!(Component);
-
-impl wr_sdk::RunGuest for Component {
-    fn run() {
-        wr_sdk::log::log("starting");
-
-        let client = InventoryServiceClient::new("ecommerce.inventory");
-
-        match client.get_items(proto::GetItemsRequest { category: "books".into() }) {
-            Ok(resp) => wr_sdk::log::log(&format!("items: {:?}", resp.items)),
-            Err(e)   => wr_sdk::log::log(&format!("error: {e}")),
-        }
-    }
-}
-```
-
 ## SDK reference
 
 | Item | Description |
@@ -177,9 +105,7 @@ impl wr_sdk::RunGuest for Component {
 | `wr_sdk::io::err_body(status, msg)` | Return `(status, {"error":"msg"})` |
 | `wr_sdk::log::log(msg)` | Write a line to WASI stderr |
 | `wr_sdk::export!(T with_types_in wr_sdk::bindings)` | Register `T` as the `wasi:http/incoming-handler` implementation |
-| `wr_sdk::export_run!(T)` | Register `T::run()` as the WASM `run` export |
 | `wr_sdk::ServiceGuest` | Trait for HTTP handler modules (`fn handle(request, response_out)`) |
-| `wr_sdk::RunGuest` | Trait for runner modules (`fn run()`) |
 | `wr_sdk::ServiceError` | Error type with `status` and `message`; constructors: `bad_request()`, `not_found()`, `conflict()`, `internal()` |
 
 ## Building the component

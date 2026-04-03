@@ -43,6 +43,19 @@ fn map_lock_err(e: tokio_postgres::Error) -> Status {
     }
 }
 
+/// Acquire the global routing-table lock, waiting if another transaction holds it.
+/// Used by the background monitor which can afford to block briefly.
+async fn acquire_global_lock_wait(txn: &deadpool_postgres::Transaction<'_>) -> Result<i64, Status> {
+    let row = txn
+        .query_one(
+            "SELECT version FROM wr_manager_lock WHERE id = 1 FOR UPDATE",
+            &[],
+        )
+        .await
+        .map_err(|e| Status::internal(format!("lock query failed: {e}")))?;
+    Ok(row.get(0))
+}
+
 fn internal(msg: impl std::fmt::Display) -> Status {
     Status::internal(msg.to_string())
 }
@@ -67,7 +80,8 @@ pub async fn upsert_engine_and_schemas(
            SET address = EXCLUDED.address,
                proxy_address = EXCLUDED.proxy_address,
                registration = EXCLUDED.registration,
-               updated_at = NOW()",
+               updated_at = NOW(),
+               last_heartbeat = NOW()",
         &[
             &reg.engine_id,
             &reg.address,
@@ -127,6 +141,86 @@ pub async fn deregister_engine(pool: &Pool, engine_id: &str) -> Result<(), Statu
 
     txn.commit().await.map_err(internal)?;
     Ok(())
+}
+
+/// Update an engine's heartbeat timestamp.
+pub async fn heartbeat_engine(pool: &Pool, engine_id: &str) -> Result<(), Status> {
+    let client = pool.get().await.map_err(internal)?;
+    let updated = client
+        .execute(
+            "UPDATE wr_engines SET last_heartbeat = NOW() WHERE engine_id = $1",
+            &[&engine_id],
+        )
+        .await
+        .map_err(internal)?;
+    if updated == 0 {
+        return Err(Status::not_found(format!(
+            "engine {engine_id} not registered"
+        )));
+    }
+    Ok(())
+}
+
+/// Batch-update rule health based on engine heartbeat timestamps.
+/// Finds stale engines (heartbeat older than `timeout_secs`) and marks their
+/// healthy rules unhealthy, and finds recovered engines and marks their
+/// unhealthy rules healthy.
+///
+/// The health UPDATEs run without the global lock (they are idempotent).
+/// The global lock is only acquired briefly to bump the routing table version
+/// when changes occurred.
+///
+/// Returns `(stale_rule_ids, recovered_rule_ids)`.
+pub async fn update_rule_health_from_heartbeats(
+    pool: &Pool,
+    timeout_secs: f64,
+) -> Result<(Vec<String>, Vec<String>), Status> {
+    let mut client = pool.get().await.map_err(internal)?;
+
+    // Mark stale engines' rules unhealthy (no lock needed — idempotent)
+    let stale_rows = client
+        .query(
+            "UPDATE wr_routing_rules SET healthy = FALSE, updated_at = NOW()
+             WHERE rule_id IN (
+                 SELECT r.rule_id FROM wr_routing_rules r
+                 JOIN wr_engines e ON r.engine_id = e.engine_id
+                 WHERE e.last_heartbeat < NOW() - make_interval(secs => $1::double precision)
+                   AND r.healthy = TRUE
+             )
+             RETURNING rule_id",
+            &[&timeout_secs],
+        )
+        .await
+        .map_err(internal)?;
+
+    // Mark recovered engines' rules healthy (no lock needed — idempotent)
+    let recovered_rows = client
+        .query(
+            "UPDATE wr_routing_rules SET healthy = TRUE, updated_at = NOW()
+             WHERE rule_id IN (
+                 SELECT r.rule_id FROM wr_routing_rules r
+                 JOIN wr_engines e ON r.engine_id = e.engine_id
+                 WHERE e.last_heartbeat >= NOW() - make_interval(secs => $1::double precision)
+                   AND r.healthy = FALSE
+             )
+             RETURNING rule_id",
+            &[&timeout_secs],
+        )
+        .await
+        .map_err(internal)?;
+
+    let stale: Vec<String> = stale_rows.iter().map(|r| r.get(0)).collect();
+    let recovered: Vec<String> = recovered_rows.iter().map(|r| r.get(0)).collect();
+
+    // Only acquire the lock briefly to bump the version
+    if !stale.is_empty() || !recovered.is_empty() {
+        let txn = client.transaction().await.map_err(internal)?;
+        acquire_global_lock_wait(&txn).await?;
+        increment_version(&txn).await?;
+        txn.commit().await.map_err(internal)?;
+    }
+
+    Ok((stale, recovered))
 }
 
 /// List all registered engines (decoded from protobuf BYTEA).
@@ -259,74 +353,7 @@ pub async fn get_routing_table(pool: &Pool) -> Result<RoutingTable, Status> {
     })
 }
 
-/// Mark all routing rules for an engine as unhealthy. Uses NOWAIT — on
-/// contention the caller should log a warning and retry on the next tick.
-pub async fn mark_rules_unhealthy_for_engine(pool: &Pool, engine_id: &str) -> Result<bool, Status> {
-    let mut client = pool.get().await.map_err(internal)?;
-    let txn = client.transaction().await.map_err(internal)?;
-
-    acquire_global_lock(&txn).await?;
-
-    let changed = txn
-        .execute(
-            "UPDATE wr_routing_rules SET healthy = FALSE, updated_at = NOW()
-             WHERE engine_id = $1 AND healthy = TRUE",
-            &[&engine_id],
-        )
-        .await
-        .map_err(internal)?;
-
-    if changed > 0 {
-        increment_version(&txn).await?;
-    }
-
-    txn.commit().await.map_err(internal)?;
-    Ok(changed > 0)
-}
-
-/// Update a single routing rule's health status. Uses NOWAIT.
-pub async fn set_rule_health(pool: &Pool, rule_id: &str, healthy: bool) -> Result<(), Status> {
-    let mut client = pool.get().await.map_err(internal)?;
-    let txn = client.transaction().await.map_err(internal)?;
-
-    acquire_global_lock(&txn).await?;
-
-    txn.execute(
-        "UPDATE wr_routing_rules SET healthy = $1, updated_at = NOW() WHERE rule_id = $2",
-        &[&healthy, &rule_id],
-    )
-    .await
-    .map_err(internal)?;
-
-    increment_version(&txn).await?;
-    txn.commit().await.map_err(internal)?;
-    Ok(())
-}
-
 // ── Schema operations ────────────────────────────────────────────────────────
-
-/// Upsert a schema (FileDescriptorSet bytes).
-pub async fn upsert_schema(
-    pool: &Pool,
-    namespace: &str,
-    module: &str,
-    version: &str,
-    data: &[u8],
-) -> Result<(), Status> {
-    let client = pool.get().await.map_err(internal)?;
-    client
-        .execute(
-            "INSERT INTO wr_schemas (namespace, module_name, version, proto_schema)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (namespace, module_name, version) DO UPDATE
-               SET proto_schema = EXCLUDED.proto_schema,
-                   updated_at = NOW()",
-            &[&namespace, &module, &version, &data],
-        )
-        .await
-        .map_err(internal)?;
-    Ok(())
-}
 
 // ── Secret operations ────────────────────────────────────────────────────────
 
@@ -415,6 +442,98 @@ pub async fn get_secrets(
         }
     }
     Ok(results)
+}
+
+// ── Manager registration ────────────────────────────────────────────────────
+
+/// A registered manager in the cluster.
+pub struct ManagerRecord {
+    pub manager_id: String,
+    pub grpc_address: String,
+    pub gossip_address: String,
+}
+
+/// Register (or re-register) this manager in the cluster.
+pub async fn register_manager(
+    pool: &Pool,
+    manager_id: &str,
+    grpc_address: &str,
+    gossip_address: &str,
+) -> Result<(), Status> {
+    let client = pool.get().await.map_err(internal)?;
+    client
+        .execute(
+            "INSERT INTO wr_managers (manager_id, grpc_address, gossip_address)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (manager_id) DO UPDATE
+               SET grpc_address = EXCLUDED.grpc_address,
+                   gossip_address = EXCLUDED.gossip_address,
+                   last_heartbeat = NOW()",
+            &[&manager_id, &grpc_address, &gossip_address],
+        )
+        .await
+        .map_err(internal)?;
+    Ok(())
+}
+
+/// Remove this manager from the cluster.
+pub async fn deregister_manager(pool: &Pool, manager_id: &str) -> Result<(), Status> {
+    let client = pool.get().await.map_err(internal)?;
+    client
+        .execute(
+            "DELETE FROM wr_managers WHERE manager_id = $1",
+            &[&manager_id],
+        )
+        .await
+        .map_err(internal)?;
+    Ok(())
+}
+
+/// List all managers that have heartbeated within the given threshold.
+pub async fn list_managers(pool: &Pool) -> Result<Vec<ManagerRecord>, Status> {
+    let client = pool.get().await.map_err(internal)?;
+    let rows = client
+        .query(
+            "SELECT manager_id, grpc_address, gossip_address FROM wr_managers
+             WHERE last_heartbeat > NOW() - INTERVAL '60 seconds'",
+            &[],
+        )
+        .await
+        .map_err(internal)?;
+    Ok(rows
+        .iter()
+        .map(|r| ManagerRecord {
+            manager_id: r.get(0),
+            grpc_address: r.get(1),
+            gossip_address: r.get(2),
+        })
+        .collect())
+}
+
+/// Update this manager's heartbeat timestamp.
+pub async fn heartbeat_manager(pool: &Pool, manager_id: &str) -> Result<(), Status> {
+    let client = pool.get().await.map_err(internal)?;
+    client
+        .execute(
+            "UPDATE wr_managers SET last_heartbeat = NOW() WHERE manager_id = $1",
+            &[&manager_id],
+        )
+        .await
+        .map_err(internal)?;
+    Ok(())
+}
+
+/// Remove managers that haven't heartbeated within the threshold. Returns count deleted.
+pub async fn cleanup_stale_managers(pool: &Pool, stale_threshold_secs: i64) -> Result<u64, Status> {
+    let client = pool.get().await.map_err(internal)?;
+    let deleted = client
+        .execute(
+            "DELETE FROM wr_managers WHERE last_heartbeat < NOW() - make_interval(secs => $1::double precision)",
+            &[&(stale_threshold_secs as f64)],
+        )
+        .await
+        .map_err(internal)?;
+    Ok(deleted)
 }
 
 /// Get a schema by (namespace, module, version).

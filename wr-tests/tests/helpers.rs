@@ -38,7 +38,7 @@ use wr_common::wruntime::{
 };
 use wr_engine::blobstore::BlobstoreRuntime;
 use wr_engine::config::BlobstoreConfig;
-use wr_manager::{service::Manager, state::new_state};
+use wr_manager::service::Manager;
 
 // Re-export DB types so tests using `helpers::*` need no local `use` statements.
 pub use wr_engine::db::wruntime::db::database::{DbError, Host as DbHost, PgValue};
@@ -131,11 +131,7 @@ pub async fn start_manager(pool: deadpool_postgres::Pool) -> Result<String> {
     );
     tokio::spawn(
         Server::builder()
-            .add_service(ManagerServiceServer::new(Manager::new(
-                new_state(),
-                pool,
-                crypto,
-            )))
+            .add_service(ManagerServiceServer::new(Manager::new(pool, crypto)))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
     );
     Ok(format!("http://{addr}"))
@@ -692,13 +688,12 @@ pub async fn start_proxy_with_cb(
 // ── Manager with heartbeat monitor ──────────────────────────────────────────
 
 /// Start an in-process wr-manager that also runs the heartbeat monitor background
-/// task.  `timeout_secs` controls how long before a module is marked unhealthy.
-/// Returns the gRPC address and the shared state handle for assertions.
+/// task.  `timeout_secs` controls how long before an engine is marked unhealthy.
+/// Returns the gRPC address.
 pub async fn start_manager_with_monitor(
     pool: deadpool_postgres::Pool,
     timeout_secs: u64,
-) -> Result<(String, wr_manager::state::SharedState)> {
-    let state = new_state();
+) -> Result<String> {
     let crypto = std::sync::Arc::new(
         wr_manager::crypto::SecretCrypto::from_hex(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -710,19 +705,117 @@ pub async fn start_manager_with_monitor(
     tokio::spawn(
         Server::builder()
             .add_service(ManagerServiceServer::new(Manager::new(
-                state.clone(),
                 pool.clone(),
                 crypto,
             )))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
     );
     tokio::spawn(wr_manager::state::monitor_heartbeats(
-        state.clone(),
         pool,
         timeout_secs,
         std::time::Duration::from_millis(200),
     ));
-    Ok((format!("http://{addr}"), state))
+    Ok(format!("http://{addr}"))
+}
+
+/// Backdate an engine's heartbeat in the database for testing health timeout.
+pub async fn backdate_engine_heartbeat(
+    pool: &deadpool_postgres::Pool,
+    engine_id: &str,
+    secs_ago: i64,
+) {
+    let client = pool.get().await.unwrap();
+    client
+        .execute(
+            "UPDATE wr_engines SET last_heartbeat = NOW() - make_interval(secs => $1::double precision) WHERE engine_id = $2",
+            &[&(secs_ago as f64), &engine_id],
+        )
+        .await
+        .unwrap();
+}
+
+// ── Manager cluster ──────────────────────────────────────────────────────────
+
+/// A running manager instance in a cluster.
+pub struct ClusteredManager {
+    /// gRPC address of this manager.
+    pub addr: String,
+}
+
+/// Start `count` managers with chitchat gossip, all sharing the same Postgres.
+/// Chitchat is used only for manager liveness — engine heartbeats are in Postgres.
+pub async fn start_manager_cluster(
+    pool: deadpool_postgres::Pool,
+    count: usize,
+    heartbeat_timeout_secs: u64,
+) -> Result<Vec<ClusteredManager>> {
+    let mut managers = Vec::with_capacity(count);
+    let mut gossip_addrs: Vec<String> = Vec::new();
+
+    for _ in 0..count {
+        let manager_id = uuid::Uuid::new_v4().to_string();
+
+        // Bind gRPC listener
+        let grpc_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let grpc_addr = grpc_listener.local_addr()?;
+        let grpc_url = format!("http://{grpc_addr}");
+
+        // Bind gossip UDP port (pick a free TCP port and use it for UDP)
+        let gossip_port = {
+            let tmp = TcpListener::bind("127.0.0.1:0").await?;
+            tmp.local_addr()?.port()
+        };
+        let gossip_listen: std::net::SocketAddr = format!("127.0.0.1:{gossip_port}").parse()?;
+        let gossip_addr_str = gossip_listen.to_string();
+
+        // Register in wr_managers
+        wr_manager::db::register_manager(&pool, &manager_id, &grpc_url, &gossip_addr_str)
+            .await
+            .map_err(|e| anyhow::anyhow!("register_manager: {e}"))?;
+
+        // Bootstrap chitchat for manager liveness (no application keys)
+        let _cluster = Arc::new(
+            wr_manager::cluster::ClusterHandle::new(
+                &manager_id,
+                "test-cluster",
+                gossip_listen,
+                gossip_addrs.clone(),
+                std::time::Duration::from_millis(100),
+            )
+            .await?,
+        );
+
+        gossip_addrs.push(gossip_addr_str);
+
+        let crypto = Arc::new(
+            wr_manager::crypto::SecretCrypto::from_hex(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key"),
+        );
+
+        let manager = Manager::new(pool.clone(), crypto);
+
+        // Start gRPC server
+        tokio::spawn(
+            Server::builder()
+                .add_service(ManagerServiceServer::new(manager))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                    grpc_listener,
+                )),
+        );
+
+        // Start heartbeat monitor (reads Postgres, no gossip)
+        tokio::spawn(wr_manager::state::monitor_heartbeats(
+            pool.clone(),
+            heartbeat_timeout_secs,
+            std::time::Duration::from_millis(200),
+        ));
+
+        managers.push(ClusteredManager { addr: grpc_url });
+    }
+
+    Ok(managers)
 }
 
 // ── Schema fixtures ───────────────────────────────────────────────────────────

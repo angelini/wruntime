@@ -1,8 +1,8 @@
 listen_address  = "0.0.0.0:9100"
-manager_address = "http://127.0.0.1:9000"
 
 [node]
-proxy_address = "http://127.0.0.1:9001"
+proxy_address   = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
 
 [database]
 url             = "postgres://postgres@localhost:5433/wruntime_example"

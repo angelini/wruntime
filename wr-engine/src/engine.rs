@@ -8,7 +8,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
-use tracing::{error, info, warn, Instrument};
+use tracing::{info, warn, Instrument};
 use wasmtime::component::{Component, Linker};
 use wasmtime::Store;
 use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig};
@@ -248,120 +248,75 @@ impl EngineRunner {
             None
         };
 
-        match module_config.mode {
-            ModuleMode::Run => {
-                let state = ModuleState::new(
-                    module_name.clone(),
-                    module_namespace.clone(),
-                    proxy_uri,
-                    http_client,
-                    ModuleServices {
-                        db_pool,
-                        db_schema,
-                        blobstore,
-                        blob_prefix,
-                        env_vars,
-                        llm,
-                        fs: module_config.fs.clone(),
-                        active_span: tracing::Span::current(),
-                    },
-                )?;
-                let mut store = Store::new(&self.engine, state);
-                let instance = linker.instantiate_async(&mut store, &component).await?;
+        let pre = ProxyPre::new(linker.instantiate_pre(&component)?).map_err(|e| {
+            let mode_str = if module_config.mode == ModuleMode::Worker {
+                "worker"
+            } else {
+                "service"
+            };
+            anyhow::anyhow!(
+                "module '{}' (mode {mode_str}) must export wasi:http/incoming-handler: {e}",
+                module_config.name,
+            )
+        })?;
+        let pre = Arc::new(pre);
 
-                let mn = module_name.clone();
-                tokio::spawn(async move {
-                    match instance.get_func(&mut store, "run") {
-                        Some(func) => {
-                            info!(module = %mn, "starting runner module");
-                            if let Err(e) = func.call_async(&mut store, &[], &mut []).await {
-                                error!(module = %mn, error = %e, "runner module exited with error");
-                            } else {
-                                info!(module = %mn, "runner module exited cleanly");
-                            }
-                        }
-                        None => {
-                            info!(module = %mn, "no `run` export, module is idle");
-                            std::future::pending::<()>().await;
-                        }
-                    }
-                });
-            }
+        let (tx, rx) = mpsc::channel::<InboundRequest>(module_config.channel_capacity);
+        registry
+            .register(
+                module_namespace.clone(),
+                module_name.clone(),
+                module_version.clone(),
+                tx.clone(),
+            )
+            .await;
 
-            ModuleMode::Service | ModuleMode::Worker => {
-                let pre = ProxyPre::new(linker.instantiate_pre(&component)?).map_err(|e| {
-                    let mode_str = if module_config.mode == ModuleMode::Worker {
-                        "worker"
-                    } else {
-                        "service"
-                    };
-                    anyhow::anyhow!(
-                        "module '{}' (mode {mode_str}) must export wasi:http/incoming-handler: {e}",
-                        module_config.name,
-                    )
-                })?;
-                let pre = Arc::new(pre);
+        let handler = HandlerContext {
+            engine: self.engine.clone(),
+            pre,
+            instance_semaphore: self.instance_semaphore.clone(),
+        };
+        let module = ModuleContext {
+            name: module_name.clone(),
+            namespace: module_namespace.clone(),
+            proxy_uri: proxy_uri.clone(),
+            http_client: http_client.clone(),
+            db_pool: db_pool.clone(),
+            db_schema: db_schema.clone(),
+            blobstore,
+            blob_prefix,
+            llm,
+            fs: module_config.fs.clone(),
+            env_vars: env_vars.clone(),
+            request_timeout: Duration::from_secs(module_config.request_timeout_secs),
+        };
+        tokio::spawn(http_handler_task(handler, module, rx));
 
-                let (tx, rx) = mpsc::channel::<InboundRequest>(module_config.channel_capacity);
-                registry
-                    .register(
-                        module_namespace.clone(),
-                        module_name.clone(),
-                        module_version.clone(),
-                        tx.clone(),
-                    )
-                    .await;
-
-                let handler = HandlerContext {
-                    engine: self.engine.clone(),
-                    pre,
-                    instance_semaphore: self.instance_semaphore.clone(),
-                };
-                let module = ModuleContext {
-                    name: module_name.clone(),
+        // For worker mode, also spawn the worker pool that pulls jobs from
+        // the Postgres queue and dispatches them as HTTP requests.
+        if module_config.mode == ModuleMode::Worker {
+            let admin_pool = self.db_pool.clone().expect("worker mode requires database");
+            let db_url = self
+                .config
+                .database
+                .as_ref()
+                .expect("worker mode requires database")
+                .url
+                .clone();
+            wr_engine::worker::spawn_worker_pool(
+                admin_pool,
+                wr_engine::worker::WorkerPoolConfig {
                     namespace: module_namespace.clone(),
-                    proxy_uri: proxy_uri.clone(),
-                    http_client: http_client.clone(),
-                    db_pool: db_pool.clone(),
-                    db_schema: db_schema.clone(),
-                    blobstore,
-                    blob_prefix,
-                    llm,
-                    fs: module_config.fs.clone(),
-                    env_vars: env_vars.clone(),
-                    request_timeout: Duration::from_secs(module_config.request_timeout_secs),
-                };
-                tokio::spawn(http_handler_task(handler, module, rx));
-
-                // For worker mode, also spawn the worker pool that pulls jobs from
-                // the Postgres queue and dispatches them as HTTP requests.
-                if module_config.mode == ModuleMode::Worker {
-                    let admin_pool = self.db_pool.clone().expect("worker mode requires database");
-                    let db_url = self
-                        .config
-                        .database
-                        .as_ref()
-                        .expect("worker mode requires database")
-                        .url
-                        .clone();
-                    wr_engine::worker::spawn_worker_pool(
-                        admin_pool,
-                        wr_engine::worker::WorkerPoolConfig {
-                            namespace: module_namespace.clone(),
-                            name: module_name.clone(),
-                            version: module_version.clone(),
-                            engine_id: engine_id.to_string(),
-                            concurrency: module_config.worker_concurrency,
-                            poll_interval: Duration::from_secs(
-                                module_config.worker_poll_interval_secs,
-                            ),
-                            job_timeout: Duration::from_secs(module_config.worker_job_timeout_secs),
-                            database_url: db_url,
-                        },
-                        tx,
-                    );
-                }
-            }
+                    name: module_name.clone(),
+                    version: module_version.clone(),
+                    engine_id: engine_id.to_string(),
+                    concurrency: module_config.worker_concurrency,
+                    poll_interval: Duration::from_secs(module_config.worker_poll_interval_secs),
+                    job_timeout: Duration::from_secs(module_config.worker_job_timeout_secs),
+                    database_url: db_url,
+                },
+                tx,
+            );
         }
 
         info!(module = %module_config.name, "module spawned");

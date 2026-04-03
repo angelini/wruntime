@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use deadpool_postgres::Pool;
 use tonic::{Request, Response, Status};
@@ -13,26 +12,20 @@ use wr_common::wruntime::{
     HeartbeatRequest, HeartbeatResponse, ListEnginesRequest, ListEnginesResponse,
     ListSecretsRequest, ListSecretsResponse, NamespaceSecrets, RegisterEngineRequest,
     RegisterEngineResponse, RoutingRule, SecretEntry, SetSecretRequest, SetSecretResponse,
-    UploadSchemaRequest, UploadSchemaResponse, UpsertRoutingRuleResponse,
+    UpsertRoutingRuleResponse,
 };
 
 use crate::crypto::SecretCrypto;
 use crate::db;
-use crate::state::SharedState;
 
 pub struct Manager {
-    state: SharedState,
     pool: Pool,
     crypto: Arc<SecretCrypto>,
 }
 
 impl Manager {
-    pub fn new(state: SharedState, pool: Pool, crypto: Arc<SecretCrypto>) -> Self {
-        Self {
-            state,
-            pool,
-            crypto,
-        }
+    pub fn new(pool: Pool, crypto: Arc<SecretCrypto>) -> Self {
+        Self { pool, crypto }
     }
 }
 
@@ -71,23 +64,8 @@ impl ManagerService for Manager {
 
         let engine_id = reg.engine_id.clone();
 
-        // Persist to DB
+        // Persist to DB (sets last_heartbeat = NOW() via column default / ON CONFLICT)
         db::upsert_engine_and_schemas(&self.pool, &reg).await?;
-
-        // Update ephemeral state
-        let mut state = self.state.write().await;
-        for module in &reg.modules {
-            state.module_health.insert(
-                (
-                    engine_id.clone(),
-                    module.namespace.clone(),
-                    module.name.clone(),
-                    module.version.clone(),
-                ),
-                Instant::now(),
-            );
-        }
-        state.heartbeats.insert(engine_id.clone(), Instant::now());
 
         // Resolve requested secrets
         let secrets = if reg.secrets.is_empty() {
@@ -152,13 +130,6 @@ impl ManagerService for Manager {
         // Persist to DB (marks rules unhealthy, deletes engine)
         db::deregister_engine(&self.pool, &engine_id).await?;
 
-        // Clean up ephemeral state
-        let mut state = self.state.write().await;
-        state.heartbeats.remove(&engine_id);
-        state
-            .module_health
-            .retain(|(eid, _, _, _), _| eid != &engine_id);
-
         info!(engine_id, "engine deregistered");
         Ok(Response::new(DeregisterEngineResponse {}))
     }
@@ -167,25 +138,8 @@ impl ManagerService for Manager {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        let req = request.into_inner();
-        let engine_id = req.engine_id;
-        let now = Instant::now();
-        let mut state = self.state.write().await;
-
-        state.heartbeats.insert(engine_id.clone(), now);
-
-        for module in &req.healthy_modules {
-            state.module_health.insert(
-                (
-                    engine_id.clone(),
-                    module.namespace.clone(),
-                    module.name.clone(),
-                    module.version.clone(),
-                ),
-                now,
-            );
-        }
-
+        let engine_id = request.into_inner().engine_id;
+        db::heartbeat_engine(&self.pool, &engine_id).await?;
         Ok(Response::new(HeartbeatResponse {}))
     }
 
@@ -263,31 +217,6 @@ impl ManagerService for Manager {
         let proto_schema =
             db::get_schema(&self.pool, &req.namespace, &req.module, &req.version).await?;
         Ok(Response::new(GetSchemaResponse { proto_schema }))
-    }
-
-    async fn upload_schema(
-        &self,
-        request: Request<UploadSchemaRequest>,
-    ) -> Result<Response<UploadSchemaResponse>, Status> {
-        let req = request.into_inner();
-
-        if req.module.is_empty() || req.version.is_empty() || req.namespace.is_empty() {
-            return Err(Status::invalid_argument(
-                "namespace, module, and version are required",
-            ));
-        }
-
-        db::upsert_schema(
-            &self.pool,
-            &req.namespace,
-            &req.module,
-            &req.version,
-            &req.proto_schema,
-        )
-        .await?;
-
-        info!(namespace = %req.namespace, module = %req.module, version = %req.version, "schema stored");
-        Ok(Response::new(UploadSchemaResponse {}))
     }
 
     // ── Secrets ──────────────────────────────────────────────────────────
