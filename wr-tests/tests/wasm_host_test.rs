@@ -945,7 +945,7 @@ async fn wasm_http_egress() -> Result<()> {
         "http-test".into(),
         "test-ns".into(),
         proxy_uri,
-        http_client(),
+        http_pool(),
         ModuleServices::default(),
     )?;
 

@@ -100,12 +100,9 @@ mod tests {
         "http://127.0.0.1:9001".parse().unwrap()
     }
 
-    fn test_http_client() -> hyper_util::client::legacy::Client<
-        hyper_util::client::legacy::connect::HttpConnector,
-        http_body_util::Full<bytes::Bytes>,
-    > {
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http()
+    fn test_http_pool() -> wr_common::http_pool::HttpClientPool<http_body_util::Full<bytes::Bytes>>
+    {
+        wr_common::http_pool::HttpClientPool::new(1)
     }
 
     #[test]
@@ -114,7 +111,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
-            test_http_client(),
+            test_http_pool(),
             Default::default(),
         )
         .expect("state");
@@ -128,7 +125,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
-            test_http_client(),
+            test_http_pool(),
             Default::default(),
         )
         .expect("state");
@@ -149,7 +146,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
-            test_http_client(),
+            test_http_pool(),
             Default::default(),
         )
         .expect("state");
@@ -170,7 +167,7 @@ mod tests {
             "test".into(),
             "test".into(),
             proxy_uri(),
-            test_http_client(),
+            test_http_pool(),
             Default::default(),
         )
         .expect("state");

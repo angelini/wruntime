@@ -12,7 +12,7 @@ fn test_tracing_span_start_and_drop() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
-        http_client(),
+        http_pool(),
         Default::default(),
     )
     .expect("ModuleState");
@@ -29,7 +29,7 @@ fn test_tracing_span_set_attribute() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
-        http_client(),
+        http_pool(),
         Default::default(),
     )
     .expect("ModuleState");
@@ -53,7 +53,7 @@ fn test_tracing_span_record_event() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
-        http_client(),
+        http_pool(),
         Default::default(),
     )
     .expect("ModuleState");
@@ -77,7 +77,7 @@ fn test_tracing_span_set_error() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
-        http_client(),
+        http_pool(),
         Default::default(),
     )
     .expect("ModuleState");

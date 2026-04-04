@@ -6,7 +6,6 @@ use crate::llm::LlmRuntime;
 use deadpool_postgres::Pool;
 use http_body_util::{BodyExt, Full};
 use hyper::header::{HeaderName, HeaderValue};
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use tempfile::TempDir;
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -20,6 +19,7 @@ use wasmtime_wasi_http::{
     },
     WasiHttpCtx,
 };
+use wr_common::http_pool::HttpClientPool;
 
 /// Hooks that intercept every outbound HTTP request from a WASM module.
 ///
@@ -27,14 +27,15 @@ use wasmtime_wasi_http::{
 ///   wr-proxy can route the request to the correct engine.
 /// - Tags the request with `x-wr-source` for metrics attribution.
 /// - Rewrites the URI to point at wr-proxy.
-/// - Uses a shared, connection-pooled HTTP client to avoid ephemeral port
-///   exhaustion under load (`EADDRNOTAVAIL` / DnsError).
+/// - Uses a shared pool of HTTP/2 clients to spread outbound requests
+///   across multiple TCP connections, avoiding single-connection
+///   bottlenecks (frame contention, TCP HoL blocking).
 struct ModuleHttpHooks {
     proxy_uri: hyper::Uri,
     module_name: String,
     module_namespace: String,
-    /// Shared across all requests for this module instance.
-    http_client: Client<HttpConnector, Full<bytes::Bytes>>,
+    /// Pool of HTTP/2 clients — round-robin across multiple connections.
+    http_pool: HttpClientPool<Full<bytes::Bytes>>,
 }
 
 impl WasiHttpHooks for ModuleHttpHooks {
@@ -78,7 +79,7 @@ impl WasiHttpHooks for ModuleHttpHooks {
         );
         *request.uri_mut() = new_uri;
 
-        let client = self.http_client.clone();
+        let client = self.http_pool.get().clone();
         let between_bytes_timeout = config.between_bytes_timeout;
 
         let handle = wasmtime_wasi::runtime::spawn(async move {
@@ -212,7 +213,7 @@ impl ModuleState {
         module_name: String,
         module_namespace: String,
         proxy_uri: hyper::Uri,
-        http_client: Client<HttpConnector, Full<bytes::Bytes>>,
+        http_pool: HttpClientPool<Full<bytes::Bytes>>,
         services: ModuleServices,
     ) -> anyhow::Result<Self> {
         let mut builder = WasiCtxBuilder::new();
@@ -236,7 +237,7 @@ impl ModuleState {
                 proxy_uri,
                 module_name,
                 module_namespace,
-                http_client,
+                http_pool,
             },
             db_pool: services.db_pool,
             db_schema: services.db_schema,

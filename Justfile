@@ -1,5 +1,7 @@
 # wruntime Justfile — common development tasks
 
+export RUST_BACKTRACE := "1"
+
 # Default: list available recipes
 default:
     @just --list

@@ -4,29 +4,23 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use http::Request;
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
-use hyper_util::rt::TokioExecutor;
 use tower::Service;
 use tracing::{info_span, warn, Instrument};
+use wr_common::http_pool::{HttpClientPool, DEFAULT_POOL_SIZE};
 
 use super::{Destination, ProxyBody, ResBody, ResolvedDestination};
 use crate::circuit_breaker::CircuitBreakerRegistry;
 
 #[derive(Clone)]
 pub struct ForwardService {
-    client: Client<HttpConnector, ProxyBody>,
+    pool: HttpClientPool<ProxyBody>,
     cb_registry: Arc<CircuitBreakerRegistry>,
 }
 
 impl ForwardService {
     pub fn new(cb_registry: Arc<CircuitBreakerRegistry>) -> Self {
-        let client = Client::builder(TokioExecutor::new())
-            .http2_only(true)
-            .build_http();
-        Self {
-            client,
-            cb_registry,
-        }
+        let pool = HttpClientPool::new(DEFAULT_POOL_SIZE);
+        Self { pool, cb_registry }
     }
 }
 
@@ -40,7 +34,7 @@ impl Service<Request<ProxyBody>> for ForwardService {
     }
 
     fn call(&mut self, mut req: Request<ProxyBody>) -> Self::Future {
-        let client = self.client.clone();
+        let client = self.pool.get().clone();
         let cb_registry = self.cb_registry.clone();
 
         Box::pin(async move {

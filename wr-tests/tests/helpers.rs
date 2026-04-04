@@ -488,6 +488,11 @@ pub fn http_client() -> hyper_util::client::legacy::Client<
         .build_http::<Full<Bytes>>()
 }
 
+/// Pool of HTTP/2 clients for WASM module outbound requests.
+pub fn http_pool() -> wr_common::http_pool::HttpClientPool<Full<Bytes>> {
+    wr_common::http_pool::HttpClientPool::new(wr_common::http_pool::DEFAULT_POOL_SIZE)
+}
+
 // ── Stub engines ──────────────────────────────────────────────────────────────
 
 /// A minimal stub engine: echoes the request path in the response body.
@@ -884,7 +889,7 @@ pub fn db_state(pool_size: usize) -> ModuleState {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
-        http_client(),
+        http_pool(),
         ModuleServices {
             db_pool: Some(pool),
             ..Default::default()
@@ -904,16 +909,25 @@ pub async fn db_state_for_module(pool_size: usize, namespace: &str, name: &str) 
         .get()
         .await
         .expect("get connection for schema provisioning");
-    client
+    if let Err(e) = client
         .simple_query(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
         .await
-        .expect("provision schema");
+    {
+        // Ignore unique_violation (23505) — a concurrent test may have created
+        // the schema between our IF NOT EXISTS check and the actual CREATE.
+        let is_duplicate = e
+            .as_db_error()
+            .map_or(false, |db| db.code().code() == "23505");
+        if !is_duplicate {
+            panic!("provision schema: {e}");
+        }
+    }
     drop(client);
     ModuleState::new(
         name.into(),
         namespace.into(),
         "http://127.0.0.1:9001".parse().unwrap(),
-        http_client(),
+        http_pool(),
         ModuleServices {
             db_pool: Some(pool),
             db_schema: Some(Arc::from(schema)),
@@ -1051,7 +1065,7 @@ async fn wasm_engine_serve(
     module_name: String,
     module_namespace: String,
 ) {
-    let client = http_client();
+    let pool = http_pool();
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             break;
@@ -1061,7 +1075,7 @@ async fn wasm_engine_serve(
         let proxy_uri = proxy_uri.clone();
         let module_name = module_name.clone();
         let module_namespace = module_namespace.clone();
-        let client = client.clone();
+        let pool = pool.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
@@ -1070,7 +1084,7 @@ async fn wasm_engine_serve(
                 let proxy_uri = proxy_uri.clone();
                 let module_name = module_name.clone();
                 let module_namespace = module_namespace.clone();
-                let client = client.clone();
+                let pool = pool.clone();
                 async move {
                     // Collect the body on this stream, then spawn the
                     // CPU-heavy WASM work onto a separate tokio task so
@@ -1089,7 +1103,7 @@ async fn wasm_engine_serve(
                             module_name,
                             module_namespace,
                             proxy_uri,
-                            client,
+                            pool,
                             ModuleServices::default(),
                         )
                         .expect("ModuleState");
@@ -1140,7 +1154,7 @@ pub fn blobstore_state(blobstore: Arc<BlobstoreRuntime>) -> ModuleState {
         "blobstore-test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
-        http_client(),
+        http_pool(),
         ModuleServices {
             blobstore: Some(blobstore),
             ..Default::default()
@@ -1155,7 +1169,7 @@ pub fn tracing_state() -> ModuleState {
         "tracing-test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
-        http_client(),
+        http_pool(),
         ModuleServices::default(),
     )
     .expect("ModuleState")
@@ -1344,7 +1358,7 @@ pub fn llm_state(llm: Arc<LlmRuntime>) -> ModuleState {
         "llm-test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
-        http_client(),
+        http_pool(),
         ModuleServices {
             llm: Some(llm),
             ..Default::default()

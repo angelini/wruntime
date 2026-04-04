@@ -99,7 +99,7 @@ async fn test_db_query_without_pool_returns_connection_error() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
-        http_client(),
+        http_pool(),
         Default::default(),
     )
     .expect("ModuleState");
@@ -116,7 +116,7 @@ async fn test_db_execute_without_pool_returns_connection_error() {
         "test".into(),
         "test-ns".into(),
         "http://127.0.0.1:9001".parse().unwrap(),
-        http_client(),
+        http_pool(),
         Default::default(),
     )
     .expect("ModuleState");

@@ -49,11 +49,26 @@ fn print_latency_stats(label: &str, latencies: &mut [Duration]) {
     eprintln!("\n=== {label} ({} iterations) ===", latencies.len());
     eprintln!("  throughput: {:>10.1} req/s", n / total.as_secs_f64());
     eprintln!("  mean:       {:>10.3} ms", mean * 1000.0);
-    eprintln!("  p50:        {:>10.3} ms", percentile(latencies, 50.0).as_secs_f64() * 1000.0);
-    eprintln!("  p90:        {:>10.3} ms", percentile(latencies, 90.0).as_secs_f64() * 1000.0);
-    eprintln!("  p99:        {:>10.3} ms", percentile(latencies, 99.0).as_secs_f64() * 1000.0);
-    eprintln!("  min:        {:>10.3} ms", latencies.first().unwrap().as_secs_f64() * 1000.0);
-    eprintln!("  max:        {:>10.3} ms", latencies.last().unwrap().as_secs_f64() * 1000.0);
+    eprintln!(
+        "  p50:        {:>10.3} ms",
+        percentile(latencies, 50.0).as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "  p90:        {:>10.3} ms",
+        percentile(latencies, 90.0).as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "  p99:        {:>10.3} ms",
+        percentile(latencies, 99.0).as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "  min:        {:>10.3} ms",
+        latencies.first().unwrap().as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "  max:        {:>10.3} ms",
+        latencies.last().unwrap().as_secs_f64() * 1000.0
+    );
 }
 
 fn print_concurrent_stats(
@@ -70,13 +85,31 @@ fn print_concurrent_stats(
     let speedup = wall_rps / sequential_rps;
     eprintln!("\n=== {label} ({} iterations) ===", latencies.len());
     eprintln!("  throughput: {wall_rps:>10.1} req/s  ({speedup:.1}x vs sequential)");
-    eprintln!("  wall time:  {:>10.3} ms", wall_time.as_secs_f64() * 1000.0);
+    eprintln!(
+        "  wall time:  {:>10.3} ms",
+        wall_time.as_secs_f64() * 1000.0
+    );
     eprintln!("  mean:       {:>10.3} ms", mean * 1000.0);
-    eprintln!("  p50:        {:>10.3} ms", percentile(latencies, 50.0).as_secs_f64() * 1000.0);
-    eprintln!("  p90:        {:>10.3} ms", percentile(latencies, 90.0).as_secs_f64() * 1000.0);
-    eprintln!("  p99:        {:>10.3} ms", percentile(latencies, 99.0).as_secs_f64() * 1000.0);
-    eprintln!("  min:        {:>10.3} ms", latencies.first().unwrap().as_secs_f64() * 1000.0);
-    eprintln!("  max:        {:>10.3} ms", latencies.last().unwrap().as_secs_f64() * 1000.0);
+    eprintln!(
+        "  p50:        {:>10.3} ms",
+        percentile(latencies, 50.0).as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "  p90:        {:>10.3} ms",
+        percentile(latencies, 90.0).as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "  p99:        {:>10.3} ms",
+        percentile(latencies, 99.0).as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "  min:        {:>10.3} ms",
+        latencies.first().unwrap().as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "  max:        {:>10.3} ms",
+        latencies.last().unwrap().as_secs_f64() * 1000.0
+    );
 }
 
 /// Full WASM-to-WASM hot path benchmark:
@@ -159,12 +192,14 @@ async fn bench_hot_path() -> Result<()> {
     };
     let egress_body = egress_req.encode_to_vec();
 
-    let client = http_client();
+    let pool = wr_common::http_pool::HttpClientPool::<Full<Bytes>>::new(
+        wr_common::http_pool::DEFAULT_POOL_SIZE,
+    );
 
     // ── Helper to send one request directly to the caller engine ─────────────
     // The caller's Egress handler makes the inter-module call through the
     // proxy, so we measure the full WASM→proxy→WASM round-trip.
-    let send = |client: hyper_util::client::legacy::Client<_, Full<Bytes>>,
+    let send = |pool: wr_common::http_pool::HttpClientPool<Full<Bytes>>,
                 caller_addr: String,
                 body: Vec<u8>| async move {
         let req = http::Request::builder()
@@ -172,12 +207,12 @@ async fn bench_hot_path() -> Result<()> {
             .uri(format!("{caller_addr}/test.http_test/Egress"))
             .body(Full::new(Bytes::from(body)))
             .unwrap();
-        client.request(req).await
+        pool.get().request(req).await
     };
 
     // ── Warmup ───────────────────────────────────────────────────────────────
     for _ in 0..warmup {
-        let resp = send(client.clone(), caller_addr.clone(), egress_body.clone()).await?;
+        let resp = send(pool.clone(), caller_addr.clone(), egress_body.clone()).await?;
         assert_eq!(resp.status(), 200, "warmup request failed");
     }
 
@@ -185,7 +220,7 @@ async fn bench_hot_path() -> Result<()> {
     let mut latencies = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let start = Instant::now();
-        let resp = send(client.clone(), caller_addr.clone(), egress_body.clone()).await?;
+        let resp = send(pool.clone(), caller_addr.clone(), egress_body.clone()).await?;
         let elapsed = start.elapsed();
         assert_eq!(resp.status(), 200);
         latencies.push(elapsed);
@@ -206,12 +241,12 @@ async fn bench_hot_path() -> Result<()> {
 
     for _ in 0..iterations {
         let permit = sem.clone().acquire_owned().await?;
-        let client = client.clone();
+        let pool = pool.clone();
         let body = egress_body.clone();
         let addr = caller_addr.clone();
         handles.push(tokio::spawn(async move {
             let t0 = Instant::now();
-            let resp = send(client, addr, body).await;
+            let resp = send(pool, addr, body).await;
             let lat = t0.elapsed();
             drop(permit);
             (resp, lat)

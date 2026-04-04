@@ -5627,6 +5627,8 @@ dependencies = [
  "anyhow",
  "deadpool-postgres",
  "http",
+ "http-body",
+ "hyper-util",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-http",

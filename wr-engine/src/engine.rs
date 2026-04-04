@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use deadpool_postgres::Pool;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
-use hyper_util::rt::TokioExecutor;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -313,9 +312,8 @@ impl EngineRunner {
 
         let component = Component::from_file(&self.engine, &module_config.wasm_path)?;
         let proxy_uri: hyper::Uri = self.config.node.proxy_address.parse()?;
-        let http_client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
-            .http2_only(true)
-            .build_http::<http_body_util::Full<bytes::Bytes>>();
+        let http_pool =
+            wr_common::http_pool::HttpClientPool::new(wr_common::http_pool::DEFAULT_POOL_SIZE);
         let module_name: Arc<str> = Arc::from(module_config.name.as_str());
         let module_namespace: Arc<str> = Arc::from(module_config.namespace.as_str());
         let module_version = module_config.version.clone();
@@ -364,7 +362,7 @@ impl EngineRunner {
             name: module_name.clone(),
             namespace: module_namespace.clone(),
             proxy_uri: proxy_uri.clone(),
-            http_client: http_client.clone(),
+            http_pool: http_pool.clone(),
             db_pool: svc.db_pool.clone(),
             db_schema: svc.db_schema.clone(),
             db_timeouts,
@@ -429,12 +427,10 @@ struct ModuleContext {
     name: Arc<str>,
     namespace: Arc<str>,
     proxy_uri: hyper::Uri,
-    /// Pooled HTTP client for outgoing WASM → proxy requests.
-    /// `Client` is `Clone` (internally Arc-backed), so this is cheap to clone.
-    http_client: hyper_util::client::legacy::Client<
-        hyper_util::client::legacy::connect::HttpConnector,
-        http_body_util::Full<bytes::Bytes>,
-    >,
+    /// Pool of HTTP/2 clients for outgoing WASM → proxy requests.
+    /// Spreads requests across multiple TCP connections to avoid
+    /// single-connection bottlenecks.
+    http_pool: wr_common::http_pool::HttpClientPool<http_body_util::Full<bytes::Bytes>>,
     db_pool: Option<Arc<Pool>>,
     db_schema: Option<Arc<str>>,
     db_timeouts: DbTimeouts,
@@ -539,7 +535,7 @@ async fn dispatch_request(
         module.name.to_string(),
         module.namespace.to_string(),
         module.proxy_uri.clone(),
-        module.http_client.clone(),
+        module.http_pool.clone(),
         ModuleServices {
             db_pool: module.db_pool.clone(),
             db_schema: module.db_schema.clone(),

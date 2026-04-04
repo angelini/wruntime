@@ -20,7 +20,7 @@ anyhow             = "1"
 futures            = "0.3"
 serde              = { version = "1", features = ["derive"] }
 uuid               = { version = "1", features = ["v4"] }
-wr-common           = { path = "../wr-common", features = ["pool", "config", "signal"] }
+wr-common           = { path = "../wr-common", features = ["pool", "config", "signal", "http-pool"] }
 tracing              = "0.1"
 tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
 tracing-opentelemetry = "0.32"
