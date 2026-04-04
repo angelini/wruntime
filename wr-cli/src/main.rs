@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
         Commands::Db(args) => cmd::db::run(args).await,
         Commands::Dev(args) => cmd::dev::run(args, cli.manager.as_deref()).await,
         Commands::Engines(args) => cmd::engines::run(args, require_manager(&cli.manager)?).await,
-        Commands::Managers(args) => cmd::managers::run(args, require_manager(&cli.manager)?).await,
+        Commands::Managers(args) => cmd::managers::run(args, cli.manager.as_deref()).await,
         Commands::Services(args) => cmd::services::run(args, require_manager(&cli.manager)?).await,
         Commands::Metrics(args) => cmd::metrics::run(args).await,
         Commands::Invoke(args) => cmd::invoke::run(args, require_manager(&cli.manager)?).await,

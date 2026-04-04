@@ -11,9 +11,7 @@ use flate2::Compression;
 use sha2::{Digest, Sha256};
 
 use super::build_helpers::{self, BuildModule};
-use super::config::{
-    EngineConfig, NodeConfig, ProxyCacheConfig, ProxyConfig, ProxyDatabaseConfig, ProxyNodeConfig,
-};
+use super::config::EngineConfig;
 use super::helpers;
 
 #[derive(Args)]
@@ -24,9 +22,7 @@ pub struct NodeArgs {
 
 #[derive(Subcommand)]
 pub enum NodeCommand {
-    /// Generate a node config directory from an engine config template
-    Init(InitArgs),
-    /// Build and package a universal deployment bundle
+    /// Build and package a host-agnostic deployment bundle
     Bundle(BundleArgs),
     /// Deploy a bundle to a remote host
     Deploy(DeployArgs),
@@ -35,37 +31,7 @@ pub enum NodeCommand {
 }
 
 #[derive(Args)]
-pub struct InitArgs {
-    /// Output directory for generated configs
-    output_dir: String,
-    /// Host address for the node
-    #[arg(long)]
-    host: String,
-    /// Manager database URL
-    #[arg(long)]
-    db_url: String,
-    /// Template engine config file
-    #[arg(long)]
-    engine_config: String,
-    /// Proxy listen port
-    #[arg(long, default_value = "9001")]
-    proxy_port: u16,
-    /// Proxy control port
-    #[arg(long, default_value = "9002")]
-    control_port: u16,
-    /// Engine listen port
-    #[arg(long, default_value = "9100")]
-    engine_port: u16,
-    /// Guest database URL (optional, for module DB pools)
-    #[arg(long)]
-    guest_db_url: Option<String>,
-}
-
-#[derive(Args)]
 pub struct BundleArgs {
-    /// Proxy config file
-    #[arg(long)]
-    proxy_config: String,
     /// Engine config files (repeatable)
     #[arg(long = "engine-config", value_name = "PATH")]
     engine_configs: Vec<String>,
@@ -101,6 +67,12 @@ pub struct DeployArgs {
     /// Deployment format
     #[arg(long)]
     format: DeployFormat,
+    /// Database URL for proxy and engine routing table sync
+    #[arg(long)]
+    db_url: String,
+    /// Guest database URL for module DB pools (required if engine uses guest databases)
+    #[arg(long)]
+    guest_db_url: Option<String>,
     /// SSH private key path
     #[arg(long)]
     ssh_key: Option<String>,
@@ -124,6 +96,7 @@ struct Manifest {
     image_prefix: String,
     modules: Vec<ManifestModule>,
     configs: Vec<String>,
+    template_vars: Vec<String>,
     checksums: HashMap<String, String>,
 }
 
@@ -138,7 +111,6 @@ struct ManifestModule {
 
 pub async fn run(args: NodeArgs, manager: Option<&str>) -> Result<()> {
     match args.command {
-        NodeCommand::Init(init_args) => init(init_args),
         NodeCommand::Bundle(bundle_args) => bundle(bundle_args),
         NodeCommand::Deploy(deploy_args) => {
             let mgr = manager.ok_or_else(|| {
@@ -148,83 +120,6 @@ pub async fn run(args: NodeArgs, manager: Option<&str>) -> Result<()> {
         }
         NodeCommand::Status(status_args) => status(status_args),
     }
-}
-
-// --- init ---
-
-fn init(args: InitArgs) -> Result<()> {
-    let config_path = &args.engine_config;
-    if !Path::new(config_path).exists() {
-        bail!("Engine config template not found: {config_path}");
-    }
-
-    let template = EngineConfig::from_file(config_path)?;
-
-    let output_dir = Path::new(&args.output_dir);
-    fs::create_dir_all(output_dir)
-        .with_context(|| format!("failed to create output directory: {}", args.output_dir))?;
-
-    // Generate proxy config via serde
-    let proxy = ProxyConfig {
-        listen_address: format!("0.0.0.0:{}", args.proxy_port),
-        control_address: Some(format!("0.0.0.0:{}", args.control_port)),
-        node: Some(ProxyNodeConfig {
-            proxy_address: format!("http://{}:{}", args.host, args.proxy_port),
-        }),
-        database: Some(ProxyDatabaseConfig {
-            url: args.db_url.clone(),
-        }),
-        cache: Some(ProxyCacheConfig {
-            routing_table_ttl_secs: 5,
-        }),
-    };
-    let proxy_path = output_dir.join("proxy.toml");
-    fs::write(&proxy_path, proxy.to_toml()?)
-        .with_context(|| format!("failed to write {}", proxy_path.display()))?;
-    println!("[init]  wrote {}", proxy_path.display());
-
-    // Generate engine config: override addresses and rewrite module paths for bundle
-    let mut engine = template.to_bundle_config();
-    engine.listen_address = format!("0.0.0.0:{}", args.engine_port);
-    engine.node = Some(NodeConfig {
-        proxy_address: format!("http://{}:{}", args.host, args.proxy_port),
-        control_address: format!("http://{}:{}", args.host, args.control_port),
-    });
-
-    // Override database URL, preserve guest_url logic
-    if let Some(ref mut db) = engine.database {
-        if let Some(ref guest_url) = args.guest_db_url {
-            db.guest_url = Some(guest_url.clone());
-        }
-        db.url = args.db_url.clone();
-    }
-
-    // Filter out migrations_path entries where the source directory doesn't exist
-    for module in &mut engine.modules {
-        if let Some(ref mig_path) = template
-            .modules
-            .iter()
-            .find(|m| m.name == module.name)
-            .and_then(|m| m.migrations_path.clone())
-        {
-            if !Path::new(mig_path).exists() {
-                module.migrations_path = None;
-            }
-        }
-    }
-
-    let engine_path = output_dir.join("engine.toml");
-    fs::write(&engine_path, engine.to_toml()?)
-        .with_context(|| format!("failed to write {}", engine_path.display()))?;
-    println!("[init]  wrote {}", engine_path.display());
-
-    println!();
-    println!("Node configs generated in {}", args.output_dir);
-    println!("  proxy:   {}", proxy_path.display());
-    println!("  engine:  {}", engine_path.display());
-    println!();
-    println!("Next: review configs, then run `wr-cli node bundle`");
-    Ok(())
 }
 
 // --- bundle helpers ---
@@ -253,6 +148,7 @@ fn add_engine_artifacts(
             format!("{stem}.toml")
         };
 
+        // Write the template-ized config into the bundle
         let bundle_config = config.to_bundle_config();
         tar_add_bytes(
             tar,
@@ -322,24 +218,75 @@ fn add_engine_artifacts(
     Ok((engine_names, engine_listen_ports))
 }
 
+/// Generate a proxy config template from the engine configs and add it to the bundle.
+/// Returns the proxy listen port and control port.
+fn add_proxy_config(
+    tar: &mut tar::Builder<GzEncoder<fs::File>>,
+    config_names: &mut Vec<String>,
+    all_engine_configs: &[(String, EngineConfig)],
+) -> Result<(u16, u16)> {
+    // Derive proxy/control ports from the first engine's node config
+    let first = &all_engine_configs[0].1;
+    let (proxy_port, control_port) = if let Some(ref node) = first.node {
+        (
+            helpers::extract_port(&node.proxy_address),
+            helpers::extract_port(&node.control_address),
+        )
+    } else {
+        (9001u16, 9002u16)
+    };
+
+    let proxy = super::config::ProxyConfig {
+        listen_address: format!("0.0.0.0:{proxy_port}"),
+        control_address: Some(format!("0.0.0.0:{control_port}")),
+        node: Some(super::config::ProxyNodeConfig {
+            proxy_address: format!("http://{{host}}:{proxy_port}"),
+        }),
+        database: Some(super::config::ProxyDatabaseConfig {
+            url: "{db_url}".to_string(),
+        }),
+        cache: Some(super::config::ProxyCacheConfig {
+            routing_table_ttl_secs: 5,
+        }),
+    };
+
+    tar_add_bytes(
+        tar,
+        "wr-node/config/proxy.toml",
+        proxy.to_toml()?.as_bytes(),
+        0o644,
+    )?;
+    config_names.push("proxy.toml".to_string());
+
+    Ok((proxy_port, control_port))
+}
+
+struct DeployArtifactParams<'a> {
+    workdir: &'a str,
+    image_prefix: &'a str,
+    config_names: &'a [String],
+    engine_names: &'a [String],
+    proxy_port: u16,
+    control_port: u16,
+    engine_listen_ports: &'a [u16],
+}
+
 /// Generate and add systemd units, Dockerfiles, and docker-compose.yml to the tarball.
 fn add_deployment_artifacts(
     tar: &mut tar::Builder<GzEncoder<fs::File>>,
-    args: &BundleArgs,
-    config_names: &[String],
-    engine_names: &[String],
-    engine_listen_ports: &[u16],
+    params: &DeployArtifactParams<'_>,
 ) -> Result<()> {
-    let proxy_config = ProxyConfig::from_file(&args.proxy_config)?;
-    let proxy_port = helpers::extract_port(&proxy_config.listen_address);
-    let control_port = proxy_config
-        .control_address
-        .as_deref()
-        .map(helpers::extract_port)
-        .unwrap_or(9002);
-
+    let DeployArtifactParams {
+        workdir,
+        config_names,
+        engine_names,
+        proxy_port,
+        control_port,
+        engine_listen_ports,
+        ..
+    } = params;
     // Systemd units
-    let proxy_service = generate_proxy_service(&args.workdir, &config_names[0]);
+    let proxy_service = generate_proxy_service(workdir, &config_names[0]);
     tar_add_bytes(
         tar,
         "wr-node/systemd/wr-proxy.service",
@@ -349,7 +296,7 @@ fn add_deployment_artifacts(
 
     for (i, engine_name) in engine_names.iter().enumerate() {
         let cfg_name = &config_names[i + 1];
-        let service = generate_engine_service(&args.workdir, cfg_name, engine_name);
+        let service = generate_engine_service(workdir, cfg_name, engine_name);
         tar_add_bytes(
             tar,
             &format!("wr-node/systemd/wr-engine-{engine_name}.service"),
@@ -359,7 +306,7 @@ fn add_deployment_artifacts(
     }
 
     // Docker artifacts
-    let proxy_dockerfile = generate_proxy_dockerfile(&args.workdir);
+    let proxy_dockerfile = generate_proxy_dockerfile(workdir);
     tar_add_bytes(
         tar,
         "wr-node/docker/Dockerfile.proxy",
@@ -369,7 +316,7 @@ fn add_deployment_artifacts(
 
     for (i, engine_name) in engine_names.iter().enumerate() {
         let cfg_name = &config_names[i + 1];
-        let dockerfile = generate_engine_dockerfile(&args.workdir, cfg_name);
+        let dockerfile = generate_engine_dockerfile(workdir, cfg_name);
         tar_add_bytes(
             tar,
             &format!("wr-node/docker/Dockerfile.engine-{engine_name}"),
@@ -379,10 +326,10 @@ fn add_deployment_artifacts(
     }
 
     let compose = generate_docker_compose(
-        &args.image_prefix,
+        params.image_prefix,
         engine_names,
-        proxy_port,
-        control_port,
+        *proxy_port,
+        *control_port,
         engine_listen_ports,
     );
     tar_add_bytes(
@@ -400,10 +347,6 @@ fn add_deployment_artifacts(
 // --- bundle ---
 
 fn bundle(args: BundleArgs) -> Result<()> {
-    // Validate configs exist
-    if !Path::new(&args.proxy_config).exists() {
-        bail!("Proxy config not found: {}", args.proxy_config);
-    }
     if args.engine_configs.is_empty() {
         bail!("At least one --engine-config is required");
     }
@@ -467,15 +410,9 @@ fn bundle(args: BundleArgs) -> Result<()> {
         tar_add_file(&mut tar, &mut checksums, &archive_path, &src, 0o755)?;
     }
 
-    // Add proxy config
-    tar_add_file(
-        &mut tar,
-        &mut checksums,
-        "wr-node/config/proxy.toml",
-        Path::new(&args.proxy_config),
-        0o644,
-    )?;
-    config_names.push("proxy.toml".to_string());
+    // Add proxy config template (generated from engine node config)
+    let (proxy_port, control_port) =
+        add_proxy_config(&mut tar, &mut config_names, &all_engine_configs)?;
 
     // Add engine configs + collect modules and artifacts
     let (engine_names, engine_listen_ports) = add_engine_artifacts(
@@ -486,13 +423,27 @@ fn bundle(args: BundleArgs) -> Result<()> {
         &all_engine_configs,
     )?;
 
+    // Determine which template variables this bundle requires
+    let mut template_vars = vec!["host".to_string(), "db_url".to_string()];
+    let has_guest_db = all_engine_configs
+        .iter()
+        .any(|(_, c)| c.database.as_ref().is_some_and(|db| db.guest_url.is_some()));
+    if has_guest_db {
+        template_vars.push("guest_db_url".to_string());
+    }
+
     // Generate and add deployment artifacts (systemd + docker)
     add_deployment_artifacts(
         &mut tar,
-        &args,
-        &config_names,
-        &engine_names,
-        &engine_listen_ports,
+        &DeployArtifactParams {
+            workdir: &args.workdir,
+            image_prefix: &args.image_prefix,
+            config_names: &config_names,
+            engine_names: &engine_names,
+            proxy_port,
+            control_port,
+            engine_listen_ports: &engine_listen_ports,
+        },
     )?;
 
     // Generate manifest
@@ -502,6 +453,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         image_prefix: args.image_prefix.clone(),
         modules: manifest_modules,
         configs: config_names,
+        template_vars,
         checksums,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
@@ -527,11 +479,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
     println!();
     println!("Deploy with:");
     println!(
-        "  wr-cli node deploy {} <user@host> --format systemd",
-        args.output
-    );
-    println!(
-        "  wr-cli node deploy {} <user@host> --format docker",
+        "  wr-cli node deploy {} <user@host> --format systemd --db-url <URL>",
         args.output
     );
     Ok(())
@@ -545,12 +493,74 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     }
 
     let manifest = read_manifest_from_tarball(&args.bundle)?;
+    let configs = read_configs_from_tarball(&args.bundle)?;
+
+    // Build template variables
+    let host = helpers::extract_remote_host(&args.remote);
+    let mut vars = HashMap::new();
+    vars.insert("host", host);
+    vars.insert("db_url", args.db_url.as_str());
+    let guest_db_url_val;
+    if let Some(ref url) = args.guest_db_url {
+        guest_db_url_val = url.clone();
+        vars.insert("guest_db_url", &guest_db_url_val);
+    }
+
+    // Resolve all config templates
+    let mut resolved_configs: Vec<(String, String)> = Vec::new();
+    for (name, template) in &configs {
+        let resolved = helpers::resolve_template(template, &vars)
+            .with_context(|| format!("failed to resolve template in {name}"))?;
+        resolved_configs.push((name.clone(), resolved));
+    }
+
     let ssh_base = helpers::build_ssh_args(&args.remote, args.ssh_key.as_deref(), args.ssh_port);
 
     match args.format {
         DeployFormat::Systemd => deploy_systemd(&args, &manifest, &ssh_base).await?,
         DeployFormat::Docker => deploy_docker(&args, &manifest, &ssh_base).await?,
     }
+
+    // Overwrite template configs with resolved versions
+    print!("[deploy]  writing resolved configs ... ");
+    for (name, content) in &resolved_configs {
+        let remote_path = format!("{}/wr-node/config/{name}", manifest.workdir);
+        helpers::scp_bytes(
+            content.as_bytes(),
+            &args.remote,
+            &remote_path,
+            args.ssh_key.as_deref(),
+            args.ssh_port,
+        )
+        .with_context(|| format!("failed to upload resolved {name}"))?;
+    }
+    println!("OK");
+
+    // Restart services so they pick up the resolved configs
+    print!("[deploy]  restarting services ... ");
+    match args.format {
+        DeployFormat::Systemd => {
+            let mut service_names = vec!["wr-proxy.service".to_string()];
+            for config in &manifest.configs {
+                if config != "proxy.toml" {
+                    let stem = config.strip_suffix(".toml").unwrap_or(config);
+                    service_names.push(format!("wr-engine-{stem}.service"));
+                }
+            }
+            let services = service_names.join(" ");
+            helpers::run_ssh(&ssh_base, &format!("systemctl restart {services}"))?;
+        }
+        DeployFormat::Docker => {
+            helpers::run_ssh(
+                &ssh_base,
+                &format!(
+                    "cd {}/wr-node && docker compose -f docker/docker-compose.yml restart",
+                    manifest.workdir
+                ),
+            )?;
+        }
+    }
+    println!("OK");
 
     // Poll for engine registration
     println!("[deploy]  waiting for engine registration...");
@@ -641,17 +651,13 @@ async fn deploy_docker(args: &DeployArgs, manifest: &Manifest, ssh_base: &[Strin
 
 /// SCP the bundle tarball to the remote host.
 fn scp_bundle(args: &DeployArgs) -> Result<()> {
-    let mut scp_args = vec!["scp".to_string()];
-    if let Some(ref key) = args.ssh_key {
-        scp_args.extend(["-i".to_string(), key.clone()]);
-    }
-    scp_args.extend([
-        "-P".to_string(),
-        args.ssh_port.to_string(),
-        args.bundle.clone(),
-        format!("{}:/tmp/wr-bundle.tar.gz", args.remote),
-    ]);
-    helpers::run_command(&scp_args)
+    helpers::scp_file(
+        &args.bundle,
+        &args.remote,
+        "/tmp/wr-bundle.tar.gz",
+        args.ssh_key.as_deref(),
+        args.ssh_port,
+    )
 }
 
 // --- status ---
@@ -672,6 +678,17 @@ fn status(args: StatusArgs) -> Result<()> {
     println!("Modules:");
     for m in &manifest.modules {
         println!("  {}.{} v{}", m.namespace, m.name, m.version);
+    }
+    println!();
+    println!("Templates:");
+    for var in &manifest.template_vars {
+        let source = match var.as_str() {
+            "host" => "derived from deploy target",
+            "db_url" => "--db-url flag",
+            "guest_db_url" => "--guest-db-url flag",
+            _ => "unknown",
+        };
+        println!("  {{{var}}}  {source}");
     }
     println!();
     println!("Configs:");
@@ -873,4 +890,29 @@ fn read_manifest_from_tarball(path: &str) -> Result<Manifest> {
     }
 
     bail!("manifest.json not found in bundle")
+}
+
+/// Read all config files from the bundle's config/ directory.
+fn read_configs_from_tarball(path: &str) -> Result<Vec<(String, String)>> {
+    let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut configs = Vec::new();
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_path = entry.path()?.to_string_lossy().to_string();
+        if entry_path.contains("/config/") && entry_path.ends_with(".toml") {
+            let name = entry_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&entry_path)
+                .to_string();
+            let mut content = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut content)?;
+            configs.push((name, content));
+        }
+    }
+
+    Ok(configs)
 }

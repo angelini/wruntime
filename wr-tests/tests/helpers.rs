@@ -926,9 +926,23 @@ pub async fn db_state_for_module(pool_size: usize, namespace: &str, name: &str) 
 // ── WASM guest dispatch ──────────────────────────────────────────────────────
 
 /// Set up a wasmtime `Engine` + `ProxyPre` from a compiled WASM component path.
+///
+/// Configures the pooling instance allocator (matching production) so that
+/// concurrent instantiations reuse pre-allocated memory slots instead of
+/// issuing per-request mmap/mprotect syscalls.
 pub fn wasm_module_pre(wasm_path: &str) -> Result<(Arc<Engine>, Arc<ProxyPre<ModuleState>>)> {
+    use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
+
     let mut wt_config = Config::new();
     wt_config.wasm_component_model(true);
+
+    let mut pool = PoolingAllocationConfig::new();
+    pool.total_component_instances(100);
+    pool.max_memory_size(10 * 1024 * 1024);
+    pool.total_memories(100);
+    pool.total_tables(100);
+    wt_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
+
     let engine = Engine::new(&wt_config)?;
     let component = Component::from_file(&engine, wasm_path)?;
 
@@ -1058,6 +1072,10 @@ async fn wasm_engine_serve(
                 let module_namespace = module_namespace.clone();
                 let client = client.clone();
                 async move {
+                    // Collect the body on this stream, then spawn the
+                    // CPU-heavy WASM work onto a separate tokio task so
+                    // hyper's HTTP/2 serve_connection can drive other
+                    // streams concurrently.
                     let (parts, body) = req.into_parts();
                     let body_bytes = body
                         .collect()
@@ -1066,16 +1084,20 @@ async fn wasm_engine_serve(
                         .unwrap_or_default();
                     let request = Request::from_parts(parts, body_bytes);
 
-                    let state = ModuleState::new(
-                        module_name,
-                        module_namespace,
-                        proxy_uri,
-                        client,
-                        ModuleServices::default(),
-                    )
-                    .expect("ModuleState");
+                    let handle = tokio::spawn(async move {
+                        let state = ModuleState::new(
+                            module_name,
+                            module_namespace,
+                            proxy_uri,
+                            client,
+                            ModuleServices::default(),
+                        )
+                        .expect("ModuleState");
 
-                    match dispatch_to_wasm(&engine, &pre, state, request).await {
+                        dispatch_to_wasm(&engine, &pre, state, request).await
+                    });
+
+                    match handle.await.expect("wasm task panicked") {
                         Ok(resp) => {
                             let (parts, body) = resp.into_parts();
                             Ok::<_, Infallible>(Response::from_parts(parts, Full::new(body)))

@@ -86,10 +86,13 @@ impl EngineConfig {
         toml::to_string_pretty(self).map_err(Into::into)
     }
 
-    /// Create a bundle-relative copy: rewrite wasm_path, schema_path, and
-    /// migrations_path to point at the standard bundle directories.
+    /// Create a bundle-ready copy: rewrite module paths to bundle-relative
+    /// directories and insert `{host}`, `{db_url}`, `{guest_db_url}` template
+    /// placeholders for values that vary per deployment target.
     pub fn to_bundle_config(&self) -> Self {
         let mut config = self.clone();
+
+        // Rewrite module paths
         for module in &mut config.modules {
             module.wasm_path = format!("modules/{}.wasm", module.name);
             if !module.schema_path.is_empty() {
@@ -99,6 +102,25 @@ impl EngineConfig {
                 module.migrations_path = Some(format!("migrations/{}", module.name));
             }
         }
+
+        // Template host-dependent node addresses (preserve ports from source)
+        if let Some(ref node) = self.node {
+            let proxy_port = super::helpers::extract_port(&node.proxy_address);
+            let control_port = super::helpers::extract_port(&node.control_address);
+            config.node = Some(NodeConfig {
+                proxy_address: format!("http://{{host}}:{proxy_port}"),
+                control_address: format!("http://{{host}}:{control_port}"),
+            });
+        }
+
+        // Template database URLs
+        if let Some(ref mut db) = config.database {
+            db.url = "{db_url}".to_string();
+            if db.guest_url.is_some() {
+                db.guest_url = Some("{guest_db_url}".to_string());
+            }
+        }
+
         config
     }
 }
@@ -137,14 +159,57 @@ pub struct ProxyCacheConfig {
     pub routing_table_ttl_secs: u32,
 }
 
-impl ProxyConfig {
-    /// Parse a proxy config from a TOML file.
+// ---------------------------------------------------------------------------
+// Manager config
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ManagerConfig {
+    pub listen_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_heartbeat_timeout_secs: Option<u32>,
+    pub database: ManagerDatabaseConfig,
+    pub cluster: ClusterConfig,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ManagerDatabaseConfig {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<usize>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ClusterConfig {
+    pub cluster_id: String,
+    pub gossip_listen_address: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seed_nodes: Vec<String>,
+}
+
+impl ManagerConfig {
+    /// Parse a manager config from a TOML file.
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read config: {path}"))?;
         toml::from_str(&content).with_context(|| format!("failed to parse config: {path}"))
     }
 
+    /// Serialize to TOML string.
+    pub fn to_toml(&self) -> anyhow::Result<String> {
+        toml::to_string_pretty(self).map_err(Into::into)
+    }
+
+    /// Create a bundle-ready copy with `{db_url}` template placeholder.
+    pub fn to_bundle_config(&self) -> Self {
+        let mut config = self.clone();
+        config.database.url = "{db_url}".to_string();
+        config.cluster.seed_nodes.clear();
+        config
+    }
+}
+
+impl ProxyConfig {
     /// Serialize to TOML string.
     pub fn to_toml(&self) -> anyhow::Result<String> {
         toml::to_string_pretty(self).map_err(Into::into)

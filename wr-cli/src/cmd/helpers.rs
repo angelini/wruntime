@@ -122,6 +122,110 @@ pub async fn wait_for_engine_at_address(
     .is_ok()
 }
 
+/// Poll a manager gRPC address until it responds to ListManagers or timeout.
+/// Returns `true` if the manager became reachable.
+pub async fn wait_for_manager_ready(manager_addr: &str, timeout: Duration) -> bool {
+    use tokio_retry::strategy::FixedInterval;
+    use tokio_retry::Retry;
+
+    let strategy = FixedInterval::from_millis(2000).take(timeout.as_secs() as usize / 2);
+    Retry::spawn(strategy, || async {
+        match client::connect(manager_addr).await {
+            Ok(mut c) => match c
+                .list_managers(wr_common::wruntime::ListManagersRequest {})
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(_) => Err(()),
+            },
+            Err(_) => Err(()),
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Extract the host portion from a `user@host` remote string.
+pub fn extract_remote_host(remote: &str) -> &str {
+    remote.split('@').next_back().unwrap_or(remote)
+}
+
+/// Resolve `{key}` placeholders in a config template string.
+/// Bails if any `{...}` placeholder remains unresolved.
+pub fn resolve_template(
+    template: &str,
+    vars: &std::collections::HashMap<&str, &str>,
+) -> Result<String> {
+    let mut result = template.to_string();
+    for (key, value) in vars {
+        let placeholder = format!("{{{key}}}");
+        result = result.replace(&placeholder, value);
+    }
+
+    // Scan for unresolved placeholders
+    let bytes = result.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(end) = result[i + 1..].find('}') {
+                let name = &result[i + 1..i + 1 + end];
+                // Skip empty braces or TOML inline tables (contain spaces/quotes/commas)
+                if !name.is_empty()
+                    && !name.contains(' ')
+                    && !name.contains('"')
+                    && !name.contains(',')
+                {
+                    bail!("unresolved template variable: {{{name}}}");
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(result)
+}
+
+/// SCP a local file to a remote path.
+pub fn scp_file(
+    local_path: &str,
+    remote: &str,
+    remote_path: &str,
+    ssh_key: Option<&str>,
+    ssh_port: u16,
+) -> Result<()> {
+    let mut args = vec!["scp".to_string()];
+    if let Some(key) = ssh_key {
+        args.extend(["-i".to_string(), key.to_string()]);
+    }
+    args.extend([
+        "-P".to_string(),
+        ssh_port.to_string(),
+        local_path.to_string(),
+        format!("{remote}:{remote_path}"),
+    ]);
+    run_command(&args)
+}
+
+/// Write content to a local temp file, SCP it to the remote, then clean up.
+pub fn scp_bytes(
+    content: &[u8],
+    remote: &str,
+    remote_path: &str,
+    ssh_key: Option<&str>,
+    ssh_port: u16,
+) -> Result<()> {
+    let tmp = std::env::temp_dir().join(format!("wr-deploy-{}", std::process::id()));
+    std::fs::write(&tmp, content).context("failed to write temp file")?;
+    let result = scp_file(
+        &tmp.to_string_lossy(),
+        remote,
+        remote_path,
+        ssh_key,
+        ssh_port,
+    );
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
 /// Get the current number of registered engines from the manager.
 pub async fn get_engine_count(manager: &str) -> usize {
     if let Ok(mut client) = client::connect(manager).await {

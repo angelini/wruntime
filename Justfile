@@ -214,6 +214,14 @@ test-wasm-one filter: build-test-guests
     WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
     cargo test -p wr-tests --test wasm_host_test wasm_{{filter}}
 
+# Run hot-path benchmarks (WASM→proxy→WASM). Override iterations/concurrency via env vars.
+bench: build-test-guests
+    WRT_TEST_DB_URL={{db_url_test}} \
+    BENCH_ITERATIONS=5000 \
+    BENCH_WARMUP=30 \
+    BENCH_CONCURRENCY=20 \
+    cargo test -p wr-tests --test bench_test --release -- --nocapture
+
 # ── Ecommerce Example ─────────────────────────────────────────────────────────
 
 # Compile ecommerce protobuf schemas to FileDescriptorSet binaries (.binpb)

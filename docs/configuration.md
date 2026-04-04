@@ -316,3 +316,52 @@ wr-cli engines list
 wr-cli --manager http://manager-1:9000 engines list
 # The ListManagers RPC returns all active managers if peer discovery is needed
 ```
+
+### Remote deployment via CLI
+
+The CLI provides `wr managers` and `wr node` command groups for deploying to remote hosts via SSH. Both support systemd and Docker deployment formats. Bundles are **host-agnostic** — they contain template placeholders like `{host}`, `{db_url}`, and `{guest_db_url}` that are resolved at deploy time.
+
+#### Deploying a manager
+
+```bash
+# 1. Build a host-agnostic manager bundle (db_url templated as {db_url})
+wr-cli managers bundle \
+  --manager-config examples/config/manager.toml \
+  --target x86_64-unknown-linux-gnu \
+  --output manager-bundle.tar.gz
+
+# 2. Deploy to the remote host (resolves {db_url} at deploy time)
+wr-cli managers deploy manager-bundle.tar.gz deploy@10.0.1.10 \
+  --format systemd \
+  --db-url "postgres://postgres@localhost:5432/wruntime"
+
+# 3. Inspect a bundle to see template variables and checksums
+wr-cli managers status manager-bundle.tar.gz
+```
+
+The same bundle can be deployed to multiple managers with different `--db-url` and `--seed-node` values.
+
+#### Deploying engine+proxy nodes
+
+```bash
+# 1. Build a host-agnostic node bundle (one build for all nodes)
+wr-cli node bundle \
+  --engine-config examples/codegen/engine.toml \
+  --target x86_64-unknown-linux-gnu \
+  --output codegen-bundle.tar.gz
+
+# 2. Deploy to each node (resolves {host}, {db_url}, {guest_db_url})
+export WR_MANAGER=http://10.0.1.10:9000
+
+wr-cli node deploy codegen-bundle.tar.gz deploy@10.0.1.20 \
+  --format systemd \
+  --db-url "postgres://postgres@10.0.1.10:5432/wruntime" \
+  --guest-db-url "postgres://wr_guest:pass@10.0.1.10:5432/codegen"
+
+wr-cli node deploy codegen-bundle.tar.gz deploy@10.0.1.30 \
+  --format systemd \
+  --db-url "postgres://postgres@10.0.1.10:5432/wruntime" \
+  --guest-db-url "postgres://wr_guest:pass@10.0.1.10:5432/codegen"
+```
+
+Use `--skip-build` to reuse compiled artifacts when only rebuilding the bundle metadata.

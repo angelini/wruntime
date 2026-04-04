@@ -101,6 +101,25 @@ pub fn build_wasm_modules(modules: &[BuildModule]) -> Result<()> {
     Ok(())
 }
 
+/// Cross-compile the manager binary for a given target triple
+pub fn build_manager_binary(target: &str) -> Result<()> {
+    print!("[build]   wr-manager ({target}) ... ");
+    let output = Command::new("cargo")
+        .args(["build", "--release", "--target", target, "-p", "wr-manager"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to run cargo build")?;
+    if !output.status.success() {
+        println!("FAILED");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("{stderr}");
+        bail!("cargo build failed for wr-manager target {target}");
+    }
+    println!("OK");
+    Ok(())
+}
+
 /// Cross-compile host binaries for a given target triple
 pub fn build_host_binaries(target: &str) -> Result<()> {
     print!("[build]   host binaries ({target}) ... ");
