@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -6,6 +6,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use wr_common::wruntime::{DeregisterEngineRequest, ListEnginesRequest};
 
+use super::build_helpers::{self, BuildModule};
+use super::config::EngineConfig;
+use super::helpers;
 use crate::client;
 
 const PID_FILE: &str = ".wr-dev.pid";
@@ -127,7 +130,6 @@ fn write_pid_file(entries: &[PidEntry]) -> Result<()> {
 }
 
 fn is_process_alive(pid: u32) -> bool {
-    // kill -0 checks if process exists without sending a signal
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
@@ -186,7 +188,7 @@ async fn up(manager_config: &str, proxy_config: &str) -> Result<()> {
 
         // Wait for manager to be ready
         println!("Waiting for manager to be ready...");
-        let manager_addr = parse_manager_listen_addr(manager_config)?;
+        let manager_addr = helpers::parse_listen_address(manager_config)?;
         wait_for_port_or_exit(pid, &manager_addr, Duration::from_secs(30)).await?;
     } else {
         // Keep existing manager entry
@@ -202,7 +204,7 @@ async fn up(manager_config: &str, proxy_config: &str) -> Result<()> {
     // Start proxy
     if !proxy_alive {
         let bin = resolve_binary("wr-proxy");
-        let proxy_listen = parse_proxy_listen_addr(proxy_config)?;
+        let proxy_listen = helpers::parse_listen_address(proxy_config)?;
         let child = Command::new(&bin)
             .arg(proxy_config)
             .stdout(Stdio::inherit())
@@ -274,17 +276,9 @@ async fn down() -> Result<()> {
 
 async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     let config_path = &args.config;
-    if !Path::new(config_path).exists() {
-        bail!("Engine config not found: {config_path}");
-    }
+    let config = EngineConfig::from_file(config_path)?;
 
-    // Parse engine.toml without full validation (artifacts may not exist yet)
-    let content = std::fs::read_to_string(config_path)
-        .with_context(|| format!("failed to read config: {config_path}"))?;
-    let config: DevEngineConfig =
-        toml::from_str(&content).context("failed to parse engine config")?;
-
-    let modules_to_build: Vec<&DevModuleConfig> = if args.modules.is_empty() {
+    let modules_to_build: Vec<_> = if args.modules.is_empty() {
         config.modules.iter().collect()
     } else {
         config
@@ -303,76 +297,31 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     }
 
     if !args.skip_build {
+        let build_modules: Vec<BuildModule> = modules_to_build
+            .iter()
+            .map(|m| BuildModule {
+                name: m.name.clone(),
+                wasm_path: m.wasm_path.clone(),
+                schema_path: m.schema_path.clone(),
+            })
+            .collect();
+
         // Step 1: Build schemas
         if !args.skip_schemas {
-            for module in &modules_to_build {
-                if module.schema_path.is_empty() {
-                    continue;
-                }
-                let proto_path = derive_proto_path(&module.schema_path);
-                if !Path::new(&proto_path).exists() {
-                    bail!(
-                        "Proto file not found for module '{}': {} (derived from schema_path '{}')",
-                        module.name,
-                        proto_path,
-                        module.schema_path,
-                    );
-                }
-                let proto_dir = Path::new(&proto_path)
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                print!("[schema]  {} ... ", module.schema_path);
-                let status = Command::new("protoc")
-                    .args([
-                        &format!("--descriptor_set_out={}", module.schema_path),
-                        "--include_imports",
-                        &format!("--proto_path={}", proto_dir),
-                        &proto_path,
-                    ])
-                    .status()
-                    .context("failed to run protoc")?;
-                if !status.success() {
-                    bail!("protoc failed for module '{}'", module.name);
-                }
-                println!("OK");
-            }
+            build_helpers::compile_schemas(&build_modules)?;
         }
 
         // Step 2: Build WASM modules
-        for module in &modules_to_build {
-            let cargo_dir = derive_cargo_dir(&module.wasm_path)?;
-            print!("[build]   {} ... ", cargo_dir.display());
-            let output = Command::new("cargo")
-                .args([
-                    "component",
-                    "build",
-                    "--release",
-                    "--target",
-                    "wasm32-wasip2",
-                ])
-                .current_dir(&cargo_dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .context("failed to run cargo component build")?;
-            if !output.status.success() {
-                println!("FAILED");
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                eprintln!("{stderr}");
-                bail!("cargo component build failed for module '{}'", module.name);
-            }
-            println!("OK");
-        }
+        build_helpers::build_wasm_modules(&build_modules)?;
     }
 
     // Step 3: Stop old engine by matching listen_address
-    let listen_addr = normalize_address(&config.listen_address);
+    let listen_addr = helpers::normalize_address(&config.listen_address);
     if let Ok(mut client) = client::connect(manager).await {
         if let Ok(resp) = client.list_engines(ListEnginesRequest {}).await {
             let engines = resp.into_inner().engines;
             for engine in &engines {
-                if normalize_address(&engine.address) == listen_addr {
+                if helpers::normalize_address(&engine.address) == listen_addr {
                     print!(
                         "[engine]  stopping old engine {} ... ",
                         &engine.engine_id[..8]
@@ -394,7 +343,6 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
         if e.role == "engine" && e.config.as_deref() == Some(config_path) && is_process_alive(e.pid)
         {
             kill_process(e.pid);
-            // Give it a moment to shut down
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
@@ -410,25 +358,14 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
         .with_context(|| format!("failed to start {bin}"))?;
     let engine_pid = child.id();
 
-    // Wait for engine to register (poll manager)
+    // Wait for engine to register
     println!("[engine]  waiting for registration...");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let mut registered = false;
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        if let Ok(mut client) = client::connect(manager).await {
-            if let Ok(resp) = client.list_engines(ListEnginesRequest {}).await {
-                let engines = resp.into_inner().engines;
-                if engines
-                    .iter()
-                    .any(|e| normalize_address(&e.address) == listen_addr)
-                {
-                    registered = true;
-                    break;
-                }
-            }
-        }
-    }
+    let registered = helpers::wait_for_engine_at_address(
+        manager,
+        &config.listen_address,
+        Duration::from_secs(60),
+    )
+    .await;
 
     if !registered {
         bail!("Engine did not register within 60 seconds");
@@ -502,81 +439,7 @@ async fn status(manager: &str) -> Result<()> {
 
 // --- Helpers ---
 
-/// Minimal engine config for parsing without validation
-#[derive(serde::Deserialize)]
-struct DevEngineConfig {
-    listen_address: String,
-    #[serde(rename = "module", default)]
-    modules: Vec<DevModuleConfig>,
-}
-
-#[derive(serde::Deserialize)]
-struct DevModuleConfig {
-    name: String,
-    namespace: String,
-    version: String,
-    wasm_path: String,
-    #[serde(default)]
-    schema_path: String,
-}
-
-/// Derive .proto path from .binpb schema_path
-fn derive_proto_path(schema_path: &str) -> String {
-    if schema_path.ends_with(".binpb") {
-        format!("{}proto", &schema_path[..schema_path.len() - 5])
-    } else {
-        format!("{schema_path}.proto")
-    }
-}
-
-/// Derive Cargo project directory from wasm_path by finding the `target/` component
-fn derive_cargo_dir(wasm_path: &str) -> Result<PathBuf> {
-    let path = Path::new(wasm_path);
-    let mut current = path;
-    while let Some(parent) = current.parent() {
-        if current.file_name().map(|n| n == "target").unwrap_or(false) {
-            return Ok(parent.to_path_buf());
-        }
-        current = parent;
-    }
-    bail!(
-        "Cannot derive Cargo project directory from wasm_path: {wasm_path}. \
-         Expected a path containing 'target/' (e.g., my-module/target/wasm32-wasip2/release/mod.wasm)"
-    );
-}
-
-/// Normalize address: replace 0.0.0.0 with 127.0.0.1 for comparison
-fn normalize_address(addr: &str) -> String {
-    let addr = addr
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    addr.replace("0.0.0.0", "127.0.0.1").to_string()
-}
-
-/// Parse listen_address from a manager config file
-fn parse_manager_listen_addr(config_path: &str) -> Result<String> {
-    let content = std::fs::read_to_string(config_path)?;
-    let config: toml::Value = toml::from_str(&content)?;
-    config
-        .get("listen_address")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("no listen_address in manager config"))
-}
-
-/// Parse listen_address from a proxy config file
-fn parse_proxy_listen_addr(config_path: &str) -> Result<String> {
-    let content = std::fs::read_to_string(config_path)?;
-    let config: toml::Value = toml::from_str(&content)?;
-    config
-        .get("listen_address")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("no listen_address in proxy config"))
-}
-
 /// Wait for a TCP port to accept connections, or bail if the process exits early.
-/// Normalizes 0.0.0.0 to 127.0.0.1 since you can't connect to the bind-any address.
 async fn wait_for_port_or_exit(pid: u32, addr: &str, timeout: Duration) -> Result<()> {
     let connect_addr = addr.replace("0.0.0.0", "127.0.0.1");
     let deadline = tokio::time::Instant::now() + timeout;

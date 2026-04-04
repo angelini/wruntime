@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
+use serde::Deserialize;
 use std::collections::HashMap;
 
 use tabled::builder::Builder;
@@ -46,7 +47,81 @@ fn parse_duration_secs(s: &str) -> Result<u64> {
     anyhow::bail!("unsupported duration format: {s} (use e.g. 1h, 30m, 120s)");
 }
 
-/// Represents a single span result from Tempo's search API.
+// ---------------------------------------------------------------------------
+// Typed Tempo search API response structures
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct TempoSearchResponse {
+    #[serde(default)]
+    traces: Vec<TempoTrace>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TempoTrace {
+    #[serde(default)]
+    span_sets: Option<Vec<TempoSpanSet>>,
+    #[serde(default)]
+    root_trace_name: Option<String>,
+    #[serde(default)]
+    root_service_name: Option<String>,
+    #[serde(default)]
+    duration_ms: Option<TempoNumber>,
+}
+
+#[derive(Deserialize)]
+struct TempoSpanSet {
+    #[serde(default)]
+    spans: Vec<TempoSpan>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TempoSpan {
+    #[serde(default)]
+    duration_nanos: Option<TempoNumber>,
+    #[serde(default)]
+    attributes: Vec<TempoAttribute>,
+}
+
+#[derive(Deserialize)]
+struct TempoAttribute {
+    key: String,
+    value: TempoAttrValue,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TempoAttrValue {
+    #[serde(default)]
+    string_value: Option<String>,
+    #[serde(default)]
+    int_value: Option<TempoNumber>,
+}
+
+/// Tempo encodes numeric values as either JSON numbers or strings.
+/// This type handles both transparently.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TempoNumber {
+    Int(u64),
+    Str(String),
+}
+
+impl TempoNumber {
+    fn as_u64(&self) -> Option<u64> {
+        match self {
+            TempoNumber::Int(n) => Some(*n),
+            TempoNumber::Str(s) => s.parse().ok(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal span record (parsed from Tempo response)
+// ---------------------------------------------------------------------------
+
 struct SpanRecord {
     source: String,
     destination: String,
@@ -82,12 +157,12 @@ async fn summary(tempo: &str, since: &str) -> Result<()> {
         anyhow::bail!("Tempo returned {status}: {body}");
     }
 
-    let body: serde_json::Value = resp
+    let body: TempoSearchResponse = resp
         .json()
         .await
         .context("failed to parse Tempo response")?;
 
-    let spans = parse_tempo_search_response(&body)?;
+    let spans = parse_tempo_search_response(&body);
 
     if spans.is_empty() {
         println!("No proxy.request traces found in the last {since}.");
@@ -140,88 +215,57 @@ async fn summary(tempo: &str, since: &str) -> Result<()> {
     Ok(())
 }
 
-/// Parse the Tempo `/api/search` JSON response into span records.
-///
-/// Tempo's search response shape:
-/// ```json
-/// {
-///   "traces": [
-///     {
-///       "traceID": "...",
-///       "spanSets": [
-///         {
-///           "spans": [
-///             {
-///               "durationNanos": "123456789",
-///               "attributes": [
-///                 { "key": "wr.source", "value": { "stringValue": "..." } },
-///                 { "key": "wr.destination", "value": { "stringValue": "..." } },
-///                 { "key": "http.response.status_code", "value": { "intValue": "200" } }
-///               ]
-///             }
-///           ]
-///         }
-///       ]
-///     }
-///   ]
-/// }
-/// ```
-fn parse_tempo_search_response(body: &serde_json::Value) -> Result<Vec<SpanRecord>> {
+/// Parse the typed Tempo search response into span records.
+fn parse_tempo_search_response(body: &TempoSearchResponse) -> Vec<SpanRecord> {
     let mut records = Vec::new();
 
-    let traces = body["traces"].as_array().unwrap_or(&Vec::new()).clone();
-
-    for trace in &traces {
-        // Tempo may return rootSpan-level duration or spanSets depending on the query.
+    for trace in &body.traces {
         // When using TraceQL, results come in spanSets.
-        if let Some(span_sets) = trace["spanSets"].as_array() {
+        if let Some(span_sets) = &trace.span_sets {
             for span_set in span_sets {
-                if let Some(spans) = span_set["spans"].as_array() {
-                    for span in spans {
-                        if let Some(record) = parse_span(span) {
-                            records.push(record);
-                        }
+                for span in &span_set.spans {
+                    if let Some(record) = parse_span(span) {
+                        records.push(record);
                     }
                 }
             }
-        }
-
-        // Also handle the top-level trace summary (rootServiceName / rootTraceName)
-        // for simpler search responses without spanSets.
-        if trace["spanSets"].is_null() {
+        } else {
+            // Handle top-level trace summary (rootServiceName / rootTraceName)
+            // for simpler search responses without spanSets.
             if let Some(record) = parse_trace_summary(trace) {
                 records.push(record);
             }
         }
     }
 
-    Ok(records)
+    records
 }
 
 /// Parse a span from Tempo's spanSets response.
-fn parse_span(span: &serde_json::Value) -> Option<SpanRecord> {
-    let duration_nanos = span["durationNanos"]
-        .as_str()
-        .and_then(|s| s.parse::<u64>().ok())
-        .or_else(|| span["durationNanos"].as_u64())?;
+fn parse_span(span: &TempoSpan) -> Option<SpanRecord> {
+    let duration_nanos = span.duration_nanos.as_ref()?.as_u64()?;
     let duration_ms = duration_nanos / 1_000_000;
 
-    let attrs = span["attributes"].as_array()?;
     let mut source = String::from("unknown");
     let mut destination = String::from("unknown");
     let mut status_code: u16 = 0;
 
-    for attr in attrs {
-        let key = attr["key"].as_str().unwrap_or_default();
-        match key {
+    for attr in &span.attributes {
+        match attr.key.as_str() {
             "wr.source" => {
-                source = attr_string_value(attr).unwrap_or_else(|| "unknown".into());
+                if let Some(ref s) = attr.value.string_value {
+                    source = s.clone();
+                }
             }
             "wr.destination" => {
-                destination = attr_string_value(attr).unwrap_or_else(|| "unknown".into());
+                if let Some(ref s) = attr.value.string_value {
+                    destination = s.clone();
+                }
             }
             "http.response.status_code" => {
-                status_code = attr_int_value(attr).unwrap_or(0) as u16;
+                if let Some(ref n) = attr.value.int_value {
+                    status_code = n.as_u64().unwrap_or(0) as u16;
+                }
             }
             _ => {}
         }
@@ -236,13 +280,11 @@ fn parse_span(span: &serde_json::Value) -> Option<SpanRecord> {
 }
 
 /// Parse a trace-level summary (for search responses without spanSets).
-fn parse_trace_summary(trace: &serde_json::Value) -> Option<SpanRecord> {
-    let duration_ms = trace["durationMs"]
-        .as_u64()
-        .or_else(|| trace["durationMs"].as_str().and_then(|s| s.parse().ok()))?;
+fn parse_trace_summary(trace: &TempoTrace) -> Option<SpanRecord> {
+    let duration_ms = trace.duration_ms.as_ref()?.as_u64()?;
 
-    let root_name = trace["rootTraceName"].as_str().unwrap_or("unknown");
-    let service = trace["rootServiceName"].as_str().unwrap_or("unknown");
+    let root_name = trace.root_trace_name.as_deref().unwrap_or("unknown");
+    let service = trace.root_service_name.as_deref().unwrap_or("unknown");
 
     // The root trace name for proxy.request spans is formatted as "{method} {destination}"
     let destination = root_name
@@ -256,15 +298,4 @@ fn parse_trace_summary(trace: &serde_json::Value) -> Option<SpanRecord> {
         duration_ms,
         is_error: false,
     })
-}
-
-fn attr_string_value(attr: &serde_json::Value) -> Option<String> {
-    attr["value"]["stringValue"].as_str().map(|s| s.to_string())
-}
-
-fn attr_int_value(attr: &serde_json::Value) -> Option<i64> {
-    attr["value"]["intValue"]
-        .as_str()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| attr["value"]["intValue"].as_i64())
 }

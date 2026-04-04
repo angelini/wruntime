@@ -23,3 +23,6 @@ tokio-postgres = "0.7"
 libc          = "0.2"
 toml          = "0.8"
 serde         = { version = "1", features = ["derive"] }
+flate2        = "1"
+tar           = "0.4"
+sha2          = "0.10"
