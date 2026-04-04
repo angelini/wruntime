@@ -181,13 +181,7 @@ async fn handle(
     }
 }
 
-fn header_owned(headers: &http::HeaderMap, name: &str) -> String {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_owned()
-}
+use wr_common::http_headers::header_owned;
 
 fn too_many_requests(module: &str) -> Response<Full<Bytes>> {
     let body = json!({

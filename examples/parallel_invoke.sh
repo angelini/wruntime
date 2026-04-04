@@ -5,6 +5,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_ROOT"
 
+export WR_MANAGER="${WR_MANAGER:-http://127.0.0.1:9000}"
+
 PIDS=()
 TMPDIR_OUT="$(mktemp -d)"
 

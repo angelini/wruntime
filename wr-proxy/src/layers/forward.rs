@@ -39,15 +39,15 @@ impl Service<Request<ProxyBody>> for ForwardService {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, req: Request<ProxyBody>) -> Self::Future {
+    fn call(&mut self, mut req: Request<ProxyBody>) -> Self::Future {
         let client = self.client.clone();
         let cb_registry = self.cb_registry.clone();
 
         Box::pin(async move {
             let destination = req
-                .extensions()
-                .get::<ResolvedDestination>()
-                .map(|d| d.0.clone())
+                .extensions_mut()
+                .remove::<ResolvedDestination>()
+                .map(|d| d.0)
                 .ok_or_else(|| anyhow::anyhow!("missing ResolvedDestination extension"))?;
 
             let path = req

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Deserialize;
 use wr_common::node::NodeConfig;
 
@@ -248,17 +248,18 @@ fn default_worker_max_attempts() -> i32 {
     3
 }
 
+impl wr_common::config::Validatable for EngineConfig {
+    fn validate(&self) -> Result<()> {
+        self.validate_inner()
+    }
+}
+
 impl EngineConfig {
     pub fn load(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read config file: {path}"))?;
-        let config: EngineConfig =
-            toml::from_str(&content).context("failed to parse engine config")?;
-        config.validate().context("invalid engine config")?;
-        Ok(config)
+        wr_common::config::load(path)
     }
 
-    fn validate(&self) -> Result<()> {
+    fn validate_inner(&self) -> Result<()> {
         anyhow::ensure!(
             !self.listen_address.is_empty(),
             "listen_address is required"

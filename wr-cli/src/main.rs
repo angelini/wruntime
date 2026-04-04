@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Db(args) => cmd::db::run(args).await,
-        Commands::Dev(args) => cmd::dev::run(args, require_manager(&cli.manager)?).await,
+        Commands::Dev(args) => cmd::dev::run(args, cli.manager.as_deref()).await,
         Commands::Engines(args) => cmd::engines::run(args, require_manager(&cli.manager)?).await,
         Commands::Managers(args) => cmd::managers::run(args, require_manager(&cli.manager)?).await,
         Commands::Services(args) => cmd::services::run(args, require_manager(&cli.manager)?).await,

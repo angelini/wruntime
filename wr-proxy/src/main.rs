@@ -1,5 +1,6 @@
 mod circuit_breaker;
 pub mod config;
+pub mod indexed_routing;
 mod layers;
 pub mod node_service;
 pub mod routing;
@@ -147,14 +148,7 @@ async fn main() -> Result<()> {
     }
 
     // ── Wait for shutdown signal ──────────────────────────────────────────
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
-
-    tokio::select! {
-        _ = sigint.recv()  => {},
-        _ = sigterm.recv() => {},
-    }
+    wr_common::signal::shutdown_signal().await;
     Ok(())
 }
 

@@ -251,15 +251,13 @@ impl proto::LedgerService for Component {
         )
         .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
 
-        let buyer_spend = match cash_check
+        let buyer_spend: i64 = cash_check
             .first()
             .and_then(|r| match &r.columns[0].value {
                 PgValue::Int8(v) => Some(*v),
                 _ => None,
-            }) {
-            Some(v) => v,
-            None => 0,
-        };
+            })
+            .unwrap_or_default();
 
         // Check 3: Cross-check snapshot from blobstore against DB.
         let snapshot_ok = match store::list_objects("stockmarket", Some("ledger-snapshots/")) {
@@ -321,12 +319,11 @@ impl proto::LedgerService for Component {
 
         let per_symbol = share_rows.len();
         details.push(format!("symbols traded: {per_symbol}"));
-        details.push(format!(
-            "share conservation: OK (each trade is a matched buyer+seller pair)"
-        ));
-        details.push(format!(
-            "cash conservation: OK (each trade transfers equal cash buyer->seller)"
-        ));
+        details
+            .push("share conservation: OK (each trade is a matched buyer+seller pair)".to_string());
+        details.push(
+            "cash conservation: OK (each trade transfers equal cash buyer->seller)".to_string(),
+        );
 
         let valid = snapshot_ok;
 
@@ -349,13 +346,13 @@ impl proto::LedgerService for Component {
         let rows = database::query("SELECT COUNT(*) FROM trades", &[])
             .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
 
-        let count = match rows.first().and_then(|r| match &r.columns[0].value {
-            PgValue::Int8(v) => Some(*v),
-            _ => None,
-        }) {
-            Some(v) => v,
-            None => 0,
-        };
+        let count: i64 = rows
+            .first()
+            .and_then(|r| match &r.columns[0].value {
+                PgValue::Int8(v) => Some(*v),
+                _ => None,
+            })
+            .unwrap_or_default();
 
         Ok(proto::GetTradeCountResponse { count })
     }

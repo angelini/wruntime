@@ -6,11 +6,11 @@ mod proto {
 #[allow(dead_code, unused_imports)]
 mod bindings;
 
+use prost::Message;
 use proto::InventoryServiceClient;
 use wr_sdk::bindings::wasi::http::types::{IncomingRequest, Method, ResponseOutparam};
 use wr_sdk::io::{err_body, read_body, send_response};
 use wr_sdk::tracing;
-use prost::Message;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
@@ -63,10 +63,13 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
         match i % 6 {
             // 0, 3 — Buy
             0 | 3 => {
-                let sp = tracing::start("client.buy", &[
-                    ("product.id", &product_id),
-                    ("product.quantity", &quantity.to_string()),
-                ]);
+                let sp = tracing::start(
+                    "client.buy",
+                    &[
+                        ("product.id", &product_id),
+                        ("product.quantity", &quantity.to_string()),
+                    ],
+                );
                 match inv.buy(proto::BuyRequest {
                     product_id: product_id.clone(),
                     quantity,
@@ -93,10 +96,13 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
             // 1 — Return a previously purchased item
             1 => {
                 if let Some((ret_id, ret_qty)) = purchased.pop() {
-                    let sp = tracing::start("client.return", &[
-                        ("product.id", ret_id.as_str()),
-                        ("product.quantity", &ret_qty.to_string()),
-                    ]);
+                    let sp = tracing::start(
+                        "client.return",
+                        &[
+                            ("product.id", ret_id.as_str()),
+                            ("product.quantity", &ret_qty.to_string()),
+                        ],
+                    );
                     match inv.r#return(proto::ReturnRequest {
                         product_id: ret_id.clone(),
                         quantity: ret_qty,
@@ -117,18 +123,13 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
             }
             // 2 — GetStock (read-only, high-frequency)
             2 => {
-                let sp = tracing::start("client.get_stock", &[
-                    ("product.id", &product_id),
-                ]);
+                let sp = tracing::start("client.get_stock", &[("product.id", &product_id)]);
                 match inv.get_stock(proto::GetStockRequest {
                     product_id: product_id.clone(),
                 }) {
                     Ok(r) => {
                         tracing::set_attribute(&sp, "product.stock", &r.stock.to_string());
-                        wr_sdk::log::log(&format!(
-                            "stock {} = {}",
-                            product_id, r.stock
-                        ));
+                        wr_sdk::log::log(&format!("stock {} = {}", product_id, r.stock));
                     }
                     Err(e) => {
                         tracing::set_error(&sp, &e);
@@ -142,18 +143,25 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                 let to_idx = ((i.wrapping_mul(11).wrapping_add(3)) % 50) as usize;
                 let to_product_id = PRODUCTS[to_idx].to_string();
                 if product_id != to_product_id {
-                    let sp = tracing::start("client.transfer", &[
-                        ("product.from", &product_id),
-                        ("product.to", &to_product_id),
-                        ("product.quantity", &quantity.to_string()),
-                    ]);
+                    let sp = tracing::start(
+                        "client.transfer",
+                        &[
+                            ("product.from", &product_id),
+                            ("product.to", &to_product_id),
+                            ("product.quantity", &quantity.to_string()),
+                        ],
+                    );
                     match inv.transfer(proto::TransferRequest {
                         from_product_id: product_id.clone(),
                         to_product_id: to_product_id.clone(),
                         quantity,
                     }) {
                         Ok(r) => {
-                            tracing::set_attribute(&sp, "product.transferred", &r.transferred.to_string());
+                            tracing::set_attribute(
+                                &sp,
+                                "product.transferred",
+                                &r.transferred.to_string(),
+                            );
                             wr_sdk::log::log(&format!(
                                 "transferred {} → {} x{}",
                                 product_id, to_product_id, r.transferred
@@ -176,10 +184,13 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
             }
             // 5 — Restock
             _ => {
-                let sp = tracing::start("client.restock", &[
-                    ("product.id", &product_id),
-                    ("product.quantity", &(quantity * 10).to_string()),
-                ]);
+                let sp = tracing::start(
+                    "client.restock",
+                    &[
+                        ("product.id", &product_id),
+                        ("product.quantity", &(quantity * 10).to_string()),
+                    ],
+                );
                 match inv.restock(proto::RestockRequest {
                     product_id: product_id.clone(),
                     quantity: quantity * 10,
@@ -205,12 +216,22 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
 
     tracing::set_attribute(&run_span, "client.completed", &completed.to_string());
     tracing::set_attribute(&run_span, "client.errors", &errors.len().to_string());
-    wr_sdk::log::log(&format!("client done — {completed} operations, {} errors", errors.len()));
+    wr_sdk::log::log(&format!(
+        "client done — {completed} operations, {} errors",
+        errors.len()
+    ));
 
     if errors.is_empty() {
         (200, proto::RunResponse { completed }.encode_to_vec())
     } else {
-        err_body(500, &format!("{} operation(s) failed: {}", errors.len(), errors.join("; ")))
+        err_body(
+            500,
+            &format!(
+                "{} operation(s) failed: {}",
+                errors.len(),
+                errors.join("; ")
+            ),
+        )
     }
 }
 

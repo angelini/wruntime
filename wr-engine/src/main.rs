@@ -218,15 +218,7 @@ async fn main() -> Result<()> {
     info!("engine running — press Ctrl+C to stop");
 
     // ── Wait for shutdown signal (SIGINT or SIGTERM) ──────────────────────
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigint = signal(SignalKind::interrupt())?;
-        let mut sigterm = signal(SignalKind::terminate())?;
-        tokio::select! {
-            _ = sigint.recv()  => {},
-            _ = sigterm.recv() => {},
-        }
-    }
+    wr_common::signal::shutdown_signal().await;
     info!("engine shutting down");
 
     // ── Deregister ────────────────────────────────────────────────────────

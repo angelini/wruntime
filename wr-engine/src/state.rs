@@ -144,20 +144,20 @@ pub struct ModuleServices {
     pub db_pool: Option<Arc<Pool>>,
     /// Postgres schema name for this module (`wr__{namespace}__{name}`).
     /// Set when DB access is enabled; used to scope all queries to the module's schema.
-    pub db_schema: Option<String>,
+    pub db_schema: Option<Arc<str>>,
     /// Timeout configuration for guest DB connections.
     pub db_timeouts: DbTimeouts,
     /// Shared S3-compatible blobstore client, present when the module has blobstore access enabled.
     pub blobstore: Option<Arc<BlobstoreRuntime>>,
     /// S3 key prefix for namespace isolation (e.g. `wr/ecommerce/`).
     /// Set when blobstore access is enabled; transparently prepended to all object keys.
-    pub blob_prefix: Option<String>,
+    pub blob_prefix: Option<Arc<str>>,
     /// Shared LLM inference client, present when the module has LLM access enabled.
     pub llm: Option<Arc<LlmRuntime>>,
     /// WASI filesystem mode (e.g. `FsMode::Tempdir`).
     pub fs: Option<FsMode>,
     /// Resolved environment variables for this module (plain + decrypted secrets).
-    pub env_vars: std::collections::HashMap<String, String>,
+    pub env_vars: Arc<std::collections::HashMap<String, String>>,
     /// The `engine.dispatch` span for the current request.
     /// Captured at `ModuleState` construction time so host functions can create
     /// child spans even when wasmtime's synchronous call stack is outside the
@@ -175,7 +175,7 @@ impl Default for ModuleServices {
             blob_prefix: None,
             llm: None,
             fs: None,
-            env_vars: std::collections::HashMap::new(),
+            env_vars: Arc::new(std::collections::HashMap::new()),
             active_span: tracing::Span::none(),
         }
     }
@@ -190,7 +190,7 @@ pub struct ModuleState {
     pub db_pool: Option<Arc<Pool>>,
     /// Postgres schema name for this module (`wr__{namespace}__{name}`).
     /// Set when DB access is enabled; used to scope all queries to the module's schema.
-    pub db_schema: Option<String>,
+    pub db_schema: Option<Arc<str>>,
     /// Timeout configuration for guest DB connections.
     pub db_timeouts: DbTimeouts,
     /// Ephemeral temp directory backing the module's WASI filesystem.
@@ -200,7 +200,7 @@ pub struct ModuleState {
     /// Shared S3-compatible blobstore client, present when the module has blobstore access enabled.
     pub blobstore: Option<Arc<BlobstoreRuntime>>,
     /// S3 key prefix for namespace isolation (e.g. `wr/ecommerce/`).
-    pub blob_prefix: Option<String>,
+    pub blob_prefix: Option<Arc<str>>,
     /// Shared LLM inference client, present when the module has LLM access enabled.
     pub llm: Option<Arc<LlmRuntime>>,
     /// The `engine.dispatch` span for the current request.
@@ -217,7 +217,7 @@ impl ModuleState {
     ) -> anyhow::Result<Self> {
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stdio();
-        for (key, value) in &services.env_vars {
+        for (key, value) in services.env_vars.iter() {
             builder.env(key, value);
         }
         let fs_root = match services.fs.as_ref() {

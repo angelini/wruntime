@@ -1,4 +1,4 @@
-use deadpool_postgres::{Config, Pool, PoolConfig, Runtime};
+pub use wr_common::pool::build_pool;
 
 /// Returns the Postgres schema name for a module.
 /// Format: `wr__{namespace}__{name}` with non-alphanumeric chars replaced by `_`.
@@ -22,17 +22,6 @@ pub fn blob_key_prefix(namespace: &str) -> String {
             .collect::<String>()
     };
     format!("wr/{}/", sanitize(namespace))
-}
-
-pub fn build_pool(database_url: &str, max_size: usize) -> anyhow::Result<Pool> {
-    let mut cfg = Config::new();
-    cfg.url = Some(database_url.to_string());
-    cfg.pool = Some(PoolConfig {
-        max_size,
-        ..Default::default()
-    });
-    cfg.create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
-        .map_err(Into::into)
 }
 
 #[cfg(test)]

@@ -61,8 +61,8 @@ impl proto::ExchangeService for Component {
             ],
         );
 
-        let tx = database::begin_transaction()
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        let tx =
+            database::begin_transaction().map_err(|e| ServiceError::internal(format!("{e:?}")))?;
 
         // Insert the new order.
         let rows = match tx.query(
@@ -95,9 +95,15 @@ impl proto::ExchangeService for Component {
         // Buy orders match sells at price <= buy price (cheapest first).
         // Sell orders match buys at price >= sell price (most expensive first).
         let (side_filter, order_clause) = if req.is_buy {
-            ("is_buy = false AND price <= $2", "price ASC, created_at ASC")
+            (
+                "is_buy = false AND price <= $2",
+                "price ASC, created_at ASC",
+            )
         } else {
-            ("is_buy = true AND price >= $2", "price DESC, created_at ASC")
+            (
+                "is_buy = true AND price >= $2",
+                "price DESC, created_at ASC",
+            )
         };
 
         let match_sql = format!(

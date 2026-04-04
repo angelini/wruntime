@@ -9,14 +9,17 @@ use wr_common::wruntime::{EngineRegistration, RoutingRule, RoutingTable};
 /// Acquire the global routing-table lock within an existing transaction.
 /// Returns the current version. Uses NOWAIT so concurrent writers get an
 /// immediate `Status::aborted` instead of blocking.
-async fn acquire_global_lock(txn: &deadpool_postgres::Transaction<'_>) -> Result<i64, Status> {
+async fn acquire_global_lock(
+    txn: &deadpool_postgres::Transaction<'_>,
+    operation: &str,
+) -> Result<i64, Status> {
     let row = txn
         .query_one(
             "SELECT version FROM wr_manager_lock WHERE id = 1 FOR UPDATE NOWAIT",
             &[],
         )
         .await
-        .map_err(map_lock_err)?;
+        .map_err(|e| map_lock_err(e, operation))?;
     Ok(row.get(0))
 }
 
@@ -34,12 +37,14 @@ async fn increment_version(txn: &deadpool_postgres::Transaction<'_>) -> Result<i
 
 /// Map a Postgres error to a tonic Status.
 /// `LOCK_NOT_AVAILABLE` (55P03) becomes `Status::aborted` so callers can retry.
-fn map_lock_err(e: tokio_postgres::Error) -> Status {
+fn map_lock_err(e: tokio_postgres::Error, operation: &str) -> Status {
     let code = e.code().map(|c| c.code()).unwrap_or_default();
     if code == "55P03" {
-        Status::aborted("concurrent write conflict")
+        Status::aborted(format!(
+            "concurrent write conflict during {operation} — another routing table update is in progress, retry"
+        ))
     } else {
-        Status::internal(format!("lock query failed: {e}"))
+        Status::internal(format!("lock query failed during {operation}: {e}"))
     }
 }
 
@@ -120,7 +125,7 @@ pub async fn deregister_engine(pool: &Pool, engine_id: &str) -> Result<(), Statu
     let mut client = pool.get().await.map_err(internal)?;
     let txn = client.transaction().await.map_err(internal)?;
 
-    acquire_global_lock(&txn).await?;
+    acquire_global_lock_wait(&txn).await?;
 
     let changed = txn
         .execute(
@@ -247,7 +252,7 @@ pub async fn upsert_routing_rule(pool: &Pool, rule: &RoutingRule) -> Result<(), 
     let mut client = pool.get().await.map_err(internal)?;
     let txn = client.transaction().await.map_err(internal)?;
 
-    acquire_global_lock(&txn).await?;
+    acquire_global_lock(&txn, "upsert_routing_rule").await?;
 
     txn.execute(
         "INSERT INTO wr_routing_rules (
@@ -292,7 +297,7 @@ pub async fn delete_routing_rule(pool: &Pool, rule_id: &str) -> Result<bool, Sta
     let mut client = pool.get().await.map_err(internal)?;
     let txn = client.transaction().await.map_err(internal)?;
 
-    acquire_global_lock(&txn).await?;
+    acquire_global_lock(&txn, "delete_routing_rule").await?;
 
     let deleted = txn
         .execute(

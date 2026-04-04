@@ -1,23 +1,18 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
 use tracing::{info, warn};
 use wr_common::discovery::ManagerDiscovery;
-use wr_common::wruntime::{
-    manager_service_client::ManagerServiceClient, GetRoutingTableRequest, RoutingTable,
-};
+use wr_common::wruntime::{manager_service_client::ManagerServiceClient, GetRoutingTableRequest};
 
 use crate::circuit_breaker::CircuitBreakerRegistry;
+use crate::indexed_routing::IndexedRoutingTable;
 
-pub type CachedRoutingTable = Arc<RwLock<RoutingTable>>;
+pub type CachedRoutingTable = Arc<RwLock<IndexedRoutingTable>>;
 
 pub fn new_routing_table() -> CachedRoutingTable {
-    Arc::new(RwLock::new(RoutingTable {
-        rules: vec![],
-        version: 0,
-    }))
+    Arc::new(RwLock::new(IndexedRoutingTable::empty()))
 }
 
 /// Perform a single routing-table sync from wr-manager.
@@ -32,13 +27,10 @@ pub async fn sync_once(
         .await?;
     if let Some(incoming) = resp.into_inner().table {
         let version = incoming.version;
-        let active: HashSet<&str> = incoming
-            .rules
-            .iter()
-            .map(|r| r.engine_address.as_str())
-            .collect();
+        let indexed = IndexedRoutingTable::from_proto(&incoming);
+        let active = indexed.active_engines();
         cb_registry.evict_missing(&active);
-        *table.write().await = incoming;
+        *table.write().await = indexed;
         info!(version, "routing table updated");
     }
     Ok(())

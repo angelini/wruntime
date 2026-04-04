@@ -110,24 +110,26 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
     // Place orders for each trader.
     for t in 0..num_traders {
         let trader_id = format!("trader-{:04}", t);
-        let trader_span = tracing::start(
-            "simulator.trader",
-            &[("trader.id", trader_id.as_str())],
-        );
+        let trader_span = tracing::start("simulator.trader", &[("trader.id", trader_id.as_str())]);
 
         for o in 0..orders_per_trader {
             // Deterministic pseudo-random parameters.
-            let sym_idx =
-                ((t as u64).wrapping_mul(7).wrapping_add(o as u64).wrapping_mul(13)) as u32
-                    % (num_symbols as u32);
+            let sym_idx = ((t as u64)
+                .wrapping_mul(7)
+                .wrapping_add(o as u64)
+                .wrapping_mul(13)) as u32
+                % (num_symbols as u32);
             let symbol = &symbols[sym_idx as usize];
 
             // 2/3 buys, 1/3 sells — generates more order book depth.
             let is_buy = (o % 3) != 0;
 
             // Price: 1000-1499 cents ($10.00-$14.99), varies by trader and order.
-            let price =
-                1000 + ((t as i64).wrapping_mul(11).wrapping_add((o as i64).wrapping_mul(17)) % 500)
+            let price = 1000
+                + ((t as i64)
+                    .wrapping_mul(11)
+                    .wrapping_add((o as i64).wrapping_mul(17))
+                    % 500)
                     .unsigned_abs() as i64;
 
             // Quantity: 1-10 shares.

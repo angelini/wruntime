@@ -248,7 +248,8 @@ pub async fn sync_table(
         .into_inner()
         .table
     {
-        *table.write().await = incoming;
+        *table.write().await =
+            wr_proxy::indexed_routing::IndexedRoutingTable::from_proto(&incoming);
     }
     Ok(())
 }
@@ -915,7 +916,7 @@ pub async fn db_state_for_module(pool_size: usize, namespace: &str, name: &str) 
         http_client(),
         ModuleServices {
             db_pool: Some(pool),
-            db_schema: Some(schema),
+            db_schema: Some(Arc::from(schema)),
             ..Default::default()
         },
     )

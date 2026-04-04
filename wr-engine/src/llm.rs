@@ -105,58 +105,31 @@ impl LlmRuntime {
         tokio::spawn(async move {
             use futures::StreamExt;
             let mut stream = resp.bytes_stream();
-            let mut buf = String::new();
+            let mut parser = SseParser::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(_) => break,
                 };
-                buf.push_str(&String::from_utf8_lossy(&chunk));
-
-                // Parse SSE lines from buffer
-                while let Some(pos) = buf.find("\n\n") {
-                    let event_block = buf[..pos].to_string();
-                    buf = buf[pos + 2..].to_string();
-
-                    let mut event_type = "";
-                    let mut data = String::new();
-                    for line in event_block.lines() {
-                        if let Some(t) = line.strip_prefix("event: ") {
-                            event_type = match t.trim() {
-                                "content_block_delta" => "content_block_delta",
-                                "message_delta" => "message_delta",
-                                "message_stop" => "message_stop",
-                                _ => "",
-                            };
-                        } else if let Some(d) = line.strip_prefix("data: ") {
-                            data = d.to_string();
-                        }
-                    }
-
-                    match event_type {
-                        "content_block_delta" => {
-                            if let Ok(delta) = serde_json::from_str::<ContentBlockDelta>(&data) {
-                                if delta.delta.delta_type == "text_delta"
-                                    && tx.send(StreamEvent::Delta(delta.delta.text)).await.is_err()
-                                {
-                                    return;
-                                }
+                for event in parser.feed(&String::from_utf8_lossy(&chunk)) {
+                    match event {
+                        SseEvent::Delta(text) => {
+                            if tx.send(StreamEvent::Delta(text)).await.is_err() {
+                                return;
                             }
                         }
-                        "message_delta" => {
-                            if let Ok(msg) = serde_json::from_str::<MessageDelta>(&data) {
-                                if let Some(usage) = msg.usage {
-                                    let _ = tx
-                                        .send(StreamEvent::Usage {
-                                            input_tokens: usage.input_tokens.unwrap_or(0),
-                                            output_tokens: usage.output_tokens,
-                                        })
-                                        .await;
-                                }
-                            }
+                        SseEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                        } => {
+                            let _ = tx
+                                .send(StreamEvent::Usage {
+                                    input_tokens,
+                                    output_tokens,
+                                })
+                                .await;
                         }
-                        "message_stop" => return,
-                        _ => {}
+                        SseEvent::Stop => return,
                     }
                 }
             }
@@ -168,6 +141,77 @@ impl LlmRuntime {
     /// Enforce host-side max_tokens ceiling.
     pub fn clamp_max_tokens(&self, requested: u32) -> u32 {
         requested.min(self.max_tokens_limit)
+    }
+}
+
+// ── SSE stream parser ───────────────────────────────────────────────────────
+
+enum SseEvent {
+    Delta(String),
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
+    Stop,
+}
+
+struct SseParser {
+    buf: String,
+}
+
+impl SseParser {
+    fn new() -> Self {
+        Self { buf: String::new() }
+    }
+
+    fn feed(&mut self, chunk: &str) -> Vec<SseEvent> {
+        self.buf.push_str(chunk);
+        let mut events = Vec::new();
+        while let Some(pos) = self.buf.find("\n\n") {
+            let event_block = self.buf[..pos].to_string();
+            self.buf = self.buf[pos + 2..].to_string();
+            if let Some(event) = Self::parse_block(&event_block) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    fn parse_block(block: &str) -> Option<SseEvent> {
+        let mut event_type = "";
+        let mut data = String::new();
+        for line in block.lines() {
+            if let Some(t) = line.strip_prefix("event: ") {
+                event_type = match t.trim() {
+                    "content_block_delta" => "content_block_delta",
+                    "message_delta" => "message_delta",
+                    "message_stop" => "message_stop",
+                    _ => "",
+                };
+            } else if let Some(d) = line.strip_prefix("data: ") {
+                data = d.to_string();
+            }
+        }
+        match event_type {
+            "content_block_delta" => {
+                let delta: ContentBlockDelta = serde_json::from_str(&data).ok()?;
+                if delta.delta.delta_type == "text_delta" {
+                    Some(SseEvent::Delta(delta.delta.text))
+                } else {
+                    None
+                }
+            }
+            "message_delta" => {
+                let msg: MessageDelta = serde_json::from_str(&data).ok()?;
+                let usage = msg.usage?;
+                Some(SseEvent::Usage {
+                    input_tokens: usage.input_tokens.unwrap_or(0),
+                    output_tokens: usage.output_tokens,
+                })
+            }
+            "message_stop" => Some(SseEvent::Stop),
+            _ => None,
+        }
     }
 }
 
@@ -300,7 +344,7 @@ use wruntime::llm::inference::{
 impl Host for ModuleState {
     async fn complete(&mut self, req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let runtime = require_llm(&self.llm)?;
-        let api_req = to_api_request(&runtime, &req);
+        let api_req = to_api_request(runtime, &req);
         match runtime.complete(api_req).await {
             Ok(resp) => Ok(from_api_response(resp)),
             Err(e) => Err(from_error_kind(e)),
@@ -312,7 +356,7 @@ impl Host for ModuleState {
         req: CompletionRequest,
     ) -> Result<Resource<CompletionStreamState>, LlmError> {
         let runtime = require_llm(&self.llm)?;
-        let api_req = to_api_request(&runtime, &req);
+        let api_req = to_api_request(runtime, &req);
         match runtime.complete_stream(api_req).await {
             Ok(rx) => {
                 let handle = self
@@ -367,9 +411,9 @@ impl HostCompletionStream for ModuleState {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn require_llm(client: &Option<Arc<LlmRuntime>>) -> Result<Arc<LlmRuntime>, LlmError> {
+fn require_llm(client: &Option<Arc<LlmRuntime>>) -> Result<&LlmRuntime, LlmError> {
     client
-        .clone()
+        .as_deref()
         .ok_or_else(|| LlmError::InvalidRequest("no LLM configured for this module".into()))
 }
 

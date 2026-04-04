@@ -11,6 +11,7 @@ pub use routing::RoutingLayer;
 pub use tracing::TracingLayer;
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -78,12 +79,15 @@ pub fn error_response(status: http::StatusCode, msg: &str) -> Response<ResBody> 
 }
 
 /// Routing decision made by [`RoutingLayer`]; consumed by [`ForwardService`].
+///
+/// Addresses are stored as `Arc<str>` so cloning a `Destination` is a
+/// cheap reference-count bump instead of a heap allocation.
 #[derive(Clone)]
 pub enum Destination {
     /// Forward directly to the local engine at this address.
-    LocalEngine(String),
+    LocalEngine(Arc<str>),
     /// Forward to a peer proxy at this address (cross-node hop).
-    RemoteProxy(String),
+    RemoteProxy(Arc<str>),
 }
 
 impl Destination {

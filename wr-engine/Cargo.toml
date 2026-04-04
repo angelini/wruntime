@@ -18,10 +18,9 @@ http-body-util     = "0.1"
 bytes              = "1"
 anyhow             = "1"
 futures            = "0.3"
-toml               = "0.8"
 serde              = { version = "1", features = ["derive"] }
 uuid               = { version = "1", features = ["v4"] }
-wr-common           = { path = "../wr-common" }
+wr-common           = { path = "../wr-common", features = ["pool", "config", "signal"] }
 tracing              = "0.1"
 tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
 tracing-opentelemetry = "0.32"
@@ -32,5 +31,6 @@ chrono              = "0.4"
 serde_json          = "1"
 rust_decimal        = { version = "1", features = ["db-tokio-postgres"] }
 rust-s3             = { version = "0.37", default-features = false, features = ["tags", "tokio-native-tls"] }
+hashbrown            = "0.15"
 refinery             = { version = "0.8", features = ["tokio-postgres"] }
 reqwest             = { version = "0.12", features = ["json", "stream"] }

@@ -105,15 +105,7 @@ async fn main() -> Result<()> {
 
     info!(address = %addr, "manager listening");
 
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let shutdown = async move {
-        tokio::select! {
-            _ = sigint.recv()  => {},
-            _ = sigterm.recv() => {},
-        }
-    };
+    let shutdown = wr_common::signal::shutdown_signal();
 
     Server::builder()
         .add_service(ManagerServiceServer::new(manager))

@@ -91,8 +91,8 @@ impl proto::InventoryService for Component {
             ],
         );
 
-        let tx = database::begin_transaction()
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        let tx =
+            database::begin_transaction().map_err(|e| ServiceError::internal(format!("{e:?}")))?;
 
         let rows = match tx.query(
             "SELECT stock FROM inventory WHERE product_id = $1 FOR UPDATE",
@@ -160,10 +160,7 @@ impl proto::InventoryService for Component {
         })
     }
 
-    fn r#return(
-        &self,
-        req: proto::ReturnRequest,
-    ) -> Result<proto::ReturnResponse, ServiceError> {
+    fn r#return(&self, req: proto::ReturnRequest) -> Result<proto::ReturnResponse, ServiceError> {
         if req.quantity <= 0 {
             return Err(ServiceError::bad_request("quantity must be > 0"));
         }
@@ -220,8 +217,8 @@ impl proto::InventoryService for Component {
             ],
         );
 
-        let tx = database::begin_transaction()
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        let tx =
+            database::begin_transaction().map_err(|e| ServiceError::internal(format!("{e:?}")))?;
 
         // Lock both rows in consistent lexicographic order to avoid deadlocks.
         let lock_first = if req.from_product_id < req.to_product_id {
@@ -242,9 +239,7 @@ impl proto::InventoryService for Component {
             ) {
                 Ok(rows) if rows.is_empty() => {
                     let _ = tx.rollback();
-                    return Err(ServiceError::not_found(format!(
-                        "product {id} not found"
-                    )));
+                    return Err(ServiceError::not_found(format!("product {id} not found")));
                 }
                 Err(e) => {
                     let _ = tx.rollback();
@@ -277,7 +272,10 @@ impl proto::InventoryService for Component {
 
         if stock_from < req.quantity {
             let _ = tx.rollback();
-            tracing::set_error(&sp, &format!("insufficient stock — available: {stock_from}"));
+            tracing::set_error(
+                &sp,
+                &format!("insufficient stock — available: {stock_from}"),
+            );
             return Err(ServiceError::conflict(format!(
                 "insufficient stock — available: {stock_from}"
             )));
@@ -323,10 +321,7 @@ impl proto::InventoryService for Component {
         })
     }
 
-    fn restock(
-        &self,
-        req: proto::RestockRequest,
-    ) -> Result<proto::RestockResponse, ServiceError> {
+    fn restock(&self, req: proto::RestockRequest) -> Result<proto::RestockResponse, ServiceError> {
         if req.quantity <= 0 {
             return Err(ServiceError::bad_request("quantity must be > 0"));
         }

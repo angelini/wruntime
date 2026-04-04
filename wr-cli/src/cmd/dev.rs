@@ -63,15 +63,25 @@ pub struct DeployArgs {
     modules: Vec<String>,
 }
 
-pub async fn run(args: DevArgs, manager: &str) -> Result<()> {
+pub async fn run(args: DevArgs, manager: Option<&str>) -> Result<()> {
     match args.command {
         DevCommand::Up {
             manager_config,
             proxy_config,
         } => up(&manager_config, &proxy_config).await,
         DevCommand::Down => down().await,
-        DevCommand::Deploy(deploy_args) => deploy(deploy_args, manager).await,
-        DevCommand::Status => status(manager).await,
+        DevCommand::Deploy(deploy_args) => {
+            let addr = manager.ok_or_else(|| {
+                anyhow::anyhow!("--manager (or WR_MANAGER env var) is required for dev deploy")
+            })?;
+            deploy(deploy_args, addr).await
+        }
+        DevCommand::Status => {
+            let addr = manager.ok_or_else(|| {
+                anyhow::anyhow!("--manager (or WR_MANAGER env var) is required for dev status")
+            })?;
+            status(addr).await
+        }
     }
 }
 
@@ -139,19 +149,66 @@ fn kill_process(pid: u32) -> bool {
 
 // --- Subcommands ---
 
+/// Start a service process if not already running, or keep the existing PID entry.
+async fn start_or_reuse_service(
+    role: &str,
+    binary_name: &str,
+    config_path: &str,
+    existing: &[PidEntry],
+    entries: &mut Vec<PidEntry>,
+) -> Result<()> {
+    let alive = existing
+        .iter()
+        .any(|e| e.role == role && is_process_alive(e.pid));
+
+    if alive {
+        if let Some(e) = existing.iter().find(|e| e.role == role) {
+            entries.push(PidEntry {
+                role: e.role.clone(),
+                pid: e.pid,
+                config: e.config.clone(),
+            });
+        }
+        return Ok(());
+    }
+
+    if !Path::new(config_path).exists() {
+        bail!("{role} config not found: {config_path}");
+    }
+
+    let bin = resolve_binary(binary_name);
+    let child = Command::new(&bin)
+        .arg(config_path)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to start {bin}"))?;
+    let pid = child.id();
+    println!("{role:<8} pid={}  config={}", pid, config_path);
+
+    let listen_addr = helpers::parse_listen_address(config_path)?;
+    wait_for_port_or_exit(pid, &listen_addr, Duration::from_secs(30)).await?;
+
+    entries.push(PidEntry {
+        role: role.into(),
+        pid,
+        config: Some(config_path.to_string()),
+    });
+    Ok(())
+}
+
 async fn up(manager_config: &str, proxy_config: &str) -> Result<()> {
-    // Check if already running
-    let entries = read_pid_file().unwrap_or_default();
-    let manager_alive = entries
+    let existing = read_pid_file().unwrap_or_default();
+    let manager_alive = existing
         .iter()
         .any(|e| e.role == "manager" && is_process_alive(e.pid));
-    let proxy_alive = entries
+    let proxy_alive = existing
         .iter()
         .any(|e| e.role == "proxy" && is_process_alive(e.pid));
 
     if manager_alive && proxy_alive {
         println!("Dev infrastructure already running.");
-        for e in &entries {
+        for e in &existing {
             if e.role == "manager" || e.role == "proxy" {
                 println!("  {}  pid={}", e.role, e.pid);
             }
@@ -159,79 +216,27 @@ async fn up(manager_config: &str, proxy_config: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Validate config files exist
-    if !Path::new(manager_config).exists() {
-        bail!("Manager config not found: {manager_config}");
-    }
-    if !Path::new(proxy_config).exists() {
-        bail!("Proxy config not found: {proxy_config}");
-    }
-
     let mut new_entries: Vec<PidEntry> = Vec::new();
 
-    // Start manager
-    if !manager_alive {
-        let bin = resolve_binary("wr-manager");
-        let child = Command::new(&bin)
-            .arg(manager_config)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("failed to start {bin}"))?;
-        let pid = child.id();
-        println!("manager  pid={}  config={}", pid, manager_config);
-        new_entries.push(PidEntry {
-            role: "manager".into(),
-            pid,
-            config: Some(manager_config.to_string()),
-        });
-
-        // Wait for manager to be ready
-        println!("Waiting for manager to be ready...");
-        let manager_addr = helpers::parse_listen_address(manager_config)?;
-        wait_for_port_or_exit(pid, &manager_addr, Duration::from_secs(30)).await?;
-    } else {
-        // Keep existing manager entry
-        if let Some(e) = entries.iter().find(|e| e.role == "manager") {
-            new_entries.push(PidEntry {
-                role: e.role.clone(),
-                pid: e.pid,
-                config: e.config.clone(),
-            });
-        }
-    }
-
-    // Start proxy
-    if !proxy_alive {
-        let bin = resolve_binary("wr-proxy");
-        let proxy_listen = helpers::parse_listen_address(proxy_config)?;
-        let child = Command::new(&bin)
-            .arg(proxy_config)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("failed to start {bin}"))?;
-        let pid = child.id();
-        println!("proxy    pid={}  config={}", pid, proxy_config);
-
-        // Wait for proxy to be ready
-        wait_for_port_or_exit(pid, &proxy_listen, Duration::from_secs(30)).await?;
-
-        new_entries.push(PidEntry {
-            role: "proxy".into(),
-            pid,
-            config: Some(proxy_config.to_string()),
-        });
-    } else if let Some(e) = entries.iter().find(|e| e.role == "proxy") {
-        new_entries.push(PidEntry {
-            role: e.role.clone(),
-            pid: e.pid,
-            config: e.config.clone(),
-        });
-    }
+    start_or_reuse_service(
+        "manager",
+        "wr-manager",
+        manager_config,
+        &existing,
+        &mut new_entries,
+    )
+    .await?;
+    start_or_reuse_service(
+        "proxy",
+        "wr-proxy",
+        proxy_config,
+        &existing,
+        &mut new_entries,
+    )
+    .await?;
 
     // Keep any existing engine entries
-    for e in &entries {
+    for e in &existing {
         if e.role == "engine" && is_process_alive(e.pid) {
             new_entries.push(PidEntry {
                 role: e.role.clone(),
@@ -253,8 +258,33 @@ async fn down() -> Result<()> {
         return Ok(());
     }
 
-    // Kill in reverse order: engines first, then proxy, then manager
-    for role in &["engine", "proxy", "manager"] {
+    // Kill engines first and wait for them to exit (so they can deregister
+    // via the proxy before it goes away), then stop proxy + manager.
+    for e in entries.iter().filter(|e| e.role == "engine") {
+        if is_process_alive(e.pid) {
+            if kill_process(e.pid) {
+                println!("Stopped engine  pid={}", e.pid);
+            } else {
+                println!("Failed to stop engine  pid={}", e.pid);
+            }
+        } else {
+            println!("engine  pid={}  (already dead)", e.pid);
+        }
+    }
+
+    // Wait for all engines to finish deregistering before tearing down infra
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let any_alive = entries
+            .iter()
+            .any(|e| e.role == "engine" && is_process_alive(e.pid));
+        if !any_alive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    for role in &["proxy", "manager"] {
         for e in entries.iter().filter(|e| e.role == *role) {
             if is_process_alive(e.pid) {
                 if kill_process(e.pid) {

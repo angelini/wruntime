@@ -227,6 +227,176 @@ fn init(args: InitArgs) -> Result<()> {
     Ok(())
 }
 
+// --- bundle helpers ---
+
+/// Add engine configs and their module artifacts (WASM, schemas, migrations)
+/// to the tarball. Returns engine names and listen ports.
+fn add_engine_artifacts(
+    tar: &mut tar::Builder<GzEncoder<fs::File>>,
+    checksums: &mut HashMap<String, String>,
+    config_names: &mut Vec<String>,
+    manifest_modules: &mut Vec<ManifestModule>,
+    all_engine_configs: &[(String, EngineConfig)],
+) -> Result<(Vec<String>, Vec<u16>)> {
+    let mut seen_modules: HashMap<String, bool> = HashMap::new();
+    let mut engine_names: Vec<String> = Vec::new();
+    let mut engine_listen_ports: Vec<u16> = Vec::new();
+
+    for (i, (path, config)) in all_engine_configs.iter().enumerate() {
+        let config_name = if all_engine_configs.len() == 1 {
+            "engine.toml".to_string()
+        } else {
+            let stem = Path::new(path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("engine-{}", i + 1));
+            format!("{stem}.toml")
+        };
+
+        let bundle_config = config.to_bundle_config();
+        tar_add_bytes(
+            tar,
+            &format!("wr-node/config/{config_name}"),
+            bundle_config.to_toml()?.as_bytes(),
+            0o644,
+        )?;
+        config_names.push(config_name.clone());
+
+        engine_listen_ports.push(helpers::extract_port(&config.listen_address));
+
+        let engine_name = Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("engine-{}", i + 1));
+        engine_names.push(engine_name);
+
+        for module in &config.modules {
+            if seen_modules.contains_key(&module.name) {
+                continue;
+            }
+            seen_modules.insert(module.name.clone(), true);
+
+            let wasm_src = Path::new(&module.wasm_path);
+            if !wasm_src.exists() {
+                bail!(
+                    "WASM file not found: {}. Run without --skip-build.",
+                    wasm_src.display()
+                );
+            }
+            tar_add_file(
+                tar,
+                checksums,
+                &format!("wr-node/modules/{}.wasm", module.name),
+                wasm_src,
+                0o644,
+            )?;
+
+            if !module.schema_path.is_empty() {
+                let schema_src = Path::new(&module.schema_path);
+                if schema_src.exists() {
+                    tar_add_file(
+                        tar,
+                        checksums,
+                        &format!("wr-node/schemas/{}.binpb", module.name),
+                        schema_src,
+                        0o644,
+                    )?;
+                }
+            }
+
+            if let Some(ref mig_path) = module.migrations_path {
+                let mig_dir = Path::new(mig_path);
+                if mig_dir.is_dir() {
+                    add_migrations_dir(tar, checksums, mig_dir, &module.name)?;
+                }
+            }
+
+            manifest_modules.push(ManifestModule {
+                name: module.name.clone(),
+                namespace: module.namespace.clone(),
+                version: module.version.clone(),
+            });
+        }
+    }
+
+    Ok((engine_names, engine_listen_ports))
+}
+
+/// Generate and add systemd units, Dockerfiles, and docker-compose.yml to the tarball.
+fn add_deployment_artifacts(
+    tar: &mut tar::Builder<GzEncoder<fs::File>>,
+    args: &BundleArgs,
+    config_names: &[String],
+    engine_names: &[String],
+    engine_listen_ports: &[u16],
+) -> Result<()> {
+    let proxy_config = ProxyConfig::from_file(&args.proxy_config)?;
+    let proxy_port = helpers::extract_port(&proxy_config.listen_address);
+    let control_port = proxy_config
+        .control_address
+        .as_deref()
+        .map(helpers::extract_port)
+        .unwrap_or(9002);
+
+    // Systemd units
+    let proxy_service = generate_proxy_service(&args.workdir, &config_names[0]);
+    tar_add_bytes(
+        tar,
+        "wr-node/systemd/wr-proxy.service",
+        proxy_service.as_bytes(),
+        0o644,
+    )?;
+
+    for (i, engine_name) in engine_names.iter().enumerate() {
+        let cfg_name = &config_names[i + 1];
+        let service = generate_engine_service(&args.workdir, cfg_name, engine_name);
+        tar_add_bytes(
+            tar,
+            &format!("wr-node/systemd/wr-engine-{engine_name}.service"),
+            service.as_bytes(),
+            0o644,
+        )?;
+    }
+
+    // Docker artifacts
+    let proxy_dockerfile = generate_proxy_dockerfile(&args.workdir);
+    tar_add_bytes(
+        tar,
+        "wr-node/docker/Dockerfile.proxy",
+        proxy_dockerfile.as_bytes(),
+        0o644,
+    )?;
+
+    for (i, engine_name) in engine_names.iter().enumerate() {
+        let cfg_name = &config_names[i + 1];
+        let dockerfile = generate_engine_dockerfile(&args.workdir, cfg_name);
+        tar_add_bytes(
+            tar,
+            &format!("wr-node/docker/Dockerfile.engine-{engine_name}"),
+            dockerfile.as_bytes(),
+            0o644,
+        )?;
+    }
+
+    let compose = generate_docker_compose(
+        &args.image_prefix,
+        engine_names,
+        proxy_port,
+        control_port,
+        engine_listen_ports,
+    );
+    tar_add_bytes(
+        tar,
+        "wr-node/docker/docker-compose.yml",
+        compose.as_bytes(),
+        0o644,
+    )?;
+
+    tar_add_bytes(tar, "wr-node/docker/.dockerignore", b"*.tar.gz\n", 0o644)?;
+
+    Ok(())
+}
+
 // --- bundle ---
 
 fn bundle(args: BundleArgs) -> Result<()> {
@@ -308,161 +478,21 @@ fn bundle(args: BundleArgs) -> Result<()> {
     config_names.push("proxy.toml".to_string());
 
     // Add engine configs + collect modules and artifacts
-    let mut seen_modules: HashMap<String, bool> = HashMap::new();
-    let mut engine_names: Vec<String> = Vec::new();
-    let mut engine_listen_ports: Vec<u16> = Vec::new();
-
-    for (i, (path, config)) in all_engine_configs.iter().enumerate() {
-        let config_name = if all_engine_configs.len() == 1 {
-            "engine.toml".to_string()
-        } else {
-            let stem = Path::new(path)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| format!("engine-{}", i + 1));
-            format!("{stem}.toml")
-        };
-
-        // Rewrite engine config with bundle-relative paths via serde
-        let bundle_config = config.to_bundle_config();
-        tar_add_bytes(
-            &mut tar,
-            &format!("wr-node/config/{config_name}"),
-            bundle_config.to_toml()?.as_bytes(),
-            0o644,
-        )?;
-        config_names.push(config_name.clone());
-
-        engine_listen_ports.push(helpers::extract_port(&config.listen_address));
-
-        let engine_name = Path::new(path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("engine-{}", i + 1));
-        engine_names.push(engine_name);
-
-        // Add module artifacts
-        for module in &config.modules {
-            if seen_modules.contains_key(&module.name) {
-                continue;
-            }
-            seen_modules.insert(module.name.clone(), true);
-
-            // WASM module
-            let wasm_src = Path::new(&module.wasm_path);
-            if !wasm_src.exists() {
-                bail!(
-                    "WASM file not found: {}. Run without --skip-build.",
-                    wasm_src.display()
-                );
-            }
-            tar_add_file(
-                &mut tar,
-                &mut checksums,
-                &format!("wr-node/modules/{}.wasm", module.name),
-                wasm_src,
-                0o644,
-            )?;
-
-            // Schema
-            if !module.schema_path.is_empty() {
-                let schema_src = Path::new(&module.schema_path);
-                if schema_src.exists() {
-                    tar_add_file(
-                        &mut tar,
-                        &mut checksums,
-                        &format!("wr-node/schemas/{}.binpb", module.name),
-                        schema_src,
-                        0o644,
-                    )?;
-                }
-            }
-
-            // Migrations
-            if let Some(ref mig_path) = module.migrations_path {
-                let mig_dir = Path::new(mig_path);
-                if mig_dir.is_dir() {
-                    add_migrations_dir(&mut tar, &mut checksums, mig_dir, &module.name)?;
-                }
-            }
-
-            manifest_modules.push(ManifestModule {
-                name: module.name.clone(),
-                namespace: module.namespace.clone(),
-                version: module.version.clone(),
-            });
-        }
-    }
-
-    // Parse proxy ports for docker-compose
-    let proxy_config = ProxyConfig::from_file(&args.proxy_config)?;
-    let proxy_port = helpers::extract_port(&proxy_config.listen_address);
-    let control_port = proxy_config
-        .control_address
-        .as_deref()
-        .map(helpers::extract_port)
-        .unwrap_or(9002);
-
-    // Generate systemd units
-    let proxy_service = generate_proxy_service(&args.workdir, &config_names[0]);
-    tar_add_bytes(
+    let (engine_names, engine_listen_ports) = add_engine_artifacts(
         &mut tar,
-        "wr-node/systemd/wr-proxy.service",
-        proxy_service.as_bytes(),
-        0o644,
+        &mut checksums,
+        &mut config_names,
+        &mut manifest_modules,
+        &all_engine_configs,
     )?;
 
-    for (i, engine_name) in engine_names.iter().enumerate() {
-        let cfg_name = &config_names[i + 1]; // +1 because config_names[0] is proxy.toml
-        let service = generate_engine_service(&args.workdir, cfg_name, engine_name);
-        tar_add_bytes(
-            &mut tar,
-            &format!("wr-node/systemd/wr-engine-{engine_name}.service"),
-            service.as_bytes(),
-            0o644,
-        )?;
-    }
-
-    // Generate Docker artifacts
-    let proxy_dockerfile = generate_proxy_dockerfile(&args.workdir);
-    tar_add_bytes(
+    // Generate and add deployment artifacts (systemd + docker)
+    add_deployment_artifacts(
         &mut tar,
-        "wr-node/docker/Dockerfile.proxy",
-        proxy_dockerfile.as_bytes(),
-        0o644,
-    )?;
-
-    for (i, engine_name) in engine_names.iter().enumerate() {
-        let cfg_name = &config_names[i + 1];
-        let dockerfile = generate_engine_dockerfile(&args.workdir, cfg_name);
-        tar_add_bytes(
-            &mut tar,
-            &format!("wr-node/docker/Dockerfile.engine-{engine_name}"),
-            dockerfile.as_bytes(),
-            0o644,
-        )?;
-    }
-
-    let compose = generate_docker_compose(
-        &args.image_prefix,
+        &args,
+        &config_names,
         &engine_names,
-        proxy_port,
-        control_port,
         &engine_listen_ports,
-    );
-    tar_add_bytes(
-        &mut tar,
-        "wr-node/docker/docker-compose.yml",
-        compose.as_bytes(),
-        0o644,
-    )?;
-
-    let dockerignore = "*.tar.gz\n";
-    tar_add_bytes(
-        &mut tar,
-        "wr-node/docker/.dockerignore",
-        dockerignore.as_bytes(),
-        0o644,
     )?;
 
     // Generate manifest
@@ -702,7 +732,7 @@ WantedBy=multi-user.target
 
 fn generate_proxy_dockerfile(workdir: &str) -> String {
     format!(
-        r#"FROM gcr.io/distroless/cc-debian12
+        r#"FROM gcr.io/distroless/cc-debian13
 WORKDIR {workdir}
 COPY bin/wr-proxy bin/wr-proxy
 COPY config/proxy.toml config/proxy.toml
@@ -713,7 +743,7 @@ ENTRYPOINT ["bin/wr-proxy", "config/proxy.toml"]
 
 fn generate_engine_dockerfile(workdir: &str, config_name: &str) -> String {
     format!(
-        r#"FROM gcr.io/distroless/cc-debian12
+        r#"FROM gcr.io/distroless/cc-debian13
 WORKDIR {workdir}
 COPY bin/wr-engine bin/wr-engine
 COPY config/{config_name} config/engine.toml

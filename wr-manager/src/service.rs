@@ -27,6 +27,57 @@ impl Manager {
     pub fn new(pool: Pool, crypto: Arc<SecretCrypto>) -> Self {
         Self { pool, crypto }
     }
+
+    /// Fetch, validate, decrypt, and group secrets by namespace.
+    async fn resolve_secrets(
+        &self,
+        requests: &[wr_common::wruntime::SecretRequest],
+    ) -> Result<Vec<NamespaceSecrets>, Status> {
+        if requests.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let pairs: Vec<(String, String)> = requests
+            .iter()
+            .map(|s| (s.namespace.clone(), s.key.clone()))
+            .collect();
+        let encrypted = db::get_secrets(&self.pool, &pairs).await?;
+
+        // Check for missing secrets
+        let found: std::collections::HashSet<(String, String)> = encrypted
+            .iter()
+            .map(|(ns, key, _, _)| (ns.clone(), key.clone()))
+            .collect();
+        let missing: Vec<String> = pairs
+            .iter()
+            .filter(|r| !found.contains(r))
+            .map(|(ns, key)| format!("{ns}/{key}"))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Status::not_found(format!(
+                "missing secrets: {}",
+                missing.join(", ")
+            )));
+        }
+
+        // Decrypt and group by namespace
+        let mut by_namespace: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for (ns, key, ciphertext, nonce) in &encrypted {
+            let plaintext = self
+                .crypto
+                .decrypt(ciphertext, nonce)
+                .map_err(|e| Status::internal(format!("failed to decrypt secret: {e}")))?;
+            by_namespace
+                .entry(ns.clone())
+                .or_default()
+                .insert(key.clone(), plaintext);
+        }
+
+        Ok(by_namespace
+            .into_iter()
+            .map(|(namespace, secrets)| NamespaceSecrets { namespace, secrets })
+            .collect())
+    }
 }
 
 #[tonic::async_trait]
@@ -68,51 +119,7 @@ impl ManagerService for Manager {
         db::upsert_engine_and_schemas(&self.pool, &reg).await?;
 
         // Resolve requested secrets
-        let secrets = if reg.secrets.is_empty() {
-            vec![]
-        } else {
-            let requests: Vec<(String, String)> = reg
-                .secrets
-                .iter()
-                .map(|s| (s.namespace.clone(), s.key.clone()))
-                .collect();
-            let encrypted = db::get_secrets(&self.pool, &requests).await?;
-
-            // Check for missing secrets
-            let found: std::collections::HashSet<(String, String)> = encrypted
-                .iter()
-                .map(|(ns, key, _, _)| (ns.clone(), key.clone()))
-                .collect();
-            let missing: Vec<String> = requests
-                .iter()
-                .filter(|r| !found.contains(r))
-                .map(|(ns, key)| format!("{ns}/{key}"))
-                .collect();
-            if !missing.is_empty() {
-                return Err(Status::not_found(format!(
-                    "missing secrets: {}",
-                    missing.join(", ")
-                )));
-            }
-
-            // Decrypt and group by namespace
-            let mut by_namespace: HashMap<String, HashMap<String, String>> = HashMap::new();
-            for (ns, key, ciphertext, nonce) in &encrypted {
-                let plaintext = self
-                    .crypto
-                    .decrypt(ciphertext, nonce)
-                    .map_err(|e| Status::internal(format!("failed to decrypt secret: {e}")))?;
-                by_namespace
-                    .entry(ns.clone())
-                    .or_default()
-                    .insert(key.clone(), plaintext);
-            }
-
-            by_namespace
-                .into_iter()
-                .map(|(namespace, secrets)| NamespaceSecrets { namespace, secrets })
-                .collect()
-        };
+        let secrets = self.resolve_secrets(&reg.secrets).await?;
 
         info!(engine_id, "engine registered");
         Ok(Response::new(RegisterEngineResponse {

@@ -76,14 +76,19 @@ pub async fn wait_for_engine_registration(
     initial_count: usize,
     timeout: Duration,
 ) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    use tokio_retry::strategy::FixedInterval;
+    use tokio_retry::Retry;
+
+    let strategy = FixedInterval::from_millis(2000).take(timeout.as_secs() as usize / 2);
+    Retry::spawn(strategy, || async {
         if get_engine_count(manager).await > initial_count {
-            return true;
+            Ok(())
+        } else {
+            Err(())
         }
-    }
-    false
+    })
+    .await
+    .is_ok()
 }
 
 /// Poll the manager until an engine at the given address registers or timeout.
@@ -93,10 +98,12 @@ pub async fn wait_for_engine_at_address(
     listen_addr: &str,
     timeout: Duration,
 ) -> bool {
+    use tokio_retry::strategy::FixedInterval;
+    use tokio_retry::Retry;
+
     let normalized = normalize_address(listen_addr);
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    let strategy = FixedInterval::from_millis(1000).take(timeout.as_secs() as usize);
+    Retry::spawn(strategy, || async {
         if let Ok(mut client) = client::connect(manager).await {
             if let Ok(resp) = client.list_engines(ListEnginesRequest {}).await {
                 if resp
@@ -105,12 +112,14 @@ pub async fn wait_for_engine_at_address(
                     .iter()
                     .any(|e| normalize_address(&e.address) == normalized)
                 {
-                    return true;
+                    return Ok(());
                 }
             }
         }
-    }
-    false
+        Err(())
+    })
+    .await
+    .is_ok()
 }
 
 /// Get the current number of registered engines from the manager.

@@ -368,6 +368,72 @@ async fn listen_loop(db_url: &str, channel: &str, notify: &Arc<Notify>) -> anyho
     anyhow::bail!("LISTEN connection closed")
 }
 
+/// Dispatch a single claimed job: build an HTTP request, send it through the
+/// module channel, wait for the response, and update job status accordingly.
+async fn dispatch_job(pool: &Pool, tx: &ModuleTx, job: ClaimedJob, job_timeout: Duration) {
+    let job_id = job.job_id.clone();
+
+    // Build HTTP request: POST /{job_type} with payload body.
+    let request = match http::Request::builder()
+        .method("POST")
+        .uri(format!("http://localhost{}", job.job_type))
+        .header("x-wr-job-id", &job.job_id)
+        .header("x-wr-timeout", job_timeout.as_secs().to_string())
+        .header("content-type", "application/x-protobuf")
+        .body(Bytes::from(job.payload))
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("build request: {e}");
+            warn!(job_id = %job_id, error = %msg, "failed to build job request");
+            let _ = fail_job(pool, &job_id, &msg).await;
+            return;
+        }
+    };
+
+    // Dispatch through the module's channel.
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    let inbound = InboundRequest {
+        request,
+        response_tx: resp_tx,
+        span: tracing::Span::current(),
+    };
+
+    if tx.send(inbound).await.is_err() {
+        let msg = "module channel closed";
+        warn!(job_id = %job_id, msg);
+        let _ = fail_job(pool, &job_id, msg).await;
+        return;
+    }
+
+    // Wait for response with timeout.
+    match tokio::time::timeout(job_timeout, resp_rx).await {
+        Ok(Ok(resp)) if resp.status().is_success() => {
+            let body = resp.into_body();
+            if let Err(e) = complete_job(pool, &job_id, body.as_ref()).await {
+                error!(job_id = %job_id, error = %e, "failed to mark job complete");
+            }
+        }
+        Ok(Ok(resp)) => {
+            let status = resp.status().as_u16();
+            let body = String::from_utf8_lossy(resp.body().as_ref()).to_string();
+            let msg = format!("HTTP {status}: {body}");
+            warn!(job_id = %job_id, status, "job failed");
+            let _ = fail_job(pool, &job_id, &msg).await;
+        }
+        Ok(Err(_)) => {
+            let msg = "module dropped response";
+            warn!(job_id = %job_id, msg);
+            let _ = fail_job(pool, &job_id, msg).await;
+        }
+        Err(_) => {
+            let msg = format!("job timed out after {}s", job_timeout.as_secs());
+            warn!(job_id = %job_id, %msg);
+            let _ = fail_job(pool, &job_id, &msg).await;
+        }
+    }
+}
+
 /// Single worker loop: waits for notification, claims and dispatches jobs.
 #[allow(clippy::too_many_arguments)]
 async fn worker_loop(
@@ -382,7 +448,6 @@ async fn worker_loop(
     job_timeout: Duration,
 ) {
     loop {
-        // Wait for notification or fall back to poll interval.
         tokio::select! {
             _ = notify.notified() => {}
             _ = tokio::time::sleep(poll_interval) => {}
@@ -392,7 +457,7 @@ async fn worker_loop(
         loop {
             let job = match claim_job(pool, namespace, name, engine_id).await {
                 Ok(Some(job)) => job,
-                Ok(None) => break, // no more pending jobs
+                Ok(None) => break,
                 Err(e) => {
                     warn!(
                         worker_id,
@@ -405,79 +470,16 @@ async fn worker_loop(
                 }
             };
 
-            let job_id = job.job_id.clone();
             info!(
                 worker_id,
                 namespace,
                 module = name,
-                job_id = %job_id,
+                job_id = %job.job_id,
                 job_type = %job.job_type,
                 "processing job",
             );
 
-            // Build HTTP request: POST /{job_type} with payload body.
-            // Set x-wr-timeout so the handler task uses the job timeout
-            // instead of the default request_timeout_secs.
-            let request = match http::Request::builder()
-                .method("POST")
-                .uri(format!("http://localhost{}", job.job_type))
-                .header("x-wr-job-id", &job.job_id)
-                .header("x-wr-timeout", job_timeout.as_secs().to_string())
-                .header("content-type", "application/x-protobuf")
-                .body(Bytes::from(job.payload))
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = format!("build request: {e}");
-                    warn!(job_id = %job_id, error = %msg, "failed to build job request");
-                    let _ = fail_job(pool, &job_id, &msg).await;
-                    continue;
-                }
-            };
-
-            // Dispatch through the module's channel.
-            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-            let inbound = InboundRequest {
-                request,
-                response_tx: resp_tx,
-                span: tracing::Span::current(),
-            };
-
-            if tx.send(inbound).await.is_err() {
-                let msg = "module channel closed";
-                warn!(job_id = %job_id, msg);
-                let _ = fail_job(pool, &job_id, msg).await;
-                continue;
-            }
-
-            // Wait for response with timeout.
-            let result = tokio::time::timeout(job_timeout, resp_rx).await;
-
-            match result {
-                Ok(Ok(resp)) if resp.status().is_success() => {
-                    let body = resp.into_body();
-                    if let Err(e) = complete_job(pool, &job_id, body.as_ref()).await {
-                        error!(job_id = %job_id, error = %e, "failed to mark job complete");
-                    }
-                }
-                Ok(Ok(resp)) => {
-                    let status = resp.status().as_u16();
-                    let body = String::from_utf8_lossy(resp.body().as_ref()).to_string();
-                    let msg = format!("HTTP {status}: {body}");
-                    warn!(job_id = %job_id, status, "job failed");
-                    let _ = fail_job(pool, &job_id, &msg).await;
-                }
-                Ok(Err(_)) => {
-                    let msg = "module dropped response";
-                    warn!(job_id = %job_id, msg);
-                    let _ = fail_job(pool, &job_id, msg).await;
-                }
-                Err(_) => {
-                    let msg = format!("job timed out after {}s", job_timeout.as_secs());
-                    warn!(job_id = %job_id, %msg);
-                    let _ = fail_job(pool, &job_id, &msg).await;
-                }
-            }
+            dispatch_job(pool, tx, job, job_timeout).await;
         }
     }
 }

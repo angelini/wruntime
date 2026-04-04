@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Deserialize;
 
 #[derive(Deserialize, Clone)]
@@ -50,17 +50,18 @@ fn default_max_connections() -> usize {
     10
 }
 
+impl wr_common::config::Validatable for ManagerConfig {
+    fn validate(&self) -> Result<()> {
+        self.validate_inner()
+    }
+}
+
 impl ManagerConfig {
     pub fn load(path: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read config: {path}"))?;
-        let config: ManagerConfig =
-            toml::from_str(&content).context("failed to parse manager config")?;
-        config.validate().context("invalid manager config")?;
-        Ok(config)
+        wr_common::config::load(path)
     }
 
-    fn validate(&self) -> Result<()> {
+    fn validate_inner(&self) -> Result<()> {
         anyhow::ensure!(
             !self.listen_address.is_empty(),
             "listen_address is required"

@@ -10,15 +10,15 @@ use tracing::{info_span, Instrument};
 
 use super::egress::{domain_matches, ExternalEgress};
 use super::{error_response, Destination, ProxyBody, ResBody, ResolvedDestination};
+use crate::indexed_routing::ParsedRule;
 use crate::routing::CachedRoutingTable;
-use wr_common::wruntime::RoutingRule;
 
-type RoundRobinCounters = Arc<Mutex<HashMap<(String, String, String), usize>>>;
+type RoundRobinCounters = Arc<Mutex<HashMap<(Arc<str>, Arc<str>, Arc<str>), usize>>>;
 
 pub struct RoutingLayer {
     table: CachedRoutingTable,
     /// This proxy's own address — used to distinguish local vs. remote rules.
-    self_proxy_address: String,
+    self_proxy_address: Arc<str>,
     /// Monotonic counters per (namespace, module, version) for round-robin selection.
     counters: RoundRobinCounters,
     /// Egress allowlist patterns. Only destinations matching one of these
@@ -31,14 +31,20 @@ impl RoutingLayer {
     pub fn new(table: CachedRoutingTable, self_proxy_address: impl Into<String>) -> Self {
         Self {
             table,
-            self_proxy_address: self_proxy_address.into(),
+            self_proxy_address: Arc::from(self_proxy_address.into()),
             counters: Arc::new(Mutex::new(HashMap::new())),
             egress_allowed_domains: Arc::new(Vec::new()),
         }
     }
 
     pub fn with_egress(mut self, allowed_domains: Vec<String>) -> Self {
-        self.egress_allowed_domains = Arc::new(allowed_domains);
+        // Pre-lowercase patterns once at construction time so domain_matches()
+        // can skip per-request lowercasing of the pattern side.
+        let lowered: Vec<String> = allowed_domains
+            .into_iter()
+            .map(|d| d.to_ascii_lowercase())
+            .collect();
+        self.egress_allowed_domains = Arc::new(lowered);
         self
     }
 }
@@ -60,53 +66,147 @@ impl<S> Layer<S> for RoutingLayer {
 pub struct RoutingService<S> {
     inner: S,
     table: CachedRoutingTable,
-    self_proxy_address: String,
+    self_proxy_address: Arc<str>,
     counters: RoundRobinCounters,
     egress_allowed_domains: Arc<Vec<String>>,
 }
 
-/// Compare two routing rules by their semver version, falling back to string comparison.
-fn cmp_rule_version(a: &RoutingRule, b: &RoutingRule) -> std::cmp::Ordering {
-    let va = semver::Version::parse(&a.destination_version);
-    let vb = semver::Version::parse(&b.destination_version);
-    match (va, vb) {
-        (Ok(a), Ok(b)) => a.cmp(&b),
-        (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
-        (Err(_), Ok(_)) => std::cmp::Ordering::Less,
-        _ => a.destination_version.cmp(&b.destination_version),
+// ── Routing helpers ─────────────────────────────────────────────────────────
+
+/// Parse the x-wr-destination header into (namespace, module) and the raw URI.
+#[allow(clippy::type_complexity)]
+fn parse_destination(
+    headers: &http::HeaderMap,
+) -> Result<(Arc<str>, Arc<str>, Option<http::Uri>), String> {
+    let dest_uri: Option<http::Uri> = headers
+        .get("x-wr-destination")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+
+    let host = dest_uri
+        .as_ref()
+        .and_then(|u: &http::Uri| u.host())
+        .unwrap_or("");
+
+    match host.split_once('.') {
+        Some((ns, svc)) => Ok((Arc::from(ns), Arc::from(svc), dest_uri)),
+        None => Err(format!(
+            "destination host '{host}' must use the format \
+             '{{namespace}}.{{service}}' — namespace is required"
+        )),
     }
 }
 
-/// Given a set of rules, pick the highest version and collect all candidates at that version.
+/// Given a slice of pre-sorted (descending) rules, collect all candidates at the
+/// best (first) version.
 fn best_version_candidates(
-    rules: &[&RoutingRule],
+    rules: &[ParsedRule],
     self_proxy_address: &str,
-) -> (String, Vec<Destination>) {
-    let best = rules
-        .iter()
-        .max_by(|a, b| cmp_rule_version(a, b))
-        .map(|r| r.destination_version.clone());
-
-    match best {
-        Some(ver) => {
+) -> (Arc<str>, Vec<Destination>) {
+    match rules.first() {
+        Some(best) => {
+            let ver = &best.rule.destination_version;
             let cands = rules
                 .iter()
-                .filter(|r| r.destination_version == ver)
-                .map(|r| make_destination(r, self_proxy_address))
+                .take_while(|r| r.rule.destination_version == *ver)
+                .map(|r| make_destination(&r.rule, self_proxy_address))
                 .collect();
-            (ver, cands)
+            (Arc::from(ver.as_str()), cands)
         }
-        None => (String::new(), vec![]),
+        None => (Arc::from(""), vec![]),
     }
 }
 
-fn make_destination(rule: &RoutingRule, self_proxy_address: &str) -> Destination {
+fn make_destination(
+    rule: &wr_common::wruntime::RoutingRule,
+    self_proxy_address: &str,
+) -> Destination {
     if rule.proxy_address == self_proxy_address {
-        Destination::LocalEngine(rule.engine_address.clone())
+        Destination::LocalEngine(Arc::from(rule.engine_address.as_str()))
     } else {
-        Destination::RemoteProxy(rule.proxy_address.clone())
+        Destination::RemoteProxy(Arc::from(rule.proxy_address.as_str()))
     }
 }
+
+/// Resolve the best candidates from the indexed routing table, considering an
+/// optional version requirement.
+async fn resolve_candidates(
+    table: &CachedRoutingTable,
+    namespace: &str,
+    module: &str,
+    requested_version: &Option<String>,
+    self_proxy_address: &str,
+) -> (Arc<str>, Vec<Destination>) {
+    let t = table.read().await;
+    let rules = t.get(namespace, module);
+
+    if rules.is_empty() {
+        return (Arc::from(""), vec![]);
+    }
+
+    if let Some(ref version_str) = requested_version {
+        // Filter the (already small) per-module group using pre-parsed versions.
+        let req = semver::VersionReq::parse(version_str).ok();
+        let satisfying: Vec<&ParsedRule> = rules
+            .iter()
+            .filter(|r| match (&req, &r.parsed_version) {
+                (Some(req), Some(v)) => req.matches(v),
+                (None, _) => r.rule.destination_version == *version_str,
+                _ => false,
+            })
+            .collect();
+
+        if satisfying.is_empty() {
+            return (Arc::from(version_str.as_str()), vec![]);
+        }
+
+        // satisfying is already sorted descending (inherits order from the index).
+        let best_ver = &satisfying[0].rule.destination_version;
+        let cands = satisfying
+            .iter()
+            .take_while(|r| r.rule.destination_version == *best_ver)
+            .map(|r| make_destination(&r.rule, self_proxy_address))
+            .collect();
+        (Arc::from(best_ver.as_str()), cands)
+    } else {
+        best_version_candidates(rules, self_proxy_address)
+    }
+}
+
+/// Pick a candidate via round-robin from the counter map.
+fn select_round_robin(
+    counters: &RoundRobinCounters,
+    key: (Arc<str>, Arc<str>, Arc<str>),
+    candidates: &[Destination],
+) -> Destination {
+    let mut map = counters.lock().unwrap();
+    let counter = map.entry(key).or_insert(0);
+    let idx = *counter % candidates.len();
+    *counter = counter.wrapping_add(1);
+    candidates[idx].clone()
+}
+
+/// Inject x-wr-namespace, x-wr-module, and x-wr-version headers.
+fn inject_routing_headers(
+    req: &mut Request<ProxyBody>,
+    namespace: &str,
+    module: &str,
+    version: &str,
+) {
+    if let Ok(v) = http::HeaderValue::from_str(namespace) {
+        req.headers_mut().insert("x-wr-namespace", v);
+    }
+    if !module.is_empty() {
+        if let Ok(v) = http::HeaderValue::from_str(module) {
+            req.headers_mut().insert("x-wr-module", v);
+        }
+    }
+    if let Ok(v) = http::HeaderValue::from_str(version) {
+        req.headers_mut().insert("x-wr-version", v);
+    }
+}
+
+// ── Service implementation ──────────────────────────────────────────────────
 
 impl<S> Service<Request<ProxyBody>> for RoutingService<S>
 where
@@ -130,28 +230,9 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // Extract destination module name and namespace from x-wr-destination.
-            // Expected host format: "{namespace}.{service}"
-            let dest_uri: Option<http::Uri> = req
-                .headers()
-                .get("x-wr-destination")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse().ok());
-
-            let host = dest_uri
-                .as_ref()
-                .and_then(|u: &http::Uri| u.host())
-                .unwrap_or("");
-
-            let (dest_namespace, module_name) = match host.split_once('.') {
-                Some((ns, svc)) => (ns.to_string(), svc.to_string()),
-                None => {
-                    let msg = format!(
-                        "destination host '{host}' must use the format \
-                         '{{namespace}}.{{service}}' — namespace is required"
-                    );
-                    return Ok(error_response(StatusCode::BAD_REQUEST, &msg));
-                }
+            let (dest_namespace, module_name, dest_uri) = match parse_destination(req.headers()) {
+                Ok(v) => v,
+                Err(msg) => return Ok(error_response(StatusCode::BAD_REQUEST, &msg)),
             };
 
             let span = info_span!(
@@ -163,52 +244,20 @@ where
                 otel.status_code = tracing::field::Empty,
             );
 
-            // Optional explicit version requested by the caller
             let requested_version: Option<String> = req
                 .headers()
                 .get("x-wr-version")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
 
-            // Collect healthy candidates and resolve the version string.
-            // Each candidate is a Destination (local engine or remote proxy).
-            let (resolved_version, candidates) = {
-                let t = table.read().await;
-                let healthy: Vec<_> = t
-                    .rules
-                    .iter()
-                    .filter(|r| {
-                        r.destination_module == module_name
-                            && r.destination_namespace == dest_namespace
-                            && r.healthy
-                    })
-                    .collect();
-
-                if let Some(ref version_str) = requested_version {
-                    // Filter to rules satisfying the requested version (semver range or exact match)
-                    let req = semver::VersionReq::parse(version_str).ok();
-                    let satisfying: Vec<_> = healthy
-                        .iter()
-                        .copied()
-                        .filter(
-                            |r| match (&req, semver::Version::parse(&r.destination_version)) {
-                                (Some(req), Ok(v)) => req.matches(&v),
-                                (None, _) => r.destination_version == *version_str,
-                                _ => false,
-                            },
-                        )
-                        .collect();
-
-                    let (ver, cands) = best_version_candidates(&satisfying, &self_proxy_address);
-                    if cands.is_empty() {
-                        (version_str.clone(), vec![])
-                    } else {
-                        (ver, cands)
-                    }
-                } else {
-                    best_version_candidates(&healthy, &self_proxy_address)
-                }
-            };
+            let (resolved_version, candidates) = resolve_candidates(
+                &table,
+                &dest_namespace,
+                &module_name,
+                &requested_version,
+                &self_proxy_address,
+            )
+            .await;
 
             if candidates.is_empty() {
                 // Check egress allowlist before returning 503.
@@ -242,38 +291,19 @@ where
                 return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE, &msg));
             }
 
-            // Round-robin: pick one candidate.
-            let chosen = {
-                let mut map = counters.lock().unwrap();
-                let counter = map
-                    .entry((
-                        dest_namespace.clone(),
-                        module_name.clone(),
-                        resolved_version.clone(),
-                    ))
-                    .or_insert(0);
-                let idx = *counter % candidates.len();
-                *counter = counter.wrapping_add(1);
-                candidates[idx].clone()
-            };
-
+            let chosen = select_round_robin(
+                &counters,
+                (
+                    dest_namespace.clone(),
+                    module_name.clone(),
+                    resolved_version.clone(),
+                ),
+                &candidates,
+            );
             let first_addr = chosen.address();
 
-            // Inject x-wr-namespace, x-wr-module, and x-wr-version so the
-            // destination engine (or peer proxy's routing layer) knows which
-            // WASM module and version to dispatch to.
-            if let Ok(v) = http::HeaderValue::from_str(&dest_namespace) {
-                req.headers_mut().insert("x-wr-namespace", v);
-            }
-            if !module_name.is_empty() {
-                if let Ok(v) = http::HeaderValue::from_str(&module_name) {
-                    req.headers_mut().insert("x-wr-module", v);
-                }
-            }
-            if let Ok(v) = http::HeaderValue::from_str(&resolved_version) {
-                req.headers_mut().insert("x-wr-version", v);
-            }
-            span.record("wr.version", &resolved_version);
+            inject_routing_headers(&mut req, &dest_namespace, &module_name, &resolved_version);
+            span.record("wr.version", &*resolved_version);
             span.record("wr.engine", first_addr);
 
             req.extensions_mut().insert(ResolvedDestination(chosen));

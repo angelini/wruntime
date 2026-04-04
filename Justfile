@@ -20,13 +20,17 @@ check:
 
 # ── Lint & Format ─────────────────────────────────────────────────────────────
 
-# Format all source code
+guest_crates := "examples/ecommerce/client examples/ecommerce/inventory examples/codegen/agent examples/codegen/collector examples/codegen/coordinator examples/codegen/worker examples/stockmarket/exchange examples/stockmarket/ledger examples/stockmarket/simulator"
+
+# Format all source code (workspace + example guests)
 fmt:
     cargo fmt --all
+    for d in {{guest_crates}}; do (cd "$d" && cargo fmt); done
 
-# Run Clippy lints across the workspace
+# Run Clippy lints across the workspace + example guests
 lint:
     cargo clippy --all-targets --all-features -- -D warnings
+    for d in {{guest_crates}}; do (cd "$d" && cargo clippy --target wasm32-wasip2 -- -D warnings); done
 
 # Format and lint
 tidy: fmt lint

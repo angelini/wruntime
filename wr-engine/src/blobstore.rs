@@ -70,7 +70,7 @@ fn normalize_key(key: &str) -> Option<String> {
 
 /// Prepend the namespace prefix to a key after normalizing it. Returns an
 /// error if the key attempts path traversal.
-fn scoped_key(prefix: &Option<String>, key: &str) -> Result<String, BlobError> {
+fn scoped_key(prefix: &Option<Arc<str>>, key: &str) -> Result<String, BlobError> {
     let clean = normalize_key(key)
         .ok_or_else(|| BlobError::AccessDenied("path traversal in key".into()))?;
     match prefix {
@@ -80,9 +80,9 @@ fn scoped_key(prefix: &Option<String>, key: &str) -> Result<String, BlobError> {
 }
 
 /// Strip the namespace prefix from a key returned by S3.
-fn unscoped_key(prefix: &Option<String>, key: &str) -> String {
+fn unscoped_key(prefix: &Option<Arc<str>>, key: &str) -> String {
     match prefix {
-        Some(p) => key.strip_prefix(p.as_str()).unwrap_or(key).to_string(),
+        Some(p) => key.strip_prefix(&**p).unwrap_or(key).to_string(),
         None => key.to_string(),
     }
 }
@@ -201,9 +201,9 @@ impl Host for ModuleState {
 
 fn require_blobstore(
     client: &Option<Arc<BlobstoreRuntime>>,
-) -> Result<Arc<BlobstoreRuntime>, BlobError> {
+) -> Result<&BlobstoreRuntime, BlobError> {
     client
-        .clone()
+        .as_deref()
         .ok_or_else(|| BlobError::Io("no blobstore configured for this module".into()))
 }
 
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_scoped_key_with_prefix() {
-        let prefix = Some("wr/ecommerce/".to_string());
+        let prefix = Some(Arc::<str>::from("wr/ecommerce/"));
         assert_eq!(
             scoped_key(&prefix, "file.txt").unwrap(),
             "wr/ecommerce/file.txt"
@@ -313,19 +313,19 @@ mod tests {
 
     #[test]
     fn test_scoped_key_rejects_traversal() {
-        let prefix = Some("wr/ecommerce/".to_string());
+        let prefix = Some(Arc::<str>::from("wr/ecommerce/"));
         assert!(scoped_key(&prefix, "../../other/secret").is_err());
     }
 
     #[test]
     fn test_scoped_key_normalizes_dots() {
-        let prefix = Some("wr/ecommerce/".to_string());
+        let prefix = Some(Arc::<str>::from("wr/ecommerce/"));
         assert_eq!(scoped_key(&prefix, "a/../b").unwrap(), "wr/ecommerce/b");
     }
 
     #[test]
     fn test_unscoped_key_strips_prefix() {
-        let prefix = Some("wr/ecommerce/".to_string());
+        let prefix = Some(Arc::<str>::from("wr/ecommerce/"));
         assert_eq!(unscoped_key(&prefix, "wr/ecommerce/file.txt"), "file.txt");
     }
 
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn test_unscoped_key_missing_prefix_is_passthrough() {
-        let prefix = Some("wr/other/".to_string());
+        let prefix = Some(Arc::<str>::from("wr/other/"));
         assert_eq!(unscoped_key(&prefix, "file.txt"), "file.txt");
     }
 
@@ -382,8 +382,7 @@ mod tests {
     #[test]
     fn test_require_blobstore_some_returns_runtime() {
         let rt = Arc::new(BlobstoreRuntime::new(&test_config()).unwrap());
-        let result = require_blobstore(&Some(rt));
-        assert!(result.is_ok());
+        assert!(require_blobstore(&Some(rt)).is_ok());
     }
 
     // ── map_s3_err tests ─────────────────────────────────────────────────────

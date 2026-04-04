@@ -17,11 +17,11 @@ tonic          = { version = "0.14", features = ["transport"] }
 bytes          = "1"
 anyhow         = "1"
 semver         = "1"
-toml           = "0.8"
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
 failsafe           = "1"
-wr-common          = { path = "../wr-common", features = ["discovery"] }
+matchit            = "0.8"
+wr-common          = { path = "../wr-common", features = ["discovery", "config", "signal"] }
 deadpool-postgres  = { version = "0.14", features = ["rt_tokio_1"] }
 tokio-postgres     = "0.7"
 prost              = "0.14"

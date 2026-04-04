@@ -10,7 +10,7 @@ pub type EngineBreaker = StateMachine<failure_policy::ConsecutiveFailures<backof
 
 #[derive(Clone)]
 pub struct CircuitBreakerRegistry {
-    inner: Arc<Mutex<HashMap<String, EngineBreaker>>>,
+    inner: Arc<Mutex<HashMap<Arc<str>, EngineBreaker>>>,
     config: CircuitBreakerConfig,
 }
 
@@ -25,7 +25,7 @@ impl CircuitBreakerRegistry {
     /// Returns the breaker for `addr`, creating one in the Closed state on first access.
     pub fn get_or_create(&self, addr: &str) -> EngineBreaker {
         let mut map = self.inner.lock().unwrap();
-        map.entry(addr.to_string())
+        map.entry(Arc::from(addr))
             .or_insert_with(|| self.build_breaker())
             .clone()
     }
@@ -39,7 +39,7 @@ impl CircuitBreakerRegistry {
         self.inner
             .lock()
             .unwrap()
-            .retain(|k: &String, _| active.contains(k.as_str()));
+            .retain(|k, _| active.contains(&**k));
     }
 
     fn build_breaker(&self) -> EngineBreaker {

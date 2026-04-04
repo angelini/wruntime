@@ -98,9 +98,12 @@ fn handle_external(method: &Method, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
             let task_id = &p[7..];
             handle_get_task_json(task_id)
         }
-        _ => json_response(404, &ErrorJson {
-            error: "not found".into(),
-        }),
+        _ => json_response(
+            404,
+            &ErrorJson {
+                error: "not found".into(),
+            },
+        ),
     }
 }
 
@@ -108,9 +111,12 @@ fn handle_create_task_json(body: &[u8]) -> (u16, Vec<u8>) {
     let req: CreateTaskJson = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
-            return json_response(400, &ErrorJson {
-                error: format!("invalid JSON: {e}"),
-            })
+            return json_response(
+                400,
+                &ErrorJson {
+                    error: format!("invalid JSON: {e}"),
+                },
+            )
         }
     };
 
@@ -132,32 +138,34 @@ fn handle_create_task_json(body: &[u8]) -> (u16, Vec<u8>) {
     };
 
     match Component.create_task(proto_req) {
-        Ok(resp) => json_response(201, &CreateResponseJson {
-            task_id: resp.task_id,
-            status: resp.status,
-        }),
-        Err(e) => json_response(e.status, &ErrorJson {
-            error: e.message,
-        }),
+        Ok(resp) => json_response(
+            201,
+            &CreateResponseJson {
+                task_id: resp.task_id,
+                status: resp.status,
+            },
+        ),
+        Err(e) => json_response(e.status, &ErrorJson { error: e.message }),
     }
 }
 
 fn handle_get_task_json(task_id: &str) -> (u16, Vec<u8>) {
     match Component.get_task_inner(task_id) {
-        Ok(resp) => json_response(200, &TaskResponseJson {
-            task_id: resp.task_id,
-            status: resp.status,
-            unified_diff: resp.unified_diff,
-            message: resp.message,
-            agent_turns: resp.agent_turns,
-            total_input_tokens: resp.total_input_tokens,
-            total_output_tokens: resp.total_output_tokens,
-            created_at: resp.created_at,
-            updated_at: resp.updated_at,
-        }),
-        Err(e) => json_response(e.status, &ErrorJson {
-            error: e.message,
-        }),
+        Ok(resp) => json_response(
+            200,
+            &TaskResponseJson {
+                task_id: resp.task_id,
+                status: resp.status,
+                unified_diff: resp.unified_diff,
+                message: resp.message,
+                agent_turns: resp.agent_turns,
+                total_input_tokens: resp.total_input_tokens,
+                total_output_tokens: resp.total_output_tokens,
+                created_at: resp.created_at,
+                updated_at: resp.updated_at,
+            },
+        ),
+        Err(e) => json_response(e.status, &ErrorJson { error: e.message }),
     }
 }
 
@@ -235,10 +243,7 @@ impl proto::CoordinatorService for Component {
         })
     }
 
-    fn get_task(
-        &self,
-        req: proto::GetTaskRequest,
-    ) -> Result<proto::GetTaskResponse, ServiceError> {
+    fn get_task(&self, req: proto::GetTaskRequest) -> Result<proto::GetTaskResponse, ServiceError> {
         self.get_task_inner(&req.task_id)
     }
 
@@ -330,10 +335,7 @@ impl proto::CoordinatorService for Component {
     ) -> Result<proto::UpdateTaskStatusResponse, ServiceError> {
         database::execute(
             "UPDATE tasks SET status = $2, updated_at = now() WHERE task_id = $1",
-            &[
-                PgValue::Text(req.task_id),
-                PgValue::Text(req.status),
-            ],
+            &[PgValue::Text(req.task_id), PgValue::Text(req.status)],
         )
         .map_err(|e| ServiceError::internal(format!("update status: {e:?}")))?;
         Ok(proto::UpdateTaskStatusResponse {})

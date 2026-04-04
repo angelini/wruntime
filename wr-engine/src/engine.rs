@@ -26,6 +26,14 @@ use wr_engine::llm::LlmRuntime;
 use wr_engine::pool::{blob_key_prefix, module_schema};
 use wr_engine::state::{DbTimeouts, ModuleServices, ModuleState};
 
+struct ResolvedServices {
+    db_pool: Option<Arc<Pool>>,
+    db_schema: Option<Arc<str>>,
+    blobstore: Option<Arc<BlobstoreRuntime>>,
+    blob_prefix: Option<Arc<str>>,
+    llm: Option<Arc<LlmRuntime>>,
+}
+
 pub struct EngineRunner {
     engine: Arc<Engine>,
     config: EngineConfig,
@@ -231,24 +239,7 @@ impl EngineRunner {
         Ok(())
     }
 
-    async fn spawn_module(
-        &self,
-        module_config: &ModuleConfig,
-        registry: &ModuleRegistry,
-        env_vars: HashMap<String, String>,
-        engine_id: &str,
-    ) -> Result<()> {
-        info!(module = %module_config.name, "loading module");
-
-        let component = Component::from_file(&self.engine, &module_config.wasm_path)?;
-        let proxy_uri: hyper::Uri = self.config.node.proxy_address.parse()?;
-        let http_client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
-            .http2_only(true)
-            .build_http::<http_body_util::Full<bytes::Bytes>>();
-        let module_name = module_config.name.clone();
-        let module_namespace = module_config.namespace.clone();
-        let module_version = module_config.version.clone();
-
+    fn configure_linker(&self) -> Result<Linker<ModuleState>> {
         let mut linker: Linker<ModuleState> = Linker::new(&self.engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
@@ -268,13 +259,22 @@ impl EngineRunner {
             &mut linker,
             |s| s,
         )?;
+        Ok(linker)
+    }
 
-        // Resolve common host-binding resources for this module.
+    /// Resolve database pool, blobstore client, and LLM client for a module
+    /// based on its config flags.
+    fn resolve_module_services(
+        &self,
+        module_config: &ModuleConfig,
+        module_namespace: &str,
+        module_name: &str,
+    ) -> ResolvedServices {
         let (db_pool, db_schema) = if module_config.database {
-            let schema = module_schema(&module_namespace, &module_name);
+            let schema: Arc<str> = Arc::from(module_schema(module_namespace, module_name));
             let pool = self
                 .db_pools
-                .get(&(module_namespace.clone(), module_name.clone()))
+                .get(&(module_config.namespace.clone(), module_config.name.clone()))
                 .cloned();
             (pool, Some(schema))
         } else {
@@ -283,7 +283,7 @@ impl EngineRunner {
         let (blobstore, blob_prefix) = if module_config.blobstore {
             (
                 self.blobstore_client.clone(),
-                Some(blob_key_prefix(&module_namespace)),
+                Some(Arc::<str>::from(blob_key_prefix(module_namespace))),
             )
         } else {
             (None, None)
@@ -293,6 +293,35 @@ impl EngineRunner {
         } else {
             None
         };
+        ResolvedServices {
+            db_pool,
+            db_schema,
+            blobstore,
+            blob_prefix,
+            llm,
+        }
+    }
+
+    async fn spawn_module(
+        &self,
+        module_config: &ModuleConfig,
+        registry: &ModuleRegistry,
+        env_vars: HashMap<String, String>,
+        engine_id: &str,
+    ) -> Result<()> {
+        info!(module = %module_config.name, "loading module");
+
+        let component = Component::from_file(&self.engine, &module_config.wasm_path)?;
+        let proxy_uri: hyper::Uri = self.config.node.proxy_address.parse()?;
+        let http_client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+            .http2_only(true)
+            .build_http::<http_body_util::Full<bytes::Bytes>>();
+        let module_name: Arc<str> = Arc::from(module_config.name.as_str());
+        let module_namespace: Arc<str> = Arc::from(module_config.namespace.as_str());
+        let module_version = module_config.version.clone();
+
+        let linker = self.configure_linker()?;
+        let svc = self.resolve_module_services(module_config, &module_namespace, &module_name);
 
         let pre = ProxyPre::new(linker.instantiate_pre(&component)?).map_err(|e| {
             let mode_str = if module_config.mode == ModuleMode::Worker {
@@ -310,8 +339,8 @@ impl EngineRunner {
         let (tx, rx) = mpsc::channel::<InboundRequest>(module_config.channel_capacity);
         registry
             .register(
-                module_namespace.clone(),
-                module_name.clone(),
+                module_namespace.to_string(),
+                module_name.to_string(),
                 module_version.clone(),
                 tx.clone(),
             )
@@ -336,14 +365,14 @@ impl EngineRunner {
             namespace: module_namespace.clone(),
             proxy_uri: proxy_uri.clone(),
             http_client: http_client.clone(),
-            db_pool: db_pool.clone(),
-            db_schema: db_schema.clone(),
+            db_pool: svc.db_pool.clone(),
+            db_schema: svc.db_schema.clone(),
             db_timeouts,
-            blobstore,
-            blob_prefix,
-            llm,
+            blobstore: svc.blobstore,
+            blob_prefix: svc.blob_prefix,
+            llm: svc.llm,
             fs: module_config.fs.clone(),
-            env_vars: env_vars.clone(),
+            env_vars: Arc::new(env_vars),
             request_timeout: Duration::from_secs(module_config.request_timeout_secs),
         };
         tokio::spawn(http_handler_task(handler, module, rx));
@@ -362,8 +391,8 @@ impl EngineRunner {
             wr_engine::worker::spawn_worker_pool(
                 admin_pool,
                 wr_engine::worker::WorkerPoolConfig {
-                    namespace: module_namespace.clone(),
-                    name: module_name.clone(),
+                    namespace: module_namespace.to_string(),
+                    name: module_name.to_string(),
                     version: module_version.clone(),
                     engine_id: engine_id.to_string(),
                     concurrency: module_config.worker_concurrency,
@@ -391,10 +420,14 @@ struct HandlerContext {
 }
 
 /// Module identity and runtime config — shared across requests.
+///
+/// All `String` fields that were cloned per-request are now `Arc<str>` or
+/// `Arc<HashMap>` so that cloning `ModuleContext` is O(1) reference-count
+/// bumps instead of O(n) heap copies.
 #[derive(Clone)]
 struct ModuleContext {
-    name: String,
-    namespace: String,
+    name: Arc<str>,
+    namespace: Arc<str>,
     proxy_uri: hyper::Uri,
     /// Pooled HTTP client for outgoing WASM → proxy requests.
     /// `Client` is `Clone` (internally Arc-backed), so this is cheap to clone.
@@ -403,13 +436,13 @@ struct ModuleContext {
         http_body_util::Full<bytes::Bytes>,
     >,
     db_pool: Option<Arc<Pool>>,
-    db_schema: Option<String>,
+    db_schema: Option<Arc<str>>,
     db_timeouts: DbTimeouts,
     blobstore: Option<Arc<BlobstoreRuntime>>,
-    blob_prefix: Option<String>,
+    blob_prefix: Option<Arc<str>>,
     llm: Option<Arc<LlmRuntime>>,
     fs: Option<wr_engine::config::FsMode>,
-    env_vars: HashMap<String, String>,
+    env_vars: Arc<HashMap<String, String>>,
     request_timeout: Duration,
 }
 
@@ -503,8 +536,8 @@ async fn dispatch_request(
         };
 
     let state = ModuleState::new(
-        module.name.clone(),
-        module.namespace.clone(),
+        module.name.to_string(),
+        module.namespace.to_string(),
         module.proxy_uri.clone(),
         module.http_client.clone(),
         ModuleServices {

@@ -204,7 +204,9 @@ impl proto::AgentService for Component {
             let resp = complete_with_retry(|| {
                 CompletionBuilder::sonnet()
                     .max_tokens(8192)
-                    .user(&format!("Here is a unified diff I produced:\n\n{prev_assistant}"))
+                    .user(format!(
+                        "Here is a unified diff I produced:\n\n{prev_assistant}"
+                    ))
                     .user(refine_prompt)
             })
             .map_err(|e| {

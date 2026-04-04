@@ -23,6 +23,7 @@ S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:8900}"
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-rustfsadmin}"
 export RUST_LOG="${RUST_LOG:-info}"
+export WR_MANAGER="${WR_MANAGER:-http://127.0.0.1:9000}"
 
 # ── Kill stale processes ─────────────────────────────────────────────────────
 # Usage: kill_stale_ports 9000 9001 9100 9101

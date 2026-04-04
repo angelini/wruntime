@@ -84,9 +84,4 @@ where
     }
 }
 
-fn header_str<'a>(headers: &'a http::HeaderMap, name: &str) -> &'a str {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-}
+use wr_common::http_headers::header_str;

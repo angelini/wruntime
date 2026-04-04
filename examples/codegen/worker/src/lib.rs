@@ -42,8 +42,7 @@ impl proto::WorkerService for Component {
             status: "collecting".into(),
         });
 
-        let collect_span =
-            tracing::start("worker.collect_docs", &[("task.id", task_id.as_str())]);
+        let collect_span = tracing::start("worker.collect_docs", &[("task.id", task_id.as_str())]);
 
         let mut sources: Vec<proto::DocSourceSpec> = req
             .doc_sources
@@ -79,19 +78,18 @@ impl proto::WorkerService for Component {
             })
             .collect();
 
-        let fetch_resp =
-            match collector.fetch_docs(proto::FetchDocsRequest {
-                sources: collector_sources,
-            }) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::set_error(&collect_span, &format!("collector: {e}"));
-                    fail_task(&coordinator, task_id, &format!("collector: {e}"));
-                    drop(collect_span);
-                    drop(span);
-                    return Err(ServiceError::internal(format!("collector: {e}")));
-                }
-            };
+        let fetch_resp = match collector.fetch_docs(proto::FetchDocsRequest {
+            sources: collector_sources,
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::set_error(&collect_span, &format!("collector: {e}"));
+                fail_task(&coordinator, task_id, &format!("collector: {e}"));
+                drop(collect_span);
+                drop(span);
+                return Err(ServiceError::internal(format!("collector: {e}")));
+            }
+        };
 
         tracing::set_attribute(
             &collect_span,
@@ -111,10 +109,13 @@ impl proto::WorkerService for Component {
             status: "generating".into(),
         });
 
-        let agent_span = tracing::start("worker.run_agent", &[
-            ("task.id", task_id.as_str()),
-            ("agent.max_turns", &req.max_agent_turns.to_string()),
-        ]);
+        let agent_span = tracing::start(
+            "worker.run_agent",
+            &[
+                ("task.id", task_id.as_str()),
+                ("agent.max_turns", &req.max_agent_turns.to_string()),
+            ],
+        );
 
         let agent_resp = match agent.run_task(proto::RunTaskRequest {
             session_id: req.session_id,

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::Timelike as _;
 use futures::StreamExt as _;
 use wasmtime::component::Resource;
@@ -66,7 +68,7 @@ use crate::state::{DbTimeouts, ModuleState};
 /// Uses `batch_execute` so all SET commands travel in a single round-trip.
 async fn prepare_connection(
     client: &deadpool_postgres::Object,
-    schema: &Option<String>,
+    schema: &Option<Arc<str>>,
     timeouts: &DbTimeouts,
 ) -> Result<(), DbError> {
     let mut sql = String::new();
@@ -318,37 +320,53 @@ impl tokio_postgres::types::ToSql for PgParam {
 
 // ── Host implementation ──────────────────────────────────────────────────────
 
+/// Acquires a connection from the pool and sets schema/timeouts.
+/// Takes cloned fields to avoid borrowing ModuleState across await points
+/// (ModuleState contains non-Send WASI streams).
+async fn get_prepared_connection(
+    pool: &deadpool_postgres::Pool,
+    schema: &Option<Arc<str>>,
+    timeouts: &DbTimeouts,
+) -> Result<deadpool_postgres::Object, DbError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| DbError::Connection(e.to_string()))?;
+    prepare_connection(&client, schema, timeouts).await?;
+    Ok(client)
+}
+
+fn require_pool(state: &ModuleState) -> Result<std::sync::Arc<deadpool_postgres::Pool>, DbError> {
+    state
+        .db_pool
+        .clone()
+        .ok_or_else(|| DbError::Connection("no database configured for this module".into()))
+}
+
+fn to_pg_params(params: Vec<PgValue>) -> Vec<PgParam> {
+    params.into_iter().map(PgParam::from).collect()
+}
+
 impl Host for ModuleState {
     fn query(
         &mut self,
         sql: String,
         params: Vec<PgValue>,
     ) -> impl std::future::Future<Output = Result<Vec<Row>, DbError>> + Send {
-        let pool = match &self.db_pool {
-            Some(p) => p.clone(),
-            None => {
-                return futures::future::Either::Left(std::future::ready(Err(DbError::Connection(
-                    "no database configured for this module".into(),
-                ))))
-            }
-        };
+        let pool = require_pool(self);
         let schema = self.db_schema.clone();
         let timeouts = self.db_timeouts.clone();
-        futures::future::Either::Right(async move {
-            let client = pool
-                .get()
-                .await
-                .map_err(|e| DbError::Connection(e.to_string()))?;
-            prepare_connection(&client, &schema, &timeouts).await?;
-            let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
+        async move {
+            let client = get_prepared_connection(&*pool?, &schema, &timeouts).await?;
+            let pg_params = to_pg_params(params);
             let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
                 pg_params.iter().map(|p| p as _).collect();
             let rows = client
                 .query(sql.as_str(), &params_ref)
                 .await
                 .map_err(|e| DbError::Query(pg_error_string(&e)))?;
-            Ok(rows.iter().map(pg_row_to_wit).collect())
-        })
+            Ok(rows.iter().map(pg_row_to_wit).collect::<Vec<_>>())
+        }
     }
 
     fn execute(
@@ -356,30 +374,19 @@ impl Host for ModuleState {
         sql: String,
         params: Vec<PgValue>,
     ) -> impl std::future::Future<Output = Result<u64, DbError>> + Send {
-        let pool = match &self.db_pool {
-            Some(p) => p.clone(),
-            None => {
-                return futures::future::Either::Left(std::future::ready(Err(DbError::Connection(
-                    "no database configured for this module".into(),
-                ))))
-            }
-        };
+        let pool = require_pool(self);
         let schema = self.db_schema.clone();
         let timeouts = self.db_timeouts.clone();
-        futures::future::Either::Right(async move {
-            let client = pool
-                .get()
-                .await
-                .map_err(|e| DbError::Connection(e.to_string()))?;
-            prepare_connection(&client, &schema, &timeouts).await?;
-            let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
+        async move {
+            let client = get_prepared_connection(&*pool?, &schema, &timeouts).await?;
+            let pg_params = to_pg_params(params);
             let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
                 pg_params.iter().map(|p| p as _).collect();
             client
                 .execute(sql.as_str(), &params_ref)
                 .await
                 .map_err(|e| DbError::Query(pg_error_string(&e)))
-        })
+        }
     }
 
     async fn query_stream(
@@ -387,22 +394,11 @@ impl Host for ModuleState {
         sql: String,
         params: Vec<PgValue>,
     ) -> Result<Resource<CursorState>, DbError> {
-        let pool = match &self.db_pool {
-            Some(p) => p.clone(),
-            None => {
-                return Err(DbError::Connection(
-                    "no database configured for this module".into(),
-                ))
-            }
-        };
+        let pool = require_pool(self)?;
         let schema = self.db_schema.clone();
         let timeouts = self.db_timeouts.clone();
-        let client = pool
-            .get()
-            .await
-            .map_err(|e| DbError::Connection(e.to_string()))?;
-        prepare_connection(&client, &schema, &timeouts).await?;
-        let pg_params: Vec<PgParam> = params.into_iter().map(PgParam::from).collect();
+        let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
+        let pg_params = to_pg_params(params);
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             pg_params.iter().map(|p| p as _).collect();
         let stream = client
@@ -419,29 +415,14 @@ impl Host for ModuleState {
     }
 
     async fn begin_transaction(&mut self) -> Result<Resource<TxState>, DbError> {
-        let pool = match &self.db_pool {
-            Some(p) => p.clone(),
-            None => {
-                return Err(DbError::Connection(
-                    "no database configured for this module".into(),
-                ))
-            }
-        };
+        let pool = require_pool(self)?;
         let schema = self.db_schema.clone();
         let timeouts = self.db_timeouts.clone();
-        let client = async move {
-            let client = pool
-                .get()
-                .await
-                .map_err(|e| DbError::Connection(e.to_string()))?;
-            client
-                .execute("BEGIN", &[])
-                .await
-                .map_err(|e| DbError::Query(pg_error_string(&e)))?;
-            prepare_connection(&client, &schema, &timeouts).await?;
-            Ok::<_, DbError>(client)
-        }
-        .await?;
+        let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
+        client
+            .execute("BEGIN", &[])
+            .await
+            .map_err(|e| DbError::Query(pg_error_string(&e)))?;
         self.table()
             .push(TxState {
                 client,
@@ -615,118 +596,112 @@ fn pg_row_to_wit(row: &tokio_postgres::Row) -> Row {
     Row { columns }
 }
 
+/// Maps a single Postgres column value to a WIT `PgValue`.
+///
+/// The `pg_col!` macro reduces the per-arm boilerplate. Each invocation
+/// generates: `opt(row.get::<_, Option<$rust_ty>>(i), $map_fn)`.
+macro_rules! pg_col {
+    // Simple: Type → PgValue variant, no transform needed
+    ($row:ident, $i:ident, $rust_ty:ty, $variant:expr) => {
+        opt($row.get::<_, Option<$rust_ty>>($i), $variant)
+    };
+    // Transform: Type → PgValue via closure
+    ($row:ident, $i:ident, $rust_ty:ty, |$v:ident| $body:expr) => {
+        opt($row.get::<_, Option<$rust_ty>>($i), |$v| $body)
+    };
+}
+
 fn pg_col_to_wit(row: &tokio_postgres::Row, i: usize, ty: &tokio_postgres::types::Type) -> PgValue {
     use tokio_postgres::types::Type;
 
     match *ty {
-        Type::BOOL => opt(row.get::<_, Option<bool>>(i), PgValue::Boolean),
-        Type::INT2 => opt(row.get::<_, Option<i16>>(i), PgValue::Int2),
-        Type::INT4 => opt(row.get::<_, Option<i32>>(i), PgValue::Int4),
-        Type::INT8 => opt(row.get::<_, Option<i64>>(i), PgValue::Int8),
-        Type::FLOAT4 => opt(row.get::<_, Option<f32>>(i), PgValue::Float4),
-        Type::FLOAT8 => opt(row.get::<_, Option<f64>>(i), PgValue::Float8),
+        // ── Scalars ─────────────────────────────────────────────────────
+        Type::BOOL => pg_col!(row, i, bool, PgValue::Boolean),
+        Type::INT2 => pg_col!(row, i, i16, PgValue::Int2),
+        Type::INT4 => pg_col!(row, i, i32, PgValue::Int4),
+        Type::INT8 => pg_col!(row, i, i64, PgValue::Int8),
+        Type::FLOAT4 => pg_col!(row, i, f32, PgValue::Float4),
+        Type::FLOAT8 => pg_col!(row, i, f64, PgValue::Float8),
+        Type::OID => pg_col!(row, i, u32, PgValue::Oid),
+        Type::BYTEA => pg_col!(row, i, Vec<u8>, PgValue::Bytea),
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
-            opt(row.get::<_, Option<String>>(i), PgValue::Text)
+            pg_col!(row, i, String, PgValue::Text)
         }
-        Type::BYTEA => opt(row.get::<_, Option<Vec<u8>>>(i), PgValue::Bytea),
-        Type::TIMESTAMPTZ => opt(
-            row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(i),
-            |dt| PgValue::Timestamptz(dt.timestamp_micros()),
-        ),
-        Type::TIMESTAMP => opt(row.get::<_, Option<chrono::NaiveDateTime>>(i), |dt| {
-            PgValue::Timestamp(dt.and_utc().timestamp_micros())
+
+        // ── Scalars with transforms ─────────────────────────────────────
+        Type::TIMESTAMPTZ => pg_col!(row, i, chrono::DateTime<chrono::Utc>, |dt| {
+            PgValue::Timestamptz(dt.timestamp_micros())
         }),
-        Type::DATE => opt(row.get::<_, Option<chrono::NaiveDate>>(i), |d| {
+        Type::TIMESTAMP => pg_col!(row, i, chrono::NaiveDateTime, |dt| PgValue::Timestamp(
+            dt.and_utc().timestamp_micros()
+        )),
+        Type::DATE => pg_col!(row, i, chrono::NaiveDate, |d| {
             let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
             PgValue::Date((d - epoch).num_days() as i32)
         }),
-        Type::TIME => opt(row.get::<_, Option<chrono::NaiveTime>>(i), |t| {
+        Type::TIME => pg_col!(row, i, chrono::NaiveTime, |t| {
             let micros =
                 t.num_seconds_from_midnight() as i64 * 1_000_000 + t.nanosecond() as i64 / 1_000;
             PgValue::Time(micros)
         }),
-        Type::NUMERIC => opt(row.get::<_, Option<rust_decimal::Decimal>>(i), |d| {
-            PgValue::Numeric(d.to_string())
-        }),
-        Type::UUID => opt(row.get::<_, Option<uuid::Uuid>>(i), |u| {
+        Type::NUMERIC => pg_col!(row, i, rust_decimal::Decimal, |d| PgValue::Numeric(
+            d.to_string()
+        )),
+        Type::UUID => pg_col!(row, i, uuid::Uuid, |u| {
             let n = u.as_u128();
             PgValue::Uuid(((n >> 64) as u64, n as u64))
         }),
-        Type::JSON | Type::JSONB => opt(row.get::<_, Option<serde_json::Value>>(i), |v| {
-            PgValue::Jsonb(v.to_string())
-        }),
-        Type::INTERVAL => opt(row.get::<_, Option<PgIntervalRaw>>(i), |iv| {
-            PgValue::Interval(PgInterval {
-                months: iv.months,
-                days: iv.days,
-                microseconds: iv.microseconds,
-            })
-        }),
-        Type::OID => opt(row.get::<_, Option<u32>>(i), PgValue::Oid),
-        Type::BOOL_ARRAY => opt(
-            row.get::<_, Option<Vec<Option<bool>>>>(i),
-            PgValue::BoolArray,
-        ),
-        Type::INT2_ARRAY => opt(
-            row.get::<_, Option<Vec<Option<i16>>>>(i),
-            PgValue::Int2Array,
-        ),
-        Type::INT4_ARRAY => opt(
-            row.get::<_, Option<Vec<Option<i32>>>>(i),
-            PgValue::Int4Array,
-        ),
-        Type::INT8_ARRAY => opt(
-            row.get::<_, Option<Vec<Option<i64>>>>(i),
-            PgValue::Int8Array,
-        ),
-        Type::FLOAT4_ARRAY => opt(
-            row.get::<_, Option<Vec<Option<f32>>>>(i),
-            PgValue::Float4Array,
-        ),
-        Type::FLOAT8_ARRAY => opt(
-            row.get::<_, Option<Vec<Option<f64>>>>(i),
-            PgValue::Float8Array,
-        ),
-        Type::TEXT_ARRAY | Type::VARCHAR_ARRAY => opt(
-            row.get::<_, Option<Vec<Option<String>>>>(i),
-            PgValue::TextArray,
-        ),
-        Type::TIMESTAMPTZ_ARRAY => opt(
-            row.get::<_, Option<Vec<Option<chrono::DateTime<chrono::Utc>>>>>(i),
-            |arr| {
+        Type::JSON | Type::JSONB => {
+            pg_col!(row, i, serde_json::Value, |v| PgValue::Jsonb(v.to_string()))
+        }
+        Type::INTERVAL => pg_col!(row, i, PgIntervalRaw, |iv| PgValue::Interval(PgInterval {
+            months: iv.months,
+            days: iv.days,
+            microseconds: iv.microseconds,
+        })),
+
+        // ── Simple arrays ─────────────────────────────────────────���─────
+        Type::BOOL_ARRAY => pg_col!(row, i, Vec<Option<bool>>, PgValue::BoolArray),
+        Type::INT2_ARRAY => pg_col!(row, i, Vec<Option<i16>>, PgValue::Int2Array),
+        Type::INT4_ARRAY => pg_col!(row, i, Vec<Option<i32>>, PgValue::Int4Array),
+        Type::INT8_ARRAY => pg_col!(row, i, Vec<Option<i64>>, PgValue::Int8Array),
+        Type::FLOAT4_ARRAY => pg_col!(row, i, Vec<Option<f32>>, PgValue::Float4Array),
+        Type::FLOAT8_ARRAY => pg_col!(row, i, Vec<Option<f64>>, PgValue::Float8Array),
+        Type::TEXT_ARRAY | Type::VARCHAR_ARRAY => {
+            pg_col!(row, i, Vec<Option<String>>, PgValue::TextArray)
+        }
+
+        // ── Arrays with transforms ──────────────────────────────────────
+        Type::TIMESTAMPTZ_ARRAY => {
+            pg_col!(row, i, Vec<Option<chrono::DateTime<chrono::Utc>>>, |arr| {
                 PgValue::TimestamptzArray(
                     arr.into_iter()
                         .map(|o| o.map(|dt| dt.timestamp_micros()))
                         .collect(),
                 )
-            },
-        ),
-        Type::TIMESTAMP_ARRAY => opt(
-            row.get::<_, Option<Vec<Option<chrono::NaiveDateTime>>>>(i),
-            |arr| {
-                PgValue::TimestampArray(
-                    arr.into_iter()
-                        .map(|o| o.map(|dt| dt.and_utc().timestamp_micros()))
-                        .collect(),
-                )
-            },
-        ),
-        Type::UUID_ARRAY => opt(row.get::<_, Option<Vec<Option<uuid::Uuid>>>>(i), |arr| {
-            PgValue::UuidArray(
+            })
+        }
+        Type::TIMESTAMP_ARRAY => pg_col!(row, i, Vec<Option<chrono::NaiveDateTime>>, |arr| {
+            PgValue::TimestampArray(
                 arr.into_iter()
-                    .map(|o| {
-                        o.map(|u| {
-                            let n = u.as_u128();
-                            ((n >> 64) as u64, n as u64)
-                        })
-                    })
+                    .map(|o| o.map(|dt| dt.and_utc().timestamp_micros()))
                     .collect(),
             )
         }),
-        Type::JSON_ARRAY | Type::JSONB_ARRAY => opt(
-            row.get::<_, Option<Vec<Option<serde_json::Value>>>>(i),
-            |arr| PgValue::JsonbArray(arr.into_iter().map(|o| o.map(|v| v.to_string())).collect()),
-        ),
+        Type::UUID_ARRAY => pg_col!(row, i, Vec<Option<uuid::Uuid>>, |arr| PgValue::UuidArray(
+            arr.into_iter()
+                .map(|o| o.map(|u| {
+                    let n = u.as_u128();
+                    ((n >> 64) as u64, n as u64)
+                }))
+                .collect()
+        )),
+        Type::JSON_ARRAY | Type::JSONB_ARRAY => {
+            pg_col!(row, i, Vec<Option<serde_json::Value>>, |arr| {
+                PgValue::JsonbArray(arr.into_iter().map(|o| o.map(|v| v.to_string())).collect())
+            })
+        }
+
         _ => {
             tracing::warn!(
                 col  = %row.columns()[i].name(),

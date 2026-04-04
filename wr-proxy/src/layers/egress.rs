@@ -39,6 +39,15 @@ impl EgressLayer {
             .enable_http2()
             .build();
         let client = Client::builder(TokioExecutor::new()).build(https);
+        // Pre-lowercase domain patterns so domain_matches() skips per-request lowercasing.
+        let config = config.map(|mut c| {
+            c.allowed_domains = c
+                .allowed_domains
+                .into_iter()
+                .map(|d| d.to_ascii_lowercase())
+                .collect();
+            c
+        });
         Self {
             config,
             client: Arc::new(client),
@@ -189,15 +198,16 @@ where
     }
 }
 
-/// Returns `true` if `host` matches `pattern` (case-insensitive).
+/// Returns `true` if `host` matches `pattern`.
+///
+/// Both `pattern` and `host` **must** be pre-lowercased by the caller.
+/// The routing layer lowercases egress patterns at construction time and
+/// lowercases the host when it is extracted from the request URI.
 ///
 /// `*` matches exactly one DNS label:
 /// - `*.openai.com` matches `api.openai.com` ✓
 /// - `*.openai.com` does NOT match `openai.com` or `a.b.openai.com`
 pub fn domain_matches(pattern: &str, host: &str) -> bool {
-    let pattern = pattern.to_ascii_lowercase();
-    let host = host.to_ascii_lowercase();
-
     if !pattern.contains('*') {
         return pattern == host;
     }
@@ -243,8 +253,9 @@ mod tests {
     }
 
     #[test]
-    fn case_insensitive() {
-        assert!(domain_matches("*.OpenAI.COM", "API.openai.com"));
+    fn pre_lowered_inputs() {
+        // Both pattern and host must be pre-lowercased by the caller.
+        assert!(domain_matches("*.openai.com", "api.openai.com"));
     }
 
     #[test]
