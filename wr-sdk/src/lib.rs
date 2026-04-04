@@ -58,11 +58,14 @@ pub mod exports {
 /// Convenience re-export of the HTTP handler `ServiceGuest` trait.
 pub use exports::incoming_handler::ServiceGuest;
 
+pub mod blobstore;
+pub mod db;
 pub mod http;
 pub mod io;
 pub mod jobs;
 pub mod llm;
 pub mod log;
+pub mod prelude;
 pub mod tracing;
 
 /// Error type returned by generated service handler traits.
@@ -101,6 +104,21 @@ impl ServiceError {
 impl std::fmt::Display for ServiceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "HTTP {}: {}", self.status, self.message)
+    }
+}
+
+impl From<crate::http::HttpError> for ServiceError {
+    fn from(e: crate::http::HttpError) -> Self {
+        match e {
+            crate::http::HttpError::Status { code, body } => ServiceError {
+                status: code,
+                message: String::from_utf8_lossy(&body).into_owned(),
+            },
+            crate::http::HttpError::Transport(msg) => {
+                ServiceError::internal(format!("transport: {msg}"))
+            }
+            crate::http::HttpError::Decode(msg) => ServiceError::internal(format!("decode: {msg}")),
+        }
     }
 }
 

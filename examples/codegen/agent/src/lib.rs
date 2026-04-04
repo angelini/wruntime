@@ -110,7 +110,7 @@ impl proto::AgentService for Component {
         // Load relevant documentation from blobstore.
         let ctx_span = tracing::start("agent.build_context", &[]);
         let context = build_context(&req.doc_prefixes, &req.task_description)?;
-        tracing::set_attribute(&ctx_span, "context.length", &context.len().to_string());
+        tracing::set_attr(&ctx_span, "context.length", &context.len().to_string());
         drop(ctx_span);
 
         let system_prompt = format!(
@@ -169,12 +169,12 @@ impl proto::AgentService for Component {
             resp.usage.output_tokens,
             text.len()
         ));
-        tracing::set_attribute(
+        tracing::set_attr(
             &turn_span,
             "tokens.input",
             &resp.usage.input_tokens.to_string(),
         );
-        tracing::set_attribute(
+        tracing::set_attr(
             &turn_span,
             "tokens.output",
             &resp.usage.output_tokens.to_string(),
@@ -234,12 +234,12 @@ impl proto::AgentService for Component {
                 "llm response: turn={turn} type=refine input_tokens={} output_tokens={} response_len={} lgtm={}",
                 resp.usage.input_tokens, resp.usage.output_tokens, text.len(), text.trim() == "LGTM"
             ));
-            tracing::set_attribute(
+            tracing::set_attr(
                 &turn_span,
                 "tokens.input",
                 &resp.usage.input_tokens.to_string(),
             );
-            tracing::set_attribute(
+            tracing::set_attr(
                 &turn_span,
                 "tokens.output",
                 &resp.usage.output_tokens.to_string(),
@@ -269,14 +269,14 @@ impl proto::AgentService for Component {
         )
         .map_err(|e| ServiceError::internal(format!("update session: {e:?}")))?;
 
-        tracing::set_attribute(&span, "agent.turns_used", &turn.to_string());
-        tracing::set_attribute(&span, "agent.total_input_tokens", &total_input.to_string());
-        tracing::set_attribute(
+        tracing::set_attr(&span, "agent.turns_used", &turn.to_string());
+        tracing::set_attr(&span, "agent.total_input_tokens", &total_input.to_string());
+        tracing::set_attr(
             &span,
             "agent.total_output_tokens",
             &total_output.to_string(),
         );
-        tracing::set_attribute(&span, "agent.diff_bytes", &latest_diff.len().to_string());
+        tracing::set_attr(&span, "agent.diff_bytes", &latest_diff.len().to_string());
         drop(span);
 
         Ok(proto::RunTaskResponse {

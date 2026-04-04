@@ -103,7 +103,7 @@ impl proto::CollectorService for Component {
                 tracing::set_error(&fetch_span, &e.message);
             })?;
 
-            tracing::set_attribute(&fetch_span, "source.bytes", &bytes.to_string());
+            tracing::set_attr(&fetch_span, "source.bytes", &bytes.to_string());
             drop(fetch_span);
 
             total_bytes += bytes as i64;
@@ -111,8 +111,8 @@ impl proto::CollectorService for Component {
             doc_prefixes.push(prefix);
         }
 
-        tracing::set_attribute(&span, "sources.fetched", &sources_fetched.to_string());
-        tracing::set_attribute(&span, "total_bytes", &total_bytes.to_string());
+        tracing::set_attr(&span, "sources.fetched", &sources_fetched.to_string());
+        tracing::set_attr(&span, "total_bytes", &total_bytes.to_string());
         drop(span);
 
         Ok(proto::FetchDocsResponse {

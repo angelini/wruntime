@@ -8,8 +8,9 @@ pub fn start(name: &str, attrs: &[(&str, &str)]) -> span::ActiveSpan {
     span::start(name, &owned)
 }
 
-pub fn set_attribute(span: &span::ActiveSpan, key: &str, value: &str) {
-    span.set_attribute(key, value);
+/// Set a span attribute, converting the value to a string via `Display`.
+pub fn set_attr(span: &span::ActiveSpan, key: &str, value: impl std::fmt::Display) {
+    span.set_attribute(key, &value.to_string());
 }
 
 pub fn record_event(span: &span::ActiveSpan, name: &str, attrs: &[(&str, &str)]) {

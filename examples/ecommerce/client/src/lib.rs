@@ -8,9 +8,7 @@ mod bindings;
 
 use prost::Message;
 use proto::InventoryServiceClient;
-use wr_sdk::bindings::wasi::http::types::{IncomingRequest, Method, ResponseOutparam};
-use wr_sdk::io::{err_body, read_body, send_response};
-use wr_sdk::tracing;
+use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
@@ -75,19 +73,19 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                     quantity,
                 }) {
                     Ok(r) => {
-                        tracing::set_attribute(&sp, "product.remaining", &r.remaining.to_string());
+                        tracing::set_attr(&sp, "product.remaining", r.remaining);
                         wr_sdk::log::log(&format!(
                             "bought {} x{} — remaining={}",
                             product_id, quantity, r.remaining
                         ));
                         purchased.push((product_id, quantity));
                     }
-                    Err(e) if e.contains("HTTP 409") => {
+                    Err(ref e) if e.is_status(409) => {
                         tracing::set_error(&sp, "out of stock");
                         wr_sdk::log::log(&format!("out of stock {} x{}", product_id, quantity));
                     }
                     Err(e) => {
-                        tracing::set_error(&sp, &e);
+                        tracing::set_error(&sp, &format!("{e}"));
                         wr_sdk::log::log(&format!("buy error: {e}"));
                         errors.push(format!("buy {product_id}: {e}"));
                     }
@@ -114,7 +112,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                             ));
                         }
                         Err(e) => {
-                            tracing::set_error(&sp, &e);
+                            tracing::set_error(&sp, &format!("{e}"));
                             wr_sdk::log::log(&format!("return error: {e}"));
                             errors.push(format!("return {ret_id}: {e}"));
                         }
@@ -128,11 +126,11 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                     product_id: product_id.clone(),
                 }) {
                     Ok(r) => {
-                        tracing::set_attribute(&sp, "product.stock", &r.stock.to_string());
+                        tracing::set_attr(&sp, "product.stock", r.stock);
                         wr_sdk::log::log(&format!("stock {} = {}", product_id, r.stock));
                     }
                     Err(e) => {
-                        tracing::set_error(&sp, &e);
+                        tracing::set_error(&sp, &format!("{e}"));
                         wr_sdk::log::log(&format!("get_stock error: {e}"));
                         errors.push(format!("get_stock {product_id}: {e}"));
                     }
@@ -157,17 +155,13 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                         quantity,
                     }) {
                         Ok(r) => {
-                            tracing::set_attribute(
-                                &sp,
-                                "product.transferred",
-                                &r.transferred.to_string(),
-                            );
+                            tracing::set_attr(&sp, "product.transferred", r.transferred);
                             wr_sdk::log::log(&format!(
                                 "transferred {} → {} x{}",
                                 product_id, to_product_id, r.transferred
                             ));
                         }
-                        Err(e) if e.contains("HTTP 409") => {
+                        Err(ref e) if e.is_status(409) => {
                             tracing::set_error(&sp, "insufficient stock");
                             wr_sdk::log::log(&format!(
                                 "transfer insufficient stock {} → {}",
@@ -175,7 +169,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                             ));
                         }
                         Err(e) => {
-                            tracing::set_error(&sp, &e);
+                            tracing::set_error(&sp, &format!("{e}"));
                             wr_sdk::log::log(&format!("transfer error: {e}"));
                             errors.push(format!("transfer {product_id} → {to_product_id}: {e}"));
                         }
@@ -196,14 +190,14 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                     quantity: quantity * 10,
                 }) {
                     Ok(r) => {
-                        tracing::set_attribute(&sp, "product.new_stock", &r.new_stock.to_string());
+                        tracing::set_attr(&sp, "product.new_stock", r.new_stock);
                         wr_sdk::log::log(&format!(
                             "restocked {} — new_stock={}",
                             product_id, r.new_stock
                         ));
                     }
                     Err(e) => {
-                        tracing::set_error(&sp, &e);
+                        tracing::set_error(&sp, &format!("{e}"));
                         wr_sdk::log::log(&format!("restock error: {e}"));
                         errors.push(format!("restock {product_id}: {e}"));
                     }
@@ -214,8 +208,8 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
         completed += 1;
     }
 
-    tracing::set_attribute(&run_span, "client.completed", &completed.to_string());
-    tracing::set_attribute(&run_span, "client.errors", &errors.len().to_string());
+    tracing::set_attr(&run_span, "client.completed", completed);
+    tracing::set_attr(&run_span, "client.errors", errors.len());
     wr_sdk::log::log(&format!(
         "client done — {completed} operations, {} errors",
         errors.len()

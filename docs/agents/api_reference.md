@@ -25,11 +25,74 @@ pub fn err_body(status: u16, msg: &str) -> (u16, Vec<u8>)
 Source: `wr-sdk/src/http.rs`
 
 ```rust
-/// POST protobuf body to http://{authority}{path}.
-/// Returns (http_status, response_bytes) on success.
-/// The authority is the module address: "namespace.module" (e.g. "ecommerce.inventory").
-pub fn http_rpc(authority: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String>
+/// Errors from outbound HTTP requests.
+pub enum HttpError {
+    /// Non-success HTTP status with response body.
+    Status { code: u16, body: Vec<u8> },
+    /// Transport-level failure (DNS, connection refused, timeout).
+    Transport(String),
+    /// Failed to decode the response body.
+    Decode(String),
+}
+
+impl HttpError {
+    pub fn status_code(&self) -> Option<u16>;
+    pub fn is_status(&self, code: u16) -> bool;
+}
+
+/// HTTP method for outbound requests.
+pub enum Method { Get, Post, Put, Delete, Patch, Head, Options }
+
+/// An outbound HTTP request descriptor.
+pub struct HttpRequest<'a> {
+    pub authority: &'a str,
+    pub path: &'a str,
+    pub method: Method,
+    pub headers: &'a [(&'a str, &'a [u8])],
+    pub body: &'a [u8],
+}
+
+/// An HTTP response with status and body.
+pub struct HttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// Interpret body as UTF-8.
+    pub fn text(&self) -> Result<&str, HttpError>;
+    /// Decode body as protobuf message.
+    pub fn decode<T: prost::Message + Default>(&self) -> Result<T, HttpError>;
+    /// Return Err if status is not 2xx.
+    pub fn error_for_status(self) -> Result<Self, HttpError>;
+}
+
+/// Timeout configuration for HTTP requests.
+pub struct Timeouts {
+    pub connect: Option<Duration>,
+    pub first_byte: Option<Duration>,
+    pub between_bytes: Option<Duration>,
+}
+
+impl Timeouts {
+    pub fn uniform(d: Duration) -> Self;
+}
+
+/// Execute an HTTP request.
+pub fn http_request(req: &HttpRequest) -> Result<HttpResponse, HttpError>;
+
+/// Execute an HTTP request with timeouts.
+pub fn http_request_with_timeouts(req: &HttpRequest, timeouts: &Timeouts) -> Result<HttpResponse, HttpError>;
+
+/// Legacy convenience wrapper: POST protobuf body to http://{authority}{path}.
+/// New code should prefer http_request for typed errors and method flexibility.
+pub fn http_rpc(authority: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String>;
 ```
+
+Generated clients now return `Result<T, HttpError>` instead of `Result<T, String>`.
+Use `e.is_status(409)` instead of `e.contains("HTTP 409")` for status matching.
+`HttpError` implements `Display` so `format!("{e}")` works everywhere.
+`From<HttpError> for ServiceError` is provided for `?` propagation in handlers.
 
 ## wr_sdk::log
 
@@ -48,8 +111,8 @@ Source: `wr-sdk/src/tracing.rs`
 /// Start a new child span under the current request span.
 pub fn start(name: &str, attrs: &[(&str, &str)]) -> ActiveSpan
 
-/// Record a key/value attribute on a span.
-pub fn set_attribute(span: &ActiveSpan, key: &str, value: &str)
+/// Set a span attribute. Accepts any Display type (no manual .to_string() needed).
+pub fn set_attr(span: &ActiveSpan, key: &str, value: impl Display)
 
 /// Record a point-in-time event on a span.
 pub fn record_event(span: &ActiveSpan, name: &str, attrs: &[(&str, &str)])
@@ -92,7 +155,84 @@ Export macros:
 ```rust
 // Register T as wasi:http/incoming-handler (handler modules)
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
+```
 
+Error conversions — all error types convert to `ServiceError` via `From`, enabling `?`:
+- `From<HttpError> for ServiceError` — HTTP client errors
+- `From<DbError> for ServiceError` — database errors
+- `From<BlobError> for ServiceError` — blobstore errors
+- `From<LlmError> for ServiceError` — LLM errors
+
+## wr_sdk::prelude
+
+Source: `wr-sdk/src/prelude.rs`. Import with `use wr_sdk::prelude::*` to get:
+
+`IncomingRequest`, `Method`, `ResponseOutparam`, `database`, `PgValue`,
+`err_body`, `read_body`, `send_response`, `send_json_response`,
+`ServiceError`, `tracing`, `ServiceGuest`.
+
+## wr_sdk::db
+
+Source: `wr-sdk/src/db.rs`
+
+### Row helpers
+
+```rust
+impl Row {
+    fn get_text(&self, col: usize) -> Result<&str, ServiceError>;
+    fn get_i64(&self, col: usize) -> Result<i64, ServiceError>;
+    fn get_i32(&self, col: usize) -> Result<i32, ServiceError>;
+    fn get_bool(&self, col: usize) -> Result<bool, ServiceError>;
+    fn get_f64(&self, col: usize) -> Result<f64, ServiceError>;
+    fn get_jsonb(&self, col: usize) -> Result<&str, ServiceError>;
+}
+```
+
+### Transaction guard (auto-rollback on drop)
+
+```rust
+/// Begin a transaction wrapped in TxGuard. Rolls back automatically on drop.
+pub fn transaction() -> Result<TxGuard, ServiceError>;
+
+impl TxGuard {
+    fn query(&self, sql: &str, params: &[PgValue]) -> Result<Vec<Row>, ServiceError>;
+    fn execute(&self, sql: &str, params: &[PgValue]) -> Result<u64, ServiceError>;
+    fn commit(self) -> Result<(), ServiceError>;  // consumes guard, no rollback
+}
+```
+
+## wr_sdk::io extras
+
+```rust
+/// Send response with application/json content-type.
+pub fn send_json_response(response_out: ResponseOutparam, status: u16, body: Vec<u8>)
+
+/// Send response with custom content-type.
+pub fn send_response_with_content_type(
+    response_out: ResponseOutparam, status: u16, body: Vec<u8>, content_type: &str,
+)
+```
+
+## Generated code (wr-build)
+
+The service generator emits a `_handle` function alongside each router:
+
+```rust
+/// Default ServiceGuest handler — reads body, routes, sends response.
+pub fn inventory_service_handle<T: InventoryService>(
+    svc: &T,
+    request: IncomingRequest,
+    response_out: ResponseOutparam,
+);
+```
+
+Usage in handler modules:
+```rust
+impl wr_sdk::ServiceGuest for Component {
+    fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
+        proto::inventory_service_handle(&Component, request, response_out);
+    }
+}
 ```
 
 ## wruntime:db/database@0.4.0

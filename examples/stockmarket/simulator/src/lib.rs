@@ -8,9 +8,7 @@ mod bindings;
 
 use prost::Message;
 use proto::{ExchangeServiceClient, LedgerServiceClient};
-use wr_sdk::bindings::wasi::http::types::{IncomingRequest, Method, ResponseOutparam};
-use wr_sdk::io::{err_body, read_body, send_response};
-use wr_sdk::tracing;
+use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
@@ -156,25 +154,17 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                     total_trades += r.trades_matched as i64;
                     // Approximate volume (actual execution prices may differ).
                     total_volume += r.quantity_filled * price;
-                    tracing::set_attribute(
-                        &order_span,
-                        "order.trades_matched",
-                        &r.trades_matched.to_string(),
-                    );
+                    tracing::set_attr(&order_span, "order.trades_matched", r.trades_matched);
                 }
                 Err(e) => {
-                    tracing::set_error(&order_span, &e);
+                    tracing::set_error(&order_span, &format!("{e}"));
                     wr_sdk::log::log(&format!("place_order error: {e}"));
                     errors += 1;
                 }
             }
         }
 
-        tracing::set_attribute(
-            &trader_span,
-            "trader.orders_placed",
-            &orders_per_trader.to_string(),
-        );
+        tracing::set_attr(&trader_span, "trader.orders_placed", orders_per_trader);
     }
 
     wr_sdk::log::log(&format!(
@@ -187,19 +177,15 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
         label: "final".to_string(),
     }) {
         Ok(r) => {
-            tracing::set_attribute(&snapshot_span, "snapshot.key", &r.snapshot_key);
-            tracing::set_attribute(
-                &snapshot_span,
-                "snapshot.trade_count",
-                &r.trade_count.to_string(),
-            );
+            tracing::set_attr(&snapshot_span, "snapshot.key", &r.snapshot_key);
+            tracing::set_attr(&snapshot_span, "snapshot.trade_count", r.trade_count);
             wr_sdk::log::log(&format!(
                 "snapshot taken: key={}, trades={}, bytes={}",
                 r.snapshot_key, r.trade_count, r.snapshot_bytes
             ));
         }
         Err(e) => {
-            tracing::set_error(&snapshot_span, &e);
+            tracing::set_error(&snapshot_span, &format!("{e}"));
             wr_sdk::log::log(&format!("snapshot error: {e}"));
             errors += 1;
         }
@@ -209,16 +195,8 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
     let verify_span = tracing::start("simulator.verify", &[]);
     let (ledger_valid, verification_details) = match ledger.verify(proto::VerifyRequest {}) {
         Ok(r) => {
-            tracing::set_attribute(
-                &verify_span,
-                "verify.valid",
-                if r.valid { "true" } else { "false" },
-            );
-            tracing::set_attribute(
-                &verify_span,
-                "verify.total_trades",
-                &r.total_trades.to_string(),
-            );
+            tracing::set_attr(&verify_span, "verify.valid", r.valid);
+            tracing::set_attr(&verify_span, "verify.total_trades", r.total_trades);
             wr_sdk::log::log(&format!(
                 "verification: valid={}, trades={}, volume={}, details={}",
                 r.valid, r.total_trades, r.total_volume, r.details
@@ -229,21 +207,17 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
             (r.valid, r.details)
         }
         Err(e) => {
-            tracing::set_error(&verify_span, &e);
+            tracing::set_error(&verify_span, &format!("{e}"));
             wr_sdk::log::log(&format!("verification error: {e}"));
             errors += 1;
             (false, format!("verification call failed: {e}"))
         }
     };
 
-    tracing::set_attribute(&run_span, "sim.total_trades", &total_trades.to_string());
-    tracing::set_attribute(&run_span, "sim.total_volume", &total_volume.to_string());
-    tracing::set_attribute(&run_span, "sim.errors", &errors.to_string());
-    tracing::set_attribute(
-        &run_span,
-        "sim.ledger_valid",
-        if ledger_valid { "true" } else { "false" },
-    );
+    tracing::set_attr(&run_span, "sim.total_trades", total_trades);
+    tracing::set_attr(&run_span, "sim.total_volume", total_volume);
+    tracing::set_attr(&run_span, "sim.errors", errors);
+    tracing::set_attr(&run_span, "sim.ledger_valid", ledger_valid);
 
     wr_sdk::log::log(&format!(
         "simulator done — orders={total_orders}, trades={total_trades}, \

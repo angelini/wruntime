@@ -33,7 +33,7 @@ impl proto::ExchangeService for Component {
         let _ = database::execute("TRUNCATE orders, positions", &[]);
 
         let count = req.symbols.len() as i32;
-        tracing::set_attribute(&sp, "exchange.symbols", &count.to_string());
+        tracing::set_attr(&sp, "exchange.symbols", &count.to_string());
         Ok(proto::SetupResponse {
             symbols_created: count,
         })
@@ -248,9 +248,9 @@ impl proto::ExchangeService for Component {
             }
         }
 
-        tracing::set_attribute(&sp, "order.id", &order_id.to_string());
-        tracing::set_attribute(&sp, "order.trades_matched", &trades_matched.to_string());
-        tracing::set_attribute(&sp, "order.total_filled", &total_filled.to_string());
+        tracing::set_attr(&sp, "order.id", &order_id.to_string());
+        tracing::set_attr(&sp, "order.trades_matched", &trades_matched.to_string());
+        tracing::set_attr(&sp, "order.total_filled", &total_filled.to_string());
         if trades_matched > 0 {
             tracing::record_event(
                 &sp,

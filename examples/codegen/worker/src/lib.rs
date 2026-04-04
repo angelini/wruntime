@@ -91,7 +91,7 @@ impl proto::WorkerService for Component {
             }
         };
 
-        tracing::set_attribute(
+        tracing::set_attr(
             &collect_span,
             "collector.sources_fetched",
             &fetch_resp.sources_fetched.to_string(),
@@ -133,7 +133,7 @@ impl proto::WorkerService for Component {
             }
         };
 
-        tracing::set_attribute(
+        tracing::set_attr(
             &agent_span,
             "agent.turns_used",
             &agent_resp.turns_used.to_string(),
@@ -151,7 +151,7 @@ impl proto::WorkerService for Component {
             total_output_tokens: agent_resp.output_tokens,
         });
 
-        tracing::set_attribute(&span, "task.status", "complete");
+        tracing::set_attr(&span, "task.status", "complete");
         drop(span);
         wr_sdk::log::log(&format!("task {} complete", task_id));
 

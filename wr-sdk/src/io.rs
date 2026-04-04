@@ -40,6 +40,36 @@ pub fn send_response(response_out: ResponseOutparam, status: u16, body: Vec<u8>)
     let _ = OutgoingBody::finish(out_body, None);
 }
 
+/// Write a response with the given status, content-type, and body bytes.
+pub fn send_json_response(response_out: ResponseOutparam, status: u16, body: Vec<u8>) {
+    send_response_with_content_type(response_out, status, body, "application/json");
+}
+
+/// Write a response with a custom content-type header.
+pub fn send_response_with_content_type(
+    response_out: ResponseOutparam,
+    status: u16,
+    body: Vec<u8>,
+    content_type: &str,
+) {
+    let headers = Fields::new();
+    let _ = headers.set("content-type", &[content_type.as_bytes().to_vec()]);
+
+    let resp = OutgoingResponse::new(headers);
+    let _ = resp.set_status_code(status);
+
+    let out_body = resp.body().unwrap();
+    {
+        let stream = out_body.write().unwrap();
+        for chunk in body.chunks(4096) {
+            let _ = stream.blocking_write_and_flush(chunk);
+        }
+    }
+
+    ResponseOutparam::set(response_out, Ok(resp));
+    let _ = OutgoingBody::finish(out_body, None);
+}
+
 /// Return a JSON error body with the given status code.
 pub fn err_body(status: u16, msg: &str) -> (u16, Vec<u8>) {
     (status, format!(r#"{{"error":"{}"}}"#, msg).into_bytes())

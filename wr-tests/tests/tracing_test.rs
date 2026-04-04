@@ -18,7 +18,9 @@ async fn test_tracing_span_start_and_drop() {
     .expect("ModuleState");
 
     let span = Host::start(&mut state, "my-operation".into(), vec![]).await;
-    HostActiveSpan::drop(&mut state, span).await.expect("drop span");
+    HostActiveSpan::drop(&mut state, span)
+        .await
+        .expect("drop span");
 }
 
 #[tokio::test]

@@ -1,4 +1,25 @@
 use crate::bindings::wruntime::llm::inference::*;
+use crate::ServiceError;
+
+impl From<LlmError> for ServiceError {
+    fn from(e: LlmError) -> Self {
+        match e {
+            LlmError::InvalidRequest(msg) => ServiceError::bad_request(format!("llm: {msg}")),
+            LlmError::Auth(msg) => ServiceError::internal(format!("llm auth: {msg}")),
+            LlmError::RateLimited(retry_after) => {
+                let msg = match retry_after {
+                    Some(secs) => format!("llm rate limited (retry after {secs}s)"),
+                    None => "llm rate limited".into(),
+                };
+                ServiceError {
+                    status: 429,
+                    message: msg,
+                }
+            }
+            LlmError::Api(msg) => ServiceError::internal(format!("llm api: {msg}")),
+        }
+    }
+}
 
 /// Builder for completion requests.
 pub struct CompletionBuilder {

@@ -65,7 +65,7 @@ async fn test_proxy_routes_to_explicit_version() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_proxy_routes_to_latest_version() -> Result<()> {
+async fn test_proxy_load_balances_across_versions_without_header() -> Result<()> {
     let pool = manager_pool().await;
     let mgr_addr = start_manager(pool).await?;
     let mut mgr = manager_client(&mgr_addr).await?;
@@ -108,12 +108,22 @@ async fn test_proxy_routes_to_latest_version() -> Result<()> {
     sync_table(&mgr_addr, &table).await?;
     let proxy = start_proxy(table).await?;
 
-    // No x-wr-version → should route to the highest semver (2.0.0)
-    let (s, body) = proxy_get(proxy, "latest-ns", "latest-service", None).await?;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(
-        body, "engine-v2",
-        "no version header should route to latest"
+    // No x-wr-version → should load-balance across all versions
+    let mut saw_v1 = false;
+    let mut saw_v2 = false;
+    for _ in 0..10 {
+        let (s, body) = proxy_get(proxy, "latest-ns", "latest-service", None).await?;
+        assert_eq!(s, StatusCode::OK);
+        saw_v1 |= body == "engine-v1";
+        saw_v2 |= body == "engine-v2";
+    }
+    assert!(
+        saw_v1,
+        "engine-v1 should receive traffic without version header"
+    );
+    assert!(
+        saw_v2,
+        "engine-v2 should receive traffic without version header"
     );
 
     let _ = e1_shutdown.send(());

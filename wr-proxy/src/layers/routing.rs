@@ -13,6 +13,14 @@ use super::{error_response, Destination, ProxyBody, ResBody, ResolvedDestination
 use crate::indexed_routing::ParsedRule;
 use crate::routing::CachedRoutingTable;
 
+/// A routing candidate with its resolved version attached so the caller can
+/// inject the correct `x-wr-version` header after round-robin selection.
+#[derive(Clone)]
+struct VersionedCandidate {
+    dest: Destination,
+    version: Arc<str>,
+}
+
 type RoundRobinCounters = Arc<Mutex<HashMap<(Arc<str>, Arc<str>, Arc<str>), usize>>>;
 
 pub struct RoutingLayer {
@@ -97,26 +105,6 @@ fn parse_destination(
     }
 }
 
-/// Given a slice of pre-sorted (descending) rules, collect all candidates at the
-/// best (first) version.
-fn best_version_candidates(
-    rules: &[ParsedRule],
-    self_proxy_address: &str,
-) -> (Arc<str>, Vec<Destination>) {
-    match rules.first() {
-        Some(best) => {
-            let ver = &best.rule.destination_version;
-            let cands = rules
-                .iter()
-                .take_while(|r| r.rule.destination_version == *ver)
-                .map(|r| make_destination(&r.rule, self_proxy_address))
-                .collect();
-            (Arc::from(ver.as_str()), cands)
-        }
-        None => (Arc::from(""), vec![]),
-    }
-}
-
 fn make_destination(
     rule: &wr_common::wruntime::RoutingRule,
     self_proxy_address: &str,
@@ -128,15 +116,23 @@ fn make_destination(
     }
 }
 
-/// Resolve the best candidates from the indexed routing table, considering an
-/// optional version requirement.
+/// Resolve candidates from the indexed routing table.
+///
+/// When a version requirement is provided (`x-wr-version` header), returns only
+/// candidates matching the highest satisfying semver version.
+///
+/// When no version is specified, returns **all** healthy candidates regardless
+/// of version so traffic is spread across every available engine.  The first
+/// element of the returned tuple is the round-robin key version: the resolved
+/// version when pinned, or an empty string when unversioned (so all candidates
+/// share a single counter).
 async fn resolve_candidates(
     table: &CachedRoutingTable,
     namespace: &str,
     module: &str,
     requested_version: &Option<String>,
     self_proxy_address: &str,
-) -> (Arc<str>, Vec<Destination>) {
+) -> (Arc<str>, Vec<VersionedCandidate>) {
     let t = table.read().await;
     let rules = t.get(namespace, module);
 
@@ -165,11 +161,23 @@ async fn resolve_candidates(
         let cands = satisfying
             .iter()
             .take_while(|r| r.rule.destination_version == *best_ver)
-            .map(|r| make_destination(&r.rule, self_proxy_address))
+            .map(|r| VersionedCandidate {
+                dest: make_destination(&r.rule, self_proxy_address),
+                version: Arc::from(best_ver.as_str()),
+            })
             .collect();
         (Arc::from(best_ver.as_str()), cands)
     } else {
-        best_version_candidates(rules, self_proxy_address)
+        // No version requested — load-balance across all healthy candidates
+        // regardless of version.
+        let cands = rules
+            .iter()
+            .map(|r| VersionedCandidate {
+                dest: make_destination(&r.rule, self_proxy_address),
+                version: Arc::from(r.rule.destination_version.as_str()),
+            })
+            .collect();
+        (Arc::from(""), cands)
     }
 }
 
@@ -177,8 +185,8 @@ async fn resolve_candidates(
 fn select_round_robin(
     counters: &RoundRobinCounters,
     key: (Arc<str>, Arc<str>, Arc<str>),
-    candidates: &[Destination],
-) -> Destination {
+    candidates: &[VersionedCandidate],
+) -> VersionedCandidate {
     let mut map = counters.lock().unwrap();
     let counter = map.entry(key).or_insert(0);
     let idx = *counter % candidates.len();
@@ -300,13 +308,17 @@ where
                 ),
                 &candidates,
             );
-            let first_addr = chosen.address();
+            let first_addr = chosen.dest.address();
 
-            inject_routing_headers(&mut req, &dest_namespace, &module_name, &resolved_version);
-            span.record("wr.version", &*resolved_version);
+            // Use the selected candidate's version for the header — this
+            // matters when no version was requested and candidates span
+            // multiple versions.
+            inject_routing_headers(&mut req, &dest_namespace, &module_name, &chosen.version);
+            span.record("wr.version", &*chosen.version);
             span.record("wr.engine", first_addr);
 
-            req.extensions_mut().insert(ResolvedDestination(chosen));
+            req.extensions_mut()
+                .insert(ResolvedDestination(chosen.dest));
             inner.call(req).instrument(span).await
         })
     }

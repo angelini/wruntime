@@ -1,3 +1,5 @@
+use crate::http::{HttpError, HttpRequest, Method};
+
 /// Submit a job to a worker module's engine-managed queue.
 ///
 /// `engine_authority` is the worker's `namespace.name` (e.g. `"codegen.worker"`).
@@ -6,7 +8,7 @@ pub fn submit_job(
     engine_authority: &str,
     job_type: &str,
     payload: &[u8],
-) -> Result<String, String> {
+) -> Result<String, HttpError> {
     submit_job_with_options(engine_authority, job_type, payload, 0, 0)
 }
 
@@ -19,10 +21,12 @@ pub fn submit_job_with_options(
     payload: &[u8],
     timeout_secs: i32,
     max_attempts: i32,
-) -> Result<String, String> {
+) -> Result<String, HttpError> {
     // Parse namespace.name from the authority.
     let (namespace, name) = engine_authority.split_once('.').ok_or_else(|| {
-        format!("invalid authority: {engine_authority} (expected namespace.name)")
+        HttpError::Transport(format!(
+            "invalid authority: {engine_authority} (expected namespace.name)"
+        ))
     })?;
 
     let body = encode_submit_job_request(
@@ -33,33 +37,45 @@ pub fn submit_job_with_options(
         timeout_secs,
         max_attempts,
     );
-    let (status, resp_bytes) =
-        crate::http::http_rpc(engine_authority, "/wruntime.WorkerService/SubmitJob", &body)?;
+    let resp = crate::http::http_request(&HttpRequest {
+        authority: engine_authority,
+        path: "/wruntime.WorkerService/SubmitJob",
+        method: Method::Post,
+        headers: &[("content-type", b"application/x-protobuf" as &[u8])],
+        body: &body,
+    })?;
 
-    if status != 200 {
-        let msg = String::from_utf8_lossy(&resp_bytes);
-        return Err(format!("submit job failed: HTTP {status}: {msg}"));
+    if resp.status != 200 {
+        return Err(HttpError::Status {
+            code: resp.status,
+            body: resp.body,
+        });
     }
 
     // Decode SubmitJobResponse: field 1 (string) = job_id
-    decode_string_field(&resp_bytes, 1).ok_or_else(|| "missing job_id in response".to_string())
+    decode_string_field(&resp.body, 1)
+        .ok_or_else(|| HttpError::Decode("missing job_id in response".into()))
 }
 
 /// Query the status of a previously submitted job.
-pub fn get_job_status(engine_authority: &str, job_id: &str) -> Result<JobStatus, String> {
+pub fn get_job_status(engine_authority: &str, job_id: &str) -> Result<JobStatus, HttpError> {
     let body = encode_string_field(1, job_id);
-    let (status, resp_bytes) = crate::http::http_rpc(
-        engine_authority,
-        "/wruntime.WorkerService/GetJobStatus",
-        &body,
-    )?;
+    let resp = crate::http::http_request(&HttpRequest {
+        authority: engine_authority,
+        path: "/wruntime.WorkerService/GetJobStatus",
+        method: Method::Post,
+        headers: &[("content-type", b"application/x-protobuf" as &[u8])],
+        body: &body,
+    })?;
 
-    if status != 200 {
-        let msg = String::from_utf8_lossy(&resp_bytes);
-        return Err(format!("get job status failed: HTTP {status}: {msg}"));
+    if resp.status != 200 {
+        return Err(HttpError::Status {
+            code: resp.status,
+            body: resp.body,
+        });
     }
 
-    Ok(decode_job_status_response(&resp_bytes))
+    Ok(decode_job_status_response(&resp.body))
 }
 
 /// Status of a worker job.

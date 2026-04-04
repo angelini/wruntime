@@ -43,7 +43,7 @@ impl proto::TracingTestService for Component {
     ) -> Result<proto::SpanAttributesResponse, ServiceError> {
         let span = sdk_tracing::start(&req.span_name, &[]);
         for (k, v) in &req.attrs {
-            sdk_tracing::set_attribute(&span, k, v);
+            sdk_tracing::set_attr(&span, k, v);
         }
         Ok(proto::SpanAttributesResponse { ok: true })
     }
@@ -77,7 +77,7 @@ impl proto::TracingTestService for Component {
     ) -> Result<proto::NestedSpansResponse, ServiceError> {
         let outer = sdk_tracing::start(&req.outer_name, &[("level", "outer")]);
         let inner = sdk_tracing::start(&req.inner_name, &[("level", "inner")]);
-        sdk_tracing::set_attribute(&inner, "nested", "true");
+        sdk_tracing::set_attr(&inner, "nested", "true");
         sdk_tracing::record_event(&outer, "checkpoint", &[("stage", "mid")]);
         drop(inner);
         drop(outer);

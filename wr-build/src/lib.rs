@@ -57,8 +57,8 @@ impl<A: prost_build::ServiceGenerator, B: prost_build::ServiceGenerator>
 
 // ── WrServiceGenerator ──────────────────────────────────────────────────────
 
-/// A `prost_build::ServiceGenerator` that emits a trait and router function for
-/// each service, enabling typed server-side handlers.
+/// A `prost_build::ServiceGenerator` that emits a trait, router function, and
+/// default `ServiceGuest` handler for each service.
 ///
 /// For a service `InventoryService` in package `ecommerce` with a `Seed` RPC,
 /// the generator emits:
@@ -71,6 +71,13 @@ impl<A: prost_build::ServiceGenerator, B: prost_build::ServiceGenerator>
 /// pub fn inventory_service_router<T: InventoryService>(
 ///     svc: &T, path: &str, body: &[u8],
 /// ) -> (u16, Vec<u8>) { ... }
+///
+/// /// Default `ServiceGuest` handler that routes to the service trait impl.
+/// pub fn inventory_service_handle<T: InventoryService>(
+///     svc: &T,
+///     request: wr_sdk::bindings::wasi::http::types::IncomingRequest,
+///     response_out: wr_sdk::bindings::wasi::http::types::ResponseOutparam,
+/// ) { ... }
 /// ```
 pub struct WrServiceGenerator;
 
@@ -78,6 +85,7 @@ impl prost_build::ServiceGenerator for WrServiceGenerator {
     fn generate(&mut self, service: prost_build::Service, buf: &mut String) {
         let trait_ident = format_ident!("{}", service.name);
         let router_ident = format_ident!("{}_router", to_snake(&service.name));
+        let handle_ident = format_ident!("{}_handle", to_snake(&service.name));
         let service_snake = to_snake(&service.name)
             .trim_end_matches("_service")
             .to_string();
@@ -145,6 +153,19 @@ impl prost_build::ServiceGenerator for WrServiceGenerator {
                     ),
                 }
             }
+
+            /// Default `ServiceGuest` handler that reads the request body,
+            /// routes to the service trait impl, and sends the response.
+            pub fn #handle_ident<T: #trait_ident>(
+                svc: &T,
+                request: wr_sdk::bindings::wasi::http::types::IncomingRequest,
+                response_out: wr_sdk::bindings::wasi::http::types::ResponseOutparam,
+            ) {
+                let path = request.path_with_query().unwrap_or_default();
+                let body = wr_sdk::io::read_body(request.consume().unwrap());
+                let (status, resp) = #router_ident(svc, &path, &body);
+                wr_sdk::io::send_response(response_out, status, resp);
+            }
         };
 
         buf.push_str(&pretty(tokens));
@@ -155,7 +176,7 @@ impl prost_build::ServiceGenerator for WrServiceGenerator {
 
 /// A `prost_build::ServiceGenerator` that emits a typed gRPC client struct for
 /// each service.  Add it to your `build.rs` to get zero-boilerplate RPC calls
-/// via `wr_sdk::http::http_rpc`.
+/// via `wr_sdk::http::http_request`.
 ///
 /// For a service `InventoryService` in package `ecommerce` with a `Seed` RPC,
 /// the generator emits:
@@ -165,7 +186,7 @@ impl prost_build::ServiceGenerator for WrServiceGenerator {
 ///
 /// impl InventoryServiceClient {
 ///     pub fn new(authority: impl Into<String>) -> Self { ... }
-///     pub fn seed(&self, req: SeedRequest) -> Result<SeedResponse, String> { ... }
+///     pub fn seed(&self, req: SeedRequest) -> Result<SeedResponse, wr_sdk::http::HttpError> { ... }
 /// }
 /// ```
 ///
@@ -190,16 +211,18 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
                 let output = parse_type(&m.output_type);
                 let proto_name = &m.proto_name;
                 quote! {
-                    pub fn #method_ident(&self, req: #input) -> Result<#output, String> {
+                    pub fn #method_ident(&self, req: #input) -> Result<#output, wr_sdk::http::HttpError> {
                         let body = prost::Message::encode_to_vec(&req);
                         let path = format!("/{}/{}", self.authority, #proto_name);
-                        let (status, resp_bytes) =
-                            wr_sdk::http::http_rpc(&self.authority, &path, &body)?;
-                        if status != 200 {
-                            return Err(format!("rpc error: HTTP {status}"));
-                        }
-                        prost::Message::decode(resp_bytes.as_slice())
-                            .map_err(|e| e.to_string())
+                        wr_sdk::http::http_request(&wr_sdk::http::HttpRequest {
+                            authority: &self.authority,
+                            path: &path,
+                            method: wr_sdk::http::Method::Post,
+                            headers: &[("content-type", b"application/x-protobuf" as &[u8])],
+                            body: &body,
+                        })?
+                        .error_for_status()?
+                        .decode()
                     }
                 }
             })
@@ -238,7 +261,7 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
 ///
 /// impl TaskWorkerClient {
 ///     pub fn new(authority: impl Into<String>) -> Self { ... }
-///     pub fn process_task(&self, req: ProcessTaskRequest) -> Result<String, String> { ... }
+///     pub fn process_task(&self, req: ProcessTaskRequest) -> Result<String, wr_sdk::http::HttpError> { ... }
 /// }
 /// ```
 pub struct WrWorkerClientGenerator;
@@ -262,7 +285,7 @@ impl prost_build::ServiceGenerator for WrWorkerClientGenerator {
                 let input = parse_type(&m.input_type);
                 let job_type = format!("/{}.{}/{}", service.package, service_snake, m.proto_name);
                 quote! {
-                    pub fn #method_name(&self, req: #input) -> Result<String, String> {
+                    pub fn #method_name(&self, req: #input) -> Result<String, wr_sdk::http::HttpError> {
                         let payload = prost::Message::encode_to_vec(&req);
                         wr_sdk::jobs::submit_job(&self.authority, #job_type, &payload)
                     }

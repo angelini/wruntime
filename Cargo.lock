@@ -5739,6 +5739,7 @@ dependencies = [
 name = "wr-sdk"
 version = "0.1.0"
 dependencies = [
+ "prost",
  "wit-bindgen",
  "wit-bindgen-rt",
 ]

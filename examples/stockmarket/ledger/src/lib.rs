@@ -54,8 +54,8 @@ impl proto::LedgerService for Component {
             }
         }
 
-        tracing::set_attribute(&sp, "reset.trades_deleted", &trades_deleted.to_string());
-        tracing::set_attribute(
+        tracing::set_attr(&sp, "reset.trades_deleted", &trades_deleted.to_string());
+        tracing::set_attr(
             &sp,
             "reset.snapshots_deleted",
             &snapshots_deleted.to_string(),
@@ -101,7 +101,7 @@ impl proto::LedgerService for Component {
             _ => return Err(ServiceError::internal("unexpected trade_id type")),
         };
 
-        tracing::set_attribute(&sp, "trade.id", &trade_id.to_string());
+        tracing::set_attr(&sp, "trade.id", &trade_id.to_string());
         Ok(proto::RecordTradeResponse { trade_id })
     }
 
@@ -175,9 +175,9 @@ impl proto::LedgerService for Component {
         store::put_object("stockmarket", &key, &data)
             .map_err(|e| ServiceError::internal(format!("blobstore put failed: {e:?}")))?;
 
-        tracing::set_attribute(&sp, "snapshot.trade_count", &trade_count.to_string());
-        tracing::set_attribute(&sp, "snapshot.bytes", &snapshot_bytes.to_string());
-        tracing::set_attribute(&sp, "snapshot.key", &key);
+        tracing::set_attr(&sp, "snapshot.trade_count", &trade_count.to_string());
+        tracing::set_attr(&sp, "snapshot.bytes", &snapshot_bytes.to_string());
+        tracing::set_attr(&sp, "snapshot.key", &key);
 
         Ok(proto::SnapshotResponse {
             snapshot_key: key,
@@ -327,9 +327,9 @@ impl proto::LedgerService for Component {
 
         let valid = snapshot_ok;
 
-        tracing::set_attribute(&sp, "verify.valid", if valid { "true" } else { "false" });
-        tracing::set_attribute(&sp, "verify.total_trades", &total_trades.to_string());
-        tracing::set_attribute(&sp, "verify.total_volume", &total_volume.to_string());
+        tracing::set_attr(&sp, "verify.valid", if valid { "true" } else { "false" });
+        tracing::set_attr(&sp, "verify.total_trades", &total_trades.to_string());
+        tracing::set_attr(&sp, "verify.total_volume", &total_volume.to_string());
 
         Ok(proto::VerifyResponse {
             valid,
