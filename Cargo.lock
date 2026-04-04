@@ -5616,6 +5616,7 @@ dependencies = [
  "tokio-retry",
  "toml 0.8.23",
  "tonic",
+ "wasmtime",
  "wr-common",
  "wr-engine",
 ]

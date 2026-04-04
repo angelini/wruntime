@@ -42,7 +42,7 @@ A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. 
 | Binary | Default port | Role |
 |--------|-------------|------|
 | `wr-manager` | `9000` (gRPC) + `9010` (gossip) | Registry — engines register here, proxies sync routing tables from here. Runs active-active behind shared Postgres; chitchat gossip provides manager-to-manager liveness detection |
-| `wr-proxy` | `9001` (HTTP) | Streaming header-based router — intercepts and routes inter-module traffic; forwards cross-node requests to peer proxies; request and response bodies flow through without buffering |
+| `wr-proxy` | `9001` (HTTP) + `9002` (gRPC control plane) | Streaming header-based router — intercepts and routes inter-module traffic; forwards cross-node requests to peer proxies; request and response bodies flow through without buffering. The control plane (`NodeService`) handles engine registration and heartbeats |
 | `wr-engine` | `9100` (HTTP) | Loads WASM modules, runs them, and receives forwarded requests |
 
 A **node** groups one `wr-proxy` with one or more `wr-engine` instances behind a shared externally-reachable proxy address. Each node knows its own address via `[node] proxy_address` in its config files; the engine sends this value to the manager on registration so the routing table can distinguish local from remote destinations.

@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tracing::{info, warn, Instrument};
 use wasmtime::component::{Component, Linker};
 use wasmtime::Store;
-use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig};
+use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Trap};
 use wasmtime_wasi_http::p2::{
     bindings::http::types::{ErrorCode, Scheme},
     bindings::ProxyPre,
@@ -53,6 +53,10 @@ impl EngineRunner {
     pub fn new(config: EngineConfig) -> Result<Self> {
         let mut wt_config = Config::new();
         wt_config.wasm_component_model(true);
+        wt_config.epoch_interruption(true);
+        wt_config.memory_reservation(4 * (1 << 30));
+        wt_config.memory_guard_size(32 * (1 << 20));
+        wt_config.memory_init_cow(true);
 
         let mut pool = PoolingAllocationConfig::new();
         pool.total_component_instances(config.pool.total_component_instances);
@@ -114,6 +118,20 @@ impl EngineRunner {
             llm_client,
             instance_semaphore,
         })
+    }
+
+    /// Spawn a background task that increments the wasmtime epoch at the
+    /// configured tick interval, enabling preemption of CPU-bound WASM code.
+    pub fn spawn_epoch_ticker(&self) {
+        let tick_ms = self.config.pool.epoch_tick_interval_ms;
+        let engine = self.engine.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
+            loop {
+                interval.tick().await;
+                engine.increment_epoch();
+            }
+        });
     }
 
     /// For every DB-enabled module, ensure its Postgres schema exists.
@@ -301,6 +319,35 @@ impl EngineRunner {
         }
     }
 
+    /// Load a WASM component, preferring a pre-compiled `.cwasm` artifact when
+    /// available and compatible. Falls back to JIT compilation from `.wasm`.
+    fn load_component(&self, module_config: &ModuleConfig) -> Result<Component> {
+        if let Some(ref cwasm_path) = module_config.cwasm_path {
+            let path = std::path::Path::new(cwasm_path);
+            if path.exists() {
+                // Safety: we only deserialize artifacts produced by our own
+                // `precompile_components` step with a matching Engine config.
+                match unsafe { Component::deserialize_file(&self.engine, path) } {
+                    Ok(component) => {
+                        info!(module = %module_config.name, "loaded pre-compiled component");
+                        return Ok(component);
+                    }
+                    Err(e) => {
+                        warn!(
+                            module = %module_config.name,
+                            error = %e,
+                            "pre-compiled artifact incompatible, falling back to JIT",
+                        );
+                    }
+                }
+            }
+        }
+        Ok(Component::from_file(
+            &self.engine,
+            &module_config.wasm_path,
+        )?)
+    }
+
     async fn spawn_module(
         &self,
         module_config: &ModuleConfig,
@@ -310,7 +357,7 @@ impl EngineRunner {
     ) -> Result<()> {
         info!(module = %module_config.name, "loading module");
 
-        let component = Component::from_file(&self.engine, &module_config.wasm_path)?;
+        let component = self.load_component(module_config)?;
         let proxy_uri: hyper::Uri = self.config.node.proxy_address.parse()?;
         let http_pool =
             wr_common::http_pool::HttpClientPool::new(wr_common::http_pool::DEFAULT_POOL_SIZE);
@@ -549,6 +596,11 @@ async fn dispatch_request(
         },
     )?;
     let mut store = Store::new(&handler.engine, state);
+    // Yield back to tokio on every epoch tick so CPU-bound WASM doesn't
+    // block the async runtime. The outer tokio::time::timeout still
+    // enforces the total request deadline.
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_async_yield_and_update(1);
     let proxy = handler.pre.instantiate_async(&mut store).await?;
 
     // ── Build the incoming request resource ──────────────────────────────
@@ -571,10 +623,19 @@ async fn dispatch_request(
     let out_resource = store.data_mut().http().new_response_outparam(resp_tx)?;
 
     // ── Call the WASM incoming handler ───────────────────────────────────
-    proxy
+    if let Err(e) = proxy
         .wasi_http_incoming_handler()
         .call_handle(&mut store, req_resource, out_resource)
-        .await?;
+        .await
+    {
+        if e.downcast_ref::<Trap>() == Some(&Trap::Interrupt) {
+            return Ok(http::Response::builder()
+                .status(http::StatusCode::GATEWAY_TIMEOUT)
+                .body(Bytes::from("execution deadline exceeded"))
+                .unwrap());
+        }
+        return Err(e.into());
+    }
 
     // ── Collect and return the response ──────────────────────────────────
     // The `_permit` is held until this point, released on drop.

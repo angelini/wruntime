@@ -235,7 +235,7 @@ enum BlobError {
 }
 ```
 
-## wruntime:tracing/span
+## wruntime:tracing/span@0.1.0
 
 Source: `wit/tracing.wit`. Import path: `wr_sdk::bindings::wruntime::tracing::span`.
 
@@ -358,6 +358,47 @@ impl CompletionBuilder {
 
 /// Collect a stream into a single string.
 pub fn collect_stream(stream: CompletionStream) -> Result<String, LlmError>
+```
+
+## wr_sdk::jobs
+
+Source: `wr-sdk/src/jobs.rs`
+
+```rust
+/// Submit a job to a worker module's engine-managed queue.
+/// `engine_authority` is the worker's `namespace.name` (e.g. "codegen.worker").
+/// Returns the job_id on success.
+pub fn submit_job(
+    engine_authority: &str,
+    job_type: &str,
+    payload: &[u8],
+) -> Result<String, String>
+
+/// Submit a job with explicit timeout and retry settings.
+/// Pass 0 for timeout_secs or max_attempts to use the worker's defaults.
+pub fn submit_job_with_options(
+    engine_authority: &str,
+    job_type: &str,
+    payload: &[u8],
+    timeout_secs: i32,
+    max_attempts: i32,
+) -> Result<String, String>
+
+/// Query the status of a previously submitted job.
+pub fn get_job_status(engine_authority: &str, job_id: &str) -> Result<JobStatus, String>
+```
+
+### Types
+
+```rust
+pub struct JobStatus {
+    pub job_id: String,
+    pub status: String,         // "pending" | "running" | "complete" | "failed"
+    pub result: Vec<u8>,
+    pub error_message: String,
+    pub attempt: i32,
+    pub max_attempts: i32,
+}
 ```
 
 ## wr-build code generators

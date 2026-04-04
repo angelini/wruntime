@@ -19,6 +19,7 @@ prost-reflect = { version = "0.16", features = ["serde"] }
 serde_json    = "1"
 wr-common     = { path = "../wr-common", features = ["discovery"] }
 wr-engine     = { path = "../wr-engine" }
+wasmtime      = { version = "43", features = ["component-model"] }
 tokio-postgres = "0.7"
 tokio-retry    = "0.3"
 libc          = "0.2"

@@ -15,7 +15,7 @@ Choose the right pattern based on what your module needs to do.
 |------|--------------------|-----------------|-----------------------|
 | PostgreSQL | `database = true` + `migrations_path` | `import wruntime:db/database@0.4.0;` | `"wruntime:db" = { path = ".../db.wit" }` |
 | S3/Blobstore | `blobstore = true` + `[blobstore]` section | `import wruntime:blobstore/store@0.1.0;` | `"wruntime:blobstore" = { path = ".../blobstore.wit" }` |
-| OpenTelemetry tracing | *(always available)* | `import wruntime:tracing/span;` | `"wruntime:tracing" = { path = ".../tracing.wit" }` |
+| OpenTelemetry tracing | *(always available)* | `import wruntime:tracing/span@0.1.0;` | `"wruntime:tracing" = { path = ".../tracing.wit" }` |
 | Ephemeral filesystem | `fs = "tempdir"` | *(standard WASI)* | *(already included)* |
 | Outbound HTTP to other modules | *(always available)* | `import wasi:http/outgoing-handler@0.2.6;` | *(already included)* |
 

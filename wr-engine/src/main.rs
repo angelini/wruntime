@@ -15,8 +15,17 @@ use wr_common::wruntime::{
     HeartbeatRequest, ModuleDescriptor, RegisterEngineRequest, SecretRequest,
 };
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(|| {
+            wasmtime::Engine::tls_eager_initialize();
+        })
+        .build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "engine.toml".to_string());
@@ -40,6 +49,7 @@ async fn main() -> Result<()> {
     // ── Prepare WASM runtime (schemas + migrations, but don't load modules yet)
     let registry = registry::ModuleRegistry::new();
     let runner = engine::EngineRunner::new(config.clone())?;
+    runner.spawn_epoch_ticker();
     runner.provision_schemas().await?;
 
     // Provision the wr__jobs schema if any module uses worker mode.

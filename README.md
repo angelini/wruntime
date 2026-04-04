@@ -179,6 +179,7 @@ WASM modules can access host-provided capabilities through WIT interfaces:
 | **Database** | `wit/db.wit` | `wr_sdk::bindings::wruntime::db::database` | Parameterized SQL queries and transactions against a shared Postgres pool |
 | **Blobstore** | `wit/blobstore.wit` | `wr_sdk::bindings::wruntime::blobstore::store` | S3-compatible object storage (put, get, delete, list, head) |
 | **Tracing** | `wit/tracing.wit` | `wr_sdk::bindings::wruntime::tracing::span` | Create and annotate OpenTelemetry spans from within modules |
+| **LLM** | `wit/llm.wit` | `wr_sdk::bindings::wruntime::llm::inference` | Claude API (and other LLM providers) — completions, streaming, tool use |
 
 See [docs/host-bindings.md](docs/host-bindings.md) for configuration and usage examples.
 
@@ -212,10 +213,12 @@ wruntime/
 ├── wr-build/               # build.rs helper: service/client generators from proto
 ├── wr-cli/                 # CLI: invoke modules, list engines/services, query metrics (requires --manager or WR_MANAGER)
 ├── wr-tests/               # integration tests
-├── wit/                    # WIT interfaces (db, blobstore, tracing)
+├── wit/                    # WIT interfaces (db, blobstore, tracing, llm)
 ├── examples/
 │   ├── config/             # example single-node configs
 │   ├── ecommerce/          # example: inventory (handler) + client (runner)
+│   ├── codegen/            # example: LLM agent sandbox (code generation)
+│   ├── stockmarket/        # example: multi-module trading system
 │   └── multi-node/         # example multi-node deployment
 ```
 
@@ -223,8 +226,8 @@ wruntime/
 
 - [Architecture](docs/architecture.md) — detailed system diagram, request flow, internal headers
 - [Configuration](docs/configuration.md) — manager, proxy, and engine TOML configs; health checks; routing rules; multi-node setup
-- [gRPC API](docs/grpc-api.md) — `ManagerService` RPC reference (engine lifecycle, routing, schemas, metrics)
+- [gRPC API](docs/grpc-api.md) — `ManagerService` and `NodeService` RPC reference, worker job queue API
 - [Protobuf Schemas](docs/schemas.md) — writing, compiling, and validation behavior
 - [Module SDK](docs/sdk.md) — `wr-sdk` + `wr-build` reference; handler and runner module guides
-- [Host Bindings](docs/host-bindings.md) — database, blobstore, tracing, and filesystem access
+- [Host Bindings](docs/host-bindings.md) — database, blobstore, tracing, LLM, and filesystem access
 - [Testing](docs/testing.md) — running integration tests

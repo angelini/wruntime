@@ -1,7 +1,7 @@
 package stockmarket:simulator@1.0.0;
 
 world simulator {
-  import wruntime:tracing/span;
+  import wruntime:tracing/span@0.1.0;
   import wruntime:blobstore/store@0.1.0;
   import wasi:cli/stderr@0.2.6;
   import wasi:cli/environment@0.2.6;

@@ -15,13 +15,14 @@ pub struct SpanState {
 wasmtime::component::bindgen!({
     path: "../wit/tracing.wit",
     world: "tracing-access",
+    imports: { default: async },
     with: {
         "wruntime:tracing/span.active-span": SpanState,
     },
 });
 
 impl wruntime::tracing::span::Host for ModuleState {
-    fn start(&mut self, name: String, attrs: Vec<(String, String)>) -> Resource<SpanState> {
+    async fn start(&mut self, name: String, attrs: Vec<(String, String)>) -> Resource<SpanState> {
         let child = self.active_span.in_scope(|| {
             tracing::info_span!(
                 "module",
@@ -46,7 +47,7 @@ impl wruntime::tracing::span::Host for ModuleState {
 }
 
 impl wruntime::tracing::span::HostActiveSpan for ModuleState {
-    fn set_attribute(&mut self, self_: Resource<SpanState>, key: String, value: String) {
+    async fn set_attribute(&mut self, self_: Resource<SpanState>, key: String, value: String) {
         if let Ok(state) = self.table().get(&self_) {
             use tracing_opentelemetry::OpenTelemetrySpanExt as _;
             state.span.set_attribute(
@@ -56,7 +57,7 @@ impl wruntime::tracing::span::HostActiveSpan for ModuleState {
         }
     }
 
-    fn record_event(
+    async fn record_event(
         &mut self,
         self_: Resource<SpanState>,
         name: String,
@@ -69,7 +70,7 @@ impl wruntime::tracing::span::HostActiveSpan for ModuleState {
         }
     }
 
-    fn set_error(&mut self, self_: Resource<SpanState>, message: String) {
+    async fn set_error(&mut self, self_: Resource<SpanState>, message: String) {
         if let Ok(state) = self.table().get(&self_) {
             state.span.in_scope(|| {
                 tracing::error!(
@@ -80,7 +81,7 @@ impl wruntime::tracing::span::HostActiveSpan for ModuleState {
         }
     }
 
-    fn drop(&mut self, self_: Resource<SpanState>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, self_: Resource<SpanState>) -> wasmtime::Result<()> {
         self.table().delete(self_)?;
         // SpanState drops here → tracing::Span drops → span ends in OTLP
         Ok(())
@@ -105,8 +106,8 @@ mod tests {
         wr_common::http_pool::HttpClientPool::new(1)
     }
 
-    #[test]
-    fn test_start_returns_valid_handle() {
+    #[tokio::test]
+    async fn test_start_returns_valid_handle() {
         let mut state = ModuleState::new(
             "test".into(),
             "test".into(),
@@ -115,12 +116,12 @@ mod tests {
             Default::default(),
         )
         .expect("state");
-        let span = Host::start(&mut state, "my-operation".into(), vec![]);
-        HostActiveSpan::drop(&mut state, span).expect("drop");
+        let span = Host::start(&mut state, "my-operation".into(), vec![]).await;
+        HostActiveSpan::drop(&mut state, span).await.expect("drop");
     }
 
-    #[test]
-    fn test_set_attribute_on_span() {
+    #[tokio::test]
+    async fn test_set_attribute_on_span() {
         let mut state = ModuleState::new(
             "test".into(),
             "test".into(),
@@ -129,19 +130,20 @@ mod tests {
             Default::default(),
         )
         .expect("state");
-        let span = Host::start(&mut state, "op".into(), vec![]);
+        let span = Host::start(&mut state, "op".into(), vec![]).await;
         let rep = span.rep();
         HostActiveSpan::set_attribute(
             &mut state,
             wasmtime::component::Resource::new_borrow(rep),
             "db.table".into(),
             "users".into(),
-        );
-        HostActiveSpan::drop(&mut state, span).expect("drop");
+        )
+        .await;
+        HostActiveSpan::drop(&mut state, span).await.expect("drop");
     }
 
-    #[test]
-    fn test_record_event_on_span() {
+    #[tokio::test]
+    async fn test_record_event_on_span() {
         let mut state = ModuleState::new(
             "test".into(),
             "test".into(),
@@ -150,19 +152,20 @@ mod tests {
             Default::default(),
         )
         .expect("state");
-        let span = Host::start(&mut state, "op".into(), vec![]);
+        let span = Host::start(&mut state, "op".into(), vec![]).await;
         let rep = span.rep();
         HostActiveSpan::record_event(
             &mut state,
             wasmtime::component::Resource::new_borrow(rep),
             "cache.miss".into(),
             vec![("key".into(), "user:42".into())],
-        );
-        HostActiveSpan::drop(&mut state, span).expect("drop");
+        )
+        .await;
+        HostActiveSpan::drop(&mut state, span).await.expect("drop");
     }
 
-    #[test]
-    fn test_set_error_on_span() {
+    #[tokio::test]
+    async fn test_set_error_on_span() {
         let mut state = ModuleState::new(
             "test".into(),
             "test".into(),
@@ -171,13 +174,14 @@ mod tests {
             Default::default(),
         )
         .expect("state");
-        let span = Host::start(&mut state, "op".into(), vec![]);
+        let span = Host::start(&mut state, "op".into(), vec![]).await;
         let rep = span.rep();
         HostActiveSpan::set_error(
             &mut state,
             wasmtime::component::Resource::new_borrow(rep),
             "connection refused".into(),
-        );
-        HostActiveSpan::drop(&mut state, span).expect("drop");
+        )
+        .await;
+        HostActiveSpan::drop(&mut state, span).await.expect("drop");
     }
 }

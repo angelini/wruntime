@@ -110,7 +110,7 @@ world agent {
     import wruntime:db/database@0.4.0;
     import wruntime:blobstore/store@0.1.0;
     import wruntime:llm/inference@0.1.0;
-    import wruntime:tracing/span;
+    import wruntime:tracing/span@0.1.0;
     // + wasi:http, wasi:io, wasi:clocks, wasi:random
     export wasi:http/incoming-handler@0.2.6;
 }

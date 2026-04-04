@@ -35,6 +35,11 @@ pub struct PoolConfig {
     /// Maximum linear memory size in bytes per instance. Defaults to 10 MiB.
     #[serde(default = "default_max_memory_size")]
     pub max_memory_size: usize,
+    /// Epoch tick interval in milliseconds. A background task increments the
+    /// wasmtime epoch at this rate, enabling preemption of CPU-bound WASM
+    /// modules that never yield to the host. Defaults to 100.
+    #[serde(default = "default_epoch_tick_interval_ms")]
+    pub epoch_tick_interval_ms: u64,
 }
 
 impl Default for PoolConfig {
@@ -42,6 +47,7 @@ impl Default for PoolConfig {
         Self {
             total_component_instances: default_total_component_instances(),
             max_memory_size: default_max_memory_size(),
+            epoch_tick_interval_ms: default_epoch_tick_interval_ms(),
         }
     }
 }
@@ -52,6 +58,10 @@ fn default_total_component_instances() -> u32 {
 
 fn default_max_memory_size() -> usize {
     10 * 1024 * 1024 // 10 MiB
+}
+
+fn default_epoch_tick_interval_ms() -> u64 {
+    10
 }
 
 #[derive(Deserialize, Clone)]
@@ -165,6 +175,11 @@ pub struct ModuleConfig {
     pub namespace: String,
     pub version: String,
     pub wasm_path: String,
+    /// Path to a pre-compiled native artifact (`.cwasm`).
+    /// When present and compatible, the engine deserializes this instead of
+    /// JIT-compiling the `.wasm`, reducing startup time to ~microseconds.
+    #[serde(default)]
+    pub cwasm_path: Option<String>,
     /// Path to a compiled `FileDescriptorSet` binary for this module's API.
     /// Optional — modules may omit this if they don't expose a schema.
     #[serde(default)]

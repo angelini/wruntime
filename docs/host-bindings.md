@@ -92,13 +92,37 @@ Available functions:
 
 | Function | Description |
 |----------|-------------|
-| `put-object(key, data)` | Upload an object |
-| `get-object(key)` | Download an object's bytes |
-| `delete-object(key)` | Remove an object |
-| `list-objects(prefix)` | List objects matching a prefix |
-| `head-object(key)` | Get object metadata (size, etag, last-modified) |
+| `put-object(bucket, key, data)` | Upload an object |
+| `get-object(bucket, key)` | Download an object's bytes |
+| `delete-object(bucket, key)` | Remove an object |
+| `list-objects(bucket, prefix)` | List objects matching a prefix |
+| `head-object(bucket, key)` | Get object metadata (size, etag, last-modified) |
 
 Access via `wr_sdk::bindings::wruntime::blobstore::store`.
+
+### Example: storing and retrieving objects
+
+```rust
+use wr_sdk::bindings::wruntime::blobstore::store;
+
+fn save_report(report_id: &str, data: &[u8]) {
+    store::put_object("reports", &format!("daily/{report_id}.bin"), data)
+        .expect("put_object failed");
+}
+
+fn load_report(report_id: &str) -> Vec<u8> {
+    store::get_object("reports", &format!("daily/{report_id}.bin"))
+        .expect("get_object failed")
+}
+
+fn list_reports() -> Vec<String> {
+    store::list_objects("reports", Some("daily/"))
+        .expect("list_objects failed")
+        .into_iter()
+        .map(|meta| meta.key)
+        .collect()
+}
+```
 
 ## Tracing (OpenTelemetry)
 
@@ -114,6 +138,57 @@ tracing::record_event(&span, "validation-passed", &[]);
 ```
 
 Access via `wr_sdk::bindings::wruntime::tracing::span`.
+
+## LLM Inference
+
+Defined in `wit/llm.wit`. Allows modules to call LLM APIs (currently Anthropic Claude) through a host binding. The engine holds the API key — guests never see credentials.
+
+### Engine configuration
+
+Add an `[llm]` section to `engine.toml` and set `llm = true` on each module that should have access:
+
+```toml
+[llm]
+provider         = "anthropic"
+api_key_env      = "ANTHROPIC_API_KEY"   # env var read at startup
+base_url         = "https://api.anthropic.com"  # optional, this is the default
+max_tokens_limit = 8192                  # host-enforced ceiling per request
+
+[[module]]
+name        = "my-agent"
+namespace   = "example"
+version     = "1.0.0"
+wasm_path   = "modules/my_agent.wasm"
+schema_path = "schemas/my_agent.binpb"
+llm         = true
+```
+
+### Example: calling Claude from a WASM module
+
+```rust
+use wr_sdk::llm::CompletionBuilder;
+
+fn summarize(text: &str) -> String {
+    CompletionBuilder::sonnet()
+        .system("You are a concise summarizer.")
+        .user(text)
+        .max_tokens(256)
+        .complete_text()
+        .expect("completion failed")
+}
+
+// Streaming example
+fn stream_response(prompt: &str) -> String {
+    let stream = CompletionBuilder::sonnet()
+        .user(prompt)
+        .max_tokens(1024)
+        .stream()
+        .expect("stream failed");
+    wr_sdk::llm::collect_stream(stream).expect("collect failed")
+}
+```
+
+Access via `wr_sdk::bindings::wruntime::llm::inference` (raw WIT binding) or `wr_sdk::llm` (ergonomic helpers).
 
 ## Filesystem
 

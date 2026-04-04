@@ -49,6 +49,10 @@ pub struct ModuleConfig {
     pub namespace: String,
     pub version: String,
     pub wasm_path: String,
+    /// Path to a pre-compiled native artifact (`.cwasm`).
+    /// When present, the engine deserializes this instead of JIT-compiling the `.wasm`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwasm_path: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub schema_path: String,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -94,6 +98,7 @@ impl EngineConfig {
 
         // Rewrite module paths
         for module in &mut config.modules {
+            module.cwasm_path = Some(format!("modules/{}.cwasm", module.name));
             module.wasm_path = format!("modules/{}.wasm", module.name);
             if !module.schema_path.is_empty() {
                 module.schema_path = format!("schemas/{}.binpb", module.name);

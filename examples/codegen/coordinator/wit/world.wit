@@ -2,7 +2,7 @@ package codegen:coordinator@1.0.0;
 
 world coordinator {
   import wruntime:db/database@0.4.0;
-  import wruntime:tracing/span;
+  import wruntime:tracing/span@0.1.0;
   import wasi:cli/stderr@0.2.6;
   import wasi:cli/environment@0.2.6;
   import wasi:cli/exit@0.2.6;

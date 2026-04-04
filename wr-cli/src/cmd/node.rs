@@ -98,6 +98,10 @@ struct Manifest {
     configs: Vec<String>,
     template_vars: Vec<String>,
     checksums: HashMap<String, String>,
+    /// Wasmtime compatibility hash for pre-compiled `.cwasm` artifacts.
+    /// Engine verifies this at startup before deserializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    precompile_hash: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -186,6 +190,18 @@ fn add_engine_artifacts(
                 wasm_src,
                 0o644,
             )?;
+
+            // Add pre-compiled native artifact when available
+            let cwasm_src = wasm_src.with_extension("cwasm");
+            if cwasm_src.exists() {
+                tar_add_file(
+                    tar,
+                    checksums,
+                    &format!("wr-node/modules/{}.cwasm", module.name),
+                    &cwasm_src,
+                    0o644,
+                )?;
+            }
 
             if !module.schema_path.is_empty() {
                 let schema_src = Path::new(&module.schema_path);
@@ -305,6 +321,15 @@ fn add_deployment_artifacts(
         )?;
     }
 
+    // Sysctl tuning for wasmtime memory pooling
+    let sysctl_conf = generate_sysctl_config();
+    tar_add_bytes(
+        tar,
+        "wr-node/systemd/99-wruntime.conf",
+        sysctl_conf.as_bytes(),
+        0o644,
+    )?;
+
     // Docker artifacts
     let proxy_dockerfile = generate_proxy_dockerfile(workdir);
     tar_add_bytes(
@@ -364,6 +389,8 @@ fn bundle(args: BundleArgs) -> Result<()> {
         .flat_map(|(_, c)| c.modules.iter())
         .collect();
 
+    let mut precompile_hash: Option<String> = None;
+
     if !args.skip_build {
         let build_modules: Vec<BuildModule> = all_modules
             .iter()
@@ -380,11 +407,17 @@ fn bundle(args: BundleArgs) -> Result<()> {
         // Step 2: Build WASM modules
         build_helpers::build_wasm_modules(&build_modules)?;
 
-        // Step 3: Cross-compile host binaries
+        // Step 3: Pre-compile WASM → native for target architecture
+        precompile_hash = Some(build_helpers::precompile_components(
+            &build_modules,
+            &args.target,
+        )?);
+
+        // Step 4: Cross-compile host binaries
         build_helpers::build_host_binaries(&args.target)?;
     }
 
-    // Step 4: Assemble the bundle
+    // Step 5: Assemble the bundle
     println!("[bundle]  assembling tarball ...");
 
     let output_file = fs::File::create(&args.output)
@@ -455,6 +488,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         configs: config_names,
         template_vars,
         checksums,
+        precompile_hash,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     tar_add_bytes(
@@ -595,11 +629,18 @@ async fn deploy_systemd(args: &DeployArgs, manifest: &Manifest, ssh_base: &[Stri
     )?;
     println!("OK");
 
-    // Step 3: install systemd units
+    // Step 3: install systemd units and sysctl config
     print!("[deploy]  installing systemd units ... ");
     helpers::run_ssh(
         ssh_base,
         &format!("cp {workdir}/wr-node/systemd/*.service /etc/systemd/system/"),
+    )?;
+    println!("OK");
+
+    print!("[deploy]  applying sysctl tuning ... ");
+    helpers::run_ssh(
+        ssh_base,
+        &format!("cp {workdir}/wr-node/systemd/99-wruntime.conf /etc/sysctl.d/ && sysctl --system > /dev/null"),
     )?;
     println!("OK");
 
@@ -747,6 +788,10 @@ WantedBy=multi-user.target
     )
 }
 
+fn generate_sysctl_config() -> String {
+    "# Wasmtime pooling allocator requires higher mmap limit for COW-based instantiation.\nvm.max_map_count = 262144\n".to_string()
+}
+
 fn generate_proxy_dockerfile(workdir: &str) -> String {
     format!(
         r#"FROM gcr.io/distroless/cc-debian13
@@ -779,7 +824,13 @@ fn generate_docker_compose(
     control_port: u16,
     engine_ports: &[u16],
 ) -> String {
-    let mut out = String::from("services:\n");
+    let mut out = String::from(
+        "# Requires vm.max_map_count >= 262144 on the Docker host for wasmtime memory pooling.\n\
+         # Apply with: sysctl -w vm.max_map_count=262144\n\
+         # Persist with: echo 'vm.max_map_count = 262144' > /etc/sysctl.d/99-wruntime.conf\n\
+         \n\
+         services:\n",
+    );
 
     // Proxy service
     out.push_str(&format!(

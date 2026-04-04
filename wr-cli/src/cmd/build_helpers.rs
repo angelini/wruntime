@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use anyhow::{bail, Context, Result};
+use wasmtime::{Config, Engine};
 
 /// Minimal module config for build operations
 pub struct BuildModule {
@@ -97,6 +100,22 @@ pub fn build_wasm_modules(modules: &[BuildModule]) -> Result<()> {
             bail!("cargo component build failed for module '{}'", module.name);
         }
         println!("OK");
+
+        // Strip debug info and custom sections to reduce .wasm size
+        print!("[strip]   {} ... ", module.name);
+        let strip_output = Command::new("wasm-tools")
+            .args(["strip", "-o", &module.wasm_path, &module.wasm_path])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .context("failed to run wasm-tools strip")?;
+        if !strip_output.status.success() {
+            println!("FAILED");
+            let stderr = String::from_utf8_lossy(&strip_output.stderr);
+            eprintln!("{stderr}");
+            bail!("wasm-tools strip failed for module '{}'", module.name);
+        }
+        println!("OK");
     }
     Ok(())
 }
@@ -118,6 +137,34 @@ pub fn build_manager_binary(target: &str) -> Result<()> {
     }
     println!("OK");
     Ok(())
+}
+
+/// Pre-compile WASM components to native code for the given target triple.
+/// Uses Cranelift cross-compilation so the build host need not match the target.
+/// Returns the compatibility hash for the compiled artifacts.
+pub fn precompile_components(modules: &[BuildModule], target: &str) -> Result<String> {
+    let mut wt_config = Config::new();
+    wt_config.wasm_component_model(true);
+    wt_config.target(target)?;
+    let engine = Engine::new(&wt_config)?;
+    let mut hasher = DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut hasher);
+    let hash = format!("{:016x}", hasher.finish());
+
+    for module in modules {
+        let wasm_path = Path::new(&module.wasm_path);
+        if !wasm_path.exists() {
+            continue;
+        }
+        print!("[precompile] {} ... ", module.name);
+        let wasm_bytes = std::fs::read(wasm_path)?;
+        let cwasm_bytes = engine.precompile_component(&wasm_bytes)?;
+        let cwasm_path = wasm_path.with_extension("cwasm");
+        std::fs::write(&cwasm_path, &cwasm_bytes)?;
+        println!("OK ({} bytes)", cwasm_bytes.len());
+    }
+
+    Ok(hash)
 }
 
 /// Cross-compile host binaries for a given target triple

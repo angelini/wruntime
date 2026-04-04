@@ -1,4 +1,4 @@
-package wruntime:tracing;
+package wruntime:tracing@0.1.0;
 
 interface span {
     /// An active span. Ends when the resource is dropped.

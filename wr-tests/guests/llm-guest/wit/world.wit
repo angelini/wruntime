@@ -2,7 +2,7 @@ package test:llm-guest@0.1.0;
 
 world llm-guest {
   import wruntime:llm/inference@0.1.0;
-  import wruntime:tracing/span;
+  import wruntime:tracing/span@0.1.0;
   import wasi:cli/stderr@0.2.6;
   import wasi:cli/environment@0.2.6;
   import wasi:cli/exit@0.2.6;

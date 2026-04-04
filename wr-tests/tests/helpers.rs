@@ -917,7 +917,7 @@ pub async fn db_state_for_module(pool_size: usize, namespace: &str, name: &str) 
         // the schema between our IF NOT EXISTS check and the actual CREATE.
         let is_duplicate = e
             .as_db_error()
-            .map_or(false, |db| db.code().code() == "23505");
+            .is_some_and(|db| db.code().code() == "23505");
         if !is_duplicate {
             panic!("provision schema: {e}");
         }
@@ -949,6 +949,7 @@ pub fn wasm_module_pre(wasm_path: &str) -> Result<(Arc<Engine>, Arc<ProxyPre<Mod
 
     let mut wt_config = Config::new();
     wt_config.wasm_component_model(true);
+    wt_config.epoch_interruption(true);
 
     let mut pool = PoolingAllocationConfig::new();
     pool.total_component_instances(100);
@@ -958,6 +959,16 @@ pub fn wasm_module_pre(wasm_path: &str) -> Result<(Arc<Engine>, Arc<ProxyPre<Mod
     wt_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
 
     let engine = Engine::new(&wt_config)?;
+    {
+        let e = engine.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+            loop {
+                interval.tick().await;
+                e.increment_epoch();
+            }
+        });
+    }
     let component = Component::from_file(&engine, wasm_path)?;
 
     let mut linker: Linker<ModuleState> = Linker::new(&engine);
@@ -992,6 +1003,8 @@ pub async fn dispatch_to_wasm(
     request: http::Request<Bytes>,
 ) -> Result<http::Response<Bytes>> {
     let mut store = Store::new(engine, state);
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_async_yield_and_update(1);
     let proxy = pre.instantiate_async(&mut store).await?;
 
     let (req_parts, req_body) = request.into_parts();

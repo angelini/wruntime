@@ -49,10 +49,13 @@ just proxy
 
 ```toml
 listen_address  = "0.0.0.0:9001"
-manager_address = "http://127.0.0.1:9000"
+control_address = "0.0.0.0:9002"           # gRPC control plane for engine registration/heartbeats
 
 [node]
 proxy_address = "http://127.0.0.1:9001"   # this proxy's own address, as reachable by peers
+
+[database]
+url = "postgres://postgres@localhost:5433/wruntime_example"
 
 [cache]
 routing_table_ttl_secs = 5   # how often to poll the manager for routing updates
@@ -60,7 +63,44 @@ routing_table_ttl_secs = 5   # how often to poll the manager for routing updates
 
 `proxy_address` must match how peer nodes (and engines on this node) will reach this proxy. The routing layer uses it to distinguish rules whose `proxy_address` matches this node — those are forwarded directly to the local engine; all others are forwarded to the peer proxy that owns that address.
 
+`control_address` exposes a gRPC `NodeService` that engines on the same node use for registration and heartbeats instead of connecting directly to the manager. This decouples engines from the manager address and enables local-first orchestration.
+
 The proxy is a streaming header-based router — it inspects only HTTP headers for routing decisions and streams request and response bodies through without buffering. It connects to the manager at startup, then polls for routing table updates in the background.
+
+### Circuit breaker
+
+The proxy can protect downstream engines from cascading failures with per-engine circuit breakers. Each engine address gets its own independent breaker — one open circuit does not affect routing to other engines.
+
+```toml
+[circuit_breaker]
+failure_threshold  = 5    # consecutive failures (5xx / 429 / network error) before opening
+open_duration_secs = 30   # seconds the breaker stays open before probing again
+```
+
+Both fields are optional and default to the values shown above. Omit the `[circuit_breaker]` section entirely to disable circuit breaking.
+
+### External routes (public API)
+
+Expose a subset of internal module routes to external callers on a separate port. All `x-wr-*` headers are stripped from incoming requests before routing, preventing header spoofing.
+
+```toml
+[external]
+listen_address = "0.0.0.0:8080"
+
+[[external.route]]
+path      = "/items"
+methods   = ["GET", "POST"]
+module    = "inventory"
+namespace = "ecommerce"
+
+[[external.route]]
+path      = "/items/{id}"
+methods   = ["GET"]
+module    = "inventory"
+namespace = "ecommerce"
+```
+
+Omit the `[external]` section to keep all routes internal-only.
 
 ## wr-engine
 
@@ -71,13 +111,13 @@ just engine
 `engine.toml`:
 
 ```toml
-listen_address  = "0.0.0.0:9100"
-manager_address = "http://127.0.0.1:9000"
+listen_address = "0.0.0.0:9100"
 
 [node]
-proxy_address = "http://127.0.0.1:9001"   # local proxy; WASM outbound calls are rewritten to
-                                           # this address, and it is sent to the manager on
-                                           # registration so peers can find this node
+proxy_address   = "http://127.0.0.1:9001"  # local proxy; WASM outbound calls are rewritten to
+                                            # this address, and it is sent to the manager on
+                                            # registration so peers can find this node
+control_address = "http://127.0.0.1:9002"  # proxy's gRPC control plane for registration/heartbeats
 
 [[module]]
 name                 = "order-service"
@@ -112,6 +152,7 @@ Modules that use a database can declare a `migrations_path` pointing to a direct
 ```toml
 [database]
 url             = "postgres://user:pass@localhost:5432/mydb"
+guest_url       = "postgres://wr_guest@localhost:5432/mydb"   # optional: lower-privilege role for module connection pools
 max_connections = 20
 
 [[module]]
@@ -133,6 +174,7 @@ modules/inventory/migrations/
 ```
 
 Key behaviors:
+- **`guest_url`:** When set, module connection pools use this URL (typically a lower-privilege role) instead of the admin `url`. The admin `url` is still used for schema provisioning and migrations. This provides privilege separation — modules only get the permissions granted to the guest role.
 - **Schema isolation:** `search_path` is set to the module's own schema before migrations run. A migration cannot modify tables belonging to another module.
 - **Advisory locking:** An engine acquires a Postgres advisory lock before running migrations, preventing concurrent execution across engine replicas for the same module.
 - **Idempotent:** Refinery tracks applied migrations in a `refinery_schema_history` table inside the module's schema. Already-applied migrations are skipped on subsequent startups.

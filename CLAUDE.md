@@ -74,7 +74,7 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 | Service | Default Port | Role |
 |---|---|---|
 | `wr-manager` | 9000 (gRPC) + 9010 (gossip) | Registry — routing table, schemas, heartbeat monitor. Runs active-active; chitchat gossip for manager liveness |
-| `wr-proxy` | 9001 (HTTP) | Streaming header-based router — intercepts inter-module traffic, routes to engines; bodies flow through without buffering |
+| `wr-proxy` | 9001 (HTTP) + 9002 (gRPC control plane) | Streaming header-based router — intercepts inter-module traffic, routes to engines; bodies flow through without buffering. Control plane handles engine registration/heartbeats |
 | `wr-engine` | 9100 (HTTP) | Runs WASM modules via wasmtime WASI component model |
 
 ### Request Flow
@@ -98,7 +98,7 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 
 The proxy uses a custom `ProxyBody` type that wraps `hyper::body::Incoming` behind a `Pin<Box<dyn Body + Send>>`, enabling streaming without the `Sync` requirement that `BoxBody` imposes. All layers only inspect headers — bodies flow through untouched.
 
-**`wr-engine`** — uses wasmtime 41 with the WASI component model. On startup: provisions DB schemas → runs migrations (via `refinery`) → loads WASM components → registers with manager → starts 10-second heartbeat loop. Modules can optionally have a PostgreSQL pool (`deadpool-postgres`) and a blobstore (S3-compatible via `rust-s3`) exposed to WASM via custom host bindings.
+**`wr-engine`** — uses wasmtime 43 with the WASI component model. On startup: provisions DB schemas → runs migrations (via `refinery`) → loads WASM components → registers with manager → starts 10-second heartbeat loop. Modules can optionally have a PostgreSQL pool (`deadpool-postgres`) and a blobstore (S3-compatible via `rust-s3`) exposed to WASM via custom host bindings.
 
 **Database migrations** — modules can declare `migrations_path` in `engine.toml` pointing to a directory of `V{n}__description.sql` files. Migrations run on the engine (host side) at startup using [refinery](https://github.com/rust-db/refinery) with tokio-postgres. Each module's migrations are schema-isolated (`search_path` set to the module's schema only) and serialized across engine replicas via Postgres advisory locks. Routing rules are not registered until migrations complete. See `docs/configuration.md` for details.
 
@@ -152,6 +152,10 @@ let rows = state.query("SELECT 1".into(), vec![]).await.expect("query");
 - **client** — drives 100 buy/return transactions against inventory via `http://ecommerce.inventory/...`
 
 Multiple engine configs (`engine-inventory-1.toml`, `engine-inventory-2.toml`, `engine-client.toml`) demonstrate running several engine instances with load-balanced routing.
+
+`examples/codegen/` contains an LLM agent sandbox example — a WASM module that uses the LLM host binding to run code generation tasks.
+
+`examples/stockmarket/` contains a multi-module trading system example with multiple interacting services.
 
 `examples/multi-node/` contains `node-a/` and `node-b/` config directories for multi-node deployments.
 

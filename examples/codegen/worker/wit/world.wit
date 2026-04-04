@@ -1,7 +1,7 @@
 package codegen:worker@1.0.0;
 
 world worker {
-  import wruntime:tracing/span;
+  import wruntime:tracing/span@0.1.0;
   import wruntime:db/database@0.4.0;
   import wruntime:blobstore/store@0.1.0;
   import wruntime:llm/inference@0.1.0;

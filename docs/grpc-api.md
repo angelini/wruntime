@@ -55,6 +55,54 @@ message ManagerInfo {
 }
 ```
 
+## NodeService (control plane)
+
+The `wruntime.NodeService` gRPC service is exposed by `wr-proxy` on its `control_address` (default port 9002). Engines on the same node use this for registration and heartbeats instead of connecting directly to the manager.
+
+| RPC | Request | Response | Description |
+|-----|---------|----------|-------------|
+| `RegisterEngine` | `RegisterEngineRequest` | `RegisterEngineResponse` | Engine announces itself and its modules to the local proxy |
+| `DeregisterEngine` | `DeregisterEngineRequest` | `DeregisterEngineResponse` | Engine removes itself on shutdown |
+| `Heartbeat` | `HeartbeatRequest` | `HeartbeatResponse` | Sent every 10 s; the proxy forwards to the manager |
+
+This decouples engines from the manager address — engines only need to know their local proxy's control address.
+
+## Worker job queue (HTTP RPC)
+
+Worker jobs use HTTP RPC via the proxy (not a gRPC service). The SDK provides ergonomic wrappers in `wr_sdk::jobs`.
+
+| Endpoint | Request | Response | Description |
+|----------|---------|----------|-------------|
+| `POST /wruntime.WorkerService/SubmitJob` | `SubmitJobRequest` | `SubmitJobResponse` | Submit a job to a worker module's queue |
+| `POST /wruntime.WorkerService/GetJobStatus` | `GetJobStatusRequest` | `GetJobStatusResponse` | Query the status of a previously submitted job |
+
+A `SubmitJobRequest` has the fields:
+
+```protobuf
+message SubmitJobRequest {
+  string worker_namespace = 1;
+  string worker_name      = 2;
+  string worker_version   = 3;
+  string job_type         = 4;
+  bytes  payload          = 5;
+  int32  timeout_secs     = 6;
+  int32  max_attempts     = 7;
+}
+```
+
+A `GetJobStatusResponse` has the fields:
+
+```protobuf
+message GetJobStatusResponse {
+  string job_id        = 1;
+  string status        = 2;   // "pending" | "running" | "complete" | "failed"
+  bytes  result        = 3;
+  string error_message = 4;
+  int32  attempt       = 5;
+  int32  max_attempts  = 6;
+}
+```
+
 ## Schemas
 
 | RPC | Description |

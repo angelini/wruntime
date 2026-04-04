@@ -24,18 +24,27 @@ check:
 
 guest_crates := "examples/ecommerce/client examples/ecommerce/inventory examples/codegen/agent examples/codegen/collector examples/codegen/coordinator examples/codegen/worker examples/stockmarket/exchange examples/stockmarket/ledger examples/stockmarket/simulator"
 
-# Format all source code (workspace + example guests)
+# Format workspace source code
 fmt:
     cargo fmt --all
+
+# Format example guest crates
+fmt-examples:
     for d in {{guest_crates}}; do (cd "$d" && cargo fmt); done
 
-# Run Clippy lints across the workspace + example guests
+# Run Clippy lints across the workspace
 lint:
     cargo clippy --all-targets --all-features -- -D warnings
+
+# Run Clippy lints across example guest crates
+lint-examples:
     for d in {{guest_crates}}; do (cd "$d" && cargo clippy --target wasm32-wasip2 -- -D warnings); done
 
-# Format and lint
+# Format and lint workspace
 tidy: fmt lint
+
+# Format and lint example guests
+tidy-examples: fmt-examples lint-examples
 
 # ── Test ──────────────────────────────────────────────────────────────────────
 
