@@ -6,20 +6,14 @@ mod proto {
 #[allow(dead_code, unused_imports)]
 mod bindings;
 
-use wr_sdk::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
-use wr_sdk::bindings::wruntime::db::database::{self, PgValue};
-use wr_sdk::io::{read_body, send_response};
-use wr_sdk::ServiceError;
+use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
 impl wr_sdk::ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        let path = request.path_with_query().unwrap_or_default();
-        let body = read_body(request.consume().unwrap());
-        let (status, resp) = proto::db_test_service_router(&Component, &path, &body);
-        send_response(response_out, status, resp);
+        proto::db_test_service_handle(&Component, request, response_out);
     }
 }
 
@@ -134,16 +128,15 @@ impl proto::DbTestService for Component {
         req: proto::ExecuteRequest,
     ) -> Result<proto::ExecuteResponse, ServiceError> {
         let params = parse_params(&req.params_json);
-        match database::execute(&req.sql, &params) {
-            Ok(affected) => Ok(proto::ExecuteResponse { affected }),
-            Err(e) => Err(ServiceError::internal(format!("{e:?}"))),
-        }
+        let affected = database::execute(&req.sql, &params)?;
+        Ok(proto::ExecuteResponse { affected })
     }
 
     fn query(&self, req: proto::QueryRequest) -> Result<proto::QueryResponse, ServiceError> {
         let params = parse_params(&req.params_json);
         match database::query(&req.sql, &params) {
             Ok(rows) => {
+
                 let proto_rows = rows
                     .iter()
                     .map(|row| {
@@ -157,7 +150,7 @@ impl proto::DbTestService for Component {
                     .collect();
                 Ok(proto::QueryResponse { rows: proto_rows })
             }
-            Err(e) => Err(ServiceError::internal(format!("{e:?}"))),
+            Err(e) => Err(ServiceError::from(e)),
         }
     }
 
@@ -173,7 +166,7 @@ impl proto::DbTestService for Component {
             )",
             &[],
         )
-        .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        ?;
 
         database::execute(
             "INSERT INTO type_test (b, i2, i4, i8, f4, f8, t, ts) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -188,10 +181,10 @@ impl proto::DbTestService for Component {
                 PgValue::Timestamptz(1700000000),
             ],
         )
-        .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        ?;
 
         let rows = database::query("SELECT * FROM type_test LIMIT 1", &[])
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
 
         let row_json = if let Some(row) = rows.first() {
             let parts: Vec<String> = row
@@ -221,30 +214,23 @@ impl proto::DbTestService for Component {
             &format!("CREATE TABLE IF NOT EXISTS {table} (id integer)"),
             &[],
         )
-        .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        ?;
 
         // Clean up from prior runs
         database::execute(&format!("DELETE FROM {table}"), &[])
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
 
         let tx = database::begin_transaction()
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
         tx.execute(&format!("INSERT INTO {table} (id) VALUES (1)"), &[])
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
         tx.commit()
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
 
         let rows = database::query(&format!("SELECT count(*) as cnt FROM {table}"), &[])
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
 
-        let count = rows
-            .first()
-            .and_then(|r| r.columns.first())
-            .map(|c| match &c.value {
-                PgValue::Int8(v) => *v,
-                _ => -1,
-            })
-            .unwrap_or(-1);
+        let count = rows.first().map(|r| r.get_i64(0)).transpose()?.unwrap_or(-1);
 
         Ok(proto::TransactionCommitResponse { count })
     }
@@ -263,29 +249,22 @@ impl proto::DbTestService for Component {
             &format!("CREATE TABLE IF NOT EXISTS {table} (id integer)"),
             &[],
         )
-        .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        ?;
 
         database::execute(&format!("DELETE FROM {table}"), &[])
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
 
         let tx = database::begin_transaction()
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
         tx.execute(&format!("INSERT INTO {table} (id) VALUES (1)"), &[])
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
         tx.rollback()
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
 
         let rows = database::query(&format!("SELECT count(*) as cnt FROM {table}"), &[])
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
 
-        let count = rows
-            .first()
-            .and_then(|r| r.columns.first())
-            .map(|c| match &c.value {
-                PgValue::Int8(v) => *v,
-                _ => -1,
-            })
-            .unwrap_or(-1);
+        let count = rows.first().map(|r| r.get_i64(0)).transpose()?.unwrap_or(-1);
 
         Ok(proto::TransactionRollbackResponse { count })
     }
@@ -304,30 +283,23 @@ impl proto::DbTestService for Component {
             &format!("CREATE TABLE IF NOT EXISTS {table} (id integer)"),
             &[],
         )
-        .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        ?;
 
         database::execute(&format!("DELETE FROM {table}"), &[])
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
 
         {
             let tx = database::begin_transaction()
-                .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+                ?;
             tx.execute(&format!("INSERT INTO {table} (id) VALUES (1)"), &[])
-                .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+                ?;
             // tx is dropped here without commit or rollback
         }
 
         let rows = database::query(&format!("SELECT count(*) as cnt FROM {table}"), &[])
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
 
-        let count = rows
-            .first()
-            .and_then(|r| r.columns.first())
-            .map(|c| match &c.value {
-                PgValue::Int8(v) => *v,
-                _ => -1,
-            })
-            .unwrap_or(-1);
+        let count = rows.first().map(|r| r.get_i64(0)).transpose()?.unwrap_or(-1);
 
         Ok(proto::TransactionDropResponse { count })
     }
@@ -358,13 +330,13 @@ impl proto::DbTestService for Component {
         let params = parse_params(&req.params_json);
         let batch_size = if req.batch_size == 0 { 10 } else { req.batch_size };
         let cursor = database::query_stream(&req.sql, &params)
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
         let mut all_rows = vec![];
         let mut batch_count: u32 = 0;
         loop {
             let batch = cursor
                 .next_batch(batch_size)
-                .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+                ?;
             batch_count += 1;
             if batch.is_empty() {
                 break;
@@ -389,13 +361,13 @@ impl proto::DbTestService for Component {
         req: proto::QueryStreamDropRequest,
     ) -> Result<proto::QueryStreamDropResponse, ServiceError> {
         let cursor = database::query_stream(&req.sql, &[])
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+            ?;
         let mut fetched: u32 = 0;
         while fetched < req.fetch_count {
             let remaining = req.fetch_count - fetched;
             let batch = cursor
                 .next_batch(remaining)
-                .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+                ?;
             if batch.is_empty() {
                 break;
             }

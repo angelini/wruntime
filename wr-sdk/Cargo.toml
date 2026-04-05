@@ -6,8 +6,11 @@ edition = "2021"
 [features]
 default = ["prost"]
 prost = ["dep:prost"]
+serde = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
 prost = { version = "0.14", optional = true }
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
 wit-bindgen = "0.51.0"
 wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }

@@ -8,14 +8,10 @@ mod bindings;
 
 use serde::Deserialize;
 use wr_sdk::bindings::wasi::clocks::monotonic_clock;
-use wr_sdk::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
 use wr_sdk::bindings::wruntime::blobstore::store;
-use wr_sdk::bindings::wruntime::db::database::{self, PgValue};
 use wr_sdk::bindings::wruntime::llm::inference::{CompletionResponse, LlmError};
-use wr_sdk::io::{read_body, send_response};
 use wr_sdk::llm::CompletionBuilder;
-use wr_sdk::tracing;
-use wr_sdk::ServiceError;
+use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
@@ -50,10 +46,7 @@ fn complete_with_retry(
 
 impl wr_sdk::ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        let path = request.path_with_query().unwrap_or_default();
-        let body = read_body(request.consume().unwrap());
-        let (status, resp) = proto::agent_service_router(&Component, &path, &body);
-        send_response(response_out, status, resp);
+        proto::agent_service_handle(&Component, request, response_out);
     }
 }
 
@@ -77,13 +70,11 @@ impl proto::AgentService for Component {
         let session_id = &req.session_id;
         let max_turns = if req.max_turns > 0 { req.max_turns } else { 3 };
 
-        let span = tracing::start(
+        let span = wr_sdk::span!(
             "agent.run_task",
-            &[
-                ("session.id", session_id.as_str()),
-                ("agent.max_turns", &max_turns.to_string()),
-                ("agent.doc_prefixes", &req.doc_prefixes.len().to_string()),
-            ],
+            "session.id" => session_id.as_str(),
+            "agent.max_turns" => max_turns,
+            "agent.doc_prefixes" => req.doc_prefixes.len()
         );
 
         // Create session in DB.
@@ -91,8 +82,7 @@ impl proto::AgentService for Component {
             "INSERT INTO sessions (session_id, status) VALUES ($1, 'active') \
              ON CONFLICT (session_id) DO UPDATE SET status = 'active', updated_at = now()",
             &[PgValue::Text(session_id.clone())],
-        )
-        .map_err(|e| ServiceError::internal(format!("insert session: {e:?}")))?;
+        )?;
 
         // Store doc prefix associations.
         for prefix in &req.doc_prefixes {
@@ -103,14 +93,13 @@ impl proto::AgentService for Component {
                     PgValue::Text(session_id.clone()),
                     PgValue::Text(prefix.clone()),
                 ],
-            )
-            .map_err(|e| ServiceError::internal(format!("insert doc prefix: {e:?}")))?;
+            )?;
         }
 
         // Load relevant documentation from blobstore.
         let ctx_span = tracing::start("agent.build_context", &[]);
         let context = build_context(&req.doc_prefixes, &req.task_description)?;
-        tracing::set_attr(&ctx_span, "context.length", &context.len().to_string());
+        tracing::set_attr(&ctx_span, "context.length", context.len());
         drop(ctx_span);
 
         let system_prompt = format!(
@@ -169,16 +158,8 @@ impl proto::AgentService for Component {
             resp.usage.output_tokens,
             text.len()
         ));
-        tracing::set_attr(
-            &turn_span,
-            "tokens.input",
-            &resp.usage.input_tokens.to_string(),
-        );
-        tracing::set_attr(
-            &turn_span,
-            "tokens.output",
-            &resp.usage.output_tokens.to_string(),
-        );
+        tracing::set_attr(&turn_span, "tokens.input", resp.usage.input_tokens);
+        tracing::set_attr(&turn_span, "tokens.output", resp.usage.output_tokens);
         drop(turn_span);
 
         store_turn(session_id, turn, &user_prompt, &text, &resp.usage)?;
@@ -191,10 +172,7 @@ impl proto::AgentService for Component {
                 If improvements are needed, produce an updated unified diff. \
                 If the diff is already correct, respond with exactly: LGTM";
 
-            let turn_span = tracing::start(
-                "agent.llm_turn",
-                &[("turn", &(turn + 1).to_string()), ("type", "refine")],
-            );
+            let turn_span = wr_sdk::span!("agent.llm_turn", "turn" => turn + 1, "type" => "refine");
             wr_sdk::log::log(&format!(
                 "llm call: turn={} type=refine model=claude-sonnet-4-6 messages=2 max_tokens=8192",
                 turn + 1,
@@ -234,16 +212,8 @@ impl proto::AgentService for Component {
                 "llm response: turn={turn} type=refine input_tokens={} output_tokens={} response_len={} lgtm={}",
                 resp.usage.input_tokens, resp.usage.output_tokens, text.len(), text.trim() == "LGTM"
             ));
-            tracing::set_attr(
-                &turn_span,
-                "tokens.input",
-                &resp.usage.input_tokens.to_string(),
-            );
-            tracing::set_attr(
-                &turn_span,
-                "tokens.output",
-                &resp.usage.output_tokens.to_string(),
-            );
+            tracing::set_attr(&turn_span, "tokens.input", resp.usage.input_tokens);
+            tracing::set_attr(&turn_span, "tokens.output", resp.usage.output_tokens);
 
             store_turn(session_id, turn, refine_prompt, &text, &resp.usage)?;
 
@@ -266,17 +236,12 @@ impl proto::AgentService for Component {
                 PgValue::Text(session_id.clone()),
                 PgValue::Text(latest_diff.clone()),
             ],
-        )
-        .map_err(|e| ServiceError::internal(format!("update session: {e:?}")))?;
+        )?;
 
-        tracing::set_attr(&span, "agent.turns_used", &turn.to_string());
-        tracing::set_attr(&span, "agent.total_input_tokens", &total_input.to_string());
-        tracing::set_attr(
-            &span,
-            "agent.total_output_tokens",
-            &total_output.to_string(),
-        );
-        tracing::set_attr(&span, "agent.diff_bytes", &latest_diff.len().to_string());
+        tracing::set_attr(&span, "agent.turns_used", turn);
+        tracing::set_attr(&span, "agent.total_input_tokens", total_input);
+        tracing::set_attr(&span, "agent.total_output_tokens", total_output);
+        tracing::set_attr(&span, "agent.diff_bytes", latest_diff.len());
         drop(span);
 
         Ok(proto::RunTaskResponse {
@@ -297,8 +262,7 @@ impl proto::AgentService for Component {
         let rows = database::query(
             "SELECT status, latest_diff FROM sessions WHERE session_id = $1",
             &[PgValue::Text(req.session_id.clone())],
-        )
-        .map_err(|e| ServiceError::internal(format!("query session: {e:?}")))?;
+        )?;
 
         if rows.is_empty() {
             return Err(ServiceError::not_found("session not found"));
@@ -317,8 +281,7 @@ impl proto::AgentService for Component {
             "SELECT turn_number, user_prompt, assistant_resp, input_tokens, output_tokens \
              FROM conversation_turns WHERE session_id = $1 ORDER BY turn_number",
             &[PgValue::Text(req.session_id.clone())],
-        )
-        .map_err(|e| ServiceError::internal(format!("query turns: {e:?}")))?;
+        )?;
 
         let turns = turn_rows
             .into_iter()
@@ -372,8 +335,7 @@ fn build_context(doc_prefixes: &[String], task_description: &str) -> Result<Stri
 
     for prefix in doc_prefixes {
         let manifest_key = format!("{prefix}/manifest.json");
-        let manifest_data = store::get_object(BUCKET, &manifest_key)
-            .map_err(|e| ServiceError::internal(format!("get manifest: {e:?}")))?;
+        let manifest_data = store::get_object(BUCKET, &manifest_key)?;
 
         let manifest: Manifest = serde_json::from_slice(&manifest_data)
             .map_err(|e| ServiceError::internal(format!("parse manifest: {e}")))?;
@@ -470,7 +432,6 @@ fn store_turn(
             PgValue::Int4(usage.input_tokens as i32),
             PgValue::Int4(usage.output_tokens as i32),
         ],
-    )
-    .map_err(|e| ServiceError::internal(format!("insert turn: {e:?}")))?;
+    )?;
     Ok(())
 }

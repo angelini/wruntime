@@ -38,7 +38,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
 
     wr_sdk::log::log(&format!("client starting — {count} iterations"));
 
-    let run_span = tracing::start("client.run", &[("client.count", &count.to_string())]);
+    let run_span = wr_sdk::span!("client.run", "client.count" => count);
 
     let inv = InventoryServiceClient::new("ecommerce.inventory");
 
@@ -61,13 +61,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
         match i % 6 {
             // 0, 3 — Buy
             0 | 3 => {
-                let sp = tracing::start(
-                    "client.buy",
-                    &[
-                        ("product.id", &product_id),
-                        ("product.quantity", &quantity.to_string()),
-                    ],
-                );
+                let sp = wr_sdk::span!("client.buy", "product.id" => &product_id, "product.quantity" => quantity);
                 match inv.buy(proto::BuyRequest {
                     product_id: product_id.clone(),
                     quantity,
@@ -94,13 +88,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
             // 1 — Return a previously purchased item
             1 => {
                 if let Some((ret_id, ret_qty)) = purchased.pop() {
-                    let sp = tracing::start(
-                        "client.return",
-                        &[
-                            ("product.id", ret_id.as_str()),
-                            ("product.quantity", &ret_qty.to_string()),
-                        ],
-                    );
+                    let sp = wr_sdk::span!("client.return", "product.id" => ret_id.as_str(), "product.quantity" => ret_qty);
                     match inv.r#return(proto::ReturnRequest {
                         product_id: ret_id.clone(),
                         quantity: ret_qty,
@@ -141,14 +129,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
                 let to_idx = ((i.wrapping_mul(11).wrapping_add(3)) % 50) as usize;
                 let to_product_id = PRODUCTS[to_idx].to_string();
                 if product_id != to_product_id {
-                    let sp = tracing::start(
-                        "client.transfer",
-                        &[
-                            ("product.from", &product_id),
-                            ("product.to", &to_product_id),
-                            ("product.quantity", &quantity.to_string()),
-                        ],
-                    );
+                    let sp = wr_sdk::span!("client.transfer", "product.from" => &product_id, "product.to" => &to_product_id, "product.quantity" => quantity);
                     match inv.transfer(proto::TransferRequest {
                         from_product_id: product_id.clone(),
                         to_product_id: to_product_id.clone(),
@@ -178,13 +159,7 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
             }
             // 5 — Restock
             _ => {
-                let sp = tracing::start(
-                    "client.restock",
-                    &[
-                        ("product.id", &product_id),
-                        ("product.quantity", &(quantity * 10).to_string()),
-                    ],
-                );
+                let sp = wr_sdk::span!("client.restock", "product.id" => &product_id, "product.quantity" => quantity * 10);
                 match inv.restock(proto::RestockRequest {
                     product_id: product_id.clone(),
                     quantity: quantity * 10,

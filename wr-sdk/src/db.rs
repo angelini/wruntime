@@ -1,10 +1,69 @@
 use crate::bindings::wruntime::db::database::{self, DbError, PgValue, Row, Transaction};
 use crate::ServiceError;
 
+// ── FromPgValue trait ───────────────────────────────────────────────────────
+
+/// Trait for types extractable from a `PgValue` column.
+pub trait FromPgValue: Sized {
+    fn from_pg(col: usize, val: &PgValue) -> Result<Self, ServiceError>;
+}
+
+impl FromPgValue for i64 {
+    fn from_pg(col: usize, val: &PgValue) -> Result<Self, ServiceError> {
+        match val {
+            PgValue::Int8(v) => Ok(*v),
+            other => Err(type_err(col, "int8", other)),
+        }
+    }
+}
+
+impl FromPgValue for i32 {
+    fn from_pg(col: usize, val: &PgValue) -> Result<Self, ServiceError> {
+        match val {
+            PgValue::Int4(v) => Ok(*v),
+            other => Err(type_err(col, "int4", other)),
+        }
+    }
+}
+
+impl FromPgValue for String {
+    fn from_pg(col: usize, val: &PgValue) -> Result<Self, ServiceError> {
+        match val {
+            PgValue::Text(s) => Ok(s.clone()),
+            PgValue::Jsonb(s) => Ok(s.clone()),
+            other => Err(type_err(col, "text", other)),
+        }
+    }
+}
+
+impl FromPgValue for bool {
+    fn from_pg(col: usize, val: &PgValue) -> Result<Self, ServiceError> {
+        match val {
+            PgValue::Boolean(v) => Ok(*v),
+            other => Err(type_err(col, "boolean", other)),
+        }
+    }
+}
+
+impl FromPgValue for f64 {
+    fn from_pg(col: usize, val: &PgValue) -> Result<Self, ServiceError> {
+        match val {
+            PgValue::Float8(v) => Ok(*v),
+            other => Err(type_err(col, "float8", other)),
+        }
+    }
+}
+
 // ── Row helpers ─────────────────────────────────────────────────────────────
 
 impl Row {
-    /// Extract a `TEXT` column by index, returning a `ServiceError` on type mismatch.
+    /// Extract a typed column by index using the `FromPgValue` trait.
+    pub fn get<T: FromPgValue>(&self, col: usize) -> Result<T, ServiceError> {
+        let column = self.columns.get(col).ok_or_else(|| col_err(col))?;
+        T::from_pg(col, &column.value)
+    }
+
+    /// Extract a `TEXT` column by index as a borrowed `&str`.
     pub fn get_text(&self, col: usize) -> Result<&str, ServiceError> {
         match &self.columns.get(col).ok_or_else(|| col_err(col))?.value {
             PgValue::Text(s) => Ok(s),
@@ -14,37 +73,25 @@ impl Row {
 
     /// Extract a `BIGINT` / `INT8` column by index.
     pub fn get_i64(&self, col: usize) -> Result<i64, ServiceError> {
-        match &self.columns.get(col).ok_or_else(|| col_err(col))?.value {
-            PgValue::Int8(v) => Ok(*v),
-            other => Err(type_err(col, "int8", other)),
-        }
+        self.get(col)
     }
 
     /// Extract an `INTEGER` / `INT4` column by index.
     pub fn get_i32(&self, col: usize) -> Result<i32, ServiceError> {
-        match &self.columns.get(col).ok_or_else(|| col_err(col))?.value {
-            PgValue::Int4(v) => Ok(*v),
-            other => Err(type_err(col, "int4", other)),
-        }
+        self.get(col)
     }
 
     /// Extract a `BOOLEAN` column by index.
     pub fn get_bool(&self, col: usize) -> Result<bool, ServiceError> {
-        match &self.columns.get(col).ok_or_else(|| col_err(col))?.value {
-            PgValue::Boolean(v) => Ok(*v),
-            other => Err(type_err(col, "boolean", other)),
-        }
+        self.get(col)
     }
 
     /// Extract a `FLOAT8` / `DOUBLE PRECISION` column by index.
     pub fn get_f64(&self, col: usize) -> Result<f64, ServiceError> {
-        match &self.columns.get(col).ok_or_else(|| col_err(col))?.value {
-            PgValue::Float8(v) => Ok(*v),
-            other => Err(type_err(col, "float8", other)),
-        }
+        self.get(col)
     }
 
-    /// Extract a `JSONB` / `JSON` column by index.
+    /// Extract a `JSONB` / `JSON` column by index as a borrowed `&str`.
     pub fn get_jsonb(&self, col: usize) -> Result<&str, ServiceError> {
         match &self.columns.get(col).ok_or_else(|| col_err(col))?.value {
             PgValue::Jsonb(s) => Ok(s),
@@ -52,6 +99,36 @@ impl Row {
         }
     }
 }
+
+// ── Tuple extraction ────────────────────────────────────────────────────────
+
+/// Extract multiple typed columns from a row in one call.
+///
+/// ```rust,ignore
+/// let (trade_id, buyer, seller, qty, price): (i64, String, String, i64, i64) =
+///     row.unpack()?;
+/// ```
+pub trait UnpackRow<T> {
+    fn unpack(&self) -> Result<T, ServiceError>;
+}
+
+macro_rules! impl_unpack {
+    ($($idx:tt: $T:ident),+) => {
+        impl<$($T: FromPgValue),+> UnpackRow<($($T,)+)> for Row {
+            fn unpack(&self) -> Result<($($T,)+), ServiceError> {
+                Ok(($($T::from_pg($idx, &self.columns.get($idx).ok_or_else(|| col_err($idx))?.value)?,)+))
+            }
+        }
+    };
+}
+
+impl_unpack!(0: A, 1: B);
+impl_unpack!(0: A, 1: B, 2: C);
+impl_unpack!(0: A, 1: B, 2: C, 3: D);
+impl_unpack!(0: A, 1: B, 2: C, 3: D, 4: E);
+impl_unpack!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F);
+impl_unpack!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G);
+impl_unpack!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H);
 
 fn col_err(col: usize) -> ServiceError {
     ServiceError::internal(format!("column {col} out of bounds"))

@@ -65,14 +65,12 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
          symbols={num_symbols}, total_orders={total_orders}"
     ));
 
-    let run_span = tracing::start(
+    let run_span = wr_sdk::span!(
         "simulator.run",
-        &[
-            ("sim.num_traders", &num_traders.to_string()),
-            ("sim.orders_per_trader", &orders_per_trader.to_string()),
-            ("sim.num_symbols", &num_symbols.to_string()),
-            ("sim.total_orders", &total_orders.to_string()),
-        ],
+        "sim.num_traders" => num_traders,
+        "sim.orders_per_trader" => orders_per_trader,
+        "sim.num_symbols" => num_symbols,
+        "sim.total_orders" => total_orders
     );
 
     let exchange = ExchangeServiceClient::new("stockmarket.exchange");
@@ -133,14 +131,12 @@ fn handle_run(body: &[u8]) -> (u16, Vec<u8>) {
             // Quantity: 1-10 shares.
             let quantity = 1 + ((o as i64) % 10);
 
-            let order_span = tracing::start(
+            let order_span = wr_sdk::span!(
                 "simulator.place_order",
-                &[
-                    ("order.symbol", symbol.as_str()),
-                    ("order.is_buy", if is_buy { "true" } else { "false" }),
-                    ("order.price", &price.to_string()),
-                    ("order.quantity", &quantity.to_string()),
-                ],
+                "order.symbol" => symbol.as_str(),
+                "order.is_buy" => if is_buy { "true" } else { "false" },
+                "order.price" => price,
+                "order.quantity" => quantity
             );
 
             match exchange.place_order(proto::PlaceOrderRequest {

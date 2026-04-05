@@ -74,3 +74,20 @@ pub fn send_response_with_content_type(
 pub fn err_body(status: u16, msg: &str) -> (u16, Vec<u8>) {
     (status, format!(r#"{{"error":"{}"}}"#, msg).into_bytes())
 }
+
+/// Serialize a value as JSON and return it as a `(status, body)` tuple.
+///
+/// Fits the router return convention for modules that serve JSON:
+/// ```rust,ignore
+/// fn handle_list() -> (u16, Vec<u8>) {
+///     let items = vec!["a", "b"];
+///     json_body(200, &items)
+/// }
+/// ```
+#[cfg(feature = "serde")]
+pub fn json_body(status: u16, value: &impl serde::Serialize) -> (u16, Vec<u8>) {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => (status, bytes),
+        Err(e) => err_body(500, &format!("json serialize: {e}")),
+    }
+}

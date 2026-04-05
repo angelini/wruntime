@@ -6,39 +6,31 @@ mod proto {
 #[allow(dead_code, unused_imports)]
 mod bindings;
 
-use wr_sdk::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
 use wr_sdk::bindings::wruntime::blobstore::store::{self, BlobError};
-use wr_sdk::io::{read_body, send_response};
-use wr_sdk::ServiceError;
+use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
 impl wr_sdk::ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        let path = request.path_with_query().unwrap_or_default();
-        let body = read_body(request.consume().unwrap());
-        let (status, resp) = proto::blobstore_test_service_router(&Component, &path, &body);
-        send_response(response_out, status, resp);
+        proto::blobstore_test_service_handle(&Component, request, response_out);
     }
 }
 
 impl proto::BlobstoreTestService for Component {
     fn put(&self, req: proto::PutRequest) -> Result<proto::PutResponse, ServiceError> {
-        store::put_object(&req.bucket, &req.key, &req.data)
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        store::put_object(&req.bucket, &req.key, &req.data)?;
         Ok(proto::PutResponse {})
     }
 
     fn get(&self, req: proto::GetRequest) -> Result<proto::GetResponse, ServiceError> {
-        let data = store::get_object(&req.bucket, &req.key)
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        let data = store::get_object(&req.bucket, &req.key)?;
         Ok(proto::GetResponse { data })
     }
 
     fn delete(&self, req: proto::DeleteRequest) -> Result<proto::DeleteResponse, ServiceError> {
-        store::delete_object(&req.bucket, &req.key)
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        store::delete_object(&req.bucket, &req.key)?;
         Ok(proto::DeleteResponse {})
     }
 
@@ -48,8 +40,7 @@ impl proto::BlobstoreTestService for Component {
         } else {
             Some(req.prefix.as_str())
         };
-        let objects = store::list_objects(&req.bucket, prefix)
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        let objects = store::list_objects(&req.bucket, prefix)?;
         let proto_objects = objects
             .into_iter()
             .map(|o| proto::ObjectMeta {
@@ -65,8 +56,7 @@ impl proto::BlobstoreTestService for Component {
     }
 
     fn head(&self, req: proto::HeadRequest) -> Result<proto::HeadResponse, ServiceError> {
-        let meta = store::head_object(&req.bucket, &req.key)
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        let meta = store::head_object(&req.bucket, &req.key)?;
         Ok(proto::HeadResponse {
             key: meta.key,
             size: meta.size,
@@ -79,10 +69,8 @@ impl proto::BlobstoreTestService for Component {
         &self,
         req: proto::RoundTripRequest,
     ) -> Result<proto::RoundTripResponse, ServiceError> {
-        store::put_object(&req.bucket, &req.key, &req.data)
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
-        let fetched = store::get_object(&req.bucket, &req.key)
-            .map_err(|e| ServiceError::internal(format!("{e:?}")))?;
+        store::put_object(&req.bucket, &req.key, &req.data)?;
+        let fetched = store::get_object(&req.bucket, &req.key)?;
         let matches = fetched == req.data;
         Ok(proto::RoundTripResponse {
             data: fetched,

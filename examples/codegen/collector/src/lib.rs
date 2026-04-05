@@ -7,11 +7,8 @@ mod proto {
 mod bindings;
 
 use serde::{Deserialize, Serialize};
-use wr_sdk::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
 use wr_sdk::bindings::wruntime::blobstore::store;
-use wr_sdk::io::{read_body, send_response};
-use wr_sdk::tracing;
-use wr_sdk::ServiceError;
+use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
@@ -20,10 +17,7 @@ const BUCKET: &str = "codegen";
 
 impl wr_sdk::ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        let path = request.path_with_query().unwrap_or_default();
-        let body = read_body(request.consume().unwrap());
-        let (status, resp) = proto::collector_service_router(&Component, &path, &body);
-        send_response(response_out, status, resp);
+        proto::collector_service_handle(&Component, request, response_out);
     }
 }
 
@@ -52,10 +46,7 @@ impl proto::CollectorService for Component {
         &self,
         req: proto::FetchDocsRequest,
     ) -> Result<proto::FetchDocsResponse, ServiceError> {
-        let span = tracing::start(
-            "collector.fetch_docs",
-            &[("sources.count", &req.sources.len().to_string())],
-        );
+        let span = wr_sdk::span!("collector.fetch_docs", "sources.count" => req.sources.len());
 
         let mut sources_fetched: i32 = 0;
         let mut total_bytes: i64 = 0;
@@ -103,7 +94,7 @@ impl proto::CollectorService for Component {
                 tracing::set_error(&fetch_span, &e.message);
             })?;
 
-            tracing::set_attr(&fetch_span, "source.bytes", &bytes.to_string());
+            tracing::set_attr(&fetch_span, "source.bytes", bytes);
             drop(fetch_span);
 
             total_bytes += bytes as i64;
@@ -111,8 +102,8 @@ impl proto::CollectorService for Component {
             doc_prefixes.push(prefix);
         }
 
-        tracing::set_attr(&span, "sources.fetched", &sources_fetched.to_string());
-        tracing::set_attr(&span, "total_bytes", &total_bytes.to_string());
+        tracing::set_attr(&span, "sources.fetched", sources_fetched);
+        tracing::set_attr(&span, "total_bytes", total_bytes);
         drop(span);
 
         Ok(proto::FetchDocsResponse {
@@ -126,8 +117,7 @@ impl proto::CollectorService for Component {
         &self,
         req: proto::ListDocsRequest,
     ) -> Result<proto::ListDocsResponse, ServiceError> {
-        let objects = store::list_objects(BUCKET, Some(&req.doc_prefix))
-            .map_err(|e| ServiceError::internal(format!("list_objects: {e:?}")))?;
+        let objects = store::list_objects(BUCKET, Some(&req.doc_prefix))?;
 
         let chunks = objects
             .into_iter()
@@ -280,14 +270,12 @@ fn write_manifest(prefix: &str, manifest: &Manifest) -> Result<(), ServiceError>
     let json = serde_json::to_vec(manifest)
         .map_err(|e| ServiceError::internal(format!("serialize manifest: {e}")))?;
     let key = format!("{prefix}/manifest.json");
-    store::put_object(BUCKET, &key, &json)
-        .map_err(|e| ServiceError::internal(format!("put manifest: {e:?}")))?;
+    store::put_object(BUCKET, &key, &json)?;
     Ok(())
 }
 
 fn store_file(key: &str, data: &[u8]) -> Result<(), ServiceError> {
-    store::put_object(BUCKET, key, data)
-        .map_err(|e| ServiceError::internal(format!("put_object({key}): {e:?}")))?;
+    store::put_object(BUCKET, key, data)?;
     Ok(())
 }
 

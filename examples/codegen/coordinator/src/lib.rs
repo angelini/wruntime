@@ -8,11 +8,7 @@ mod bindings;
 
 use proto::CoordinatorService;
 use serde::{Deserialize, Serialize};
-use wr_sdk::bindings::wasi::http::types::{IncomingRequest, Method, ResponseOutparam};
-use wr_sdk::bindings::wruntime::db::database::{self, PgValue};
-use wr_sdk::io::{read_body, send_response};
-use wr_sdk::tracing;
-use wr_sdk::ServiceError;
+use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
@@ -88,7 +84,7 @@ struct ErrorJson {
 }
 
 fn json_response(status: u16, body: &impl Serialize) -> (u16, Vec<u8>) {
-    (status, serde_json::to_vec(body).unwrap_or_default())
+    json_body(status, body)
 }
 
 fn handle_external(method: &Method, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
@@ -211,8 +207,7 @@ impl proto::CoordinatorService for Component {
                 PgValue::Int4(max_turns),
                 PgValue::Text(session_id.clone()),
             ],
-        )
-        .map_err(|e| ServiceError::internal(format!("insert task: {e:?}")))?;
+        )?;
 
         // Submit a job to the engine's worker queue.
         let worker = proto::WorkerServiceClient::new("codegen.worker");
@@ -260,8 +255,7 @@ impl proto::CoordinatorService for Component {
              created_at::text, updated_at::text \
              FROM tasks ORDER BY created_at DESC LIMIT $1 OFFSET $2",
             &[PgValue::Int4(limit), PgValue::Int4(offset)],
-        )
-        .map_err(|e| ServiceError::internal(format!("query tasks: {e:?}")))?;
+        )?;
 
         let tasks = rows.into_iter().map(row_to_task_response).collect();
         Ok(proto::ListTasksResponse { tasks })
@@ -280,8 +274,7 @@ impl proto::CoordinatorService for Component {
              ) RETURNING task_id, session_id, repo_url, \"ref\", \
                doc_sources, task_description, max_agent_turns",
             &[],
-        )
-        .map_err(|e| ServiceError::internal(format!("claim task: {e:?}")))?;
+        )?;
 
         if rows.is_empty() {
             return Ok(proto::ClaimTaskResponse {
@@ -336,8 +329,7 @@ impl proto::CoordinatorService for Component {
         database::execute(
             "UPDATE tasks SET status = $2, updated_at = now() WHERE task_id = $1",
             &[PgValue::Text(req.task_id), PgValue::Text(req.status)],
-        )
-        .map_err(|e| ServiceError::internal(format!("update status: {e:?}")))?;
+        )?;
         Ok(proto::UpdateTaskStatusResponse {})
     }
 
@@ -358,8 +350,7 @@ impl proto::CoordinatorService for Component {
                 PgValue::Int4(req.total_input_tokens),
                 PgValue::Int4(req.total_output_tokens),
             ],
-        )
-        .map_err(|e| ServiceError::internal(format!("complete task: {e:?}")))?;
+        )?;
         Ok(proto::CompleteTaskResponse {})
     }
 }
@@ -373,8 +364,7 @@ impl Component {
              created_at::text, updated_at::text \
              FROM tasks WHERE task_id = $1",
             &[PgValue::Text(task_id.into())],
-        )
-        .map_err(|e| ServiceError::internal(format!("query task: {e:?}")))?;
+        )?;
 
         if rows.is_empty() {
             tracing::set_error(&span, "task not found");

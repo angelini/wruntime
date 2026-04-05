@@ -6,21 +6,16 @@ mod proto {
 #[allow(dead_code, unused_imports)]
 mod bindings;
 
-use wr_sdk::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
 use wr_sdk::bindings::wruntime::llm::inference;
-use wr_sdk::io::{read_body, send_response};
 use wr_sdk::llm::CompletionBuilder;
-use wr_sdk::ServiceError;
+use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
 impl wr_sdk::ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        let path = request.path_with_query().unwrap_or_default();
-        let body = read_body(request.consume().unwrap());
-        let (status, resp) = proto::llm_test_service_router(&Component, &path, &body);
-        send_response(response_out, status, resp);
+        proto::llm_test_service_handle(&Component, request, response_out);
     }
 }
 
@@ -35,9 +30,7 @@ impl proto::LlmTestService for Component {
         }
         builder = builder.user(&req.user_message).max_tokens(req.max_tokens);
 
-        let resp = builder
-            .complete()
-            .map_err(|e| ServiceError::internal(format!("llm error: {:?}", e)))?;
+        let resp = builder.complete()?;
 
         let text = match resp.completion {
             inference::Completion::Text(t) => t,
@@ -58,8 +51,7 @@ impl proto::LlmTestService for Component {
     ) -> Result<proto::CompleteTextResponse, ServiceError> {
         let text = CompletionBuilder::sonnet()
             .user(&req.user_message)
-            .complete_text()
-            .map_err(|e| ServiceError::internal(format!("llm error: {:?}", e)))?;
+            .complete_text()?;
 
         Ok(proto::CompleteTextResponse { text })
     }
@@ -71,14 +63,13 @@ impl proto::LlmTestService for Component {
         let resp = CompletionBuilder::sonnet()
             .user(&req.user_message)
             .tool(&req.tool_name, &req.tool_description, &req.tool_schema)
-            .complete()
-            .map_err(|e| ServiceError::internal(format!("llm error: {:?}", e)))?;
+            .complete()?;
 
         match resp.completion {
             inference::Completion::ToolCalls(calls) => {
-                let call = calls.first().ok_or_else(|| {
-                    ServiceError::internal("no tool calls returned")
-                })?;
+                let call = calls
+                    .first()
+                    .ok_or_else(|| ServiceError::internal("no tool calls returned"))?;
                 Ok(proto::ToolUseResponse {
                     tool_name: call.name.clone(),
                     tool_id: call.id.clone(),
@@ -128,8 +119,7 @@ impl proto::LlmTestService for Component {
     ) -> Result<proto::StreamResponse, ServiceError> {
         let stream = CompletionBuilder::sonnet()
             .user(&req.user_message)
-            .stream()
-            .map_err(|e| ServiceError::internal(format!("llm error: {:?}", e)))?;
+            .stream()?;
 
         let mut text = String::new();
         let mut chunk_count: u32 = 0;
@@ -140,9 +130,7 @@ impl proto::LlmTestService for Component {
                     chunk_count += 1;
                 }
                 Ok(None) => break,
-                Err(e) => {
-                    return Err(ServiceError::internal(format!("stream error: {:?}", e)));
-                }
+                Err(e) => return Err(ServiceError::from(e)),
             }
         }
 

@@ -183,6 +183,32 @@ WASM modules can access host-provided capabilities through WIT interfaces:
 
 See [docs/host-bindings.md](docs/host-bindings.md) for configuration and usage examples.
 
+## Deployment
+
+Bundle once, deploy anywhere — the CLI packages cross-compiled binaries, WASM modules, and configs into a single tarball that works with both systemd and Docker.
+
+```bash
+# Bundle a node (proxy + engine) for Linux
+wr-cli node bundle \
+    --engine-config engine.toml \
+    --target x86_64-unknown-linux-gnu \
+    --output myapp.tar.gz
+
+# Deploy to a remote host via SSH (systemd)
+wr-cli node deploy myapp.tar.gz deploy@10.0.1.50 \
+    --format systemd \
+    --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
+    --manager http://10.0.1.1:9000
+
+# Or deploy with Docker
+wr-cli node deploy myapp.tar.gz deploy@10.0.1.50 \
+    --format docker \
+    --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
+    --manager http://10.0.1.1:9000
+```
+
+Manager deployment follows the same pattern (`wr managers bundle` / `wr managers deploy`). See [docs/deployment.md](docs/deployment.md) for multi-node cluster setup, bundle structure, and template variables.
+
 ## Prerequisites
 
 | Tool | Purpose |
@@ -230,4 +256,5 @@ wruntime/
 - [Protobuf Schemas](docs/schemas.md) — writing, compiling, and validation behavior
 - [Module SDK](docs/sdk.md) — `wr-sdk` + `wr-build` reference; handler and runner module guides
 - [Host Bindings](docs/host-bindings.md) — database, blobstore, tracing, LLM, and filesystem access
+- [Deployment](docs/deployment.md) — bundle, deploy, multi-node clusters, systemd and Docker
 - [Testing](docs/testing.md) — running integration tests

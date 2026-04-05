@@ -69,12 +69,9 @@ impl proto::InventoryService for Component {
             return Err(ServiceError::bad_request("quantity must be > 0"));
         }
 
-        let sp = tracing::start(
-            "inventory.buy",
-            &[
-                ("product.id", req.product_id.as_str()),
-                ("product.quantity", &req.quantity.to_string()),
-            ],
+        let sp = wr_sdk::span!("inventory.buy",
+            "product.id" => req.product_id.as_str(),
+            "product.quantity" => req.quantity,
         );
 
         let tx = wr_sdk::db::transaction()?;
@@ -131,12 +128,9 @@ impl proto::InventoryService for Component {
             return Err(ServiceError::bad_request("quantity must be > 0"));
         }
 
-        tracing::start(
-            "inventory.return",
-            &[
-                ("product.id", req.product_id.as_str()),
-                ("product.quantity", &req.quantity.to_string()),
-            ],
+        wr_sdk::span!("inventory.return",
+            "product.id" => req.product_id.as_str(),
+            "product.quantity" => req.quantity,
         );
 
         let affected = database::execute(
@@ -173,13 +167,10 @@ impl proto::InventoryService for Component {
             ));
         }
 
-        let sp = tracing::start(
-            "inventory.transfer",
-            &[
-                ("product.from", req.from_product_id.as_str()),
-                ("product.to", req.to_product_id.as_str()),
-                ("product.quantity", &req.quantity.to_string()),
-            ],
+        let sp = wr_sdk::span!("inventory.transfer",
+            "product.from" => req.from_product_id.as_str(),
+            "product.to" => req.to_product_id.as_str(),
+            "product.quantity" => req.quantity,
         );
 
         let tx = wr_sdk::db::transaction()?;
@@ -263,12 +254,9 @@ impl proto::InventoryService for Component {
             return Err(ServiceError::bad_request("quantity must be > 0"));
         }
 
-        let sp = tracing::start(
-            "inventory.restock",
-            &[
-                ("product.id", req.product_id.as_str()),
-                ("product.quantity", &req.quantity.to_string()),
-            ],
+        let sp = wr_sdk::span!("inventory.restock",
+            "product.id" => req.product_id.as_str(),
+            "product.quantity" => req.quantity,
         );
 
         let rows = database::query(

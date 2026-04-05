@@ -7,20 +7,14 @@ mod proto {
 mod bindings;
 
 use proto::{AgentServiceClient, CollectorServiceClient, CoordinatorServiceClient};
-use wr_sdk::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
-use wr_sdk::io::{read_body, send_response};
-use wr_sdk::tracing;
-use wr_sdk::ServiceError;
+use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
 impl wr_sdk::ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        let path = request.path_with_query().unwrap_or_default();
-        let body = read_body(request.consume().unwrap());
-        let (status, resp) = proto::worker_service_router(&Component, &path, &body);
-        send_response(response_out, status, resp);
+        proto::worker_service_handle(&Component, request, response_out);
     }
 }
 
@@ -94,7 +88,7 @@ impl proto::WorkerService for Component {
         tracing::set_attr(
             &collect_span,
             "collector.sources_fetched",
-            &fetch_resp.sources_fetched.to_string(),
+            fetch_resp.sources_fetched,
         );
         drop(collect_span);
 
@@ -109,13 +103,7 @@ impl proto::WorkerService for Component {
             status: "generating".into(),
         });
 
-        let agent_span = tracing::start(
-            "worker.run_agent",
-            &[
-                ("task.id", task_id.as_str()),
-                ("agent.max_turns", &req.max_agent_turns.to_string()),
-            ],
-        );
+        let agent_span = wr_sdk::span!("worker.run_agent", "task.id" => task_id.as_str(), "agent.max_turns" => req.max_agent_turns);
 
         let agent_resp = match agent.run_task(proto::RunTaskRequest {
             session_id: req.session_id,
@@ -133,11 +121,7 @@ impl proto::WorkerService for Component {
             }
         };
 
-        tracing::set_attr(
-            &agent_span,
-            "agent.turns_used",
-            &agent_resp.turns_used.to_string(),
-        );
+        tracing::set_attr(&agent_span, "agent.turns_used", agent_resp.turns_used);
         drop(agent_span);
 
         // Store result via coordinator.
