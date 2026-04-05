@@ -12,6 +12,10 @@ struct Cli {
     #[arg(long, env = "WR_MANAGER", global = true)]
     manager: Option<String>,
 
+    /// Enable verbose debug output (connection attempts, SSH commands, retries)
+    #[arg(long, short, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -36,6 +40,8 @@ enum Commands {
     Secrets(cmd::secrets::SecretsArgs),
     /// Remote node deployment (init, bundle, deploy, status)
     Node(cmd::node::NodeArgs),
+    /// View logs from remote services
+    Logs(cmd::logs::LogsArgs),
 }
 
 fn require_manager(manager: &Option<String>) -> Result<&str> {
@@ -49,6 +55,8 @@ fn require_manager(manager: &Option<String>) -> Result<&str> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    cmd::helpers::set_verbose(cli.verbose);
+
     match cli.command {
         Commands::Db(args) => cmd::db::run(args).await,
         Commands::Dev(args) => cmd::dev::run(args, cli.manager.as_deref()).await,
@@ -59,5 +67,6 @@ async fn main() -> Result<()> {
         Commands::Invoke(args) => cmd::invoke::run(args, require_manager(&cli.manager)?).await,
         Commands::Secrets(args) => cmd::secrets::run(args, require_manager(&cli.manager)?).await,
         Commands::Node(args) => cmd::node::run(args, cli.manager.as_deref()).await,
+        Commands::Logs(args) => cmd::logs::run(args).await,
     }
 }

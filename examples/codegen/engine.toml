@@ -1,4 +1,4 @@
-listen_address  = "0.0.0.0:9100"
+listen_address = "0.0.0.0:9100"
 
 [node]
 proxy_address   = "http://127.0.0.1:9001"
@@ -23,44 +23,44 @@ max_tokens_limit = 8192
 max_memory_size = 10485760
 
 [[module]]
-name        = "collector"
-namespace   = "codegen"
-version     = "1.0.0"
-wasm_path   = "examples/codegen/collector/target/wasm32-wasip2/release/collector.wasm"
-schema_path = "examples/codegen/schemas/collector.binpb"
-blobstore   = true
-fs          = "tempdir"
+name                 = "collector"
+namespace            = "codegen"
+version              = "1.0.0"
+wasm_path            = "examples/codegen/collector/target/wasm32-wasip2/release/collector.wasm"
+schema_path          = "examples/codegen/schemas/collector.binpb"
+blobstore            = true
+fs                   = "tempdir"
 request_timeout_secs = 120
 
 [[module]]
-name        = "agent"
-namespace   = "codegen"
-version     = "1.0.0"
-wasm_path   = "examples/codegen/agent/target/wasm32-wasip2/release/agent.wasm"
-schema_path = "examples/codegen/schemas/agent.binpb"
-database    = true
-blobstore   = true
-llm         = true
-fs          = "tempdir"
-migrations_path = "examples/codegen/agent/migrations"
+name                 = "agent"
+namespace            = "codegen"
+version              = "1.0.0"
+wasm_path            = "examples/codegen/agent/target/wasm32-wasip2/release/agent.wasm"
+schema_path          = "examples/codegen/schemas/agent.binpb"
+database             = true
+blobstore            = true
+llm                  = true
+fs                   = "tempdir"
+migrations_path      = "examples/codegen/agent/migrations"
 request_timeout_secs = 300
 
 [[module]]
-name        = "coordinator"
-namespace   = "codegen"
-version     = "1.0.0"
-wasm_path   = "examples/codegen/coordinator/target/wasm32-wasip2/release/coordinator.wasm"
-schema_path = "examples/codegen/schemas/coordinator.binpb"
-database    = true
+name            = "coordinator"
+namespace       = "codegen"
+version         = "1.0.0"
+wasm_path       = "examples/codegen/coordinator/target/wasm32-wasip2/release/coordinator.wasm"
+schema_path     = "examples/codegen/schemas/coordinator.binpb"
+database        = true
 migrations_path = "examples/codegen/coordinator/migrations"
 
 [[module]]
-name        = "worker"
-namespace   = "codegen"
-version     = "1.0.0"
-wasm_path   = "examples/codegen/worker/target/wasm32-wasip2/release/worker.wasm"
-schema_path = "examples/codegen/schemas/worker.binpb"
-mode        = "worker"
-database    = true
-worker_concurrency       = 1
-worker_job_timeout_secs  = 900
+name                    = "worker"
+namespace               = "codegen"
+version                 = "1.0.0"
+wasm_path               = "examples/codegen/worker/target/wasm32-wasip2/release/worker.wasm"
+schema_path             = "examples/codegen/schemas/worker.binpb"
+mode                    = "worker"
+database                = true
+worker_concurrency      = 1
+worker_job_timeout_secs = 900

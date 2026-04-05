@@ -1,4 +1,4 @@
-listen_address  = "0.0.0.0:9101"
+listen_address = "0.0.0.0:9101"
 
 [node]
 proxy_address   = "http://127.0.0.1:9001"

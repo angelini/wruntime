@@ -1,42 +1,72 @@
 [package]
-name = "wr-common"
+name    = "wr-common"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-prost       = "0.14"
-tonic       = { version = "0.14", features = ["transport"] }
+prost = "0.14"
+tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
-serde  = { version = "1", features = ["derive"] }
-http   = "1"
+serde = { version = "1", features = ["derive"] }
+http = "1"
 anyhow = "1"
-tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
-tracing-opentelemetry       = "0.32"
-opentelemetry               = { version = "0.31", features = ["trace", "metrics", "logs"] }
-opentelemetry_sdk           = { version = "0.31", features = ["rt-tokio", "trace", "metrics", "logs"] }
-opentelemetry-otlp          = { version = "0.31", features = ["grpc-tonic", "trace", "metrics", "logs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = [
+  "env-filter",
+  "fmt",
+  "registry",
+] }
+tracing-opentelemetry = "0.32"
+opentelemetry = { version = "0.31", features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.31", features = [
+  "rt-tokio",
+  "trace",
+  "metrics",
+  "logs",
+] }
+opentelemetry-otlp = { version = "0.31", features = [
+  "grpc-tonic",
+  "trace",
+  "metrics",
+  "logs",
+] }
 opentelemetry-semantic-conventions = "0.31"
-opentelemetry-appender-tracing     = "0.31"
-opentelemetry-http                 = "0.31"
+opentelemetry-appender-tracing = "0.31"
+opentelemetry-http = "0.31"
 
 # Optional: manager discovery via Postgres
-deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"], optional = true }
-tokio-postgres    = { version = "0.7", optional = true }
-tokio             = { version = "1", features = ["sync", "time", "rt", "signal"], optional = true }
-rand              = { version = "0.9", optional = true }
-toml              = { version = "0.8", optional = true }
+deadpool-postgres = { version = "0.14", features = [
+  "rt_tokio_1",
+], optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+tokio = { version = "1", features = [
+  "sync",
+  "time",
+  "rt",
+  "signal",
+], optional = true }
+rand = { version = "0.9", optional = true }
+toml = { version = "0.8", optional = true }
 
 # Optional: HTTP/2 client pool
-hyper-util = { version = "0.1", features = ["client-legacy", "http2", "tokio"], optional = true }
-http-body  = { version = "1", optional = true }
+hyper-util = { version = "0.1", features = [
+  "client-legacy",
+  "http2",
+  "tokio",
+], optional = true }
+http-body = { version = "1", optional = true }
 
 [features]
 default = []
-discovery = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio", "dep:rand"]
-pool      = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio"]
-config    = ["dep:toml"]
-signal    = ["dep:tokio"]
+discovery = [
+  "dep:deadpool-postgres",
+  "dep:tokio-postgres",
+  "dep:tokio",
+  "dep:rand",
+]
+pool = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio"]
+config = ["dep:toml"]
+signal = ["dep:tokio"]
 http-pool = ["dep:hyper-util", "dep:http-body"]
 
 [dev-dependencies]

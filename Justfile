@@ -27,6 +27,7 @@ guest_crates := "examples/ecommerce/client examples/ecommerce/inventory examples
 # Format workspace source code
 fmt:
     cargo fmt --all
+    taplo fmt
 
 # Format example guest crates
 fmt-examples:

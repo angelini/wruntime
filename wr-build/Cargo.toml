@@ -1,11 +1,11 @@
 [package]
-name = "wr-build"
+name    = "wr-build"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-prost-build = "0.14"
-quote = "1"
-proc-macro2 = "1"
-syn = "2"
+prost-build  = "0.14"
+quote        = "1"
+proc-macro2  = "1"
+syn          = "2"
 prettyplease = "0.2"

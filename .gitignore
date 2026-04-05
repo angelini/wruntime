@@ -3,3 +3,5 @@
 bindings.rs
 observability
 target
+wr-deploy.toml
+wr-manager-bundle.tar.gz

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::build_helpers::{self, BuildModule};
 use super::config::EngineConfig;
+use super::deploy_config::{self, DeployConfig, DeployFormat};
 use super::helpers;
 
 #[derive(Args)]
@@ -35,8 +36,11 @@ pub struct BundleArgs {
     /// Engine config files (repeatable)
     #[arg(long = "engine-config", value_name = "PATH")]
     engine_configs: Vec<String>,
-    /// Cargo target triple for cross-compilation
+    /// Deploy config file (default: auto-discover wr-deploy.toml in CWD)
     #[arg(long)]
+    config: Option<String>,
+    /// Cargo target triple for cross-compilation
+    #[arg(long, default_value = "x86_64-unknown-linux-gnu", env = "WR_TARGET")]
     target: String,
     /// Base directory for installed files
     #[arg(long, default_value = "/opt/wruntime")]
@@ -44,9 +48,9 @@ pub struct BundleArgs {
     /// Docker image name prefix
     #[arg(long, default_value = "wr")]
     image_prefix: String,
-    /// Output tarball path
+    /// Output tarball path [default: wr-node-bundle.tar.gz]
     #[arg(long)]
-    output: String,
+    output: Option<String>,
     /// Skip WASM and schema compilation
     #[arg(long)]
     skip_build: bool,
@@ -55,24 +59,21 @@ pub struct BundleArgs {
     no_otel: bool,
 }
 
-#[derive(Clone, ValueEnum)]
-pub enum DeployFormat {
-    Systemd,
-    Docker,
-}
-
 #[derive(Args)]
 pub struct DeployArgs {
     /// Path to the bundle tarball
     bundle: String,
     /// Remote host in user@host format
     remote: String,
-    /// Deployment format
+    /// Deploy config file (default: auto-discover wr-deploy.toml in CWD)
     #[arg(long)]
-    format: DeployFormat,
+    config: Option<String>,
+    /// Deployment format [default: systemd]
+    #[arg(long)]
+    format: Option<DeployFormat>,
     /// Database URL for proxy and engine routing table sync
     #[arg(long)]
-    db_url: String,
+    db_url: Option<String>,
     /// Guest database URL for module DB pools (required if engine uses guest databases)
     #[arg(long)]
     guest_db_url: Option<String>,
@@ -80,8 +81,8 @@ pub struct DeployArgs {
     #[arg(long)]
     ssh_key: Option<String>,
     /// SSH port
-    #[arg(long, default_value = "22")]
-    ssh_port: u16,
+    #[arg(long)]
+    ssh_port: Option<u16>,
 }
 
 #[derive(Args)]
@@ -386,6 +387,26 @@ fn bundle(args: BundleArgs) -> Result<()> {
         bail!("At least one --engine-config is required");
     }
 
+    let deploy_cfg = DeployConfig::load_or_discover(args.config.as_deref())?;
+    let target = deploy_config::resolve_with_default(
+        &args.target,
+        "x86_64-unknown-linux-gnu",
+        deploy_cfg.target,
+        "WR_TARGET",
+    );
+    let workdir = deploy_config::resolve_with_default(
+        &args.workdir,
+        "/opt/wruntime",
+        deploy_cfg.workdir,
+        "WR_WORKDIR",
+    );
+    let image_prefix = deploy_config::resolve_with_default(
+        &args.image_prefix,
+        "wr",
+        deploy_cfg.image_prefix,
+        "WR_IMAGE_PREFIX",
+    );
+
     // Parse all engine configs
     let mut all_engine_configs: Vec<(String, EngineConfig)> = Vec::new();
     for path in &args.engine_configs {
@@ -420,18 +441,21 @@ fn bundle(args: BundleArgs) -> Result<()> {
         // Step 3: Pre-compile WASM → native for target architecture
         precompile_hash = Some(build_helpers::precompile_components(
             &build_modules,
-            &args.target,
+            &target,
         )?);
 
         // Step 4: Cross-compile host binaries
-        build_helpers::build_host_binaries(&args.target)?;
+        build_helpers::build_host_binaries(&target)?;
     }
 
     // Step 5: Assemble the bundle
+    let output = args
+        .output
+        .unwrap_or_else(|| "wr-node-bundle.tar.gz".to_string());
     println!("[bundle]  assembling tarball ...");
 
-    let output_file = fs::File::create(&args.output)
-        .with_context(|| format!("failed to create output file: {}", args.output))?;
+    let output_file = fs::File::create(&output)
+        .with_context(|| format!("failed to create output file: {output}"))?;
     let enc = GzEncoder::new(output_file, Compression::default());
     let mut tar = tar::Builder::new(enc);
 
@@ -440,7 +464,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
     let mut config_names: Vec<String> = Vec::new();
 
     // Add host binaries
-    let target_dir = format!("target/{}/release", args.target);
+    let target_dir = format!("target/{}/release", target);
     for bin_name in &["wr-proxy", "wr-engine"] {
         let src = PathBuf::from(&target_dir).join(bin_name);
         if !src.exists() {
@@ -479,8 +503,8 @@ fn bundle(args: BundleArgs) -> Result<()> {
     add_deployment_artifacts(
         &mut tar,
         &DeployArtifactParams {
-            workdir: &args.workdir,
-            image_prefix: &args.image_prefix,
+            workdir: &workdir,
+            image_prefix: &image_prefix,
             config_names: &config_names,
             engine_names: &engine_names,
             proxy_port,
@@ -492,9 +516,9 @@ fn bundle(args: BundleArgs) -> Result<()> {
 
     // Generate manifest
     let manifest = Manifest {
-        target: args.target.clone(),
-        workdir: args.workdir.clone(),
-        image_prefix: args.image_prefix.clone(),
+        target: target.clone(),
+        workdir: workdir.clone(),
+        image_prefix: image_prefix.clone(),
         modules: manifest_modules,
         configs: config_names,
         template_vars,
@@ -510,23 +534,21 @@ fn bundle(args: BundleArgs) -> Result<()> {
     )?;
 
     tar.into_inner()?.finish()?;
-    println!("[bundle]  wrote {}", args.output);
+    println!("[bundle]  wrote {output}");
 
     // Print summary
     println!();
     println!("Bundle contents:");
-    println!("  target:       {}", args.target);
-    println!("  workdir:      {}", args.workdir);
-    println!("  image_prefix: {}", args.image_prefix);
+    println!("  target:       {target}");
+    println!("  workdir:      {workdir}");
+    println!("  image_prefix: {image_prefix}");
     for m in &manifest.modules {
         println!("  module:       {}.{} v{}", m.namespace, m.name, m.version);
     }
     println!();
     println!("Deploy with:");
-    println!(
-        "  wr-cli node deploy {} <user@host> --format systemd --db-url <URL>",
-        args.output
-    );
+    println!("  wr-cli node deploy {output} <user@host>");
+    println!("  (configure via --config, wr-deploy.toml, or WR_* env vars)");
     Ok(())
 }
 
@@ -537,16 +559,31 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
         bail!("Bundle not found: {}", args.bundle);
     }
 
+    // Resolve args from CLI > config file > env vars > defaults
+    let deploy_cfg = DeployConfig::load_or_discover(args.config.as_deref())?;
+    let format = deploy_config::resolve_format(args.format, deploy_cfg.format);
+    let db_url =
+        deploy_config::resolve_required(args.db_url, deploy_cfg.db_url, "WR_DB_URL", "db_url")?;
+    let guest_db_url = deploy_config::resolve_string(
+        args.guest_db_url,
+        deploy_cfg.guest_db_url,
+        "WR_GUEST_DB_URL",
+    );
+    let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key, "WR_SSH_KEY");
+    let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port);
+
     let manifest = read_manifest_from_tarball(&args.bundle)?;
     let configs = read_configs_from_tarball(&args.bundle)?;
 
+    let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
+
     // Build template variables
-    let host = helpers::extract_remote_host(&args.remote);
+    let host = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
     let mut vars = HashMap::new();
-    vars.insert("host", host);
-    vars.insert("db_url", args.db_url.as_str());
-    let guest_db_url_val;
-    if let Some(ref url) = args.guest_db_url {
+    vars.insert("host", host.as_str());
+    vars.insert("db_url", db_url.as_str());
+    let guest_db_url_val: String;
+    if let Some(ref url) = guest_db_url {
         guest_db_url_val = url.clone();
         vars.insert("guest_db_url", &guest_db_url_val);
     }
@@ -559,11 +596,29 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
         resolved_configs.push((name.clone(), resolved));
     }
 
-    let ssh_base = helpers::build_ssh_args(&args.remote, args.ssh_key.as_deref(), args.ssh_port);
-
-    match args.format {
-        DeployFormat::Systemd => deploy_systemd(&args, &manifest, &ssh_base).await?,
-        DeployFormat::Docker => deploy_docker(&args, &manifest, &ssh_base).await?,
+    match format {
+        DeployFormat::Systemd => {
+            deploy_systemd(
+                &args.bundle,
+                &args.remote,
+                ssh_key.as_deref(),
+                ssh_port,
+                &manifest,
+                &ssh_base,
+            )
+            .await?;
+        }
+        DeployFormat::Docker => {
+            deploy_docker(
+                &args.bundle,
+                &args.remote,
+                ssh_key.as_deref(),
+                ssh_port,
+                &manifest,
+                &ssh_base,
+            )
+            .await?;
+        }
     }
 
     // Overwrite template configs with resolved versions
@@ -574,8 +629,8 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
             content.as_bytes(),
             &args.remote,
             &remote_path,
-            args.ssh_key.as_deref(),
-            args.ssh_port,
+            ssh_key.as_deref(),
+            ssh_port,
         )
         .with_context(|| format!("failed to upload resolved {name}"))?;
     }
@@ -583,7 +638,7 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
 
     // Restart services so they pick up the resolved configs
     print!("[deploy]  restarting services ... ");
-    match args.format {
+    match format {
         DeployFormat::Systemd => {
             let mut service_names = vec!["wr-proxy.service".to_string()];
             for config in &manifest.configs {
@@ -608,7 +663,6 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     println!("OK");
 
     // Poll until engines serving all schema-bearing modules are registered.
-    // Modules without schemas are not registered with the manager.
     let expected_modules: Vec<(String, String)> = manifest
         .modules
         .iter()
@@ -616,12 +670,25 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
         .map(|m| (m.namespace.clone(), m.name.clone()))
         .collect();
     println!("[deploy]  waiting for engine registration...");
+
+    // Tail service logs in the background while we wait
+    let log_cmd = match format {
+        DeployFormat::Systemd => super::logs::build_journalctl_command(None, 20, "1m", true),
+        DeployFormat::Docker => {
+            super::logs::build_docker_logs_command(&manifest.workdir, None, 20, true)
+        }
+    };
+    let _log_tail = helpers::spawn_ssh_prefixed(&ssh_base, &log_cmd, "\t\t");
+
     let registered = if expected_modules.is_empty() {
-        // No routable modules — nothing to wait for.
         true
     } else {
         helpers::wait_for_modules(manager, &expected_modules, Duration::from_secs(60)).await
     };
+
+    // _log_tail dropped here, killing the background SSH process
+    drop(_log_tail);
+    println!();
 
     if registered {
         println!("[deploy]  engine registered successfully");
@@ -633,24 +700,46 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     Ok(())
 }
 
-async fn deploy_systemd(args: &DeployArgs, manifest: &Manifest, ssh_base: &[String]) -> Result<()> {
+async fn deploy_systemd(
+    bundle: &str,
+    remote: &str,
+    ssh_key: Option<&str>,
+    ssh_port: Option<u16>,
+    manifest: &Manifest,
+    ssh_base: &[String],
+) -> Result<()> {
     let workdir = &manifest.workdir;
 
-    // Step 1: scp tarball to remote
     print!("[deploy]  copying bundle to remote ... ");
-    scp_bundle(args)?;
+    helpers::scp_file(bundle, remote, "/tmp/wr-bundle.tar.gz", ssh_key, ssh_port)?;
     println!("OK");
 
-    // Step 2: unpack
     print!("[deploy]  unpacking on remote ... ");
+    let run_user = helpers::extract_remote_user(remote).unwrap_or("root");
     helpers::run_ssh(
         ssh_base,
-        &format!("sudo mkdir -p {workdir} && sudo tar xzf /tmp/wr-bundle.tar.gz -C {workdir} && rm /tmp/wr-bundle.tar.gz"),
+        &format!("sudo mkdir -p {workdir} && sudo tar xzf /tmp/wr-bundle.tar.gz -C {workdir} && sudo chown -R {run_user}:{run_user} {workdir}/wr-node && rm /tmp/wr-bundle.tar.gz"),
     )?;
     println!("OK");
 
-    // Step 3: install systemd units and sysctl config
     print!("[deploy]  installing systemd units ... ");
+    // Resolve {run_user}/{run_group} in service files before installing
+    let service_files = list_files_from_tarball(bundle, "wr-node/systemd/", ".service")?;
+    let mut user_vars = std::collections::HashMap::new();
+    user_vars.insert("run_user", run_user);
+    user_vars.insert("run_group", run_user);
+    for (archive_path, template) in &service_files {
+        let resolved = helpers::resolve_template(template, &user_vars)
+            .with_context(|| format!("failed to resolve {archive_path}"))?;
+        let remote_path = format!("{workdir}/{archive_path}");
+        helpers::scp_bytes(
+            resolved.as_bytes(),
+            remote,
+            &remote_path,
+            ssh_key,
+            ssh_port,
+        )?;
+    }
     helpers::run_ssh(
         ssh_base,
         &format!("sudo cp {workdir}/wr-node/systemd/*.service /etc/systemd/system/"),
@@ -664,7 +753,6 @@ async fn deploy_systemd(args: &DeployArgs, manifest: &Manifest, ssh_base: &[Stri
     )?;
     println!("OK");
 
-    // Step 4: enable and start services
     print!("[deploy]  starting services ... ");
     let mut service_names = vec!["wr-proxy.service".to_string()];
     for config in &manifest.configs {
@@ -683,15 +771,20 @@ async fn deploy_systemd(args: &DeployArgs, manifest: &Manifest, ssh_base: &[Stri
     Ok(())
 }
 
-async fn deploy_docker(args: &DeployArgs, manifest: &Manifest, ssh_base: &[String]) -> Result<()> {
+async fn deploy_docker(
+    bundle: &str,
+    remote: &str,
+    ssh_key: Option<&str>,
+    ssh_port: Option<u16>,
+    manifest: &Manifest,
+    ssh_base: &[String],
+) -> Result<()> {
     let workdir = &manifest.workdir;
 
-    // Step 1: scp tarball to remote
     print!("[deploy]  copying bundle to remote ... ");
-    scp_bundle(args)?;
+    helpers::scp_file(bundle, remote, "/tmp/wr-bundle.tar.gz", ssh_key, ssh_port)?;
     println!("OK");
 
-    // Step 2: unpack
     print!("[deploy]  unpacking on remote ... ");
     helpers::run_ssh(
         ssh_base,
@@ -699,7 +792,6 @@ async fn deploy_docker(args: &DeployArgs, manifest: &Manifest, ssh_base: &[Strin
     )?;
     println!("OK");
 
-    // Step 3: docker compose up
     print!("[deploy]  starting containers ... ");
     helpers::run_ssh(
         ssh_base,
@@ -708,17 +800,6 @@ async fn deploy_docker(args: &DeployArgs, manifest: &Manifest, ssh_base: &[Strin
     println!("OK");
 
     Ok(())
-}
-
-/// SCP the bundle tarball to the remote host.
-fn scp_bundle(args: &DeployArgs) -> Result<()> {
-    helpers::scp_file(
-        &args.bundle,
-        &args.remote,
-        "/tmp/wr-bundle.tar.gz",
-        args.ssh_key.as_deref(),
-        args.ssh_port,
-    )
 }
 
 // --- status ---
@@ -745,8 +826,8 @@ fn status(args: StatusArgs) -> Result<()> {
     for var in &manifest.template_vars {
         let source = match var.as_str() {
             "host" => "derived from deploy target",
-            "db_url" => "--db-url flag",
-            "guest_db_url" => "--guest-db-url flag",
+            "db_url" => "--db-url / WR_DB_URL / wr-deploy.toml",
+            "guest_db_url" => "--guest-db-url / WR_GUEST_DB_URL / wr-deploy.toml",
             _ => "unknown",
         };
         println!("  {{{var}}}  {source}");
@@ -782,6 +863,8 @@ After=network.target
 
 [Service]
 Type=simple
+User={{run_user}}
+Group={{run_group}}
 WorkingDirectory={workdir}/wr-node
 ExecStart={workdir}/wr-node/bin/wr-proxy {workdir}/wr-node/config/{config_name}
 {otel_env}Restart=on-failure
@@ -812,6 +895,8 @@ Requires=wr-proxy.service
 
 [Service]
 Type=simple
+User={{run_user}}
+Group={{run_group}}
 WorkingDirectory={workdir}/wr-node
 ExecStart={workdir}/wr-node/bin/wr-engine {workdir}/wr-node/config/{config_name}
 {otel_env}Restart=on-failure
@@ -989,6 +1074,31 @@ fn read_manifest_from_tarball(path: &str) -> Result<Manifest> {
 }
 
 /// Read all config files from the bundle's config/ directory.
+/// Read files from the tarball whose archive path contains `dir_prefix` and ends with `suffix`.
+/// Returns `(archive_path, content)` pairs.
+fn list_files_from_tarball(
+    path: &str,
+    dir_prefix: &str,
+    suffix: &str,
+) -> Result<Vec<(String, String)>> {
+    let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut files = Vec::new();
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_path = entry.path()?.to_string_lossy().to_string();
+        if entry_path.contains(dir_prefix) && entry_path.ends_with(suffix) {
+            let mut content = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut content)?;
+            files.push((entry_path, content));
+        }
+    }
+
+    Ok(files)
+}
+
 fn read_configs_from_tarball(path: &str) -> Result<Vec<(String, String)>> {
     let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
     let decoder = GzDecoder::new(file);

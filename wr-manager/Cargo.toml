@@ -1,14 +1,14 @@
 [package]
-name = "wr-manager"
+name    = "wr-manager"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tonic    = { version = "0.14", features = ["transport"] }
-prost    = "0.14"
-tokio    = { version = "1", features = ["full"] }
-anyhow   = "1"
-serde    = { version = "1", features = ["derive"] }
+tonic              = { version = "0.14", features = ["transport"] }
+prost              = "0.14"
+tokio              = { version = "1", features = ["full"] }
+anyhow             = "1"
+serde              = { version = "1", features = ["derive"] }
 wr-common          = { path = "../wr-common", features = ["pool", "config", "signal"] }
 deadpool-postgres  = { version = "0.14", features = ["rt_tokio_1"] }
 tokio-postgres     = { version = "0.7", features = ["with-chrono-0_4"] }
@@ -17,5 +17,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 aes-gcm            = "0.10"
 hex                = "0.4"
 uuid               = { version = "1", features = ["v4"] }
-chitchat    = "0.10.0"
-tokio-retry = "0.3"
+chitchat           = "0.10.0"
+tokio-retry        = "0.3"

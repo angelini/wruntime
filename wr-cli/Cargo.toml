@@ -8,23 +8,27 @@ name = "wr-cli"
 path = "src/main.rs"
 
 [dependencies]
-clap      = { version = "4", features = ["derive", "env"] }
-tonic     = { version = "0.14", features = ["transport"] }
-tokio     = { version = "1", features = ["rt-multi-thread", "macros"] }
-anyhow    = "1"
-tabled    = "0.16"
-reqwest       = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"] }
-prost         = "0.14"
+clap = { version = "4", features = ["derive", "env"] }
+tonic = { version = "0.14", features = ["transport"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+tabled = "0.16"
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "http2",
+  "json",
+] }
+prost = "0.14"
 prost-reflect = { version = "0.16", features = ["serde"] }
-serde_json    = "1"
-wr-common     = { path = "../wr-common", features = ["discovery"] }
-wr-engine     = { path = "../wr-engine" }
-wasmtime      = { version = "43", features = ["component-model"] }
+serde_json = "1"
+wr-common = { path = "../wr-common", features = ["discovery"] }
+wr-engine = { path = "../wr-engine" }
+wasmtime = { version = "43", features = ["component-model"] }
 tokio-postgres = "0.7"
-tokio-retry    = "0.3"
-libc          = "0.2"
-toml          = "0.8"
-serde         = { version = "1", features = ["derive"] }
-flate2        = "1"
-tar           = "0.4"
-sha2          = "0.10"
+tokio-retry = "0.3"
+libc = "0.2"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+flate2 = "1"
+tar = "0.4"
+sha2 = "0.10"

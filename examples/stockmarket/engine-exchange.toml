@@ -1,4 +1,4 @@
-listen_address  = "0.0.0.0:9100"
+listen_address = "0.0.0.0:9100"
 
 [node]
 proxy_address   = "http://127.0.0.1:9001"
@@ -10,10 +10,10 @@ guest_url       = "postgres://wr_guest:pass@localhost:5432/stockmarket"
 max_connections = 100
 
 [[module]]
-name        = "exchange"
-namespace   = "stockmarket"
-version     = "1.0.0"
-wasm_path   = "examples/stockmarket/exchange/target/wasm32-wasip2/release/exchange.wasm"
-schema_path = "examples/stockmarket/schemas/exchange.binpb"
+name            = "exchange"
+namespace       = "stockmarket"
+version         = "1.0.0"
+wasm_path       = "examples/stockmarket/exchange/target/wasm32-wasip2/release/exchange.wasm"
+schema_path     = "examples/stockmarket/schemas/exchange.binpb"
 database        = true
 migrations_path = "examples/stockmarket/exchange/migrations"

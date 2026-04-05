@@ -363,45 +363,43 @@ wr-cli --manager http://manager-1:9000 engines list
 
 The CLI provides `wr managers` and `wr node` command groups for deploying to remote hosts via SSH. Both support systemd and Docker deployment formats. Bundles are **host-agnostic** — they contain template placeholders like `{host}`, `{db_url}`, and `{guest_db_url}` that are resolved at deploy time.
 
+Both bundle and deploy commands auto-discover a `wr-deploy.toml` file in the current directory (or accept `--config <path>`). This file provides defaults for flags like `target`, `db_url`, `format`, etc. — see [deployment.md](deployment.md) for the full config reference.
+
 #### Deploying a manager
 
 ```bash
-# 1. Build a host-agnostic manager bundle (db_url templated as {db_url})
-wr-cli managers bundle \
-  --manager-config examples/config/manager.toml \
-  --target x86_64-unknown-linux-gnu \
-  --output manager-bundle.tar.gz
+# 1. Build a host-agnostic manager bundle (target defaults to x86_64-unknown-linux-gnu)
+wr-cli managers bundle --manager-config examples/config/manager.toml
 
 # 2. Deploy to the remote host (resolves {db_url} at deploy time)
-wr-cli managers deploy manager-bundle.tar.gz deploy@10.0.1.10 \
-  --format systemd \
-  --db-url "postgres://postgres@localhost:5432/wruntime"
+wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10 \
+  --db-url "postgres://postgres@localhost:5432/wruntime" \
+  --secret-key "<64-char-hex-key>"
 
 # 3. Inspect a bundle to see template variables and checksums
-wr-cli managers status manager-bundle.tar.gz
+wr-cli managers status wr-manager-bundle.tar.gz
 ```
 
-The same bundle can be deployed to multiple managers with different `--db-url` and `--seed-node` values.
+The same bundle can be deployed to multiple managers with different `--db-url` and `--seed-node` values. With a `wr-deploy.toml`, deploy reduces to just the positional args:
+
+```bash
+wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10
+```
 
 #### Deploying engine+proxy nodes
 
 ```bash
 # 1. Build a host-agnostic node bundle (one build for all nodes)
-wr-cli node bundle \
-  --engine-config examples/codegen/engine.toml \
-  --target x86_64-unknown-linux-gnu \
-  --output codegen-bundle.tar.gz
+wr-cli node bundle --engine-config examples/codegen/engine.toml
 
 # 2. Deploy to each node (resolves {host}, {db_url}, {guest_db_url})
 export WR_MANAGER=http://10.0.1.10:9000
 
-wr-cli node deploy codegen-bundle.tar.gz deploy@10.0.1.20 \
-  --format systemd \
+wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.20 \
   --db-url "postgres://postgres@10.0.1.10:5432/wruntime" \
   --guest-db-url "postgres://wr_guest:pass@10.0.1.10:5432/codegen"
 
-wr-cli node deploy codegen-bundle.tar.gz deploy@10.0.1.30 \
-  --format systemd \
+wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.30 \
   --db-url "postgres://postgres@10.0.1.10:5432/wruntime" \
   --guest-db-url "postgres://wr_guest:pass@10.0.1.10:5432/codegen"
 ```

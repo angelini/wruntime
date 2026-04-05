@@ -182,29 +182,23 @@ See [docs/host-bindings.md](docs/host-bindings.md) for configuration and usage e
 
 ## Deployment
 
-Bundle once, deploy anywhere — the CLI packages cross-compiled binaries, WASM modules, and configs into a single tarball that works with both systemd and Docker.
+Bundle once, deploy anywhere — the CLI packages cross-compiled binaries, WASM modules, and configs into a single tarball that works with both systemd and Docker. Shared settings (target, db_url, format, etc.) can live in a `wr-deploy.toml` so commands stay short.
 
 ```bash
-# Bundle a node (proxy + engine) for Linux
-wr-cli node bundle \
-    --engine-config engine.toml \
-    --target x86_64-unknown-linux-gnu \
-    --output myapp.tar.gz
+# Bundle a node (proxy + engine) — target defaults to x86_64-unknown-linux-gnu
+wr-cli node bundle --engine-config engine.toml
 
-# Deploy to a remote host via SSH (systemd)
-wr-cli node deploy myapp.tar.gz deploy@10.0.1.50 \
-    --format systemd \
+# Deploy to a remote host via SSH (format defaults to systemd)
+wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.50 \
     --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
     --manager http://10.0.1.1:9000
 
-# Or deploy with Docker
-wr-cli node deploy myapp.tar.gz deploy@10.0.1.50 \
-    --format docker \
-    --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
+# Or with a wr-deploy.toml providing db_url, just the positional args:
+wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.50 \
     --manager http://10.0.1.1:9000
 ```
 
-Manager deployment follows the same pattern (`wr managers bundle` / `wr managers deploy`). See [docs/deployment.md](docs/deployment.md) for multi-node cluster setup, bundle structure, and template variables.
+Manager deployment follows the same pattern (`wr managers bundle` / `wr managers deploy`). See [docs/deployment.md](docs/deployment.md) for the deploy config reference, multi-node cluster setup, bundle structure, and template variables.
 
 ## Prerequisites
 

@@ -1,10 +1,12 @@
 pub mod build_helpers;
 pub mod config;
 pub mod db;
+pub mod deploy_config;
 pub mod dev;
 pub mod engines;
 pub mod helpers;
 pub mod invoke;
+pub mod logs;
 pub mod managers;
 pub mod metrics;
 pub mod node;

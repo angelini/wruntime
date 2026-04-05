@@ -69,71 +69,149 @@ wr-node/
 └── manifest.json
 ```
 
+## Deploy configuration (`wr-deploy.toml`)
+
+Instead of passing every flag on the command line, you can create a `wr-deploy.toml` in your working directory. Both bundle and deploy commands auto-discover it (or accept `--config <path>` to load a specific file).
+
+**Precedence:** CLI flag > config file > environment variable > default
+
+```toml
+# wr-deploy.toml — shared settings for bundle and deploy commands
+format     = "systemd"
+target     = "aarch64-unknown-linux-gnu"
+workdir    = "/opt/wruntime"
+db_url     = "postgres://postgres@10.0.1.1:5432/wruntime"
+secret_key = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+ssh_key    = "~/.ssh/deploy_key"
+seed_nodes = ["10.0.1.11:9010", "10.0.1.12:9010"]
+# guest_db_url = "postgres://wr_guest:pass@10.0.1.1:5432/wruntime"
+# ssh_port     = 22
+# image_prefix = "wr"
+```
+
+All fields are optional. Fields that only apply to specific commands (e.g. `secret_key` for managers, `guest_db_url` for nodes) are silently ignored when unused. CLI flags always override the config file.
+
+**Environment variables** are also supported for all deploy-related fields:
+
+| Flag | Env var | Default |
+|------|---------|---------|
+| `--format` | `WR_FORMAT` | `systemd` |
+| `--db-url` | `WR_DB_URL` | — |
+| `--guest-db-url` | `WR_GUEST_DB_URL` | — |
+| `--secret-key` | `WR_SECRET_KEY` | — |
+| `--ssh-key` | `WR_SSH_KEY` | — |
+| `--ssh-port` | `WR_SSH_PORT` | SSH default |
+| `--target` | `WR_TARGET` | `x86_64-unknown-linux-gnu` |
+| `--advertise-address` | `WR_ADVERTISE_ADDRESS` | derived from remote host |
+| `--manager` | `WR_MANAGER` | — |
+
 ## Template variables
 
 Config files use placeholders that are resolved at deploy time:
 
 | Variable | Resolved from | Used in |
 |----------|---------------|---------|
-| `{db_url}` | `--db-url` flag | manager, proxy, engine configs |
-| `{guest_db_url}` | `--guest-db-url` flag | engine config (module DB access) |
+| `{db_url}` | `--db-url` / `WR_DB_URL` / config | manager, proxy, engine configs |
+| `{guest_db_url}` | `--guest-db-url` / `WR_GUEST_DB_URL` / config | engine config (module DB access) |
 | `{host}` | deploy target (`user@host`) | proxy/engine `[node]` addresses |
-| `{secret_key}` | `--secret-key` flag | manager systemd unit / Dockerfile |
-| `{advertise_address}` | `--advertise-address` flag | manager config (`advertise_grpc_address`) |
+| `{secret_key}` | `--secret-key` / `WR_SECRET_KEY` / config | manager systemd unit / Dockerfile |
+| `{advertise_address}` | `--advertise-address` / `WR_ADVERTISE_ADDRESS` (auto-derived from remote host if omitted) | manager config (`advertise_grpc_address`) |
 
 Unresolved placeholders cause deployment to fail.
 
 ## Single-node deployment (systemd)
 
+The simplest approach is a `wr-deploy.toml` alongside your engine configs:
+
+```toml
+# wr-deploy.toml
+target     = "aarch64-unknown-linux-gnu"
+db_url     = "postgres://postgres@localhost:5432/wruntime"
+secret_key = "<64-char-hex-key>"
+```
+
 ```bash
-# 1. Bundle manager
+# 1. Bundle manager (target and output have defaults)
+wr-cli managers bundle --manager-config examples/config/manager.toml
+
+# 2. Deploy manager (format defaults to systemd, advertise-address derived from host)
+wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.1
+
+# 3. Bundle node
+wr-cli node bundle --engine-config engine.toml
+
+# 4. Deploy node
+wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.1 --manager http://10.0.1.1:9000
+
+# 5. Verify
+wr-cli engines list --manager http://10.0.1.1:9000
+```
+
+Without the config file, pass all values as flags:
+
+```bash
 wr-cli managers bundle \
     --manager-config examples/config/manager.toml \
     --target aarch64-unknown-linux-gnu \
     --output manager.tar.gz
 
-# 2. Deploy manager
 wr-cli managers deploy manager.tar.gz deploy@10.0.1.1 \
-    --format systemd \
     --db-url "postgres://postgres@localhost:5432/wruntime" \
-    --secret-key "<64-char-hex-key>" \
-    --advertise-address "http://10.0.1.1:9000"
+    --secret-key "<64-char-hex-key>"
 
-# 3. Bundle node — cross-compile for the target architecture
 wr-cli node bundle \
     --engine-config engine.toml \
     --target aarch64-unknown-linux-gnu \
     --output myapp.tar.gz
 
-# 4. Deploy node
 wr-cli node deploy myapp.tar.gz deploy@10.0.1.1 \
-    --format systemd \
     --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
     --manager http://10.0.1.1:9000
-
-# 5. Verify
-wr-cli engines list --manager http://10.0.1.1:9000
 ```
 
 Deploy steps (systemd): SCP tarball, unpack to `--workdir` (default `/opt/wruntime`), install systemd units, resolve config templates, restart services, poll manager until the engine registers (60s timeout).
 
 ## Multi-node cluster setup
 
+With a shared `wr-deploy.toml`:
+
+```toml
+# wr-deploy.toml
+target     = "aarch64-unknown-linux-gnu"
+db_url     = "postgres://postgres@10.0.1.1:5432/wruntime"
+secret_key = "<64-char-hex-key>"
+```
+
 ```bash
+export WR_MANAGER=http://10.0.1.1:9000
+
 # --- Manager (once per cluster) ---
 
+wr-cli managers bundle --manager-config examples/config/manager.toml --output manager.tar.gz
+wr-cli managers deploy manager.tar.gz deploy@10.0.1.1
+
+# --- Node A ---
+
+wr-cli node bundle --engine-config examples/multi-node/node-a/engine-1.toml --output node-a.tar.gz
+wr-cli node deploy node-a.tar.gz deploy@10.0.1.50
+
+# --- Node B ---
+
+wr-cli node bundle --engine-config examples/multi-node/node-b/engine-1.toml --output node-b.tar.gz
+wr-cli node deploy node-b.tar.gz deploy@10.0.1.51
+```
+
+Without the config file, pass all values explicitly:
+
+```bash
 wr-cli managers bundle \
     --manager-config examples/config/manager.toml \
     --target aarch64-unknown-linux-gnu \
     --output manager.tar.gz
 
 wr-cli managers deploy manager.tar.gz deploy@10.0.1.1 \
-    --format systemd \
     --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
-    --secret-key "<64-char-hex-key>" \
-    --advertise-address "http://10.0.1.1:9000"
-
-# --- Node A ---
+    --secret-key "<64-char-hex-key>"
 
 wr-cli node bundle \
     --engine-config examples/multi-node/node-a/engine-1.toml \
@@ -141,32 +219,20 @@ wr-cli node bundle \
     --output node-a.tar.gz
 
 wr-cli node deploy node-a.tar.gz deploy@10.0.1.50 \
-    --format systemd \
-    --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
-    --manager http://10.0.1.1:9000
-
-# --- Node B ---
-
-wr-cli node bundle \
-    --engine-config examples/multi-node/node-b/engine-1.toml \
-    --target aarch64-unknown-linux-gnu \
-    --output node-b.tar.gz
-
-wr-cli node deploy node-b.tar.gz deploy@10.0.1.51 \
-    --format systemd \
     --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
     --manager http://10.0.1.1:9000
 ```
 
 ## Docker deployment
 
-The same bundle works for Docker — just change the `--format` flag:
+The same bundle works for Docker — override the format via flag, env, or config:
 
 ```bash
-wr-cli node deploy myapp.tar.gz deploy@10.0.1.50 \
-    --format docker \
-    --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
-    --manager http://10.0.1.1:9000
+# Via flag
+wr-cli node deploy myapp.tar.gz deploy@10.0.1.50 --format docker
+
+# Via wr-deploy.toml
+# format = "docker"
 
 # Or extract locally and run with Docker Compose
 tar xzf myapp.tar.gz
@@ -185,25 +251,25 @@ echo "deploy ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/deploy
 
 Both `managers deploy` and `node deploy` accept:
 
-- `--ssh-key <PATH>` — private key for authentication
-- `--ssh-port <PORT>` — SSH port (default: 22)
+- `--ssh-key <PATH>` — private key for authentication (env: `WR_SSH_KEY`, config: `ssh_key`)
+- `--ssh-port <PORT>` — SSH port (env: `WR_SSH_PORT`, config: `ssh_port`)
 
 ## NAT / port-forwarding environments
 
 When VMs are behind NAT (e.g., QEMU emulated VLAN with port forwarding), services cannot reach each other by their bind addresses. Use `--advertise-address` on the manager deploy so that proxies discover a routable address from the `wr_managers` database table. Use `--ssh-port` to target forwarded SSH ports on the host.
 
+By default, `--advertise-address` is auto-derived from the deploy target host and the manager's listen port. You only need to set it explicitly when the externally-reachable address differs from the deploy target (e.g., NAT).
+
 ```bash
 # Example: QEMU VMs with port forwarding through the host
 wr-cli managers deploy manager.tar.gz example@localhost \
     --ssh-port 2201 \
-    --format systemd \
     --db-url "postgres://postgres@localhost:5432/wruntime" \
     --secret-key "<64-char-hex-key>" \
     --advertise-address "http://10.0.2.2:9000"
 
 wr-cli node deploy node.tar.gz example@localhost \
     --ssh-port 2202 \
-    --format systemd \
     --db-url "postgres://postgres@10.0.2.2:5432/wruntime" \
     --manager http://10.0.2.2:9000
 ```

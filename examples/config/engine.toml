@@ -1,14 +1,14 @@
 listen_address = "0.0.0.0:9100"
 
 [node]
-proxy_address   = "http://127.0.0.1:9001"  # local proxy; used to rewrite WASM outbound calls
-control_address = "http://127.0.0.1:9002"  # proxy gRPC control plane for registration/heartbeats
+proxy_address   = "http://127.0.0.1:9001" # local proxy; used to rewrite WASM outbound calls
+control_address = "http://127.0.0.1:9002" # proxy gRPC control plane for registration/heartbeats
 
 # Optional — remove this section if no modules need database access.
 [database]
 url             = "postgres://postgres@localhost:5433/wruntime_example"
-guest_url       = "postgres://wr_guest@localhost:5433/wruntime_example"   # lower-privilege role for module pools
-max_connections = 20   # default pool size for all DB-enabled modules
+guest_url       = "postgres://wr_guest@localhost:5433/wruntime_example" # lower-privilege role for module pools
+max_connections = 20                                                    # default pool size for all DB-enabled modules
 # statement_timeout_secs              = 30   # per-statement timeout for guest queries (default: 30)
 # idle_in_transaction_timeout_secs    = 60   # kill idle-in-transaction sessions (default: 60)
 
@@ -21,16 +21,16 @@ max_connections = 20   # default pool size for all DB-enabled modules
 
 # Optional — remove this section to use the default on-demand allocator.
 [pool]
-total_component_instances = 1000   # max concurrent WASM instances across all modules
-max_memory_size = 10485760         # 10 MiB per instance linear memory
+total_component_instances = 1000     # max concurrent WASM instances across all modules
+max_memory_size           = 10485760 # 10 MiB per instance linear memory
 
 [[module]]
 name        = "order-service"
 namespace   = "payments"
 version     = "1.0.0"
 wasm_path   = "modules/order_service.wasm"
-schema_path = "schemas/order_service.binpb"   # required: compiled FileDescriptorSet
-database    = true                             # opt in to the shared connection pool
+schema_path = "schemas/order_service.binpb" # required: compiled FileDescriptorSet
+database    = true                          # opt in to the shared connection pool
 # db_max_connections = 10   # override pool size for this module (default: [database].max_connections)
 # channel_capacity   = 256  # inbound request queue depth before 429 (default: 128)
 

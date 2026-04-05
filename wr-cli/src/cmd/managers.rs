@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -13,6 +13,7 @@ use tabled::builder::Builder;
 
 use super::build_helpers;
 use super::config::ManagerConfig;
+use super::deploy_config::{self, DeployConfig, DeployFormat};
 use super::helpers;
 use crate::{client, display};
 
@@ -39,8 +40,11 @@ pub struct BundleArgs {
     /// Manager config file (used as template; db_url will be replaced with {db_url})
     #[arg(long)]
     manager_config: String,
-    /// Cargo target triple for cross-compilation
+    /// Deploy config file (default: auto-discover wr-deploy.toml in CWD)
     #[arg(long)]
+    config: Option<String>,
+    /// Cargo target triple for cross-compilation
+    #[arg(long, default_value = "x86_64-unknown-linux-gnu", env = "WR_TARGET")]
     target: String,
     /// Base directory for installed files on the remote host
     #[arg(long, default_value = "/opt/wruntime")]
@@ -48,9 +52,9 @@ pub struct BundleArgs {
     /// Docker image name prefix
     #[arg(long, default_value = "wr")]
     image_prefix: String,
-    /// Output tarball path
+    /// Output tarball path [default: wr-manager-bundle.tar.gz]
     #[arg(long)]
-    output: String,
+    output: Option<String>,
     /// Skip compilation (reuse existing binary)
     #[arg(long)]
     skip_build: bool,
@@ -59,24 +63,21 @@ pub struct BundleArgs {
     no_otel: bool,
 }
 
-#[derive(Clone, ValueEnum)]
-pub enum DeployFormat {
-    Systemd,
-    Docker,
-}
-
 #[derive(Args)]
 pub struct DeployArgs {
     /// Path to the manager bundle tarball
     bundle: String,
     /// Remote host in user@host format
     remote: String,
-    /// Deployment format
+    /// Deploy config file (default: auto-discover wr-deploy.toml in CWD)
     #[arg(long)]
-    format: DeployFormat,
+    config: Option<String>,
+    /// Deployment format [default: systemd]
+    #[arg(long)]
+    format: Option<DeployFormat>,
     /// Postgres database URL
     #[arg(long)]
-    db_url: String,
+    db_url: Option<String>,
     /// Gossip seed node addresses (repeatable, e.g. 10.0.1.11:9010)
     #[arg(long = "seed-node", value_name = "ADDR")]
     seed_nodes: Vec<String>,
@@ -84,14 +85,14 @@ pub struct DeployArgs {
     #[arg(long)]
     ssh_key: Option<String>,
     /// SSH port
-    #[arg(long, default_value = "22")]
-    ssh_port: u16,
+    #[arg(long)]
+    ssh_port: Option<u16>,
     /// Secret encryption key (hex-encoded, 32 bytes / 64 hex chars)
     #[arg(long)]
-    secret_key: String,
-    /// Manager's externally-reachable gRPC address (e.g. http://10.0.2.2:9000)
+    secret_key: Option<String>,
+    /// Manager's externally-reachable gRPC address (derived from remote host if omitted)
     #[arg(long)]
-    advertise_address: String,
+    advertise_address: Option<String>,
 }
 
 #[derive(Args)]
@@ -154,22 +155,45 @@ fn bundle(args: BundleArgs) -> Result<()> {
         bail!("Manager config not found: {}", args.manager_config);
     }
 
+    let deploy_cfg = DeployConfig::load_or_discover(args.config.as_deref())?;
+    let target = deploy_config::resolve_with_default(
+        &args.target,
+        "x86_64-unknown-linux-gnu",
+        deploy_cfg.target,
+        "WR_TARGET",
+    );
+    let workdir = deploy_config::resolve_with_default(
+        &args.workdir,
+        "/opt/wruntime",
+        deploy_cfg.workdir,
+        "WR_WORKDIR",
+    );
+    let image_prefix = deploy_config::resolve_with_default(
+        &args.image_prefix,
+        "wr",
+        deploy_cfg.image_prefix,
+        "WR_IMAGE_PREFIX",
+    );
+
     let config = ManagerConfig::from_file(&args.manager_config)?;
+    let output = args
+        .output
+        .unwrap_or_else(|| "wr-manager-bundle.tar.gz".to_string());
 
     if !args.skip_build {
-        build_helpers::build_manager_binary(&args.target)?;
+        build_helpers::build_manager_binary(&target)?;
     }
 
     println!("[bundle]  assembling tarball ...");
 
-    let output_file = fs::File::create(&args.output)
-        .with_context(|| format!("failed to create output file: {}", args.output))?;
+    let output_file = fs::File::create(&output)
+        .with_context(|| format!("failed to create output file: {output}"))?;
     let enc = GzEncoder::new(output_file, Compression::default());
     let mut tar = tar::Builder::new(enc);
     let mut checksums: HashMap<String, String> = HashMap::new();
 
     // Add manager binary
-    let bin_path = PathBuf::from(format!("target/{}/release/wr-manager", args.target));
+    let bin_path = PathBuf::from(format!("target/{}/release/wr-manager", target));
     if !bin_path.exists() {
         bail!(
             "Binary not found: {}. Did cross-compilation succeed?",
@@ -194,7 +218,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
     )?;
 
     // Systemd unit
-    let service = generate_manager_service(&args.workdir, args.no_otel);
+    let service = generate_manager_service(&workdir, args.no_otel);
     tar_add_bytes(
         &mut tar,
         "wr-manager/systemd/wr-manager.service",
@@ -206,7 +230,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
     let listen_port = helpers::extract_port(&config.listen_address);
     let gossip_port = helpers::extract_port(&config.cluster.gossip_listen_address);
 
-    let dockerfile = generate_manager_dockerfile(&args.workdir, args.no_otel);
+    let dockerfile = generate_manager_dockerfile(&workdir, args.no_otel);
     tar_add_bytes(
         &mut tar,
         "wr-manager/docker/Dockerfile.manager",
@@ -214,7 +238,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         0o644,
     )?;
 
-    let compose = generate_manager_compose(&args.image_prefix, listen_port, gossip_port);
+    let compose = generate_manager_compose(&image_prefix, listen_port, gossip_port);
     tar_add_bytes(
         &mut tar,
         "wr-manager/docker/docker-compose.yml",
@@ -231,9 +255,9 @@ fn bundle(args: BundleArgs) -> Result<()> {
 
     // Manifest
     let manifest = ManagerManifest {
-        target: args.target.clone(),
-        workdir: args.workdir.clone(),
-        image_prefix: args.image_prefix.clone(),
+        target: target.clone(),
+        workdir: workdir.clone(),
+        image_prefix: image_prefix.clone(),
         listen_address: config.listen_address.clone(),
         cluster_id: config.cluster.cluster_id.clone(),
         template_vars: vec!["db_url".to_string()],
@@ -248,20 +272,18 @@ fn bundle(args: BundleArgs) -> Result<()> {
     )?;
 
     tar.into_inner()?.finish()?;
-    println!("[bundle]  wrote {}", args.output);
+    println!("[bundle]  wrote {output}");
 
     println!();
     println!("Bundle contents:");
-    println!("  target:     {}", args.target);
-    println!("  workdir:    {}", args.workdir);
+    println!("  target:     {}", target);
+    println!("  workdir:    {}", workdir);
     println!("  listen:     {}", config.listen_address);
     println!("  cluster_id: {}", config.cluster.cluster_id);
     println!();
     println!("Deploy with:");
-    println!(
-        "  wr-cli managers deploy {} <user@host> --format systemd --db-url <URL>",
-        args.output
-    );
+    println!("  wr-cli managers deploy {output} <user@host>");
+    println!("  (configure via --config, wr-deploy.toml, or WR_* env vars)");
     Ok(())
 }
 
@@ -272,39 +294,94 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         bail!("Bundle not found: {}", args.bundle);
     }
 
+    // Resolve args from CLI > config file > env vars > defaults
+    let deploy_cfg = DeployConfig::load_or_discover(args.config.as_deref())?;
+    let format = deploy_config::resolve_format(args.format, deploy_cfg.format);
+    let db_url =
+        deploy_config::resolve_required(args.db_url, deploy_cfg.db_url, "WR_DB_URL", "db_url")?;
+    let secret_key = deploy_config::resolve_required(
+        args.secret_key,
+        deploy_cfg.secret_key,
+        "WR_SECRET_KEY",
+        "secret_key",
+    )?;
+    let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key, "WR_SSH_KEY");
+    let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port);
+
     let manifest = read_manifest_from_tarball(&args.bundle)?;
+
+    let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
+
+    // Auto-derive advertise_address from remote host + listen port if not provided
+    let listen_port = helpers::extract_port(&manifest.listen_address);
+    let advertise_address =
+        match deploy_config::resolve_string(args.advertise_address, None, "WR_ADVERTISE_ADDRESS") {
+            Some(addr) => addr,
+            None => {
+                let ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
+                format!("http://{ip}:{listen_port}")
+            }
+        };
+
+    // Merge seed_nodes: CLI wins if non-empty, otherwise use config
+    let seed_nodes = if args.seed_nodes.is_empty() {
+        deploy_cfg.seed_nodes.unwrap_or_default()
+    } else {
+        args.seed_nodes
+    };
+
     let config_template = read_config_from_tarball(&args.bundle)?;
 
     // Resolve template variables
     let mut vars = HashMap::new();
-    vars.insert("db_url", args.db_url.as_str());
-    vars.insert("advertise_address", args.advertise_address.as_str());
+    vars.insert("db_url", db_url.as_str());
+    vars.insert("advertise_address", advertise_address.as_str());
     let mut resolved = helpers::resolve_template(&config_template, &vars)
         .context("failed to resolve template in manager.toml")?;
 
     // Inject seed_nodes if provided (append to [cluster] section)
-    if !args.seed_nodes.is_empty() {
-        // Parse the resolved config, set seed_nodes, re-serialize
+    if !seed_nodes.is_empty() {
         let mut config: ManagerConfig =
             toml::from_str(&resolved).context("failed to parse resolved manager config")?;
-        config.cluster.seed_nodes = args.seed_nodes.clone();
+        config.cluster.seed_nodes = seed_nodes;
         resolved = config.to_toml()?;
     }
 
-    let ssh_base = helpers::build_ssh_args(&args.remote, args.ssh_key.as_deref(), args.ssh_port);
-
-    match args.format {
-        DeployFormat::Systemd => deploy_systemd(&args, &manifest, &ssh_base)?,
-        DeployFormat::Docker => deploy_docker(&args, &manifest, &ssh_base)?,
+    match format {
+        DeployFormat::Systemd => {
+            deploy_systemd(
+                &args.bundle,
+                &args.remote,
+                ssh_key.as_deref(),
+                ssh_port,
+                &manifest,
+                &ssh_base,
+            )?;
+        }
+        DeployFormat::Docker => {
+            deploy_docker(
+                &args.bundle,
+                &args.remote,
+                ssh_key.as_deref(),
+                ssh_port,
+                &manifest,
+                &ssh_base,
+            )?;
+        }
     }
 
-    // Resolve {secret_key} in systemd unit and reinstall
+    // Resolve {secret_key}, {run_user}, {run_group} in systemd unit and reinstall
     print!("[deploy]  resolving secrets ... ");
     let workdir = &manifest.workdir;
+    let run_user = helpers::extract_remote_user(&args.remote)
+        .unwrap_or("root")
+        .to_string();
     let service_template =
         read_file_from_tarball(&args.bundle, "wr-manager/systemd/wr-manager.service")?;
     let mut secret_vars = HashMap::new();
-    secret_vars.insert("secret_key", args.secret_key.as_str());
+    secret_vars.insert("secret_key", secret_key.as_str());
+    secret_vars.insert("run_user", run_user.as_str());
+    secret_vars.insert("run_group", run_user.as_str());
     let resolved_service = helpers::resolve_template(&service_template, &secret_vars)
         .context("failed to resolve secret_key in systemd unit")?;
     let service_path = format!("{workdir}/wr-manager/systemd/wr-manager.service");
@@ -312,10 +389,10 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         resolved_service.as_bytes(),
         &args.remote,
         &service_path,
-        args.ssh_key.as_deref(),
-        args.ssh_port,
+        ssh_key.as_deref(),
+        ssh_port,
     )?;
-    if matches!(args.format, DeployFormat::Systemd) {
+    if matches!(format, DeployFormat::Systemd) {
         helpers::run_ssh(
             &ssh_base,
             &format!("sudo cp {service_path} /etc/systemd/system/ && sudo systemctl daemon-reload"),
@@ -330,15 +407,15 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         resolved.as_bytes(),
         &args.remote,
         &remote_path,
-        args.ssh_key.as_deref(),
-        args.ssh_port,
+        ssh_key.as_deref(),
+        ssh_port,
     )
     .context("failed to upload resolved manager.toml")?;
     println!("OK");
 
     // Restart service so it picks up the resolved config
     print!("[deploy]  restarting service ... ");
-    match args.format {
+    match format {
         DeployFormat::Systemd => {
             helpers::run_ssh(&ssh_base, "sudo systemctl restart wr-manager.service")?;
         }
@@ -354,13 +431,26 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     }
     println!("OK");
 
-    // Derive the manager gRPC address from the remote host + listen port
-    let remote_host = helpers::extract_remote_host(&args.remote);
-    let listen_port = helpers::extract_port(&manifest.listen_address);
-    let manager_addr = format!("http://{remote_host}:{listen_port}");
-
+    // Use the advertise_address for polling — it's already resolved to a routable address
+    let manager_addr = advertise_address.clone();
     println!("[deploy]  waiting for manager to become ready...");
+
+    // Tail manager logs in the background while we wait
+    let log_cmd = match format {
+        DeployFormat::Systemd => {
+            super::logs::build_journalctl_command(Some("wr-manager"), 20, "1m", true)
+        }
+        DeployFormat::Docker => {
+            let compose = format!("{}/wr-manager/docker/docker-compose.yml", manifest.workdir);
+            format!("docker compose -f {compose} logs --tail 20 -f")
+        }
+    };
+    let _log_tail = helpers::spawn_ssh_prefixed(&ssh_base, &log_cmd, "\t\t");
+
     let ready = helpers::wait_for_manager_ready(&manager_addr, Duration::from_secs(60)).await;
+
+    drop(_log_tail);
+    println!();
 
     if ready {
         println!("[deploy]  manager is ready at {manager_addr}");
@@ -373,20 +463,30 @@ async fn deploy(args: DeployArgs) -> Result<()> {
 }
 
 fn deploy_systemd(
-    args: &DeployArgs,
+    bundle: &str,
+    remote: &str,
+    ssh_key: Option<&str>,
+    ssh_port: Option<u16>,
     manifest: &ManagerManifest,
     ssh_base: &[String],
 ) -> Result<()> {
     let workdir = &manifest.workdir;
 
     print!("[deploy]  copying bundle to remote ... ");
-    scp_bundle(args)?;
+    helpers::scp_file(
+        bundle,
+        remote,
+        "/tmp/wr-manager-bundle.tar.gz",
+        ssh_key,
+        ssh_port,
+    )?;
     println!("OK");
 
     print!("[deploy]  unpacking on remote ... ");
+    let run_user = helpers::extract_remote_user(remote).unwrap_or("root");
     helpers::run_ssh(
         ssh_base,
-        &format!("sudo mkdir -p {workdir} && sudo tar xzf /tmp/wr-manager-bundle.tar.gz -C {workdir} && rm /tmp/wr-manager-bundle.tar.gz"),
+        &format!("sudo mkdir -p {workdir} && sudo tar xzf /tmp/wr-manager-bundle.tar.gz -C {workdir} && sudo chown -R {run_user}:{run_user} {workdir}/wr-manager && rm /tmp/wr-manager-bundle.tar.gz"),
     )?;
     println!("OK");
 
@@ -407,11 +507,24 @@ fn deploy_systemd(
     Ok(())
 }
 
-fn deploy_docker(args: &DeployArgs, manifest: &ManagerManifest, ssh_base: &[String]) -> Result<()> {
+fn deploy_docker(
+    bundle: &str,
+    remote: &str,
+    ssh_key: Option<&str>,
+    ssh_port: Option<u16>,
+    manifest: &ManagerManifest,
+    ssh_base: &[String],
+) -> Result<()> {
     let workdir = &manifest.workdir;
 
     print!("[deploy]  copying bundle to remote ... ");
-    scp_bundle(args)?;
+    helpers::scp_file(
+        bundle,
+        remote,
+        "/tmp/wr-manager-bundle.tar.gz",
+        ssh_key,
+        ssh_port,
+    )?;
     println!("OK");
 
     print!("[deploy]  unpacking on remote ... ");
@@ -433,16 +546,6 @@ fn deploy_docker(args: &DeployArgs, manifest: &ManagerManifest, ssh_base: &[Stri
     Ok(())
 }
 
-fn scp_bundle(args: &DeployArgs) -> Result<()> {
-    helpers::scp_file(
-        &args.bundle,
-        &args.remote,
-        "/tmp/wr-manager-bundle.tar.gz",
-        args.ssh_key.as_deref(),
-        args.ssh_port,
-    )
-}
-
 // --- status ---
 
 fn status(args: StatusArgs) -> Result<()> {
@@ -462,7 +565,7 @@ fn status(args: StatusArgs) -> Result<()> {
     println!("Templates:");
     for var in &manifest.template_vars {
         let source = match var.as_str() {
-            "db_url" => "--db-url flag",
+            "db_url" => "--db-url flag / WR_DB_URL / wr-deploy.toml",
             _ => "unknown",
         };
         println!("  {{{var}}}  {source}");
@@ -493,6 +596,8 @@ After=network.target
 
 [Service]
 Type=simple
+User={{run_user}}
+Group={{run_group}}
 WorkingDirectory={workdir}/wr-manager
 ExecStart={workdir}/wr-manager/bin/wr-manager {workdir}/wr-manager/config/manager.toml
 Environment=WRT_SECRET_ENCRYPTION_KEY={{secret_key}}

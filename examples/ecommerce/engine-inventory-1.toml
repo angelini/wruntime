@@ -1,4 +1,4 @@
-listen_address  = "0.0.0.0:9100"
+listen_address = "0.0.0.0:9100"
 
 [node]
 proxy_address   = "http://127.0.0.1:9001"
@@ -10,10 +10,10 @@ guest_url       = "postgres://wr_guest@localhost:5433/wruntime_example"
 max_connections = 100
 
 [[module]]
-name        = "inventory"
-namespace   = "ecommerce"
-version     = "1.0.0"
-wasm_path   = "examples/ecommerce/inventory/target/wasm32-wasip2/release/inventory.wasm"
-schema_path = "examples/ecommerce/schemas/inventory.binpb"
+name            = "inventory"
+namespace       = "ecommerce"
+version         = "1.0.0"
+wasm_path       = "examples/ecommerce/inventory/target/wasm32-wasip2/release/inventory.wasm"
+schema_path     = "examples/ecommerce/schemas/inventory.binpb"
 database        = true
 migrations_path = "examples/ecommerce/inventory/migrations"

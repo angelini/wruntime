@@ -1,30 +1,45 @@
 [package]
-name = "wr-proxy"
+name    = "wr-proxy"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tower          = { version = "0.5", features = ["full"] }
-http           = "1"
-hyper          = { version = "1", features = ["http1", "http2", "server"] }
-hyper-util     = { version = "0.1", features = ["client-legacy", "http1", "http2", "server-auto", "tokio"] }
-hyper-rustls   = { version = "0.27", features = ["native-tokio", "http1", "http2"] }
-rustls         = { version = "0.23", features = ["ring"] }
-http-body      = "1"
+tower = { version = "0.5", features = ["full"] }
+http = "1"
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = [
+  "client-legacy",
+  "http1",
+  "http2",
+  "server-auto",
+  "tokio",
+] }
+hyper-rustls = { version = "0.27", features = [
+  "native-tokio",
+  "http1",
+  "http2",
+] }
+rustls = { version = "0.23", features = ["ring"] }
+http-body = "1"
 http-body-util = "0.1"
-tokio          = { version = "1", features = ["full"] }
-tonic          = { version = "0.14", features = ["transport"] }
-bytes          = "1"
-anyhow         = "1"
-semver         = "1"
-serde          = { version = "1", features = ["derive"] }
-serde_json     = "1"
-failsafe           = "1"
-matchit            = "0.8"
-wr-common          = { path = "../wr-common", features = ["discovery", "config", "signal", "http-pool"] }
-deadpool-postgres  = { version = "0.14", features = ["rt_tokio_1"] }
-tokio-postgres     = "0.7"
-prost              = "0.14"
-tokio-retry        = "0.3"
-tracing            = "0.1"
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["transport"] }
+bytes = "1"
+anyhow = "1"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+failsafe = "1"
+matchit = "0.8"
+wr-common = { path = "../wr-common", features = [
+  "discovery",
+  "config",
+  "signal",
+  "http-pool",
+] }
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+tokio-postgres = "0.7"
+prost = "0.14"
+tokio-retry = "0.3"
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,37 +1,61 @@
 [package]
-name = "wr-engine"
+name    = "wr-engine"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wasmtime           = { version = "43", features = ["component-model", "component-model-async"] }
-wasmtime-wasi      = "43"
+wasmtime = { version = "43", features = [
+  "component-model",
+  "component-model-async",
+] }
+wasmtime-wasi = "43"
 wasmtime-wasi-http = { version = "43", features = ["default-send-request"] }
-tempfile           = "3"
-tokio              = { version = "1", features = ["full"] }
-tonic              = { version = "0.14", features = ["transport"] }
-prost              = "0.14"
-hyper              = { version = "1", features = ["http2", "server"] }
-hyper-util         = { version = "0.1", features = ["tokio", "client", "client-legacy", "http2"] }
-http               = "1"
-http-body-util     = "0.1"
-bytes              = "1"
-anyhow             = "1"
-futures            = "0.3"
-serde              = { version = "1", features = ["derive"] }
-uuid               = { version = "1", features = ["v4"] }
-wr-common           = { path = "../wr-common", features = ["pool", "config", "signal", "http-pool"] }
-tracing              = "0.1"
-tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["transport"] }
+prost = "0.14"
+hyper = { version = "1", features = ["http2", "server"] }
+hyper-util = { version = "0.1", features = [
+  "tokio",
+  "client",
+  "client-legacy",
+  "http2",
+] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+anyhow = "1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+wr-common = { path = "../wr-common", features = [
+  "pool",
+  "config",
+  "signal",
+  "http-pool",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-opentelemetry = "0.32"
-opentelemetry         = "0.31"
-tokio-postgres      = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
-deadpool-postgres   = { version = "0.14", features = ["rt_tokio_1"] }
-chrono              = "0.4"
-serde_json          = "1"
-rust_decimal        = { version = "1", features = ["db-tokio-postgres"] }
-rust-s3             = { version = "0.37", default-features = false, features = ["tags", "tokio-rustls-tls"] }
-hashbrown            = "0.15"
-refinery             = { version = "0.8", features = ["tokio-postgres"] }
-tokio-retry          = "0.3"
-reqwest             = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+opentelemetry = "0.31"
+tokio-postgres = { version = "0.7", features = [
+  "with-chrono-0_4",
+  "with-uuid-1",
+  "with-serde_json-1",
+] }
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+chrono = "0.4"
+serde_json = "1"
+rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
+rust-s3 = { version = "0.37", default-features = false, features = [
+  "tags",
+  "tokio-rustls-tls",
+] }
+hashbrown = "0.15"
+refinery = { version = "0.8", features = ["tokio-postgres"] }
+tokio-retry = "0.3"
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+  "stream",
+] }
