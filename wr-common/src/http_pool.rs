@@ -18,9 +18,8 @@ pub struct HttpClientPool<B> {
     next: Arc<AtomicUsize>,
 }
 
-// Manual Clone impl to avoid requiring `B: Clone`.
 // `Client` is internally Arc-backed and always Clone regardless of B.
-// The Vec is behind an Arc, so cloning is just a refcount bump.
+// Both fields are Arc-wrapped, so Clone is just a refcount bump.
 impl<B> Clone for HttpClientPool<B> {
     fn clone(&self) -> Self {
         Self {
@@ -114,8 +113,8 @@ mod tests {
 
         // Advance counter on original
         let _ = pool.get(); // counter becomes 1
-        // Clone should see the same counter (shared via Arc<AtomicUsize>)
-        // Next get on clone should use index 1 % 2 = 1, then advance to 2
+                            // Clone should see the same counter (shared via Arc<AtomicUsize>)
+                            // Next get on clone should use index 1 % 2 = 1, then advance to 2
         let _ = clone.get();
         // Counter is now 2; next call on original uses 2 % 2 = 0
         assert_eq!(clone.size(), 2);

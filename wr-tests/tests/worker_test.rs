@@ -565,7 +565,16 @@ async fn test_worker_pool_job_timeout() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::worker::InboundRequest>(16);
 
     let job_id = wr_engine::worker::insert_job(
-        &pool, &ns, "timeout-mod", "1.0.0", "/test/Slow", b"data", 60, 1, "", "",
+        &pool,
+        &ns,
+        "timeout-mod",
+        "1.0.0",
+        "/test/Slow",
+        b"data",
+        60,
+        1,
+        "",
+        "",
     )
     .await
     .unwrap();
@@ -602,7 +611,10 @@ async fn test_worker_pool_job_timeout() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(status.status, "dead", "max_attempts=1 so timeout should mark dead");
+    assert_eq!(
+        status.status, "dead",
+        "max_attempts=1 so timeout should mark dead"
+    );
     assert!(
         status.error_message.contains("job timed out"),
         "expected timeout error, got: {}",
@@ -621,18 +633,16 @@ async fn test_worker_concurrent_claim_across_engines() {
     let ns = unique_ns();
 
     // Insert two jobs.
-    let id1 = wr_engine::worker::insert_job(
-        &pool, &ns, "cc-mod", "1.0.0", "/test/A", b"", 60, 3, "", "",
-    )
-    .await
-    .unwrap();
+    let id1 =
+        wr_engine::worker::insert_job(&pool, &ns, "cc-mod", "1.0.0", "/test/A", b"", 60, 3, "", "")
+            .await
+            .unwrap();
     // Small delay so created_at ordering is deterministic.
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    let id2 = wr_engine::worker::insert_job(
-        &pool, &ns, "cc-mod", "1.0.0", "/test/B", b"", 60, 3, "", "",
-    )
-    .await
-    .unwrap();
+    let id2 =
+        wr_engine::worker::insert_job(&pool, &ns, "cc-mod", "1.0.0", "/test/B", b"", 60, 3, "", "")
+            .await
+            .unwrap();
 
     // Two engines claim concurrently — each should get a different job.
     let (claim1, claim2) = tokio::join!(
@@ -642,7 +652,10 @@ async fn test_worker_concurrent_claim_across_engines() {
 
     let c1 = claim1.unwrap().expect("engine-a should claim a job");
     let c2 = claim2.unwrap().expect("engine-b should claim a job");
-    assert_ne!(c1.job_id, c2.job_id, "each engine must claim a different job");
+    assert_ne!(
+        c1.job_id, c2.job_id,
+        "each engine must claim a different job"
+    );
 
     // Together they should have claimed both jobs.
     let mut claimed_ids = vec![c1.job_id, c2.job_id];
@@ -783,7 +796,16 @@ async fn test_worker_listen_notify_immediate_wake() {
 
     // NOW insert a job — NOTIFY should wake the worker immediately.
     let _job_id = wr_engine::worker::insert_job(
-        &pool, &ns, "notify-mod", "1.0.0", "/test/Wake", b"ping", 60, 3, "", "",
+        &pool,
+        &ns,
+        "notify-mod",
+        "1.0.0",
+        "/test/Wake",
+        b"ping",
+        60,
+        3,
+        "",
+        "",
     )
     .await
     .unwrap();
@@ -816,7 +838,16 @@ async fn test_worker_stale_recovery_marks_dead_when_exhausted() {
 
     // Insert with max_attempts=1, timeout_secs=1.
     let id = wr_engine::worker::insert_job(
-        &pool, &ns, "stale-mod", "1.0.0", "/test/Stale", b"", 1, 1, "", "",
+        &pool,
+        &ns,
+        "stale-mod",
+        "1.0.0",
+        "/test/Stale",
+        b"",
+        1,
+        1,
+        "",
+        "",
     )
     .await
     .unwrap();
@@ -955,8 +986,8 @@ async fn test_worker_grpc_get_status_not_found() {
                                 .unwrap_or_default();
 
                             use prost::Message;
-                            let req =
-                                wr_common::wruntime::GetJobStatusRequest::decode(&body[..]).unwrap();
+                            let req = wr_common::wruntime::GetJobStatusRequest::decode(&body[..])
+                                .unwrap();
                             let status =
                                 wr_engine::worker::get_job_status(&pool, &req.job_id).await;
 
@@ -1010,9 +1041,7 @@ async fn test_worker_grpc_get_status_not_found() {
         .request(
             Request::builder()
                 .method("POST")
-                .uri(format!(
-                    "http://{addr}/wruntime.WorkerService/GetJobStatus"
-                ))
+                .uri(format!("http://{addr}/wruntime.WorkerService/GetJobStatus"))
                 .header("content-type", "application/x-protobuf")
                 .body(Full::new(Bytes::from(req.encode_to_vec())))
                 .unwrap(),
@@ -1025,9 +1054,7 @@ async fn test_worker_grpc_get_status_not_found() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_worker_pool_preserves_payload_and_job_type() {
     if std::env::var("WRT_TEST_DB_URL").is_err() {
-        eprintln!(
-            "skipping test_worker_pool_preserves_payload_and_job_type (no WRT_TEST_DB_URL)"
-        );
+        eprintln!("skipping test_worker_pool_preserves_payload_and_job_type (no WRT_TEST_DB_URL)");
         return;
     }
     let pool = worker_pool().await;

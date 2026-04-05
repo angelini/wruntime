@@ -172,7 +172,10 @@ async fn test_get_schema_after_registration() -> Result<()> {
         .await?
         .into_inner();
 
-    assert_eq!(resp.proto_schema, schema_bytes, "schema bytes should round-trip");
+    assert_eq!(
+        resp.proto_schema, schema_bytes,
+        "schema bytes should round-trip"
+    );
 
     Ok(())
 }

@@ -32,8 +32,8 @@ use wr_common::http_pool::HttpClientPool;
 ///   bottlenecks (frame contention, TCP HoL blocking).
 struct ModuleHttpHooks {
     proxy_uri: hyper::Uri,
-    module_name: String,
-    module_namespace: String,
+    module_name: Arc<str>,
+    module_namespace: Arc<str>,
     /// Pool of HTTP/2 clients — round-robin across multiple connections.
     http_pool: HttpClientPool<Full<bytes::Bytes>>,
 }
@@ -210,8 +210,8 @@ pub struct ModuleState {
 
 impl ModuleState {
     pub fn new(
-        module_name: String,
-        module_namespace: String,
+        module_name: Arc<str>,
+        module_namespace: Arc<str>,
         proxy_uri: hyper::Uri,
         http_pool: HttpClientPool<Full<bytes::Bytes>>,
         services: ModuleServices,

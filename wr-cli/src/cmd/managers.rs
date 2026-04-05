@@ -301,7 +301,8 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     // Resolve {secret_key} in systemd unit and reinstall
     print!("[deploy]  resolving secrets ... ");
     let workdir = &manifest.workdir;
-    let service_template = read_file_from_tarball(&args.bundle, "wr-manager/systemd/wr-manager.service")?;
+    let service_template =
+        read_file_from_tarball(&args.bundle, "wr-manager/systemd/wr-manager.service")?;
     let mut secret_vars = HashMap::new();
     secret_vars.insert("secret_key", args.secret_key.as_str());
     let resolved_service = helpers::resolve_template(&service_template, &secret_vars)
@@ -423,7 +424,9 @@ fn deploy_docker(args: &DeployArgs, manifest: &ManagerManifest, ssh_base: &[Stri
     print!("[deploy]  starting container ... ");
     helpers::run_ssh(
         ssh_base,
-        &format!("cd {workdir}/wr-manager && sudo docker compose -f docker/docker-compose.yml up -d"),
+        &format!(
+            "cd {workdir}/wr-manager && sudo docker compose -f docker/docker-compose.yml up -d"
+        ),
     )?;
     println!("OK");
 
@@ -503,7 +506,11 @@ WantedBy=multi-user.target
 }
 
 fn generate_manager_dockerfile(workdir: &str, no_otel: bool) -> String {
-    let otel_env = if no_otel { "ENV OTEL_SDK_DISABLED=true\n" } else { "" };
+    let otel_env = if no_otel {
+        "ENV OTEL_SDK_DISABLED=true\n"
+    } else {
+        ""
+    };
     format!(
         r#"FROM gcr.io/distroless/cc-debian13
 WORKDIR {workdir}

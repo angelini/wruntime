@@ -579,8 +579,8 @@ async fn dispatch_request(
         };
 
     let state = ModuleState::new(
-        module.name.to_string(),
-        module.namespace.to_string(),
+        module.name.clone(),
+        module.namespace.clone(),
         module.proxy_uri.clone(),
         module.http_pool.clone(),
         ModuleServices {

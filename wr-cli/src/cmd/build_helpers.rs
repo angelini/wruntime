@@ -124,7 +124,14 @@ pub fn build_wasm_modules(modules: &[BuildModule]) -> Result<()> {
 pub fn build_manager_binary(target: &str) -> Result<()> {
     print!("[build]   wr-manager ({target}) ... ");
     let output = Command::new("cargo")
-        .args(["zigbuild", "--release", "--target", target, "-p", "wr-manager"])
+        .args([
+            "zigbuild",
+            "--release",
+            "--target",
+            target,
+            "-p",
+            "wr-manager",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

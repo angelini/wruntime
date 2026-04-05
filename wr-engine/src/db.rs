@@ -4,23 +4,7 @@ use chrono::Timelike as _;
 use futures::StreamExt as _;
 use wasmtime::component::Resource;
 
-/// Format a tokio-postgres error with its full source chain.
-///
-/// `tokio_postgres::Error::fmt` just prints "db error" for database errors —
-/// the actual message (column name, constraint, syntax detail) lives in the
-/// `source()` chain.  This helper walks the chain so callers see the real
-/// Postgres error instead of the opaque "db error" string.
-fn pg_error_string(e: &tokio_postgres::Error) -> String {
-    use std::error::Error;
-    let mut msg = e.to_string();
-    let mut source = e.source();
-    while let Some(cause) = source {
-        msg.push_str(": ");
-        msg.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    msg
-}
+use wr_common::pool::pg_error_string;
 
 /// Host-side state for an active WIT `transaction` resource.
 ///
@@ -247,17 +231,15 @@ fn convert_complex(v: PgValue) -> PgParam {
                 .map(|o| o.and_then(chrono::DateTime::from_timestamp_micros))
                 .collect(),
         ),
-        PgValue::TimestampArray(a) => PgParam::TimestampArray(
-            a.into_iter()
-                .map(|o| o.map(micros_to_timestamp))
-                .collect(),
-        ),
-        PgValue::UuidArray(a) => PgParam::UuidArray(
-            a.into_iter().map(|o| o.map(uuid_from_hilo)).collect(),
-        ),
-        PgValue::JsonbArray(a) => PgParam::JsonbArray(
-            a.into_iter().map(|o| o.map(parse_jsonb)).collect(),
-        ),
+        PgValue::TimestampArray(a) => {
+            PgParam::TimestampArray(a.into_iter().map(|o| o.map(micros_to_timestamp)).collect())
+        }
+        PgValue::UuidArray(a) => {
+            PgParam::UuidArray(a.into_iter().map(|o| o.map(uuid_from_hilo)).collect())
+        }
+        PgValue::JsonbArray(a) => {
+            PgParam::JsonbArray(a.into_iter().map(|o| o.map(parse_jsonb)).collect())
+        }
         // Handled by passthrough_variants — unreachable at runtime but
         // needed to satisfy exhaustiveness.
         _ => unreachable!(),
@@ -266,10 +248,27 @@ fn convert_complex(v: PgValue) -> PgParam {
 
 impl From<PgValue> for PgParam {
     fn from(v: PgValue) -> Self {
-        passthrough_variants!(v, [
-            Boolean, Int2, Int4, Int8, Float4, Float8, Text, Bytea, Oid,
-            BoolArray, Int2Array, Int4Array, Int8Array, Float4Array, Float8Array, TextArray,
-        ])
+        passthrough_variants!(
+            v,
+            [
+                Boolean,
+                Int2,
+                Int4,
+                Int8,
+                Float4,
+                Float8,
+                Text,
+                Bytea,
+                Oid,
+                BoolArray,
+                Int2Array,
+                Int4Array,
+                Int8Array,
+                Float4Array,
+                Float8Array,
+                TextArray,
+            ]
+        )
     }
 }
 
@@ -290,12 +289,41 @@ impl tokio_postgres::types::ToSql for PgParam {
         ty: &tokio_postgres::types::Type,
         buf: &mut bytes::BytesMut,
     ) -> Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        delegate_to_sql!(self, ty, buf, [
-            Boolean, Int2, Int4, Int8, Float4, Float8, Text, Bytea,
-            Timestamptz, Date, Time, Numeric, Uuid, Timestamp, Interval, Jsonb, Oid,
-            BoolArray, Int2Array, Int4Array, Int8Array, Float4Array, Float8Array,
-            TextArray, TimestamptzArray, TimestampArray, UuidArray, JsonbArray,
-        ])
+        delegate_to_sql!(
+            self,
+            ty,
+            buf,
+            [
+                Boolean,
+                Int2,
+                Int4,
+                Int8,
+                Float4,
+                Float8,
+                Text,
+                Bytea,
+                Timestamptz,
+                Date,
+                Time,
+                Numeric,
+                Uuid,
+                Timestamp,
+                Interval,
+                Jsonb,
+                Oid,
+                BoolArray,
+                Int2Array,
+                Int4Array,
+                Int8Array,
+                Float4Array,
+                Float8Array,
+                TextArray,
+                TimestamptzArray,
+                TimestampArray,
+                UuidArray,
+                JsonbArray,
+            ]
+        )
     }
 
     /// Always returns `true`; each variant delegates to its inner type's

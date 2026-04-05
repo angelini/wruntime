@@ -1113,8 +1113,8 @@ async fn wasm_engine_serve(
 
                     let handle = tokio::spawn(async move {
                         let state = ModuleState::new(
-                            module_name,
-                            module_namespace,
+                            module_name.into(),
+                            module_namespace.into(),
                             proxy_uri,
                             pool,
                             ModuleServices::default(),

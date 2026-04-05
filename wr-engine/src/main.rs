@@ -117,10 +117,10 @@ async fn async_main() -> Result<()> {
     // with the manager (runner modules without schemas are skipped).
     let mut module_descriptors: Vec<ModuleDescriptor> = Vec::new();
     for m in &config.modules {
-        if m.schema_path.is_empty() {
+        let Some(ref schema_path) = m.schema_path else {
             continue;
-        }
-        let proto_schema = std::fs::read(&m.schema_path)
+        };
+        let proto_schema = std::fs::read(schema_path)
             .with_context(|| format!("failed to read schema for module '{}'", m.name))?;
         module_descriptors.push(ModuleDescriptor {
             name: m.name.clone(),
@@ -267,11 +267,7 @@ async fn async_main() -> Result<()> {
                 }
                 if sent.is_err() {
                     // Connection may be stale — reconnect for next cycle.
-                    if let Ok(c) = NodeServiceClient::connect(
-                        hb_control_address.clone(),
-                    )
-                    .await
-                    {
+                    if let Ok(c) = NodeServiceClient::connect(hb_control_address.clone()).await {
                         hb_client = c;
                     }
                 }

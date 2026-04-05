@@ -828,7 +828,11 @@ fn generate_sysctl_config() -> String {
 }
 
 fn generate_proxy_dockerfile(workdir: &str, no_otel: bool) -> String {
-    let otel_env = if no_otel { "ENV OTEL_SDK_DISABLED=true\n" } else { "" };
+    let otel_env = if no_otel {
+        "ENV OTEL_SDK_DISABLED=true\n"
+    } else {
+        ""
+    };
     format!(
         r#"FROM gcr.io/distroless/cc-debian13
 WORKDIR {workdir}
@@ -840,7 +844,11 @@ COPY config/proxy.toml config/proxy.toml
 }
 
 fn generate_engine_dockerfile(workdir: &str, config_name: &str, no_otel: bool) -> String {
-    let otel_env = if no_otel { "ENV OTEL_SDK_DISABLED=true\n" } else { "" };
+    let otel_env = if no_otel {
+        "ENV OTEL_SDK_DISABLED=true\n"
+    } else {
+        ""
+    };
     format!(
         r#"FROM gcr.io/distroless/cc-debian13
 WORKDIR {workdir}

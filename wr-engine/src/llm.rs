@@ -340,7 +340,7 @@ impl Host for ModuleState {
         let api_req = to_api_request(runtime, &req);
         match runtime.complete(api_req).await {
             Ok(resp) => Ok(from_api_response(resp)),
-            Err(e) => Err(from_error_kind(e)),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -358,7 +358,7 @@ impl Host for ModuleState {
                     .map_err(|e| LlmError::Api(format!("resource table full: {e}")))?;
                 Ok(handle)
             }
-            Err(e) => Err(from_error_kind(e)),
+            Err(e) => Err(e.into()),
         }
     }
 }
@@ -484,12 +484,14 @@ fn from_api_response(resp: ApiResponse) -> CompletionResponse {
     }
 }
 
-fn from_error_kind(e: LlmErrorKind) -> LlmError {
-    match e {
-        LlmErrorKind::InvalidRequest(s) => LlmError::InvalidRequest(s),
-        LlmErrorKind::Auth(s) => LlmError::Auth(s),
-        LlmErrorKind::RateLimited(r) => LlmError::RateLimited(r),
-        LlmErrorKind::Api(s) => LlmError::Api(s),
+impl From<LlmErrorKind> for LlmError {
+    fn from(e: LlmErrorKind) -> Self {
+        match e {
+            LlmErrorKind::InvalidRequest(s) => LlmError::InvalidRequest(s),
+            LlmErrorKind::Auth(s) => LlmError::Auth(s),
+            LlmErrorKind::RateLimited(r) => LlmError::RateLimited(r),
+            LlmErrorKind::Api(s) => LlmError::Api(s),
+        }
     }
 }
 
@@ -662,21 +664,13 @@ mod tests {
 
     #[test]
     fn test_from_error_kind_mapping() {
-        assert!(matches!(
-            from_error_kind(LlmErrorKind::InvalidRequest("bad".into())),
-            LlmError::InvalidRequest(s) if s == "bad"
-        ));
-        assert!(matches!(
-            from_error_kind(LlmErrorKind::Auth("denied".into())),
-            LlmError::Auth(s) if s == "denied"
-        ));
-        assert!(matches!(
-            from_error_kind(LlmErrorKind::RateLimited(Some(30))),
-            LlmError::RateLimited(Some(30))
-        ));
-        assert!(matches!(
-            from_error_kind(LlmErrorKind::Api("fail".into())),
-            LlmError::Api(s) if s == "fail"
-        ));
+        let e: LlmError = LlmErrorKind::InvalidRequest("bad".into()).into();
+        assert!(matches!(e, LlmError::InvalidRequest(s) if s == "bad"));
+        let e: LlmError = LlmErrorKind::Auth("denied".into()).into();
+        assert!(matches!(e, LlmError::Auth(s) if s == "denied"));
+        let e: LlmError = LlmErrorKind::RateLimited(Some(30)).into();
+        assert!(matches!(e, LlmError::RateLimited(Some(30))));
+        let e: LlmError = LlmErrorKind::Api("fail".into()).into();
+        assert!(matches!(e, LlmError::Api(s) if s == "fail"));
     }
 }

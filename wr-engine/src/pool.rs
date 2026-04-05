@@ -1,13 +1,15 @@
 pub use wr_common::pool::build_pool;
 
+/// Replace non-alphanumeric characters with `_`.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
 /// Returns the Postgres schema name for a module.
 /// Format: `wr__{namespace}__{name}` with non-alphanumeric chars replaced by `_`.
 pub fn module_schema(namespace: &str, name: &str) -> String {
-    let sanitize = |s: &str| {
-        s.chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect::<String>()
-    };
     format!("wr__{}__{}", sanitize(namespace), sanitize(name))
 }
 
@@ -16,11 +18,6 @@ pub fn module_schema(namespace: &str, name: &str) -> String {
 /// Scoped to namespace only (not module name) so modules within the same
 /// namespace can share blobstore data.
 pub fn blob_key_prefix(namespace: &str) -> String {
-    let sanitize = |s: &str| {
-        s.chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect::<String>()
-    };
     format!("wr/{}/", sanitize(namespace))
 }
 

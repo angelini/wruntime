@@ -48,7 +48,11 @@ pub fn run_command(args: &[String]) -> Result<()> {
         if !stderr.is_empty() {
             eprintln!("{stderr}");
         }
-        bail!("{} failed with exit code {:?}", args[0], output.status.code());
+        bail!(
+            "{} failed with exit code {:?}",
+            args[0],
+            output.status.code()
+        );
     }
     Ok(())
 }

@@ -76,8 +76,7 @@ async fn test_delete_retries_on_contention() -> Result<()> {
     let pool = manager_pool().await;
 
     // Insert a rule first.
-    wr_manager::db::upsert_routing_rule(&pool, &make_rule("del-retry-r1", "del-svc", "e1"))
-        .await?;
+    wr_manager::db::upsert_routing_rule(&pool, &make_rule("del-retry-r1", "del-svc", "e1")).await?;
 
     // Hold the lock briefly.
     let pool2 = pool.clone();
@@ -238,7 +237,11 @@ async fn test_parallel_upserts_all_version_bumps() -> Result<()> {
     };
 
     // Each upsert bumps version by 1.
-    assert_eq!(v_after, v_before + n, "each upsert should bump version by 1");
+    assert_eq!(
+        v_after,
+        v_before + n,
+        "each upsert should bump version by 1"
+    );
 
     // All rules should be present.
     let mut c = manager_client(&addr).await?;

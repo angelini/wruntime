@@ -169,7 +169,7 @@ pub struct ModuleConfig {
     /// Path to a compiled `FileDescriptorSet` binary for this module's API.
     /// Optional — modules may omit this if they don't expose a schema.
     #[serde(default)]
-    pub schema_path: String,
+    pub schema_path: Option<String>,
     /// Whether this module has access to the shared database pool.
     /// Requires a `[database]` section in the engine config.
     #[serde(default)]
@@ -264,9 +264,18 @@ impl EngineConfig {
         use wr_common::config::Validator;
         let mut v = Validator::new();
 
-        v.check(!self.listen_address.is_empty(), "listen_address is required");
-        v.check(!self.node.proxy_address.is_empty(), "node.proxy_address is required");
-        v.check(!self.node.control_address.is_empty(), "node.control_address is required");
+        v.check(
+            !self.listen_address.is_empty(),
+            "listen_address is required",
+        );
+        v.check(
+            !self.node.proxy_address.is_empty(),
+            "node.proxy_address is required",
+        );
+        v.check(
+            !self.node.control_address.is_empty(),
+            "node.control_address is required",
+        );
 
         for module in &self.modules {
             let m = &module.name;
@@ -277,10 +286,10 @@ impl EngineConfig {
                 std::path::Path::new(&module.wasm_path).exists(),
                 format!("wasm_path not found for module '{m}': {}", module.wasm_path),
             );
-            if !module.schema_path.is_empty() {
+            if let Some(ref schema_path) = module.schema_path {
                 v.check(
-                    std::path::Path::new(&module.schema_path).exists(),
-                    format!("schema_path not found for module '{m}': {}", module.schema_path),
+                    std::path::Path::new(schema_path).exists(),
+                    format!("schema_path not found for module '{m}': {schema_path}"),
                 );
             }
             v.check(
@@ -289,7 +298,9 @@ impl EngineConfig {
             );
             v.check(
                 !module.blobstore || self.blobstore.is_some(),
-                format!("module '{m}' has blobstore = true but no [blobstore] section is configured"),
+                format!(
+                    "module '{m}' has blobstore = true but no [blobstore] section is configured"
+                ),
             );
             v.check(
                 !module.llm || self.llm.is_some(),

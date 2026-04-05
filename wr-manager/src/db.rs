@@ -56,7 +56,10 @@ fn map_lock_err(e: tokio_postgres::Error, operation: &str) -> Status {
             "concurrent write conflict during {operation} — another routing table update is in progress, retry"
         ))
     } else {
-        Status::internal(format!("lock query failed during {operation}: {e}"))
+        Status::internal(format!(
+            "lock query failed during {operation}: {}",
+            wr_common::pool::pg_error_string(&e)
+        ))
     }
 }
 
