@@ -188,6 +188,8 @@ pub struct ManagerDatabaseConfig {
 pub struct ClusterConfig {
     pub cluster_id: String,
     pub gossip_listen_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertise_grpc_address: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seed_nodes: Vec<String>,
 }
@@ -205,10 +207,11 @@ impl ManagerConfig {
         toml::to_string_pretty(self).map_err(Into::into)
     }
 
-    /// Create a bundle-ready copy with `{db_url}` template placeholder.
+    /// Create a bundle-ready copy with `{db_url}` and `{advertise_address}` template placeholders.
     pub fn to_bundle_config(&self) -> Self {
         let mut config = self.clone();
         config.database.url = "{db_url}".to_string();
+        config.cluster.advertise_grpc_address = Some("{advertise_address}".to_string());
         config.cluster.seed_nodes.clear();
         config
     }

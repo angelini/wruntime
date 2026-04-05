@@ -25,7 +25,7 @@ Real code in the repository demonstrating each pattern. Read these files for con
 |-----------|------|---------------------|
 | Database CRUD + transactions | `wr-tests/guests/db-guest/src/lib.rs` | query, execute, begin_transaction, streaming cursors |
 | Blobstore operations | `wr-tests/guests/blobstore-guest/src/lib.rs` | put_object, get_object, delete_object, list_objects, head_object |
-| Outbound HTTP | `wr-tests/guests/http-guest/src/lib.rs` | http_rpc to other modules |
+| Outbound HTTP | `wr-tests/guests/http-guest/src/lib.rs` | http_request to other modules |
 | Tracing spans | `wr-tests/guests/tracing-guest/src/lib.rs` | start, set_attribute, record_event, set_error |
 
 ## Proto schemas

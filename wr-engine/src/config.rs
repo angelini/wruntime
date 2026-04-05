@@ -27,41 +27,27 @@ pub struct EngineConfig {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(default)]
 pub struct PoolConfig {
     /// Maximum number of concurrent component instances across all modules.
     /// Defaults to 1000.
-    #[serde(default = "default_total_component_instances")]
     pub total_component_instances: u32,
     /// Maximum linear memory size in bytes per instance. Defaults to 10 MiB.
-    #[serde(default = "default_max_memory_size")]
     pub max_memory_size: usize,
     /// Epoch tick interval in milliseconds. A background task increments the
     /// wasmtime epoch at this rate, enabling preemption of CPU-bound WASM
     /// modules that never yield to the host. Defaults to 100.
-    #[serde(default = "default_epoch_tick_interval_ms")]
     pub epoch_tick_interval_ms: u64,
 }
 
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            total_component_instances: default_total_component_instances(),
-            max_memory_size: default_max_memory_size(),
-            epoch_tick_interval_ms: default_epoch_tick_interval_ms(),
+            total_component_instances: 1000,
+            max_memory_size: 10 * 1024 * 1024, // 10 MiB
+            epoch_tick_interval_ms: 10,
         }
     }
-}
-
-fn default_total_component_instances() -> u32 {
-    1000
-}
-
-fn default_max_memory_size() -> usize {
-    10 * 1024 * 1024 // 10 MiB
-}
-
-fn default_epoch_tick_interval_ms() -> u64 {
-    10
 }
 
 #[derive(Deserialize, Clone)]
@@ -275,74 +261,58 @@ impl EngineConfig {
     }
 
     fn validate_inner(&self) -> Result<()> {
-        anyhow::ensure!(
-            !self.listen_address.is_empty(),
-            "listen_address is required"
-        );
-        anyhow::ensure!(
-            !self.node.proxy_address.is_empty(),
-            "node.proxy_address is required"
-        );
-        anyhow::ensure!(
-            !self.node.control_address.is_empty(),
-            "node.control_address is required"
-        );
+        use wr_common::config::Validator;
+        let mut v = Validator::new();
+
+        v.check(!self.listen_address.is_empty(), "listen_address is required");
+        v.check(!self.node.proxy_address.is_empty(), "node.proxy_address is required");
+        v.check(!self.node.control_address.is_empty(), "node.control_address is required");
 
         for module in &self.modules {
-            anyhow::ensure!(!module.name.is_empty(), "module.name is required");
-            anyhow::ensure!(!module.namespace.is_empty(), "module.namespace is required");
-            anyhow::ensure!(!module.version.is_empty(), "module.version is required");
-            anyhow::ensure!(
+            let m = &module.name;
+            v.check(!module.name.is_empty(), "module.name is required");
+            v.check(!module.namespace.is_empty(), "module.namespace is required");
+            v.check(!module.version.is_empty(), "module.version is required");
+            v.check(
                 std::path::Path::new(&module.wasm_path).exists(),
-                "wasm_path not found for module '{}': {}",
-                module.name,
-                module.wasm_path,
+                format!("wasm_path not found for module '{m}': {}", module.wasm_path),
             );
             if !module.schema_path.is_empty() {
-                anyhow::ensure!(
+                v.check(
                     std::path::Path::new(&module.schema_path).exists(),
-                    "schema_path not found for module '{}': {}",
-                    module.name,
-                    module.schema_path,
+                    format!("schema_path not found for module '{m}': {}", module.schema_path),
                 );
             }
-            anyhow::ensure!(
+            v.check(
                 !module.database || self.database.is_some(),
-                "module '{}' has database = true but no [database] section is configured",
-                module.name,
+                format!("module '{m}' has database = true but no [database] section is configured"),
             );
-            anyhow::ensure!(
+            v.check(
                 !module.blobstore || self.blobstore.is_some(),
-                "module '{}' has blobstore = true but no [blobstore] section is configured",
-                module.name,
+                format!("module '{m}' has blobstore = true but no [blobstore] section is configured"),
             );
-            anyhow::ensure!(
+            v.check(
                 !module.llm || self.llm.is_some(),
-                "module '{}' has llm = true but no [llm] section is configured",
-                module.name,
+                format!("module '{m}' has llm = true but no [llm] section is configured"),
             );
             if module.mode == ModuleMode::Worker {
-                anyhow::ensure!(
+                v.check(
                     module.database,
-                    "module '{}' has mode = \"worker\" but database is not enabled (job queue requires database)",
-                    module.name,
+                    format!("module '{m}' has mode = \"worker\" but database is not enabled (job queue requires database)"),
                 );
             }
             if let Some(mig_path) = &module.migrations_path {
-                anyhow::ensure!(
+                v.check(
                     module.database,
-                    "module '{}' has migrations_path but database is not enabled",
-                    module.name,
+                    format!("module '{m}' has migrations_path but database is not enabled"),
                 );
-                anyhow::ensure!(
+                v.check(
                     std::path::Path::new(mig_path).is_dir(),
-                    "migrations_path for module '{}' is not a directory: {}",
-                    module.name,
-                    mig_path,
+                    format!("migrations_path for module '{m}' is not a directory: {mig_path}"),
                 );
             }
         }
 
-        Ok(())
+        v.finish()
     }
 }

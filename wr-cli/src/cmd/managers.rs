@@ -54,6 +54,9 @@ pub struct BundleArgs {
     /// Skip compilation (reuse existing binary)
     #[arg(long)]
     skip_build: bool,
+    /// Disable OpenTelemetry export in generated service units
+    #[arg(long)]
+    no_otel: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -83,6 +86,12 @@ pub struct DeployArgs {
     /// SSH port
     #[arg(long, default_value = "22")]
     ssh_port: u16,
+    /// Secret encryption key (hex-encoded, 32 bytes / 64 hex chars)
+    #[arg(long)]
+    secret_key: String,
+    /// Manager's externally-reachable gRPC address (e.g. http://10.0.2.2:9000)
+    #[arg(long)]
+    advertise_address: String,
 }
 
 #[derive(Args)]
@@ -185,7 +194,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
     )?;
 
     // Systemd unit
-    let service = generate_manager_service(&args.workdir);
+    let service = generate_manager_service(&args.workdir, args.no_otel);
     tar_add_bytes(
         &mut tar,
         "wr-manager/systemd/wr-manager.service",
@@ -197,7 +206,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
     let listen_port = helpers::extract_port(&config.listen_address);
     let gossip_port = helpers::extract_port(&config.cluster.gossip_listen_address);
 
-    let dockerfile = generate_manager_dockerfile(&args.workdir);
+    let dockerfile = generate_manager_dockerfile(&args.workdir, args.no_otel);
     tar_add_bytes(
         &mut tar,
         "wr-manager/docker/Dockerfile.manager",
@@ -269,6 +278,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     // Resolve template variables
     let mut vars = HashMap::new();
     vars.insert("db_url", args.db_url.as_str());
+    vars.insert("advertise_address", args.advertise_address.as_str());
     let mut resolved = helpers::resolve_template(&config_template, &vars)
         .context("failed to resolve template in manager.toml")?;
 
@@ -288,6 +298,30 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         DeployFormat::Docker => deploy_docker(&args, &manifest, &ssh_base)?,
     }
 
+    // Resolve {secret_key} in systemd unit and reinstall
+    print!("[deploy]  resolving secrets ... ");
+    let workdir = &manifest.workdir;
+    let service_template = read_file_from_tarball(&args.bundle, "wr-manager/systemd/wr-manager.service")?;
+    let mut secret_vars = HashMap::new();
+    secret_vars.insert("secret_key", args.secret_key.as_str());
+    let resolved_service = helpers::resolve_template(&service_template, &secret_vars)
+        .context("failed to resolve secret_key in systemd unit")?;
+    let service_path = format!("{workdir}/wr-manager/systemd/wr-manager.service");
+    helpers::scp_bytes(
+        resolved_service.as_bytes(),
+        &args.remote,
+        &service_path,
+        args.ssh_key.as_deref(),
+        args.ssh_port,
+    )?;
+    if matches!(args.format, DeployFormat::Systemd) {
+        helpers::run_ssh(
+            &ssh_base,
+            &format!("sudo cp {service_path} /etc/systemd/system/ && sudo systemctl daemon-reload"),
+        )?;
+    }
+    println!("OK");
+
     // Overwrite template config with resolved version
     print!("[deploy]  writing resolved config ... ");
     let remote_path = format!("{}/wr-manager/config/manager.toml", manifest.workdir);
@@ -305,13 +339,13 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     print!("[deploy]  restarting service ... ");
     match args.format {
         DeployFormat::Systemd => {
-            helpers::run_ssh(&ssh_base, "systemctl restart wr-manager.service")?;
+            helpers::run_ssh(&ssh_base, "sudo systemctl restart wr-manager.service")?;
         }
         DeployFormat::Docker => {
             helpers::run_ssh(
                 &ssh_base,
                 &format!(
-                    "cd {}/wr-manager && docker compose -f docker/docker-compose.yml restart",
+                    "cd {}/wr-manager && sudo docker compose -f docker/docker-compose.yml restart",
                     manifest.workdir
                 ),
             )?;
@@ -351,21 +385,21 @@ fn deploy_systemd(
     print!("[deploy]  unpacking on remote ... ");
     helpers::run_ssh(
         ssh_base,
-        &format!("mkdir -p {workdir} && tar xzf /tmp/wr-manager-bundle.tar.gz -C {workdir} && rm /tmp/wr-manager-bundle.tar.gz"),
+        &format!("sudo mkdir -p {workdir} && sudo tar xzf /tmp/wr-manager-bundle.tar.gz -C {workdir} && rm /tmp/wr-manager-bundle.tar.gz"),
     )?;
     println!("OK");
 
     print!("[deploy]  installing systemd unit ... ");
     helpers::run_ssh(
         ssh_base,
-        &format!("cp {workdir}/wr-manager/systemd/wr-manager.service /etc/systemd/system/"),
+        &format!("sudo cp {workdir}/wr-manager/systemd/wr-manager.service /etc/systemd/system/"),
     )?;
     println!("OK");
 
     print!("[deploy]  starting service ... ");
     helpers::run_ssh(
         ssh_base,
-        "systemctl daemon-reload && systemctl enable --now wr-manager.service",
+        "sudo systemctl daemon-reload && sudo systemctl enable --now wr-manager.service",
     )?;
     println!("OK");
 
@@ -382,14 +416,14 @@ fn deploy_docker(args: &DeployArgs, manifest: &ManagerManifest, ssh_base: &[Stri
     print!("[deploy]  unpacking on remote ... ");
     helpers::run_ssh(
         ssh_base,
-        &format!("mkdir -p {workdir} && tar xzf /tmp/wr-manager-bundle.tar.gz -C {workdir} && rm /tmp/wr-manager-bundle.tar.gz"),
+        &format!("sudo mkdir -p {workdir} && sudo tar xzf /tmp/wr-manager-bundle.tar.gz -C {workdir} && rm /tmp/wr-manager-bundle.tar.gz"),
     )?;
     println!("OK");
 
     print!("[deploy]  starting container ... ");
     helpers::run_ssh(
         ssh_base,
-        &format!("cd {workdir}/wr-manager && docker compose -f docker/docker-compose.yml up -d"),
+        &format!("cd {workdir}/wr-manager && sudo docker compose -f docker/docker-compose.yml up -d"),
     )?;
     println!("OK");
 
@@ -443,7 +477,12 @@ fn status(args: StatusArgs) -> Result<()> {
 
 // --- Generators ---
 
-fn generate_manager_service(workdir: &str) -> String {
+fn generate_manager_service(workdir: &str, no_otel: bool) -> String {
+    let otel_env = if no_otel {
+        "Environment=OTEL_SDK_DISABLED=true\n"
+    } else {
+        ""
+    };
     format!(
         r#"[Unit]
 Description=wruntime manager
@@ -453,7 +492,8 @@ After=network.target
 Type=simple
 WorkingDirectory={workdir}/wr-manager
 ExecStart={workdir}/wr-manager/bin/wr-manager {workdir}/wr-manager/config/manager.toml
-Restart=on-failure
+Environment=WRT_SECRET_ENCRYPTION_KEY={{secret_key}}
+{otel_env}Restart=on-failure
 RestartSec=5
 
 [Install]
@@ -462,13 +502,15 @@ WantedBy=multi-user.target
     )
 }
 
-fn generate_manager_dockerfile(workdir: &str) -> String {
+fn generate_manager_dockerfile(workdir: &str, no_otel: bool) -> String {
+    let otel_env = if no_otel { "ENV OTEL_SDK_DISABLED=true\n" } else { "" };
     format!(
         r#"FROM gcr.io/distroless/cc-debian13
 WORKDIR {workdir}
 COPY bin/wr-manager bin/wr-manager
 COPY config/manager.toml config/manager.toml
-ENTRYPOINT ["bin/wr-manager", "config/manager.toml"]
+ENV WRT_SECRET_ENCRYPTION_KEY={{secret_key}}
+{otel_env}ENTRYPOINT ["bin/wr-manager", "config/manager.toml"]
 "#
     )
 }
@@ -545,7 +587,7 @@ fn read_manifest_from_tarball(path: &str) -> Result<ManagerManifest> {
 }
 
 /// Read the manager config template from the bundle.
-fn read_config_from_tarball(path: &str) -> Result<String> {
+fn read_file_from_tarball(path: &str, target_file: &str) -> Result<String> {
     let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
     let decoder = GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
@@ -553,12 +595,16 @@ fn read_config_from_tarball(path: &str) -> Result<String> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let entry_path = entry.path()?.to_string_lossy().to_string();
-        if entry_path.ends_with("manager.toml") {
+        if entry_path.ends_with(target_file) {
             let mut content = String::new();
             std::io::Read::read_to_string(&mut entry, &mut content)?;
             return Ok(content);
         }
     }
 
-    bail!("manager.toml not found in bundle")
+    bail!("{target_file} not found in bundle")
+}
+
+fn read_config_from_tarball(path: &str) -> Result<String> {
+    read_file_from_tarball(path, "manager.toml")
 }

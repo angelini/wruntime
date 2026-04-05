@@ -62,27 +62,16 @@ impl ManagerConfig {
     }
 
     fn validate_inner(&self) -> Result<()> {
-        anyhow::ensure!(
-            !self.listen_address.is_empty(),
-            "listen_address is required"
-        );
-        anyhow::ensure!(
-            self.engine_heartbeat_timeout_secs > 0,
-            "engine_heartbeat_timeout_secs must be > 0"
-        );
-        anyhow::ensure!(!self.database.url.is_empty(), "database.url is required");
-        anyhow::ensure!(
-            self.database.max_connections > 0,
-            "database.max_connections must be > 0"
-        );
-        anyhow::ensure!(
-            !self.cluster.cluster_id.is_empty(),
-            "cluster.cluster_id is required"
-        );
-        anyhow::ensure!(
-            !self.cluster.gossip_listen_address.is_empty(),
-            "cluster.gossip_listen_address is required"
-        );
-        Ok(())
+        use wr_common::config::Validator;
+        let mut v = Validator::new();
+
+        v.check(!self.listen_address.is_empty(), "listen_address is required");
+        v.check(self.engine_heartbeat_timeout_secs > 0, "engine_heartbeat_timeout_secs must be > 0");
+        v.check(!self.database.url.is_empty(), "database.url is required");
+        v.check(self.database.max_connections > 0, "database.max_connections must be > 0");
+        v.check(!self.cluster.cluster_id.is_empty(), "cluster.cluster_id is required");
+        v.check(!self.cluster.gossip_listen_address.is_empty(), "cluster.gossip_listen_address is required");
+
+        v.finish()
     }
 }

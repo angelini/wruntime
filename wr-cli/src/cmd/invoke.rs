@@ -8,7 +8,7 @@ use wr_common::wruntime::{GetSchemaRequest, ListEnginesRequest};
 
 #[derive(Args)]
 pub struct InvokeArgs {
-    /// Proxy address
+    /// Proxy address (all traffic must route through the proxy)
     #[arg(long, env = "WR_PROXY", default_value = "http://127.0.0.1:9001")]
     pub proxy: String,
 
@@ -49,7 +49,7 @@ pub async fn run(args: InvokeArgs, manager_addr: &str) -> Result<()> {
         .context("destination host must be {namespace}.{module}")?;
 
     // Fetch the module's schema from the manager.
-    let schema_bytes = fetch_schema(manager_addr, namespace, module).await?;
+    let (schema_bytes, _version) = fetch_schema(manager_addr, namespace, module).await?;
 
     // Transcode JSON request body → protobuf.
     let body_bytes = match &args.body {
@@ -94,7 +94,11 @@ pub async fn run(args: InvokeArgs, manager_addr: &str) -> Result<()> {
 ///
 /// The manager requires an exact `(namespace, module, version)` triple, so we
 /// first list registered engines to discover the version for this module.
-async fn fetch_schema(manager_addr: &str, namespace: &str, module: &str) -> Result<Vec<u8>> {
+async fn fetch_schema(
+    manager_addr: &str,
+    namespace: &str,
+    module: &str,
+) -> Result<(Vec<u8>, String)> {
     let mut client = crate::client::connect(manager_addr).await?;
 
     // Discover the version by scanning registered engines.
@@ -116,11 +120,11 @@ async fn fetch_schema(manager_addr: &str, namespace: &str, module: &str) -> Resu
         .get_schema(GetSchemaRequest {
             namespace: namespace.into(),
             module: module.into(),
-            version,
+            version: version.clone(),
         })
         .await
         .context("failed to fetch schema from manager")?;
-    Ok(resp.into_inner().proto_schema)
+    Ok((resp.into_inner().proto_schema, version))
 }
 
 /// Transcode a JSON body to protobuf using the module's schema.

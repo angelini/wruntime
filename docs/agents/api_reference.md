@@ -16,8 +16,20 @@ pub fn read_body(incoming: IncomingBody) -> Vec<u8>
 /// Content-Type is set to application/x-protobuf.
 pub fn send_response(response_out: ResponseOutparam, status: u16, body: Vec<u8>)
 
+/// Send response with application/json content-type.
+pub fn send_json_response(response_out: ResponseOutparam, status: u16, body: Vec<u8>)
+
+/// Send response with custom content-type.
+pub fn send_response_with_content_type(
+    response_out: ResponseOutparam, status: u16, body: Vec<u8>, content_type: &str,
+)
+
 /// Return a JSON error body: (status, b'{"error":"msg"}')
 pub fn err_body(status: u16, msg: &str) -> (u16, Vec<u8>)
+
+/// Serialize a value as JSON and return (status, body). Requires `serde` feature.
+#[cfg(feature = "serde")]
+pub fn json_body(status: u16, value: &impl serde::Serialize) -> (u16, Vec<u8>)
 ```
 
 ## wr_sdk::http
@@ -121,6 +133,13 @@ pub fn record_event(span: &ActiveSpan, name: &str, attrs: &[(&str, &str)])
 pub fn set_error(span: &ActiveSpan, message: &str)
 ```
 
+### span! macro
+
+```rust
+/// Create a span with attributes that accept any Display value (no manual .to_string()).
+let sp = wr_sdk::span!("inventory.buy", "product.id" => req.product_id, "qty" => req.quantity);
+```
+
 `ActiveSpan` ends automatically when dropped. Type: `wr_sdk::bindings::wruntime::tracing::span::ActiveSpan`.
 
 ## wr_sdk traits and macros
@@ -167,18 +186,32 @@ Error conversions — all error types convert to `ServiceError` via `From`, enab
 
 Source: `wr-sdk/src/prelude.rs`. Import with `use wr_sdk::prelude::*` to get:
 
-`IncomingRequest`, `Method`, `ResponseOutparam`, `database`, `PgValue`,
+`IncomingRequest`, `Method`, `ResponseOutparam`, `database`, `PgValue`, `UnpackRow`,
 `err_body`, `read_body`, `send_response`, `send_json_response`,
+`json_body` (requires `serde` feature),
 `ServiceError`, `tracing`, `ServiceGuest`.
 
 ## wr_sdk::db
 
 Source: `wr-sdk/src/db.rs`
 
+### FromPgValue trait
+
+```rust
+/// Trait for types extractable from a PgValue column.
+pub trait FromPgValue: Sized {
+    fn from_pg(col: usize, val: &PgValue) -> Result<Self, ServiceError>;
+}
+// Implemented for: i64, i32, String, bool, f64
+```
+
 ### Row helpers
 
 ```rust
 impl Row {
+    /// Generic typed column extraction via FromPgValue.
+    fn get<T: FromPgValue>(&self, col: usize) -> Result<T, ServiceError>;
+
     fn get_text(&self, col: usize) -> Result<&str, ServiceError>;
     fn get_i64(&self, col: usize) -> Result<i64, ServiceError>;
     fn get_i32(&self, col: usize) -> Result<i32, ServiceError>;
@@ -186,6 +219,20 @@ impl Row {
     fn get_f64(&self, col: usize) -> Result<f64, ServiceError>;
     fn get_jsonb(&self, col: usize) -> Result<&str, ServiceError>;
 }
+```
+
+### UnpackRow trait
+
+```rust
+/// Extract multiple typed columns from a row in one call.
+/// Implemented for tuples of 2–8 elements where each element is FromPgValue.
+pub trait UnpackRow<T> {
+    fn unpack(&self) -> Result<T, ServiceError>;
+}
+
+// Example:
+let (trade_id, buyer, seller, qty, price): (i64, String, String, i64, i64) =
+    row.unpack()?;
 ```
 
 ### Transaction guard (auto-rollback on drop)
@@ -199,18 +246,6 @@ impl TxGuard {
     fn execute(&self, sql: &str, params: &[PgValue]) -> Result<u64, ServiceError>;
     fn commit(self) -> Result<(), ServiceError>;  // consumes guard, no rollback
 }
-```
-
-## wr_sdk::io extras
-
-```rust
-/// Send response with application/json content-type.
-pub fn send_json_response(response_out: ResponseOutparam, status: u16, body: Vec<u8>)
-
-/// Send response with custom content-type.
-pub fn send_response_with_content_type(
-    response_out: ResponseOutparam, status: u16, body: Vec<u8>, content_type: &str,
-)
 ```
 
 ## Generated code (wr-build)
@@ -512,7 +547,7 @@ pub fn submit_job(
     engine_authority: &str,
     job_type: &str,
     payload: &[u8],
-) -> Result<String, String>
+) -> Result<String, HttpError>
 
 /// Submit a job with explicit timeout and retry settings.
 /// Pass 0 for timeout_secs or max_attempts to use the worker's defaults.
@@ -522,10 +557,10 @@ pub fn submit_job_with_options(
     payload: &[u8],
     timeout_secs: i32,
     max_attempts: i32,
-) -> Result<String, String>
+) -> Result<String, HttpError>
 
 /// Query the status of a previously submitted job.
-pub fn get_job_status(engine_authority: &str, job_id: &str) -> Result<JobStatus, String>
+pub fn get_job_status(engine_authority: &str, job_id: &str) -> Result<JobStatus, HttpError>
 ```
 
 ### Types
@@ -553,6 +588,10 @@ pub struct WrServiceGenerator;
 /// Generates a Client struct per proto service.
 /// Use for client/runner modules.
 pub struct WrClientGenerator;
+
+/// Generates a job submission client for services ending with `WorkerService`.
+/// Methods return job_id instead of decoded response.
+pub struct WrWorkerClientGenerator;
 
 /// Runs two generators on every service definition.
 /// Use when a module is both handler and client.

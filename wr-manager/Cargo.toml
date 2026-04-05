@@ -17,4 +17,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 aes-gcm            = "0.10"
 hex                = "0.4"
 uuid               = { version = "1", features = ["v4"] }
-chitchat = "0.10.0"
+chitchat    = "0.10.0"
+tokio-retry = "0.3"

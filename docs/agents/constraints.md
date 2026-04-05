@@ -27,12 +27,12 @@ Hard rules and common mistakes when building wruntime guest modules. Read this b
 6. **All host binding calls are synchronous from the guest's perspective.** The engine handles async internally. Do not attempt `async`/`await` in guest code.
 
 7. **WASI sandbox restrictions** — these are unavailable in guest modules:
-   - `std::net` (use `wr_sdk::http::http_rpc` for outbound calls)
+   - `std::net` (use `wr_sdk::http::http_request` for outbound calls)
    - `std::fs` (unless `fs = "tempdir"` is set in engine.toml)
    - `std::thread` (single-threaded execution)
    - `std::process` (no subprocess spawning)
 
-8. **Outbound HTTP is transparently intercepted.** Use `http_rpc("namespace.module", "/path", &body)` for inter-module calls. The engine rewrites the URI to the local proxy automatically.
+8. **Outbound HTTP is transparently intercepted.** Use `wr_sdk::http::http_request` (or generated client methods) for inter-module calls. The engine rewrites the URI to the local proxy automatically.
 
 9. **The `bindings` module must be included** in every guest module:
    ```rust

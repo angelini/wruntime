@@ -50,6 +50,9 @@ pub struct BundleArgs {
     /// Skip WASM and schema compilation
     #[arg(long)]
     skip_build: bool,
+    /// Disable OpenTelemetry export in generated service units
+    #[arg(long)]
+    no_otel: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -109,6 +112,9 @@ struct ManifestModule {
     name: String,
     namespace: String,
     version: String,
+    /// Whether this module has a protobuf schema and is registered with the manager.
+    #[serde(default)]
+    has_schema: bool,
 }
 
 // --- Entry point ---
@@ -227,6 +233,7 @@ fn add_engine_artifacts(
                 name: module.name.clone(),
                 namespace: module.namespace.clone(),
                 version: module.version.clone(),
+                has_schema: !module.schema_path.is_empty(),
             });
         }
     }
@@ -285,6 +292,7 @@ struct DeployArtifactParams<'a> {
     proxy_port: u16,
     control_port: u16,
     engine_listen_ports: &'a [u16],
+    no_otel: bool,
 }
 
 /// Generate and add systemd units, Dockerfiles, and docker-compose.yml to the tarball.
@@ -301,8 +309,10 @@ fn add_deployment_artifacts(
         engine_listen_ports,
         ..
     } = params;
+    let no_otel = params.no_otel;
+
     // Systemd units
-    let proxy_service = generate_proxy_service(workdir, &config_names[0]);
+    let proxy_service = generate_proxy_service(workdir, &config_names[0], no_otel);
     tar_add_bytes(
         tar,
         "wr-node/systemd/wr-proxy.service",
@@ -312,7 +322,7 @@ fn add_deployment_artifacts(
 
     for (i, engine_name) in engine_names.iter().enumerate() {
         let cfg_name = &config_names[i + 1];
-        let service = generate_engine_service(workdir, cfg_name, engine_name);
+        let service = generate_engine_service(workdir, cfg_name, engine_name, no_otel);
         tar_add_bytes(
             tar,
             &format!("wr-node/systemd/wr-engine-{engine_name}.service"),
@@ -331,7 +341,7 @@ fn add_deployment_artifacts(
     )?;
 
     // Docker artifacts
-    let proxy_dockerfile = generate_proxy_dockerfile(workdir);
+    let proxy_dockerfile = generate_proxy_dockerfile(workdir, no_otel);
     tar_add_bytes(
         tar,
         "wr-node/docker/Dockerfile.proxy",
@@ -341,7 +351,7 @@ fn add_deployment_artifacts(
 
     for (i, engine_name) in engine_names.iter().enumerate() {
         let cfg_name = &config_names[i + 1];
-        let dockerfile = generate_engine_dockerfile(workdir, cfg_name);
+        let dockerfile = generate_engine_dockerfile(workdir, cfg_name, no_otel);
         tar_add_bytes(
             tar,
             &format!("wr-node/docker/Dockerfile.engine-{engine_name}"),
@@ -476,6 +486,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
             proxy_port,
             control_port,
             engine_listen_ports: &engine_listen_ports,
+            no_otel: args.no_otel,
         },
     )?;
 
@@ -582,13 +593,13 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
                 }
             }
             let services = service_names.join(" ");
-            helpers::run_ssh(&ssh_base, &format!("systemctl restart {services}"))?;
+            helpers::run_ssh(&ssh_base, &format!("sudo systemctl restart {services}"))?;
         }
         DeployFormat::Docker => {
             helpers::run_ssh(
                 &ssh_base,
                 &format!(
-                    "cd {}/wr-node && docker compose -f docker/docker-compose.yml restart",
+                    "cd {}/wr-node && sudo docker compose -f docker/docker-compose.yml restart",
                     manifest.workdir
                 ),
             )?;
@@ -596,12 +607,21 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     }
     println!("OK");
 
-    // Poll for engine registration
+    // Poll until engines serving all schema-bearing modules are registered.
+    // Modules without schemas are not registered with the manager.
+    let expected_modules: Vec<(String, String)> = manifest
+        .modules
+        .iter()
+        .filter(|m| m.has_schema)
+        .map(|m| (m.namespace.clone(), m.name.clone()))
+        .collect();
     println!("[deploy]  waiting for engine registration...");
-    let initial_count = helpers::get_engine_count(manager).await;
-    let registered =
-        helpers::wait_for_engine_registration(manager, initial_count, Duration::from_secs(60))
-            .await;
+    let registered = if expected_modules.is_empty() {
+        // No routable modules — nothing to wait for.
+        true
+    } else {
+        helpers::wait_for_modules(manager, &expected_modules, Duration::from_secs(60)).await
+    };
 
     if registered {
         println!("[deploy]  engine registered successfully");
@@ -625,7 +645,7 @@ async fn deploy_systemd(args: &DeployArgs, manifest: &Manifest, ssh_base: &[Stri
     print!("[deploy]  unpacking on remote ... ");
     helpers::run_ssh(
         ssh_base,
-        &format!("mkdir -p {workdir} && tar xzf /tmp/wr-bundle.tar.gz -C {workdir} && rm /tmp/wr-bundle.tar.gz"),
+        &format!("sudo mkdir -p {workdir} && sudo tar xzf /tmp/wr-bundle.tar.gz -C {workdir} && rm /tmp/wr-bundle.tar.gz"),
     )?;
     println!("OK");
 
@@ -633,14 +653,14 @@ async fn deploy_systemd(args: &DeployArgs, manifest: &Manifest, ssh_base: &[Stri
     print!("[deploy]  installing systemd units ... ");
     helpers::run_ssh(
         ssh_base,
-        &format!("cp {workdir}/wr-node/systemd/*.service /etc/systemd/system/"),
+        &format!("sudo cp {workdir}/wr-node/systemd/*.service /etc/systemd/system/"),
     )?;
     println!("OK");
 
     print!("[deploy]  applying sysctl tuning ... ");
     helpers::run_ssh(
         ssh_base,
-        &format!("cp {workdir}/wr-node/systemd/99-wruntime.conf /etc/sysctl.d/ && sysctl --system > /dev/null"),
+        &format!("sudo cp {workdir}/wr-node/systemd/99-wruntime.conf /etc/sysctl.d/ && sudo sysctl --system > /dev/null"),
     )?;
     println!("OK");
 
@@ -656,7 +676,7 @@ async fn deploy_systemd(args: &DeployArgs, manifest: &Manifest, ssh_base: &[Stri
     let services = service_names.join(" ");
     helpers::run_ssh(
         ssh_base,
-        &format!("systemctl daemon-reload && systemctl enable --now {services}"),
+        &format!("sudo systemctl daemon-reload && sudo systemctl enable --now {services}"),
     )?;
     println!("OK");
 
@@ -675,7 +695,7 @@ async fn deploy_docker(args: &DeployArgs, manifest: &Manifest, ssh_base: &[Strin
     print!("[deploy]  unpacking on remote ... ");
     helpers::run_ssh(
         ssh_base,
-        &format!("mkdir -p {workdir} && tar xzf /tmp/wr-bundle.tar.gz -C {workdir} && rm /tmp/wr-bundle.tar.gz"),
+        &format!("sudo mkdir -p {workdir} && sudo tar xzf /tmp/wr-bundle.tar.gz -C {workdir} && rm /tmp/wr-bundle.tar.gz"),
     )?;
     println!("OK");
 
@@ -683,7 +703,7 @@ async fn deploy_docker(args: &DeployArgs, manifest: &Manifest, ssh_base: &[Strin
     print!("[deploy]  starting containers ... ");
     helpers::run_ssh(
         ssh_base,
-        &format!("cd {workdir}/wr-node && docker compose -f docker/docker-compose.yml up -d"),
+        &format!("cd {workdir}/wr-node && sudo docker compose -f docker/docker-compose.yml up -d"),
     )?;
     println!("OK");
 
@@ -749,7 +769,12 @@ fn status(args: StatusArgs) -> Result<()> {
 
 // --- Generators (non-TOML: systemd, Dockerfile, docker-compose) ---
 
-fn generate_proxy_service(workdir: &str, config_name: &str) -> String {
+fn generate_proxy_service(workdir: &str, config_name: &str, no_otel: bool) -> String {
+    let otel_env = if no_otel {
+        "Environment=OTEL_SDK_DISABLED=true\n"
+    } else {
+        ""
+    };
     format!(
         r#"[Unit]
 Description=wruntime proxy
@@ -759,7 +784,7 @@ After=network.target
 Type=simple
 WorkingDirectory={workdir}/wr-node
 ExecStart={workdir}/wr-node/bin/wr-proxy {workdir}/wr-node/config/{config_name}
-Restart=on-failure
+{otel_env}Restart=on-failure
 RestartSec=5
 
 [Install]
@@ -768,7 +793,17 @@ WantedBy=multi-user.target
     )
 }
 
-fn generate_engine_service(workdir: &str, config_name: &str, engine_name: &str) -> String {
+fn generate_engine_service(
+    workdir: &str,
+    config_name: &str,
+    engine_name: &str,
+    no_otel: bool,
+) -> String {
+    let otel_env = if no_otel {
+        "Environment=OTEL_SDK_DISABLED=true\n"
+    } else {
+        ""
+    };
     format!(
         r#"[Unit]
 Description=wruntime engine ({engine_name})
@@ -779,7 +814,7 @@ Requires=wr-proxy.service
 Type=simple
 WorkingDirectory={workdir}/wr-node
 ExecStart={workdir}/wr-node/bin/wr-engine {workdir}/wr-node/config/{config_name}
-Restart=on-failure
+{otel_env}Restart=on-failure
 RestartSec=5
 
 [Install]
@@ -792,18 +827,20 @@ fn generate_sysctl_config() -> String {
     "# Wasmtime pooling allocator requires higher mmap limit for COW-based instantiation.\nvm.max_map_count = 262144\n".to_string()
 }
 
-fn generate_proxy_dockerfile(workdir: &str) -> String {
+fn generate_proxy_dockerfile(workdir: &str, no_otel: bool) -> String {
+    let otel_env = if no_otel { "ENV OTEL_SDK_DISABLED=true\n" } else { "" };
     format!(
         r#"FROM gcr.io/distroless/cc-debian13
 WORKDIR {workdir}
 COPY bin/wr-proxy bin/wr-proxy
 COPY config/proxy.toml config/proxy.toml
-ENTRYPOINT ["bin/wr-proxy", "config/proxy.toml"]
+{otel_env}ENTRYPOINT ["bin/wr-proxy", "config/proxy.toml"]
 "#
     )
 }
 
-fn generate_engine_dockerfile(workdir: &str, config_name: &str) -> String {
+fn generate_engine_dockerfile(workdir: &str, config_name: &str, no_otel: bool) -> String {
+    let otel_env = if no_otel { "ENV OTEL_SDK_DISABLED=true\n" } else { "" };
     format!(
         r#"FROM gcr.io/distroless/cc-debian13
 WORKDIR {workdir}
@@ -812,7 +849,7 @@ COPY config/{config_name} config/engine.toml
 COPY modules/ modules/
 COPY schemas/ schemas/
 COPY migrations/ migrations/
-ENTRYPOINT ["bin/wr-engine", "config/engine.toml"]
+{otel_env}ENTRYPOINT ["bin/wr-engine", "config/engine.toml"]
 "#
     )
 }

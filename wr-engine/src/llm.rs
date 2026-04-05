@@ -44,20 +44,8 @@ impl LlmRuntime {
             .await
             .map_err(|e| LlmErrorKind::Api(format!("request failed: {e}")))?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u32>().ok());
-            let body = resp.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                400 => LlmErrorKind::InvalidRequest(body),
-                401 | 403 => LlmErrorKind::Auth(body),
-                429 | 529 => LlmErrorKind::RateLimited(retry_after),
-                _ => LlmErrorKind::Api(format!("HTTP {status}: {body}")),
-            });
+        if !resp.status().is_success() {
+            return Err(error_from_response(resp).await);
         }
 
         resp.json::<ApiResponse>()
@@ -84,20 +72,8 @@ impl LlmRuntime {
             .await
             .map_err(|e| LlmErrorKind::Api(format!("request failed: {e}")))?;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u32>().ok());
-            let body = resp.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                400 => LlmErrorKind::InvalidRequest(body),
-                401 | 403 => LlmErrorKind::Auth(body),
-                429 | 529 => LlmErrorKind::RateLimited(retry_after),
-                _ => LlmErrorKind::Api(format!("HTTP {status}: {body}")),
-            });
+        if !resp.status().is_success() {
+            return Err(error_from_response(resp).await);
         }
 
         let (tx, rx) = mpsc::channel(64);
@@ -315,6 +291,23 @@ pub enum LlmErrorKind {
     Auth(String),
     RateLimited(Option<u32>),
     Api(String),
+}
+
+/// Map a non-success HTTP response to the appropriate `LlmErrorKind`.
+async fn error_from_response(resp: reqwest::Response) -> LlmErrorKind {
+    let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u32>().ok());
+    let body = resp.text().await.unwrap_or_default();
+    match status.as_u16() {
+        400 => LlmErrorKind::InvalidRequest(body),
+        401 | 403 => LlmErrorKind::Auth(body),
+        429 | 529 => LlmErrorKind::RateLimited(retry_after),
+        _ => LlmErrorKind::Api(format!("HTTP {status}: {body}")),
+    }
 }
 
 // ── WIT bindings ─────────────────────────────────────────────────────────────

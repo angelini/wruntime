@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
+use tokio_retry::strategy::FixedInterval;
+use tokio_retry::Retry;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
@@ -53,7 +55,7 @@ impl NodeAgent {
             return;
         }
 
-        let mut client = match self.discovery.get_client().await {
+        let client = match self.discovery.get_client().await {
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, "heartbeat flush: all managers unreachable");
@@ -63,14 +65,19 @@ impl NodeAgent {
 
         let mut any_failed = false;
         for state in engines.values() {
-            if let Err(e) = client
-                .heartbeat(wr_common::wruntime::HeartbeatRequest {
-                    engine_id: state.engine_id.clone(),
-                    healthy_modules: state.healthy_modules.clone(),
-                })
-                .await
-            {
-                warn!(engine_id = %state.engine_id, error = %e, "heartbeat forward failed");
+            let req = wr_common::wruntime::HeartbeatRequest {
+                engine_id: state.engine_id.clone(),
+                healthy_modules: state.healthy_modules.clone(),
+            };
+            let strategy = FixedInterval::from_millis(50).take(2);
+            let result = Retry::spawn(strategy, || {
+                let mut c = client.clone();
+                let r = req.clone();
+                async move { c.heartbeat(r).await }
+            })
+            .await;
+            if let Err(e) = result {
+                warn!(engine_id = %state.engine_id, error = %e, "heartbeat forward failed after retries");
                 any_failed = true;
             }
         }

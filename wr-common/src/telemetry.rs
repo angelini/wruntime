@@ -45,52 +45,67 @@ impl Drop for TelemetryGuard {
 /// The returned [`TelemetryGuard`] must be kept alive for the duration of the
 /// process — dropping it flushes and shuts down all providers.
 pub fn init(service_name: &'static str) -> Result<TelemetryGuard> {
+    let otel_disabled = std::env::var("OTEL_SDK_DISABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
     let resource = Resource::builder().with_service_name(service_name).build();
 
-    // ── Traces ────────────────────────────────────────────────────────────
-    let trace_exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(OTLP_ENDPOINT)
-        .build()?;
+    let (tracer_provider, meter_provider, logger_provider) = if otel_disabled {
+        // No-op providers — no exporters, no network connections.
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_resource(resource.clone())
+            .build();
+        let meter_provider = SdkMeterProvider::builder()
+            .with_resource(resource.clone())
+            .build();
+        let logger_provider = SdkLoggerProvider::builder()
+            .with_resource(resource.clone())
+            .build();
+        (tracer_provider, meter_provider, logger_provider)
+    } else {
+        // ── Traces ────────────────────────────────────────────────────────
+        let trace_exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(OTLP_ENDPOINT)
+            .build()?;
 
-    let tracer_provider = SdkTracerProvider::builder()
-        .with_sampler(Sampler::AlwaysOn)
-        .with_id_generator(RandomIdGenerator::default())
-        .with_resource(resource.clone())
-        .with_batch_exporter(trace_exporter)
-        .build();
+        let tracer_provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_id_generator(RandomIdGenerator::default())
+            .with_resource(resource.clone())
+            .with_batch_exporter(trace_exporter)
+            .build();
+
+        // ── Metrics ───────────────────────────────────────────────────────
+        let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(OTLP_ENDPOINT)
+            .build()?;
+
+        let meter_provider = SdkMeterProvider::builder()
+            .with_resource(resource.clone())
+            .with_periodic_exporter(metric_exporter)
+            .build();
+
+        // ── Logs ──────────────────────────────────────────────────────────
+        let log_exporter = opentelemetry_otlp::LogExporter::builder()
+            .with_tonic()
+            .with_endpoint(OTLP_ENDPOINT)
+            .build()?;
+
+        let logger_provider = SdkLoggerProvider::builder()
+            .with_resource(resource.clone())
+            .with_batch_exporter(log_exporter)
+            .build();
+
+        (tracer_provider, meter_provider, logger_provider)
+    };
 
     global::set_tracer_provider(tracer_provider.clone());
-
-    // W3C TraceContext: propagates trace-id/span-id via `traceparent` header.
     global::set_text_map_propagator(TraceContextPropagator::new());
-
-    // Obtain a concrete tracer to pass to the tracing_opentelemetry layer.
     let tracer = tracer_provider.tracer(service_name);
-
-    // ── Metrics ───────────────────────────────────────────────────────────
-    let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_tonic()
-        .with_endpoint(OTLP_ENDPOINT)
-        .build()?;
-
-    let meter_provider = SdkMeterProvider::builder()
-        .with_resource(resource.clone())
-        .with_periodic_exporter(metric_exporter)
-        .build();
-
     global::set_meter_provider(meter_provider.clone());
-
-    // ── Logs ──────────────────────────────────────────────────────────────
-    let log_exporter = opentelemetry_otlp::LogExporter::builder()
-        .with_tonic()
-        .with_endpoint(OTLP_ENDPOINT)
-        .build()?;
-
-    let logger_provider = SdkLoggerProvider::builder()
-        .with_resource(resource.clone())
-        .with_batch_exporter(log_exporter)
-        .build();
 
     // ── tracing subscriber ────────────────────────────────────────────────
     // Three layers:

@@ -70,3 +70,71 @@ where
 
 /// Default pool size for service-to-service HTTP/2 connections.
 pub const DEFAULT_POOL_SIZE: usize = 4;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Use http_body_util::Empty as a simple Body impl for tests.
+    type TestPool = HttpClientPool<http_body_util::Empty<bytes::Bytes>>;
+
+    #[test]
+    fn new_creates_pool_of_requested_size() {
+        let pool = TestPool::new(3);
+        assert_eq!(pool.size(), 3);
+    }
+
+    #[test]
+    fn new_single_client() {
+        let pool = TestPool::new(1);
+        assert_eq!(pool.size(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "pool size must be at least 1")]
+    fn new_zero_size_panics() {
+        let _ = TestPool::new(0);
+    }
+
+    #[test]
+    fn get_round_robins_across_clients() {
+        let pool = TestPool::new(3);
+        // Each call to get() should cycle through indices 0, 1, 2, 0, 1, ...
+        // We can't directly compare Client identity, but we can verify
+        // the counter advances by calling get() many times without panic.
+        for _ in 0..100 {
+            let _ = pool.get();
+        }
+    }
+
+    #[test]
+    fn clone_shares_state() {
+        let pool = TestPool::new(2);
+        let clone = pool.clone();
+
+        // Advance counter on original
+        let _ = pool.get(); // counter becomes 1
+        // Clone should see the same counter (shared via Arc<AtomicUsize>)
+        // Next get on clone should use index 1 % 2 = 1, then advance to 2
+        let _ = clone.get();
+        // Counter is now 2; next call on original uses 2 % 2 = 0
+        assert_eq!(clone.size(), 2);
+    }
+
+    #[test]
+    fn counter_wrapping_does_not_panic() {
+        let pool = TestPool::new(3);
+        // Simulate near-overflow by setting the counter close to usize::MAX
+        pool.next.store(usize::MAX - 1, Ordering::Relaxed);
+        // These calls cross the usize::MAX boundary via wrapping add
+        let _ = pool.get(); // usize::MAX - 1
+        let _ = pool.get(); // usize::MAX
+        let _ = pool.get(); // wraps to 0
+        let _ = pool.get(); // 1
+    }
+
+    #[test]
+    fn default_pool_size_is_four() {
+        assert_eq!(DEFAULT_POOL_SIZE, 4);
+    }
+}

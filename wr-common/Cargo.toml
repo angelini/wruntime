@@ -23,7 +23,7 @@ opentelemetry-http                 = "0.31"
 # Optional: manager discovery via Postgres
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"], optional = true }
 tokio-postgres    = { version = "0.7", optional = true }
-tokio             = { version = "1", features = ["sync", "time", "rt"], optional = true }
+tokio             = { version = "1", features = ["sync", "time", "rt", "signal"], optional = true }
 rand              = { version = "0.9", optional = true }
 toml              = { version = "0.8", optional = true }
 
@@ -38,6 +38,12 @@ pool      = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio"]
 config    = ["dep:toml"]
 signal    = ["dep:tokio"]
 http-pool = ["dep:hyper-util", "dep:http-body"]
+
+[dev-dependencies]
+tempfile       = "3"
+http-body-util = "0.1"
+bytes          = "1"
+toml           = "0.8"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

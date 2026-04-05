@@ -114,76 +114,45 @@ impl ProxyConfig {
     }
 
     fn validate_inner(&self) -> Result<()> {
-        anyhow::ensure!(
-            !self.listen_address.is_empty(),
-            "listen_address is required"
-        );
-        anyhow::ensure!(
-            !self.control_address.is_empty(),
-            "control_address is required"
-        );
-        anyhow::ensure!(!self.database.url.is_empty(), "database.url is required");
-        anyhow::ensure!(
-            !self.node.proxy_address.is_empty(),
-            "node.proxy_address is required"
-        );
-        anyhow::ensure!(
-            self.cache.routing_table_ttl_secs > 0,
-            "cache.routing_table_ttl_secs must be > 0"
-        );
-        anyhow::ensure!(
-            self.circuit_breaker.failure_threshold > 0,
-            "circuit_breaker.failure_threshold must be > 0"
-        );
-        anyhow::ensure!(
-            self.circuit_breaker.open_duration_secs > 0,
-            "circuit_breaker.open_duration_secs must be > 0"
-        );
+        use wr_common::config::Validator;
+        let mut v = Validator::new();
+
+        v.check(!self.listen_address.is_empty(), "listen_address is required");
+        v.check(!self.control_address.is_empty(), "control_address is required");
+        v.check(!self.database.url.is_empty(), "database.url is required");
+        v.check(!self.node.proxy_address.is_empty(), "node.proxy_address is required");
+        v.check(self.cache.routing_table_ttl_secs > 0, "cache.routing_table_ttl_secs must be > 0");
+        v.check(self.circuit_breaker.failure_threshold > 0, "circuit_breaker.failure_threshold must be > 0");
+        v.check(self.circuit_breaker.open_duration_secs > 0, "circuit_breaker.open_duration_secs must be > 0");
+
         if let Some(egress) = &self.egress {
             for (i, pattern) in egress.allowed_domains.iter().enumerate() {
-                anyhow::ensure!(
-                    !pattern.is_empty(),
-                    "egress.allowed_domains[{i}] must not be empty"
-                );
-                anyhow::ensure!(
+                v.check(!pattern.is_empty(), format!("egress.allowed_domains[{i}] must not be empty"));
+                v.check(
                     !pattern.starts_with('.') && !pattern.ends_with('.'),
-                    "egress.allowed_domains[{i}] must not start or end with '.'"
+                    format!("egress.allowed_domains[{i}] must not start or end with '.'"),
                 );
-                anyhow::ensure!(
-                    !pattern.contains(".."),
-                    "egress.allowed_domains[{i}] must not contain '..'"
-                );
+                v.check(!pattern.contains(".."), format!("egress.allowed_domains[{i}] must not contain '..'"));
                 for (j, label) in pattern.split('.').enumerate() {
                     if label.contains('*') {
-                        anyhow::ensure!(
+                        v.check(
                             j == 0 && label == "*",
-                            "egress.allowed_domains[{i}]: '*' may only appear as \
-                             the entire first label (e.g. '*.example.com')"
+                            format!("egress.allowed_domains[{i}]: '*' may only appear as \
+                                     the entire first label (e.g. '*.example.com')"),
                         );
                     }
                 }
             }
         }
         if let Some(ext) = &self.external {
-            anyhow::ensure!(
-                !ext.listen_address.is_empty(),
-                "external.listen_address is required"
-            );
+            v.check(!ext.listen_address.is_empty(), "external.listen_address is required");
             for (i, route) in ext.routes.iter().enumerate() {
-                anyhow::ensure!(
-                    !route.path.is_empty(),
-                    "external.routes[{i}].path is required"
-                );
-                anyhow::ensure!(
-                    !route.module.is_empty(),
-                    "external.routes[{i}].module is required"
-                );
-                anyhow::ensure!(
-                    !route.namespace.is_empty(),
-                    "external.routes[{i}].namespace is required"
-                );
+                v.check(!route.path.is_empty(), format!("external.routes[{i}].path is required"));
+                v.check(!route.module.is_empty(), format!("external.routes[{i}].module is required"));
+                v.check(!route.namespace.is_empty(), format!("external.routes[{i}].namespace is required"));
             }
         }
-        Ok(())
+
+        v.finish()
     }
 }

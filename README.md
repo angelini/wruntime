@@ -68,19 +68,14 @@ fn main() {
 ```rust
 mod proto { include!(concat!(env!("OUT_DIR"), "/echo.rs")); }
 
-use wr_sdk::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
-use wr_sdk::io::{read_body, send_response};
-use wr_sdk::ServiceError;
+use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
-impl wr_sdk::ServiceGuest for Component {
+impl ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        let path = request.path_with_query().unwrap_or_default();
-        let body = read_body(request.consume().unwrap());
-        let (status, resp) = proto::echo_service_router(&Component, &path, &body);
-        send_response(response_out, status, resp);
+        proto::echo_service_handle(&Component, request, response_out);
     }
 }
 
@@ -91,7 +86,7 @@ impl proto::EchoService for Component {
 }
 ```
 
-`WrServiceGenerator` generates a trait (`EchoService`) and a router function (`echo_service_router`) from the proto definition — you implement the trait and wire up the router in `handle`.
+`WrServiceGenerator` generates a trait (`EchoService`) and a `_handle` function (`echo_service_handle`) from the proto definition — you implement the trait and delegate `handle` to the generated function.
 
 ### 3. Caller module (runner)
 
@@ -111,24 +106,26 @@ fn main() {
 ```rust
 mod proto { include!(concat!(env!("OUT_DIR"), "/echo.rs")); }
 
+use prost::Message;
 use proto::EchoServiceClient;
+use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
-impl wr_sdk::ServiceGuest for Component {
+impl ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         let client = EchoServiceClient::new("example.echo");
 
         match client.echo(proto::EchoRequest { message: "hello".into() }) {
-            Ok(resp) => wr_sdk::io::send_response(response_out, 200, resp.encode_to_vec()),
+            Ok(resp) => send_response(response_out, 200, resp.encode_to_vec()),
             Err(e)   => wr_sdk::log::log(&format!("error: {e}")),
         }
     }
 }
 ```
 
-`WrClientGenerator` generates a typed `EchoServiceClient` struct with one method per RPC. The client calls `http://example.echo/Echo` under the hood via `wr_sdk::http::http_rpc`.
+`WrClientGenerator` generates a typed `EchoServiceClient` struct with one method per RPC. The client calls `http://example.echo/Echo` under the hood via `wr_sdk::http::http_request`.
 
 ### 4. Configure and run
 
@@ -235,7 +232,7 @@ wruntime/
 ├── wr-manager/             # central registry gRPC server
 ├── wr-proxy/               # streaming HTTP routing proxy
 ├── wr-engine/              # WASM runtime (wasmtime) + inbound HTTP server
-├── wr-sdk/                 # WASM module SDK: http_rpc, io, log, export macros
+├── wr-sdk/                 # WASM module SDK: http, io, db, tracing, llm, export macros
 ├── wr-build/               # build.rs helper: service/client generators from proto
 ├── wr-cli/                 # CLI: invoke modules, list engines/services, query metrics (requires --manager or WR_MANAGER)
 ├── wr-tests/               # integration tests

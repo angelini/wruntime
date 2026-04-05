@@ -71,14 +71,17 @@ async fn prepare_connection(
     schema: &Option<Arc<str>>,
     timeouts: &DbTimeouts,
 ) -> Result<(), DbError> {
+    use std::fmt::Write;
     let mut sql = String::new();
     if let Some(s) = schema {
-        sql.push_str(&format!("SET search_path = \"{s}\"; "));
+        write!(sql, "SET search_path = \"{s}\"; ").unwrap();
     }
-    sql.push_str(&format!(
+    write!(
+        sql,
         "SET statement_timeout = '{}s'; SET idle_in_transaction_session_timeout = '{}s';",
         timeouts.statement_timeout_secs, timeouts.idle_in_transaction_timeout_secs
-    ));
+    )
+    .unwrap();
     client
         .batch_execute(&sql)
         .await
@@ -178,90 +181,107 @@ impl tokio_postgres::types::ToSql for PgIntervalRaw {
     tokio_postgres::types::to_sql_checked!();
 }
 
+// ── PgValue → PgParam conversion helpers ────────────────────────────────────
+
+fn pg_epoch() -> chrono::NaiveDate {
+    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
+}
+
+fn micros_to_timestamptz(micros: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp_micros(micros)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+}
+
+fn micros_to_timestamp(micros: i64) -> chrono::NaiveDateTime {
+    micros_to_timestamptz(micros).naive_utc()
+}
+
+fn days_to_date(days: i32) -> chrono::NaiveDate {
+    pg_epoch() + chrono::Duration::days(days as i64)
+}
+
+fn micros_to_time(micros: i64) -> chrono::NaiveTime {
+    let secs = (micros / 1_000_000) as u32;
+    let nano = ((micros % 1_000_000) * 1_000) as u32;
+    chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nano)
+        .unwrap_or(chrono::NaiveTime::MIN)
+}
+
+fn uuid_from_hilo((hi, lo): (u64, u64)) -> uuid::Uuid {
+    uuid::Uuid::from_u128((hi as u128) << 64 | lo as u128)
+}
+
+fn parse_jsonb(s: String) -> serde_json::Value {
+    serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)
+}
+
+/// Generates pass-through arms where both variants have the same name and
+/// the inner value is forwarded without transformation.
+macro_rules! passthrough_variants {
+    ($v:expr, [ $($variant:ident),+ $(,)? ]) => {
+        match $v {
+            PgValue::Null => PgParam::Null,
+            $(PgValue::$variant(inner) => PgParam::$variant(inner),)+
+            other => convert_complex(other),
+        }
+    };
+}
+
+/// Handles variants that require type conversion (dates, times, json, etc.).
+fn convert_complex(v: PgValue) -> PgParam {
+    match v {
+        PgValue::Timestamptz(micros) => PgParam::Timestamptz(micros_to_timestamptz(micros)),
+        PgValue::Timestamp(micros) => PgParam::Timestamp(micros_to_timestamp(micros)),
+        PgValue::Date(days) => PgParam::Date(days_to_date(days)),
+        PgValue::Time(micros) => PgParam::Time(micros_to_time(micros)),
+        PgValue::Numeric(s) => PgParam::Numeric(s.parse().unwrap_or(rust_decimal::Decimal::ZERO)),
+        PgValue::Uuid(pair) => PgParam::Uuid(uuid_from_hilo(pair)),
+        PgValue::Interval(iv) => PgParam::Interval(PgIntervalRaw {
+            microseconds: iv.microseconds,
+            days: iv.days,
+            months: iv.months,
+        }),
+        PgValue::Jsonb(s) => PgParam::Jsonb(parse_jsonb(s)),
+        PgValue::TimestamptzArray(a) => PgParam::TimestamptzArray(
+            a.into_iter()
+                .map(|o| o.and_then(chrono::DateTime::from_timestamp_micros))
+                .collect(),
+        ),
+        PgValue::TimestampArray(a) => PgParam::TimestampArray(
+            a.into_iter()
+                .map(|o| o.map(micros_to_timestamp))
+                .collect(),
+        ),
+        PgValue::UuidArray(a) => PgParam::UuidArray(
+            a.into_iter().map(|o| o.map(uuid_from_hilo)).collect(),
+        ),
+        PgValue::JsonbArray(a) => PgParam::JsonbArray(
+            a.into_iter().map(|o| o.map(parse_jsonb)).collect(),
+        ),
+        // Handled by passthrough_variants — unreachable at runtime but
+        // needed to satisfy exhaustiveness.
+        _ => unreachable!(),
+    }
+}
+
 impl From<PgValue> for PgParam {
     fn from(v: PgValue) -> Self {
-        match v {
-            PgValue::Null => PgParam::Null,
-            PgValue::Boolean(b) => PgParam::Boolean(b),
-            PgValue::Int2(i) => PgParam::Int2(i),
-            PgValue::Int4(i) => PgParam::Int4(i),
-            PgValue::Int8(i) => PgParam::Int8(i),
-            PgValue::Float4(f) => PgParam::Float4(f),
-            PgValue::Float8(f) => PgParam::Float8(f),
-            PgValue::Text(s) => PgParam::Text(s),
-            PgValue::Bytea(b) => PgParam::Bytea(b),
-            PgValue::Timestamptz(micros) => {
-                let dt = chrono::DateTime::from_timestamp_micros(micros)
-                    .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
-                PgParam::Timestamptz(dt)
-            }
-            PgValue::Date(days) => {
-                let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                PgParam::Date(epoch + chrono::Duration::days(days as i64))
-            }
-            PgValue::Time(micros) => {
-                let secs = (micros / 1_000_000) as u32;
-                let nano = ((micros % 1_000_000) * 1_000) as u32;
-                let t = chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nano)
-                    .unwrap_or(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-                PgParam::Time(t)
-            }
-            PgValue::Numeric(s) => {
-                PgParam::Numeric(s.parse().unwrap_or(rust_decimal::Decimal::ZERO))
-            }
-            PgValue::Uuid((hi, lo)) => {
-                PgParam::Uuid(uuid::Uuid::from_u128((hi as u128) << 64 | lo as u128))
-            }
-            PgValue::Timestamp(micros) => {
-                let dt = chrono::DateTime::from_timestamp_micros(micros)
-                    .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
-                    .naive_utc();
-                PgParam::Timestamp(dt)
-            }
-            PgValue::Interval(iv) => PgParam::Interval(PgIntervalRaw {
-                microseconds: iv.microseconds,
-                days: iv.days,
-                months: iv.months,
-            }),
-            PgValue::Jsonb(s) => {
-                PgParam::Jsonb(serde_json::from_str(&s).unwrap_or(serde_json::Value::Null))
-            }
-            PgValue::Oid(o) => PgParam::Oid(o),
-            PgValue::BoolArray(a) => PgParam::BoolArray(a),
-            PgValue::Int2Array(a) => PgParam::Int2Array(a),
-            PgValue::Int4Array(a) => PgParam::Int4Array(a),
-            PgValue::Int8Array(a) => PgParam::Int8Array(a),
-            PgValue::Float4Array(a) => PgParam::Float4Array(a),
-            PgValue::Float8Array(a) => PgParam::Float8Array(a),
-            PgValue::TextArray(a) => PgParam::TextArray(a),
-            PgValue::TimestamptzArray(a) => PgParam::TimestamptzArray(
-                a.into_iter()
-                    .map(|o| o.and_then(chrono::DateTime::from_timestamp_micros))
-                    .collect(),
-            ),
-            PgValue::TimestampArray(a) => PgParam::TimestampArray(
-                a.into_iter()
-                    .map(|o| {
-                        o.and_then(|micros| {
-                            chrono::DateTime::from_timestamp_micros(micros).map(|dt| dt.naive_utc())
-                        })
-                    })
-                    .collect(),
-            ),
-            PgValue::UuidArray(a) => PgParam::UuidArray(
-                a.into_iter()
-                    .map(|o| {
-                        o.map(|(hi, lo)| uuid::Uuid::from_u128((hi as u128) << 64 | lo as u128))
-                    })
-                    .collect(),
-            ),
-            PgValue::JsonbArray(a) => PgParam::JsonbArray(
-                a.into_iter()
-                    .map(|o| o.map(|s| serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)))
-                    .collect(),
-            ),
-        }
+        passthrough_variants!(v, [
+            Boolean, Int2, Int4, Int8, Float4, Float8, Text, Bytea, Oid,
+            BoolArray, Int2Array, Int4Array, Int8Array, Float4Array, Float8Array, TextArray,
+        ])
     }
+}
+
+/// Generates the `to_sql` match: every non-Null variant delegates to its
+/// inner value's `ToSql` implementation.
+macro_rules! delegate_to_sql {
+    ($self:expr, $ty:expr, $buf:expr, [ $($variant:ident),+ $(,)? ]) => {
+        match $self {
+            PgParam::Null => Ok(tokio_postgres::types::IsNull::Yes),
+            $(PgParam::$variant(v) => v.to_sql($ty, $buf),)+
+        }
+    };
 }
 
 impl tokio_postgres::types::ToSql for PgParam {
@@ -270,37 +290,12 @@ impl tokio_postgres::types::ToSql for PgParam {
         ty: &tokio_postgres::types::Type,
         buf: &mut bytes::BytesMut,
     ) -> Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        match self {
-            PgParam::Null => Ok(tokio_postgres::types::IsNull::Yes),
-            PgParam::Boolean(v) => v.to_sql(ty, buf),
-            PgParam::Int2(v) => v.to_sql(ty, buf),
-            PgParam::Int4(v) => v.to_sql(ty, buf),
-            PgParam::Int8(v) => v.to_sql(ty, buf),
-            PgParam::Float4(v) => v.to_sql(ty, buf),
-            PgParam::Float8(v) => v.to_sql(ty, buf),
-            PgParam::Text(v) => v.to_sql(ty, buf),
-            PgParam::Bytea(v) => v.to_sql(ty, buf),
-            PgParam::Timestamptz(v) => v.to_sql(ty, buf),
-            PgParam::Date(v) => v.to_sql(ty, buf),
-            PgParam::Time(v) => v.to_sql(ty, buf),
-            PgParam::Numeric(v) => v.to_sql(ty, buf),
-            PgParam::Uuid(v) => v.to_sql(ty, buf),
-            PgParam::Timestamp(v) => v.to_sql(ty, buf),
-            PgParam::Interval(v) => v.to_sql(ty, buf),
-            PgParam::Jsonb(v) => v.to_sql(ty, buf),
-            PgParam::Oid(v) => v.to_sql(ty, buf),
-            PgParam::BoolArray(v) => v.to_sql(ty, buf),
-            PgParam::Int2Array(v) => v.to_sql(ty, buf),
-            PgParam::Int4Array(v) => v.to_sql(ty, buf),
-            PgParam::Int8Array(v) => v.to_sql(ty, buf),
-            PgParam::Float4Array(v) => v.to_sql(ty, buf),
-            PgParam::Float8Array(v) => v.to_sql(ty, buf),
-            PgParam::TextArray(v) => v.to_sql(ty, buf),
-            PgParam::TimestamptzArray(v) => v.to_sql(ty, buf),
-            PgParam::TimestampArray(v) => v.to_sql(ty, buf),
-            PgParam::UuidArray(v) => v.to_sql(ty, buf),
-            PgParam::JsonbArray(v) => v.to_sql(ty, buf),
-        }
+        delegate_to_sql!(self, ty, buf, [
+            Boolean, Int2, Int4, Int8, Float4, Float8, Text, Bytea,
+            Timestamptz, Date, Time, Numeric, Uuid, Timestamp, Interval, Jsonb, Oid,
+            BoolArray, Int2Array, Int4Array, Int8Array, Float4Array, Float8Array,
+            TextArray, TimestamptzArray, TimestampArray, UuidArray, JsonbArray,
+        ])
     }
 
     /// Always returns `true`; each variant delegates to its inner type's

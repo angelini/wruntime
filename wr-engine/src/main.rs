@@ -7,6 +7,8 @@ use wr_engine::config::{self, EnvValue};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio_retry::strategy::FixedInterval;
+use tokio_retry::Retry;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -86,8 +88,30 @@ async fn async_main() -> Result<()> {
         });
     }
 
-    // ── Connect to proxy NodeService ───────────────────────────────────────
-    let mut client = NodeServiceClient::connect(config.node.control_address.clone()).await?;
+    // ── Connect to proxy NodeService (retry with backoff) ───────────────────
+    let mut client = {
+        use tokio_retry::strategy::ExponentialBackoff;
+        use tokio_retry::Retry;
+
+        let strategy = ExponentialBackoff::from_millis(200)
+            .max_delay(Duration::from_secs(5))
+            .take(10);
+        let addr = config.node.control_address.clone();
+        Retry::spawn(strategy, || {
+            let addr = addr.clone();
+            async move {
+                let c = NodeServiceClient::connect(addr).await?;
+                Ok::<_, tonic::transport::Error>(c)
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "failed to connect to proxy at {} after retries",
+                config.node.control_address
+            )
+        })?
+    };
 
     // Build module descriptors — only modules with a schema_path are registered
     // with the manager (runner modules without schemas are skipped).
@@ -119,9 +143,15 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    // ── Register with manager ─────────────────────────────────────────────
-    let reg_response = client
-        .register_engine(RegisterEngineRequest {
+    // ── Register with manager (retry with backoff) ─────────────────────────
+    let reg_response = {
+        use tokio_retry::strategy::ExponentialBackoff;
+        use tokio_retry::Retry;
+
+        let strategy = ExponentialBackoff::from_millis(500)
+            .max_delay(Duration::from_secs(5))
+            .take(10);
+        let req = RegisterEngineRequest {
             registration: Some(EngineRegistration {
                 engine_id: engine_id.clone(),
                 address: advertise_address.clone(),
@@ -129,17 +159,25 @@ async fn async_main() -> Result<()> {
                 modules: module_descriptors,
                 secrets: secret_requests,
             }),
+        };
+        let cl = client.clone();
+        Retry::spawn(strategy, || {
+            let req = req.clone();
+            let mut cl = cl.clone();
+            async move { cl.register_engine(req).await }
         })
-        .await?
-        .into_inner();
+        .await
+        .context("engine registration failed after retries")?
+        .into_inner()
+    };
     info!(address = %config.node.control_address, engine_id, "registered via proxy");
 
     // ── Resolve secrets into env vars per module ──────────────────────────
     // Build a lookup: (namespace, key) → plaintext value
-    let mut secrets_map: HashMap<(String, String), String> = HashMap::new();
+    let mut secrets_map: HashMap<(&str, &str), &str> = HashMap::new();
     for ns_secrets in &reg_response.secrets {
         for (key, value) in &ns_secrets.secrets {
-            secrets_map.insert((ns_secrets.namespace.clone(), key.clone()), value.clone());
+            secrets_map.insert((&ns_secrets.namespace, key), value);
         }
     }
 
@@ -154,14 +192,14 @@ async fn async_main() -> Result<()> {
                 }
                 EnvValue::Secret { secret: true } => {
                     let plaintext = secrets_map
-                        .get(&(module.namespace.clone(), key.clone()))
+                        .get(&(module.namespace.as_str(), key.as_str()))
                         .ok_or_else(|| {
                             anyhow::anyhow!(
                                 "secret '{key}' not found for namespace '{}'",
                                 module.namespace
                             )
                         })?;
-                    env.insert(key.clone(), plaintext.clone());
+                    env.insert(key.clone(), plaintext.to_string());
                 }
                 EnvValue::Secret { secret: false } => {}
             }
@@ -181,6 +219,7 @@ async fn async_main() -> Result<()> {
         let hb_id = engine_id.clone();
         let hb_registry = registry.clone();
         let hb_module_configs = config.modules.clone();
+        let hb_control_address = config.node.control_address.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3));
@@ -212,14 +251,29 @@ async fn async_main() -> Result<()> {
                     }
                 }
 
-                if let Err(e) = hb_client
-                    .heartbeat(HeartbeatRequest {
-                        engine_id: hb_id.clone(),
-                        healthy_modules: healthy,
-                    })
+                let hb_req = HeartbeatRequest {
+                    engine_id: hb_id.clone(),
+                    healthy_modules: healthy,
+                };
+                let strategy = FixedInterval::from_millis(50).take(2);
+                let sent = Retry::spawn(strategy, || {
+                    let mut c = hb_client.clone();
+                    let r = hb_req.clone();
+                    async move { c.heartbeat(r).await }
+                })
+                .await;
+                if let Err(e) = &sent {
+                    warn!(error = %e, "heartbeat failed after retries");
+                }
+                if sent.is_err() {
+                    // Connection may be stale — reconnect for next cycle.
+                    if let Ok(c) = NodeServiceClient::connect(
+                        hb_control_address.clone(),
+                    )
                     .await
-                {
-                    warn!(error = %e, "heartbeat failed");
+                    {
+                        hb_client = c;
+                    }
                 }
             }
         });

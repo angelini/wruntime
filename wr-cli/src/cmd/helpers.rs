@@ -37,14 +37,18 @@ pub fn parse_listen_address(config_path: &str) -> Result<String> {
 
 /// Run a command (given as a slice of args) and bail on failure.
 pub fn run_command(args: &[String]) -> Result<()> {
-    let status = Command::new(&args[0])
+    let output = Command::new(&args[0])
         .args(&args[1..])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .status()
+        .output()
         .with_context(|| format!("failed to run {}", args[0]))?;
-    if !status.success() {
-        bail!("{} failed with exit code {:?}", args[0], status.code());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            eprintln!("{stderr}");
+        }
+        bail!("{} failed with exit code {:?}", args[0], output.status.code());
     }
     Ok(())
 }
@@ -69,29 +73,7 @@ pub fn run_ssh(ssh_base: &[String], command: &str) -> Result<()> {
     run_command(&args)
 }
 
-/// Poll the manager until a new engine registers (count increases) or timeout.
-/// Returns `true` if a new engine was detected.
-pub async fn wait_for_engine_registration(
-    manager: &str,
-    initial_count: usize,
-    timeout: Duration,
-) -> bool {
-    use tokio_retry::strategy::FixedInterval;
-    use tokio_retry::Retry;
-
-    let strategy = FixedInterval::from_millis(2000).take(timeout.as_secs() as usize / 2);
-    Retry::spawn(strategy, || async {
-        if get_engine_count(manager).await > initial_count {
-            Ok(())
-        } else {
-            Err(())
-        }
-    })
-    .await
-    .is_ok()
-}
-
-/// Poll the manager until an engine at the given address registers or timeout.
+///Poll the manager until an engine at the given address registers or timeout.
 /// Returns `true` if the engine was detected.
 pub async fn wait_for_engine_at_address(
     manager: &str,
@@ -205,7 +187,7 @@ pub fn scp_file(
     run_command(&args)
 }
 
-/// Write content to a local temp file, SCP it to the remote, then clean up.
+/// Write content to a local temp file, SCP it to the remote, then sudo mv into place.
 pub fn scp_bytes(
     content: &[u8],
     remote: &str,
@@ -215,23 +197,49 @@ pub fn scp_bytes(
 ) -> Result<()> {
     let tmp = std::env::temp_dir().join(format!("wr-deploy-{}", std::process::id()));
     std::fs::write(&tmp, content).context("failed to write temp file")?;
+    let remote_tmp = format!("/tmp/wr-deploy-{}", std::process::id());
     let result = scp_file(
         &tmp.to_string_lossy(),
         remote,
-        remote_path,
+        &remote_tmp,
         ssh_key,
         ssh_port,
     );
     let _ = std::fs::remove_file(&tmp);
-    result
+    result?;
+    let ssh_base = build_ssh_args(remote, ssh_key, ssh_port);
+    run_ssh(&ssh_base, &format!("sudo mv {remote_tmp} {remote_path}"))
 }
 
-/// Get the current number of registered engines from the manager.
-pub async fn get_engine_count(manager: &str) -> usize {
-    if let Ok(mut client) = client::connect(manager).await {
-        if let Ok(resp) = client.list_engines(ListEnginesRequest {}).await {
-            return resp.into_inner().engines.len();
+/// Poll the manager until an engine serving all the given (namespace, name) modules
+/// is registered, or timeout. Works for both fresh deploys and re-deploys.
+pub async fn wait_for_modules(
+    manager: &str,
+    modules: &[(String, String)],
+    timeout: Duration,
+) -> bool {
+    use tokio_retry::strategy::FixedInterval;
+    use tokio_retry::Retry;
+
+    let strategy = FixedInterval::from_millis(2000).take(timeout.as_secs() as usize / 2);
+    Retry::spawn(strategy, || async {
+        if let Ok(mut client) = client::connect(manager).await {
+            if let Ok(resp) = client.list_engines(ListEnginesRequest {}).await {
+                let engines = resp.into_inner().engines;
+                let all_found = modules.iter().all(|(ns, name)| {
+                    engines.iter().any(|e| {
+                        e.modules
+                            .iter()
+                            .any(|m| m.namespace == *ns && m.name == *name)
+                    })
+                });
+                if all_found {
+                    return Ok(());
+                }
+            }
         }
-    }
-    0
+        Err(())
+    })
+    .await
+    .is_ok()
 }

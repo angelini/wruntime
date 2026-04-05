@@ -81,19 +81,23 @@ impl InventoryServiceClient {
         Self { authority: authority.into() }
     }
 
-    pub fn seed(&self, req: SeedRequest) -> Result<SeedResponse, String> {
+    pub fn seed(&self, req: SeedRequest) -> Result<SeedResponse, wr_sdk::http::HttpError> {
         let body = prost::Message::encode_to_vec(&req);
         let path = format!("/{}/Seed", self.authority);
-        let (status, resp_bytes) = wr_sdk::http::http_rpc(&self.authority, &path, &body)?;
-        if status != 200 {
-            return Err(format!("rpc error: HTTP {status}"));
-        }
-        prost::Message::decode(resp_bytes.as_slice()).map_err(|e| e.to_string())
+        wr_sdk::http::http_request(&wr_sdk::http::HttpRequest {
+            authority: &self.authority,
+            path: &path,
+            method: wr_sdk::http::Method::Post,
+            headers: &[("content-type", b"application/x-protobuf" as &[u8])],
+            body: &body,
+        })?
+        .error_for_status()?
+        .decode()
     }
 
-    pub fn buy(&self, req: BuyRequest) -> Result<BuyResponse, String> { /* same pattern */ }
-    pub fn get_stock(&self, req: GetStockRequest) -> Result<GetStockResponse, String> { /* ... */ }
-    pub fn r#return(&self, req: ReturnRequest) -> Result<ReturnResponse, String> { /* ... */ }
+    pub fn buy(&self, req: BuyRequest) -> Result<BuyResponse, wr_sdk::http::HttpError> { /* same pattern */ }
+    pub fn get_stock(&self, req: GetStockRequest) -> Result<GetStockResponse, wr_sdk::http::HttpError> { /* ... */ }
+    pub fn r#return(&self, req: ReturnRequest) -> Result<ReturnResponse, wr_sdk::http::HttpError> { /* ... */ }
 }
 ```
 
@@ -111,9 +115,9 @@ impl InventoryServiceClient {
 | Generator | Return type | Error type |
 |-----------|------------|------------|
 | `WrServiceGenerator` (trait) | `Result<Response, wr_sdk::ServiceError>` | `ServiceError { status, message }` |
-| `WrClientGenerator` (client) | `Result<Response, String>` | Plain `String` error message |
+| `WrClientGenerator` (client) | `Result<Response, wr_sdk::http::HttpError>` | `HttpError` enum |
 
-Client errors contain either a transport error string or `"rpc error: HTTP {status}"` for non-200 responses. Check `e.contains("HTTP 409")` etc. to distinguish error codes.
+Use `e.is_status(409)` to check for specific HTTP status codes. `HttpError` implements `Display` and `From<HttpError> for ServiceError` enables `?` propagation in handlers.
 
 ## WrCombinedGenerator output
 

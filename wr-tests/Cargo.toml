@@ -19,7 +19,7 @@ prost-types    = "0.14"
 serde          = { version = "1", features = ["derive"] }
 toml           = "0.8"
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
-wr-common      = { path = "../wr-common", features = ["http-pool"] }
+wr-common      = { path = "../wr-common", features = ["http-pool", "config"] }
 wr-engine      = { path = "../wr-engine" }
 wr-manager     = { path = "../wr-manager" }
 wr-proxy       = { path = "../wr-proxy" }
