@@ -69,7 +69,11 @@ pub fn run_command(args: &[String]) -> Result<()> {
         .with_context(|| format!("failed to run {}", args[0]))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!("exit code {:?}, stderr: {}", output.status.code(), stderr.trim());
+        debug!(
+            "exit code {:?}, stderr: {}",
+            output.status.code(),
+            stderr.trim()
+        );
         if !stderr.is_empty() {
             eprintln!("{stderr}");
         }
@@ -232,7 +236,10 @@ pub async fn wait_for_manager_ready(manager_addr: &str, timeout: Duration) -> bo
     use tokio_retry::strategy::FixedInterval;
     use tokio_retry::Retry;
 
-    debug!("polling manager at {manager_addr} (timeout {}s)", timeout.as_secs());
+    debug!(
+        "polling manager at {manager_addr} (timeout {}s)",
+        timeout.as_secs()
+    );
     let attempt = std::sync::atomic::AtomicU32::new(0);
     let strategy = FixedInterval::from_millis(2000).take(timeout.as_secs() as usize / 2);
     Retry::spawn(strategy, || {
@@ -407,7 +414,10 @@ pub async fn wait_for_modules(
     use tokio_retry::Retry;
 
     let expected: Vec<_> = modules.iter().map(|(ns, n)| format!("{ns}.{n}")).collect();
-    debug!("polling manager {manager} for modules: {expected:?} (timeout {}s)", timeout.as_secs());
+    debug!(
+        "polling manager {manager} for modules: {expected:?} (timeout {}s)",
+        timeout.as_secs()
+    );
     let attempt = std::sync::atomic::AtomicU32::new(0);
     let strategy = FixedInterval::from_millis(2000).take(timeout.as_secs() as usize / 2);
     Retry::spawn(strategy, || {

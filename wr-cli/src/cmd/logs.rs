@@ -104,12 +104,18 @@ pub fn build_journalctl_command(
     since: &str,
     follow: bool,
 ) -> String {
-    let unit = match service {
-        Some(s) => format!("-u {s}"),
-        None => "-u 'wr-*'".to_string(),
-    };
     let since_val = normalize_since(since);
-    let mut cmd = format!("sudo journalctl -q {unit} --since '{since_val}' -n {tail} --no-pager");
+    let mut cmd = match service {
+        Some(s) => {
+            format!("sudo journalctl -q -u {s} --since '{since_val}' -n {tail} --no-pager")
+        }
+        None => {
+            // Discover wr-* units dynamically to avoid journalctl glob issues
+            format!(
+                r#"units=$(systemctl list-units --plain --no-legend 'wr-*' | awk '{{printf "-u %s ", $1}}'); sudo journalctl -q $units --since '{since_val}' -n {tail} --no-pager"#
+            )
+        }
+    };
     if follow {
         cmd.push_str(" -f");
     }

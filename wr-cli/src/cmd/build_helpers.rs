@@ -6,6 +6,34 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use anyhow::{bail, Context, Result};
 use wasmtime::{Config, Engine};
 
+/// Raise the file descriptor soft limit to avoid `ProcessFdQuotaExceeded` during
+/// linking of large release binaries (wasmtime alone opens hundreds of `.rlib` files).
+/// macOS defaults to a soft limit of 256 which is not enough.
+pub fn raise_fd_limit() {
+    #[cfg(unix)]
+    {
+        use std::io;
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        unsafe {
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
+                let target = rlim.rlim_max.min(65536);
+                if rlim.rlim_cur < target {
+                    rlim.rlim_cur = target;
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) != 0 {
+                        eprintln!(
+                            "warning: failed to raise fd limit: {}",
+                            io::Error::last_os_error()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Minimal module config for build operations
 pub struct BuildModule {
     pub name: String,
@@ -122,6 +150,7 @@ pub fn build_wasm_modules(modules: &[BuildModule]) -> Result<()> {
 
 /// Cross-compile the manager binary for a given target triple
 pub fn build_manager_binary(target: &str) -> Result<()> {
+    raise_fd_limit();
     print!("[build]   wr-manager ({target}) ... ");
     let output = Command::new("cargo")
         .args([
@@ -176,6 +205,7 @@ pub fn precompile_components(modules: &[BuildModule], target: &str) -> Result<St
 
 /// Cross-compile host binaries for a given target triple
 pub fn build_host_binaries(target: &str) -> Result<()> {
+    raise_fd_limit();
     print!("[build]   host binaries ({target}) ... ");
     let output = Command::new("cargo")
         .args([

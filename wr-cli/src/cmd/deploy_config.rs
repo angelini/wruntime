@@ -37,6 +37,8 @@ pub struct DeployConfig {
     pub image_prefix: Option<String>,
     /// Gossip seed node addresses (manager deploy only)
     pub seed_nodes: Option<Vec<String>>,
+    /// Disable OpenTelemetry export in generated service units
+    pub no_otel: Option<bool>,
 }
 
 impl DeployConfig {
@@ -127,4 +129,18 @@ pub fn resolve_ssh_port(cli: Option<u16>, config: Option<u16>) -> Option<u16> {
             .ok()
             .and_then(|s| s.parse().ok())
     })
+}
+
+/// Resolve no_otel flag from CLI > config > env > default (false).
+pub fn resolve_no_otel(cli: bool, config: Option<bool>) -> bool {
+    if cli {
+        return true;
+    }
+    if let Some(v) = config {
+        return v;
+    }
+    std::env::var("WR_NO_OTEL")
+        .ok()
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }

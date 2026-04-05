@@ -174,6 +174,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         deploy_cfg.image_prefix,
         "WR_IMAGE_PREFIX",
     );
+    let no_otel = deploy_config::resolve_no_otel(args.no_otel, deploy_cfg.no_otel);
 
     let config = ManagerConfig::from_file(&args.manager_config)?;
     let output = args
@@ -218,7 +219,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
     )?;
 
     // Systemd unit
-    let service = generate_manager_service(&workdir, args.no_otel);
+    let service = generate_manager_service(&workdir, no_otel);
     tar_add_bytes(
         &mut tar,
         "wr-manager/systemd/wr-manager.service",
@@ -230,7 +231,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
     let listen_port = helpers::extract_port(&config.listen_address);
     let gossip_port = helpers::extract_port(&config.cluster.gossip_listen_address);
 
-    let dockerfile = generate_manager_dockerfile(&workdir, args.no_otel);
+    let dockerfile = generate_manager_dockerfile(&workdir, no_otel);
     tar_add_bytes(
         &mut tar,
         "wr-manager/docker/Dockerfile.manager",

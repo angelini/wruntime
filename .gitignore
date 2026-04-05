@@ -5,3 +5,4 @@ observability
 target
 wr-deploy.toml
 wr-manager-bundle.tar.gz
+wr-node-bundle.tar.gz

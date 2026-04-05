@@ -406,6 +406,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         deploy_cfg.image_prefix,
         "WR_IMAGE_PREFIX",
     );
+    let no_otel = deploy_config::resolve_no_otel(args.no_otel, deploy_cfg.no_otel);
 
     // Parse all engine configs
     let mut all_engine_configs: Vec<(String, EngineConfig)> = Vec::new();
@@ -510,7 +511,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
             proxy_port,
             control_port,
             engine_listen_ports: &engine_listen_ports,
-            no_otel: args.no_otel,
+            no_otel,
         },
     )?;
 
@@ -732,13 +733,7 @@ async fn deploy_systemd(
         let resolved = helpers::resolve_template(template, &user_vars)
             .with_context(|| format!("failed to resolve {archive_path}"))?;
         let remote_path = format!("{workdir}/{archive_path}");
-        helpers::scp_bytes(
-            resolved.as_bytes(),
-            remote,
-            &remote_path,
-            ssh_key,
-            ssh_port,
-        )?;
+        helpers::scp_bytes(resolved.as_bytes(), remote, &remote_path, ssh_key, ssh_port)?;
     }
     helpers::run_ssh(
         ssh_base,
