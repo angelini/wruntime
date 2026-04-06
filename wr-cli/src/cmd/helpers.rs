@@ -127,6 +127,42 @@ pub fn run_ssh_streaming(ssh_base: &[String], command: &str) -> Result<()> {
     Ok(())
 }
 
+/// Get the current timestamp from the remote host in `YYYY-MM-DD HH:MM:SS` format.
+/// Used to anchor log queries to the remote clock rather than the local one.
+pub fn get_remote_timestamp(ssh_base: &[String]) -> Result<String> {
+    let mut args = ssh_base.to_vec();
+    args.push("date '+%Y-%m-%d %H:%M:%S'".to_string());
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to get remote timestamp")?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Like `run_ssh_streaming` but ignores non-zero exit codes and prefixes each
+/// output line with `prefix` (e.g. journalctl returning 1 when no entries match).
+pub fn run_ssh_prefixed_best_effort(ssh_base: &[String], command: &str, prefix: &str) {
+    let mut args = ssh_base.to_vec();
+    args.push(command.to_string());
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    if let Ok(out) = output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            println!("{prefix}{line}");
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        for line in err.lines() {
+            eprintln!("{prefix}{line}");
+        }
+    }
+}
+
 /// Spawn an SSH command in the background, prefixing each stdout line with `prefix`.
 /// Returns a handle that kills the child and cancels the reader task on drop.
 pub fn spawn_ssh_prefixed(

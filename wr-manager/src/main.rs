@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod db;
 pub mod migrate;
 pub mod pool;
+pub mod scheduler;
 pub mod service;
 pub mod state;
 
@@ -103,6 +104,12 @@ async fn main() -> Result<()> {
         std::time::Duration::from_secs(5),
     ));
 
+    // Evaluate scheduled jobs
+    let scheduler_handle = tokio::spawn(scheduler::run_scheduler(
+        db_pool.clone(),
+        std::time::Duration::from_secs(10),
+    ));
+
     info!(address = %addr, "manager listening");
 
     let shutdown = wr_common::signal::shutdown_signal();
@@ -114,6 +121,7 @@ async fn main() -> Result<()> {
 
     // ── Graceful shutdown ─────────────────────────────────────────────────
     monitor_handle.abort();
+    scheduler_handle.abort();
 
     if let Err(e) = db::deregister_manager(&db_pool, &manager_id).await {
         warn!(error = %e, "failed to deregister manager");

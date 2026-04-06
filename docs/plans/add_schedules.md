@@ -2,17 +2,20 @@
 
 ## Context
 
-To replace the recurring-loop pattern that Run mode previously enabled, we add a Schedule feature. The manager owns schedule definitions, evaluates them on a timer, and submits jobs to engines via their existing `/wruntime.WorkerService/SubmitJob` HTTP/2 endpoint. Schedules are managed via gRPC (upsert, list, delete) and can be loaded from a standalone `schedules.toml` config file via the CLI.
+Replace the recurring-loop pattern with a Schedule feature. The manager owns schedule definitions, evaluates them on a background timer, and submits jobs to engines via their existing `/wruntime.WorkerService/SubmitJob` HTTP/2 endpoint (raw protobuf, not tonic gRPC). Schedules are managed via gRPC RPCs and a CLI subcommand, with optional deployment integration.
+
+**Multi-manager safety:** Each manager runs its own scheduler loop. `FOR UPDATE SKIP LOCKED` prevents double-firing — concurrent managers claim disjoint sets of due schedules.
 
 ---
 
 ## Design
 
-- **Schedule definitions** live in a standalone config file (`schedules.toml`) and are sent to the manager via new gRPC endpoints (Upsert, List, Delete).
-- **Manager owns evaluation**: a background task checks due schedules every N seconds and submits jobs to engines.
-- **Manager submits jobs** by calling the engine's existing `/wruntime.WorkerService/SubmitJob` HTTP/2 endpoint (protobuf body). Requires adding an HTTP client (`hyper`) to the manager.
+- **Schedule definitions** live in a standalone config file (`schedules.toml`) and are sent to the manager via gRPC RPCs (Upsert, List, Delete).
+- **Manager owns evaluation**: a background task checks due schedules every 10 seconds and submits jobs to engines.
+- **Manager submits jobs** by calling the engine's existing `/wruntime.WorkerService/SubmitJob` HTTP/2 endpoint (protobuf body). Uses a hyper HTTP/2 client.
 - **First fire** is configurable per schedule via an `immediate` boolean (default false).
-- Jobs land in the existing `wr__jobs.jobs` table and are processed by the existing worker pool — no changes to job infrastructure.
+- Jobs land in the existing `wr__jobs.jobs` table and are processed by the existing worker pool.
+- **Natural key** `(worker_namespace, worker_name, worker_version, job_type)` makes re-applying the same config idempotent.
 
 ## Schedule config format (`schedules.toml`)
 
@@ -31,115 +34,88 @@ max_attempts     = 3       # optional, default 3
 
 ## Proto changes (`proto/wruntime.proto`)
 
-Add new messages:
+Messages:
+- `Schedule` — full schedule representation with all fields
+- `UpsertScheduleRequest` — fields for creating/updating (uses natural key)
+- `UpsertScheduleResponse` — returns `schedule_id`
+- `DeleteScheduleRequest` — identifies by natural key
+- `ListSchedulesRequest` — optional `worker_namespace` filter
+- `ListSchedulesResponse` — list of `Schedule` messages
 
-```protobuf
-message Schedule {
-  string schedule_id       = 1;  // UUID, assigned by manager on create
-  string worker_namespace  = 2;
-  string worker_name       = 3;
-  string worker_version    = 4;
-  string job_type          = 5;
-  bytes  payload           = 6;
-  uint64 interval_secs     = 7;
-  bool   immediate         = 8;
-  int32  timeout_secs      = 9;
-  int32  max_attempts      = 10;
-  bool   enabled           = 11;
-}
+RPCs added to `ManagerService`:
+- `UpsertSchedule`
+- `DeleteSchedule`
+- `ListSchedules`
 
-message UpsertScheduleRequest  { Schedule schedule = 1; }
-message UpsertScheduleResponse { string schedule_id = 1; }
-message DeleteScheduleRequest  { string schedule_id = 1; }
-message DeleteScheduleResponse {}
-message ListSchedulesRequest   { string worker_namespace = 1; } // empty = all
-message ListSchedulesResponse  { repeated Schedule schedules = 1; }
-```
-
-Add RPCs to `ManagerService`:
-```protobuf
-rpc UpsertSchedule (UpsertScheduleRequest) returns (UpsertScheduleResponse);
-rpc DeleteSchedule (DeleteScheduleRequest) returns (DeleteScheduleResponse);
-rpc ListSchedules  (ListSchedulesRequest)  returns (ListSchedulesResponse);
-```
-
-## Manager DB migration (`migrations/V4__schedules.sql`)
+## Manager DB migration (`V5__schedules.sql`)
 
 ```sql
-CREATE TABLE wr_schedules (
-    schedule_id      TEXT PRIMARY KEY,
-    worker_namespace TEXT NOT NULL,
-    worker_name      TEXT NOT NULL,
-    worker_version   TEXT NOT NULL,
-    job_type         TEXT NOT NULL,
-    payload          BYTEA NOT NULL DEFAULT '',
-    interval_secs    BIGINT NOT NULL,
-    immediate        BOOLEAN NOT NULL DEFAULT FALSE,
-    timeout_secs     INT NOT NULL DEFAULT 300,
-    max_attempts     INT NOT NULL DEFAULT 3,
-    enabled          BOOLEAN NOT NULL DEFAULT TRUE,
-    last_fired_at    TIMESTAMPTZ,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS wr_schedules (
+    schedule_id       TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    worker_namespace  TEXT NOT NULL,
+    worker_name       TEXT NOT NULL,
+    worker_version    TEXT NOT NULL,
+    job_type          TEXT NOT NULL,
+    interval_secs     INT NOT NULL CHECK (interval_secs > 0),
+    immediate         BOOL NOT NULL DEFAULT FALSE,
+    payload           BYTEA NOT NULL DEFAULT ''::bytea,
+    timeout_secs      INT NOT NULL DEFAULT 300,
+    max_attempts      INT NOT NULL DEFAULT 3,
+    enabled           BOOL NOT NULL DEFAULT TRUE,
+    last_fired_at     TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (worker_namespace, worker_name, worker_version, job_type)
 );
 ```
 
-## Implementation steps
+## Implementation
 
-1. **`proto/wruntime.proto`** — Add Schedule messages and RPCs (above).
+### DB functions (`wr-manager/src/db.rs`)
 
-2. **`wr-manager/migrations/V4__schedules.sql`** — New migration file (above).
+- `upsert_schedule` — INSERT ON CONFLICT DO UPDATE, RETURNING schedule_id
+- `delete_schedule` — DELETE by natural key
+- `list_schedules` — SELECT with optional namespace filter
+- `claim_due_schedules(txn)` — SELECT ... FOR UPDATE SKIP LOCKED (multi-manager safe)
+- `mark_schedule_fired(txn, id)` — UPDATE last_fired_at = NOW()
+- `resolve_engine_for_worker` — find healthy engine from routing table
 
-3. **`wr-manager/src/migrate.rs`** — Add `V4_SQL` constant and entry in `MIGRATIONS` array.
+### Scheduler background task (`wr-manager/src/scheduler.rs`)
 
-4. **`wr-manager/src/db.rs`** — Add functions:
-   - `upsert_schedule(pool, schedule) -> Result<String>` — INSERT ... ON CONFLICT (schedule_id) DO UPDATE
-   - `delete_schedule(pool, schedule_id) -> Result<()>`
-   - `list_schedules(pool, namespace_filter) -> Result<Vec<Schedule>>`
-   - `get_due_schedules(pool) -> Result<Vec<Schedule>>` — `WHERE enabled = true AND (last_fired_at IS NULL OR last_fired_at + interval_secs * interval '1 second' <= now())`
-   - `mark_schedule_fired(pool, schedule_id) -> Result<()>` — `UPDATE ... SET last_fired_at = now()`
+Loop every 10s:
+1. Begin transaction
+2. `claim_due_schedules(&txn)` — locks due rows with SKIP LOCKED
+3. For each: resolve engine address, POST SubmitJobRequest via hyper HTTP/2
+4. On success: `mark_schedule_fired(&txn, id)`
+5. On failure: warn + skip (retries next tick)
+6. Commit transaction
 
-5. **`wr-manager/src/service.rs`** — Implement the three new RPCs: `upsert_schedule`, `delete_schedule`, `list_schedules`. Follow the existing secrets pattern.
+### CLI (`wr-cli/src/cmd/schedules.rs`)
 
-6. **`wr-manager/src/scheduler.rs`** (new) — Background task:
-   - Spawned in `main.rs` alongside `monitor_heartbeats`
-   - Loop on configurable interval (default 10s):
-     1. Call `db::get_due_schedules()`
-     2. For each due schedule, resolve a healthy engine address from the routing table
-     3. POST `SubmitJobRequest` protobuf to `http://{engine_address}/wruntime.WorkerService/SubmitJob` via hyper HTTP/2 client
-     4. On success, call `db::mark_schedule_fired()`
-     5. On failure, log warning and retry next tick
-   - For schedules with `immediate = true` and `last_fired_at IS NULL`, fire immediately on first evaluation
+- `wr schedules apply --file schedules.toml` — reads TOML, upserts each entry
+- `wr schedules list [--namespace X]` — table display
+- `wr schedules delete --namespace X --name Y --version Z --job-type T`
 
-7. **`wr-manager/src/config.rs`** — Add `scheduler_interval_secs` field (default 10).
+### Deployment integration
 
-8. **`wr-manager/src/main.rs`** — Spawn the scheduler background task.
+- `schedules_path` field in `wr-deploy.toml` (optional)
+- `wr node deploy` applies schedules automatically after engine registration when configured
 
-9. **`wr-manager/Cargo.toml`** — Add `hyper`, `hyper-util`, `http-body-util`, `bytes` dependencies for the HTTP/2 client.
+## Multi-manager behavior
 
-10. **`wr-cli/src/cmd/schedules.rs`** (new) — CLI subcommands:
-    - `wr schedules upsert --file schedules.toml` — reads file, calls UpsertSchedule for each entry
-    - `wr schedules list [--namespace X]` — calls ListSchedules
-    - `wr schedules delete <schedule_id>` — calls DeleteSchedule
-    - Follow the pattern in `wr-cli/src/cmd/secrets.rs`
-
-11. **`wr-cli/src/cmd/mod.rs`** + **`wr-cli/src/main.rs`** — Register the `schedules` subcommand.
+- Each manager spawns its own scheduler loop (10s interval)
+- `claim_due_schedules` uses `FOR UPDATE SKIP LOCKED` — only one manager fires each due schedule
+- If a manager crashes mid-transaction, the row lock is released and another manager picks it up next tick
+- No leader election needed — lock-free coordination via Postgres row locks
 
 ## Edge cases
 
 - **Overlapping jobs**: If a scheduled job is still running when the next interval fires, a new job is submitted. Workers handle this naturally (jobs queue as `pending`).
 - **No healthy engine**: If no engine hosts the target worker module, log warning and skip. Fires on next evaluation when an engine is available.
-- **Multiple managers**: `get_due_schedules` + `mark_schedule_fired` use `FOR UPDATE SKIP LOCKED` so concurrent managers don't double-fire.
-
-## Documentation updates
-
-- **`CLAUDE.md`** — Add schedule config format and CLI commands
-- **`README.md`** — Add schedules section showing config + CLI usage
-- **`docs/configuration.md`** — Document `schedules.toml` format
-- **`docs/agents/decision_matrix.md`** — Note that recurring tasks use Worker + Schedule
+- **Immediate flag**: Schedules with `immediate = true` and `last_fired_at IS NULL` fire on first evaluation.
 
 ## Verification
 
 - `just tidy` — compiles clean
 - `just test` — all tests pass
-- Manual test: `just dev-up`, start manager + engine with a worker module, `wr schedules upsert --file schedules.toml`, verify jobs appear in the DB on schedule
+- Manual test: `just dev-up`, start manager + engine with a worker module, `wr schedules apply --file schedules.toml`, verify jobs appear on schedule

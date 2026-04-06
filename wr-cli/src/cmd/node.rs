@@ -14,6 +14,7 @@ use super::build_helpers::{self, BuildModule};
 use super::config::EngineConfig;
 use super::deploy_config::{self, DeployConfig, DeployFormat};
 use super::helpers;
+use super::schedules::SchedulesFile;
 
 #[derive(Args)]
 pub struct NodeArgs {
@@ -637,6 +638,9 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     }
     println!("OK");
 
+    // Capture remote timestamp before restart to anchor the post-deploy log dump
+    let restart_timestamp = helpers::get_remote_timestamp(&ssh_base).unwrap_or_default();
+
     // Restart services so they pick up the resolved configs
     print!("[deploy]  restarting services ... ");
     match format {
@@ -679,7 +683,7 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
             super::logs::build_docker_logs_command(&manifest.workdir, None, 20, true)
         }
     };
-    let _log_tail = helpers::spawn_ssh_prefixed(&ssh_base, &log_cmd, "\t\t");
+    let _log_tail = helpers::spawn_ssh_prefixed(&ssh_base, &log_cmd, "\t");
 
     let registered = if expected_modules.is_empty() {
         true
@@ -693,9 +697,43 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
 
     if registered {
         println!("[deploy]  engine registered successfully");
+
+        // Apply schedules from config if present
+        if let Some(ref schedules_path) = deploy_cfg.schedules_path {
+            if std::path::Path::new(schedules_path).exists() {
+                println!("[deploy]  applying schedules from {schedules_path}...");
+                let content = std::fs::read_to_string(schedules_path)?;
+                let schedules_file: SchedulesFile = toml::from_str(&content)?;
+                super::schedules::apply_entries(manager, &schedules_file.schedule).await?;
+                println!(
+                    "[deploy]  {} schedule(s) applied.",
+                    schedules_file.schedule.len()
+                );
+            } else {
+                println!(
+                    "[deploy]  WARNING: schedules_path '{}' not found, skipping",
+                    schedules_path
+                );
+            }
+        }
     } else {
         println!("[deploy]  WARNING: engine did not register within 60 seconds");
         println!("          check remote logs for errors");
+    }
+
+    // Dump all startup logs from the deploy window (catches fast starts the tail missed)
+    if !restart_timestamp.is_empty() {
+        println!();
+        println!("[deploy]  startup logs:");
+        let dump_cmd = match format {
+            DeployFormat::Systemd => {
+                super::logs::build_journalctl_command_absolute(None, 200, &restart_timestamp, false)
+            }
+            DeployFormat::Docker => {
+                super::logs::build_docker_logs_command(&manifest.workdir, None, 200, false)
+            }
+        };
+        helpers::run_ssh_prefixed_best_effort(&ssh_base, &dump_cmd, "\t");
     }
 
     Ok(())

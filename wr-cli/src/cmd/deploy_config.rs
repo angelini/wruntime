@@ -39,6 +39,8 @@ pub struct DeployConfig {
     pub seed_nodes: Option<Vec<String>>,
     /// Disable OpenTelemetry export in generated service units
     pub no_otel: Option<bool>,
+    /// Path to schedules TOML file for post-deploy apply
+    pub schedules_path: Option<String>,
 }
 
 impl DeployConfig {

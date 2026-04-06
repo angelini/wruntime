@@ -123,6 +123,49 @@ message GetJobStatusResponse {
   int32  max_attempts  = 6;
 }
 
+// ── Schedules ────────────────────────────────────────────────────────────
+
+message Schedule {
+  string schedule_id       = 1;
+  string worker_namespace  = 2;
+  string worker_name       = 3;
+  string worker_version    = 4;
+  string job_type          = 5;
+  int32  interval_secs     = 6;
+  bool   immediate         = 7;
+  bytes  payload           = 8;
+  int32  timeout_secs      = 9;
+  int32  max_attempts      = 10;
+  bool   enabled           = 11;
+  string last_fired_at     = 12; // RFC 3339 or empty
+}
+
+message UpsertScheduleRequest {
+  string worker_namespace  = 1;
+  string worker_name       = 2;
+  string worker_version    = 3;
+  string job_type          = 4;
+  int32  interval_secs     = 5;
+  bool   immediate         = 6;
+  bytes  payload           = 7;
+  int32  timeout_secs      = 8;
+  int32  max_attempts      = 9;
+}
+
+message UpsertScheduleResponse { string schedule_id = 1; }
+
+message DeleteScheduleRequest {
+  string worker_namespace = 1;
+  string worker_name      = 2;
+  string worker_version   = 3;
+  string job_type         = 4;
+}
+
+message DeleteScheduleResponse {}
+
+message ListSchedulesRequest  { string worker_namespace = 1; }
+message ListSchedulesResponse { repeated Schedule schedules = 1; }
+
 // ── NodeService ──────────────────────────────────────────────────────────
 // Local gRPC service exposed by wr-proxy for engines on the same node.
 // Engines use this instead of connecting directly to wr-manager.
@@ -157,4 +200,9 @@ service ManagerService {
   rpc SetSecret         (SetSecretRequest)         returns (SetSecretResponse);
   rpc DeleteSecret      (DeleteSecretRequest)      returns (DeleteSecretResponse);
   rpc ListSecrets       (ListSecretsRequest)       returns (ListSecretsResponse);
+
+  // Schedules
+  rpc UpsertSchedule    (UpsertScheduleRequest)    returns (UpsertScheduleResponse);
+  rpc DeleteSchedule    (DeleteScheduleRequest)    returns (DeleteScheduleResponse);
+  rpc ListSchedules     (ListSchedulesRequest)     returns (ListSchedulesResponse);
 }

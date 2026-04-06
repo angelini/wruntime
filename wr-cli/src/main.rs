@@ -36,6 +36,8 @@ enum Commands {
     Metrics(cmd::metrics::MetricsArgs),
     /// Send an HTTP request through the proxy to a module
     Invoke(cmd::invoke::InvokeArgs),
+    /// Manage scheduled jobs
+    Schedules(cmd::schedules::SchedulesArgs),
     /// Manage namespace-scoped secrets
     Secrets(cmd::secrets::SecretsArgs),
     /// Remote node deployment (init, bundle, deploy, status)
@@ -65,6 +67,9 @@ async fn main() -> Result<()> {
         Commands::Services(args) => cmd::services::run(args, require_manager(&cli.manager)?).await,
         Commands::Metrics(args) => cmd::metrics::run(args).await,
         Commands::Invoke(args) => cmd::invoke::run(args, require_manager(&cli.manager)?).await,
+        Commands::Schedules(args) => {
+            cmd::schedules::run(args, require_manager(&cli.manager)?).await
+        }
         Commands::Secrets(args) => cmd::secrets::run(args, require_manager(&cli.manager)?).await,
         Commands::Node(args) => cmd::node::run(args, cli.manager.as_deref()).await,
         Commands::Logs(args) => cmd::logs::run(args).await,

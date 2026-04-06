@@ -414,6 +414,9 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     .context("failed to upload resolved manager.toml")?;
     println!("OK");
 
+    // Capture remote timestamp before restart to anchor the post-deploy log dump
+    let restart_timestamp = helpers::get_remote_timestamp(&ssh_base).unwrap_or_default();
+
     // Restart service so it picks up the resolved config
     print!("[deploy]  restarting service ... ");
     match format {
@@ -446,7 +449,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
             format!("docker compose -f {compose} logs --tail 20 -f")
         }
     };
-    let _log_tail = helpers::spawn_ssh_prefixed(&ssh_base, &log_cmd, "\t\t");
+    let _log_tail = helpers::spawn_ssh_prefixed(&ssh_base, &log_cmd, "\t");
 
     let ready = helpers::wait_for_manager_ready(&manager_addr, Duration::from_secs(60)).await;
 
@@ -458,6 +461,25 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     } else {
         println!("[deploy]  WARNING: manager did not respond within 60 seconds");
         println!("          check remote logs for errors");
+    }
+
+    // Dump all startup logs from the deploy window (catches fast starts the tail missed)
+    if !restart_timestamp.is_empty() {
+        println!();
+        println!("[deploy]  startup logs:");
+        let dump_cmd = match format {
+            DeployFormat::Systemd => super::logs::build_journalctl_command_absolute(
+                Some("wr-manager"),
+                200,
+                &restart_timestamp,
+                false,
+            ),
+            DeployFormat::Docker => {
+                let compose = format!("{}/wr-manager/docker/docker-compose.yml", manifest.workdir);
+                format!("docker compose -f {compose} logs --tail 200")
+            }
+        };
+        helpers::run_ssh_prefixed_best_effort(&ssh_base, &dump_cmd, "\t");
     }
 
     Ok(())

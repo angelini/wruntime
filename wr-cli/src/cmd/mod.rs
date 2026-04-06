@@ -10,5 +10,6 @@ pub mod logs;
 pub mod managers;
 pub mod metrics;
 pub mod node;
+pub mod schedules;
 pub mod secrets;
 pub mod services;

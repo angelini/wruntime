@@ -19,3 +19,16 @@ The `wr-tests` crate contains integration tests that spin up in-process instance
 - Failover: deregistering an instance immediately redirects traffic to remaining healthy instances
 - Full failure: 503 when all instances are unhealthy
 - Cross-node routing: request originating on Node A is relayed to Node B's proxy when the destination engine lives on Node B; schema validation is skipped on the second hop (`x-wr-via-proxy`)
+
+## Dev Infrastructure
+
+Docker Compose provides Postgres, Grafana/LGTM, and RustFS S3 for local development and testing:
+
+```bash
+just dev-up                  # start all dev services
+just dev-down                # stop all dev services
+just dev-logs                # tail logs from all services
+just dev-logs postgres       # tail logs from a single service
+just dev-ps                  # show running container status
+just dev-reset-db            # drop all module schemas, manager tables, and migration history
+```

@@ -7,12 +7,14 @@ use tracing::info;
 
 use wr_common::wruntime::{
     manager_service_server::ManagerService, DeleteRoutingRuleRequest, DeleteRoutingRuleResponse,
-    DeleteSecretRequest, DeleteSecretResponse, DeregisterEngineRequest, DeregisterEngineResponse,
-    GetRoutingTableRequest, GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse,
-    HeartbeatRequest, HeartbeatResponse, ListEnginesRequest, ListEnginesResponse,
-    ListManagersRequest, ListManagersResponse, ListSecretsRequest, ListSecretsResponse,
-    ManagerInfo, NamespaceSecrets, RegisterEngineRequest, RegisterEngineResponse, RoutingRule,
-    SecretEntry, SetSecretRequest, SetSecretResponse, UpsertRoutingRuleResponse,
+    DeleteScheduleRequest, DeleteScheduleResponse, DeleteSecretRequest, DeleteSecretResponse,
+    DeregisterEngineRequest, DeregisterEngineResponse, GetRoutingTableRequest,
+    GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse, HeartbeatRequest,
+    HeartbeatResponse, ListEnginesRequest, ListEnginesResponse, ListManagersRequest,
+    ListManagersResponse, ListSchedulesRequest, ListSchedulesResponse, ListSecretsRequest,
+    ListSecretsResponse, ManagerInfo, NamespaceSecrets, RegisterEngineRequest,
+    RegisterEngineResponse, RoutingRule, Schedule, SecretEntry, SetSecretRequest,
+    SetSecretResponse, UpsertRoutingRuleResponse, UpsertScheduleRequest, UpsertScheduleResponse,
 };
 
 use crate::crypto::SecretCrypto;
@@ -288,5 +290,106 @@ impl ManagerService for Manager {
             .map(|(namespace, key)| SecretEntry { namespace, key })
             .collect();
         Ok(Response::new(ListSecretsResponse { secrets }))
+    }
+
+    // ── Schedules ──────────────────────────────────────────────────────────
+
+    async fn upsert_schedule(
+        &self,
+        request: Request<UpsertScheduleRequest>,
+    ) -> Result<Response<UpsertScheduleResponse>, Status> {
+        let req = request.into_inner();
+        if req.worker_namespace.is_empty()
+            || req.worker_name.is_empty()
+            || req.worker_version.is_empty()
+            || req.job_type.is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "worker_namespace, worker_name, worker_version, and job_type are required",
+            ));
+        }
+        if req.interval_secs <= 0 {
+            return Err(Status::invalid_argument("interval_secs must be > 0"));
+        }
+
+        let schedule_id = db::upsert_schedule(
+            &self.pool,
+            &req.worker_namespace,
+            &req.worker_name,
+            &req.worker_version,
+            &req.job_type,
+            req.interval_secs,
+            req.immediate,
+            &req.payload,
+            req.timeout_secs,
+            req.max_attempts,
+        )
+        .await?;
+
+        info!(
+            schedule_id,
+            worker = %format!("{}/{}/{}", req.worker_namespace, req.worker_name, req.worker_version),
+            job_type = %req.job_type,
+            "schedule upserted"
+        );
+        Ok(Response::new(UpsertScheduleResponse { schedule_id }))
+    }
+
+    async fn delete_schedule(
+        &self,
+        request: Request<DeleteScheduleRequest>,
+    ) -> Result<Response<DeleteScheduleResponse>, Status> {
+        let req = request.into_inner();
+        if req.worker_namespace.is_empty()
+            || req.worker_name.is_empty()
+            || req.worker_version.is_empty()
+            || req.job_type.is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "worker_namespace, worker_name, worker_version, and job_type are required",
+            ));
+        }
+
+        db::delete_schedule(
+            &self.pool,
+            &req.worker_namespace,
+            &req.worker_name,
+            &req.worker_version,
+            &req.job_type,
+        )
+        .await?;
+
+        info!(
+            worker_namespace = %req.worker_namespace,
+            job_type = %req.job_type,
+            "schedule deleted"
+        );
+        Ok(Response::new(DeleteScheduleResponse {}))
+    }
+
+    async fn list_schedules(
+        &self,
+        request: Request<ListSchedulesRequest>,
+    ) -> Result<Response<ListSchedulesResponse>, Status> {
+        let req = request.into_inner();
+        let rows = db::list_schedules(&self.pool, &req.worker_namespace).await?;
+        let schedules = rows
+            .into_iter()
+            .map(|r| Schedule {
+                schedule_id: r.schedule_id,
+                worker_namespace: r.worker_namespace,
+                worker_name: r.worker_name,
+                worker_version: r.worker_version,
+                job_type: r.job_type,
+                interval_secs: r.interval_secs,
+                immediate: r.immediate,
+                payload: r.payload,
+                timeout_secs: r.timeout_secs,
+                max_attempts: r.max_attempts,
+                enabled: r.enabled,
+                last_fired_at: r.last_fired_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
+            })
+            .collect();
+        Ok(Response::new(ListSchedulesResponse { schedules }))
     }
 }

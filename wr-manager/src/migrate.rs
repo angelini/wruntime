@@ -5,8 +5,15 @@ const V1_SQL: &str = include_str!("../migrations/V1__initial.sql");
 const V2_SQL: &str = include_str!("../migrations/V2__secrets.sql");
 const V3_SQL: &str = include_str!("../migrations/V3__managers.sql");
 const V4_SQL: &str = include_str!("../migrations/V4__engine_heartbeats.sql");
+const V5_SQL: &str = include_str!("../migrations/V5__schedules.sql");
 
-const MIGRATIONS: &[(i32, &str)] = &[(1, V1_SQL), (2, V2_SQL), (3, V3_SQL), (4, V4_SQL)];
+const MIGRATIONS: &[(i32, &str)] = &[
+    (1, V1_SQL),
+    (2, V2_SQL),
+    (3, V3_SQL),
+    (4, V4_SQL),
+    (5, V5_SQL),
+];
 
 /// Run all pending manager migrations.
 ///

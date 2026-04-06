@@ -614,3 +614,207 @@ pub async fn get_schema(
         })?;
     Ok(row.get(0))
 }
+
+// ── Schedule operations ────────────────────────────────────────────────────
+
+pub struct ScheduleRow {
+    pub schedule_id: String,
+    pub worker_namespace: String,
+    pub worker_name: String,
+    pub worker_version: String,
+    pub job_type: String,
+    pub interval_secs: i32,
+    pub immediate: bool,
+    pub payload: Vec<u8>,
+    pub timeout_secs: i32,
+    pub max_attempts: i32,
+    pub enabled: bool,
+    pub last_fired_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn row_to_schedule(row: &tokio_postgres::Row) -> ScheduleRow {
+    ScheduleRow {
+        schedule_id: row.get(0),
+        worker_namespace: row.get(1),
+        worker_name: row.get(2),
+        worker_version: row.get(3),
+        job_type: row.get(4),
+        interval_secs: row.get(5),
+        immediate: row.get(6),
+        payload: row.get(7),
+        timeout_secs: row.get(8),
+        max_attempts: row.get(9),
+        enabled: row.get(10),
+        last_fired_at: row.get(11),
+    }
+}
+
+/// Upsert a schedule by its natural key (namespace, name, version, job_type).
+/// Returns the schedule_id.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_schedule(
+    pool: &Pool,
+    worker_namespace: &str,
+    worker_name: &str,
+    worker_version: &str,
+    job_type: &str,
+    interval_secs: i32,
+    immediate: bool,
+    payload: &[u8],
+    timeout_secs: i32,
+    max_attempts: i32,
+) -> Result<String, Status> {
+    let client = pool.get().await.internal()?;
+    let row = client
+        .query_one(
+            "INSERT INTO wr_schedules
+                (worker_namespace, worker_name, worker_version, job_type,
+                 interval_secs, immediate, payload, timeout_secs, max_attempts, enabled)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
+             ON CONFLICT (worker_namespace, worker_name, worker_version, job_type)
+             DO UPDATE SET
+                interval_secs = EXCLUDED.interval_secs,
+                immediate     = EXCLUDED.immediate,
+                payload       = EXCLUDED.payload,
+                timeout_secs  = EXCLUDED.timeout_secs,
+                max_attempts  = EXCLUDED.max_attempts,
+                enabled       = TRUE,
+                updated_at    = NOW()
+             RETURNING schedule_id",
+            &[
+                &worker_namespace,
+                &worker_name,
+                &worker_version,
+                &job_type,
+                &interval_secs,
+                &immediate,
+                &payload,
+                &timeout_secs,
+                &max_attempts,
+            ],
+        )
+        .await
+        .internal()?;
+    Ok(row.get(0))
+}
+
+/// Delete a schedule by natural key. Returns true if a row was deleted.
+pub async fn delete_schedule(
+    pool: &Pool,
+    worker_namespace: &str,
+    worker_name: &str,
+    worker_version: &str,
+    job_type: &str,
+) -> Result<bool, Status> {
+    let client = pool.get().await.internal()?;
+    let deleted = client
+        .execute(
+            "DELETE FROM wr_schedules
+             WHERE worker_namespace = $1 AND worker_name = $2
+               AND worker_version = $3 AND job_type = $4",
+            &[&worker_namespace, &worker_name, &worker_version, &job_type],
+        )
+        .await
+        .internal()?;
+    Ok(deleted > 0)
+}
+
+/// List schedules, optionally filtered by namespace. Empty namespace returns all.
+pub async fn list_schedules(
+    pool: &Pool,
+    worker_namespace: &str,
+) -> Result<Vec<ScheduleRow>, Status> {
+    let client = pool.get().await.internal()?;
+    let rows = if worker_namespace.is_empty() {
+        client
+            .query(
+                "SELECT schedule_id, worker_namespace, worker_name, worker_version,
+                        job_type, interval_secs, immediate, payload, timeout_secs,
+                        max_attempts, enabled, last_fired_at
+                 FROM wr_schedules
+                 ORDER BY worker_namespace, worker_name, job_type",
+                &[],
+            )
+            .await
+            .internal()?
+    } else {
+        client
+            .query(
+                "SELECT schedule_id, worker_namespace, worker_name, worker_version,
+                        job_type, interval_secs, immediate, payload, timeout_secs,
+                        max_attempts, enabled, last_fired_at
+                 FROM wr_schedules
+                 WHERE worker_namespace = $1
+                 ORDER BY worker_name, job_type",
+                &[&worker_namespace],
+            )
+            .await
+            .internal()?
+    };
+    Ok(rows.iter().map(row_to_schedule).collect())
+}
+
+/// Claim due schedules using FOR UPDATE SKIP LOCKED for multi-manager safety.
+/// Must be called within a transaction — the caller commits after processing.
+pub async fn claim_due_schedules(
+    txn: &deadpool_postgres::Transaction<'_>,
+) -> Result<Vec<ScheduleRow>, Status> {
+    let rows = txn
+        .query(
+            "SELECT schedule_id, worker_namespace, worker_name, worker_version,
+                    job_type, interval_secs, immediate, payload, timeout_secs,
+                    max_attempts, enabled, last_fired_at
+             FROM wr_schedules
+             WHERE enabled = TRUE
+               AND (
+                 (last_fired_at IS NULL AND immediate = TRUE)
+                 OR (last_fired_at IS NULL AND immediate = FALSE
+                     AND created_at + make_interval(secs => interval_secs::double precision) <= NOW())
+                 OR (last_fired_at IS NOT NULL
+                     AND last_fired_at + make_interval(secs => interval_secs::double precision) <= NOW())
+               )
+             FOR UPDATE SKIP LOCKED",
+            &[],
+        )
+        .await
+        .internal()?;
+    Ok(rows.iter().map(row_to_schedule).collect())
+}
+
+/// Mark a schedule as fired (set last_fired_at = NOW()).
+pub async fn mark_schedule_fired(
+    txn: &deadpool_postgres::Transaction<'_>,
+    schedule_id: &str,
+) -> Result<(), Status> {
+    txn.execute(
+        "UPDATE wr_schedules SET last_fired_at = NOW(), updated_at = NOW()
+         WHERE schedule_id = $1",
+        &[&schedule_id],
+    )
+    .await
+    .internal()?;
+    Ok(())
+}
+
+/// Resolve a healthy engine address for a given worker module.
+pub async fn resolve_engine_for_worker(
+    pool: &Pool,
+    worker_namespace: &str,
+    worker_name: &str,
+    worker_version: &str,
+) -> Result<Option<String>, Status> {
+    let client = pool.get().await.internal()?;
+    let row = client
+        .query_opt(
+            "SELECT engine_address FROM wr_routing_rules
+             WHERE destination_namespace = $1
+               AND destination_module = $2
+               AND destination_version = $3
+               AND healthy = TRUE
+             LIMIT 1",
+            &[&worker_namespace, &worker_name, &worker_version],
+        )
+        .await
+        .internal()?;
+    Ok(row.map(|r| r.get(0)))
+}

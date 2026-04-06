@@ -105,6 +105,26 @@ pub fn build_journalctl_command(
     follow: bool,
 ) -> String {
     let since_val = normalize_since(since);
+    build_journalctl_command_raw(service, tail, &since_val, follow)
+}
+
+/// Build a journalctl command using an absolute `--since` value (no normalization).
+/// Useful when passing a pre-formatted timestamp like `"2026-04-06 12:00:00"`.
+pub fn build_journalctl_command_absolute(
+    service: Option<&str>,
+    tail: u32,
+    since: &str,
+    follow: bool,
+) -> String {
+    build_journalctl_command_raw(service, tail, since, follow)
+}
+
+fn build_journalctl_command_raw(
+    service: Option<&str>,
+    tail: u32,
+    since_val: &str,
+    follow: bool,
+) -> String {
     let mut cmd = match service {
         Some(s) => {
             format!("sudo journalctl -q -u {s} --since '{since_val}' -n {tail} --no-pager")

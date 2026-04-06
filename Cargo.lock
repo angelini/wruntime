@@ -545,6 +545,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link 0.2.1",
 ]
@@ -5546,9 +5547,15 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "bytes",
  "chitchat",
+ "chrono",
  "deadpool-postgres",
  "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "prost",
  "serde",
  "tokio",

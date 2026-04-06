@@ -22,6 +22,7 @@ cargo install cargo-zigbuild
 | `wr node bundle` | Package proxy + engine binaries, WASM modules, and schemas |
 | `wr node deploy` | Push node bundle to a remote host and start services |
 | `wr node status` | Inspect a node bundle without deploying |
+| `wr logs node` | View logs from services on a remote node (systemd or Docker) |
 
 ## Bundle structure
 
@@ -306,3 +307,29 @@ wr-cli node status myapp.tar.gz
 ```
 
 Prints: target triple, workdir, modules, template variables, config files, and checksums.
+
+## Viewing logs
+
+Stream logs from remote nodes over SSH:
+
+```bash
+# All services on a systemd node
+wr-cli logs node deploy@10.0.1.50 --format systemd
+
+# Single service, follow mode
+wr-cli logs node deploy@10.0.1.50 --format systemd --service wr-proxy --follow
+
+# Docker node, last 50 lines from the last hour
+wr-cli logs node deploy@10.0.1.50 --format docker --tail 50 --since 1h
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--format` | — | `systemd` or `docker` (required) |
+| `--service` | all wr-* units | Filter to a specific service (e.g. `wr-proxy`, `wr-engine-inventory`) |
+| `--tail` | `100` | Number of recent log lines to show |
+| `--since` | `5m` | Lookback window, e.g. `5m`, `1h` (systemd only) |
+| `--follow` | off | Stream new lines as they arrive |
+| `--workdir` | `/opt/wruntime` | Base directory for installed files |
+| `--ssh-key` | — | SSH private key path |
+| `--ssh-port` | — | SSH port |
