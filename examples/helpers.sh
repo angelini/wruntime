@@ -23,7 +23,18 @@ S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:8900}"
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-rustfsadmin}"
 export RUST_LOG="${RUST_LOG:-info}"
-export WR_MANAGER="${WR_MANAGER:-http://127.0.0.1:9000}"
+export WR_MANAGER="${WR_MANAGER:-https://127.0.0.1:9000}"
+export WR_CA_CERT="${WR_CA_CERT:-certs/ca.crt}"
+export WR_CLIENT_CERT="${WR_CLIENT_CERT:-certs/127.0.0.1.crt}"
+export WR_CLIENT_KEY="${WR_CLIENT_KEY:-certs/127.0.0.1.key}"
+
+# ── Generate TLS certificates if missing ─────────────────────────────────────
+if [ ! -f certs/ca.crt ]; then
+    echo "==> Generating TLS certificates..."
+    ./target/debug/wr-cli cert init-ca --output certs/
+    ./target/debug/wr-cli cert generate 127.0.0.1 --ca-dir certs/
+    ./target/debug/wr-cli cert generate manager --ca-dir certs/
+fi
 
 # ── Kill stale processes ─────────────────────────────────────────────────────
 # Usage: kill_stale_ports 9000 9001 9100 9101

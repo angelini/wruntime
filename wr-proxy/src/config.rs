@@ -130,6 +130,19 @@ impl ProxyConfig {
             !self.node.proxy_address.is_empty(),
             "node.proxy_address is required",
         );
+        v.check(self.node.peer_port > 0, "node.peer_port must be > 0");
+        v.check(
+            !self.node.tls.cert_path.is_empty(),
+            "node.tls.cert_path is required",
+        );
+        v.check(
+            !self.node.tls.key_path.is_empty(),
+            "node.tls.key_path is required",
+        );
+        v.check(
+            !self.node.tls.ca_cert_path.is_empty(),
+            "node.tls.ca_cert_path is required",
+        );
         v.check(
             self.cache.routing_table_ttl_secs > 0,
             "cache.routing_table_ttl_secs must be > 0",

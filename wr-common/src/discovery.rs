@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use deadpool_postgres::Pool;
 use rand::seq::SliceRandom;
 use tokio::sync::RwLock;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tracing::warn;
 
 use crate::wruntime::manager_service_client::ManagerServiceClient;
@@ -22,16 +22,18 @@ pub struct ManagerDiscovery {
     pool: Pool,
     managers: RwLock<Vec<String>>,
     affinity: RwLock<Option<AffinityState>>,
+    tls_config: Option<ClientTlsConfig>,
 }
 
 impl ManagerDiscovery {
     const AFFINITY_DURATION: Duration = Duration::from_secs(120);
 
-    pub fn new(pool: Pool) -> Self {
+    pub fn new(pool: Pool, tls_config: Option<ClientTlsConfig>) -> Self {
         Self {
             pool,
             managers: RwLock::new(Vec::new()),
             affinity: RwLock::new(None),
+            tls_config,
         }
     }
 
@@ -106,13 +108,24 @@ impl ManagerDiscovery {
         drop(managers);
         shuffled.shuffle(&mut rand::rng());
 
-        let mut last_err = None;
+        let mut last_err: Option<String> = None;
         for addr in &shuffled {
-            match ManagerServiceClient::connect(addr.clone()).await {
+            let result = match &self.tls_config {
+                Some(tls) => {
+                    let ep = Endpoint::from_shared(addr.clone())
+                        .and_then(|ep| ep.tls_config(tls.clone()));
+                    match ep {
+                        Ok(ep) => ep.connect().await.map(ManagerServiceClient::new),
+                        Err(e) => Err(e),
+                    }
+                }
+                None => ManagerServiceClient::connect(addr.clone()).await,
+            };
+            match result {
                 Ok(client) => return Ok(client),
                 Err(e) => {
                     warn!(address = %addr, error = %e, "manager connection failed, trying next");
-                    last_err = Some(e);
+                    last_err = Some(e.to_string());
                 }
             }
         }
@@ -120,9 +133,7 @@ impl ManagerDiscovery {
         Err(tonic::Status::unavailable(format!(
             "all {} managers unreachable: {}",
             shuffled.len(),
-            last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "unknown".into()),
+            last_err.unwrap_or_else(|| "unknown".into()),
         )))
     }
 

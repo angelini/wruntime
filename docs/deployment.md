@@ -85,6 +85,8 @@ db_url     = "postgres://postgres@10.0.1.1:5432/wruntime"
 secret_key = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 ssh_key    = "~/.ssh/deploy_key"
 seed_nodes = ["10.0.1.11:9010", "10.0.1.12:9010"]
+cert_dir   = "./certs"    # CA + node certs from `wr cert`
+peer_port  = 9443         # mTLS peer listener port
 # guest_db_url = "postgres://wr_guest:pass@10.0.1.1:5432/wruntime"
 # ssh_port     = 22
 # image_prefix = "wr"
@@ -105,6 +107,8 @@ All fields are optional. Fields that only apply to specific commands (e.g. `secr
 | `--target` | `WR_TARGET` | `x86_64-unknown-linux-gnu` |
 | `--advertise-address` | `WR_ADVERTISE_ADDRESS` | derived from remote host |
 | `--manager` | `WR_MANAGER` | — |
+| `--cert-dir` | `WR_CERT_DIR` | — |
+| `--peer-port` | `WR_PEER_PORT` | `9443` |
 
 ## Template variables
 
@@ -116,6 +120,7 @@ Config files use placeholders that are resolved at deploy time:
 | `{guest_db_url}` | `--guest-db-url` / `WR_GUEST_DB_URL` / config | engine config (module DB access) |
 | `{host}` | deploy target (`user@host`) | proxy/engine `[node]` addresses |
 | `{secret_key}` | `--secret-key` / `WR_SECRET_KEY` / config | manager systemd unit / Dockerfile |
+| `{peer_port}` | `--peer-port` / `WR_PEER_PORT` / config (default: 9443) | proxy config (`peer_port`) |
 | `{advertise_address}` | `--advertise-address` / `WR_ADVERTISE_ADDRESS` (auto-derived from remote host if omitted) | manager config (`advertise_grpc_address`) |
 
 Unresolved placeholders cause deployment to fail.
@@ -239,6 +244,24 @@ wr-cli node deploy myapp.tar.gz deploy@10.0.1.50 --format docker
 tar xzf myapp.tar.gz
 cd wr-node && docker compose -f docker/docker-compose.yml up -d
 ```
+
+## TLS certificates
+
+All inter-service communication uses mTLS. Generate certificates before deployment:
+
+```bash
+# 1. Create a CA (once per cluster)
+wr-cli cert init-ca --output ./certs/
+
+# 2. Generate per-node certificates (hostname must match the deploy target IP)
+wr-cli cert generate 10.0.1.1 --ca-dir ./certs/    # manager
+wr-cli cert generate 10.0.1.50 --ca-dir ./certs/   # node A
+wr-cli cert generate 10.0.1.51 --ca-dir ./certs/   # node B
+```
+
+During `node deploy`, pass `--cert-dir ./certs/` (or set `cert_dir` in `wr-deploy.toml`). The deploy command SCPs `ca.crt`, `<host>.crt`, and `<host>.key` to `{workdir}/wr-node/certs/` on the remote host. The bundled proxy config references these paths.
+
+For local development, run `just certs` to generate a CA and localhost certificates.
 
 ## Remote host requirements
 

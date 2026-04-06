@@ -5,7 +5,7 @@
 /// minimal test data each suite needs.
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -44,6 +44,68 @@ use wr_manager::service::Manager;
 pub use wr_engine::db::wruntime::db::database::{DbError, Host as DbHost, PgValue};
 pub use wr_engine::state::{ModuleServices, ModuleState};
 pub use wr_proxy::config::{EgressConfig, ExternalRoute};
+
+// ── Test PKI ─────────────────────────────────────────────────────────────────
+
+/// In-memory PKI for tests — generated once per test binary.
+pub struct TestPki {
+    pub ca_cert_der: Vec<rustls::pki_types::CertificateDer<'static>>,
+    pub node_cert_der: Vec<rustls::pki_types::CertificateDer<'static>>,
+    pub node_key_der: rustls::pki_types::PrivateKeyDer<'static>,
+}
+
+/// Generate a CA + node cert entirely in memory. No files on disk.
+pub fn generate_test_pki() -> TestPki {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
+    use std::net::IpAddr;
+
+    // CA
+    let mut ca_params = CertificateParams::new(vec![]).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "test-ca");
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+    // Node cert signed by CA
+    let mut node_params = CertificateParams::new(vec![]).unwrap();
+    node_params.subject_alt_names = vec![
+        SanType::DnsName("localhost".try_into().unwrap()),
+        SanType::IpAddress(IpAddr::from([127, 0, 0, 1])),
+    ];
+    node_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "test-node");
+    let node_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let node_cert = node_params.signed_by(&node_key, &ca_cert, &ca_key).unwrap();
+
+    TestPki {
+        ca_cert_der: vec![ca_cert.der().clone()],
+        node_cert_der: vec![node_cert.der().clone()],
+        node_key_der: rustls::pki_types::PrivateKeyDer::Pkcs8(node_key.serialize_der().into()),
+    }
+}
+
+/// Lazily-initialized shared PKI — cert gen happens once per test binary.
+/// Also installs the rustls crypto provider if not already set.
+pub fn shared_test_pki() -> &'static TestPki {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    static PKI: OnceLock<TestPki> = OnceLock::new();
+    PKI.get_or_init(generate_test_pki)
+}
+
+/// Build an HttpsClientPool from the shared test PKI.
+pub fn test_mtls_pool() -> wr_common::tls::HttpsClientPool<wr_proxy::layers::ProxyBody> {
+    let pki = shared_test_pki();
+    let config = wr_common::tls::build_client_config_from_der(
+        pki.node_cert_der.clone(),
+        pki.node_key_der.clone_key(),
+        &pki.ca_cert_der,
+    )
+    .unwrap();
+    wr_common::tls::HttpsClientPool::new(2, config)
+}
 
 // ── Manager ───────────────────────────────────────────────────────────────────
 
@@ -207,6 +269,7 @@ pub async fn register_module(
             engine_id: engine.id.into(),
             address: engine.addr.into(),
             proxy_address: engine.proxy_address.into(),
+            peer_address: engine.proxy_address.into(),
             modules: vec![ModuleDescriptor {
                 name: module.name.into(),
                 namespace: module.namespace.into(),
@@ -230,6 +293,7 @@ pub async fn register_module(
         engine_id: engine.id.into(),
         engine_address: engine.addr.into(),
         proxy_address: engine.proxy_address.into(),
+        peer_address: engine.proxy_address.into(),
         healthy: false, // manager overrides to true on upsert
     })
     .await?;
@@ -269,9 +333,12 @@ pub async fn start_proxy_on(
             table,
             self_proxy_address,
         ))
-        .service(wr_proxy::layers::ForwardService::new(std::sync::Arc::new(
-            wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
-        )));
+        .service(wr_proxy::layers::ForwardService::new(
+            std::sync::Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
+                Default::default(),
+            )),
+            test_mtls_pool(),
+        ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(proxy_serve(listener, svc));
@@ -287,9 +354,12 @@ pub async fn start_ingress_proxy(
     let svc = tower::ServiceBuilder::new()
         .layer(wr_proxy::layers::IngressLayer::new(routes))
         .layer(wr_proxy::layers::RoutingLayer::new(table, ""))
-        .service(wr_proxy::layers::ForwardService::new(std::sync::Arc::new(
-            wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
-        )));
+        .service(wr_proxy::layers::ForwardService::new(
+            std::sync::Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
+                Default::default(),
+            )),
+            test_mtls_pool(),
+        ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(proxy_serve(listener, svc));
@@ -310,9 +380,12 @@ pub async fn start_egress_proxy(
     let svc = tower::ServiceBuilder::new()
         .layer(wr_proxy::layers::RoutingLayer::new(table, "").with_egress(egress_domains))
         .layer(wr_proxy::layers::EgressLayer::new(egress_cfg))
-        .service(wr_proxy::layers::ForwardService::new(Arc::new(
-            wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
-        )));
+        .service(wr_proxy::layers::ForwardService::new(
+            Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
+                Default::default(),
+            )),
+            test_mtls_pool(),
+        ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(proxy_serve(listener, svc));
@@ -374,11 +447,27 @@ pub struct Node {
     pub proxy_shutdown: oneshot::Sender<()>,
 }
 
-/// Spin up a proxy node on an ephemeral port.
+/// Spin up a proxy node with both a plain HTTP listener (for local engine
+/// traffic / test requests) and a TLS listener (for cross-node peer traffic).
+/// The `proxy_address` returned in `Node` is the `https://` TLS address —
+/// this is what gets stored in routing rules for remote proxy forwarding.
 pub async fn start_node(mgr_addr: &str) -> Result<Node> {
+    // Plain HTTP listener (test requests + local engine forwarding)
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let proxy_address = format!("http://{addr}");
+
+    // TLS listener (cross-node peer traffic)
+    let tls_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tls_addr = tls_listener.local_addr()?;
+    let proxy_address = format!("https://127.0.0.1:{}", tls_addr.port());
+
+    let pki = shared_test_pki();
+    let server_config = wr_common::tls::build_server_config_from_der(
+        pki.node_cert_der.clone(),
+        pki.node_key_der.clone_key(),
+        &pki.ca_cert_der,
+    )?;
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(server_config);
 
     let table = wr_proxy::routing::new_routing_table();
     sync_table(mgr_addr, &table).await?;
@@ -388,15 +477,25 @@ pub async fn start_node(mgr_addr: &str) -> Result<Node> {
             table.clone(),
             &proxy_address,
         ))
-        .service(wr_proxy::layers::ForwardService::new(std::sync::Arc::new(
-            wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(Default::default()),
-        )));
+        .service(wr_proxy::layers::ForwardService::new(
+            std::sync::Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
+                Default::default(),
+            )),
+            test_mtls_pool(),
+        ));
 
     let (tx, rx) = oneshot::channel::<()>();
+    let svc_clone = svc.clone();
     tokio::spawn(async move {
         tokio::select! {
             _ = rx => {}
-            _ = proxy_serve(listener, svc) => {}
+            _ = async {
+                // Run both listeners concurrently
+                tokio::join!(
+                    proxy_serve(listener, svc.clone()),
+                    tls_proxy_serve(tls_listener, tls_acceptor, svc_clone),
+                );
+            } => {}
         }
     });
 
@@ -457,6 +556,54 @@ where
         let svc = svc.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
+            let svc_fn = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                let mut svc = svc.clone();
+                async move {
+                    let req = req.map(wr_proxy::layers::ProxyBody::streaming);
+                    let result = tower::Service::call(&mut svc, req).await;
+                    Ok::<_, Infallible>(match result {
+                        Ok(r) => r,
+                        Err(_) => Response::builder()
+                            .status(502)
+                            .body(wr_proxy::layers::full_body(Bytes::from("proxy error")))
+                            .unwrap(),
+                    })
+                }
+            });
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc_fn)
+                .await;
+        });
+    }
+}
+
+/// Drive the proxy Tower stack over a TLS-wrapped TCP listener (mTLS peer traffic).
+pub async fn tls_proxy_serve<S>(
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    svc: S,
+) where
+    S: tower::Service<
+            Request<wr_proxy::layers::ProxyBody>,
+            Response = Response<wr_proxy::layers::ResBody>,
+            Error = anyhow::Error,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
+        let acceptor = acceptor.clone();
+        let svc = svc.clone();
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let io = TokioIo::new(tls_stream);
             let svc_fn = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
                 let mut svc = svc.clone();
                 async move {
@@ -681,9 +828,12 @@ pub async fn start_proxy_with_cb(
 ) -> Result<SocketAddr> {
     let svc = tower::ServiceBuilder::new()
         .layer(wr_proxy::layers::RoutingLayer::new(table, ""))
-        .service(wr_proxy::layers::ForwardService::new(Arc::new(
-            wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(cb_config),
-        )));
+        .service(wr_proxy::layers::ForwardService::new(
+            Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
+                cb_config,
+            )),
+            test_mtls_pool(),
+        ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(proxy_serve(listener, svc));

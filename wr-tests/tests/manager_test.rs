@@ -20,6 +20,7 @@ async fn test_register_and_list_engines() -> Result<()> {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9100".into(),
             proxy_address: String::new(),
+            peer_address: String::new(),
             modules: vec![ModuleDescriptor {
                 name: "inventory-service".into(),
                 namespace: "store".into(),
@@ -54,6 +55,7 @@ async fn test_deregister_engine() -> Result<()> {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9101".into(),
             proxy_address: String::new(),
+            peer_address: String::new(),
             modules: vec![],
             secrets: vec![],
         }),
@@ -86,6 +88,7 @@ async fn test_heartbeat() -> Result<()> {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9102".into(),
             proxy_address: String::new(),
+            peer_address: String::new(),
             modules: vec![],
             secrets: vec![],
         }),
@@ -117,6 +120,7 @@ async fn test_routing_table_upsert_and_get() -> Result<()> {
         engine_id: "e1".into(),
         engine_address: "http://127.0.0.1:9103".into(),
         proxy_address: String::new(),
+        peer_address: String::new(),
         healthy: false, // server sets this to true on upsert
     })
     .await?;
@@ -152,6 +156,7 @@ async fn test_get_schema_after_registration() -> Result<()> {
             engine_id: "schema-e1".into(),
             address: "http://127.0.0.1:9200".into(),
             proxy_address: String::new(),
+            peer_address: String::new(),
             modules: vec![ModuleDescriptor {
                 name: "orders".into(),
                 namespace: "shop".into(),
@@ -258,6 +263,7 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
             engine_id: "ver-e1".into(),
             address: "http://127.0.0.1:9210".into(),
             proxy_address: String::new(),
+            peer_address: String::new(),
             modules: vec![ModuleDescriptor {
                 name: "catalog".into(),
                 namespace: "retail".into(),
@@ -275,6 +281,7 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
             engine_id: "ver-e2".into(),
             address: "http://127.0.0.1:9211".into(),
             proxy_address: String::new(),
+            peer_address: String::new(),
             modules: vec![ModuleDescriptor {
                 name: "catalog".into(),
                 namespace: "retail".into(),
@@ -324,6 +331,7 @@ async fn test_get_schema_cross_namespace_isolation() -> Result<()> {
             engine_id: "ns-e1".into(),
             address: "http://127.0.0.1:9220".into(),
             proxy_address: String::new(),
+            peer_address: String::new(),
             modules: vec![ModuleDescriptor {
                 name: "gateway".into(),
                 namespace: "alpha".into(),
@@ -374,6 +382,7 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
             engine_id: "reup-e1".into(),
             address: "http://127.0.0.1:9230".into(),
             proxy_address: String::new(),
+            peer_address: String::new(),
             modules: vec![ModuleDescriptor {
                 name: "payments".into(),
                 namespace: "billing".into(),
@@ -402,6 +411,7 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
             engine_id: "reup-e1".into(),
             address: "http://127.0.0.1:9230".into(),
             proxy_address: String::new(),
+            peer_address: String::new(),
             modules: vec![ModuleDescriptor {
                 name: "payments".into(),
                 namespace: "billing".into(),
@@ -445,6 +455,7 @@ async fn test_get_schema_multi_module_engine() -> Result<()> {
             engine_id: "multi-e1".into(),
             address: "http://127.0.0.1:9240".into(),
             proxy_address: String::new(),
+            peer_address: String::new(),
             modules: vec![
                 ModuleDescriptor {
                     name: "auth".into(),

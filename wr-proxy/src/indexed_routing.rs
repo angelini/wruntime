@@ -106,6 +106,7 @@ mod tests {
             source_namespace: String::new(),
             destination_namespace: ns.to_string(),
             proxy_address: "http://proxy:9001".to_string(),
+            peer_address: String::new(),
         }
     }
 

@@ -19,11 +19,13 @@ prost-types        = "0.14"
 serde              = { version = "1", features = ["derive"] }
 toml               = "0.8"
 deadpool-postgres  = { version = "0.14", features = ["rt_tokio_1"] }
-wr-common          = { path = "../wr-common", features = ["http-pool", "config"] }
+wr-common          = { path = "../wr-common", features = ["http-pool", "config", "tls"] }
 wr-engine          = { path = "../wr-engine" }
 wr-manager         = { path = "../wr-manager" }
 wr-proxy           = { path = "../wr-proxy" }
 rustls             = { version = "0.23", features = ["ring"] }
+rcgen              = { version = "0.13", features = ["pem"] }
+tokio-rustls       = "0.26"
 serde_json         = "1"
 tracing            = "0.1"
 wasmtime           = { version = "43", features = ["component-model"] }

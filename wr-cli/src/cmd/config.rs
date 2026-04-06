@@ -28,6 +28,17 @@ pub struct NodeConfig {
     pub proxy_address: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub control_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<CliTlsConfig>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct CliTlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
+    pub ca_cert_path: String,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -115,6 +126,8 @@ impl EngineConfig {
             config.node = Some(NodeConfig {
                 proxy_address: format!("http://{{host}}:{proxy_port}"),
                 control_address: format!("http://{{host}}:{control_port}"),
+                peer_port: node.peer_port,
+                tls: node.tls.clone(),
             });
         }
 
@@ -152,6 +165,10 @@ pub struct ProxyConfig {
 #[derive(Deserialize, Serialize, Clone)]
 pub struct ProxyNodeConfig {
     pub proxy_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<CliTlsConfig>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -175,6 +192,8 @@ pub struct ManagerConfig {
     pub engine_heartbeat_timeout_secs: Option<u32>,
     pub database: ManagerDatabaseConfig,
     pub cluster: ClusterConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<CliTlsConfig>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]

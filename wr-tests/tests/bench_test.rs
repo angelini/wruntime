@@ -124,6 +124,7 @@ fn print_concurrent_stats(
 /// - protobuf encode/decode in both guest modules
 #[tokio::test(flavor = "multi_thread")]
 async fn bench_hot_path() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     if skip_if_no_wasm() {
         return Ok(());
     }
@@ -274,6 +275,7 @@ async fn bench_hot_path() -> Result<()> {
 /// Isolates the proxy routing + forwarding cost from wasmtime instantiation.
 #[tokio::test(flavor = "multi_thread")]
 async fn bench_proxy_only() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let iterations: usize = std::env::var("BENCH_ITERATIONS")
         .ok()
         .and_then(|v| v.parse().ok())

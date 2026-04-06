@@ -20,6 +20,14 @@ build-release:
 check:
     cargo check
 
+# ── Certificates ──────────────────────────────────────────────────────────────
+
+# Generate local CA + localhost certs for development
+certs:
+    cargo run -p wr-cli -- cert init-ca --output certs/
+    cargo run -p wr-cli -- cert generate 127.0.0.1 --ca-dir certs/
+    cargo run -p wr-cli -- cert generate manager --ca-dir certs/
+
 # ── Lint & Format ─────────────────────────────────────────────────────────────
 
 guest_crates := "examples/ecommerce/client examples/ecommerce/inventory examples/codegen/agent examples/codegen/collector examples/codegen/coordinator examples/codegen/worker examples/stockmarket/exchange examples/stockmarket/ledger examples/stockmarket/simulator"

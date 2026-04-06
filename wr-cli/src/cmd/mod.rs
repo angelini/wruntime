@@ -1,4 +1,5 @@
 pub mod build_helpers;
+pub mod cert;
 pub mod config;
 pub mod db;
 pub mod deploy_config;

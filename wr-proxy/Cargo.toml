@@ -20,6 +20,7 @@ hyper-rustls = { version = "0.27", features = [
   "http2",
 ] }
 rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
 http-body = "1"
 http-body-util = "0.1"
 tokio = { version = "1", features = ["full"] }
@@ -36,6 +37,7 @@ wr-common = { path = "../wr-common", features = [
   "config",
   "signal",
   "http-pool",
+  "tls",
 ] }
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
 tokio-postgres = "0.7"

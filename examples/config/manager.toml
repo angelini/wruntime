@@ -1,6 +1,11 @@
 listen_address                = "0.0.0.0:9000"
 engine_heartbeat_timeout_secs = 30
 
+[tls]
+cert_path    = "certs/manager.crt"
+key_path     = "certs/manager.key"
+ca_cert_path = "certs/ca.crt"
+
 [database]
 url             = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 10

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::Deserialize;
+use wr_common::node::TlsConfig;
 
 #[derive(Deserialize, Clone)]
 pub struct ManagerConfig {
@@ -12,6 +13,8 @@ pub struct ManagerConfig {
     pub database: DatabaseConfig,
     /// Cluster configuration for multi-manager HA.
     pub cluster: ClusterConfig,
+    /// TLS certificate configuration for the gRPC listener.
+    pub tls: TlsConfig,
 }
 
 #[derive(Deserialize, Clone)]
@@ -85,6 +88,12 @@ impl ManagerConfig {
         v.check(
             !self.cluster.gossip_listen_address.is_empty(),
             "cluster.gossip_listen_address is required",
+        );
+        v.check(!self.tls.cert_path.is_empty(), "tls.cert_path is required");
+        v.check(!self.tls.key_path.is_empty(), "tls.key_path is required");
+        v.check(
+            !self.tls.ca_cert_path.is_empty(),
+            "tls.ca_cert_path is required",
         );
 
         v.finish()

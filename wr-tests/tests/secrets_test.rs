@@ -150,6 +150,7 @@ async fn test_set_secret_upsert_overwrites() -> Result<()> {
                 engine_id: "upsert-engine".into(),
                 address: engine_addr,
                 proxy_address: "http://127.0.0.1:9001".into(),
+                peer_address: String::new(),
                 modules: vec![ModuleDescriptor {
                     name: "mod".into(),
                     namespace: "ns".into(),
@@ -271,6 +272,7 @@ async fn test_register_engine_with_secrets() -> Result<()> {
                 engine_id: "secret-engine".into(),
                 address: engine_addr,
                 proxy_address: "http://127.0.0.1:9001".into(),
+                peer_address: String::new(),
                 modules: vec![ModuleDescriptor {
                     name: "svc".into(),
                     namespace: "myapp".into(),
@@ -319,6 +321,7 @@ async fn test_register_engine_with_missing_secret_fails() -> Result<()> {
                 engine_id: "missing-secret-engine".into(),
                 address: engine_addr,
                 proxy_address: "http://127.0.0.1:9001".into(),
+                peer_address: String::new(),
                 modules: vec![ModuleDescriptor {
                     name: "svc".into(),
                     namespace: "myapp".into(),
@@ -355,6 +358,7 @@ async fn test_register_engine_no_secrets_succeeds() -> Result<()> {
                 engine_id: "no-secrets-engine".into(),
                 address: engine_addr,
                 proxy_address: "http://127.0.0.1:9001".into(),
+                peer_address: String::new(),
                 modules: vec![ModuleDescriptor {
                     name: "svc".into(),
                     namespace: "ns".into(),
@@ -402,6 +406,7 @@ async fn test_secrets_across_namespaces() -> Result<()> {
                 engine_id: "multi-ns-engine".into(),
                 address: engine_addr,
                 proxy_address: "http://127.0.0.1:9001".into(),
+                peer_address: String::new(),
                 modules: vec![
                     ModuleDescriptor {
                         name: "fe".into(),
@@ -496,6 +501,7 @@ async fn test_secret_deleted_then_registration_fails() -> Result<()> {
                 engine_id: "deleted-secret-engine".into(),
                 address: engine_addr,
                 proxy_address: "http://127.0.0.1:9001".into(),
+                peer_address: String::new(),
                 modules: vec![ModuleDescriptor {
                     name: "svc".into(),
                     namespace: "ns".into(),

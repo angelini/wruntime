@@ -123,7 +123,8 @@ impl NodeService for NodeAgent {
                     destination_version: module.version.clone(),
                     engine_id: engine_id.clone(),
                     engine_address: reg.address.clone(),
-                    proxy_address: reg.proxy_address.clone(),
+                    proxy_address: reg.peer_address.clone(),
+                    peer_address: reg.peer_address.clone(),
                     healthy: true,
                 })
                 .await?;

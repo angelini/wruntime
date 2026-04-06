@@ -41,6 +41,10 @@ pub struct DeployConfig {
     pub no_otel: Option<bool>,
     /// Path to schedules TOML file for post-deploy apply
     pub schedules_path: Option<String>,
+    /// Local directory containing CA + node certificates (from `wr cert`)
+    pub cert_dir: Option<String>,
+    /// mTLS peer listener port (default: 9443)
+    pub peer_port: Option<u16>,
 }
 
 impl DeployConfig {
@@ -131,6 +135,17 @@ pub fn resolve_ssh_port(cli: Option<u16>, config: Option<u16>) -> Option<u16> {
             .ok()
             .and_then(|s| s.parse().ok())
     })
+}
+
+/// Resolve peer port from CLI > config > env > default (9443).
+pub fn resolve_peer_port(cli: Option<u16>, config: Option<u16>) -> u16 {
+    cli.or(config)
+        .or_else(|| {
+            std::env::var("WR_PEER_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(9443)
 }
 
 /// Resolve no_otel flag from CLI > config > env > default (false).

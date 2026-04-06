@@ -4,24 +4,30 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tonic              = { version = "0.14", features = ["transport"] }
-prost              = "0.14"
-tokio              = { version = "1", features = ["full"] }
-anyhow             = "1"
-serde              = { version = "1", features = ["derive"] }
-wr-common          = { path = "../wr-common", features = ["pool", "config", "signal"] }
-deadpool-postgres  = { version = "0.14", features = ["rt_tokio_1"] }
-tokio-postgres     = { version = "0.7", features = ["with-chrono-0_4"] }
-tracing            = "0.1"
+tonic = { version = "0.14", features = ["transport"] }
+prost = "0.14"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+wr-common = { path = "../wr-common", features = [
+  "pool",
+  "config",
+  "signal",
+  "tls",
+] }
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-aes-gcm            = "0.10"
-hex                = "0.4"
-uuid               = { version = "1", features = ["v4"] }
-chitchat           = "0.10.0"
-tokio-retry        = "0.3"
-hyper              = { version = "1", features = ["client", "http2"] }
-hyper-util         = { version = "0.1", features = ["tokio"] }
-http-body-util     = "0.1"
-http               = "1"
-bytes              = "1"
-chrono             = { version = "0.4", features = ["serde"] }
+aes-gcm = "0.10"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+chitchat = "0.10.0"
+tokio-retry = "0.3"
+hyper = { version = "1", features = ["client", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+rustls = { version = "0.23", features = ["ring"] }

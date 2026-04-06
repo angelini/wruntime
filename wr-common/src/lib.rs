@@ -17,3 +17,5 @@ pub mod pool;
 #[cfg(feature = "signal")]
 pub mod signal;
 pub mod telemetry;
+#[cfg(feature = "tls")]
+pub mod tls;

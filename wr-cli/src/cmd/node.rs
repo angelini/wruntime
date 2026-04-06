@@ -58,6 +58,9 @@ pub struct BundleArgs {
     /// Disable OpenTelemetry export in generated service units
     #[arg(long)]
     no_otel: bool,
+    /// mTLS peer listener port (default: 9443)
+    #[arg(long)]
+    peer_port: Option<u16>,
 }
 
 #[derive(Args)]
@@ -84,6 +87,12 @@ pub struct DeployArgs {
     /// SSH port
     #[arg(long)]
     ssh_port: Option<u16>,
+    /// Local directory containing CA + node certificates (from `wr cert`)
+    #[arg(long)]
+    cert_dir: Option<String>,
+    /// mTLS peer listener port (default: 9443)
+    #[arg(long)]
+    peer_port: Option<u16>,
 }
 
 #[derive(Args)]
@@ -261,11 +270,24 @@ fn add_proxy_config(
         (9001u16, 9002u16)
     };
 
+    // Derive peer_port from first engine's node config if available
+    let peer_port = first
+        .node
+        .as_ref()
+        .and_then(|n| n.peer_port)
+        .unwrap_or(9443);
+
     let proxy = super::config::ProxyConfig {
-        listen_address: format!("0.0.0.0:{proxy_port}"),
-        control_address: Some(format!("0.0.0.0:{control_port}")),
+        listen_address: format!("127.0.0.1:{proxy_port}"),
+        control_address: Some(format!("127.0.0.1:{control_port}")),
         node: Some(super::config::ProxyNodeConfig {
             proxy_address: format!("http://{{host}}:{proxy_port}"),
+            peer_port: Some(peer_port),
+            tls: Some(super::config::CliTlsConfig {
+                cert_path: "certs/node.crt".to_string(),
+                key_path: "certs/node.key".to_string(),
+                ca_cert_path: "certs/ca.crt".to_string(),
+            }),
         }),
         database: Some(super::config::ProxyDatabaseConfig {
             url: "{db_url}".to_string(),
@@ -293,6 +315,7 @@ struct DeployArtifactParams<'a> {
     engine_names: &'a [String],
     proxy_port: u16,
     control_port: u16,
+    peer_port: u16,
     engine_listen_ports: &'a [u16],
     no_otel: bool,
 }
@@ -308,6 +331,7 @@ fn add_deployment_artifacts(
         engine_names,
         proxy_port,
         control_port,
+        peer_port,
         engine_listen_ports,
         ..
     } = params;
@@ -367,6 +391,7 @@ fn add_deployment_artifacts(
         engine_names,
         *proxy_port,
         *control_port,
+        *peer_port,
         engine_listen_ports,
     );
     tar_add_bytes(
@@ -408,6 +433,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         "WR_IMAGE_PREFIX",
     );
     let no_otel = deploy_config::resolve_no_otel(args.no_otel, deploy_cfg.no_otel);
+    let peer_port = deploy_config::resolve_peer_port(args.peer_port, deploy_cfg.peer_port);
 
     // Parse all engine configs
     let mut all_engine_configs: Vec<(String, EngineConfig)> = Vec::new();
@@ -493,7 +519,11 @@ fn bundle(args: BundleArgs) -> Result<()> {
     )?;
 
     // Determine which template variables this bundle requires
-    let mut template_vars = vec!["host".to_string(), "db_url".to_string()];
+    let mut template_vars = vec![
+        "host".to_string(),
+        "db_url".to_string(),
+        "peer_port".to_string(),
+    ];
     let has_guest_db = all_engine_configs
         .iter()
         .any(|(_, c)| c.database.as_ref().is_some_and(|db| db.guest_url.is_some()));
@@ -511,6 +541,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
             engine_names: &engine_names,
             proxy_port,
             control_port,
+            peer_port,
             engine_listen_ports: &engine_listen_ports,
             no_otel,
         },
@@ -573,6 +604,8 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     );
     let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key, "WR_SSH_KEY");
     let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port);
+    let cert_dir = deploy_config::resolve_string(args.cert_dir, deploy_cfg.cert_dir, "WR_CERT_DIR");
+    let peer_port = deploy_config::resolve_peer_port(args.peer_port, deploy_cfg.peer_port);
 
     let manifest = read_manifest_from_tarball(&args.bundle)?;
     let configs = read_configs_from_tarball(&args.bundle)?;
@@ -581,9 +614,11 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
 
     // Build template variables
     let host = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
+    let peer_port_str = peer_port.to_string();
     let mut vars = HashMap::new();
     vars.insert("host", host.as_str());
     vars.insert("db_url", db_url.as_str());
+    vars.insert("peer_port", peer_port_str.as_str());
     let guest_db_url_val: String;
     if let Some(ref url) = guest_db_url {
         guest_db_url_val = url.clone();
@@ -637,6 +672,36 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
         .with_context(|| format!("failed to upload resolved {name}"))?;
     }
     println!("OK");
+
+    // Provision TLS certificates on the remote host
+    if let Some(ref cert_dir) = cert_dir {
+        print!("[deploy]  provisioning TLS certificates ... ");
+        let remote_cert_dir = format!("{}/wr-node/certs", manifest.workdir);
+        helpers::run_ssh(&ssh_base, &format!("mkdir -p {remote_cert_dir}"))?;
+
+        let ca_cert = format!("{cert_dir}/ca.crt");
+        let host_cert = format!("{cert_dir}/{host}.crt");
+        let host_key = format!("{cert_dir}/{host}.key");
+
+        for (local, remote_name) in [
+            (&ca_cert, "ca.crt"),
+            (&host_cert, "node.crt"),
+            (&host_key, "node.key"),
+        ] {
+            if !Path::new(local).exists() {
+                bail!("Certificate file not found: {local}. Run `wr cert generate {host}` first.");
+            }
+            helpers::scp_file(
+                local,
+                &args.remote,
+                &format!("{remote_cert_dir}/{remote_name}"),
+                ssh_key.as_deref(),
+                ssh_port,
+            )
+            .with_context(|| format!("failed to upload {local}"))?;
+        }
+        println!("OK");
+    }
 
     // Capture remote timestamp before restart to anchor the post-deploy log dump
     let restart_timestamp = helpers::get_remote_timestamp(&ssh_base).unwrap_or_default();
@@ -861,6 +926,7 @@ fn status(args: StatusArgs) -> Result<()> {
             "host" => "derived from deploy target",
             "db_url" => "--db-url / WR_DB_URL / wr-deploy.toml",
             "guest_db_url" => "--guest-db-url / WR_GUEST_DB_URL / wr-deploy.toml",
+            "peer_port" => "--peer-port / WR_PEER_PORT / wr-deploy.toml (default: 9443)",
             _ => "unknown",
         };
         println!("  {{{var}}}  {source}");
@@ -985,6 +1051,7 @@ fn generate_docker_compose(
     engine_names: &[String],
     proxy_port: u16,
     control_port: u16,
+    peer_port: u16,
     engine_ports: &[u16],
 ) -> String {
     let mut out = String::from(
@@ -1004,6 +1071,7 @@ fn generate_docker_compose(
     ports:
       - "{proxy_port}:{proxy_port}"
       - "{control_port}:{control_port}"
+      - "{peer_port}:{peer_port}"
     restart: on-failure
 "#
     ));

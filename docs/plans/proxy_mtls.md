@@ -1,497 +1,740 @@
-# Proxy-to-Proxy mTLS
+# Inter-Service mTLS
 
-Encrypts and mutually authenticates all cross-node proxy traffic. Implements after
-`plans/cross_node_proxy_routing.md`.
+Encrypts and mutually authenticates all network-facing inter-service communication: proxy-to-proxy, proxy-to-manager, engine-to-proxy, and CLI-to-manager.
 
-Intra-node traffic (engine → local proxy) remains plain HTTP — it is same-host loopback
-and does not cross the network. Only the inter-proxy path is TLS-protected.
+## Context
+
+All inter-service traffic currently flows over plain HTTP/gRPC. Any network listener is reachable by anything on the network. This change:
+
+1. Makes mTLS mandatory on all network-facing listeners — a shared CA signs one cert per node
+2. Locks intra-node listeners (proxy→engine, engine→proxy control plane) to `127.0.0.1` loopback
+3. Integrates cert generation (`wr cert`) and provisioning into the deploy pipeline
+4. Uses a single port per service — no separate "peer port"
+
+## Communication Paths
+
+| Flow | Port | Crosses network? | Change |
+|------|------|-------------------|--------|
+| WASM module → Proxy (HTTP outbound) | `:9001` | No (loopback) | Keep plain HTTP, bind `127.0.0.1` |
+| Proxy → Engine (forward) | `:9100` | No (loopback) | Keep plain HTTP, bind `127.0.0.1` |
+| Engine → Proxy (gRPC control) | `:9002` | No (loopback) | Keep plain gRPC, bind `127.0.0.1` |
+| **Proxy → Proxy (cross-node)** | `:9443` | **Yes** | **New mTLS listener** |
+| **Proxy → Manager (sync/fwd)** | `:9000` | **Yes** | **Add TLS to gRPC** |
+| **CLI → Manager (commands)** | `:9000` | **Yes** | **Add TLS to gRPC client** |
+
+The proxy gets a dedicated mTLS peer listener on `:9443` (configurable via `peer_port`). The internal `:9001` listener binds to `127.0.0.1` only — unreachable from the network. The manager's gRPC listener upgrades to TLS. The CLI and proxy gRPC clients add TLS with the same CA.
 
 ---
 
 ## Architecture
 
-Each node runs two listeners:
-
-```
-engine → proxy :9001   (plain HTTP, intra-node only)
-proxy  → proxy :9443   (mTLS, inter-node)
-```
-
-A shared internal CA signs one certificate per proxy. Every proxy trusts only certs
-signed by that CA, enforcing mutual authentication on all peer connections.
-
 ```
 Node A                               Node B
 ┌──────────────────────────────────┐  ┌──────────────────────────────────┐
-│  proxy :9001  (plain HTTP/2)     │  │  proxy :9002  (plain HTTP/2)     │
-│  proxy :9443  (mTLS HTTP/2) ◄────┼──┼──► proxy :9443  (mTLS HTTP/2)   │
-│  engine A1 :9100                 │  │  engine B1 :9200                 │
+│  proxy 127.0.0.1:9001 (HTTP/2)  │  │  proxy 127.0.0.1:9001 (HTTP/2)  │
+│  proxy 0.0.0.0:9443 (mTLS) <────┼──┼──> proxy 0.0.0.0:9443 (mTLS)    │
+│  engine 127.0.0.1:9100           │  │  engine 127.0.0.1:9200           │
+│  proxy ctrl 127.0.0.1:9002      │  │  proxy ctrl 127.0.0.1:9002      │
 └──────────────────────────────────┘  └──────────────────────────────────┘
+
+Manager (0.0.0.0:9000, TLS gRPC)
+  ↑ TLS from proxies (routing sync, registration forwarding)
+  ↑ TLS from CLI (management commands)
 ```
 
-The `proxy_address` field introduced in `cross_node_proxy_routing.md` splits into two:
+The peer address is derived automatically: given `proxy_address = "http://10.0.1.5:9001"` and `peer_port = 9443`, the peer address becomes `https://10.0.1.5:9443`. No separate URL field needed.
 
-| Field | Used by | Value |
-|---|---|---|
-| `node.proxy_address` | Engines (outbound rewrite), routing table identity | `http://127.0.0.1:9001` |
-| `node.peer_address` | Peer proxies forwarding cross-node traffic | `https://10.0.1.5:9443` |
-
-`RoutingRule.proxy_address` stores `peer_address` going forward. The routing layer
-comparison becomes `rule.proxy_address == self.peer_address` to distinguish local from
-remote.
+**Certificate flow:**
+```
+wr cert init-ca              →  certs/ca.crt, certs/ca.key
+wr cert generate <hostname>  →  certs/<hostname>.crt, certs/<hostname>.key
+wr node deploy ... --cert-dir ./certs  →  SCPs ca.crt + node cert/key to remote
+```
 
 ---
 
-## Phase 1 — Dependencies
+## Phase 1 — `wr cert` CLI Command
 
-Add to `wr-proxy/Cargo.toml`:
+New top-level subcommand using `rcgen` (pure Rust, no openssl dependency):
 
-```toml
-rustls         = "0.23"
-rustls-pemfile = "2"
-tokio-rustls   = "0.26"
+```
+wr cert init-ca [--output ./certs/]              # P-256 CA, 10yr, self-signed
+wr cert generate <hostname> [--ca-dir ./certs/]  # Node cert signed by CA, SAN: hostname + 127.0.0.1
 ```
 
-`hyper-rustls` 0.27 is already present with `native-tokio`, `http1`, and `http2` features.
-No changes to `wr-engine` or `wr-manager` — TLS is proxy-only.
+Output: PEM files — `ca.crt`, `ca.key`, `<hostname>.crt`, `<hostname>.key`.
+
+**Files:**
+| File | Change |
+|------|--------|
+| `wr-cli/Cargo.toml` | Add `rcgen = "0.13"` |
+| `wr-cli/src/cmd/cert.rs` | **New** — `CertArgs`, `InitCa`, `Generate` subcommands |
+| `wr-cli/src/cmd/mod.rs` | Add `pub mod cert;` |
+| `wr-cli/src/main.rs` | Add `Cert` variant to `Commands` enum |
 
 ---
 
-## Phase 2 — Config
+## Phase 2 — Config Changes
 
 ### `NodeConfig` (`wr-common/src/node.rs`)
-
-Extend the existing struct:
 
 ```rust
 #[derive(Debug, Deserialize, Clone)]
 pub struct NodeConfig {
-    pub proxy_address: String,       // plain HTTP, used by engines (existing)
-    pub peer_address: Option<String>,        // mTLS HTTPS, used by peer proxies
-    pub peer_listen_address: Option<String>, // bind address for the mTLS listener
-    pub tls: Option<TlsConfig>,
+    pub proxy_address: String,            // plain HTTP, engines use this (loopback)
+    #[serde(default)]
+    pub control_address: String,          // gRPC control plane (loopback)
+    #[serde(default = "default_peer_port")]
+    pub peer_port: u16,                   // mTLS peer listener port (default 9443)
+    pub tls: TlsConfig,
 }
+
+fn default_peer_port() -> u16 { 9443 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TlsConfig {
-    pub cert_path:    String,   // PEM: this proxy's certificate (chain)
-    pub key_path:     String,   // PEM: this proxy's private key
-    pub ca_cert_path: String,   // PEM: CA cert used to verify peer certs
+    pub cert_path: String,
+    pub key_path: String,
+    pub ca_cert_path: String,
+}
+
+impl NodeConfig {
+    /// Derive the mTLS peer address from proxy_address host + peer_port.
+    /// "http://10.0.1.5:9001" + peer_port=9443 → "https://10.0.1.5:9443"
+    pub fn peer_address(&self) -> String {
+        let uri: http::Uri = self.proxy_address.parse().expect("valid proxy_address");
+        let host = uri.host().expect("proxy_address must have a host");
+        format!("https://{}:{}", host, self.peer_port)
+    }
 }
 ```
-
-`peer_address`, `peer_listen_address`, and `tls` are `Option` so that single-node
-deployments (and `wr-engine`, which also uses `NodeConfig`) continue to work without
-any TLS configuration. The proxy validates at startup that all three are set together
-when any one is present.
-
-`TlsConfig` lives in `wr-common` alongside `NodeConfig` so it can be referenced from
-tests without duplicating the type.
 
 ### `ProxyConfig` validation (`wr-proxy/src/config.rs`)
 
-Add validation to the existing `validate()` method:
+```rust
+v.check(!self.node.tls.cert_path.is_empty(), "node.tls.cert_path is required");
+v.check(!self.node.tls.key_path.is_empty(), "node.tls.key_path is required");
+v.check(!self.node.tls.ca_cert_path.is_empty(), "node.tls.ca_cert_path is required");
+v.check(self.node.peer_port > 0, "node.peer_port must be > 0");
+```
+
+### Loopback enforcement
+
+At proxy startup, warn if `listen_address` binds to a non-loopback interface:
 
 ```rust
-// If any peer/tls field is set, all must be set
-let has_peer = self.node.peer_address.is_some();
-let has_listen = self.node.peer_listen_address.is_some();
-let has_tls = self.node.tls.is_some();
-anyhow::ensure!(
-    (has_peer && has_listen && has_tls) || (!has_peer && !has_listen && !has_tls),
-    "node.peer_address, node.peer_listen_address, and node.tls must all be set together"
-);
-```
-
-### `proxy.toml`
-
-```toml
-listen_address  = "0.0.0.0:9001"
-manager_address = "http://127.0.0.1:9000"
-
-[node]
-proxy_address       = "http://127.0.0.1:9001"
-peer_address        = "https://127.0.0.1:9443"
-peer_listen_address = "0.0.0.0:9443"
-
-[node.tls]
-cert_path    = "certs/proxy-a.crt"
-key_path     = "certs/proxy-a.key"
-ca_cert_path = "certs/ca.crt"
-
-[cache]
-# ...
-```
-
-Engine config is unchanged — engines only reference `node.proxy_address`.
-
----
-
-## Phase 3 — Proto: `proxy_address` stores the peer address
-
-`RoutingRule.proxy_address` (field 10) now holds `peer_address` (`https://...`) rather
-than the plain HTTP address. No proto field additions are needed; only the value
-semantics change.
-
-Update the engine registration in `wr-engine/src/main.rs` to send
-`config.node.peer_address` (read from the engine's config, which mirrors the proxy's
-peer address for its node) rather than `config.node.proxy_address`. The engine config
-gains a `peer_address` field alongside `proxy_address`:
-
-```toml
-# engine.toml
-[node]
-proxy_address = "http://127.0.0.1:9001"   # outbound rewrite target (unchanged)
-peer_address  = "https://127.0.0.1:9443"  # stored in routing rules for peer proxies
-```
-
-```rust
-// wr-engine/src/main.rs — RoutingRule upsert
-RoutingRule {
-    proxy_address: config.node.peer_address.clone()
-        .unwrap_or_else(|| config.node.proxy_address.clone()),
-    ..
+if !config.listen_address.starts_with("127.0.0.1:")
+    && !config.listen_address.starts_with("localhost:")
+{
+    warn!("listen_address should bind to loopback — network traffic uses the mTLS peer listener");
 }
 ```
 
-Update `RoutingLayer::new()` in `wr-proxy/src/layers/routing.rs` — currently receives
-`config.node.proxy_address` for local-vs-remote comparison. Change to accept
-`config.node.peer_address` (falling back to `proxy_address` when mTLS is not
-configured):
+### Example proxy.toml
+
+```toml
+listen_address  = "127.0.0.1:9001"
+control_address = "127.0.0.1:9002"
+
+[node]
+proxy_address = "http://10.0.1.5:9001"
+peer_port     = 9443
+
+[node.tls]
+cert_path    = "certs/10.0.1.5.crt"
+key_path     = "certs/10.0.1.5.key"
+ca_cert_path = "certs/ca.crt"
+
+[database]
+url = "postgres://..."
+```
+
+### Example engine.toml
+
+```toml
+listen_address = "127.0.0.1:9100"
+
+[node]
+proxy_address   = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_port       = 9443
+
+[node.tls]
+cert_path    = "certs/10.0.1.5.crt"
+key_path     = "certs/10.0.1.5.key"
+ca_cert_path = "certs/ca.crt"
+```
+
+### Manager TLS config
+
+Add TLS config to `ManagerConfig` (`wr-manager/src/config.rs`):
 
 ```rust
-// wr-proxy/src/main.rs — both internal and external service stacks
-let self_address = config.node.peer_address.clone()
-    .unwrap_or_else(|| config.node.proxy_address.clone());
+pub struct ManagerConfig {
+    // ... existing fields ...
+    pub tls: TlsConfig,  // reuse same struct from wr-common
+}
+```
+
+Example `manager.toml`:
+```toml
+listen_address = "0.0.0.0:9000"
+
+[tls]
+cert_path    = "certs/manager.crt"
+key_path     = "certs/manager.key"
+ca_cert_path = "certs/ca.crt"
+
+[database]
+url = "postgres://..."
+
+[cluster]
+cluster_id = "prod"
+gossip_listen_address = "0.0.0.0:9010"
+```
+
+**Files:**
+| File | Change |
+|------|--------|
+| `wr-common/src/node.rs` | Add `peer_port`, `tls: TlsConfig`, `TlsConfig` struct, `peer_address()` method |
+| `wr-proxy/src/config.rs` | Add TLS + peer_port validation; loopback warning |
+| `wr-manager/src/config.rs` | Add `tls: TlsConfig` |
+| All example `*.toml` files | Add `[node.tls]` / `[tls]` sections; `listen_address` → `127.0.0.1` for loopback services |
+
+---
+
+## Phase 3 — TLS Module (`wr-common/src/tls.rs`)
+
+Shared TLS utilities in `wr-common` so proxy, manager, and CLI can all use them.
+
+**New file: `wr-common/src/tls.rs`**
+
+### Server-side (mTLS acceptor)
+
+```rust
+pub fn build_server_config(tls: &TlsConfig) -> Result<Arc<rustls::ServerConfig>> {
+    // Load cert chain, key, CA from PEM files
+    // Build ServerConfig with WebPkiClientVerifier (require client certs)
+}
+
+pub fn build_acceptor(tls: &TlsConfig) -> Result<TlsAcceptor> {
+    Ok(TlsAcceptor::from(build_server_config(tls)?))
+}
+```
+
+### Client-side (mTLS connector)
+
+```rust
+pub fn build_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfig> {
+    // Load cert chain, key, CA from PEM files
+    // Build ClientConfig with client auth cert and CA-only root store
+}
+```
+
+### `HttpsClientPool<B>` — mTLS HTTP/2 client pool
+
+```rust
+pub struct HttpsClientPool<B> {
+    clients: Arc<Vec<Client<HttpsConnector<HttpConnector>, B>>>,
+    next: Arc<AtomicUsize>,
+}
+
+impl<B> HttpsClientPool<B> {
+    pub fn new(size: usize, tls_config: rustls::ClientConfig) -> Self { ... }
+    pub fn get(&self) -> &Client<...> { /* round-robin */ }
+}
+```
+
+### gRPC TLS helpers
+
+```rust
+/// Build a tonic ServerTlsConfig for the manager's gRPC listener.
+pub fn build_tonic_server_tls(tls: &TlsConfig) -> Result<tonic::transport::ServerTlsConfig> {
+    let cert_pem = std::fs::read_to_string(&tls.cert_path)?;
+    let key_pem = std::fs::read_to_string(&tls.key_path)?;
+    let ca_pem = std::fs::read_to_string(&tls.ca_cert_path)?;
+    let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+    let ca = tonic::transport::Certificate::from_pem(ca_pem);
+    Ok(tonic::transport::ServerTlsConfig::new()
+        .identity(identity)
+        .client_ca_root(ca))
+}
+
+/// Build a tonic Channel with mTLS for connecting to a TLS gRPC server.
+pub fn build_tonic_client_tls(tls: &TlsConfig) -> Result<tonic::transport::ClientTlsConfig> {
+    let cert_pem = std::fs::read_to_string(&tls.cert_path)?;
+    let key_pem = std::fs::read_to_string(&tls.key_path)?;
+    let ca_pem = std::fs::read_to_string(&tls.ca_cert_path)?;
+    let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+    let ca = tonic::transport::Certificate::from_pem(ca_pem);
+    Ok(tonic::transport::ClientTlsConfig::new()
+        .identity(identity)
+        .ca_certificate(ca))
+}
+```
+
+### In-memory constructors (for tests)
+
+```rust
+pub fn build_server_config_from_der(...) -> Result<Arc<rustls::ServerConfig>> { ... }
+pub fn build_client_config_from_der(...) -> Result<rustls::ClientConfig> { ... }
+```
+
+**Dependencies:**
+| Crate | Add to |
+|-------|--------|
+| `tokio-rustls = "0.26"` | `wr-common/Cargo.toml` |
+| `rustls-pemfile = "2"` | `wr-common/Cargo.toml` |
+| `hyper-rustls = "0.27"` | `wr-common/Cargo.toml` |
+
+`rustls = "0.23"` is already used by wr-proxy; making it available in wr-common lets all crates share the TLS primitives.
+
+**Files:**
+| File | Change |
+|------|--------|
+| `wr-common/Cargo.toml` | Add `tokio-rustls`, `rustls`, `rustls-pemfile`, `hyper-rustls` |
+| `wr-common/src/tls.rs` | **New** — all TLS builders, `HttpsClientPool`, gRPC TLS helpers |
+| `wr-common/src/lib.rs` | Add `pub mod tls;` |
+
+---
+
+## Phase 4 — Proto Extension
+
+Add `peer_address` to `EngineRegistration` and `RoutingRule`:
+
+```proto
+message EngineRegistration {
+  // ... fields 1-5 unchanged ...
+  string peer_address = 6;  // derived mTLS peer address (https://host:peer_port)
+}
+
+message RoutingRule {
+  // ... fields 1-10 unchanged ...
+  string peer_address = 11;  // mTLS peer address for cross-node routing
+}
+```
+
+### Engine sends peer_address (`wr-engine/src/main.rs`)
+
+```rust
+EngineRegistration {
+    peer_address: config.node.peer_address(),
+    // ... existing fields ...
+}
+```
+
+### Routing rule creation (`wr-proxy/src/node_service.rs`, line ~126)
+
+Use `peer_address` in routing rules:
+```rust
+proxy_address: reg.peer_address.clone(),
+```
+
+### Routing layer self-address (`wr-proxy/src/main.rs`)
+
+```rust
+let self_address = config.node.peer_address();
 RoutingLayer::new(routing_table.clone(), self_address)
 ```
 
----
+`make_destination` (routing.rs:108-116) remains unchanged — when `rule.proxy_address == self_proxy_address`, it's local; otherwise `Destination::RemoteProxy` with the `https://` peer address.
 
-## Phase 4 — TLS server: mTLS listener in the proxy
+### Manager DB
 
-### `wr-proxy/src/tls.rs` (new file)
-
-Encapsulate certificate loading and acceptor construction:
-
-```rust
-use rustls::{ServerConfig, RootCertStore};
-use rustls::server::WebPkiClientVerifier;
-use rustls_pemfile::{certs, private_key};
-use tokio_rustls::TlsAcceptor;
-
-pub fn build_acceptor(tls: &TlsConfig) -> Result<TlsAcceptor> {
-    let cert_chain = load_certs(&tls.cert_path)?;
-    let private_key = load_key(&tls.key_path)?;
-    let ca_cert    = load_certs(&tls.ca_cert_path)?;
-
-    let mut root_store = RootCertStore::empty();
-    for cert in &ca_cert {
-        root_store.add(cert.clone())?;
-    }
-
-    // Require and verify client certificate against the CA
-    let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
-        .build()?;
-
-    let config = ServerConfig::builder()
-        .with_client_cert_verifier(client_verifier)
-        .with_single_cert(cert_chain, private_key)?;
-
-    Ok(TlsAcceptor::from(Arc::new(config)))
-}
+New migration:
+```sql
+ALTER TABLE wr_routing_rules ADD COLUMN IF NOT EXISTS peer_address TEXT NOT NULL DEFAULT '';
+ALTER TABLE wr_engines ADD COLUMN IF NOT EXISTS peer_address TEXT NOT NULL DEFAULT '';
 ```
 
-### `wr-proxy/src/main.rs`
+Update insert/select queries to include `peer_address`.
 
-Spawn a second accept loop alongside the existing ones (internal + optional external).
-The existing `accept_loop` function is generic over the TCP stream, so we wrap the
-TLS-accepted stream in `TokioIo` before passing it in. Both loops use the same
-`http2::Builder` and same Tower service stack:
-
-```rust
-// Only start the mTLS listener when TLS is configured
-if let (Some(peer_listen), Some(tls_config)) =
-    (&config.node.peer_listen_address, &config.node.tls)
-{
-    let tls_acceptor = wr_proxy::tls::build_acceptor(tls_config)?;
-    let tls_listener = TcpListener::bind(peer_listen).await?;
-    info!(address = %peer_listen, "proxy listening (mTLS peer)");
-
-    // Clone the internal service stack — both paths use the same layers
-    let peer_svc = internal_svc.clone();
-    tokio::spawn(tls_accept_loop(tls_listener, tls_acceptor, peer_svc));
-}
-```
-
-A new `tls_accept_loop` function mirrors the existing `accept_loop` but wraps each
-connection through the `TlsAcceptor` before handing off to `http2::Builder`:
-
-```rust
-async fn tls_accept_loop<S>(
-    listener: TcpListener,
-    acceptor: TlsAcceptor,
-    svc: S,
-) where
-    S: Service<Request<Bytes>, Response = Response<ResBody>> + Clone + Send + 'static,
-    S::Error: std::fmt::Display + Send + 'static,
-    S::Future: Send + 'static,
-{
-    loop {
-        let (stream, peer_addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => { warn!(error = %e, "tls accept error"); continue; }
-        };
-        let acceptor = acceptor.clone();
-        let svc = svc.clone();
-
-        tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => { warn!(peer = %peer_addr, error = %e, "TLS handshake failed"); return; }
-            };
-            let io = TokioIo::new(tls_stream);
-            // Same hyper http2::Builder as the plain accept_loop
-            // ... serve_connection(io, hyper_svc) ...
-        });
-    }
-}
-```
-
-The two loops share the same `svc` (Tower stack). The `x-wr-via-proxy` header is already
-set by `ForwardService` for cross-node hops, and the `EgressLayer` / `SchemaValidationLayer`
-already respect it. No additional server-side branching is required — mTLS authentication
-is handled entirely by the TLS handshake.
+**Files:**
+| File | Change |
+|------|--------|
+| `proto/wruntime.proto` | Add `peer_address` to `EngineRegistration` (6) and `RoutingRule` (11) |
+| `wr-engine/src/main.rs` | Send `peer_address()` in registration |
+| `wr-proxy/src/node_service.rs` | Use `reg.peer_address` in routing rule |
+| `wr-proxy/src/main.rs` | Pass `peer_address()` to `RoutingLayer` |
+| `wr-manager/src/db.rs` | `peer_address` in queries |
+| `wr-manager/migrations/` | New migration |
 
 ---
 
-## Phase 5 — TLS client: mTLS connector for outbound peer requests
+## Phase 5 — Proxy Tower Stack Changes
 
-### `wr-proxy/src/tls.rs`
+### `ForwardService` (`wr-proxy/src/layers/forward.rs`)
 
-```rust
-use hyper_rustls::HttpsConnector;
-use hyper_util::client::legacy::Client;
-use rustls::ClientConfig;
-
-pub fn build_peer_client(
-    tls: &TlsConfig,
-) -> Result<Client<HttpsConnector<HttpConnector>, Full<Bytes>>> {
-    let cert_chain  = load_certs(&tls.cert_path)?;
-    let private_key = load_key(&tls.key_path)?;
-    let ca_cert     = load_certs(&tls.ca_cert_path)?;
-
-    let mut root_store = RootCertStore::empty();
-    for cert in &ca_cert {
-        root_store.add(cert.clone())?;
-    }
-
-    // Send client cert (mTLS) and verify server cert against the CA
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(cert_chain, private_key)?;
-
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(config)
-        .https_only()
-        .enable_http2()
-        .build();
-
-    Ok(Client::builder(TokioExecutor::new())
-        .http2_only(true)
-        .build(connector))
-}
-```
-
-### `wr-proxy/src/layers/forward.rs`
-
-`ForwardService` gains an optional peer client. Selection is based on the `Destination`
-variant already present in `wr-proxy/src/layers/mod.rs`:
+Always holds an mTLS pool — no Option:
 
 ```rust
 #[derive(Clone)]
 pub struct ForwardService {
-    client: Client<HttpConnector, Full<Bytes>>,
-    peer_client: Option<Client<HttpsConnector<HttpConnector>, Full<Bytes>>>,
+    pool: HttpClientPool<ProxyBody>,               // plain HTTP for local engines
+    mtls_pool: tls::HttpsClientPool<ProxyBody>,    // mTLS for remote proxies
     cb_registry: Arc<CircuitBreakerRegistry>,
 }
 
 impl ForwardService {
     pub fn new(
         cb_registry: Arc<CircuitBreakerRegistry>,
-        peer_client: Option<Client<HttpsConnector<HttpConnector>, Full<Bytes>>>,
+        mtls_pool: tls::HttpsClientPool<ProxyBody>,
     ) -> Self {
-        let client = Client::builder(TokioExecutor::new())
-            .http2_only(true)
-            .build_http();
-        Self { client, peer_client, cb_registry }
+        let pool = HttpClientPool::new(DEFAULT_POOL_SIZE);
+        Self { pool, mtls_pool, cb_registry }
     }
 }
 ```
 
-In `call()`, the existing candidate loop selects the client based on destination type.
-The circuit breaker logic (`cb_registry`) applies identically to both clients:
-
+In `call()`:
 ```rust
-// Inside the candidate loop (replaces the single client.request call):
-let resp = match destination {
-    Destination::LocalEngine(_) => {
-        client.request(forward_req).await
-    }
-    Destination::RemoteProxy(_) => {
-        let peer = peer_client.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("peer TLS client not configured"))?;
-        peer.request(forward_req).await
-    }
+let result = match &destination {
+    Destination::LocalEngine(_) => client.request(forward_req).await,
+    Destination::RemoteProxy(_) => self.mtls_pool.get().request(forward_req).await,
 };
 ```
 
-Update both `ForwardService::new(...)` call sites in `main.rs` (internal and external
-stacks) to pass the optional peer client:
+### `main.rs` — mTLS setup + peer listener
 
 ```rust
-let peer_client = config.node.tls.as_ref()
-    .map(|tls| tls::build_peer_client(tls))
-    .transpose()?;
+// Build mTLS resources from node TLS config
+let client_config = wr_common::tls::build_client_config(&config.node.tls)?;
+let mtls_pool = wr_common::tls::HttpsClientPool::new(DEFAULT_POOL_SIZE, client_config);
+let tls_acceptor = wr_common::tls::build_acceptor(&config.node.tls)?;
 
-// ... in both service stacks:
-.service(ForwardService::new(cb_registry.clone(), peer_client.clone()))
+let self_address = config.node.peer_address();
+
+// Internal stack
+let internal_svc = ServiceBuilder::new()
+    .layer(TracingLayer)
+    .layer(RoutingLayer::new(routing_table.clone(), self_address).with_egress(egress_domains))
+    .layer(EgressLayer::new(config.egress.clone()))
+    .service(ForwardService::new(cb_registry.clone(), mtls_pool.clone()));
+
+// Internal listener — loopback only
+let internal_listener = TcpListener::bind(&config.listen_address).await?;
+info!(address = %config.listen_address, "proxy listening (internal, loopback)");
+tokio::spawn(accept_loop(internal_listener, internal_svc.clone()));
+
+// mTLS peer listener — all interfaces
+let peer_bind = format!("0.0.0.0:{}", config.node.peer_port);
+let peer_listener = TcpListener::bind(&peer_bind).await?;
+info!(address = %peer_bind, "proxy listening (mTLS peer)");
+tokio::spawn(tls_accept_loop(peer_listener, tls_acceptor, internal_svc.clone()));
 ```
+
+### `tls_accept_loop`
+
+Mirrors `accept_loop`, wraps each TCP stream through `TlsAcceptor` before `auto::Builder::serve_connection`.
+
+### External stack
+
+Same — `ForwardService::new` takes the mTLS pool, `RoutingLayer` takes `peer_address()`.
+
+**Files:**
+| File | Change |
+|------|--------|
+| `wr-proxy/src/main.rs` | mTLS pool + acceptor; peer listener; `tls_accept_loop`; loopback warning |
+| `wr-proxy/src/layers/forward.rs` | `mtls_pool` field (required); branch on `Destination` |
+| `wr-proxy/Cargo.toml` | Can remove `rustls`, `hyper-rustls` direct deps (now via `wr-common`) or keep for `rustls::crypto` init |
 
 ---
 
-## Phase 6 — Certificate setup for local simulation
+## Phase 6 — Manager TLS gRPC
 
-For the local two-node test setup in `examples/multi-node/`, a small script generates a
-local CA and two proxy certs using `openssl`. Commit the script alongside the `node-a/`
-and `node-b/` config directories:
+### Manager server (`wr-manager/src/main.rs`)
 
-```bash
-# scripts/gen-local-certs.sh
-set -e
-mkdir -p certs
+Add TLS to the gRPC listener using tonic's built-in TLS support:
 
-# CA
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
-  -days 3650 -nodes -keyout certs/ca.key -out certs/ca.crt \
-  -subj "/CN=wruntime-local-ca"
+```rust
+let tls_config = wr_common::tls::build_tonic_server_tls(&config.tls)?;
 
-# Per-proxy cert helper
-gen_cert() {
-  local name=$1
-  openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
-    -nodes -keyout certs/${name}.key -out certs/${name}.csr \
-    -subj "/CN=${name}"
-  openssl x509 -req -in certs/${name}.csr -CA certs/ca.crt -CAkey certs/ca.key \
-    -CAcreateserial -days 3650 -out certs/${name}.crt
+Server::builder()
+    .tls_config(tls_config)?
+    .add_service(ManagerServiceServer::new(manager))
+    .serve(addr)
+    .await?;
+```
+
+### Proxy → Manager connection (`wr-common/src/discovery.rs`)
+
+`ManagerDiscovery::connect_new` currently uses `ManagerServiceClient::connect(addr)`. Update to use TLS:
+
+```rust
+// ManagerDiscovery gains a tls_config field
+pub struct ManagerDiscovery {
+    pool: Pool,
+    managers: RwLock<Vec<String>>,
+    affinity: RwLock<Option<AffinityState>>,
+    tls_config: tonic::transport::ClientTlsConfig,
 }
 
-gen_cert proxy-a
-gen_cert proxy-b
+// In connect_new():
+let channel = Endpoint::from_shared(addr.clone())?
+    .tls_config(self.tls_config.clone())?
+    .connect()
+    .await?;
 ```
 
-Add a Justfile target:
+The proxy passes the TLS config when creating `ManagerDiscovery`:
 
-```justfile
-certs:
-    bash scripts/gen-local-certs.sh
+```rust
+let client_tls = wr_common::tls::build_tonic_client_tls(&config.node.tls)?;
+let discovery = Arc::new(ManagerDiscovery::new(db_pool, client_tls));
 ```
 
-Config files reference the generated paths:
+### CLI → Manager connection (`wr-cli/src/client.rs`)
 
+The CLI needs a `--ca-cert` flag (or reads from `wr-deploy.toml` `cert_dir`) to verify the manager's TLS cert. Optionally also `--cert` and `--key` for mTLS client auth.
+
+```rust
+pub async fn connect(addr: &str, tls: Option<&TlsConfig>) -> Result<ManagerServiceClient<Channel>> {
+    let mut endpoint = Endpoint::from_shared(addr.to_string())?
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10));
+
+    if let Some(tls) = tls {
+        let tls_config = wr_common::tls::build_tonic_client_tls(tls)?;
+        endpoint = endpoint.tls_config(tls_config)?;
+    }
+
+    let channel = endpoint.connect().await.context("failed to connect to manager")?;
+    Ok(ManagerServiceClient::new(channel))
+}
+```
+
+CLI global args:
+
+```rust
+#[arg(long, env = "WR_CA_CERT")]
+ca_cert: Option<String>,
+#[arg(long, env = "WR_CLIENT_CERT")]
+client_cert: Option<String>,
+#[arg(long, env = "WR_CLIENT_KEY")]
+client_key: Option<String>,
+```
+
+These can also be set in `wr-deploy.toml` alongside `cert_dir`:
 ```toml
-# node-a/proxy.toml
-[node.tls]
-cert_path    = "certs/proxy-a.crt"
-key_path     = "certs/proxy-a.key"
-ca_cert_path = "certs/ca.crt"
-
-# node-b/proxy.toml
-[node.tls]
-cert_path    = "certs/proxy-b.crt"
-key_path     = "certs/proxy-b.key"
-ca_cert_path = "certs/ca.crt"
+ca_cert_path    = "certs/ca.crt"
+client_cert_path = "certs/admin.crt"
+client_key_path  = "certs/admin.key"
 ```
+
+**Files:**
+| File | Change |
+|------|--------|
+| `wr-manager/src/main.rs` | Add TLS to gRPC server |
+| `wr-manager/src/config.rs` | Add `tls: TlsConfig` |
+| `wr-common/src/discovery.rs` | Add `tls_config` field to `ManagerDiscovery`; use TLS in `connect_new` |
+| `wr-cli/src/client.rs` | Accept optional `TlsConfig`; build TLS channel |
+| `wr-cli/src/main.rs` | Add `--ca-cert`, `--client-cert`, `--client-key` global args |
+| `wr-cli/src/cmd/deploy_config.rs` | Add `ca_cert_path`, `client_cert_path`, `client_key_path` |
 
 ---
 
-## Phase 7 — Integration test support
+## Phase 7 — Deploy Integration
 
-Tests use ephemeral self-signed certs generated at runtime via `rcgen` — no files on
-disk, no dependency on the `scripts/gen-local-certs.sh` output.
-
-Add to `wr-tests/Cargo.toml`:
+### `wr-deploy.toml`
 
 ```toml
-rcgen = "0.13"
+cert_dir  = "./certs"   # local dir with CA + node certs from `wr cert`
+peer_port = 9443        # peer TLS port (default 9443)
 ```
 
-### `wr-tests/tests/helpers.rs` — new helper:
+### `DeployConfig` additions
+
+```rust
+pub cert_dir: Option<String>,
+pub peer_port: Option<u16>,
+```
+
+### Bundle-time (`add_proxy_config` in node.rs)
+
+- `listen_address` → `127.0.0.1:{proxy_port}` (loopback only)
+- `control_address` → `127.0.0.1:{control_port}` (loopback only)
+- Add `peer_port = {peer_port}` to `[node]`
+- Add `[node.tls]` with relative paths: `certs/node.crt`, `certs/node.key`, `certs/ca.crt`
+
+### Deploy-time (`deploy()` in node.rs)
+
+After resolving template vars:
+
+1. Resolve `cert_dir` — **required**, error if missing
+2. Find `ca.crt` + `<host>.crt` + `<host>.key` in cert_dir
+3. Create `{workdir}/wr-node/certs/` on remote
+4. SCP the three files as `ca.crt`, `node.crt`, `node.key`
+5. Add `peer_port` to template var map
+
+### Systemd + Docker
+
+- Proxy service exposes peer port alongside the main port
+- Docker compose maps the peer port
+- Engine/control ports only bind loopback — no need to expose
+
+### CLI config structs (`wr-cli/src/cmd/config.rs`)
+
+```rust
+pub struct ProxyNodeConfig {
+    pub proxy_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<ProxyTlsConfig>,
+}
+```
+
+**Files:**
+| File | Change |
+|------|--------|
+| `wr-cli/src/cmd/deploy_config.rs` | Add `cert_dir`, `peer_port` |
+| `wr-cli/src/cmd/config.rs` | Add `peer_port`, `tls` to `ProxyNodeConfig` |
+| `wr-cli/src/cmd/node.rs` | `--cert-dir`, `--peer-port`; loopback bind addresses; cert SCP; peer port in systemd/docker |
+
+---
+
+## Phase 8 — Test + Local Dev Ergonomics
+
+### Test PKI helper (`wr-tests/tests/helpers.rs`)
+
+Lazily-initialized shared PKI — cert generation happens once per test binary:
 
 ```rust
 pub struct TestPki {
-    pub ca_cert_der:     CertificateDer<'static>,
-    pub proxy_cert_der:  CertificateDer<'static>,
-    pub proxy_key_der:   PrivateKeyDer<'static>,
+    pub ca_cert_der: Vec<CertificateDer<'static>>,
+    pub node_cert_der: Vec<CertificateDer<'static>>,
+    pub node_key_der: PrivateKeyDer<'static>,
 }
 
-/// Generate a CA and a signed proxy cert entirely in memory.
-pub fn generate_test_pki() -> TestPki {
-    let ca_params   = CertificateParams::new(vec!["wruntime-test-ca".into()]);
-    let ca_cert     = Certificate::from_params(ca_params).unwrap();
+pub fn generate_test_pki() -> TestPki { ... }
 
-    let mut params  = CertificateParams::new(vec!["127.0.0.1".into()]);
-    params.is_ca    = IsCa::NoCa;
-    let proxy_cert  = Certificate::from_params(params).unwrap();
-    let proxy_cert_signed = proxy_cert.serialize_der_with_signer(&ca_cert).unwrap();
+pub fn shared_test_pki() -> &'static TestPki {
+    static PKI: OnceLock<TestPki> = OnceLock::new();
+    PKI.get_or_init(generate_test_pki)
+}
 
-    TestPki {
-        ca_cert_der:    ca_cert.serialize_der().unwrap().into(),
-        proxy_cert_der: proxy_cert_signed.into(),
-        proxy_key_der:  proxy_cert.serialize_private_key_der().into(),
-    }
+pub fn test_mtls_pool() -> wr_common::tls::HttpsClientPool<ProxyBody> {
+    let pki = shared_test_pki();
+    let config = wr_common::tls::build_client_config_from_der(...).unwrap();
+    wr_common::tls::HttpsClientPool::new(2, config)
 }
 ```
 
-`build_acceptor` and `build_peer_client` in `wr-proxy/src/tls.rs` need an in-memory
-variant that accepts `CertificateDer` directly instead of file paths — either a second
-constructor or a builder that takes pre-loaded cert bytes.
+### Update all `start_proxy*` helpers
 
-Add a `test_cross_node_mtls` integration test that verifies:
-1. A request from node A to a module on node B succeeds over the mTLS path.
-2. A connection attempt with no client certificate is rejected (TLS handshake error).
-3. A connection attempt with a cert signed by a different CA is rejected.
+Pass `test_mtls_pool()` to `ForwardService::new`. Existing tests are unchanged — the PKI is transparent.
+
+### Manager test helper
+
+`start_manager` gets TLS: generate in-memory certs, build `tonic::ServerTlsConfig`, serve with TLS. `manager_client` uses matching client TLS.
+
+### mTLS-specific test cases
+
+1. **`test_cross_node_mtls_routing`** — two proxy nodes, request routes over mTLS peer path
+2. **`test_mtls_rejects_no_client_cert`** — plain TCP to mTLS port → handshake error
+3. **`test_mtls_rejects_wrong_ca`** — cert from different CA → rejected
+
+### Local dev
+
+```justfile
+certs:
+    cargo run -p wr-cli -- cert init-ca --output certs/
+    cargo run -p wr-cli -- cert generate 127.0.0.1 --ca-dir certs/
+    cargo run -p wr-cli -- cert generate manager --ca-dir certs/
+```
+
+All example configs reference `certs/` paths. `just certs` is a prerequisite for running examples. Add `certs/` to `.gitignore`.
+
+**Files:**
+| File | Change |
+|------|--------|
+| `wr-tests/Cargo.toml` | Add `rcgen = "0.13"` |
+| `wr-tests/tests/helpers.rs` | `TestPki`, `shared_test_pki()`, `test_mtls_pool()`; update `start_proxy*` and `start_manager` |
+| `wr-tests/tests/integration_test.rs` | mTLS test cases |
+| `justfile` | Add `certs` target |
+| `.gitignore` | Add `certs/` |
 
 ---
 
-## Implementation order
+## Phase 9 — Documentation
 
-1. **Phase 1** — add `rustls` / `rustls-pemfile` / `tokio-rustls` dependencies
-2. **Phase 2** — extend `NodeConfig` with optional `peer_address`, `peer_listen_address`, `TlsConfig`; update `ProxyConfig` validation; update TOML examples
-3. **Phase 3** — engine sends `peer_address` as `proxy_address` in routing rules; update `RoutingLayer` self-address
-4. **Phase 4** — `wr-proxy/src/tls.rs` (acceptor), `tls_accept_loop` in `main.rs`
-5. **Phase 5** — `build_peer_client`, optional dual-client `ForwardService`
-6. **Phase 6** — cert generation script, Justfile `certs` target, multi-node config files
-7. **Phase 7** — `rcgen` test helper, `test_cross_node_mtls` cases
+- `CLAUDE.md` — architecture: mTLS, loopback convention, `just certs` prerequisite
+- `docs/deployment.md` — `wr cert` workflow, `--cert-dir`, cert directory layout
+- `docs/configuration.md` — `[node.tls]`, `[tls]` config sections, `peer_port`
+- `README.md` — prerequisites: `just certs` step
 
 ---
 
-## File change summary
+## Implementation Order
+
+```
+Phase 1 (wr cert)    ─┐
+Phase 2 (config)     ──┤
+Phase 3 (tls module) ──┼─→ Phase 4 (proto) ──→ Phase 5 (proxy stack) ─┐
+                       │                                                ├─→ Phase 8 (tests)
+                       └─→ Phase 6 (manager TLS) ─────────────────────┘
+Phase 7 (deploy)     ──┘
+Phase 9 (docs) — after all other phases
+```
+
+Phases 1, 2, 7 can proceed in parallel with phase 3. Phase 5 is the critical path.
+
+---
+
+## Verification
+
+1. `just certs` — generates CA + localhost + manager certs
+2. `just tidy` — formatting + lints pass
+3. `just test` — all tests pass (TestPki transparent)
+4. `just test-wasm` — WASM host binding tests pass
+5. `just ecommerce-inline` — e2e with generated certs, zero WARN lines
+6. Integration tests: mTLS routing, no-cert rejection, wrong-CA rejection, manager TLS
+
+---
+
+## File Change Summary
 
 | File | Change |
-|---|---|
-| `wr-proxy/Cargo.toml` | Add `rustls`, `rustls-pemfile`, `tokio-rustls` |
-| `wr-common/src/node.rs` | Add optional `peer_address`, `peer_listen_address`, `tls: Option<TlsConfig>` to `NodeConfig` |
-| `wr-proxy/src/config.rs` | Add peer/TLS validation to `validate()` |
-| `wr-proxy/src/tls.rs` | **New** — `build_acceptor`, `build_peer_client`, cert loading helpers |
-| `wr-proxy/src/main.rs` | Conditional mTLS listener via `tls_accept_loop`; pass `peer_client` to `ForwardService` |
-| `wr-proxy/src/layers/forward.rs` | Add optional `peer_client` field; branch client selection on `Destination` variant |
-| `wr-proxy/src/layers/routing.rs` | Accept `peer_address` for self-identification (fallback to `proxy_address`) |
-| `wr-engine/src/main.rs` | Send `peer_address` in `RoutingRule.proxy_address` when configured |
-| `examples/config/proxy.toml` | Add `[node.tls]` section |
-| `examples/multi-node/node-a/proxy.toml` | Add `peer_address`, `peer_listen_address`, `[node.tls]` |
-| `examples/multi-node/node-b/proxy.toml` | Add `peer_address`, `peer_listen_address`, `[node.tls]` |
-| `scripts/gen-local-certs.sh` | **New** — generate local CA + proxy certs |
-| `justfile` | Add `certs` target |
+|------|--------|
+| **wr-cli** | |
+| `wr-cli/Cargo.toml` | Add `rcgen` |
+| `wr-cli/src/cmd/cert.rs` | **New** — `init-ca`, `generate` |
+| `wr-cli/src/cmd/mod.rs` | Add `pub mod cert;` |
+| `wr-cli/src/main.rs` | Add `Cert` command; `--ca-cert`, `--client-cert`, `--client-key` global args |
+| `wr-cli/src/client.rs` | TLS-aware `connect()` |
+| `wr-cli/src/cmd/deploy_config.rs` | Add `cert_dir`, `peer_port` |
+| `wr-cli/src/cmd/config.rs` | Add `peer_port`, `tls` to `ProxyNodeConfig` |
+| `wr-cli/src/cmd/node.rs` | `--cert-dir`, `--peer-port`; loopback binds; cert SCP; peer port in generators |
+| **wr-common** | |
+| `wr-common/Cargo.toml` | Add `tokio-rustls`, `rustls`, `rustls-pemfile`, `hyper-rustls` |
+| `wr-common/src/tls.rs` | **New** — all TLS builders, `HttpsClientPool`, gRPC TLS helpers, in-memory variants |
+| `wr-common/src/lib.rs` | Add `pub mod tls;` |
+| `wr-common/src/node.rs` | Add `peer_port`, `tls: TlsConfig`, `TlsConfig`, `peer_address()` |
+| `wr-common/src/discovery.rs` | Add `tls_config` to `ManagerDiscovery`; TLS in `connect_new` |
+| **wr-proxy** | |
+| `wr-proxy/src/main.rs` | mTLS pool + acceptor; peer listener; `tls_accept_loop`; loopback warning |
+| `wr-proxy/src/layers/forward.rs` | `mtls_pool` field (required); branch on `Destination` |
+| `wr-proxy/src/config.rs` | TLS + peer_port validation |
+| `wr-proxy/src/node_service.rs` | Use `reg.peer_address` in routing rule |
+| **wr-manager** | |
+| `wr-manager/src/main.rs` | TLS gRPC server |
+| `wr-manager/src/config.rs` | Add `tls: TlsConfig` |
+| `wr-manager/src/db.rs` | `peer_address` in queries |
+| `wr-manager/migrations/` | New migration |
+| **wr-engine** | |
+| `wr-engine/src/main.rs` | Send `peer_address()` in registration |
+| **proto** | |
+| `proto/wruntime.proto` | `peer_address` on `EngineRegistration` (6) and `RoutingRule` (11) |
+| **wr-tests** | |
 | `wr-tests/Cargo.toml` | Add `rcgen` |
-| `wr-tests/tests/helpers.rs` | Add `TestPki`, `generate_test_pki()` |
+| `wr-tests/tests/helpers.rs` | `TestPki`, `shared_test_pki()`, `test_mtls_pool()`; TLS-aware `start_manager` |
+| `wr-tests/tests/integration_test.rs` | mTLS test cases |
+| **Config + infra** | |
+| `examples/config/*.toml` | Loopback binds; `[node.tls]` / `[tls]`; `peer_port` |
+| `examples/ecommerce/*.toml` | `peer_port`, `[node.tls]` |
+| `examples/multi-node/**/*.toml` | Full TLS config |
+| `examples/codegen/*.toml` | `peer_port`, `[node.tls]` |
+| `examples/stockmarket/*.toml` | `peer_port`, `[node.tls]` |
+| `justfile` | Add `certs` target |
+| `.gitignore` | Add `certs/` |
+| `CLAUDE.md`, `docs/deployment.md`, `docs/configuration.md` | Document mTLS |

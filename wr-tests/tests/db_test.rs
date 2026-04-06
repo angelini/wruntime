@@ -18,6 +18,10 @@ fn test_engine_config_database_section_parses() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        [node.tls]
+        cert_path    = "c.crt"
+        key_path     = "c.key"
+        ca_cert_path = "ca.crt"
         [database]
         url             = "postgres://user:pass@localhost:5432/mydb"
         max_connections = 4
@@ -36,6 +40,10 @@ fn test_engine_config_database_max_connections_default() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        [node.tls]
+        cert_path    = "c.crt"
+        key_path     = "c.key"
+        ca_cert_path = "ca.crt"
         [database]
         url = "postgres://user:pass@localhost:5432/mydb"
     "#;
@@ -54,6 +62,10 @@ fn test_engine_config_module_database_flag_parses() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        [node.tls]
+        cert_path    = "c.crt"
+        key_path     = "c.key"
+        ca_cert_path = "ca.crt"
         [database]
         url = "postgres://user:pass@localhost:5432/mydb"
         [[module]]
@@ -80,6 +92,10 @@ fn test_engine_config_module_database_flag_defaults_to_false() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        [node.tls]
+        cert_path    = "c.crt"
+        key_path     = "c.key"
+        ca_cert_path = "ca.crt"
         [[module]]
         name        = "svc"
         namespace   = "my-ns"

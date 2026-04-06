@@ -14,13 +14,21 @@ use crate::circuit_breaker::CircuitBreakerRegistry;
 #[derive(Clone)]
 pub struct ForwardService {
     pool: HttpClientPool<ProxyBody>,
+    mtls_pool: wr_common::tls::HttpsClientPool<ProxyBody>,
     cb_registry: Arc<CircuitBreakerRegistry>,
 }
 
 impl ForwardService {
-    pub fn new(cb_registry: Arc<CircuitBreakerRegistry>) -> Self {
+    pub fn new(
+        cb_registry: Arc<CircuitBreakerRegistry>,
+        mtls_pool: wr_common::tls::HttpsClientPool<ProxyBody>,
+    ) -> Self {
         let pool = HttpClientPool::new(DEFAULT_POOL_SIZE);
-        Self { pool, cb_registry }
+        Self {
+            pool,
+            mtls_pool,
+            cb_registry,
+        }
     }
 }
 
@@ -34,7 +42,8 @@ impl Service<Request<ProxyBody>> for ForwardService {
     }
 
     fn call(&mut self, mut req: Request<ProxyBody>) -> Self::Future {
-        let client = self.pool.get().clone();
+        let local_client = self.pool.get().clone();
+        let mtls_client = self.mtls_pool.get().clone();
         let cb_registry = self.cb_registry.clone();
 
         Box::pin(async move {
@@ -98,10 +107,16 @@ impl Service<Request<ProxyBody>> for ForwardService {
             }
 
             let result = async {
-                client
-                    .request(forward_req)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("forward failed: {e}"))
+                match &destination {
+                    Destination::LocalEngine(_) => local_client
+                        .request(forward_req)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("forward failed: {e}")),
+                    Destination::RemoteProxy(_) => mtls_client
+                        .request(forward_req)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("forward failed: {e}")),
+                }
             }
             .instrument(span.clone())
             .await;

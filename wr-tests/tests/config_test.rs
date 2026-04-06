@@ -10,6 +10,11 @@ fn test_manager_config_valid() {
         listen_address                = "0.0.0.0:9000"
         engine_heartbeat_timeout_secs = 30
 
+        [tls]
+        cert_path    = "certs/mgr.crt"
+        key_path     = "certs/mgr.key"
+        ca_cert_path = "certs/ca.crt"
+
         [database]
         url = "postgres://localhost/test"
 
@@ -29,9 +34,14 @@ fn test_manager_config_valid() {
 
 #[test]
 fn test_manager_config_default_heartbeat() {
-    // engine_heartbeat_timeout_secs should default to 30 when omitted.
+    // engine_heartbeat_timeout_secs should default to 10 when omitted.
     let toml = r#"
         listen_address = "0.0.0.0:9000"
+
+        [tls]
+        cert_path    = "certs/mgr.crt"
+        key_path     = "certs/mgr.key"
+        ca_cert_path = "certs/ca.crt"
 
         [database]
         url = "postgres://localhost/test"
@@ -47,11 +57,17 @@ fn test_manager_config_default_heartbeat() {
 #[test]
 fn test_proxy_config_valid() {
     let toml = r#"
-        listen_address  = "0.0.0.0:9001"
-        control_address = "0.0.0.0:9002"
+        listen_address  = "127.0.0.1:9001"
+        control_address = "127.0.0.1:9002"
 
         [node]
         proxy_address = "http://127.0.0.1:9001"
+        peer_port     = 9443
+
+        [node.tls]
+        cert_path    = "certs/node.crt"
+        key_path     = "certs/node.key"
+        ca_cert_path = "certs/ca.crt"
 
         [database]
         url = "postgres://localhost/test"
@@ -60,34 +76,51 @@ fn test_proxy_config_valid() {
         routing_table_ttl_secs = 5
     "#;
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
-    assert_eq!(cfg.listen_address, "0.0.0.0:9001");
-    assert_eq!(cfg.control_address, "0.0.0.0:9002");
+    assert_eq!(cfg.listen_address, "127.0.0.1:9001");
+    assert_eq!(cfg.control_address, "127.0.0.1:9002");
     assert_eq!(cfg.cache.routing_table_ttl_secs, 5);
+    assert_eq!(cfg.node.peer_port, 9443);
 }
 
 #[test]
 fn test_proxy_config_defaults() {
     let toml = r#"
-        listen_address  = "0.0.0.0:9001"
-        control_address = "0.0.0.0:9002"
+        listen_address  = "127.0.0.1:9001"
+        control_address = "127.0.0.1:9002"
+
         [node]
-        proxy_address   = "http://127.0.0.1:9001"
+        proxy_address = "http://127.0.0.1:9001"
+
+        [node.tls]
+        cert_path    = "certs/node.crt"
+        key_path     = "certs/node.key"
+        ca_cert_path = "certs/ca.crt"
+
         [database]
         url = "postgres://localhost/test"
     "#;
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
     assert_eq!(cfg.cache.routing_table_ttl_secs, 2);
+    assert_eq!(cfg.node.peer_port, 9443);
 }
 
 #[test]
 fn test_proxy_config_rejects_zero_ttl() {
     let toml = r#"
-        listen_address  = "0.0.0.0:9001"
-        control_address = "0.0.0.0:9002"
+        listen_address  = "127.0.0.1:9001"
+        control_address = "127.0.0.1:9002"
+
         [node]
-        proxy_address   = "http://127.0.0.1:9001"
+        proxy_address = "http://127.0.0.1:9001"
+
+        [node.tls]
+        cert_path    = "certs/node.crt"
+        key_path     = "certs/node.key"
+        ca_cert_path = "certs/ca.crt"
+
         [database]
         url = "postgres://localhost/test"
+
         [cache]
         routing_table_ttl_secs = 0
     "#;
@@ -115,9 +148,19 @@ fn test_example_config_files_parse() {
     // check that the TOML itself is structurally valid.
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
+    struct TlsSection {
+        cert_path: String,
+        key_path: String,
+        ca_cert_path: String,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
     struct NodeSection {
         proxy_address: String,
         control_address: String,
+        #[serde(default)]
+        peer_port: u16,
+        tls: TlsSection,
     }
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]

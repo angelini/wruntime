@@ -18,6 +18,10 @@ use wr_common::wruntime::manager_service_server::ManagerServiceServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     let _telemetry = wr_common::telemetry::init("wr-manager")?;
 
     let config_path = std::env::args()
@@ -39,7 +43,11 @@ async fn main() -> Result<()> {
         .cluster
         .advertise_grpc_address
         .clone()
-        .unwrap_or_else(|| format!("http://{}", config.listen_address));
+        .unwrap_or_else(|| {
+            // Replace 0.0.0.0 with 127.0.0.1 — 0.0.0.0 is a bind address, not connectable
+            let addr = config.listen_address.replace("0.0.0.0", "127.0.0.1");
+            format!("https://{addr}")
+        });
     let gossip_address = config.cluster.gossip_listen_address.clone();
 
     db::register_manager(&db_pool, &manager_id, &grpc_address, &gossip_address)
@@ -114,7 +122,14 @@ async fn main() -> Result<()> {
 
     let shutdown = wr_common::signal::shutdown_signal();
 
-    Server::builder()
+    let mut server = Server::builder();
+    let tls_config = wr_common::tls::build_tonic_server_tls(&config.tls)
+        .map_err(|e| anyhow::anyhow!("failed to build TLS config: {e}"))?;
+    server = server
+        .tls_config(tls_config)
+        .map_err(|e| anyhow::anyhow!("failed to apply TLS config: {e}"))?;
+
+    server
         .add_service(ManagerServiceServer::new(manager))
         .serve_with_shutdown(addr, shutdown)
         .await?;

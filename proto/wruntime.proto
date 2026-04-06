@@ -16,6 +16,7 @@ message EngineRegistration {
   repeated ModuleDescriptor modules       = 3;
   string                    proxy_address = 4; // local proxy address (node identity)
   repeated SecretRequest    secrets       = 5; // secrets this engine needs (resolved from config)
+  string                    peer_address  = 6; // mTLS peer address (https://host:peer_port)
 }
 
 message RoutingRule {
@@ -29,6 +30,7 @@ message RoutingRule {
   string source_namespace          = 8;
   string destination_namespace     = 9;
   string proxy_address             = 10; // node proxy address for this engine
+  string peer_address              = 11; // mTLS peer address for cross-node routing
 }
 
 message RoutingTable {

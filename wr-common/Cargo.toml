@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 prost = "0.14"
-tonic = { version = "0.14", features = ["transport"] }
+tonic = { version = "0.14", features = ["transport", "tls-ring"] }
 tonic-prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 http = "1"
@@ -56,6 +56,15 @@ hyper-util = { version = "0.1", features = [
 ], optional = true }
 http-body = { version = "1", optional = true }
 
+# Optional: TLS (mTLS for inter-service communication)
+rustls = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+hyper-rustls = { version = "0.27", features = [
+  "http2",
+  "ring",
+], optional = true }
+
 [features]
 default = []
 discovery = [
@@ -68,6 +77,15 @@ pool = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:tokio"]
 config = ["dep:toml"]
 signal = ["dep:tokio"]
 http-pool = ["dep:hyper-util", "dep:http-body"]
+tls = [
+  "dep:rustls",
+  "dep:rustls-pemfile",
+  "dep:tokio-rustls",
+  "dep:hyper-rustls",
+  "dep:hyper-util",
+  "dep:http-body",
+  "dep:tokio",
+]
 
 [dev-dependencies]
 tempfile       = "3"

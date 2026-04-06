@@ -23,6 +23,9 @@ just fmt             # cargo fmt --all
 just lint            # cargo clippy -D warnings
 just tidy            # fmt + lint
 
+# Certificates (required before running services)
+just certs             # generate local CA + localhost certs
+
 # Run services (debug)
 just manager
 just proxy
@@ -73,9 +76,9 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 
 | Service | Default Port | Role |
 |---|---|---|
-| `wr-manager` | 9000 (gRPC) + 9010 (gossip) | Registry — routing table, schemas, heartbeat monitor. Runs active-active; chitchat gossip for manager liveness |
-| `wr-proxy` | 9001 (HTTP) + 9002 (gRPC control plane) | Streaming header-based router — intercepts inter-module traffic, routes to engines; bodies flow through without buffering. Control plane handles engine registration/heartbeats |
-| `wr-engine` | 9100 (HTTP) | Runs WASM modules via wasmtime WASI component model |
+| `wr-manager` | 9000 (TLS gRPC) + 9010 (gossip) | Registry — routing table, schemas, heartbeat monitor. Runs active-active; chitchat gossip for manager liveness. gRPC listener uses mTLS |
+| `wr-proxy` | 9001 (HTTP, loopback) + 9002 (gRPC control, loopback) + 9443 (mTLS peer) | Streaming header-based router — intercepts inter-module traffic, routes to engines. Internal listener binds `127.0.0.1`; cross-node traffic uses the mTLS peer listener |
+| `wr-engine` | 9100 (HTTP, loopback) | Runs WASM modules via wasmtime WASI component model |
 
 ### Request Flow
 
@@ -94,9 +97,11 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 1. `TracingLayer` — root OTel span per request (captures source, destination, status, duration)
 2. `RoutingLayer` — single routing table read per request; resolves destination engine from local routing table cache (TTL-based); injects `ResolvedDestination` as a request extension; when egress is enabled and no internal route matches, sets `ExternalEgress` extension
 3. `EgressLayer` — handles `ExternalEgress` requests (domain allowlist, external forward); passes internal requests through
-4. `ForwardService` — reads `ResolvedDestination` extension, strips internal headers, streams request/response bodies to/from engine without buffering
+4. `ForwardService` — reads `ResolvedDestination` extension, strips internal headers, streams request/response bodies to/from engine without buffering. Uses plain HTTP pool for `Destination::LocalEngine` and mTLS `HttpsClientPool` for `Destination::RemoteProxy`
 
 The proxy uses a custom `ProxyBody` type that wraps `hyper::body::Incoming` behind a `Pin<Box<dyn Body + Send>>`, enabling streaming without the `Sync` requirement that `BoxBody` imposes. All layers only inspect headers — bodies flow through untouched.
+
+**mTLS** — all network-facing inter-service traffic is mutually authenticated via TLS. A shared internal CA signs one certificate per node/manager. Certificate management: `wr cert init-ca` generates the CA; `wr cert generate <hostname>` generates per-node certs. Config: `[node.tls]` section with `cert_path`, `key_path`, `ca_cert_path`. The proxy's internal listener (`:9001`) binds to `127.0.0.1` (loopback only); a second mTLS listener on `peer_port` (default `:9443`) handles all cross-node traffic. The peer address is derived automatically from `proxy_address` host + `peer_port` via `NodeConfig::peer_address()`. The manager's gRPC listener also uses TLS (`[tls]` section in `manager.toml`). TLS utilities live in `wr-common/src/tls.rs` (`build_acceptor`, `build_client_config`, `HttpsClientPool`, `build_tonic_server_tls`, `build_tonic_client_tls`). For local dev, run `just certs` to generate localhost certificates.
 
 **`wr-engine`** — uses wasmtime 43 with the WASI component model. On startup: provisions DB schemas → runs migrations (via `refinery`) → loads WASM components → registers with manager → starts 10-second heartbeat loop. Modules can optionally have a PostgreSQL pool (`deadpool-postgres`) and a blobstore (S3-compatible via `rust-s3`) exposed to WASM via custom host bindings.
 
@@ -104,7 +109,7 @@ The proxy uses a custom `ProxyBody` type that wraps `hyper::body::Incoming` behi
 
 **`wr-manager` state** — persisted to Postgres (`db.rs`). Engines, routing rules, schemas, and secrets are stored in database tables; ephemeral state (heartbeats, module health timestamps) remains in-memory (`state.rs`). Migrations run automatically on startup (`migrate.rs`). Multiple manager instances can run active-active — concurrent writes are serialized via `SELECT ... FOR UPDATE NOWAIT` on a lock sentinel row. Each manager registers in the `wr_managers` table, heartbeats every 15 s, and participates in a [chitchat](https://docs.rs/chitchat) gossip mesh (UDP) for phi-accrual failure detection. The `ListManagers` gRPC RPC returns all healthy managers, enabling peer discovery from any seed. Manager config requires a `[cluster]` section with `cluster_id` and `gossip_listen_address`. Background task monitors engine heartbeats every 5 seconds — marks routing rules unhealthy and bumps the routing table version when an engine times out (default 30 s).
 
-**`wr-cli`** — requires `--manager` (or `WR_MANAGER` env var) pointing at any single manager. The CLI does **not** have database access — all communication is via gRPC. Use `ListManagers` RPC for peer discovery from a seed address. Deployment commands: `wr managers init|bundle|deploy|status` for manager deployment, `wr node init|bundle|deploy|status` for engine+proxy node deployment. Both support systemd and Docker deployment formats. Bundle and deploy commands auto-discover a `wr-deploy.toml` config file in the working directory (or accept `--config <path>`) providing shared defaults for `target`, `db_url`, `format`, `secret_key`, `ssh_key`, `workdir`, `image_prefix`, and `seed_nodes`. Precedence: CLI flag > config file > env var > default.
+**`wr-cli`** — requires `--manager` (or `WR_MANAGER` env var) pointing at any single manager. The CLI does **not** have database access — all communication is via gRPC. For mTLS connections to the manager, pass `--ca-cert`, `--client-cert`, `--client-key` (or `WR_CA_CERT`, `WR_CLIENT_CERT`, `WR_CLIENT_KEY` env vars). Use `ListManagers` RPC for peer discovery from a seed address. Certificate management: `wr cert init-ca` generates a CA, `wr cert generate <hostname>` generates per-node certs. Deployment commands: `wr managers init|bundle|deploy|status` for manager deployment, `wr node init|bundle|deploy|status` for engine+proxy node deployment. Both support systemd and Docker deployment formats. Bundle and deploy commands auto-discover a `wr-deploy.toml` config file in the working directory (or accept `--config <path>`) providing shared defaults for `target`, `db_url`, `format`, `secret_key`, `ssh_key`, `workdir`, `image_prefix`, `seed_nodes`, `cert_dir`, and `peer_port`. Precedence: CLI flag > config file > env var > default.
 
 **`wr-proxy` sync** — one background task: `sync_routing_table()` polls manager every `routing_table_ttl_secs`. Request metrics are collected via OpenTelemetry traces (no custom metrics pipeline).
 
@@ -133,7 +138,7 @@ impl Host for ModuleState {
 
 ### Configuration
 
-Each service reads a TOML config file. Examples in `examples/config/` (`manager.toml`, `proxy.toml`, `engine.toml`). Modules and their optional `.binpb` schemas are declared under `[[module]]` in `engine.toml`.
+Each service reads a TOML config file. Examples in `examples/config/` (`manager.toml`, `proxy.toml`, `engine.toml`). Modules and their optional `.binpb` schemas are declared under `[[module]]` in `engine.toml`. All services require a `[node.tls]` (proxy/engine) or `[tls]` (manager) section with `cert_path`, `key_path`, and `ca_cert_path` pointing to PEM certificate files. The proxy config additionally requires `peer_port` (default 9443) in the `[node]` section.
 
 ### Integration Tests
 

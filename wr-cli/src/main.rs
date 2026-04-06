@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use wr_common::node::TlsConfig;
 
 mod client;
 mod cmd;
@@ -12,12 +13,35 @@ struct Cli {
     #[arg(long, env = "WR_MANAGER", global = true)]
     manager: Option<String>,
 
+    /// CA certificate for verifying the manager's TLS cert
+    #[arg(long, env = "WR_CA_CERT", global = true)]
+    ca_cert: Option<String>,
+
+    /// Client certificate for mTLS authentication to the manager
+    #[arg(long, env = "WR_CLIENT_CERT", global = true)]
+    client_cert: Option<String>,
+
+    /// Client private key for mTLS authentication to the manager
+    #[arg(long, env = "WR_CLIENT_KEY", global = true)]
+    client_key: Option<String>,
+
     /// Enable verbose debug output (connection attempts, SSH commands, retries)
     #[arg(long, short, global = true)]
     verbose: bool,
 
     #[command(subcommand)]
     command: Commands,
+}
+
+fn build_tls_config(cli: &Cli) -> Option<TlsConfig> {
+    match (&cli.ca_cert, &cli.client_cert, &cli.client_key) {
+        (Some(ca), Some(cert), Some(key)) => Some(TlsConfig {
+            cert_path: cert.clone(),
+            key_path: key.clone(),
+            ca_cert_path: ca.clone(),
+        }),
+        _ => None,
+    }
 }
 
 #[derive(Subcommand)]
@@ -44,6 +68,8 @@ enum Commands {
     Node(cmd::node::NodeArgs),
     /// View logs from remote services
     Logs(cmd::logs::LogsArgs),
+    /// Generate TLS certificates for mTLS
+    Cert(cmd::cert::CertArgs),
 }
 
 fn require_manager(manager: &Option<String>) -> Result<&str> {
@@ -59,6 +85,10 @@ async fn main() -> Result<()> {
 
     cmd::helpers::set_verbose(cli.verbose);
 
+    if let Some(tls) = build_tls_config(&cli) {
+        client::set_tls_config(tls);
+    }
+
     match cli.command {
         Commands::Db(args) => cmd::db::run(args).await,
         Commands::Dev(args) => cmd::dev::run(args, cli.manager.as_deref()).await,
@@ -73,5 +103,6 @@ async fn main() -> Result<()> {
         Commands::Secrets(args) => cmd::secrets::run(args, require_manager(&cli.manager)?).await,
         Commands::Node(args) => cmd::node::run(args, cli.manager.as_deref()).await,
         Commands::Logs(args) => cmd::logs::run(args).await,
+        Commands::Cert(args) => cmd::cert::run(args),
     }
 }

@@ -1,8 +1,14 @@
-listen_address = "0.0.0.0:9100"
+listen_address = "127.0.0.1:9100"
 
 [node]
-proxy_address   = "http://127.0.0.1:9001" # local proxy; used to rewrite WASM outbound calls
-control_address = "http://127.0.0.1:9002" # proxy gRPC control plane for registration/heartbeats
+proxy_address   = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_port       = 9443
+
+[node.tls]
+cert_path    = "certs/127.0.0.1.crt"
+key_path     = "certs/127.0.0.1.key"
+ca_cert_path = "certs/ca.crt"
 
 # Optional — remove this section if no modules need database access.
 [database]

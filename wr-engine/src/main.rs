@@ -156,6 +156,7 @@ async fn async_main() -> Result<()> {
                 engine_id: engine_id.clone(),
                 address: advertise_address.clone(),
                 proxy_address: config.node.proxy_address.clone(),
+                peer_address: config.node.peer_address(),
                 modules: module_descriptors,
                 secrets: secret_requests,
             }),

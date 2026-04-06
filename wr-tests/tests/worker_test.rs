@@ -28,6 +28,10 @@ async fn test_worker_config_parsing() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        [node.tls]
+        cert_path    = "c.crt"
+        key_path     = "c.key"
+        ca_cert_path = "ca.crt"
 
         [database]
         url             = "postgres://localhost/test"
@@ -61,6 +65,10 @@ async fn test_worker_config_defaults() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        [node.tls]
+        cert_path    = "c.crt"
+        key_path     = "c.key"
+        ca_cert_path = "ca.crt"
 
         [database]
         url = "postgres://localhost/test"
@@ -88,6 +96,10 @@ async fn test_worker_mode_service_default() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        [node.tls]
+        cert_path    = "c.crt"
+        key_path     = "c.key"
+        ca_cert_path = "ca.crt"
 
         [[module]]
         name      = "svc"
@@ -890,6 +902,10 @@ async fn test_worker_config_validation_requires_database() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        [node.tls]
+        cert_path    = "c.crt"
+        key_path     = "c.key"
+        ca_cert_path = "ca.crt"
 
         [[module]]
         name      = "my-worker"

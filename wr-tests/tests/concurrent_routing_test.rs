@@ -21,6 +21,7 @@ fn make_rule(rule_id: &str, dest_module: &str, engine_id: &str) -> RoutingRule {
         engine_id: engine_id.into(),
         engine_address: "http://127.0.0.1:9999".into(),
         proxy_address: String::new(),
+        peer_address: String::new(),
         healthy: true,
     }
 }
@@ -120,6 +121,7 @@ async fn test_deregister_waits_for_lock() -> Result<()> {
             engine_id: "dereg-e1".into(),
             address: "http://127.0.0.1:9400".into(),
             proxy_address: String::new(),
+            peer_address: String::new(),
             modules: vec![ModuleDescriptor {
                 name: "dereg-svc".into(),
                 namespace: "dereg-ns".into(),
@@ -333,6 +335,7 @@ async fn test_deregister_no_rules_no_version_bump() -> Result<()> {
             engine_id: "norule-e1".into(),
             address: "http://127.0.0.1:9500".into(),
             proxy_address: String::new(),
+            peer_address: String::new(),
             modules: vec![],
             secrets: vec![],
         }),
@@ -368,6 +371,7 @@ async fn test_deregister_with_rules_bumps_version() -> Result<()> {
             engine_id: "withrule-e1".into(),
             address: "http://127.0.0.1:9501".into(),
             proxy_address: String::new(),
+            peer_address: String::new(),
             modules: vec![ModuleDescriptor {
                 name: "wr-svc".into(),
                 namespace: "wr-ns".into(),

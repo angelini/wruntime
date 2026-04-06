@@ -104,6 +104,7 @@ async fn test_manager_rejects_module_without_namespace() -> Result<()> {
                 engine_id: "e1".into(),
                 address: "http://127.0.0.1:9100".into(),
                 proxy_address: String::new(),
+                peer_address: String::new(),
                 modules: vec![ModuleDescriptor {
                     name: "svc".into(),
                     namespace: String::new(), // empty namespace → should be rejected

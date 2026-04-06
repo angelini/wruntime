@@ -24,6 +24,11 @@ just manager
 listen_address                = "0.0.0.0:9000"
 engine_heartbeat_timeout_secs = 30
 
+[tls]
+cert_path    = "certs/manager.crt"
+key_path     = "certs/manager.key"
+ca_cert_path = "certs/ca.crt"
+
 [database]
 url             = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 10
@@ -34,6 +39,8 @@ gossip_listen_address = "0.0.0.0:9010"      # UDP address for chitchat gossip
 # advertise_grpc_address = "http://manager-1:9000"  # optional; defaults to listen_address
 # gossip_interval_ms = 500                           # optional; default 500
 ```
+
+The `[tls]` section is required. All gRPC clients must present a certificate signed by the same CA.
 
 The `[database]` section is required. The manager persists engines, routing rules, and schemas to Postgres. Migrations run automatically on startup.
 
@@ -48,11 +55,17 @@ just proxy
 `proxy.toml`:
 
 ```toml
-listen_address  = "0.0.0.0:9001"
-control_address = "0.0.0.0:9002"           # gRPC control plane for engine registration/heartbeats
+listen_address  = "127.0.0.1:9001"         # loopback only — engines on same host
+control_address = "127.0.0.1:9002"         # gRPC control plane for engine registration/heartbeats
 
 [node]
-proxy_address = "http://127.0.0.1:9001"   # this proxy's own address, as reachable by peers
+proxy_address = "http://127.0.0.1:9001"   # engines use this for outbound HTTP calls
+peer_port     = 9443                       # mTLS peer listener port
+
+[node.tls]
+cert_path    = "certs/127.0.0.1.crt"
+key_path     = "certs/127.0.0.1.key"
+ca_cert_path = "certs/ca.crt"
 
 [database]
 url = "postgres://postgres@localhost:5433/wruntime_example"
@@ -61,7 +74,7 @@ url = "postgres://postgres@localhost:5433/wruntime_example"
 routing_table_ttl_secs = 5   # how often to poll the manager for routing updates
 ```
 
-`proxy_address` must match how peer nodes (and engines on this node) will reach this proxy. The routing layer uses it to distinguish rules whose `proxy_address` matches this node — those are forwarded directly to the local engine; all others are forwarded to the peer proxy that owns that address.
+`listen_address` should bind to `127.0.0.1` — only engines on the same host need to reach it. Cross-node traffic uses the mTLS peer listener on `peer_port` (default 9443, binds `0.0.0.0`). The peer address is derived automatically from `proxy_address` host + `peer_port`. The routing layer uses the derived peer address to distinguish local vs. remote rules.
 
 `control_address` exposes a gRPC `NodeService` that engines on the same node use for registration and heartbeats instead of connecting directly to the manager. This decouples engines from the manager address and enables local-first orchestration.
 
@@ -111,13 +124,17 @@ just engine
 `engine.toml`:
 
 ```toml
-listen_address = "0.0.0.0:9100"
+listen_address = "127.0.0.1:9100"
 
 [node]
-proxy_address   = "http://127.0.0.1:9001"  # local proxy; WASM outbound calls are rewritten to
-                                            # this address, and it is sent to the manager on
-                                            # registration so peers can find this node
+proxy_address   = "http://127.0.0.1:9001"  # local proxy; WASM outbound calls rewrite to this
 control_address = "http://127.0.0.1:9002"  # proxy's gRPC control plane for registration/heartbeats
+peer_port       = 9443                      # mTLS peer port (peer address derived from proxy_address host)
+
+[node.tls]
+cert_path    = "certs/127.0.0.1.crt"
+key_path     = "certs/127.0.0.1.key"
+ca_cert_path = "certs/ca.crt"
 
 [[module]]
 name                 = "order-service"

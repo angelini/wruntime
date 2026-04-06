@@ -102,11 +102,12 @@ pub async fn upsert_engine_and_schemas(
     let registration_bytes = reg.encode_to_vec();
 
     txn.execute(
-        "INSERT INTO wr_engines (engine_id, address, proxy_address, registration)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO wr_engines (engine_id, address, proxy_address, peer_address, registration)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (engine_id) DO UPDATE
            SET address = EXCLUDED.address,
                proxy_address = EXCLUDED.proxy_address,
+               peer_address = EXCLUDED.peer_address,
                registration = EXCLUDED.registration,
                updated_at = NOW(),
                last_heartbeat = NOW()",
@@ -114,6 +115,7 @@ pub async fn upsert_engine_and_schemas(
             &reg.engine_id,
             &reg.address,
             &reg.proxy_address,
+            &reg.peer_address,
             &registration_bytes,
         ],
     )
@@ -291,8 +293,8 @@ async fn upsert_routing_rule_once(pool: &Pool, rule: &RoutingRule) -> Result<(),
         "INSERT INTO wr_routing_rules (
             rule_id, source_namespace, source_module,
             destination_namespace, destination_module, destination_version,
-            engine_id, engine_address, proxy_address, healthy
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            engine_id, engine_address, proxy_address, peer_address, healthy
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (rule_id) DO UPDATE SET
             source_namespace = EXCLUDED.source_namespace,
             source_module = EXCLUDED.source_module,
@@ -302,6 +304,7 @@ async fn upsert_routing_rule_once(pool: &Pool, rule: &RoutingRule) -> Result<(),
             engine_id = EXCLUDED.engine_id,
             engine_address = EXCLUDED.engine_address,
             proxy_address = EXCLUDED.proxy_address,
+            peer_address = EXCLUDED.peer_address,
             healthy = EXCLUDED.healthy,
             updated_at = NOW()",
         &[
@@ -314,6 +317,7 @@ async fn upsert_routing_rule_once(pool: &Pool, rule: &RoutingRule) -> Result<(),
             &rule.engine_id,
             &rule.engine_address,
             &rule.proxy_address,
+            &rule.peer_address,
             &rule.healthy,
         ],
     )
@@ -381,7 +385,7 @@ pub async fn get_routing_table(
         .query(
             "SELECT rule_id, source_namespace, source_module,
                     destination_namespace, destination_module, destination_version,
-                    engine_id, engine_address, proxy_address, healthy
+                    engine_id, engine_address, proxy_address, healthy, peer_address
              FROM wr_routing_rules",
             &[],
         )
@@ -401,6 +405,7 @@ pub async fn get_routing_table(
             engine_address: row.get(7),
             proxy_address: row.get(8),
             healthy: row.get(9),
+            peer_address: row.get(10),
         })
         .collect();
 

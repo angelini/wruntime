@@ -20,6 +20,7 @@ use tower::{Service, ServiceBuilder};
 use layers::{
     EgressLayer, ForwardService, IngressLayer, ProxyBody, ResBody, RoutingLayer, TracingLayer,
 };
+use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 use wr_common::discovery::ManagerDiscovery;
 use wr_common::wruntime::node_service_server::NodeServiceServer;
@@ -59,7 +60,9 @@ async fn main() -> Result<()> {
             )
             .context("failed to create discovery pool")?
     };
-    let discovery = Arc::new(ManagerDiscovery::new(db_pool));
+    let manager_tls = wr_common::tls::build_tonic_client_tls(&config.node.tls)
+        .context("failed to build manager TLS config")?;
+    let discovery = Arc::new(ManagerDiscovery::new(db_pool, Some(manager_tls)));
     discovery.refresh().await;
     discovery.spawn_refresh_task();
     info!("manager discovery initialized");
@@ -99,6 +102,27 @@ async fn main() -> Result<()> {
     );
     info!(address = %config.control_address, "proxy control plane listening");
 
+    // ── mTLS setup ─────────────────────────────────────────────────────────
+    let mtls_client_config = wr_common::tls::build_client_config(&config.node.tls)?;
+    let mtls_pool = wr_common::tls::HttpsClientPool::new(
+        wr_common::http_pool::DEFAULT_POOL_SIZE,
+        mtls_client_config,
+    );
+    let tls_acceptor = wr_common::tls::build_acceptor(&config.node.tls)?;
+    let self_address = config.node.peer_address();
+
+    // Warn if internal listener binds to a non-loopback interface
+    if !config.listen_address.starts_with("127.0.0.1:")
+        && !config.listen_address.starts_with("localhost:")
+    {
+        warn!(
+            "listen_address binds to a non-loopback interface — \
+             internal traffic should be loopback only; \
+             network traffic uses the mTLS peer listener on port {}",
+            config.node.peer_port
+        );
+    }
+
     // ── Internal Tower service stack ──────────────────────────────────────
     //
     //   TracingLayer               ← root OTel span per request
@@ -114,15 +138,22 @@ async fn main() -> Result<()> {
     let internal_svc = ServiceBuilder::new()
         .layer(TracingLayer)
         .layer(
-            RoutingLayer::new(routing_table.clone(), config.node.proxy_address.clone())
+            RoutingLayer::new(routing_table.clone(), self_address.clone())
                 .with_egress(egress_domains),
         )
         .layer(EgressLayer::new(config.egress.clone()))
-        .service(ForwardService::new(cb_registry.clone()));
+        .service(ForwardService::new(cb_registry.clone(), mtls_pool.clone()));
 
+    // Internal listener — loopback only
     let internal_listener = TcpListener::bind(&config.listen_address).await?;
-    info!(address = %config.listen_address, "proxy listening (internal)");
-    tokio::spawn(accept_loop(internal_listener, internal_svc));
+    info!(address = %config.listen_address, "proxy listening (internal, loopback)");
+    tokio::spawn(accept_loop(internal_listener, internal_svc.clone()));
+
+    // mTLS peer listener — all interfaces
+    let peer_bind = format!("0.0.0.0:{}", config.node.peer_port);
+    let peer_listener = TcpListener::bind(&peer_bind).await?;
+    info!(address = %peer_bind, "proxy listening (mTLS peer)");
+    tokio::spawn(tls_accept_loop(peer_listener, tls_acceptor, internal_svc));
 
     // ── External Tower service stack (optional) ───────────────────────────
     //
@@ -136,11 +167,8 @@ async fn main() -> Result<()> {
         let external_svc = ServiceBuilder::new()
             .layer(IngressLayer::new(ext.routes.clone()))
             .layer(TracingLayer)
-            .layer(RoutingLayer::new(
-                routing_table,
-                config.node.proxy_address.clone(),
-            ))
-            .service(ForwardService::new(cb_registry.clone()));
+            .layer(RoutingLayer::new(routing_table, self_address))
+            .service(ForwardService::new(cb_registry.clone(), mtls_pool));
 
         let external_listener = TcpListener::bind(&ext.listen_address).await?;
         info!(address = %ext.listen_address, "proxy listening (external)");
@@ -199,6 +227,64 @@ where
                 .await
             {
                 warn!(peer = %peer_addr, error = %e, "connection error");
+            }
+        });
+    }
+}
+
+/// Accepts TLS connections on `listener`, performs the mTLS handshake via
+/// `acceptor`, and drives the same Tower service stack as [`accept_loop`].
+async fn tls_accept_loop<S>(listener: TcpListener, acceptor: TlsAcceptor, svc: S)
+where
+    S: Service<Request<ProxyBody>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Error: std::fmt::Display + Send + 'static,
+    S::Future: Send + 'static,
+{
+    loop {
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "tls accept error");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let svc = svc.clone();
+
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(peer = %peer_addr, error = %e, "TLS handshake failed");
+                    return;
+                }
+            };
+            let io = TokioIo::new(tls_stream);
+
+            let hyper_svc =
+                hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let mut svc = svc.clone();
+                    async move {
+                        let req = req.map(ProxyBody::streaming);
+
+                        match svc.call(req).await {
+                            Ok(resp) => Ok::<_, Infallible>(resp),
+                            Err(e) => {
+                                error!(error = %e, "service error");
+                                Ok(layers::error_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    "internal proxy error",
+                                ))
+                            }
+                        }
+                    }
+                });
+
+            if let Err(e) = auto::Builder::new(TokioExecutor::new())
+                .serve_connection(io, hyper_svc)
+                .await
+            {
+                warn!(peer = %peer_addr, error = %e, "tls connection error");
             }
         });
     }
