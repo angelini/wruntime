@@ -10,9 +10,7 @@ use http::StatusCode;
 /// dispatches it to the engine registered on node B.
 #[tokio::test]
 async fn test_cross_node_routing() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (engine_b_addr, engine_b_shutdown) = spawn_identified_stub("engine-b").await?;
 

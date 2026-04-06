@@ -139,9 +139,7 @@ async fn bench_hot_path() -> Result<()> {
         .unwrap_or(10);
 
     // ── Infrastructure ───────────────────────────────────────────────────────
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let table = wr_proxy::routing::new_routing_table();
     let proxy_addr = start_proxy(table.clone()).await?;
@@ -152,19 +150,13 @@ async fn bench_hot_path() -> Result<()> {
     let (echo_addr, _echo_shutdown) =
         spawn_wasm_stub_engine(echo_engine, echo_pre, &proxy_uri, "echo-svc", "bench-ns").await?;
 
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "echo-engine",
-            addr: &echo_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "bench-ns",
-            name: "echo-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "echo-engine",
+        &echo_addr,
+        "bench-ns",
+        "echo-svc",
+        "1.0.0",
     )
     .await?;
 
@@ -281,30 +273,21 @@ async fn bench_proxy_only() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(500);
 
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (engine_addr, _shutdown) = spawn_stub_engine().await?;
 
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "stub-engine",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "bench-ns",
-            name: "target-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "stub-engine",
+        &engine_addr,
+        "bench-ns",
+        "target-svc",
+        "1.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
     let proxy_addr = start_proxy(table).await?;
 
     // Warmup

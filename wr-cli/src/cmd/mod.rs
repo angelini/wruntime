@@ -1,4 +1,5 @@
 pub mod build_helpers;
+pub mod bundle;
 pub mod cert;
 pub mod config;
 pub mod db;
@@ -13,4 +14,5 @@ pub mod metrics;
 pub mod node;
 pub mod schedules;
 pub mod secrets;
+pub mod service_gen;
 pub mod services;

@@ -74,29 +74,20 @@ async fn test_egress_blocked_domain() -> Result<()> {
 /// Internal module calls must still route correctly when egress is configured.
 #[tokio::test]
 async fn test_egress_internal_module_passthrough() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr_c = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr_c) = manager_trio().await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_module(
+    register_test_module(
         &mut mgr_c,
-        EngineSpec {
-            id: "stub-engine",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "store",
-            name: "inventory",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "stub-engine",
+        &engine_addr,
+        "store",
+        "inventory",
+        "1.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
 
     // Egress is enabled but the destination is a registered internal module.
     let proxy_addr = start_egress_proxy(

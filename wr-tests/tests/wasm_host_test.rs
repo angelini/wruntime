@@ -984,28 +984,19 @@ async fn wasm_http_ingress() -> Result<()> {
         spawn_wasm_stub_engine(engine, pre, "http://127.0.0.1:9001", "http-svc", "test-ns").await?;
 
     // Manager + registration.
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut client = manager_client(&mgr_addr).await?;
-    register_module(
+    let (_pool, mgr_addr, mut client) = manager_trio().await?;
+    register_test_module(
         &mut client,
-        EngineSpec {
-            id: "wasm-engine-1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "test-ns",
-            name: "http-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "wasm-engine-1",
+        &engine_addr,
+        "test-ns",
+        "http-svc",
+        "1.0.0",
     )
     .await?;
 
     // Ingress proxy with a public route for Echo.
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
     let ingress_addr = start_ingress_proxy(
         table,
         vec![ExternalRoute {

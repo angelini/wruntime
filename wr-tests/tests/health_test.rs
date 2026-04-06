@@ -9,24 +9,16 @@ use wr_common::wruntime::{HeartbeatRequest, ModuleDescriptor};
 
 #[tokio::test]
 async fn test_heartbeat_timeout_marks_module_unhealthy() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager_with_monitor(pool.clone(), 1).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (pool, _mgr_addr, mut mgr) = manager_trio_with_monitor(1).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "hc-e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "hc-ns",
-            name: "heartbeat-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "hc-e1",
+        &engine_addr,
+        "hc-ns",
+        "heartbeat-svc",
+        "1.0.0",
     )
     .await?;
 
@@ -55,24 +47,16 @@ async fn test_heartbeat_timeout_marks_module_unhealthy() -> Result<()> {
 /// the monitor from marking its routing rules unhealthy.
 #[tokio::test]
 async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager_with_monitor(pool.clone(), 2).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, _mgr_addr, mut mgr) = manager_trio_with_monitor(2).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "hc-keep-e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "hc-keep-ns",
-            name: "kept-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "hc-keep-e1",
+        &engine_addr,
+        "hc-keep-ns",
+        "kept-svc",
+        "1.0.0",
     )
     .await?;
 
@@ -103,24 +87,16 @@ async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
 /// the monitor recovers the routing rules.
 #[tokio::test]
 async fn test_engine_health_recovery_after_heartbeat() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager_with_monitor(pool.clone(), 1).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (pool, _mgr_addr, mut mgr) = manager_trio_with_monitor(1).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "hc-rec-e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "hc-rec-ns",
-            name: "recovering-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "hc-rec-e1",
+        &engine_addr,
+        "hc-rec-ns",
+        "recovering-svc",
+        "1.0.0",
     )
     .await?;
 
@@ -153,29 +129,20 @@ async fn test_engine_health_recovery_after_heartbeat() -> Result<()> {
 /// An unhealthy module is excluded from proxy routing — requests get 503.
 #[tokio::test]
 async fn test_unhealthy_module_excluded_from_routing() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager_with_monitor(pool.clone(), 1).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio_with_monitor(1).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "hc-route-e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "hc-route-ns",
-            name: "routed-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "hc-route-e1",
+        &engine_addr,
+        "hc-route-ns",
+        "routed-svc",
+        "1.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
     let proxy = start_proxy(table.clone()).await?;
 
     // Module is healthy — routing should work.
@@ -202,24 +169,16 @@ async fn test_unhealthy_module_excluded_from_routing() -> Result<()> {
 /// Routing table version is incremented when health status changes.
 #[tokio::test]
 async fn test_health_change_bumps_routing_table_version() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager_with_monitor(pool.clone(), 1).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (pool, _mgr_addr, mut mgr) = manager_trio_with_monitor(1).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "hc-ver-e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "hc-ver-ns",
-            name: "ver-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "hc-ver-e1",
+        &engine_addr,
+        "hc-ver-ns",
+        "ver-svc",
+        "1.0.0",
     )
     .await?;
 

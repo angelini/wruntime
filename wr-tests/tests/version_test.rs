@@ -9,46 +9,31 @@ use wr_common::wruntime::DeregisterEngineRequest;
 
 #[tokio::test]
 async fn test_proxy_routes_to_explicit_version() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-v1").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-v2").await?;
 
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "e1",
-            addr: &e1_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "ver-ns",
-            name: "versioned-service",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "e1",
+        &e1_addr,
+        "ver-ns",
+        "versioned-service",
+        "1.0.0",
     )
     .await?;
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "e2",
-            addr: &e2_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "ver-ns",
-            name: "versioned-service",
-            version: "2.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "e2",
+        &e2_addr,
+        "ver-ns",
+        "versioned-service",
+        "2.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
     let proxy = start_proxy(table).await?;
 
     let (s, body) = proxy_get(proxy, "ver-ns", "versioned-service", Some("1.0.0")).await?;
@@ -66,46 +51,31 @@ async fn test_proxy_routes_to_explicit_version() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_load_balances_across_versions_without_header() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-v1").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-v2").await?;
 
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "e1",
-            addr: &e1_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "latest-ns",
-            name: "latest-service",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "e1",
+        &e1_addr,
+        "latest-ns",
+        "latest-service",
+        "1.0.0",
     )
     .await?;
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "e2",
-            addr: &e2_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "latest-ns",
-            name: "latest-service",
-            version: "2.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "e2",
+        &e2_addr,
+        "latest-ns",
+        "latest-service",
+        "2.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
     let proxy = start_proxy(table).await?;
 
     // No x-wr-version → should load-balance across all versions
@@ -133,29 +103,20 @@ async fn test_proxy_load_balances_across_versions_without_header() -> Result<()>
 
 #[tokio::test]
 async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, _stub) = spawn_identified_stub("engine-v1").await?;
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "e1",
-            addr: &e1_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "mv-ns",
-            name: "missing-ver-service",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "e1",
+        &e1_addr,
+        "mv-ns",
+        "missing-ver-service",
+        "1.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
     let proxy = start_proxy(table).await?;
 
     let (s, _) = proxy_get(proxy, "mv-ns", "missing-ver-service", Some("9.0.0")).await?;
@@ -166,38 +127,21 @@ async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_routes_semver_range_to_highest_satisfying() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-v1").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-v2").await?;
     let (e3_addr, e3_shutdown) = spawn_identified_stub("engine-v3").await?;
 
     for (id, addr, version) in [
-        ("e1", &e1_addr, "1.0.0"),
-        ("e2", &e2_addr, "1.5.0"),
-        ("e3", &e3_addr, "2.0.0"),
+        ("e1", e1_addr.as_str(), "1.0.0"),
+        ("e2", e2_addr.as_str(), "1.5.0"),
+        ("e3", e3_addr.as_str(), "2.0.0"),
     ] {
-        register_module(
-            &mut mgr,
-            EngineSpec {
-                id,
-                addr,
-                proxy_address: "",
-            },
-            ModuleSpec {
-                namespace: "range-ns",
-                name: "range-service",
-                version,
-                schema: minimal_file_descriptor_set(),
-            },
-        )
-        .await?;
+        register_test_module(&mut mgr, id, addr, "range-ns", "range-service", version).await?;
     }
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
     let proxy = start_proxy(table).await?;
 
     // ^1 should pick the highest 1.x, which is 1.5.0
@@ -221,29 +165,20 @@ async fn test_proxy_routes_semver_range_to_highest_satisfying() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_returns_503_for_unsatisfiable_range() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, _stub) = spawn_identified_stub("engine-v1").await?;
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "e1",
-            addr: &e1_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "range-503-ns",
-            name: "range-503-service",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "e1",
+        &e1_addr,
+        "range-503-ns",
+        "range-503-service",
+        "1.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
     let proxy = start_proxy(table).await?;
 
     let (s, _) = proxy_get(proxy, "range-503-ns", "range-503-service", Some("^3")).await?;
@@ -258,47 +193,16 @@ async fn test_proxy_returns_503_for_unsatisfiable_range() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_load_balances_across_instances() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     // Two engines both hosting the same (module, version).
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-a").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-b").await?;
 
-    register_module(
-        &mut mgr,
-        EngineSpec {
-            id: "ea",
-            addr: &e1_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "lb-ns",
-            name: "lb-service",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
-    )
-    .await?;
-    register_module(
-        &mut mgr,
-        EngineSpec {
-            id: "eb",
-            addr: &e2_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "lb-ns",
-            name: "lb-service",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
-    )
-    .await?;
+    register_test_module(&mut mgr, "ea", &e1_addr, "lb-ns", "lb-service", "1.0.0").await?;
+    register_test_module(&mut mgr, "eb", &e2_addr, "lb-ns", "lb-service", "1.0.0").await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
     let proxy = start_proxy(table).await?;
 
     let mut saw_a = false;
@@ -320,46 +224,31 @@ async fn test_proxy_load_balances_across_instances() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_failover_after_deregister() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-a").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-b").await?;
 
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "ea",
-            addr: &e1_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "fo-ns",
-            name: "failover-service",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "ea",
+        &e1_addr,
+        "fo-ns",
+        "failover-service",
+        "1.0.0",
     )
     .await?;
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "eb",
-            addr: &e2_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "fo-ns",
-            name: "failover-service",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "eb",
+        &e2_addr,
+        "fo-ns",
+        "failover-service",
+        "1.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
     let proxy = start_proxy(table.clone()).await?;
 
     // Both instances should be reachable before failover.
@@ -397,29 +286,12 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_503_when_all_instances_unhealthy() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, _stub) = spawn_identified_stub("engine-a").await?;
-    register_module(
-        &mut mgr,
-        EngineSpec {
-            id: "ea",
-            addr: &e1_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "gone-ns",
-            name: "gone-service",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
-    )
-    .await?;
+    register_test_module(&mut mgr, "ea", &e1_addr, "gone-ns", "gone-service", "1.0.0").await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
     let proxy = start_proxy(table.clone()).await?;
 
     let (s, _) = proxy_get(proxy, "gone-ns", "gone-service", Some("1.0.0")).await?;

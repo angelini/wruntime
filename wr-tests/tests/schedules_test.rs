@@ -8,9 +8,7 @@ use wr_common::wruntime::{DeleteScheduleRequest, ListSchedulesRequest, UpsertSch
 
 #[tokio::test]
 async fn test_upsert_and_list_schedules() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     // Upsert two schedules.
     let resp = c
@@ -92,9 +90,7 @@ async fn test_upsert_and_list_schedules() -> Result<()> {
 
 #[tokio::test]
 async fn test_upsert_schedule_is_idempotent() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let req = UpsertScheduleRequest {
         worker_namespace: "ns".into(),
@@ -135,9 +131,7 @@ async fn test_upsert_schedule_is_idempotent() -> Result<()> {
 
 #[tokio::test]
 async fn test_delete_schedule() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     c.upsert_schedule(UpsertScheduleRequest {
         worker_namespace: "ns".into(),
@@ -184,9 +178,7 @@ async fn test_delete_schedule() -> Result<()> {
 
 #[tokio::test]
 async fn test_delete_nonexistent_schedule_succeeds() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     // Deleting a schedule that was never created should not error.
     c.delete_schedule(DeleteScheduleRequest {
@@ -202,9 +194,7 @@ async fn test_delete_nonexistent_schedule_succeeds() -> Result<()> {
 
 #[tokio::test]
 async fn test_upsert_schedule_empty_fields_rejected() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     // Empty namespace.
     let result = c
@@ -267,9 +257,7 @@ async fn test_upsert_schedule_empty_fields_rejected() -> Result<()> {
 
 #[tokio::test]
 async fn test_upsert_schedule_zero_interval_rejected() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let result = c
         .upsert_schedule(UpsertScheduleRequest {
@@ -289,9 +277,7 @@ async fn test_upsert_schedule_zero_interval_rejected() -> Result<()> {
 
 #[tokio::test]
 async fn test_delete_schedule_empty_fields_rejected() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let result = c
         .delete_schedule(DeleteScheduleRequest {
@@ -320,9 +306,7 @@ async fn test_delete_schedule_empty_fields_rejected() -> Result<()> {
 
 #[tokio::test]
 async fn test_schedule_fields_preserved() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     c.upsert_schedule(UpsertScheduleRequest {
         worker_namespace: "ns".into(),

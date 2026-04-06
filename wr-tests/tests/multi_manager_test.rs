@@ -16,19 +16,13 @@ async fn test_heartbeat_visible_across_managers() {
 
     // Register engine + routing rule via manager-1
     let mut c1 = manager_client(&managers[0].addr).await.unwrap();
-    register_module(
+    register_test_module(
         &mut c1,
-        EngineSpec {
-            id: "engine-1",
-            addr: "http://127.0.0.1:19100",
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "ns",
-            name: "svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "engine-1",
+        "http://127.0.0.1:19100",
+        "ns",
+        "svc",
+        "1.0.0",
     )
     .await
     .unwrap();
@@ -62,19 +56,13 @@ async fn test_health_preserved_across_managers() {
     let managers = start_manager_cluster(pool.clone(), 2, 2).await.unwrap();
 
     let mut c1 = manager_client(&managers[0].addr).await.unwrap();
-    register_module(
+    register_test_module(
         &mut c1,
-        EngineSpec {
-            id: "engine-2",
-            addr: "http://127.0.0.1:19200",
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "ns",
-            name: "svc2",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "engine-2",
+        "http://127.0.0.1:19200",
+        "ns",
+        "svc2",
+        "1.0.0",
     )
     .await
     .unwrap();
@@ -107,19 +95,13 @@ async fn test_health_convergence_on_missed_heartbeat() {
     let managers = start_manager_cluster(pool.clone(), 2, 1).await.unwrap();
 
     let mut c1 = manager_client(&managers[0].addr).await.unwrap();
-    register_module(
+    register_test_module(
         &mut c1,
-        EngineSpec {
-            id: "engine-3",
-            addr: "http://127.0.0.1:19300",
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "ns",
-            name: "svc3",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "engine-3",
+        "http://127.0.0.1:19300",
+        "ns",
+        "svc3",
+        "1.0.0",
     )
     .await
     .unwrap();
@@ -153,19 +135,13 @@ async fn test_single_manager_cluster() {
     let managers = start_manager_cluster(pool.clone(), 1, 30).await.unwrap();
 
     let mut c = manager_client(&managers[0].addr).await.unwrap();
-    register_module(
+    register_test_module(
         &mut c,
-        EngineSpec {
-            id: "engine-solo",
-            addr: "http://127.0.0.1:19400",
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "ns",
-            name: "solo",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "engine-solo",
+        "http://127.0.0.1:19400",
+        "ns",
+        "solo",
+        "1.0.0",
     )
     .await
     .unwrap();

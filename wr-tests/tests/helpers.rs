@@ -204,6 +204,65 @@ pub async fn manager_client(addr: &str) -> Result<ManagerServiceClient<tonic::tr
     Ok(ManagerServiceClient::connect(addr.to_string()).await?)
 }
 
+/// Set up an in-process manager: pool + gRPC server + connected client.
+pub async fn manager_trio() -> Result<(
+    deadpool_postgres::Pool,
+    String,
+    ManagerServiceClient<tonic::transport::Channel>,
+)> {
+    let pool = manager_pool().await;
+    let addr = start_manager(pool.clone()).await?;
+    let client = manager_client(&addr).await?;
+    Ok((pool, addr, client))
+}
+
+/// Like [`manager_trio`] but also spawns the heartbeat monitor background task.
+pub async fn manager_trio_with_monitor(
+    timeout_secs: u64,
+) -> Result<(
+    deadpool_postgres::Pool,
+    String,
+    ManagerServiceClient<tonic::transport::Channel>,
+)> {
+    let pool = manager_pool().await;
+    let addr = start_manager_with_monitor(pool.clone(), timeout_secs).await?;
+    let client = manager_client(&addr).await?;
+    Ok((pool, addr, client))
+}
+
+/// Register a module with sensible test defaults (empty proxy_address, minimal schema).
+pub async fn register_test_module(
+    c: &mut ManagerServiceClient<tonic::transport::Channel>,
+    engine_id: &str,
+    engine_addr: &str,
+    namespace: &str,
+    name: &str,
+    version: &str,
+) -> Result<()> {
+    register_module(
+        c,
+        EngineSpec {
+            id: engine_id,
+            addr: engine_addr,
+            proxy_address: "",
+        },
+        ModuleSpec {
+            namespace,
+            name,
+            version,
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await
+}
+
+/// Create a routing table and sync it from the manager in one step.
+pub async fn synced_routing_table(mgr_addr: &str) -> Result<wr_proxy::routing::CachedRoutingTable> {
+    let table = wr_proxy::routing::new_routing_table();
+    sync_table(mgr_addr, &table).await?;
+    Ok(table)
+}
+
 /// Query the routing table via gRPC and find a rule by destination module name.
 /// Returns `(healthy, version)`.
 pub async fn get_rule_health(
@@ -578,11 +637,8 @@ where
 }
 
 /// Drive the proxy Tower stack over a TLS-wrapped TCP listener (mTLS peer traffic).
-pub async fn tls_proxy_serve<S>(
-    listener: TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
-    svc: S,
-) where
+pub async fn tls_proxy_serve<S>(listener: TcpListener, acceptor: tokio_rustls::TlsAcceptor, svc: S)
+where
     S: tower::Service<
             Request<wr_proxy::layers::ProxyBody>,
             Response = Response<wr_proxy::layers::ResBody>,

@@ -3,7 +3,7 @@ control_address = "0.0.0.0:9004"
 
 [node]
 proxy_address = "http://127.0.0.1:9003" # this proxy's own address, as reachable by peers
-peer_port = 9443
+peer_port     = 9443
 
 [node.tls]
 cert_path    = "certs/127.0.0.1.crt"

@@ -13,29 +13,12 @@ async fn ingress_fixture(
     namespace: &str,
     routes: Vec<ExternalRoute>,
 ) -> Result<(std::net::SocketAddr, tokio::sync::oneshot::Sender<()>)> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr_c = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr_c) = manager_trio().await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_module(
-        &mut mgr_c,
-        EngineSpec {
-            id: "e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace,
-            name: module,
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
-    )
-    .await?;
+    register_test_module(&mut mgr_c, "e1", &engine_addr, namespace, module, "1.0.0").await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
 
     let ingress_addr = start_ingress_proxy(table, routes).await?;
     Ok((ingress_addr, engine_shutdown))

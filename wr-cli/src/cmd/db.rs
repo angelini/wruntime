@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 
-use wr_engine::config::EngineConfig;
-use wr_engine::pool::module_schema;
+use super::config::EngineConfig;
+use wr_common::naming::module_schema;
 
 #[derive(Args)]
 pub struct DbArgs {
@@ -33,7 +33,7 @@ pub async fn run(args: DbArgs) -> Result<()> {
 }
 
 async fn reset(config_path: &str, database_url: Option<&str>) -> Result<()> {
-    let config = EngineConfig::load(config_path)?;
+    let config = EngineConfig::from_file(config_path)?;
 
     let db = config
         .database

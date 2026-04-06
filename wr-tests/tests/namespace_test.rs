@@ -11,46 +11,31 @@ use wr_common::wruntime::{EngineRegistration, ModuleDescriptor, RegisterEngineRe
 #[tokio::test]
 async fn test_proxy_namespaces_are_isolated() -> Result<()> {
     // Two engines host the same module name in different namespaces.
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e_alpha_addr, e_alpha_shutdown) = spawn_identified_stub("engine-alpha").await?;
     let (e_beta_addr, e_beta_shutdown) = spawn_identified_stub("engine-beta").await?;
 
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "ea",
-            addr: &e_alpha_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "ns-alpha",
-            name: "shared-service",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "ea",
+        &e_alpha_addr,
+        "ns-alpha",
+        "shared-service",
+        "1.0.0",
     )
     .await?;
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "eb",
-            addr: &e_beta_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "ns-beta",
-            name: "shared-service",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "eb",
+        &e_beta_addr,
+        "ns-beta",
+        "shared-service",
+        "1.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
     let proxy = start_proxy(table).await?;
 
     // ns-alpha routes to engine-alpha, not engine-beta.
@@ -94,9 +79,7 @@ async fn test_proxy_returns_400_when_namespace_missing() -> Result<()> {
 
 #[tokio::test]
 async fn test_manager_rejects_module_without_namespace() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let result = c
         .register_engine(RegisterEngineRequest {

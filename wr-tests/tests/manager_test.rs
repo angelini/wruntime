@@ -11,9 +11,7 @@ use wr_common::wruntime::{
 
 #[tokio::test]
 async fn test_register_and_list_engines() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     c.register_engine(RegisterEngineRequest {
         registration: Some(EngineRegistration {
@@ -46,9 +44,7 @@ async fn test_register_and_list_engines() -> Result<()> {
 
 #[tokio::test]
 async fn test_deregister_engine() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     c.register_engine(RegisterEngineRequest {
         registration: Some(EngineRegistration {
@@ -79,9 +75,7 @@ async fn test_deregister_engine() -> Result<()> {
 
 #[tokio::test]
 async fn test_heartbeat() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     c.register_engine(RegisterEngineRequest {
         registration: Some(EngineRegistration {
@@ -106,9 +100,7 @@ async fn test_heartbeat() -> Result<()> {
 
 #[tokio::test]
 async fn test_routing_table_upsert_and_get() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     c.upsert_routing_rule(RoutingRule {
         rule_id: "r1".into(),
@@ -145,9 +137,7 @@ async fn test_routing_table_upsert_and_get() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_schema_after_registration() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let schema_bytes = minimal_file_descriptor_set();
 
@@ -187,9 +177,7 @@ async fn test_get_schema_after_registration() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_schema_not_found() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let err = c
         .get_schema(GetSchemaRequest {
@@ -212,9 +200,7 @@ async fn test_get_schema_not_found() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_schema_empty_namespace_rejected() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let err = c
         .get_schema(GetSchemaRequest {
@@ -237,9 +223,7 @@ async fn test_get_schema_empty_namespace_rejected() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_schema_multiple_versions() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     // Build two distinct schemas so we can tell them apart.
     let schema_v1 = minimal_file_descriptor_set();
@@ -319,9 +303,7 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_schema_cross_namespace_isolation() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let schema = minimal_file_descriptor_set();
 
@@ -370,9 +352,7 @@ async fn test_get_schema_cross_namespace_isolation() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_schema_updated_on_reregistration() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let schema_v1 = minimal_file_descriptor_set();
 
@@ -443,9 +423,7 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_schema_multi_module_engine() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let schema = minimal_file_descriptor_set();
 

@@ -11,9 +11,7 @@ use wr_common::wruntime::{
 
 #[tokio::test]
 async fn test_set_and_list_secrets() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     // Set two secrets in the same namespace.
     c.set_secret(SetSecretRequest {
@@ -73,9 +71,7 @@ async fn test_set_and_list_secrets() -> Result<()> {
 
 #[tokio::test]
 async fn test_delete_secret() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     c.set_secret(SetSecretRequest {
         namespace: "ns".into(),
@@ -114,9 +110,7 @@ async fn test_delete_secret() -> Result<()> {
 
 #[tokio::test]
 async fn test_set_secret_upsert_overwrites() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     c.set_secret(SetSecretRequest {
         namespace: "ns".into(),
@@ -180,9 +174,7 @@ async fn test_set_secret_upsert_overwrites() -> Result<()> {
 
 #[tokio::test]
 async fn test_set_secret_empty_namespace_rejected() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let result = c
         .set_secret(SetSecretRequest {
@@ -200,9 +192,7 @@ async fn test_set_secret_empty_namespace_rejected() -> Result<()> {
 
 #[tokio::test]
 async fn test_set_secret_empty_key_rejected() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let result = c
         .set_secret(SetSecretRequest {
@@ -219,9 +209,7 @@ async fn test_set_secret_empty_key_rejected() -> Result<()> {
 
 #[tokio::test]
 async fn test_delete_secret_empty_fields_rejected() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let result = c
         .delete_secret(DeleteSecretRequest {
@@ -246,9 +234,7 @@ async fn test_delete_secret_empty_fields_rejected() -> Result<()> {
 
 #[tokio::test]
 async fn test_register_engine_with_secrets() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     // Store secrets.
     c.set_secret(SetSecretRequest {
@@ -309,9 +295,7 @@ async fn test_register_engine_with_secrets() -> Result<()> {
 
 #[tokio::test]
 async fn test_register_engine_with_missing_secret_fails() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     // Register engine requesting a secret that doesn't exist.
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
@@ -347,9 +331,7 @@ async fn test_register_engine_with_missing_secret_fails() -> Result<()> {
 
 #[tokio::test]
 async fn test_register_engine_no_secrets_succeeds() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
     let resp = c
@@ -380,9 +362,7 @@ async fn test_register_engine_no_secrets_succeeds() -> Result<()> {
 
 #[tokio::test]
 async fn test_secrets_across_namespaces() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     // Store secrets in two namespaces.
     c.set_secret(SetSecretRequest {
@@ -460,9 +440,7 @@ async fn test_secrets_across_namespaces() -> Result<()> {
 
 #[tokio::test]
 async fn test_delete_nonexistent_secret_succeeds() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     // Deleting a secret that was never set should not error.
     c.delete_secret(DeleteSecretRequest {
@@ -476,9 +454,7 @@ async fn test_delete_nonexistent_secret_succeeds() -> Result<()> {
 
 #[tokio::test]
 async fn test_secret_deleted_then_registration_fails() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     // Set then delete a secret.
     c.set_secret(SetSecretRequest {

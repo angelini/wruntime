@@ -5617,7 +5617,6 @@ dependencies = [
  "tonic",
  "wasmtime",
  "wr-common",
- "wr-engine",
 ]
 
 [[package]]

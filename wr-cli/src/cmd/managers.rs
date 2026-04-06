@@ -5,16 +5,16 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
-use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use sha2::{Digest, Sha256};
 use tabled::builder::Builder;
 
 use super::build_helpers;
+use super::bundle;
 use super::config::ManagerConfig;
 use super::deploy_config::{self, DeployConfig, DeployFormat};
 use super::helpers;
+use super::service_gen::{self, DockerfileSpec, ServiceUnit};
 use crate::{client, display};
 
 #[derive(Args)]
@@ -201,7 +201,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
             bin_path.display()
         );
     }
-    tar_add_file(
+    bundle::tar_add_file(
         &mut tar,
         &mut checksums,
         "wr-manager/bin/wr-manager",
@@ -211,7 +211,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
 
     // Add template config
     let bundle_config = config.to_bundle_config();
-    tar_add_bytes(
+    bundle::tar_add_bytes(
         &mut tar,
         "wr-manager/config/manager.toml",
         bundle_config.to_toml()?.as_bytes(),
@@ -219,11 +219,20 @@ fn bundle(args: BundleArgs) -> Result<()> {
     )?;
 
     // Systemd unit
-    let service = generate_manager_service(&workdir, no_otel);
-    tar_add_bytes(
+    let unit = ServiceUnit {
+        description: "wruntime manager",
+        binary_path: &format!("{workdir}/wr-manager/bin/wr-manager"),
+        config_path: &format!("{workdir}/wr-manager/config/manager.toml"),
+        working_directory: &format!("{workdir}/wr-manager"),
+        env_vars: vec![("WRT_SECRET_ENCRYPTION_KEY", "{secret_key}")],
+        no_otel,
+        after: vec![],
+        requires: vec![],
+    };
+    bundle::tar_add_bytes(
         &mut tar,
         "wr-manager/systemd/wr-manager.service",
-        service.as_bytes(),
+        unit.to_systemd().as_bytes(),
         0o644,
     )?;
 
@@ -231,23 +240,43 @@ fn bundle(args: BundleArgs) -> Result<()> {
     let listen_port = helpers::extract_port(&config.listen_address);
     let gossip_port = helpers::extract_port(&config.cluster.gossip_listen_address);
 
-    let dockerfile = generate_manager_dockerfile(&workdir, no_otel);
-    tar_add_bytes(
+    let dockerfile = DockerfileSpec {
+        workdir: &workdir,
+        binary: "bin/wr-manager",
+        config: "config/manager.toml",
+        extra_copies: vec![],
+        env_vars: vec![("WRT_SECRET_ENCRYPTION_KEY", "{secret_key}")],
+        no_otel,
+    };
+    bundle::tar_add_bytes(
         &mut tar,
         "wr-manager/docker/Dockerfile.manager",
-        dockerfile.as_bytes(),
+        dockerfile.render().as_bytes(),
         0o644,
     )?;
 
-    let compose = generate_manager_compose(&image_prefix, listen_port, gossip_port);
-    tar_add_bytes(
+    let compose = service_gen::generate_compose(
+        "",
+        &[service_gen::ComposeService {
+            name: "manager".into(),
+            dockerfile: "docker/Dockerfile.manager".into(),
+            context: "..".into(),
+            image: Some(format!("{image_prefix}-manager")),
+            ports: vec![
+                format!("{listen_port}:{listen_port}"),
+                format!("{gossip_port}:{gossip_port}/udp"),
+            ],
+            depends_on: vec![],
+        }],
+    );
+    bundle::tar_add_bytes(
         &mut tar,
         "wr-manager/docker/docker-compose.yml",
         compose.as_bytes(),
         0o644,
     )?;
 
-    tar_add_bytes(
+    bundle::tar_add_bytes(
         &mut tar,
         "wr-manager/docker/.dockerignore",
         b"*.tar.gz\n",
@@ -265,7 +294,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         checksums,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
-    tar_add_bytes(
+    bundle::tar_add_bytes(
         &mut tar,
         "wr-manager/manifest.json",
         manifest_json.as_bytes(),
@@ -309,7 +338,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key, "WR_SSH_KEY");
     let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port);
 
-    let manifest = read_manifest_from_tarball(&args.bundle)?;
+    let manifest: ManagerManifest = bundle::read_manifest(&args.bundle)?;
 
     let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
 
@@ -331,7 +360,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         args.seed_nodes
     };
 
-    let config_template = read_config_from_tarball(&args.bundle)?;
+    let config_template = bundle::read_file_from_tarball(&args.bundle, "manager.toml")?;
 
     // Resolve template variables
     let mut vars = HashMap::new();
@@ -378,7 +407,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         .unwrap_or("root")
         .to_string();
     let service_template =
-        read_file_from_tarball(&args.bundle, "wr-manager/systemd/wr-manager.service")?;
+        bundle::read_file_from_tarball(&args.bundle, "wr-manager/systemd/wr-manager.service")?;
     let mut secret_vars = HashMap::new();
     secret_vars.insert("secret_key", secret_key.as_str());
     secret_vars.insert("run_user", run_user.as_str());
@@ -576,7 +605,7 @@ fn status(args: StatusArgs) -> Result<()> {
         bail!("Bundle not found: {}", args.bundle);
     }
 
-    let manifest = read_manifest_from_tarball(&args.bundle)?;
+    let manifest: ManagerManifest = bundle::read_manifest(&args.bundle)?;
 
     println!("Bundle: {}", args.bundle);
     println!();
@@ -602,144 +631,4 @@ fn status(args: StatusArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-// --- Generators ---
-
-fn generate_manager_service(workdir: &str, no_otel: bool) -> String {
-    let otel_env = if no_otel {
-        "Environment=OTEL_SDK_DISABLED=true\n"
-    } else {
-        ""
-    };
-    format!(
-        r#"[Unit]
-Description=wruntime manager
-After=network.target
-
-[Service]
-Type=simple
-User={{run_user}}
-Group={{run_group}}
-WorkingDirectory={workdir}/wr-manager
-ExecStart={workdir}/wr-manager/bin/wr-manager {workdir}/wr-manager/config/manager.toml
-Environment=WRT_SECRET_ENCRYPTION_KEY={{secret_key}}
-{otel_env}Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"#
-    )
-}
-
-fn generate_manager_dockerfile(workdir: &str, no_otel: bool) -> String {
-    let otel_env = if no_otel {
-        "ENV OTEL_SDK_DISABLED=true\n"
-    } else {
-        ""
-    };
-    format!(
-        r#"FROM gcr.io/distroless/cc-debian13
-WORKDIR {workdir}
-COPY bin/wr-manager bin/wr-manager
-COPY config/manager.toml config/manager.toml
-ENV WRT_SECRET_ENCRYPTION_KEY={{secret_key}}
-{otel_env}ENTRYPOINT ["bin/wr-manager", "config/manager.toml"]
-"#
-    )
-}
-
-fn generate_manager_compose(image_prefix: &str, listen_port: u16, gossip_port: u16) -> String {
-    format!(
-        r#"services:
-  manager:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.manager
-    image: {image_prefix}-manager
-    ports:
-      - "{listen_port}:{listen_port}"
-      - "{gossip_port}:{gossip_port}/udp"
-    restart: on-failure
-"#
-    )
-}
-
-// --- Tar helpers ---
-
-fn tar_add_file(
-    tar: &mut tar::Builder<GzEncoder<fs::File>>,
-    checksums: &mut HashMap<String, String>,
-    archive_path: &str,
-    src_path: &Path,
-    mode: u32,
-) -> Result<()> {
-    let data =
-        fs::read(src_path).with_context(|| format!("failed to read {}", src_path.display()))?;
-    let mut header = tar::Header::new_gnu();
-    header.set_size(data.len() as u64);
-    header.set_mode(mode);
-    header.set_cksum();
-    tar.append_data(&mut header, archive_path, data.as_slice())?;
-    let hash = format!("{:x}", Sha256::digest(&data));
-    checksums.insert(archive_path.to_string(), hash);
-    Ok(())
-}
-
-fn tar_add_bytes(
-    tar: &mut tar::Builder<GzEncoder<fs::File>>,
-    archive_path: &str,
-    data: &[u8],
-    mode: u32,
-) -> Result<()> {
-    let mut header = tar::Header::new_gnu();
-    header.set_size(data.len() as u64);
-    header.set_mode(mode);
-    header.set_cksum();
-    tar.append_data(&mut header, archive_path, data)?;
-    Ok(())
-}
-
-fn read_manifest_from_tarball(path: &str) -> Result<ManagerManifest> {
-    let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let entry_path = entry.path()?.to_path_buf();
-        if entry_path.ends_with("manifest.json") {
-            let mut content = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut content)?;
-            let manifest: ManagerManifest =
-                serde_json::from_str(&content).context("failed to parse manifest.json")?;
-            return Ok(manifest);
-        }
-    }
-
-    bail!("manifest.json not found in bundle")
-}
-
-/// Read the manager config template from the bundle.
-fn read_file_from_tarball(path: &str, target_file: &str) -> Result<String> {
-    let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let entry_path = entry.path()?.to_string_lossy().to_string();
-        if entry_path.ends_with(target_file) {
-            let mut content = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut content)?;
-            return Ok(content);
-        }
-    }
-
-    bail!("{target_file} not found in bundle")
-}
-
-fn read_config_from_tarball(path: &str) -> Result<String> {
-    read_file_from_tarball(path, "manager.toml")
 }

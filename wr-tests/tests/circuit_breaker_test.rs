@@ -13,32 +13,23 @@ use wr_proxy::config::CircuitBreakerConfig;
 /// requests are rejected with 503 + `Retry-After` without reaching the engine.
 #[tokio::test]
 async fn test_circuit_breaker_opens_after_consecutive_failures() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     // Stub engine that always returns 500.
     let (engine_addr, engine_shutdown) =
         spawn_status_stub(StatusCode::INTERNAL_SERVER_ERROR).await?;
 
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "cb-e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "cb-ns",
-            name: "failing-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "cb-e1",
+        &engine_addr,
+        "cb-ns",
+        "failing-svc",
+        "1.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
 
     // threshold=3 so we can test quickly; open_duration_secs=2 for recovery test.
     let proxy = start_proxy_with_cb(
@@ -72,31 +63,22 @@ async fn test_circuit_breaker_opens_after_consecutive_failures() -> Result<()> {
 /// configured `open_duration_secs`.
 #[tokio::test]
 async fn test_circuit_breaker_retry_after_header() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (engine_addr, engine_shutdown) =
         spawn_status_stub(StatusCode::INTERNAL_SERVER_ERROR).await?;
 
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "cb-retry-e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "cb-retry-ns",
-            name: "retry-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "cb-retry-e1",
+        &engine_addr,
+        "cb-retry-ns",
+        "retry-svc",
+        "1.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
 
     let proxy = start_proxy_with_cb(
         table,
@@ -138,30 +120,21 @@ async fn test_circuit_breaker_retry_after_header() -> Result<()> {
 /// 429 Too Many Requests counts as a failure and can trip the circuit.
 #[tokio::test]
 async fn test_circuit_breaker_429_counts_as_failure() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (engine_addr, engine_shutdown) = spawn_status_stub(StatusCode::TOO_MANY_REQUESTS).await?;
 
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "cb-429-e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "cb-429-ns",
-            name: "rate-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "cb-429-e1",
+        &engine_addr,
+        "cb-429-ns",
+        "rate-svc",
+        "1.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
 
     let proxy = start_proxy_with_cb(
         table,
@@ -192,30 +165,21 @@ async fn test_circuit_breaker_429_counts_as_failure() -> Result<()> {
 /// Successful responses keep the circuit closed — no spurious opens.
 #[tokio::test]
 async fn test_circuit_breaker_stays_closed_on_success() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
 
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "cb-ok-e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "cb-ok-ns",
-            name: "ok-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "cb-ok-e1",
+        &engine_addr,
+        "cb-ok-ns",
+        "ok-svc",
+        "1.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
 
     let proxy = start_proxy_with_cb(
         table,
@@ -240,31 +204,22 @@ async fn test_circuit_breaker_stays_closed_on_success() -> Result<()> {
 /// probe closes the circuit and restores normal traffic.
 #[tokio::test]
 async fn test_circuit_breaker_half_open_recovery() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     // Start with a switchable stub returning 500.
     let (engine_addr, engine_shutdown, status_ctl) = spawn_switchable_stub(500).await?;
 
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "cb-ho-e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "cb-ho-ns",
-            name: "recover-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "cb-ho-e1",
+        &engine_addr,
+        "cb-ho-ns",
+        "recover-svc",
+        "1.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
 
     let proxy = start_proxy_with_cb(
         table,
@@ -305,9 +260,7 @@ async fn test_circuit_breaker_half_open_recovery() -> Result<()> {
 /// Circuit breakers are per-engine: one failing engine doesn't affect another.
 #[tokio::test]
 async fn test_circuit_breaker_per_engine_isolation() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager(pool).await?;
-    let mut mgr = manager_client(&mgr_addr).await?;
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     // Engine A: always fails.
     let (engine_a_addr, engine_a_shutdown) =
@@ -315,39 +268,26 @@ async fn test_circuit_breaker_per_engine_isolation() -> Result<()> {
     // Engine B: always succeeds (different module in same namespace).
     let (engine_b_addr, engine_b_shutdown) = spawn_stub_engine().await?;
 
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "cb-iso-ea",
-            addr: &engine_a_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "cb-iso-ns",
-            name: "bad-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "cb-iso-ea",
+        &engine_a_addr,
+        "cb-iso-ns",
+        "bad-svc",
+        "1.0.0",
     )
     .await?;
-    register_module(
+    register_test_module(
         &mut mgr,
-        EngineSpec {
-            id: "cb-iso-eb",
-            addr: &engine_b_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "cb-iso-ns",
-            name: "good-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
+        "cb-iso-eb",
+        &engine_b_addr,
+        "cb-iso-ns",
+        "good-svc",
+        "1.0.0",
     )
     .await?;
 
-    let table = wr_proxy::routing::new_routing_table();
-    sync_table(&mgr_addr, &table).await?;
+    let table = synced_routing_table(&mgr_addr).await?;
 
     let proxy = start_proxy_with_cb(
         table,

@@ -5,16 +5,16 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
-use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use sha2::{Digest, Sha256};
 
 use super::build_helpers::{self, BuildModule};
+use super::bundle;
 use super::config::EngineConfig;
 use super::deploy_config::{self, DeployConfig, DeployFormat};
 use super::helpers;
 use super::schedules::SchedulesFile;
+use super::service_gen::{self, DockerfileSpec, ServiceUnit};
 
 #[derive(Args)]
 pub struct NodeArgs {
@@ -171,7 +171,7 @@ fn add_engine_artifacts(
 
         // Write the template-ized config into the bundle
         let bundle_config = config.to_bundle_config();
-        tar_add_bytes(
+        bundle::tar_add_bytes(
             tar,
             &format!("wr-node/config/{config_name}"),
             bundle_config.to_toml()?.as_bytes(),
@@ -200,7 +200,7 @@ fn add_engine_artifacts(
                     wasm_src.display()
                 );
             }
-            tar_add_file(
+            bundle::tar_add_file(
                 tar,
                 checksums,
                 &format!("wr-node/modules/{}.wasm", module.name),
@@ -211,7 +211,7 @@ fn add_engine_artifacts(
             // Add pre-compiled native artifact when available
             let cwasm_src = wasm_src.with_extension("cwasm");
             if cwasm_src.exists() {
-                tar_add_file(
+                bundle::tar_add_file(
                     tar,
                     checksums,
                     &format!("wr-node/modules/{}.cwasm", module.name),
@@ -223,7 +223,7 @@ fn add_engine_artifacts(
             if !module.schema_path.is_empty() {
                 let schema_src = Path::new(&module.schema_path);
                 if schema_src.exists() {
-                    tar_add_file(
+                    bundle::tar_add_file(
                         tar,
                         checksums,
                         &format!("wr-node/schemas/{}.binpb", module.name),
@@ -297,7 +297,7 @@ fn add_proxy_config(
         }),
     };
 
-    tar_add_bytes(
+    bundle::tar_add_bytes(
         tar,
         "wr-node/config/proxy.toml",
         proxy.to_toml()?.as_bytes(),
@@ -310,7 +310,6 @@ fn add_proxy_config(
 
 struct DeployArtifactParams<'a> {
     workdir: &'a str,
-    image_prefix: &'a str,
     config_names: &'a [String],
     engine_names: &'a [String],
     proxy_port: u16,
@@ -338,70 +337,127 @@ fn add_deployment_artifacts(
     let no_otel = params.no_otel;
 
     // Systemd units
-    let proxy_service = generate_proxy_service(workdir, &config_names[0], no_otel);
-    tar_add_bytes(
+    let proxy_unit = ServiceUnit {
+        description: "wruntime proxy",
+        binary_path: &format!("{workdir}/wr-node/bin/wr-proxy"),
+        config_path: &format!("{workdir}/wr-node/config/{}", config_names[0]),
+        working_directory: &format!("{workdir}/wr-node"),
+        env_vars: vec![],
+        no_otel,
+        after: vec![],
+        requires: vec![],
+    };
+    bundle::tar_add_bytes(
         tar,
         "wr-node/systemd/wr-proxy.service",
-        proxy_service.as_bytes(),
+        proxy_unit.to_systemd().as_bytes(),
         0o644,
     )?;
 
     for (i, engine_name) in engine_names.iter().enumerate() {
         let cfg_name = &config_names[i + 1];
-        let service = generate_engine_service(workdir, cfg_name, engine_name, no_otel);
-        tar_add_bytes(
+        let engine_unit = ServiceUnit {
+            description: &format!("wruntime engine ({engine_name})"),
+            binary_path: &format!("{workdir}/wr-node/bin/wr-engine"),
+            config_path: &format!("{workdir}/wr-node/config/{cfg_name}"),
+            working_directory: &format!("{workdir}/wr-node"),
+            env_vars: vec![],
+            no_otel,
+            after: vec!["wr-proxy.service"],
+            requires: vec!["wr-proxy.service"],
+        };
+        bundle::tar_add_bytes(
             tar,
             &format!("wr-node/systemd/wr-engine-{engine_name}.service"),
-            service.as_bytes(),
+            engine_unit.to_systemd().as_bytes(),
             0o644,
         )?;
     }
 
     // Sysctl tuning for wasmtime memory pooling
-    let sysctl_conf = generate_sysctl_config();
-    tar_add_bytes(
+    bundle::tar_add_bytes(
         tar,
         "wr-node/systemd/99-wruntime.conf",
-        sysctl_conf.as_bytes(),
+        service_gen::sysctl_config().as_bytes(),
         0o644,
     )?;
 
     // Docker artifacts
-    let proxy_dockerfile = generate_proxy_dockerfile(workdir, no_otel);
-    tar_add_bytes(
+    let proxy_dockerfile = DockerfileSpec {
+        workdir,
+        binary: "bin/wr-proxy",
+        config: "config/proxy.toml",
+        extra_copies: vec![],
+        env_vars: vec![],
+        no_otel,
+    };
+    bundle::tar_add_bytes(
         tar,
         "wr-node/docker/Dockerfile.proxy",
-        proxy_dockerfile.as_bytes(),
+        proxy_dockerfile.render().as_bytes(),
         0o644,
     )?;
 
     for (i, engine_name) in engine_names.iter().enumerate() {
         let cfg_name = &config_names[i + 1];
-        let dockerfile = generate_engine_dockerfile(workdir, cfg_name, no_otel);
-        tar_add_bytes(
+        let engine_dockerfile = DockerfileSpec {
+            workdir,
+            binary: "bin/wr-engine",
+            config: &format!("config/{cfg_name}"),
+            extra_copies: vec![
+                ("modules/", "modules/"),
+                ("schemas/", "schemas/"),
+                ("migrations/", "migrations/"),
+            ],
+            env_vars: vec![],
+            no_otel,
+        };
+        bundle::tar_add_bytes(
             tar,
             &format!("wr-node/docker/Dockerfile.engine-{engine_name}"),
-            dockerfile.as_bytes(),
+            engine_dockerfile.render().as_bytes(),
             0o644,
         )?;
     }
 
-    let compose = generate_docker_compose(
-        params.image_prefix,
-        engine_names,
-        *proxy_port,
-        *control_port,
-        *peer_port,
-        engine_listen_ports,
-    );
-    tar_add_bytes(
+    let compose_header = "# Requires vm.max_map_count >= 262144 on the Docker host for wasmtime memory pooling.\n\
+                          # Apply with: sysctl -w vm.max_map_count=262144\n\
+                          # Persist with: echo 'vm.max_map_count = 262144' > /etc/sysctl.d/99-wruntime.conf";
+
+    let mut compose_services = vec![service_gen::ComposeService {
+        name: "proxy".into(),
+        dockerfile: "docker/Dockerfile.proxy".into(),
+        context: "..".into(),
+        image: None,
+        ports: vec![
+            format!("{proxy_port}:{proxy_port}"),
+            format!("{control_port}:{control_port}"),
+            format!("{peer_port}:{peer_port}"),
+        ],
+        depends_on: vec![],
+    }];
+
+    for (i, name) in engine_names.iter().enumerate() {
+        let port = engine_listen_ports.get(i).copied().unwrap_or(9100);
+        compose_services.push(service_gen::ComposeService {
+            name: format!("engine-{name}"),
+            dockerfile: format!("docker/Dockerfile.engine-{name}"),
+            context: "..".into(),
+            image: None,
+            ports: vec![format!("{port}:{port}")],
+            depends_on: vec!["proxy".into()],
+        });
+    }
+
+    let compose = service_gen::generate_compose(compose_header, &compose_services);
+    bundle::tar_add_bytes(
         tar,
         "wr-node/docker/docker-compose.yml",
         compose.as_bytes(),
         0o644,
     )?;
 
-    tar_add_bytes(tar, "wr-node/docker/.dockerignore", b"*.tar.gz\n", 0o644)?;
+    bundle::tar_add_bytes(tar, "wr-node/docker/.dockerignore", b"*.tar.gz\n", 0o644)?;
 
     Ok(())
 }
@@ -502,7 +558,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
             );
         }
         let archive_path = format!("wr-node/bin/{bin_name}");
-        tar_add_file(&mut tar, &mut checksums, &archive_path, &src, 0o755)?;
+        bundle::tar_add_file(&mut tar, &mut checksums, &archive_path, &src, 0o755)?;
     }
 
     // Add proxy config template (generated from engine node config)
@@ -536,7 +592,6 @@ fn bundle(args: BundleArgs) -> Result<()> {
         &mut tar,
         &DeployArtifactParams {
             workdir: &workdir,
-            image_prefix: &image_prefix,
             config_names: &config_names,
             engine_names: &engine_names,
             proxy_port,
@@ -559,7 +614,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         precompile_hash,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
-    tar_add_bytes(
+    bundle::tar_add_bytes(
         &mut tar,
         "wr-node/manifest.json",
         manifest_json.as_bytes(),
@@ -607,8 +662,8 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     let cert_dir = deploy_config::resolve_string(args.cert_dir, deploy_cfg.cert_dir, "WR_CERT_DIR");
     let peer_port = deploy_config::resolve_peer_port(args.peer_port, deploy_cfg.peer_port);
 
-    let manifest = read_manifest_from_tarball(&args.bundle)?;
-    let configs = read_configs_from_tarball(&args.bundle)?;
+    let manifest: Manifest = bundle::read_manifest(&args.bundle)?;
+    let configs = bundle::read_configs_from_tarball(&args.bundle)?;
 
     let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
 
@@ -828,7 +883,7 @@ async fn deploy_systemd(
 
     print!("[deploy]  installing systemd units ... ");
     // Resolve {run_user}/{run_group} in service files before installing
-    let service_files = list_files_from_tarball(bundle, "wr-node/systemd/", ".service")?;
+    let service_files = bundle::list_files_from_tarball(bundle, "wr-node/systemd/", ".service")?;
     let mut user_vars = std::collections::HashMap::new();
     user_vars.insert("run_user", run_user);
     user_vars.insert("run_group", run_user);
@@ -907,7 +962,7 @@ fn status(args: StatusArgs) -> Result<()> {
         bail!("Bundle not found: {}", args.bundle);
     }
 
-    let manifest = read_manifest_from_tarball(&args.bundle)?;
+    let manifest: Manifest = bundle::read_manifest(&args.bundle)?;
 
     println!("Bundle: {}", args.bundle);
     println!();
@@ -947,191 +1002,6 @@ fn status(args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
-// --- Generators (non-TOML: systemd, Dockerfile, docker-compose) ---
-
-fn generate_proxy_service(workdir: &str, config_name: &str, no_otel: bool) -> String {
-    let otel_env = if no_otel {
-        "Environment=OTEL_SDK_DISABLED=true\n"
-    } else {
-        ""
-    };
-    format!(
-        r#"[Unit]
-Description=wruntime proxy
-After=network.target
-
-[Service]
-Type=simple
-User={{run_user}}
-Group={{run_group}}
-WorkingDirectory={workdir}/wr-node
-ExecStart={workdir}/wr-node/bin/wr-proxy {workdir}/wr-node/config/{config_name}
-{otel_env}Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"#
-    )
-}
-
-fn generate_engine_service(
-    workdir: &str,
-    config_name: &str,
-    engine_name: &str,
-    no_otel: bool,
-) -> String {
-    let otel_env = if no_otel {
-        "Environment=OTEL_SDK_DISABLED=true\n"
-    } else {
-        ""
-    };
-    format!(
-        r#"[Unit]
-Description=wruntime engine ({engine_name})
-After=network.target wr-proxy.service
-Requires=wr-proxy.service
-
-[Service]
-Type=simple
-User={{run_user}}
-Group={{run_group}}
-WorkingDirectory={workdir}/wr-node
-ExecStart={workdir}/wr-node/bin/wr-engine {workdir}/wr-node/config/{config_name}
-{otel_env}Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"#
-    )
-}
-
-fn generate_sysctl_config() -> String {
-    "# Wasmtime pooling allocator requires higher mmap limit for COW-based instantiation.\nvm.max_map_count = 262144\n".to_string()
-}
-
-fn generate_proxy_dockerfile(workdir: &str, no_otel: bool) -> String {
-    let otel_env = if no_otel {
-        "ENV OTEL_SDK_DISABLED=true\n"
-    } else {
-        ""
-    };
-    format!(
-        r#"FROM gcr.io/distroless/cc-debian13
-WORKDIR {workdir}
-COPY bin/wr-proxy bin/wr-proxy
-COPY config/proxy.toml config/proxy.toml
-{otel_env}ENTRYPOINT ["bin/wr-proxy", "config/proxy.toml"]
-"#
-    )
-}
-
-fn generate_engine_dockerfile(workdir: &str, config_name: &str, no_otel: bool) -> String {
-    let otel_env = if no_otel {
-        "ENV OTEL_SDK_DISABLED=true\n"
-    } else {
-        ""
-    };
-    format!(
-        r#"FROM gcr.io/distroless/cc-debian13
-WORKDIR {workdir}
-COPY bin/wr-engine bin/wr-engine
-COPY config/{config_name} config/engine.toml
-COPY modules/ modules/
-COPY schemas/ schemas/
-COPY migrations/ migrations/
-{otel_env}ENTRYPOINT ["bin/wr-engine", "config/engine.toml"]
-"#
-    )
-}
-
-fn generate_docker_compose(
-    _image_prefix: &str,
-    engine_names: &[String],
-    proxy_port: u16,
-    control_port: u16,
-    peer_port: u16,
-    engine_ports: &[u16],
-) -> String {
-    let mut out = String::from(
-        "# Requires vm.max_map_count >= 262144 on the Docker host for wasmtime memory pooling.\n\
-         # Apply with: sysctl -w vm.max_map_count=262144\n\
-         # Persist with: echo 'vm.max_map_count = 262144' > /etc/sysctl.d/99-wruntime.conf\n\
-         \n\
-         services:\n",
-    );
-
-    // Proxy service
-    out.push_str(&format!(
-        r#"  proxy:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.proxy
-    ports:
-      - "{proxy_port}:{proxy_port}"
-      - "{control_port}:{control_port}"
-      - "{peer_port}:{peer_port}"
-    restart: on-failure
-"#
-    ));
-
-    // Engine services
-    for (i, name) in engine_names.iter().enumerate() {
-        let port = engine_ports.get(i).copied().unwrap_or(9100);
-        out.push_str(&format!(
-            r#"
-  engine-{name}:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.engine-{name}
-    ports:
-      - "{port}:{port}"
-    depends_on:
-      - proxy
-    restart: on-failure
-"#
-        ));
-    }
-
-    out
-}
-
-// --- Tar helpers ---
-
-fn tar_add_file(
-    tar: &mut tar::Builder<GzEncoder<fs::File>>,
-    checksums: &mut HashMap<String, String>,
-    archive_path: &str,
-    src_path: &Path,
-    mode: u32,
-) -> Result<()> {
-    let data =
-        fs::read(src_path).with_context(|| format!("failed to read {}", src_path.display()))?;
-    let mut header = tar::Header::new_gnu();
-    header.set_size(data.len() as u64);
-    header.set_mode(mode);
-    header.set_cksum();
-    tar.append_data(&mut header, archive_path, data.as_slice())?;
-    let hash = format!("{:x}", Sha256::digest(&data));
-    checksums.insert(archive_path.to_string(), hash);
-    Ok(())
-}
-
-fn tar_add_bytes(
-    tar: &mut tar::Builder<GzEncoder<fs::File>>,
-    archive_path: &str,
-    data: &[u8],
-    mode: u32,
-) -> Result<()> {
-    let mut header = tar::Header::new_gnu();
-    header.set_size(data.len() as u64);
-    header.set_mode(mode);
-    header.set_cksum();
-    tar.append_data(&mut header, archive_path, data)?;
-    Ok(())
-}
-
 fn add_migrations_dir(
     tar: &mut tar::Builder<GzEncoder<fs::File>>,
     checksums: &mut HashMap<String, String>,
@@ -1148,78 +1018,8 @@ fn add_migrations_dir(
         if path.is_file() {
             let fname = entry.file_name().to_string_lossy().to_string();
             let archive_path = format!("wr-node/migrations/{module_name}/{fname}");
-            tar_add_file(tar, checksums, &archive_path, &path, 0o644)?;
+            bundle::tar_add_file(tar, checksums, &archive_path, &path, 0o644)?;
         }
     }
     Ok(())
-}
-
-fn read_manifest_from_tarball(path: &str) -> Result<Manifest> {
-    let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let entry_path = entry.path()?.to_path_buf();
-        if entry_path.ends_with("manifest.json") {
-            let mut content = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut content)?;
-            let manifest: Manifest =
-                serde_json::from_str(&content).context("failed to parse manifest.json")?;
-            return Ok(manifest);
-        }
-    }
-
-    bail!("manifest.json not found in bundle")
-}
-
-/// Read all config files from the bundle's config/ directory.
-/// Read files from the tarball whose archive path contains `dir_prefix` and ends with `suffix`.
-/// Returns `(archive_path, content)` pairs.
-fn list_files_from_tarball(
-    path: &str,
-    dir_prefix: &str,
-    suffix: &str,
-) -> Result<Vec<(String, String)>> {
-    let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-    let mut files = Vec::new();
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let entry_path = entry.path()?.to_string_lossy().to_string();
-        if entry_path.contains(dir_prefix) && entry_path.ends_with(suffix) {
-            let mut content = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut content)?;
-            files.push((entry_path, content));
-        }
-    }
-
-    Ok(files)
-}
-
-fn read_configs_from_tarball(path: &str) -> Result<Vec<(String, String)>> {
-    let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-    let mut configs = Vec::new();
-
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let entry_path = entry.path()?.to_string_lossy().to_string();
-        if entry_path.contains("/config/") && entry_path.ends_with(".toml") {
-            let name = entry_path
-                .rsplit('/')
-                .next()
-                .unwrap_or(&entry_path)
-                .to_string();
-            let mut content = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut content)?;
-            configs.push((name, content));
-        }
-    }
-
-    Ok(configs)
 }

@@ -111,9 +111,7 @@ async fn test_delete_retries_on_contention() -> Result<()> {
 /// the other transaction commits, rather than returning Aborted.
 #[tokio::test]
 async fn test_deregister_waits_for_lock() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool.clone()).await?;
-    let mut c = manager_client(&addr).await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
     // Register an engine with a module so deregister has rules to mark unhealthy.
     c.register_engine(RegisterEngineRequest {
@@ -177,9 +175,7 @@ async fn test_deregister_waits_for_lock() -> Result<()> {
 
 #[tokio::test]
 async fn test_sequential_upserts_bump_version() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     let v0 = get_routing_table_version(&mut c).await?;
 
@@ -206,8 +202,7 @@ async fn test_sequential_upserts_bump_version() -> Result<()> {
 
 #[tokio::test]
 async fn test_parallel_upserts_all_version_bumps() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
+    let (_pool, addr, _c) = manager_trio().await?;
 
     let v_before = {
         let mut c = manager_client(&addr).await?;
@@ -262,9 +257,7 @@ async fn test_parallel_upserts_all_version_bumps() -> Result<()> {
 
 #[tokio::test]
 async fn test_delete_nonexistent_rule_no_version_bump() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     // Insert a rule so version > 0.
     c.upsert_routing_rule(make_rule("noop-r1", "noop-svc", "e1"))
@@ -290,9 +283,7 @@ async fn test_delete_nonexistent_rule_no_version_bump() -> Result<()> {
 
 #[tokio::test]
 async fn test_delete_existing_rule_bumps_version() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     c.upsert_routing_rule(make_rule("delv-r1", "delv-svc", "e1"))
         .await?;
@@ -325,9 +316,7 @@ async fn test_delete_existing_rule_bumps_version() -> Result<()> {
 
 #[tokio::test]
 async fn test_deregister_no_rules_no_version_bump() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     // Register engine without any routing rules.
     c.register_engine(RegisterEngineRequest {
@@ -362,9 +351,7 @@ async fn test_deregister_no_rules_no_version_bump() -> Result<()> {
 
 #[tokio::test]
 async fn test_deregister_with_rules_bumps_version() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     c.register_engine(RegisterEngineRequest {
         registration: Some(EngineRegistration {
@@ -405,26 +392,10 @@ async fn test_deregister_with_rules_bumps_version() -> Result<()> {
 /// When contention happens the upsert gets Aborted but succeeds on retry.
 #[tokio::test]
 async fn test_health_monitor_and_upsert_coexist() -> Result<()> {
-    let pool = manager_pool().await;
-    let mgr_addr = start_manager_with_monitor(pool.clone(), 1).await?;
-    let mut c = manager_client(&mgr_addr).await?;
+    let (pool, _mgr_addr, mut c) = manager_trio_with_monitor(1).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_module(
-        &mut c,
-        EngineSpec {
-            id: "hm-e1",
-            addr: &engine_addr,
-            proxy_address: "",
-        },
-        ModuleSpec {
-            namespace: "hm-ns",
-            name: "hm-svc",
-            version: "1.0.0",
-            schema: minimal_file_descriptor_set(),
-        },
-    )
-    .await?;
+    register_test_module(&mut c, "hm-e1", &engine_addr, "hm-ns", "hm-svc", "1.0.0").await?;
 
     // Backdate heartbeat so the monitor will flip health and acquire the lock.
     backdate_engine_heartbeat(&pool, "hm-e1", 60).await;
@@ -463,9 +434,7 @@ async fn test_health_monitor_and_upsert_coexist() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_routing_table_returns_none_when_up_to_date() -> Result<()> {
-    let pool = manager_pool().await;
-    let addr = start_manager(pool).await?;
-    let mut c = manager_client(&addr).await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     c.upsert_routing_rule(make_rule("uptodate-r1", "uptodate-svc", "e1"))
         .await?;
