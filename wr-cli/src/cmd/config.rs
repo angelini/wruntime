@@ -232,6 +232,11 @@ impl ManagerConfig {
         config.database.url = "{db_url}".to_string();
         config.cluster.advertise_grpc_address = Some("{advertise_address}".to_string());
         config.cluster.seed_nodes.clear();
+        config.tls = Some(CliTlsConfig {
+            cert_path: "certs/manager.crt".to_string(),
+            key_path: "certs/manager.key".to_string(),
+            ca_cert_path: "certs/ca.crt".to_string(),
+        });
         config
     }
 }

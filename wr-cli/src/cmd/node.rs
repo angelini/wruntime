@@ -88,8 +88,8 @@ pub struct DeployArgs {
     #[arg(long)]
     ssh_port: Option<u16>,
     /// Local directory containing CA + node certificates (from `wr cert`)
-    #[arg(long)]
-    cert_dir: Option<String>,
+    #[arg(long, default_value = "./certs")]
+    cert_dir: String,
     /// mTLS peer listener port (default: 9443)
     #[arg(long)]
     peer_port: Option<u16>,
@@ -507,8 +507,10 @@ fn bundle(args: BundleArgs) -> Result<()> {
     let mut precompile_hash: Option<String> = None;
 
     if !args.skip_build {
+        let mut seen = std::collections::HashSet::new();
         let build_modules: Vec<BuildModule> = all_modules
             .iter()
+            .filter(|m| seen.insert(m.name.clone()))
             .map(|m| BuildModule {
                 name: m.name.clone(),
                 wasm_path: m.wasm_path.clone(),
@@ -659,7 +661,7 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     );
     let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key, "WR_SSH_KEY");
     let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port);
-    let cert_dir = deploy_config::resolve_string(args.cert_dir, deploy_cfg.cert_dir, "WR_CERT_DIR");
+    let cert_dir = deploy_config::resolve_cert_dir(&args.cert_dir, deploy_cfg.cert_dir);
     let peer_port = deploy_config::resolve_peer_port(args.peer_port, deploy_cfg.peer_port);
 
     let manifest: Manifest = bundle::read_manifest(&args.bundle)?;
@@ -668,10 +670,11 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
 
     // Build template variables
-    let host = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
+    let host_ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
+    let host_name = helpers::extract_remote_host(&args.remote);
     let peer_port_str = peer_port.to_string();
     let mut vars = HashMap::new();
-    vars.insert("host", host.as_str());
+    vars.insert("host", host_ip.as_str());
     vars.insert("db_url", db_url.as_str());
     vars.insert("peer_port", peer_port_str.as_str());
     let guest_db_url_val: String;
@@ -729,14 +732,12 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     println!("OK");
 
     // Provision TLS certificates on the remote host
-    if let Some(ref cert_dir) = cert_dir {
+    {
         print!("[deploy]  provisioning TLS certificates ... ");
         let remote_cert_dir = format!("{}/wr-node/certs", manifest.workdir);
-        helpers::run_ssh(&ssh_base, &format!("mkdir -p {remote_cert_dir}"))?;
-
         let ca_cert = format!("{cert_dir}/ca.crt");
-        let host_cert = format!("{cert_dir}/{host}.crt");
-        let host_key = format!("{cert_dir}/{host}.key");
+        let host_cert = format!("{cert_dir}/{host_name}.crt");
+        let host_key = format!("{cert_dir}/{host_name}.key");
 
         for (local, remote_name) in [
             (&ca_cert, "ca.crt"),
@@ -744,16 +745,15 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
             (&host_key, "node.key"),
         ] {
             if !Path::new(local).exists() {
-                bail!("Certificate file not found: {local}. Run `wr cert generate {host}` first.");
+                bail!("Certificate file not found: {local}. Run `wr cert generate {host_name}` first.");
             }
-            helpers::scp_file(
-                local,
-                &args.remote,
-                &format!("{remote_cert_dir}/{remote_name}"),
-                ssh_key.as_deref(),
-                ssh_port,
-            )
-            .with_context(|| format!("failed to upload {local}"))?;
+            let tmp_path = format!("/tmp/{remote_name}");
+            helpers::scp_file(local, &args.remote, &tmp_path, ssh_key.as_deref(), ssh_port)
+                .with_context(|| format!("failed to upload {local}"))?;
+            helpers::run_ssh(
+                &ssh_base,
+                &format!("sudo mkdir -p {remote_cert_dir} && sudo mv {tmp_path} {remote_cert_dir}/{remote_name}"),
+            )?;
         }
         println!("OK");
     }
@@ -786,6 +786,17 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
         }
     }
     println!("OK");
+
+    // Configure mTLS for the readiness check if not already set via CLI flags.
+    // Cert files are named by the SSH host alias; the cert must include the
+    // manager's IP as a SAN (via `wr cert generate <host> --ip <addr>`).
+    if !crate::client::tls_config_is_set() {
+        crate::client::set_tls_config(wr_common::node::TlsConfig {
+            cert_path: format!("{cert_dir}/{host_name}.crt"),
+            key_path: format!("{cert_dir}/{host_name}.key"),
+            ca_cert_path: format!("{cert_dir}/ca.crt"),
+        });
+    }
 
     // Poll until engines serving all schema-bearing modules are registered.
     let expected_modules: Vec<(String, String)> = manifest

@@ -148,6 +148,17 @@ pub fn resolve_peer_port(cli: Option<u16>, config: Option<u16>) -> u16 {
         .unwrap_or(9443)
 }
 
+/// Resolve cert_dir from CLI > config > env > default ("./certs").
+pub fn resolve_cert_dir(cli: &str, config: Option<String>) -> String {
+    // If the CLI value differs from clap's default, the user explicitly passed it.
+    if cli != "./certs" {
+        return cli.to_string();
+    }
+    config
+        .or_else(|| std::env::var("WR_CERT_DIR").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| cli.to_string())
+}
+
 /// Resolve no_otel flag from CLI > config > env > default (false).
 pub fn resolve_no_otel(cli: bool, config: Option<bool>) -> bool {
     if cli {

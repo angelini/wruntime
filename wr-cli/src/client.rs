@@ -16,6 +16,11 @@ pub fn set_tls_config(config: TlsConfig) {
     let _ = TLS_CONFIG.set(config);
 }
 
+/// Returns `true` if the global TLS config has already been set.
+pub fn tls_config_is_set() -> bool {
+    TLS_CONFIG.get().is_some()
+}
+
 /// Connect to a specific manager address with a 5-second timeout.
 /// Uses the global TLS config if set via [`set_tls_config`].
 pub async fn connect(addr: &str) -> Result<ManagerServiceClient<Channel>> {

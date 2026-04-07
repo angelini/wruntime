@@ -34,6 +34,10 @@ pub struct GenerateArgs {
     /// Directory containing ca.crt and ca.key (and where node certs are written)
     #[arg(long, default_value = "./certs/")]
     ca_dir: PathBuf,
+
+    /// Additional IP addresses to include as SANs (repeatable)
+    #[arg(long = "ip", value_name = "ADDR")]
+    ips: Vec<IpAddr>,
 }
 
 pub fn run(args: CertArgs) -> Result<()> {
@@ -86,7 +90,7 @@ fn generate(args: GenerateArgs) -> Result<()> {
         .context("reconstructing CA certificate")?;
 
     let mut params = CertificateParams::new(vec![])?;
-    params.subject_alt_names = vec![
+    let mut sans = vec![
         SanType::DnsName(
             args.hostname
                 .clone()
@@ -95,6 +99,10 @@ fn generate(args: GenerateArgs) -> Result<()> {
         ),
         SanType::IpAddress(IpAddr::from([127, 0, 0, 1])),
     ];
+    for ip in &args.ips {
+        sans.push(SanType::IpAddress(*ip));
+    }
+    params.subject_alt_names = sans;
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, args.hostname.as_str());

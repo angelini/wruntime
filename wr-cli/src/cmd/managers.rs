@@ -90,6 +90,9 @@ pub struct DeployArgs {
     /// Secret encryption key (hex-encoded, 32 bytes / 64 hex chars)
     #[arg(long)]
     secret_key: Option<String>,
+    /// Local directory containing CA + manager certificates (from `wr cert`)
+    #[arg(long, default_value = "./certs")]
+    cert_dir: String,
     /// Manager's externally-reachable gRPC address (derived from remote host if omitted)
     #[arg(long)]
     advertise_address: Option<String>,
@@ -337,6 +340,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     )?;
     let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key, "WR_SSH_KEY");
     let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port);
+    let cert_dir = deploy_config::resolve_cert_dir(&args.cert_dir, deploy_cfg.cert_dir);
 
     let manifest: ManagerManifest = bundle::read_manifest(&args.bundle)?;
 
@@ -349,7 +353,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
             Some(addr) => addr,
             None => {
                 let ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
-                format!("http://{ip}:{listen_port}")
+                format!("https://{ip}:{listen_port}")
             }
         };
 
@@ -443,6 +447,37 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     .context("failed to upload resolved manager.toml")?;
     println!("OK");
 
+    // Provision TLS certificates on the remote host
+    {
+        print!("[deploy]  provisioning TLS certificates ... ");
+        let remote_cert_dir = format!("{}/wr-manager/certs", manifest.workdir);
+
+        let host = helpers::extract_remote_host(&args.remote);
+        let ca_cert = format!("{cert_dir}/ca.crt");
+        let host_cert = format!("{cert_dir}/{host}.crt");
+        let host_key = format!("{cert_dir}/{host}.key");
+
+        for (local, remote_name) in [
+            (&ca_cert, "ca.crt"),
+            (&host_cert, "manager.crt"),
+            (&host_key, "manager.key"),
+        ] {
+            if !Path::new(local).exists() {
+                bail!(
+                    "Certificate file not found: {local}. Run `wr cert generate {host}` first."
+                );
+            }
+            let tmp_path = format!("/tmp/{remote_name}");
+            helpers::scp_file(local, &args.remote, &tmp_path, ssh_key.as_deref(), ssh_port)
+                .with_context(|| format!("failed to upload {local}"))?;
+            helpers::run_ssh(
+                &ssh_base,
+                &format!("sudo mkdir -p {remote_cert_dir} && sudo mv {tmp_path} {remote_cert_dir}/{remote_name}"),
+            )?;
+        }
+        println!("OK");
+    }
+
     // Capture remote timestamp before restart to anchor the post-deploy log dump
     let restart_timestamp = helpers::get_remote_timestamp(&ssh_base).unwrap_or_default();
 
@@ -464,8 +499,20 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     }
     println!("OK");
 
-    // Use the advertise_address for polling — it's already resolved to a routable address
-    let manager_addr = advertise_address.clone();
+    // Configure mTLS so the readiness check can connect to the TLS-enabled manager.
+    // Cert files are named by the SSH host alias; the cert must include the resolved
+    // IP as a SAN (via `wr cert generate <host> --ip <addr>`).
+    let remote_host = helpers::extract_remote_host(&args.remote);
+    let remote_ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
+    crate::client::set_tls_config(wr_common::node::TlsConfig {
+        cert_path: format!("{cert_dir}/{remote_host}.crt"),
+        key_path: format!("{cert_dir}/{remote_host}.key"),
+        ca_cert_path: format!("{cert_dir}/ca.crt"),
+    });
+
+    // Connect to the resolved IP (the SSH alias may not be DNS-resolvable).
+    // The cert must have this IP as a SAN for TLS verification to succeed.
+    let manager_addr = format!("https://{remote_ip}:{listen_port}");
     println!("[deploy]  waiting for manager to become ready...");
 
     // Tail manager logs in the background while we wait
