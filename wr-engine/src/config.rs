@@ -55,12 +55,6 @@ pub struct DatabaseConfig {
     /// `postgres://user:pass@host:port/dbname` connection string.
     /// Used for admin operations (schema provisioning, migrations).
     pub url: String,
-    /// Optional connection string for guest module pools.
-    /// When set, module runtime pools connect as this (typically lower-privilege)
-    /// role while provisioning/migrations continue using `url`.
-    /// Falls back to `url` when absent.
-    #[serde(default)]
-    pub guest_url: Option<String>,
     /// Maximum number of pooled connections. Defaults to 20.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,

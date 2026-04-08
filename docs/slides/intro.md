@@ -1,6 +1,6 @@
 # WRuntime
 
-Capability-based security for multi-module systems
+WASM + WASI Runtime
 
 Sandboxed agents with a strict API for building modules
 
@@ -55,11 +55,6 @@ LLMs write module code — you can't review every line. wruntime makes that safe
 
 The host is the trust boundary, not the guest code.
 
-```bash
-wr secrets set codegen ANTHROPIC_API_KEY sk-ant-...   # store encrypted in manager
-wr secrets list --namespace codegen                    # keys only, no values shown
-```
-
 ---
 
 # Architecture: Three Services
@@ -71,18 +66,18 @@ wr secrets list --namespace codegen                    # keys only, no values sh
                           │  :9010 gossip │
                           └───────┬───────┘
                   routing table   │   heartbeat
-               ┌──────────────────┼──────────────────┐
-               │                  │                  │
-       ┌───────▼───────┐  ┌──────▼───────┐  ┌───────▼───────┐
+               ┌──────────────────┼─────────────────┐
+               │                  │                 │
+       ┌───────▼───────┐  ┌───────▼──────┐  ┌───────▼───────┐
        │   wr-proxy    │  │   wr-proxy   │  │   wr-proxy    │
        │ :9001 (local) │  │ :9001 (local)│  │ :9001 (local) │
        │ :9443 (mTLS)  │  │ :9443 (mTLS) │  │ :9443 (mTLS)  │
        └───────┬───────┘  └──────┬───────┘  └───────┬───────┘
-               │ HTTP             │ HTTP             │ HTTP
+               │ HTTP            │ HTTP             │ HTTP
        ┌───────▼───────┐  ┌──────▼───────┐  ┌───────▼───────┐
        │  wr-engine    │  │  wr-engine   │  │  wr-engine    │
        │  :9100        │  │  :9100       │  │  :9100        │
-       │  [inventory]  │  │  [inventory] │  │  [client]     │
+       │  [inventory]  │  │  [client]    │  │  [client]     │
        └───────────────┘  └──────────────┘  └───────────────┘
 ```
 
@@ -241,13 +236,13 @@ You only write the trait methods.
 ┌─────────────┐  CreateTask   ┌────────────┐
 │ coordinator │──(queue)─────►│   worker   │
 │  DB: tasks  │               │            │
-└─────────────┘               └──┬──────┬──┘
-      ▲                          │      │
-      │ UpdateStatus        ┌────▼──┐ ┌─▼─────────┐
-      │ CompleteTask        │collect│ │   agent    │
-      └─────────────────────│  or   │ │ DB+Blob+LLM│
-                            │Blob+FS│ │ Multi-turn │
-                            └───────┘ └────────────┘
+└─────────────┘               └──┬────────┬┘
+      ▲                          │        │
+      │ UpdateStatus        ┌────▼────┐ ┌─▼──────────┐
+      │ CompleteTask        │collector│ │   agent    │
+      └─────────────────────│         │ │ DB+Blob+LLM│
+                            │Blob+FS  │ │ Multi-turn │
+                            └─────────┘ └────────────┘
 ```
 
 Worker orchestrates the pipeline: collect docs → run agent → report result
@@ -286,7 +281,6 @@ let resp = CompletionBuilder::sonnet()
 ```
 
 - Host manages API keys — module never sees `ANTHROPIC_API_KEY`
-- Fluent builder API via `wr_sdk::llm`
 - Rate-limit retry in module code: `complete_with_retry(|| builder)`
 - OTel span per LLM turn for cost tracking
 
@@ -377,12 +371,6 @@ wr schedules list --namespace codegen     # view active schedules
 
 All inter-node traffic is mutually authenticated via TLS:
 
-```bash
-wr cert init-ca                  # generate CA (once)
-wr cert generate node-a          # per-node cert
-wr cert generate node-b --ip 10.0.0.2  # with IP SAN
-```
-
 - Internal listener (`:9001`) binds loopback only — local engines talk here
 - Peer listener (`:9443`) handles all cross-node traffic over mTLS
 - Proxy resolves destination: local engine → direct HTTP, remote → mTLS peer forward
@@ -411,7 +399,6 @@ allowed_domains = ["api.anthropic.com", "*.github.com"]
 
 - Modules hitting unrouted URLs pass through egress layer
 - All `x-wr-*` headers stripped before forwarding to external hosts
-- **Circuit breaker** per engine: opens after 5 consecutive failures, half-open recovery after 30s
 
 ---
 
@@ -420,7 +407,7 @@ allowed_domains = ["api.anthropic.com", "*.github.com"]
 **Shared config** — `wr-deploy.toml` in your working directory:
 
 ```toml
-format     = "systemd"          # or "docker"
+format     = "systemd"          # or "docker" or "k8s"
 target     = "aarch64-unknown-linux-gnu"
 workdir    = "/opt/wruntime"
 db_url     = "postgres://postgres@10.0.0.5:5432/wruntime"
@@ -436,7 +423,6 @@ seed_nodes = ["10.0.0.1:9000", "10.0.0.2:9000"]
 - Cross-compiles host binaries via `cargo-zigbuild` (x86 or ARM targets)
 - Pre-compiled WASM (`.cwasm`) bundled for near-instant engine startup
 - Streaming log tail during deploy for immediate feedback
-- Precedence: CLI flag > config file > env var > default
 
 ```bash
 wr managers bundle --manager-config manager.toml
@@ -482,7 +468,7 @@ The real advantage: **1 vCPU = 1 physical core** (no hyperthreading)
 
 - **No native binaries** — headless browsers, FFmpeg, system tools can't run in WASM
 - **Must compile to `wasm32-wasip2`** — Rust ecosystem coverage is strong, others are growing
-- **Single-thread per request** — no `tokio::spawn` in guest code; scale via multiple module instances
+- **Single-thread per request** — no `tokio::spawn` in guest code; scaling is done with multiple module instances
 - **Proto-first** — every module boundary needs a `.proto` definition (no freeform JSON APIs)
 - **Host binding surface** — DB, blobstore, LLM, tracing, filesystem — anything else requires a new WIT interface
 
@@ -492,7 +478,7 @@ The real advantage: **1 vCPU = 1 physical core** (no hyperthreading)
 - You trust the code and don't need per-module isolation
 - Your team already has mature container infrastructure
 
-wruntime is strongest for **multi-tenant, untrusted, or LLM-generated code** where the isolation guarantees outweigh the ecosystem constraints.
+wruntime is strongest for **multi-tenant, untrusted, or LLM-generated code** where the isolation guarantees outweigh the ecosystem constraints
 
 ---
 

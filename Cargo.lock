@@ -5726,7 +5726,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
- "deadpool-postgres",
  "failsafe",
  "http",
  "http-body",
@@ -5741,7 +5740,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tokio-postgres",
  "tokio-retry",
  "tokio-rustls 0.26.4",
  "tonic",

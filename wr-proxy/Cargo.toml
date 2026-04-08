@@ -34,13 +34,12 @@ failsafe = "1"
 matchit = "0.8"
 wr-common = { path = "../wr-common", features = [
   "discovery",
+  "pool",
   "config",
   "signal",
   "http-pool",
   "tls",
 ] }
-deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
-tokio-postgres = "0.7"
 prost = "0.14"
 tokio-retry = "0.3"
 tracing = "0.1"

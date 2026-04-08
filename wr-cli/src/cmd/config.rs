@@ -45,8 +45,6 @@ pub struct CliTlsConfig {
 pub struct DatabaseConfig {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guest_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statement_timeout_secs: Option<u32>,
@@ -102,8 +100,8 @@ impl EngineConfig {
     }
 
     /// Create a bundle-ready copy: rewrite module paths to bundle-relative
-    /// directories and insert `{host}`, `{db_url}`, `{guest_db_url}` template
-    /// placeholders for values that vary per deployment target.
+    /// directories and insert `{host}`, `{db_url}` template placeholders
+    /// for values that vary per deployment target.
     pub fn to_bundle_config(&self) -> Self {
         let mut config = self.clone();
 
@@ -131,12 +129,9 @@ impl EngineConfig {
             });
         }
 
-        // Template database URLs
+        // Template database URL
         if let Some(ref mut db) = config.database {
             db.url = "{db_url}".to_string();
-            if db.guest_url.is_some() {
-                db.guest_url = Some("{guest_db_url}".to_string());
-            }
         }
 
         config

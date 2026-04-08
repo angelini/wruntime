@@ -12,6 +12,10 @@ struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
 impl wr_sdk::ServiceGuest for Component {
+    fn init() {
+        wr_sdk::db::enable_tracing();
+    }
+
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         proto::inventory_service_handle(&Component, request, response_out);
     }

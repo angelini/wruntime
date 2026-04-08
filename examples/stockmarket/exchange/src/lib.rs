@@ -12,7 +12,33 @@ use wr_sdk::prelude::*;
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
+fn upsert_position(
+    tx: &wr_sdk::db::TxGuard,
+    trader_id: &str,
+    symbol: &str,
+    shares: i64,
+    cash_flow: i64,
+) -> Result<(), ServiceError> {
+    tx.execute(
+        "INSERT INTO positions (trader_id, symbol, shares, cash_flow) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (trader_id, symbol) \
+         DO UPDATE SET shares = positions.shares + $3, cash_flow = positions.cash_flow + $4",
+        &[
+            PgValue::Text(trader_id.into()),
+            PgValue::Text(symbol.into()),
+            PgValue::Int8(shares),
+            PgValue::Int8(cash_flow),
+        ],
+    )?;
+    Ok(())
+}
+
 impl wr_sdk::ServiceGuest for Component {
+    fn init() {
+        wr_sdk::db::enable_tracing();
+    }
+
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         proto::exchange_service_handle(&Component, request, response_out);
     }
@@ -55,7 +81,7 @@ impl proto::ExchangeService for Component {
         let tx = wr_sdk::db::transaction()?;
 
         // Insert the new order.
-        let rows = tx.query(
+        let order_id: i64 = tx.query_scalar(
             "INSERT INTO orders (trader_id, symbol, is_buy, price, quantity, remaining) \
              VALUES ($1, $2, $3, $4, $5, $5) RETURNING order_id",
             &[
@@ -66,8 +92,6 @@ impl proto::ExchangeService for Component {
                 PgValue::Int8(req.quantity),
             ],
         )?;
-
-        let order_id = rows[0].get_i64(0)?;
 
         // Find matching orders on the opposite side.
         // Buy orders match sells at price <= buy price (cheapest first).
@@ -137,33 +161,8 @@ impl proto::ExchangeService for Component {
 
             let cash_amount = fill_qty * exec_price;
 
-            // Update buyer position: +shares, -cash.
-            tx.execute(
-                "INSERT INTO positions (trader_id, symbol, shares, cash_flow) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (trader_id, symbol) \
-                 DO UPDATE SET shares = positions.shares + $3, cash_flow = positions.cash_flow + $4",
-                &[
-                    PgValue::Text(buyer_id.clone()),
-                    PgValue::Text(req.symbol.clone()),
-                    PgValue::Int8(fill_qty),
-                    PgValue::Int8(-cash_amount),
-                ],
-            )?;
-
-            // Update seller position: -shares, +cash.
-            tx.execute(
-                "INSERT INTO positions (trader_id, symbol, shares, cash_flow) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (trader_id, symbol) \
-                 DO UPDATE SET shares = positions.shares + $3, cash_flow = positions.cash_flow + $4",
-                &[
-                    PgValue::Text(seller_id.clone()),
-                    PgValue::Text(req.symbol.clone()),
-                    PgValue::Int8(-fill_qty),
-                    PgValue::Int8(cash_amount),
-                ],
-            )?;
+            upsert_position(&tx, &buyer_id, &req.symbol, fill_qty, -cash_amount)?;
+            upsert_position(&tx, &seller_id, &req.symbol, -fill_qty, cash_amount)?;
 
             trade_records.push((buyer_id, seller_id, fill_qty, exec_price, order_id));
             my_remaining -= fill_qty;

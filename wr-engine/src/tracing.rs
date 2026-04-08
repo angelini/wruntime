@@ -23,14 +23,19 @@ wasmtime::component::bindgen!({
 
 impl wruntime::tracing::span::Host for ModuleState {
     async fn start(&mut self, name: String, attrs: Vec<(String, String)>) -> Resource<SpanState> {
-        let child = self.active_span.in_scope(|| {
-            tracing::info_span!(
-                "module",
-                "otel.name" = name.as_str(),
-                "wasm.span.name" = name.as_str()
-            )
-        });
-        child.follows_from(self.active_span.id());
+        // Parent the new span to the top of the guest span stack, falling back
+        // to the request-level `active_span`. This gives automatic nesting:
+        // e.g. db.query becomes a child of db.transaction.
+        let parent = self
+            .span_stack
+            .last()
+            .unwrap_or(&self.active_span);
+        let child = tracing::info_span!(
+            parent: parent,
+            "module",
+            "otel.name" = name.as_str(),
+            "wasm.span.name" = name.as_str()
+        );
         {
             use tracing_opentelemetry::OpenTelemetrySpanExt as _;
             for (key, value) in attrs {
@@ -40,8 +45,37 @@ impl wruntime::tracing::span::Host for ModuleState {
                 );
             }
         }
+        self.span_stack.push(child.clone());
         self.table()
             .push(SpanState { span: child })
+            .expect("ResourceTable capacity exceeded")
+    }
+
+    async fn start_root(
+        &mut self,
+        name: String,
+        attrs: Vec<(String, String)>,
+    ) -> Resource<SpanState> {
+        let root = tracing::info_span!(
+            parent: tracing::Span::none(),
+            "module",
+            "otel.name" = name.as_str(),
+            "wasm.span.name" = name.as_str()
+        );
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            for (key, value) in attrs {
+                root.set_attribute(
+                    opentelemetry::Key::new(key),
+                    opentelemetry::Value::String(value.into()),
+                );
+            }
+        }
+        // Set as outbound parent so subsequent HTTP calls inherit this trace.
+        *self.outbound_parent.lock().unwrap() = Some(root.clone());
+        self.span_stack.push(root.clone());
+        self.table()
+            .push(SpanState { span: root })
             .expect("ResourceTable capacity exceeded")
     }
 }
@@ -82,7 +116,19 @@ impl wruntime::tracing::span::HostActiveSpan for ModuleState {
     }
 
     async fn drop(&mut self, self_: Resource<SpanState>) -> wasmtime::Result<()> {
-        self.table().delete(self_)?;
+        let state = self.table().delete(self_)?;
+        // Remove this span from the stack so subsequent spans don't parent to it.
+        if let Some(pos) = self.span_stack.iter().position(|s| s.id() == state.span.id()) {
+            self.span_stack.remove(pos);
+        }
+        // If this span was the outbound parent, clear it so subsequent
+        // outbound calls start fresh traces again.
+        {
+            let mut parent = self.outbound_parent.lock().unwrap();
+            if parent.as_ref().and_then(|s| s.id()) == state.span.id() {
+                *parent = None;
+            }
+        }
         // SpanState drops here → tracing::Span drops → span ends in OTLP
         Ok(())
     }

@@ -17,6 +17,7 @@ message EngineRegistration {
   string                    proxy_address = 4; // local proxy address (node identity)
   repeated SecretRequest    secrets       = 5; // secrets this engine needs (resolved from config)
   string                    peer_address  = 6; // mTLS peer address (https://host:peer_port)
+  repeated string           db_namespaces = 7; // namespaces that need DB access
 }
 
 message RoutingRule {
@@ -42,8 +43,9 @@ message RoutingTable {
 
 message RegisterEngineRequest    { EngineRegistration registration = 1; }
 message RegisterEngineResponse   {
-  bool                       accepted = 1;
-  repeated NamespaceSecrets  secrets  = 2; // only the requested secrets, decrypted
+  bool                              accepted       = 1;
+  repeated NamespaceSecrets         secrets        = 2; // only the requested secrets, decrypted
+  repeated NamespaceDbCredential    db_credentials = 3; // per-namespace DB role + password
 }
 message DeregisterEngineRequest  { string engine_id = 1; }
 message DeregisterEngineResponse {}
@@ -64,6 +66,14 @@ message GetRoutingTableResponse   { RoutingTable table = 1; }
 message UpsertRoutingRuleResponse {}
 message DeleteRoutingRuleRequest  { string rule_id = 1; }
 message DeleteRoutingRuleResponse {}
+
+// ── Database credentials ──────────────────────────────────────────────────
+
+message NamespaceDbCredential {
+  string namespace = 1;
+  string role      = 2;  // e.g. "wr_ns_ecommerce"
+  string password  = 3;
+}
 
 // ── Secrets ───────────────────────────────────────────────────────────────
 

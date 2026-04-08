@@ -1,4 +1,4 @@
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
+use aes_gcm::aead::{rand_core::RngCore, Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Nonce};
 use anyhow::{Context, Result};
 
@@ -38,6 +38,13 @@ impl SecretCrypto {
             .encrypt(&nonce, plaintext.as_bytes())
             .map_err(|e| anyhow::anyhow!("encryption failed: {e}"))?;
         Ok((ciphertext, nonce.to_vec()))
+    }
+
+    /// Generate a cryptographically random password (32 bytes, hex-encoded).
+    pub fn generate_random_password() -> String {
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        hex::encode(bytes)
     }
 
     /// Decrypt ciphertext using the provided nonce.

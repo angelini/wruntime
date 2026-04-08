@@ -57,6 +57,11 @@ where
             otel.status_code   = tracing::field::Empty,
         );
 
+        // If the request carries a traceparent header (e.g. from an engine's
+        // outbound_request span), adopt it as our parent so the proxy span
+        // joins the existing trace rather than starting a new one.
+        wr_common::telemetry::set_parent_from_headers(&span, req.headers());
+
         let mut inner = self.inner.clone();
 
         Box::pin(async move {

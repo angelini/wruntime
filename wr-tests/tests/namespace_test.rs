@@ -95,6 +95,7 @@ async fn test_manager_rejects_module_without_namespace() -> Result<()> {
                     proto_schema: vec![],
                 }],
                 secrets: vec![],
+                db_namespaces: vec![],
             }),
         })
         .await;

@@ -11,6 +11,12 @@ pub fn module_schema(namespace: &str, name: &str) -> String {
     format!("wr__{}__{}", sanitize(namespace), sanitize(name))
 }
 
+/// Returns the Postgres role name for a namespace.
+/// Format: `wr_ns_{namespace}` with non-alphanumeric chars replaced by `_`.
+pub fn namespace_role(namespace: &str) -> String {
+    format!("wr_ns_{}", sanitize(namespace))
+}
+
 /// Returns the S3 key prefix for a module's blobstore namespace.
 /// Format: `wr/{namespace}/` with non-alphanumeric chars replaced by `_`.
 /// Scoped to namespace only (not module name) so modules within the same
@@ -21,7 +27,7 @@ pub fn blob_key_prefix(namespace: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{blob_key_prefix, module_schema};
+    use super::{blob_key_prefix, module_schema, namespace_role};
 
     #[test]
     fn test_blob_key_prefix_simple() {
@@ -31,6 +37,16 @@ mod tests {
     #[test]
     fn test_blob_key_prefix_special_chars() {
         assert_eq!(blob_key_prefix("my-ns"), "wr/my_ns/");
+    }
+
+    #[test]
+    fn test_namespace_role_simple() {
+        assert_eq!(namespace_role("ecommerce"), "wr_ns_ecommerce");
+    }
+
+    #[test]
+    fn test_namespace_role_special_chars() {
+        assert_eq!(namespace_role("my-ns"), "wr_ns_my_ns");
     }
 
     #[test]

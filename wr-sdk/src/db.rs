@@ -1,5 +1,62 @@
+use std::cell::Cell;
+
 use crate::bindings::wruntime::db::database::{self, DbError, PgValue, Row, Transaction};
+use crate::bindings::wruntime::tracing::span::ActiveSpan;
 use crate::ServiceError;
+
+// ── Optional DB tracing ────────────────────────────────────────────────────
+
+thread_local! {
+    static DB_TRACING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Enable automatic tracing spans for all `db::*` helpers and `TxGuard` methods.
+/// Call once at module init (e.g., top of your `handle` function).
+pub fn enable_tracing() {
+    DB_TRACING.with(|c| c.set(true));
+}
+
+fn tracing_enabled() -> bool {
+    DB_TRACING.with(|c| c.get())
+}
+
+/// Internal span wrapper — `None` when tracing is disabled, avoiding host calls.
+struct DbSpan(Option<ActiveSpan>);
+
+impl DbSpan {
+    fn start(operation: &str, sql: &str, param_count: usize) -> Self {
+        if !tracing_enabled() {
+            return Self(None);
+        }
+        let span = crate::tracing::start_owned(
+            &format!("db.{operation}"),
+            vec![
+                ("db.operation".into(), operation.into()),
+                ("db.statement".into(), sql.into()),
+                ("db.params.count".into(), param_count.to_string()),
+            ],
+        );
+        Self(Some(span))
+    }
+
+    fn set_rows(&self, count: usize) {
+        if let Some(s) = &self.0 {
+            crate::tracing::set_attr(s, "db.rows", count);
+        }
+    }
+
+    fn set_rows_affected(&self, count: u64) {
+        if let Some(s) = &self.0 {
+            crate::tracing::set_attr(s, "db.rows_affected", count);
+        }
+    }
+
+    fn set_error(&self, msg: &str) {
+        if let Some(s) = &self.0 {
+            crate::tracing::set_error(s, msg);
+        }
+    }
+}
 
 // ── FromPgValue trait ───────────────────────────────────────────────────────
 
@@ -130,6 +187,60 @@ impl_unpack!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F);
 impl_unpack!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G);
 impl_unpack!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H);
 
+// ── Convenience query helpers ──────────────────────────────────────────────
+
+/// Execute a query and return a single scalar value from the first row / first column.
+///
+/// Returns a `not_found` error if the query returns no rows.
+///
+/// ```rust,ignore
+/// let count: i64 = db::query_scalar("SELECT COUNT(*) FROM trades", &[])?;
+/// ```
+pub fn query_scalar<T: FromPgValue>(sql: &str, params: &[PgValue]) -> Result<T, ServiceError> {
+    let span = DbSpan::start("query", sql, params.len());
+    let rows = match database::query(sql, params) {
+        Ok(r) => r,
+        Err(e) => {
+            let se = ServiceError::from(e);
+            span.set_error(&se.message);
+            return Err(se);
+        }
+    };
+    span.set_rows(rows.len());
+    let row = rows
+        .first()
+        .ok_or_else(|| ServiceError::not_found("query returned no rows"))?;
+    row.get(0)
+}
+
+/// Execute a query and unpack the first row into a tuple.
+///
+/// Returns a `not_found` error if the query returns no rows.
+///
+/// ```rust,ignore
+/// let (id, name, stock): (i64, String, i64) =
+///     db::query_one("SELECT id, name, stock FROM inventory WHERE id = $1", &[...])?;
+/// ```
+pub fn query_one<T>(sql: &str, params: &[PgValue]) -> Result<T, ServiceError>
+where
+    Row: UnpackRow<T>,
+{
+    let span = DbSpan::start("query", sql, params.len());
+    let rows = match database::query(sql, params) {
+        Ok(r) => r,
+        Err(e) => {
+            let se = ServiceError::from(e);
+            span.set_error(&se.message);
+            return Err(se);
+        }
+    };
+    span.set_rows(rows.len());
+    let row = rows
+        .first()
+        .ok_or_else(|| ServiceError::not_found("query returned no rows"))?;
+    row.unpack()
+}
+
 fn col_err(col: usize) -> ServiceError {
     ServiceError::internal(format!("column {col} out of bounds"))
 }
@@ -161,44 +272,87 @@ impl From<DbError> for ServiceError {
 /// ```
 pub struct TxGuard {
     inner: Option<Transaction>,
+    span: DbSpan,
 }
 
 /// Begin a transaction and return a guard that auto-rollbacks on drop.
 pub fn transaction() -> Result<TxGuard, ServiceError> {
-    let tx = database::begin_transaction()?;
-    Ok(TxGuard { inner: Some(tx) })
+    let span = DbSpan::start("transaction", "BEGIN", 0);
+    let tx = match database::begin_transaction() {
+        Ok(t) => t,
+        Err(e) => {
+            let se = ServiceError::from(e);
+            span.set_error(&se.message);
+            return Err(se);
+        }
+    };
+    Ok(TxGuard {
+        inner: Some(tx),
+        span,
+    })
 }
 
 impl TxGuard {
     pub fn query(&self, sql: &str, params: &[PgValue]) -> Result<Vec<Row>, ServiceError> {
-        self.inner
-            .as_ref()
-            .unwrap()
-            .query(sql, params)
-            .map_err(ServiceError::from)
+        let span = DbSpan::start("query", sql, params.len());
+        match self.inner.as_ref().unwrap().query(sql, params) {
+            Ok(rows) => {
+                span.set_rows(rows.len());
+                Ok(rows)
+            }
+            Err(e) => {
+                let se = ServiceError::from(e);
+                span.set_error(&se.message);
+                Err(se)
+            }
+        }
     }
 
     pub fn execute(&self, sql: &str, params: &[PgValue]) -> Result<u64, ServiceError> {
-        self.inner
-            .as_ref()
-            .unwrap()
-            .execute(sql, params)
-            .map_err(ServiceError::from)
+        let span = DbSpan::start("execute", sql, params.len());
+        match self.inner.as_ref().unwrap().execute(sql, params) {
+            Ok(n) => {
+                span.set_rows_affected(n);
+                Ok(n)
+            }
+            Err(e) => {
+                let se = ServiceError::from(e);
+                span.set_error(&se.message);
+                Err(se)
+            }
+        }
+    }
+
+    /// Execute a query and return a single scalar value from the first row / first column.
+    pub fn query_scalar<T: FromPgValue>(
+        &self,
+        sql: &str,
+        params: &[PgValue],
+    ) -> Result<T, ServiceError> {
+        let rows = self.query(sql, params)?;
+        let row = rows
+            .first()
+            .ok_or_else(|| ServiceError::not_found("query returned no rows"))?;
+        row.get(0)
     }
 
     /// Commit the transaction, consuming the guard.
     pub fn commit(mut self) -> Result<(), ServiceError> {
-        self.inner
-            .take()
-            .unwrap()
-            .commit()
-            .map_err(ServiceError::from)
+        match self.inner.take().unwrap().commit() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let se = ServiceError::from(e);
+                self.span.set_error(&se.message);
+                Err(se)
+            }
+        }
     }
 }
 
 impl Drop for TxGuard {
     fn drop(&mut self) {
         if let Some(tx) = self.inner.take() {
+            self.span.set_error("transaction rolled back");
             let _ = tx.rollback();
         }
     }

@@ -155,6 +155,7 @@ async fn test_set_secret_upsert_overwrites() -> Result<()> {
                     namespace: "ns".into(),
                     key: "API_KEY".into(),
                 }],
+                db_namespaces: vec![],
             }),
         })
         .await?
@@ -275,6 +276,7 @@ async fn test_register_engine_with_secrets() -> Result<()> {
                         key: "API_TOKEN".into(),
                     },
                 ],
+                db_namespaces: vec![],
             }),
         })
         .await?
@@ -316,6 +318,7 @@ async fn test_register_engine_with_missing_secret_fails() -> Result<()> {
                     namespace: "myapp".into(),
                     key: "NONEXISTENT".into(),
                 }],
+                db_namespaces: vec![],
             }),
         })
         .await;
@@ -348,6 +351,7 @@ async fn test_register_engine_no_secrets_succeeds() -> Result<()> {
                     proto_schema: minimal_file_descriptor_set(),
                 }],
                 secrets: vec![],
+                db_namespaces: vec![],
             }),
         })
         .await?
@@ -411,6 +415,7 @@ async fn test_secrets_across_namespaces() -> Result<()> {
                         key: "API_KEY".into(),
                     },
                 ],
+                db_namespaces: vec![],
             }),
         })
         .await?
@@ -488,6 +493,7 @@ async fn test_secret_deleted_then_registration_fails() -> Result<()> {
                     namespace: "ns".into(),
                     key: "TEMP".into(),
                 }],
+                db_namespaces: vec![],
             }),
         })
         .await;

@@ -12,7 +12,6 @@ ca_cert_path = "certs/ca.crt"
 
 [database]
 url             = "postgres://user:pass@localhost:5432/stockmarket"
-guest_url       = "postgres://wr_guest:pass@localhost:5432/stockmarket"
 max_connections = 100
 
 [[module]]
@@ -23,3 +22,17 @@ wasm_path       = "examples/stockmarket/exchange/target/wasm32-wasip2/release/ex
 schema_path     = "examples/stockmarket/schemas/exchange.binpb"
 database        = true
 migrations_path = "examples/stockmarket/exchange/migrations"
+
+[[module]]
+name            = "exchange"
+namespace       = "stockmarket"
+version         = "1.0.0"
+wasm_path       = "examples/stockmarket/exchange/target/wasm32-wasip2/release/exchange.wasm"
+database        = true
+
+[[module]]
+name            = "exchange"
+namespace       = "stockmarket"
+version         = "1.0.0"
+wasm_path       = "examples/stockmarket/exchange/target/wasm32-wasip2/release/exchange.wasm"
+database        = true

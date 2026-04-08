@@ -72,6 +72,7 @@ All services running. Press Ctrl-C to stop.
 
 Trigger a load run (default 100 iterations):
   cargo run -p wr-cli -- invoke \
+    --manager https://127.0.0.1:9000 \
     --proxy http://127.0.0.1:9001 \
     --destination http://ecommerce.client/Run \
     --source loadtest --source-ns ecommerce \
@@ -79,13 +80,14 @@ Trigger a load run (default 100 iterations):
 
 Trigger with a custom request count (e.g. 1000):
   cargo run -p wr-cli -- invoke \
+    --manager https://127.0.0.1:9000 \
     --proxy http://127.0.0.1:9001 \
     --destination http://ecommerce.client/Run \
     --source loadtest --source-ns ecommerce \
     --body '{"count": 1000}'
 
 Inspect metrics:
-  cargo run -p wr-cli -- metrics summary
+  cargo run -p wr-cli -- --manager https://127.0.0.1:9000 metrics summary
 USAGE
 
 wait_forever

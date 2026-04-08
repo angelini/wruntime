@@ -169,7 +169,6 @@ Modules that use a database can declare a `migrations_path` pointing to a direct
 ```toml
 [database]
 url             = "postgres://user:pass@localhost:5432/mydb"
-guest_url       = "postgres://wr_guest@localhost:5432/mydb"   # optional: lower-privilege role for module connection pools
 max_connections = 20
 
 [[module]]
@@ -191,7 +190,7 @@ modules/inventory/migrations/
 ```
 
 Key behaviors:
-- **`guest_url`:** When set, module connection pools use this URL (typically a lower-privilege role) instead of the admin `url`. The admin `url` is still used for schema provisioning and migrations. This provides privilege separation — modules only get the permissions granted to the guest role.
+- **Per-namespace DB roles:** The manager automatically generates and stores a random password for each namespace that needs database access. At engine registration, the manager returns per-namespace credentials (`wr_ns_{namespace}` roles). The engine creates these roles, grants them access to the relevant schemas, and connects module pools using the namespace role — modules never see the DB password. This provides namespace-level privilege isolation without any manual role or secret configuration.
 - **Schema isolation:** `search_path` is set to the module's own schema before migrations run. A migration cannot modify tables belonging to another module.
 - **Advisory locking:** An engine acquires a Postgres advisory lock before running migrations, preventing concurrent execution across engine replicas for the same module.
 - **Idempotent:** Refinery tracks applied migrations in a `refinery_schema_history` table inside the module's schema. Already-applied migrations are skipped on subsequent startups.
@@ -378,7 +377,7 @@ wr-cli --manager http://manager-1:9000 engines list
 
 ### Remote deployment via CLI
 
-The CLI provides `wr managers` and `wr node` command groups for deploying to remote hosts via SSH. Both support systemd and Docker deployment formats. Bundles are **host-agnostic** — they contain template placeholders like `{host}`, `{db_url}`, and `{guest_db_url}` that are resolved at deploy time.
+The CLI provides `wr managers` and `wr node` command groups for deploying to remote hosts via SSH. Both support systemd and Docker deployment formats. Bundles are **host-agnostic** — they contain template placeholders like `{host}` and `{db_url}` that are resolved at deploy time.
 
 Both bundle and deploy commands auto-discover a `wr-deploy.toml` file in the current directory (or accept `--config <path>`). This file provides defaults for flags like `target`, `db_url`, `format`, etc. — see [deployment.md](deployment.md) for the full config reference.
 
@@ -409,7 +408,7 @@ wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10
 # 1. Build a host-agnostic node bundle (one build for all nodes)
 wr-cli node bundle --engine-config examples/codegen/engine.toml
 
-# 2. Deploy to each node (resolves {host}, {db_url}, {guest_db_url})
+# 2. Deploy to each node (resolves {host}, {db_url})
 export WR_MANAGER=http://10.0.1.10:9000
 
 wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.20 \

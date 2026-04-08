@@ -5,6 +5,7 @@ use deadpool_postgres::Pool;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
+use wr_common::naming::namespace_role;
 use wr_common::wruntime::{
     manager_service_server::ManagerService, DeleteRoutingRuleRequest, DeleteRoutingRuleResponse,
     DeleteScheduleRequest, DeleteScheduleResponse, DeleteSecretRequest, DeleteSecretResponse,
@@ -12,9 +13,10 @@ use wr_common::wruntime::{
     GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse, HeartbeatRequest,
     HeartbeatResponse, ListEnginesRequest, ListEnginesResponse, ListManagersRequest,
     ListManagersResponse, ListSchedulesRequest, ListSchedulesResponse, ListSecretsRequest,
-    ListSecretsResponse, ManagerInfo, NamespaceSecrets, RegisterEngineRequest,
-    RegisterEngineResponse, RoutingRule, Schedule, SecretEntry, SetSecretRequest,
-    SetSecretResponse, UpsertRoutingRuleResponse, UpsertScheduleRequest, UpsertScheduleResponse,
+    ListSecretsResponse, ManagerInfo, NamespaceDbCredential, NamespaceSecrets,
+    RegisterEngineRequest, RegisterEngineResponse, RoutingRule, Schedule, SecretEntry,
+    SetSecretRequest, SetSecretResponse, UpsertRoutingRuleResponse, UpsertScheduleRequest,
+    UpsertScheduleResponse,
 };
 
 use crate::crypto::SecretCrypto;
@@ -30,6 +32,51 @@ impl Manager {
         Self { pool, crypto }
     }
 
+    /// Ensure a DB password exists for the given namespace, creating one if not.
+    /// Returns the plaintext password.
+    async fn ensure_db_password(&self, namespace: &str) -> Result<String, Status> {
+        let key = "__db_password";
+        let existing =
+            db::get_secrets(&self.pool, &[(namespace.to_string(), key.to_string())]).await?;
+
+        if let Some((_, _, ciphertext, nonce)) = existing.into_iter().next() {
+            return self
+                .crypto
+                .decrypt(&ciphertext, &nonce)
+                .map_err(|e| Status::internal(format!("failed to decrypt db password: {e}")));
+        }
+
+        // Generate and store a new random password
+        let password = SecretCrypto::generate_random_password();
+        let (ciphertext, nonce) = self
+            .crypto
+            .encrypt(&password)
+            .map_err(|e| Status::internal(format!("encryption failed: {e}")))?;
+        db::upsert_secret(&self.pool, namespace, key, &ciphertext, &nonce).await?;
+        Ok(password)
+    }
+
+    /// Resolve DB credentials for each namespace that needs database access.
+    async fn resolve_db_credentials(
+        &self,
+        db_namespaces: &[String],
+    ) -> Result<Vec<NamespaceDbCredential>, Status> {
+        let mut credentials = Vec::with_capacity(db_namespaces.len());
+        // Deduplicate namespaces
+        let unique: std::collections::HashSet<&str> =
+            db_namespaces.iter().map(|s| s.as_str()).collect();
+        for namespace in unique {
+            let role = namespace_role(namespace);
+            let password = self.ensure_db_password(namespace).await?;
+            credentials.push(NamespaceDbCredential {
+                namespace: namespace.to_string(),
+                role,
+                password,
+            });
+        }
+        Ok(credentials)
+    }
+
     /// Fetch, validate, decrypt, and group secrets by namespace.
     async fn resolve_secrets(
         &self,
@@ -37,6 +84,16 @@ impl Manager {
     ) -> Result<Vec<NamespaceSecrets>, Status> {
         if requests.is_empty() {
             return Ok(vec![]);
+        }
+
+        // Block reserved key prefix
+        for req in requests {
+            if req.key.starts_with("__") {
+                return Err(Status::invalid_argument(format!(
+                    "secret key '{}' uses reserved prefix '__'",
+                    req.key
+                )));
+            }
         }
 
         let pairs: Vec<(String, String)> = requests
@@ -99,19 +156,26 @@ impl ManagerService for Manager {
             return Err(Status::invalid_argument("engine_id is required"));
         }
 
-        // Validate modules
-        for module in &reg.modules {
-            if module.namespace.is_empty() {
-                return Err(Status::invalid_argument(format!(
-                    "module '{}' is missing a namespace",
-                    module.name
-                )));
-            }
-            if module.proto_schema.is_empty() {
-                return Err(Status::invalid_argument(format!(
-                    "module '{}' in namespace '{}' has no schema — proto_schema is required",
-                    module.name, module.namespace
-                )));
+        // Validate modules — proto_schema is only required on the first
+        // descriptor for a given (namespace, name, version) tuple; additional
+        // entries represent extra instances on the same engine.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for module in &reg.modules {
+                if module.namespace.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "module '{}' is missing a namespace",
+                        module.name
+                    )));
+                }
+                let first =
+                    seen.insert((&module.namespace, &module.name, &module.version));
+                if first && module.proto_schema.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "module '{}' in namespace '{}' has no schema — proto_schema is required",
+                        module.name, module.namespace
+                    )));
+                }
             }
         }
 
@@ -123,10 +187,14 @@ impl ManagerService for Manager {
         // Resolve requested secrets
         let secrets = self.resolve_secrets(&reg.secrets).await?;
 
+        // Resolve DB credentials for namespaces that need database access
+        let db_credentials = self.resolve_db_credentials(&reg.db_namespaces).await?;
+
         info!(engine_id, "engine registered");
         Ok(Response::new(RegisterEngineResponse {
             accepted: true,
             secrets,
+            db_credentials,
         }))
     }
 
@@ -254,6 +322,11 @@ impl ManagerService for Manager {
         if req.namespace.is_empty() || req.key.is_empty() {
             return Err(Status::invalid_argument("namespace and key are required"));
         }
+        if req.key.starts_with("__") {
+            return Err(Status::invalid_argument(
+                "secret keys starting with '__' are reserved for internal use",
+            ));
+        }
 
         let (ciphertext, nonce) = self
             .crypto
@@ -287,6 +360,7 @@ impl ManagerService for Manager {
         let entries = db::list_secrets(&self.pool, &req.namespace).await?;
         let secrets = entries
             .into_iter()
+            .filter(|(_, key)| !key.starts_with("__"))
             .map(|(namespace, key)| SecretEntry { namespace, key })
             .collect();
         Ok(Response::new(ListSecretsResponse { secrets }))

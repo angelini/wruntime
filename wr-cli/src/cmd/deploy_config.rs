@@ -21,8 +21,6 @@ pub struct DeployConfig {
     pub format: Option<DeployFormat>,
     /// Postgres database URL
     pub db_url: Option<String>,
-    /// Guest database URL (node deploy only)
-    pub guest_db_url: Option<String>,
     /// Secret encryption key (manager deploy only)
     pub secret_key: Option<String>,
     /// SSH private key path

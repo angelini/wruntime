@@ -78,9 +78,6 @@ pub struct DeployArgs {
     /// Database URL for proxy and engine routing table sync
     #[arg(long)]
     db_url: Option<String>,
-    /// Guest database URL for module DB pools (required if engine uses guest databases)
-    #[arg(long)]
-    guest_db_url: Option<String>,
     /// SSH private key path
     #[arg(long)]
     ssh_key: Option<String>,
@@ -577,17 +574,11 @@ fn bundle(args: BundleArgs) -> Result<()> {
     )?;
 
     // Determine which template variables this bundle requires
-    let mut template_vars = vec![
+    let template_vars = vec![
         "host".to_string(),
         "db_url".to_string(),
         "peer_port".to_string(),
     ];
-    let has_guest_db = all_engine_configs
-        .iter()
-        .any(|(_, c)| c.database.as_ref().is_some_and(|db| db.guest_url.is_some()));
-    if has_guest_db {
-        template_vars.push("guest_db_url".to_string());
-    }
 
     // Generate and add deployment artifacts (systemd + docker)
     add_deployment_artifacts(
@@ -654,11 +645,6 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     let format = deploy_config::resolve_format(args.format, deploy_cfg.format);
     let db_url =
         deploy_config::resolve_required(args.db_url, deploy_cfg.db_url, "WR_DB_URL", "db_url")?;
-    let guest_db_url = deploy_config::resolve_string(
-        args.guest_db_url,
-        deploy_cfg.guest_db_url,
-        "WR_GUEST_DB_URL",
-    );
     let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key, "WR_SSH_KEY");
     let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port);
     let cert_dir = deploy_config::resolve_cert_dir(&args.cert_dir, deploy_cfg.cert_dir);
@@ -677,11 +663,6 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     vars.insert("host", host_ip.as_str());
     vars.insert("db_url", db_url.as_str());
     vars.insert("peer_port", peer_port_str.as_str());
-    let guest_db_url_val: String;
-    if let Some(ref url) = guest_db_url {
-        guest_db_url_val = url.clone();
-        vars.insert("guest_db_url", &guest_db_url_val);
-    }
 
     // Resolve all config templates
     let mut resolved_configs: Vec<(String, String)> = Vec::new();
@@ -786,17 +767,6 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
         }
     }
     println!("OK");
-
-    // Configure mTLS for the readiness check if not already set via CLI flags.
-    // Cert files are named by the SSH host alias; the cert must include the
-    // manager's IP as a SAN (via `wr cert generate <host> --ip <addr>`).
-    if !crate::client::tls_config_is_set() {
-        crate::client::set_tls_config(wr_common::node::TlsConfig {
-            cert_path: format!("{cert_dir}/{host_name}.crt"),
-            key_path: format!("{cert_dir}/{host_name}.key"),
-            ca_cert_path: format!("{cert_dir}/ca.crt"),
-        });
-    }
 
     // Poll until engines serving all schema-bearing modules are registered.
     let expected_modules: Vec<(String, String)> = manifest
@@ -991,7 +961,6 @@ fn status(args: StatusArgs) -> Result<()> {
         let source = match var.as_str() {
             "host" => "derived from deploy target",
             "db_url" => "--db-url / WR_DB_URL / wr-deploy.toml",
-            "guest_db_url" => "--guest-db-url / WR_GUEST_DB_URL / wr-deploy.toml",
             "peer_port" => "--peer-port / WR_PEER_PORT / wr-deploy.toml (default: 9443)",
             _ => "unknown",
         };

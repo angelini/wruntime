@@ -50,7 +50,7 @@ wr-node/
 │   └── wr-engine
 ├── config/
 │   ├── proxy.toml               # template with {db_url}, {host}
-│   └── engine.toml              # template with {db_url}, {guest_db_url}
+│   └── engine.toml              # template with {db_url}
 ├── modules/
 │   ├── order-service.wasm
 │   └── order-service.cwasm      # pre-compiled native (Cranelift)
@@ -87,12 +87,11 @@ ssh_key    = "~/.ssh/deploy_key"
 seed_nodes = ["10.0.1.11:9010", "10.0.1.12:9010"]
 cert_dir   = "./certs"    # CA + node certs from `wr cert`
 peer_port  = 9443         # mTLS peer listener port
-# guest_db_url = "postgres://wr_guest:pass@10.0.1.1:5432/wruntime"
 # ssh_port     = 22
 # image_prefix = "wr"
 ```
 
-All fields are optional. Fields that only apply to specific commands (e.g. `secret_key` for managers, `guest_db_url` for nodes) are silently ignored when unused. CLI flags always override the config file.
+All fields are optional. Fields that only apply to specific commands (e.g. `secret_key` for managers) are silently ignored when unused. CLI flags always override the config file.
 
 **Environment variables** are also supported for all deploy-related fields:
 
@@ -100,7 +99,6 @@ All fields are optional. Fields that only apply to specific commands (e.g. `secr
 |------|---------|---------|
 | `--format` | `WR_FORMAT` | `systemd` |
 | `--db-url` | `WR_DB_URL` | — |
-| `--guest-db-url` | `WR_GUEST_DB_URL` | — |
 | `--secret-key` | `WR_SECRET_KEY` | — |
 | `--ssh-key` | `WR_SSH_KEY` | — |
 | `--ssh-port` | `WR_SSH_PORT` | SSH default |
@@ -117,7 +115,6 @@ Config files use placeholders that are resolved at deploy time:
 | Variable | Resolved from | Used in |
 |----------|---------------|---------|
 | `{db_url}` | `--db-url` / `WR_DB_URL` / config | manager, proxy, engine configs |
-| `{guest_db_url}` | `--guest-db-url` / `WR_GUEST_DB_URL` / config | engine config (module DB access) |
 | `{host}` | deploy target (`user@host`) | proxy/engine `[node]` addresses |
 | `{secret_key}` | `--secret-key` / `WR_SECRET_KEY` / config | manager systemd unit / Dockerfile |
 | `{peer_port}` | `--peer-port` / `WR_PEER_PORT` / config (default: 9443) | proxy config (`peer_port`) |

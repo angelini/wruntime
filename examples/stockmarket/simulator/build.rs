@@ -1,9 +1,10 @@
 fn main() {
-    // Generate clients for exchange and ledger services.
-    // SimulatorService messages are included so SimRunRequest/SimRunResponse
-    // are available (the Run route is handled manually, like the ecommerce client).
+    // Generate SimulatorService trait + router, AND clients for exchange/ledger.
     prost_build::Config::new()
-        .service_generator(Box::new(wr_build::WrClientGenerator))
+        .service_generator(Box::new(wr_build::WrCombinedGenerator::new(
+            wr_build::WrServiceGenerator,
+            wr_build::WrClientGenerator,
+        )))
         .compile_protos(
             &[
                 "../schemas/exchange.proto",

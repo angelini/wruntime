@@ -26,6 +26,7 @@ async fn test_register_and_list_engines() -> Result<()> {
                 proto_schema: minimal_file_descriptor_set(),
             }],
             secrets: vec![],
+            db_namespaces: vec![],
         }),
     })
     .await?;
@@ -54,6 +55,7 @@ async fn test_deregister_engine() -> Result<()> {
             peer_address: String::new(),
             modules: vec![],
             secrets: vec![],
+            db_namespaces: vec![],
         }),
     })
     .await?;
@@ -85,6 +87,7 @@ async fn test_heartbeat() -> Result<()> {
             peer_address: String::new(),
             modules: vec![],
             secrets: vec![],
+            db_namespaces: vec![],
         }),
     })
     .await?;
@@ -154,6 +157,7 @@ async fn test_get_schema_after_registration() -> Result<()> {
                 proto_schema: schema_bytes.clone(),
             }],
             secrets: vec![],
+            db_namespaces: vec![],
         }),
     })
     .await?;
@@ -255,6 +259,7 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
                 proto_schema: schema_v1.clone(),
             }],
             secrets: vec![],
+            db_namespaces: vec![],
         }),
     })
     .await?;
@@ -273,6 +278,7 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
                 proto_schema: schema_v2.clone(),
             }],
             secrets: vec![],
+            db_namespaces: vec![],
         }),
     })
     .await?;
@@ -321,6 +327,7 @@ async fn test_get_schema_cross_namespace_isolation() -> Result<()> {
                 proto_schema: schema.clone(),
             }],
             secrets: vec![],
+            db_namespaces: vec![],
         }),
     })
     .await?;
@@ -370,6 +377,7 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
                 proto_schema: schema_v1.clone(),
             }],
             secrets: vec![],
+            db_namespaces: vec![],
         }),
     })
     .await?;
@@ -399,6 +407,7 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
                 proto_schema: schema_updated.clone(),
             }],
             secrets: vec![],
+            db_namespaces: vec![],
         }),
     })
     .await?;
@@ -449,6 +458,7 @@ async fn test_get_schema_multi_module_engine() -> Result<()> {
                 },
             ],
             secrets: vec![],
+            db_namespaces: vec![],
         }),
     })
     .await?;

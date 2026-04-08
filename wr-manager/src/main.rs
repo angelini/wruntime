@@ -31,7 +31,15 @@ async fn main() -> Result<()> {
     let config = config::ManagerConfig::load(&config_path)?;
     let addr = config.listen_address.parse()?;
 
-    // Database
+    // Database — create wr_system schema before building the pool (which
+    // sets search_path = wr_system and would fail if the schema doesn't exist).
+    {
+        let bootstrap = wr_common::pool::build_pool(&config.database.url, 1)?;
+        let client = bootstrap.get().await?;
+        client
+            .batch_execute("CREATE SCHEMA IF NOT EXISTS wr_system")
+            .await?;
+    }
     let db_pool = pool::build_pool(&config.database.url, config.database.max_connections)?;
     let client = db_pool.get().await?;
     migrate::run_migrations(&client).await?;

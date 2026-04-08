@@ -146,7 +146,20 @@ impl ManagerDiscovery {
                 "SELECT grpc_address FROM wr_managers WHERE last_heartbeat > NOW() - INTERVAL '60 seconds'",
                 &[],
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                // Walk the source chain — tokio_postgres prints "db error"
+                // but the real message is in the cause.
+                use std::error::Error;
+                let mut msg = e.to_string();
+                let mut source = e.source();
+                while let Some(cause) = source {
+                    msg.push_str(": ");
+                    msg.push_str(&cause.to_string());
+                    source = cause.source();
+                }
+                msg
+            })?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 }

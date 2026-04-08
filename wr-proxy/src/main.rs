@@ -44,22 +44,12 @@ async fn main() -> Result<()> {
     ));
 
     // ── Manager discovery via Postgres ────────────────────────────────────
-    let db_pool = {
-        let pg_config = deadpool_postgres::Config {
-            url: Some(config.database.url.clone()),
-            pool: Some(deadpool_postgres::PoolConfig {
-                max_size: config.database.max_connections,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        pg_config
-            .create_pool(
-                Some(deadpool_postgres::Runtime::Tokio1),
-                tokio_postgres::NoTls,
-            )
-            .context("failed to create discovery pool")?
-    };
+    let db_pool = wr_common::pool::build_pool_with_search_path(
+        &config.database.url,
+        config.database.max_connections,
+        "wr_system",
+    )
+    .context("failed to create discovery pool")?;
     let manager_tls = wr_common::tls::build_tonic_client_tls(&config.node.tls)
         .context("failed to build manager TLS config")?;
     let discovery = Arc::new(ManagerDiscovery::new(db_pool, Some(manager_tls)));

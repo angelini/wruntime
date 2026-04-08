@@ -24,9 +24,6 @@ S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-rustfsadmin}"
 export RUST_LOG="${RUST_LOG:-info}"
 export WR_MANAGER="${WR_MANAGER:-https://127.0.0.1:9000}"
-export WR_CA_CERT="${WR_CA_CERT:-certs/ca.crt}"
-export WR_CLIENT_CERT="${WR_CLIENT_CERT:-certs/127.0.0.1.crt}"
-export WR_CLIENT_KEY="${WR_CLIENT_KEY:-certs/127.0.0.1.key}"
 
 # ── Generate TLS certificates if missing ─────────────────────────────────────
 if [ ! -f certs/ca.crt ]; then
@@ -81,7 +78,7 @@ prepare_proxy_config() {
 # ── Clean stale manager state ────────────────────────────────────────────────
 clean_manager_state() {
     echo "==> Cleaning manager state..."
-    psql "${DB_URL}" -c "TRUNCATE wr_engines, wr_routing_rules, wr_schemas, wr_managers CASCADE" 2>/dev/null \
+    psql "${DB_URL}" -c "TRUNCATE wr_system.wr_engines, wr_system.wr_routing_rules, wr_system.wr_schemas, wr_system.wr_managers CASCADE" 2>/dev/null \
         || echo "   (tables may not exist yet — first run)"
 }
 

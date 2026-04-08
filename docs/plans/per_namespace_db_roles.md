@@ -1,8 +1,22 @@
 # Plan: Per-Namespace Postgres Role Isolation
 
+**Status:** Implemented (revised approach — manager-managed passwords instead of HMAC derivation).
+
 ## Context
 
-A single shared `guest_url` role gets `GRANT ALL` on every module's schema across all namespaces. Any guest can use fully-qualified table names (`SELECT * FROM wr__other_ns__mod.table`) to read/write other namespaces' data. This change auto-creates a per-namespace Postgres role (`wr_ns_{namespace}`) with a deterministic HMAC-derived password, replacing `guest_url` entirely.
+A single shared `guest_url` role gets `GRANT ALL` on every module's schema across all namespaces. Any guest can use fully-qualified table names (`SELECT * FROM wr__other_ns__mod.table`) to read/write other namespaces' data.
+
+## Implemented Approach
+
+Instead of the original HMAC-based `WRT_DB_SECRET_KEY` design below, the implementation uses the manager's existing secret infrastructure to generate and store random per-namespace DB passwords. This eliminates the need for a separate secret key on engines:
+
+1. Engines send `db_namespaces` in their registration request
+2. The manager generates a random password per namespace (stored encrypted in `wr_secrets` under the reserved key `__db_password`), or retrieves the existing one
+3. The manager returns `NamespaceDbCredential` (namespace, role, password) in the registration response
+4. The engine creates the Postgres role, grants schema access, and builds namespace connection pools — the password never enters the WASM env var path
+5. Secret keys prefixed with `__` are blocked in the public `SetSecret`/`ListSecrets` RPCs, preventing guests from accessing DB passwords
+
+## Original Design (superseded)
 
 ## Design Decisions
 

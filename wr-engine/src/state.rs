@@ -36,6 +36,9 @@ struct ModuleHttpHooks {
     module_namespace: Arc<str>,
     /// Pool of HTTP/2 clients — round-robin across multiple connections.
     http_pool: HttpClientPool<Full<bytes::Bytes>>,
+    /// When set, outbound requests are parented to this span instead of
+    /// starting a new trace. Modules set this via `start-root`.
+    outbound_parent: Arc<std::sync::Mutex<Option<tracing::Span>>>,
 }
 
 impl WasiHttpHooks for ModuleHttpHooks {
@@ -45,6 +48,24 @@ impl WasiHttpHooks for ModuleHttpHooks {
         config: OutgoingRequestConfig,
     ) -> HttpResult<HostFutureIncomingResponse> {
         let original_uri = request.uri().to_string();
+
+        // If the guest set an outbound parent (via `start-root`), parent to
+        // that span so all outbound calls share one trace. Otherwise start a
+        // new root trace per outbound call.
+        let parent_lock = self.outbound_parent.lock().unwrap();
+        let parent = parent_lock.clone().unwrap_or_else(tracing::Span::none);
+        drop(parent_lock);
+        let outbound_span = tracing::info_span!(
+            parent: &parent,
+            "engine.outbound_request",
+            otel.name = format!("{} {}", request.method(), &original_uri),
+            wr.source = %self.module_name,
+            wr.destination = %original_uri,
+            http.request.method = %request.method(),
+            url.full = %original_uri,
+            http.response.status_code = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        );
 
         request.headers_mut().insert(
             HeaderName::from_static("x-wr-destination"),
@@ -59,6 +80,13 @@ impl WasiHttpHooks for ModuleHttpHooks {
             HeaderValue::from_str(&self.module_namespace)
                 .map_err(|_| ErrorCode::InternalError(None))?,
         );
+
+        // Inject trace context so downstream services (proxy, destination engine)
+        // join this trace instead of starting a new one.
+        {
+            let _guard = outbound_span.enter();
+            wr_common::telemetry::inject_context(request.headers_mut());
+        }
 
         // Preserve the original path+query; only replace scheme and authority.
         let path_and_query = request
@@ -96,12 +124,21 @@ impl WasiHttpHooks for ModuleHttpHooks {
 
                 let resp = client.request(buffered).await.map_err(|e| {
                     tracing::warn!(error = ?e, "outgoing http request failed");
+                    outbound_span.record("otel.status_code", "ERROR");
                     if e.is_connect() {
                         ErrorCode::ConnectionRefused
                     } else {
                         ErrorCode::InternalError(Some(e.to_string()))
                     }
                 })?;
+
+                let status = resp.status().as_u16();
+                outbound_span.record("http.response.status_code", status);
+                if status >= 400 {
+                    outbound_span.record("otel.status_code", "ERROR");
+                } else {
+                    outbound_span.record("otel.status_code", "OK");
+                }
 
                 let (resp_parts, resp_body) = resp.into_parts();
                 let incoming_body: HyperIncomingBody =
@@ -206,6 +243,12 @@ pub struct ModuleState {
     pub llm: Option<Arc<LlmRuntime>>,
     /// The `engine.dispatch` span for the current request.
     pub active_span: tracing::Span,
+    /// Stack of guest-created spans for automatic parent-child nesting.
+    /// New spans are parented to the top of the stack (or `active_span` if empty).
+    pub span_stack: Vec<tracing::Span>,
+    /// Shared with `ModuleHttpHooks` — when set, outbound requests parent to
+    /// this span. Modules set it via `start-root`.
+    pub outbound_parent: Arc<std::sync::Mutex<Option<tracing::Span>>>,
 }
 
 impl ModuleState {
@@ -229,6 +272,7 @@ impl ModuleState {
             }
             None => None,
         };
+        let outbound_parent = Arc::new(std::sync::Mutex::new(None));
         Ok(Self {
             wasi: builder.build(),
             http: WasiHttpCtx::new(),
@@ -238,6 +282,7 @@ impl ModuleState {
                 module_name,
                 module_namespace,
                 http_pool,
+                outbound_parent: outbound_parent.clone(),
             },
             db_pool: services.db_pool,
             db_schema: services.db_schema,
@@ -247,6 +292,8 @@ impl ModuleState {
             llm: services.llm,
             _fs_root: fs_root,
             active_span: services.active_span,
+            span_stack: Vec::new(),
+            outbound_parent,
         })
     }
 

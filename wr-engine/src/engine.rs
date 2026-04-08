@@ -36,10 +36,10 @@ struct ResolvedServices {
 pub struct EngineRunner {
     engine: Arc<Engine>,
     config: EngineConfig,
-    /// Admin pool used only for schema provisioning; shares creds with module pools.
+    /// Admin pool used only for schema provisioning and migrations.
     db_pool: Option<Arc<Pool>>,
-    /// One pool per DB-enabled module, keyed by (namespace, name).
-    db_pools: HashMap<(String, String), Arc<Pool>>,
+    /// One pool per namespace with DB-enabled modules.
+    db_pools: HashMap<String, Arc<Pool>>,
     /// Shared S3-compatible blobstore client, present when `[blobstore]` is configured.
     blobstore_client: Option<Arc<BlobstoreRuntime>>,
     /// Shared LLM inference client, present when `[llm]` is configured.
@@ -74,22 +74,9 @@ impl EngineRunner {
             .transpose()?
             .map(Arc::new);
 
-        let mut db_pools: HashMap<(String, String), Arc<Pool>> = HashMap::new();
-        if let Some(db) = &config.database {
-            let guest_db_url = db.guest_url.as_deref().unwrap_or(&db.url);
-            for module in &config.modules {
-                if module.database {
-                    let pool = wr_engine::pool::build_pool(
-                        guest_db_url,
-                        module.db_max_connections.unwrap_or(db.max_connections),
-                    )?;
-                    db_pools.insert(
-                        (module.namespace.clone(), module.name.clone()),
-                        Arc::new(pool),
-                    );
-                }
-            }
-        }
+        // Guest pools are built later from manager-provided credentials
+        // via build_namespace_pools().
+        let db_pools: HashMap<String, Arc<Pool>> = HashMap::new();
 
         let blobstore_client = config
             .blobstore
@@ -134,46 +121,84 @@ impl EngineRunner {
         });
     }
 
-    /// For every DB-enabled module, ensure its Postgres schema exists.
-    /// When a separate `guest_url` is configured, also GRANTs the guest role
-    /// full access to the module's schema so the lower-privilege role can
-    /// create/modify tables within it.
+    /// Build per-namespace connection pools from manager-provided DB credentials.
+    /// Must be called after registration and before loading modules.
+    pub fn build_namespace_pools(
+        &mut self,
+        credentials: &[wr_common::wruntime::NamespaceDbCredential],
+    ) -> Result<()> {
+        let db = match &self.config.database {
+            Some(db) => db,
+            None => return Ok(()),
+        };
+
+        // Sum max_connections per namespace from all DB-enabled modules
+        let mut ns_max_conns: HashMap<String, usize> = HashMap::new();
+        for module in &self.config.modules {
+            if module.database {
+                *ns_max_conns.entry(module.namespace.clone()).or_default() +=
+                    module.db_max_connections.unwrap_or(db.max_connections);
+            }
+        }
+
+        for cred in credentials {
+            let max_size = ns_max_conns
+                .get(&cred.namespace)
+                .copied()
+                .unwrap_or(db.max_connections);
+            let pool =
+                wr_engine::pool::build_guest_pool(&db.url, &cred.role, &cred.password, max_size)?;
+            self.db_pools.insert(cred.namespace.clone(), Arc::new(pool));
+        }
+        Ok(())
+    }
+
+    /// For every DB-enabled module, ensure its Postgres schema and per-namespace
+    /// role exist. Creates roles, schemas, and grants access.
     /// Idempotent — safe to run on every startup.
-    pub async fn provision_schemas(&self) -> Result<()> {
+    pub async fn provision_schemas(
+        &self,
+        credentials: &[wr_common::wruntime::NamespaceDbCredential],
+    ) -> Result<()> {
         let pool = match &self.db_pool {
             Some(p) => p,
             None => return Ok(()),
         };
 
-        // Extract the guest role name from guest_url (if configured) so we can
-        // GRANT schema access to the lower-privilege role.
-        // Parses the username from `postgres://user:pass@host/db` without
-        // pulling in a full URL parser.
-        let guest_role = self
-            .config
-            .database
-            .as_ref()
-            .and_then(|db| db.guest_url.as_ref())
-            .and_then(|url| {
-                let after_scheme = url.split("://").nth(1)?;
-                let userinfo = after_scheme.split('@').next()?;
-                let user = userinfo.split(':').next()?;
-                if user.is_empty() {
-                    None
-                } else {
-                    Some(user.to_string())
-                }
-            });
+        let client = pool
+            .get()
+            .await
+            .context("failed to get DB connection for schema provisioning")?;
+
+        // Create per-namespace roles
+        for cred in credentials {
+            client
+                .batch_execute(&format!(
+                    "DO $$ BEGIN \
+                       IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') THEN \
+                         CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'; \
+                       END IF; \
+                     END $$; \
+                     ALTER ROLE \"{role}\" PASSWORD '{password}';",
+                    role = cred.role,
+                    password = cred.password,
+                ))
+                .await
+                .with_context(|| format!("failed to provision role '{}'", cred.role))?;
+            info!(role = %cred.role, namespace = %cred.namespace, "db role provisioned");
+        }
+
+        // Build a lookup from namespace → role for grant statements
+        let ns_roles: HashMap<&str, &str> = credentials
+            .iter()
+            .map(|c| (c.namespace.as_str(), c.role.as_str()))
+            .collect();
 
         for module in &self.config.modules {
             if !module.database {
                 continue;
             }
             let schema = module_schema(&module.namespace, &module.name);
-            let client = pool
-                .get()
-                .await
-                .context("failed to get DB connection for schema provisioning")?;
             let result = client
                 .execute(
                     &format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""),
@@ -191,11 +216,8 @@ impl EngineRunner {
                 }
             }
 
-            // Grant the guest role full access to this module's schema:
-            // - Schema usage + creation rights
-            // - All existing tables, sequences, and functions
-            // - Default privileges so future objects (created by migrations) are also accessible
-            if let Some(role) = &guest_role {
+            // Grant the namespace role full access to this module's schema
+            if let Some(role) = ns_roles.get(module.namespace.as_str()) {
                 client
                     .batch_execute(&format!(
                         "GRANT ALL ON SCHEMA \"{schema}\" TO \"{role}\"; \
@@ -289,10 +311,7 @@ impl EngineRunner {
     ) -> ResolvedServices {
         let (db_pool, db_schema) = if module_config.database {
             let schema: Arc<str> = Arc::from(module_schema(module_namespace, module_name));
-            let pool = self
-                .db_pools
-                .get(&(module_config.namespace.clone(), module_config.name.clone()))
-                .cloned();
+            let pool = self.db_pools.get(&module_config.namespace).cloned();
             (pool, Some(schema))
         } else {
             (None, None)

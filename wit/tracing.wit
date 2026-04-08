@@ -15,6 +15,11 @@ interface span {
 
     /// Start a new child span under the current request span with initial attributes.
     start: func(name: string, attrs: list<tuple<string, string>>) -> active-span;
+
+    /// Start a new root span (fresh trace). All subsequent outbound HTTP
+    /// requests will be parented to this span until it is dropped.
+    /// Use this to group a batch of related outbound calls under one trace.
+    start-root: func(name: string, attrs: list<tuple<string, string>>) -> active-span;
 }
 
 world tracing-access {

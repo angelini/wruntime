@@ -48,27 +48,10 @@ async fn async_main() -> Result<()> {
     };
     info!(engine_id, "engine starting");
 
-    // ── Prepare WASM runtime (schemas + migrations, but don't load modules yet)
+    // ── Prepare WASM runtime (pools and schemas are provisioned after registration)
     let registry = registry::ModuleRegistry::new();
-    let runner = engine::EngineRunner::new(config.clone())?;
+    let mut runner = engine::EngineRunner::new(config.clone())?;
     runner.spawn_epoch_ticker();
-    runner.provision_schemas().await?;
-
-    // Provision the wr__jobs schema if any module uses worker mode.
-    let has_workers = config
-        .modules
-        .iter()
-        .any(|m| m.mode == config::ModuleMode::Worker);
-    if has_workers {
-        let db = config
-            .database
-            .as_ref()
-            .expect("worker mode requires [database] section");
-        let admin_pool = wr_engine::pool::build_pool(&db.url, db.max_connections)?;
-        wr_engine::worker::provision_job_schema(&admin_pool).await?;
-    }
-
-    runner.run_migrations().await?;
 
     // ── Start inbound HTTP server ─────────────────────────────────────────
     {
@@ -113,35 +96,61 @@ async fn async_main() -> Result<()> {
         })?
     };
 
-    // Build module descriptors — only modules with a schema_path are registered
-    // with the manager (runner modules without schemas are skipped).
+    // Build module descriptors — one per config entry. The proto_schema is
+    // only included on the first occurrence to avoid redundant uploads;
+    // subsequent entries for the same module carry an empty schema.
     let mut module_descriptors: Vec<ModuleDescriptor> = Vec::new();
-    for m in &config.modules {
-        let Some(ref schema_path) = m.schema_path else {
-            continue;
-        };
-        let proto_schema = std::fs::read(schema_path)
-            .with_context(|| format!("failed to read schema for module '{}'", m.name))?;
-        module_descriptors.push(ModuleDescriptor {
-            name: m.name.clone(),
-            namespace: m.namespace.clone(),
-            version: m.version.clone(),
-            proto_schema,
-        });
+    {
+        let mut schema_sent = std::collections::HashSet::new();
+        for m in &config.modules {
+            let first = schema_sent.insert((&m.namespace, &m.name, &m.version));
+            let proto_schema = if first {
+                m.schema_path
+                    .as_ref()
+                    .map(std::fs::read)
+                    .transpose()
+                    .with_context(|| format!("failed to read schema for module '{}'", m.name))?
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
+            module_descriptors.push(ModuleDescriptor {
+                name: m.name.clone(),
+                namespace: m.namespace.clone(),
+                version: m.version.clone(),
+                proto_schema,
+
+            });
+        }
     }
 
-    // Build secret requests from module env configs
+    // Build secret requests from module env configs (deduplicated)
     let mut secret_requests: Vec<SecretRequest> = Vec::new();
-    for m in &config.modules {
-        for (key, val) in &m.env {
-            if matches!(val, EnvValue::Secret { secret: true }) {
-                secret_requests.push(SecretRequest {
-                    namespace: m.namespace.clone(),
-                    key: key.clone(),
-                });
+    {
+        let mut seen = std::collections::HashSet::new();
+        for m in &config.modules {
+            for (key, val) in &m.env {
+                if matches!(val, EnvValue::Secret { secret: true })
+                    && seen.insert((&m.namespace, key))
+                {
+                    secret_requests.push(SecretRequest {
+                        namespace: m.namespace.clone(),
+                        key: key.clone(),
+                    });
+                }
             }
         }
     }
+
+    // Collect namespaces that need DB access
+    let db_namespaces: Vec<String> = config
+        .modules
+        .iter()
+        .filter(|m| m.database)
+        .map(|m| m.namespace.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
 
     // ── Register with manager (retry with backoff) ─────────────────────────
     let reg_response = {
@@ -159,6 +168,7 @@ async fn async_main() -> Result<()> {
                 peer_address: config.node.peer_address(),
                 modules: module_descriptors,
                 secrets: secret_requests,
+                db_namespaces: db_namespaces.clone(),
             }),
         };
         let cl = client.clone();
@@ -172,6 +182,28 @@ async fn async_main() -> Result<()> {
         .into_inner()
     };
     info!(address = %config.node.control_address, engine_id, "registered via proxy");
+
+    // ── Provision DB schemas and build namespace pools from manager credentials ──
+    runner
+        .provision_schemas(&reg_response.db_credentials)
+        .await?;
+
+    // Provision the wr__jobs schema if any module uses worker mode.
+    let has_workers = config
+        .modules
+        .iter()
+        .any(|m| m.mode == config::ModuleMode::Worker);
+    if has_workers {
+        let db = config
+            .database
+            .as_ref()
+            .expect("worker mode requires [database] section");
+        let admin_pool = wr_engine::pool::build_pool(&db.url, db.max_connections)?;
+        wr_engine::worker::provision_job_schema(&admin_pool).await?;
+    }
+
+    runner.run_migrations().await?;
+    runner.build_namespace_pools(&reg_response.db_credentials)?;
 
     // ── Resolve secrets into env vars per module ──────────────────────────
     // Build a lookup: (namespace, key) → plaintext value
@@ -227,9 +259,13 @@ async fn async_main() -> Result<()> {
             loop {
                 interval.tick().await;
 
-                // Health-check each module; only include passing ones in the heartbeat.
+                // Health-check each unique module; only include passing ones.
                 let mut healthy = Vec::new();
+                let mut checked = std::collections::HashSet::new();
                 for m in &hb_module_configs {
+                    if !checked.insert((&m.namespace, &m.name, &m.version)) {
+                        continue;
+                    }
                     if let Some(tx) = hb_registry
                         .next_sender(&m.namespace, &m.name, &m.version)
                         .await
@@ -240,6 +276,7 @@ async fn async_main() -> Result<()> {
                                 namespace: m.namespace.clone(),
                                 version: m.version.clone(),
                                 proto_schema: vec![],
+                
                             });
                         } else {
                             warn!(

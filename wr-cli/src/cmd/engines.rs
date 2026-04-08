@@ -1,6 +1,8 @@
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use tabled::builder::Builder;
+use tabled::grid::config::HorizontalLine;
+use tabled::settings::{Style, Theme};
 use wr_common::wruntime::{DeregisterEngineRequest, ListEnginesRequest};
 
 use crate::{client, display};
@@ -48,15 +50,47 @@ async fn list(manager: &str) -> Result<()> {
     }
 
     let mut builder = Builder::new();
-    builder.push_record(["ID", "Address", "Modules"]);
-    for engine in &resp.engines {
-        builder.push_record([
-            engine.engine_id.as_str(),
-            engine.address.as_str(),
-            &engine.modules.len().to_string(),
-        ]);
+    builder.push_record(["Engine", "Address", "Module"]);
+    let mut separator_rows = Vec::new();
+    let mut row_idx = 1; // row 0 is header
+    for (i, engine) in resp.engines.iter().enumerate() {
+        if i > 0 {
+            separator_rows.push(row_idx);
+        }
+        if engine.modules.is_empty() {
+            builder.push_record([engine.engine_id.as_str(), engine.address.as_str(), ""]);
+            row_idx += 1;
+        } else {
+            let mut modules: Vec<_> = engine.modules.iter().collect();
+            modules.sort_by(|a, b| {
+                (&a.namespace, &a.name, &a.version).cmp(&(&b.namespace, &b.name, &b.version))
+            });
+            for (j, module) in modules.iter().enumerate() {
+                let module_str = format!(
+                    "{}.{} v{}",
+                    module.namespace, module.name, module.version
+                );
+                if j == 0 {
+                    builder.push_record([
+                        engine.engine_id.as_str(),
+                        engine.address.as_str(),
+                        &module_str,
+                    ]);
+                } else {
+                    builder.push_record(["", "", &module_str]);
+                }
+                row_idx += 1;
+            }
+        }
     }
-    display::print_table(builder);
+
+    let mut table = builder.build();
+    let mut theme = Theme::from_style(Style::rounded());
+    for row in separator_rows {
+        theme.insert_horizontal_line(row, HorizontalLine::new(Some('─'), Some('┼'), Some('├'), Some('┤')));
+    }
+    table.with(theme);
+    println!("{table}");
     Ok(())
 }
 
@@ -80,9 +114,13 @@ async fn get(manager: &str, id: &str) -> Result<()> {
         return Ok(());
     }
 
+    let mut modules: Vec<_> = engine.modules.iter().collect();
+    modules.sort_by(|a, b| {
+        (&a.namespace, &a.name, &a.version).cmp(&(&b.namespace, &b.name, &b.version))
+    });
     let mut builder = Builder::new();
     builder.push_record(["Namespace", "Module", "Version"]);
-    for module in &engine.modules {
+    for module in &modules {
         builder.push_record([
             module.namespace.as_str(),
             module.name.as_str(),

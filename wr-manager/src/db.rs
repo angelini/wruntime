@@ -123,6 +123,9 @@ pub async fn upsert_engine_and_schemas(
     .internal()?;
 
     for module in &reg.modules {
+        if module.proto_schema.is_empty() {
+            continue;
+        }
         txn.execute(
             "INSERT INTO wr_schemas (namespace, module_name, version, proto_schema)
              VALUES ($1, $2, $3, $4)

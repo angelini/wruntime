@@ -25,6 +25,10 @@ pub mod exports {
         pub trait ServiceGuest {
             fn handle(request: IncomingRequest, response_out: ResponseOutparam);
 
+            /// Called once before the first request is handled. Use this for
+            /// one-time setup such as `db::enable_tracing()`.
+            fn init() {}
+
             /// Called by the engine on each heartbeat to determine if this module
             /// instance is healthy. Return `false` to mark the module unhealthy in
             /// the routing table. The default implementation always returns `true`.
@@ -39,6 +43,10 @@ pub mod exports {
 
             #[cfg(target_arch = "wasm32")]
             ::wit_bindgen_rt::run_ctors_once();
+
+            static INIT: std::sync::Once = std::sync::Once::new();
+            INIT.call_once(T::init);
+
             let request = unsafe { IncomingRequest::from_handle(arg0 as u32) };
             let response_out = unsafe { ResponseOutparam::from_handle(arg1 as u32) };
 

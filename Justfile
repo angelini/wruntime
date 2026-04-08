@@ -289,14 +289,15 @@ build-stockmarket: build-stockmarket-schemas
     (cd examples/stockmarket/simulator && cargo component build --release --target wasm32-wasip2)
 
 # Run the full stockmarket example (requires Postgres + RustFS S3 — see `just dev-up`)
-stockmarket: build-stockmarket build
+# Pass exchanges=N to run N exchange engines in parallel (default: 1)
+stockmarket exchanges="1": build-stockmarket build
     WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
-    DB_URL={{db_url_example}} bash examples/stockmarket/run.sh
+    DB_URL={{db_url_example}} bash examples/stockmarket/run.sh --exchanges {{exchanges}}
 
 # Run the stockmarket example inline (single invocation, exits on failure)
-stockmarket-inline: build-stockmarket build
+stockmarket-inline exchanges="1": build-stockmarket build
     WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
-    DB_URL={{db_url_example}} bash examples/stockmarket/run.sh --inline
+    DB_URL={{db_url_example}} bash examples/stockmarket/run.sh --inline --exchanges {{exchanges}}
 
 # ── Codegen Example ───────────────────────────────────────────────────────────
 

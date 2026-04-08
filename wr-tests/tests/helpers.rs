@@ -130,9 +130,9 @@ pub async fn manager_pool() -> deadpool_postgres::Pool {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let schema = format!("mgr_test_{n}");
 
-    // Create the schema using a one-shot connection to the base DB.
+    // Create the schema using a one-shot connection to the base DB (no search_path override).
     let setup_pool =
-        wr_manager::pool::build_pool(&base_url, 1).expect("failed to build setup pool");
+        wr_common::pool::build_pool(&base_url, 1).expect("failed to build setup pool");
     let client = setup_pool.get().await.expect("setup connection");
 
     // On the first call only, drop all leftover mgr_test_* schemas from
@@ -166,10 +166,9 @@ pub async fn manager_pool() -> deadpool_postgres::Pool {
     drop(client);
     drop(setup_pool);
 
-    // Build the real pool with search_path pinned to the new schema.
-    let sep = if base_url.contains('?') { "&" } else { "?" };
-    let url = format!("{base_url}{sep}options=-csearch_path%3D{schema}");
-    let pool = wr_manager::pool::build_pool(&url, 5).expect("failed to build manager test pool");
+    // Build the real pool with search_path pinned to the test schema.
+    let pool = wr_common::pool::build_pool_with_search_path(&base_url, 5, &schema)
+        .expect("failed to build manager test pool");
 
     let client = pool.get().await.expect("migration connection");
     wr_manager::migrate::run_migrations(&client)
@@ -336,6 +335,7 @@ pub async fn register_module(
                 proto_schema: module.schema,
             }],
             secrets: vec![],
+            db_namespaces: vec![],
         }),
     })
     .await?;

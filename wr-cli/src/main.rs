@@ -14,16 +14,31 @@ struct Cli {
     manager: Option<String>,
 
     /// CA certificate for verifying the manager's TLS cert
-    #[arg(long, env = "WR_CA_CERT", global = true)]
-    ca_cert: Option<String>,
+    #[arg(
+        long,
+        env = "WR_CA_CERT",
+        global = true,
+        default_value = "certs/ca.crt"
+    )]
+    ca_cert: String,
 
     /// Client certificate for mTLS authentication to the manager
-    #[arg(long, env = "WR_CLIENT_CERT", global = true)]
-    client_cert: Option<String>,
+    #[arg(
+        long,
+        env = "WR_CLIENT_CERT",
+        global = true,
+        default_value = "certs/127.0.0.1.crt"
+    )]
+    client_cert: String,
 
     /// Client private key for mTLS authentication to the manager
-    #[arg(long, env = "WR_CLIENT_KEY", global = true)]
-    client_key: Option<String>,
+    #[arg(
+        long,
+        env = "WR_CLIENT_KEY",
+        global = true,
+        default_value = "certs/127.0.0.1.key"
+    )]
+    client_key: String,
 
     /// Enable verbose debug output (connection attempts, SSH commands, retries)
     #[arg(long, short, global = true)]
@@ -33,14 +48,11 @@ struct Cli {
     command: Commands,
 }
 
-fn build_tls_config(cli: &Cli) -> Option<TlsConfig> {
-    match (&cli.ca_cert, &cli.client_cert, &cli.client_key) {
-        (Some(ca), Some(cert), Some(key)) => Some(TlsConfig {
-            cert_path: cert.clone(),
-            key_path: key.clone(),
-            ca_cert_path: ca.clone(),
-        }),
-        _ => None,
+fn build_tls_config(cli: &Cli) -> TlsConfig {
+    TlsConfig {
+        cert_path: cli.client_cert.clone(),
+        key_path: cli.client_key.clone(),
+        ca_cert_path: cli.ca_cert.clone(),
     }
 }
 
@@ -85,9 +97,7 @@ async fn main() -> Result<()> {
 
     cmd::helpers::set_verbose(cli.verbose);
 
-    if let Some(tls) = build_tls_config(&cli) {
-        client::set_tls_config(tls);
-    }
+    client::set_tls_config(build_tls_config(&cli));
 
     match cli.command {
         Commands::Db(args) => cmd::db::run(args).await,

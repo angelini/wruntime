@@ -12,7 +12,6 @@ ca_cert_path = "certs/ca.crt"
 
 [database]
 url             = "postgres://postgres@localhost:5433/wruntime_example"
-guest_url       = "postgres://wr_guest@localhost:5433/wruntime_example"
 max_connections = 100
 
 [[module]]

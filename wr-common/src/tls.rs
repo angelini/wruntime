@@ -44,12 +44,35 @@ fn build_root_store(ca_certs: &[CertificateDer<'static>]) -> Result<RootCertStor
     Ok(store)
 }
 
+/// Check that all TLS certificate files exist before attempting to load them.
+/// Produces a single actionable error listing every missing file.
+fn check_tls_files_exist(tls: &TlsConfig) -> Result<()> {
+    let mut missing = Vec::new();
+    for (label, path) in [
+        ("cert", &tls.cert_path),
+        ("key", &tls.key_path),
+        ("CA cert", &tls.ca_cert_path),
+    ] {
+        if !std::path::Path::new(path).exists() {
+            missing.push(format!("  {label}: {path}"));
+        }
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "TLS certificate files not found:\n{}\n\nRun `just certs` to generate local dev certificates.",
+            missing.join("\n")
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Server-side (mTLS acceptor)
 // ---------------------------------------------------------------------------
 
 /// Build a `ServerConfig` that requires client certificates signed by the given CA.
 pub fn build_server_config(tls: &TlsConfig) -> Result<Arc<ServerConfig>> {
+    check_tls_files_exist(tls)?;
     let cert_chain = load_certs(&tls.cert_path)?;
     let private_key = load_key(&tls.key_path)?;
     let ca_certs = load_certs(&tls.ca_cert_path)?;
@@ -86,6 +109,7 @@ pub fn build_acceptor(tls: &TlsConfig) -> Result<TlsAcceptor> {
 
 /// Build a `ClientConfig` with client certificate authentication.
 pub fn build_client_config(tls: &TlsConfig) -> Result<ClientConfig> {
+    check_tls_files_exist(tls)?;
     let cert_chain = load_certs(&tls.cert_path)?;
     let private_key = load_key(&tls.key_path)?;
     let ca_certs = load_certs(&tls.ca_cert_path)?;
@@ -164,6 +188,7 @@ where
 
 /// Build a `tonic::transport::ServerTlsConfig` for a gRPC server with mTLS.
 pub fn build_tonic_server_tls(tls: &TlsConfig) -> Result<tonic::transport::ServerTlsConfig> {
+    check_tls_files_exist(tls)?;
     let cert_pem = std::fs::read_to_string(&tls.cert_path)
         .with_context(|| format!("failed to read cert: {}", tls.cert_path))?;
     let key_pem = std::fs::read_to_string(&tls.key_path)
@@ -181,6 +206,7 @@ pub fn build_tonic_server_tls(tls: &TlsConfig) -> Result<tonic::transport::Serve
 
 /// Build a `tonic::transport::ClientTlsConfig` for a gRPC client with mTLS.
 pub fn build_tonic_client_tls(tls: &TlsConfig) -> Result<tonic::transport::ClientTlsConfig> {
+    check_tls_files_exist(tls)?;
     let cert_pem = std::fs::read_to_string(&tls.cert_path)
         .with_context(|| format!("failed to read cert: {}", tls.cert_path))?;
     let key_pem = std::fs::read_to_string(&tls.key_path)

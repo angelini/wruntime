@@ -463,9 +463,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
             (&host_key, "manager.key"),
         ] {
             if !Path::new(local).exists() {
-                bail!(
-                    "Certificate file not found: {local}. Run `wr cert generate {host}` first."
-                );
+                bail!("Certificate file not found: {local}. Run `wr cert generate {host}` first.");
             }
             let tmp_path = format!("/tmp/{remote_name}");
             helpers::scp_file(local, &args.remote, &tmp_path, ssh_key.as_deref(), ssh_port)

@@ -14,6 +14,10 @@ struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
 impl wr_sdk::ServiceGuest for Component {
+    fn init() {
+        wr_sdk::db::enable_tracing();
+    }
+
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         proto::ledger_service_handle(&Component, request, response_out);
     }
@@ -23,13 +27,7 @@ impl proto::LedgerService for Component {
     fn reset(&self, _req: proto::ResetRequest) -> Result<proto::ResetResponse, ServiceError> {
         let sp = tracing::start("ledger.reset", &[]);
 
-        // Truncate trades table and count deleted rows.
-        let count_rows = database::query("SELECT COUNT(*) FROM trades", &[])?;
-        let trades_deleted = count_rows
-            .first()
-            .map(|r| r.get_i64(0))
-            .transpose()?
-            .unwrap_or(0);
+        let trades_deleted: i64 = query_scalar("SELECT COUNT(*) FROM trades", &[])?;
 
         database::execute("TRUNCATE trades", &[])?;
 
@@ -65,7 +63,7 @@ impl proto::LedgerService for Component {
             "trade.price" => req.price
         );
 
-        let rows = database::query(
+        let trade_id: i64 = query_scalar(
             "INSERT INTO trades (buyer_id, seller_id, symbol, quantity, price, order_id) \
              VALUES ($1, $2, $3, $4, $5, $6) RETURNING trade_id",
             &[
@@ -77,8 +75,6 @@ impl proto::LedgerService for Component {
                 PgValue::Int8(req.order_id),
             ],
         )?;
-
-        let trade_id = rows[0].get_i64(0)?;
         tracing::set_attr(&sp, "trade.id", trade_id);
         Ok(proto::RecordTradeResponse { trade_id })
     }
@@ -146,50 +142,15 @@ impl proto::LedgerService for Component {
     fn verify(&self, _req: proto::VerifyRequest) -> Result<proto::VerifyResponse, ServiceError> {
         let sp = tracing::start("ledger.verify", &[]);
 
-        let share_rows = database::query(
-            "SELECT symbol, SUM(quantity) as bought, SUM(quantity) as sold \
-             FROM trades GROUP BY symbol",
+        let (total_trades, total_volume, symbols_traded): (i64, i64, i64) = query_one(
+            "SELECT COUNT(*), COALESCE(SUM(quantity * price), 0)::BIGINT, \
+             COUNT(DISTINCT symbol) FROM trades",
             &[],
         )?;
 
-        // Net position check (conservation by construction).
-        let _net_check = database::query(
-            "SELECT symbol, SUM(quantity) as total_bought, SUM(quantity) as total_sold, \
-             SUM(quantity * price) as volume FROM trades GROUP BY symbol",
-            &[],
-        )?;
-
-        let mut details = Vec::new();
-
-        // Total trade count.
-        let count_rows = database::query("SELECT COUNT(*) FROM trades", &[])?;
-        let total_trades = count_rows
-            .first()
-            .map(|r| r.get_i64(0))
-            .transpose()?
-            .unwrap_or(0);
-
-        // Total volume.
-        let vol_rows = database::query(
-            "SELECT COALESCE(SUM(quantity * price), 0)::BIGINT FROM trades",
-            &[],
-        )?;
-        let total_volume = vol_rows
-            .first()
-            .map(|r| r.get_i64(0))
-            .transpose()?
-            .unwrap_or(0);
-
-        // Cash conservation check.
-        let cash_check = database::query(
-            "SELECT COALESCE(SUM(quantity * price), 0)::BIGINT as total_buyer_spend FROM trades",
-            &[],
-        )?;
-        let buyer_spend = cash_check
-            .first()
-            .map(|r| r.get_i64(0))
-            .transpose()?
-            .unwrap_or(0);
+        let mut details = vec![format!(
+            "total_trades={total_trades}, total_volume={total_volume} cents"
+        )];
 
         // Cross-check snapshot from blobstore against DB.
         let snapshot_ok = match store::list_objects("stockmarket", Some("ledger-snapshots/")) {
@@ -199,30 +160,28 @@ impl proto::LedgerService for Component {
                     .max_by_key(|o| &o.key)
                     .map(|o| o.key.clone())
                     .unwrap_or_default();
-                match store::get_object("stockmarket", &latest_key) {
-                    Ok(data) => match proto::LedgerSnapshot::decode(data.as_slice()) {
-                        Ok(snap) => {
-                            if snap.trade_count == total_trades {
-                                details.push(format!(
-                                    "snapshot cross-check OK: {} trades in snapshot match DB",
-                                    snap.trade_count
-                                ));
-                                true
-                            } else {
-                                details.push(format!(
-                                    "snapshot MISMATCH: snapshot has {} trades, DB has {}",
-                                    snap.trade_count, total_trades
-                                ));
-                                false
-                            }
-                        }
-                        Err(e) => {
-                            details.push(format!("snapshot decode error: {e}"));
-                            false
-                        }
-                    },
+                match store::get_object("stockmarket", &latest_key)
+                    .map_err(|e| format!("{e:?}"))
+                    .and_then(|data| {
+                        proto::LedgerSnapshot::decode(data.as_slice())
+                            .map_err(|e| format!("{e}"))
+                    }) {
+                    Ok(snap) if snap.trade_count == total_trades => {
+                        details.push(format!(
+                            "snapshot cross-check OK: {} trades match DB",
+                            snap.trade_count
+                        ));
+                        true
+                    }
+                    Ok(snap) => {
+                        details.push(format!(
+                            "snapshot MISMATCH: snapshot has {} trades, DB has {}",
+                            snap.trade_count, total_trades
+                        ));
+                        false
+                    }
                     Err(e) => {
-                        details.push(format!("snapshot read error: {e:?}"));
+                        details.push(format!("snapshot error: {e}"));
                         false
                     }
                 }
@@ -237,30 +196,16 @@ impl proto::LedgerService for Component {
             }
         };
 
-        details.insert(
-            0,
-            format!(
-                "total_trades={}, total_volume={} cents, buyer_spend={} cents",
-                total_trades, total_volume, buyer_spend
-            ),
-        );
+        details.push(format!("symbols traded: {symbols_traded}"));
+        details.push("share conservation: OK (each trade is a matched buyer+seller pair)".into());
+        details.push("cash conservation: OK (each trade transfers equal cash buyer->seller)".into());
 
-        let per_symbol = share_rows.len();
-        details.push(format!("symbols traded: {per_symbol}"));
-        details
-            .push("share conservation: OK (each trade is a matched buyer+seller pair)".to_string());
-        details.push(
-            "cash conservation: OK (each trade transfers equal cash buyer->seller)".to_string(),
-        );
-
-        let valid = snapshot_ok;
-
-        tracing::set_attr(&sp, "verify.valid", valid);
+        tracing::set_attr(&sp, "verify.valid", snapshot_ok);
         tracing::set_attr(&sp, "verify.total_trades", total_trades);
         tracing::set_attr(&sp, "verify.total_volume", total_volume);
 
         Ok(proto::VerifyResponse {
-            valid,
+            valid: snapshot_ok,
             total_trades,
             total_volume,
             details: details.join("; "),
@@ -271,9 +216,7 @@ impl proto::LedgerService for Component {
         &self,
         _req: proto::GetTradeCountRequest,
     ) -> Result<proto::GetTradeCountResponse, ServiceError> {
-        let rows = database::query("SELECT COUNT(*) FROM trades", &[])?;
-        let count = rows.first().map(|r| r.get_i64(0)).transpose()?.unwrap_or(0);
-
+        let count: i64 = query_scalar("SELECT COUNT(*) FROM trades", &[])?;
         Ok(proto::GetTradeCountResponse { count })
     }
 }
