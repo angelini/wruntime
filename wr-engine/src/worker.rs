@@ -3,20 +3,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use deadpool_postgres::Pool;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
-/// A single inbound request dispatched to a WASM module task.
-/// Used by both the inbound HTTP server and the worker pool.
-pub struct InboundRequest {
-    pub request: http::Request<Bytes>,
-    pub response_tx: oneshot::Sender<http::Response<Bytes>>,
-    /// Trace span carried through the channel for context propagation.
-    pub span: tracing::Span,
-}
-
-/// Channel sender for dispatching requests to a module handler.
-pub type ModuleTx = mpsc::Sender<InboundRequest>;
+use crate::{InboundRequest, ModuleTx};
 
 /// Provision the `wr__jobs` schema, table, indexes, and NOTIFY trigger.
 /// Idempotent — safe to call on every startup.

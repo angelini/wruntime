@@ -23,6 +23,15 @@ just fmt             # cargo fmt --all
 just lint            # cargo clippy -D warnings
 just tidy            # fmt + lint
 
+# Dev workflow (continuous compilation via bacon)
+just watch                  # cargo build + all example WASM guests (re-runs on file save)
+just watch check            # cargo check only
+just watch clippy           # clippy -D warnings
+just watch test             # cargo test
+just watch build-ecommerce  # WASM ecommerce guests only
+just watch build-codegen    # WASM codegen guests only
+just watch build-stockmarket # WASM stockmarket guests only
+
 # Certificates (required before running services)
 just certs             # generate local CA + localhost certs
 

@@ -155,6 +155,12 @@ pub async fn manager_pool() -> deadpool_postgres::Pool {
                     .await
                     .expect("drop leftover schema");
             }
+            // Ensure wr_system schema exists before any migrations run.
+            // Done once under the lock to avoid races between parallel tests.
+            client
+                .batch_execute("CREATE SCHEMA IF NOT EXISTS wr_system")
+                .await
+                .expect("create wr_system schema");
             CLEANED.store(true, Ordering::SeqCst);
         }
     }

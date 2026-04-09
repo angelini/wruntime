@@ -284,7 +284,7 @@ async fn test_worker_pool_dispatches_job_as_http() {
     let pool = Arc::new(pool);
 
     // Create a channel that the worker pool will send InboundRequests into.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::worker::InboundRequest>(16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::InboundRequest>(16);
 
     // Insert a job.
     let job_id = wr_engine::worker::insert_job(
@@ -361,7 +361,7 @@ async fn test_worker_pool_retries_on_failure() {
     let pool = worker_pool().await;
     let pool = Arc::new(pool);
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::worker::InboundRequest>(16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::InboundRequest>(16);
 
     let job_id = wr_engine::worker::insert_job(
         &pool,
@@ -438,7 +438,7 @@ async fn test_worker_pool_marks_dead_after_max_attempts() {
     let pool = worker_pool().await;
     let pool = Arc::new(pool);
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::worker::InboundRequest>(16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::InboundRequest>(16);
 
     // max_attempts = 1 — first failure should mark it dead.
     let job_id = wr_engine::worker::insert_job(
@@ -505,7 +505,7 @@ async fn test_worker_pool_handles_dropped_response() {
     let pool = worker_pool().await;
     let pool = Arc::new(pool);
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::worker::InboundRequest>(16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::InboundRequest>(16);
 
     let job_id = wr_engine::worker::insert_job(
         &pool,
@@ -574,7 +574,7 @@ async fn test_worker_pool_job_timeout() {
     let pool = Arc::new(pool);
     let ns = unique_ns();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::worker::InboundRequest>(16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::InboundRequest>(16);
 
     let job_id = wr_engine::worker::insert_job(
         &pool,
@@ -693,7 +693,7 @@ async fn test_worker_pool_multiple_concurrent_workers() {
     let pool = Arc::new(pool);
     let ns = unique_ns();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::worker::InboundRequest>(32);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::InboundRequest>(32);
 
     // Insert 4 jobs.
     let mut job_ids = Vec::new();
@@ -782,7 +782,7 @@ async fn test_worker_listen_notify_immediate_wake() {
     let pool = Arc::new(pool);
     let ns = unique_ns();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::worker::InboundRequest>(16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::InboundRequest>(16);
 
     // Start the worker pool FIRST with a very long poll interval.
     // If LISTEN/NOTIFY works, the job will be picked up much sooner.
@@ -1077,7 +1077,7 @@ async fn test_worker_pool_preserves_payload_and_job_type() {
     let pool = Arc::new(pool);
     let ns = unique_ns();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::worker::InboundRequest>(16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<wr_engine::InboundRequest>(16);
 
     // Use a non-trivial payload and multi-segment path.
     let payload = vec![0u8, 1, 2, 255, 254, 128];

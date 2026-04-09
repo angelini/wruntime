@@ -334,6 +334,13 @@ codegen-inline: build-codegen build
     WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
     DB_URL={{db_url_example}} bash examples/codegen/run.sh --inline
 
+# ── Dev Workflow ──────────────────────────────────────────────────────────────
+
+# Run bacon (continuous compilation on file save)
+# Jobs: check, clippy, test, build, build-ecommerce, build-codegen, build-stockmarket
+watch job="build":
+    bacon {{job}}
+
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 
 # Remove build artifacts

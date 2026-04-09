@@ -5,7 +5,7 @@ use std::sync::Arc;
 use hashbrown::HashMap;
 use tokio::sync::RwLock;
 
-pub use wr_engine::worker::{InboundRequest, ModuleTx};
+pub use wr_engine::{InboundRequest, ModuleTx};
 
 // ── Zero-allocation key types ───────────────────────────────────────────────
 
