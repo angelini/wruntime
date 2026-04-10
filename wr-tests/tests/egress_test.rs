@@ -105,7 +105,7 @@ async fn test_egress_internal_module_passthrough() -> Result<()> {
         "internal module call should succeed"
     );
     assert!(
-        body.contains("/store.inventory"),
+        body.contains("/Ping"),
         "stub should echo the request path, got: {body}"
     );
 
