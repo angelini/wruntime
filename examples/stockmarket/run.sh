@@ -99,7 +99,7 @@ setup_cleanup_trap
 
 if [ "$INLINE" = true ]; then
     echo "==> Running simulator inline (10 traders, 20 orders each, 5 symbols, ${NUM_EXCHANGES} exchange(s))..."
-    cargo run -p wr-cli -- invoke \
+    just cli invoke \
         --proxy http://127.0.0.1:9001 \
         --destination http://stockmarket.simulator/Run \
         --source loadtest --source-ns stockmarket \
@@ -128,7 +128,7 @@ All services running. Press Ctrl-C to stop.
   Simulator : http://127.0.0.1:${SIMULATOR_PORT}
 
 Run a simulation (default: 10 traders, 20 orders each, 5 symbols):
-  cargo run -p wr-cli -- invoke \\
+  just cli invoke \\
     --manager https://127.0.0.1:9000 \\
     --proxy http://127.0.0.1:9001 \\
     --destination http://stockmarket.simulator/Run \\
@@ -136,7 +136,7 @@ Run a simulation (default: 10 traders, 20 orders each, 5 symbols):
     --body ''
 
 Stress test (100 traders, 100 orders each, 10 symbols = 10,000 orders):
-  cargo run -p wr-cli -- invoke \\
+  just cli invoke \\
     --manager https://127.0.0.1:9000 \\
     --proxy http://127.0.0.1:9001 \\
     --destination http://stockmarket.simulator/Run \\
@@ -144,7 +144,7 @@ Stress test (100 traders, 100 orders each, 10 symbols = 10,000 orders):
     --body '{"num_traders": 100, "orders_per_trader": 100, "num_symbols": 10}'
 
 Inspect metrics:
-  cargo run -p wr-cli -- --manager https://127.0.0.1:9000 metrics summary
+  just cli --manager https://127.0.0.1:9000 metrics summary
 USAGE
 
 wait_forever

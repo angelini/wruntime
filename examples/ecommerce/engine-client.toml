@@ -16,19 +16,19 @@ ca_cert_path = "certs/ca.crt"
 name        = "client"
 namespace   = "ecommerce"
 version     = "1.0.0"
-wasm_path   = "examples/ecommerce/client/target/wasm32-wasip2/release/client.wasm"
+wasm_path   = "examples/ecommerce/client/target/wasm32-wasip2/debug/client.wasm"
 schema_path = "examples/ecommerce/schemas/client.binpb"
 
 [[module]]
 name        = "client"
 namespace   = "ecommerce"
 version     = "1.0.0"
-wasm_path   = "examples/ecommerce/client/target/wasm32-wasip2/release/client.wasm"
+wasm_path   = "examples/ecommerce/client/target/wasm32-wasip2/debug/client.wasm"
 schema_path = "examples/ecommerce/schemas/client.binpb"
 
 [[module]]
 name        = "client"
 namespace   = "ecommerce"
 version     = "1.0.0"
-wasm_path   = "examples/ecommerce/client/target/wasm32-wasip2/release/client.wasm"
+wasm_path   = "examples/ecommerce/client/target/wasm32-wasip2/debug/client.wasm"
 schema_path = "examples/ecommerce/schemas/client.binpb"

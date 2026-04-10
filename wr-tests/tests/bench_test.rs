@@ -24,7 +24,7 @@ mod proto {
 
 const HTTP_GUEST_WASM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/guests/http-guest/target/wasm32-wasip2/release/http_guest.wasm"
+    "/guests/http-guest/target/wasm32-wasip2/debug/http_guest.wasm"
 );
 
 fn skip_if_no_wasm() -> bool {

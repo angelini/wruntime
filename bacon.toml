@@ -1,38 +1,59 @@
 [default]
-job = "build"
+job     = "build"
 summary = true
 
 [jobs.check]
-command = ["cargo", "check", "--color", "always"]
+command     = ["cargo", "check", "--color", "always"]
 need_stdout = false
 
 [jobs.clippy]
-command = ["cargo", "clippy", "--all-targets", "--all-features", "--color", "always", "--", "-D", "warnings"]
+command = [
+  "cargo",
+  "clippy",
+  "--all-targets",
+  "--all-features",
+  "--color",
+  "always",
+  "--",
+  "-D",
+  "warnings",
+]
 need_stdout = false
 
 [jobs.test]
-command = ["cargo", "test", "--color", "always"]
+command     = ["cargo", "test", "--color", "always"]
 need_stdout = true
 
 [jobs.build]
-command = ["bash", "-c", "cargo build --color=always && just build-ecommerce && just build-codegen && just build-stockmarket"]
+command = [
+  "bash",
+  "-c",
+  "just build-ecommerce && just build-codegen && just build-stockmarket && cargo build --color=always",
+]
 need_stdout = true
-watch = ["examples/ecommerce", "examples/codegen", "examples/stockmarket"]
+watch = [
+  "examples/ecommerce",
+  "examples/codegen",
+  "examples/stockmarket",
+  "wit",
+  "wr-sdk",
+  "wr-build",
+]
 
 [jobs.build-ecommerce]
-command = ["just", "build-ecommerce"]
+command     = ["just", "build-ecommerce"]
 need_stdout = true
-watch = ["examples/ecommerce"]
+watch       = ["examples/ecommerce", "wit", "wr-sdk", "wr-build"]
 
 [jobs.build-codegen]
-command = ["just", "build-codegen"]
+command     = ["just", "build-codegen"]
 need_stdout = true
-watch = ["examples/codegen"]
+watch       = ["examples/codegen", "wit", "wr-sdk", "wr-build"]
 
 [jobs.build-stockmarket]
-command = ["just", "build-stockmarket"]
+command     = ["just", "build-stockmarket"]
 need_stdout = true
-watch = ["examples/stockmarket"]
+watch       = ["examples/stockmarket", "wit", "wr-sdk", "wr-build"]
 
 [keybindings]
 c = "job:check"

@@ -102,8 +102,8 @@ deploy_engine() {
 
 # ── Print engine/service lists ───────────────────────────────────────────────
 list_services() {
-    cargo run -p wr-cli -- engines list
-    cargo run -p wr-cli -- services list
+    just cli engines list
+    just cli services list
 }
 
 # ── Create S3 bucket ─────────────────────────────────────────────────────────

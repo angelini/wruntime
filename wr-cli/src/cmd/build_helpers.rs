@@ -62,7 +62,7 @@ pub fn derive_cargo_dir(wasm_path: &str) -> Result<PathBuf> {
     }
     bail!(
         "Cannot derive Cargo project directory from wasm_path: {wasm_path}. \
-         Expected a path containing 'target/' (e.g., my-module/target/wasm32-wasip2/release/mod.wasm)"
+         Expected a path containing 'target/' (e.g., my-module/target/wasm32-wasip2/debug/mod.wasm)"
     );
 }
 
@@ -104,18 +104,17 @@ pub fn compile_schemas(modules: &[BuildModule]) -> Result<()> {
 }
 
 /// Build WASM modules via `cargo component build`
-pub fn build_wasm_modules(modules: &[BuildModule]) -> Result<()> {
+pub fn build_wasm_modules(modules: &[BuildModule], release: bool) -> Result<()> {
     for module in modules {
         let cargo_dir = derive_cargo_dir(&module.wasm_path)?;
         print!("[build]   {} ... ", cargo_dir.display());
+        let mut args = vec!["component", "build"];
+        if release {
+            args.push("--release");
+        }
+        args.extend(["--target", "wasm32-wasip2"]);
         let output = Command::new("cargo")
-            .args([
-                "component",
-                "build",
-                "--release",
-                "--target",
-                "wasm32-wasip2",
-            ])
+            .args(&args)
             .current_dir(&cargo_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -119,7 +119,6 @@ async fn async_main() -> Result<()> {
                 namespace: m.namespace.clone(),
                 version: m.version.clone(),
                 proto_schema,
-
             });
         }
     }
@@ -276,7 +275,6 @@ async fn async_main() -> Result<()> {
                                 namespace: m.namespace.clone(),
                                 version: m.version.clone(),
                                 proto_schema: vec![],
-                
                             });
                         } else {
                             warn!(

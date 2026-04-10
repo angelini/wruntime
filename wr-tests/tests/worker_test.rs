@@ -41,7 +41,7 @@ async fn test_worker_config_parsing() {
         name      = "my-worker"
         namespace = "test"
         version   = "1.0.0"
-        wasm_path = "wr-tests/guests/tracing-guest/target/wasm32-wasip2/release/tracing_guest.wasm"
+        wasm_path = "wr-tests/guests/tracing-guest/target/wasm32-wasip2/debug/tracing_guest.wasm"
         mode      = "worker"
         database  = true
         worker_concurrency      = 8
@@ -77,7 +77,7 @@ async fn test_worker_config_defaults() {
         name      = "my-worker"
         namespace = "test"
         version   = "1.0.0"
-        wasm_path = "wr-tests/guests/tracing-guest/target/wasm32-wasip2/release/tracing_guest.wasm"
+        wasm_path = "wr-tests/guests/tracing-guest/target/wasm32-wasip2/debug/tracing_guest.wasm"
         mode      = "worker"
         database  = true
     "#;
@@ -105,7 +105,7 @@ async fn test_worker_mode_service_default() {
         name      = "svc"
         namespace = "test"
         version   = "1.0.0"
-        wasm_path = "wr-tests/guests/tracing-guest/target/wasm32-wasip2/release/tracing_guest.wasm"
+        wasm_path = "wr-tests/guests/tracing-guest/target/wasm32-wasip2/debug/tracing_guest.wasm"
     "#;
     let config: wr_engine::config::EngineConfig = toml::from_str(toml_str).unwrap();
     assert_eq!(

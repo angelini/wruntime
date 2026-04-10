@@ -131,8 +131,7 @@ pub async fn manager_pool() -> deadpool_postgres::Pool {
     let schema = format!("mgr_test_{n}");
 
     // Create the schema using a one-shot connection to the base DB (no search_path override).
-    let setup_pool =
-        wr_common::pool::build_pool(&base_url, 1).expect("failed to build setup pool");
+    let setup_pool = wr_common::pool::build_pool(&base_url, 1).expect("failed to build setup pool");
     let client = setup_pool.get().await.expect("setup connection");
 
     // On the first call only, drop all leftover mgr_test_* schemas from
@@ -582,8 +581,7 @@ pub async fn proxy_get(
     destination_module: &str,
     version: Option<&str>,
 ) -> Result<(StatusCode, String)> {
-    // Path uses {namespace}.{module}/Method format, consistent with the HTTP hostname.
-    let path = format!("/{namespace}.{destination_module}/Ping");
+    let path = "/Ping";
     let mut builder = Request::builder()
         .uri(format!("http://{proxy_addr}{path}"))
         .header(

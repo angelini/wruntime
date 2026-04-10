@@ -95,9 +95,7 @@ async fn handle(
     }
 
     // ── Worker job queue gRPC endpoints ──────────────────────────────────
-    if req.uri().path() == "/wruntime.WorkerService/SubmitJob"
-        || req.uri().path() == "/wruntime.WorkerService/GetJobStatus"
-    {
+    if req.uri().path() == "/SubmitJob" || req.uri().path() == "/GetJobStatus" {
         let path = req.uri().path().to_owned();
         return handle_worker_grpc(req, &path, db_pool).await;
     }
@@ -223,8 +221,8 @@ async fn handle_worker_grpc(
     };
 
     match path {
-        "/wruntime.WorkerService/SubmitJob" => handle_submit_job(&pool, &body).await,
-        "/wruntime.WorkerService/GetJobStatus" => handle_get_job_status(&pool, &body).await,
+        "/SubmitJob" => handle_submit_job(&pool, &body).await,
+        "/GetJobStatus" => handle_get_job_status(&pool, &body).await,
         _ => err(StatusCode::NOT_FOUND, "unknown worker endpoint"),
     }
 }

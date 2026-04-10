@@ -38,7 +38,7 @@ list_services
 
 # ── Seed inventory via the proxy ─────────────────────────────────────────
 echo "==> Seeding inventory..."
-cargo run -p wr-cli -- invoke \
+just cli invoke \
     --proxy http://127.0.0.1:9001 \
     --destination http://ecommerce.inventory/Seed \
     --source bootstrap \
@@ -53,7 +53,7 @@ setup_cleanup_trap
 
 if [ "$INLINE" = true ]; then
     echo "==> Running client inline with {\"count\": 1}..."
-    cargo run -p wr-cli -- invoke \
+    just cli invoke \
         --proxy http://127.0.0.1:9001 \
         --destination http://ecommerce.client/Run \
         --source loadtest --source-ns ecommerce \
@@ -71,7 +71,7 @@ All services running. Press Ctrl-C to stop.
   Client   : http://127.0.0.1:9200 (3 instances, ServiceGuest)
 
 Trigger a load run (default 100 iterations):
-  cargo run -p wr-cli -- invoke \
+  just cli invoke \
     --manager https://127.0.0.1:9000 \
     --proxy http://127.0.0.1:9001 \
     --destination http://ecommerce.client/Run \
@@ -79,7 +79,7 @@ Trigger a load run (default 100 iterations):
     --body ''
 
 Trigger with a custom request count (e.g. 1000):
-  cargo run -p wr-cli -- invoke \
+  just cli invoke \
     --manager https://127.0.0.1:9000 \
     --proxy http://127.0.0.1:9001 \
     --destination http://ecommerce.client/Run \
@@ -87,7 +87,7 @@ Trigger with a custom request count (e.g. 1000):
     --body '{"count": 1000}'
 
 Inspect metrics:
-  cargo run -p wr-cli -- --manager https://127.0.0.1:9000 metrics summary
+  just cli --manager https://127.0.0.1:9000 metrics summary
 USAGE
 
 wait_forever

@@ -519,7 +519,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         build_helpers::compile_schemas(&build_modules)?;
 
         // Step 2: Build WASM modules
-        build_helpers::build_wasm_modules(&build_modules)?;
+        build_helpers::build_wasm_modules(&build_modules, true)?;
 
         // Step 3: Pre-compile WASM → native for target architecture
         precompile_hash = Some(build_helpers::precompile_components(

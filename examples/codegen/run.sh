@@ -67,7 +67,7 @@ setup_cleanup_trap
 
 if [ "$INLINE" = true ]; then
     echo "==> Creating codegen task (worker will process it automatically)..."
-    CREATE_OUTPUT=$(cargo run -p wr-cli -- invoke \
+    CREATE_OUTPUT=$(just cli invoke \
         --proxy http://127.0.0.1:9001 \
         --destination http://codegen.coordinator/CreateTask \
         --source test --source-ns codegen \
@@ -82,7 +82,7 @@ if [ "$INLINE" = true ]; then
     echo "==> Polling task ${TASK_ID}..."
 
     while true; do
-        TASK_OUTPUT=$(cargo run -p wr-cli -- invoke \
+        TASK_OUTPUT=$(just cli invoke \
             --proxy http://127.0.0.1:9001 \
             --destination http://codegen.coordinator/GetTask \
             --source test --source-ns codegen \

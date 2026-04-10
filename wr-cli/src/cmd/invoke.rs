@@ -206,13 +206,9 @@ fn build_proxy_url(proxy: &str, destination: &str) -> Result<String> {
     let dest: reqwest::Url = destination
         .parse()
         .with_context(|| format!("invalid destination URL: {destination}"))?;
-    let host = dest.host_str().unwrap_or("");
     let path_and_query = match dest.query() {
         Some(q) => format!("{}?{q}", dest.path()),
         None => dest.path().to_string(),
     };
-    Ok(format!(
-        "{}/{host}{path_and_query}",
-        proxy.trim_end_matches('/')
-    ))
+    Ok(format!("{}{path_and_query}", proxy.trim_end_matches('/')))
 }

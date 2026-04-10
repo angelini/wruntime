@@ -111,6 +111,10 @@ pub fn inventory_service_router<T: InventoryService>(
 ## Building the component
 
 ```bash
+cargo component build
+# produces: target/wasm32-wasip2/debug/inventory_service.wasm
+
+# For production deployments:
 cargo component build --release
 # produces: target/wasm32-wasip2/release/inventory_service.wasm
 ```

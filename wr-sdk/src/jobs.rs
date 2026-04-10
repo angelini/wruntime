@@ -39,7 +39,7 @@ pub fn submit_job_with_options(
     );
     let resp = crate::http::http_request(&HttpRequest {
         authority: engine_authority,
-        path: "/wruntime.WorkerService/SubmitJob",
+        path: "/SubmitJob",
         method: Method::Post,
         headers: &[("content-type", b"application/x-protobuf" as &[u8])],
         body: &body,

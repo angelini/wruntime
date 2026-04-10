@@ -22,15 +22,15 @@ mod proto {
 
 const DB_GUEST_WASM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/guests/db-guest/target/wasm32-wasip2/release/db_guest.wasm"
+    "/guests/db-guest/target/wasm32-wasip2/debug/db_guest.wasm"
 );
 const TRACING_GUEST_WASM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/guests/tracing-guest/target/wasm32-wasip2/release/tracing_guest.wasm"
+    "/guests/tracing-guest/target/wasm32-wasip2/debug/tracing_guest.wasm"
 );
 const BLOBSTORE_GUEST_WASM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/guests/blobstore-guest/target/wasm32-wasip2/release/blobstore_guest.wasm"
+    "/guests/blobstore-guest/target/wasm32-wasip2/debug/blobstore_guest.wasm"
 );
 
 /// Build an HTTP POST request targeting a generated router path.
@@ -722,7 +722,7 @@ async fn wasm_blobstore_not_found() -> Result<()> {
 
 const LLM_GUEST_WASM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/guests/llm-guest/target/wasm32-wasip2/release/llm_guest.wasm"
+    "/guests/llm-guest/target/wasm32-wasip2/debug/llm_guest.wasm"
 );
 
 fn skip_if_no_llm_wasm() -> bool {
@@ -908,7 +908,7 @@ async fn wasm_llm_stream() -> Result<()> {
 
 const HTTP_GUEST_WASM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/guests/http-guest/target/wasm32-wasip2/release/http_guest.wasm"
+    "/guests/http-guest/target/wasm32-wasip2/debug/http_guest.wasm"
 );
 
 fn skip_if_no_http_wasm() -> bool {

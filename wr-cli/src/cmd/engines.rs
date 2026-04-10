@@ -66,10 +66,8 @@ async fn list(manager: &str) -> Result<()> {
                 (&a.namespace, &a.name, &a.version).cmp(&(&b.namespace, &b.name, &b.version))
             });
             for (j, module) in modules.iter().enumerate() {
-                let module_str = format!(
-                    "{}.{} v{}",
-                    module.namespace, module.name, module.version
-                );
+                let module_str =
+                    format!("{}.{} v{}", module.namespace, module.name, module.version);
                 if j == 0 {
                     builder.push_record([
                         engine.engine_id.as_str(),
@@ -87,7 +85,10 @@ async fn list(manager: &str) -> Result<()> {
     let mut table = builder.build();
     let mut theme = Theme::from_style(Style::rounded());
     for row in separator_rows {
-        theme.insert_horizontal_line(row, HorizontalLine::new(Some('─'), Some('┼'), Some('├'), Some('┤')));
+        theme.insert_horizontal_line(
+            row,
+            HorizontalLine::new(Some('─'), Some('┼'), Some('├'), Some('┤')),
+        );
     }
     table.with(theme);
     println!("{table}");

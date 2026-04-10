@@ -342,7 +342,7 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
         }
 
         // Step 2: Build WASM modules
-        build_helpers::build_wasm_modules(&build_modules)?;
+        build_helpers::build_wasm_modules(&build_modules, false)?;
     }
 
     // Step 3: Stop old engine by matching listen_address

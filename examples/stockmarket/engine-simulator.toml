@@ -14,6 +14,6 @@ ca_cert_path = "certs/ca.crt"
 name                 = "simulator"
 namespace            = "stockmarket"
 version              = "1.0.0"
-wasm_path            = "examples/stockmarket/simulator/target/wasm32-wasip2/release/simulator.wasm"
+wasm_path            = "examples/stockmarket/simulator/target/wasm32-wasip2/debug/simulator.wasm"
 schema_path          = "examples/stockmarket/schemas/simulator.binpb"
 request_timeout_secs = 240

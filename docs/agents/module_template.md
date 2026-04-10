@@ -236,7 +236,7 @@ Key rules:
 name        = "{{MODULE_NAME}}"
 namespace   = "{{NAMESPACE}}"
 version     = "1.0.0"
-wasm_path   = "path/to/{{MODULE_NAME}}/target/wasm32-wasip2/release/{{MODULE_NAME}}.wasm"
+wasm_path   = "path/to/{{MODULE_NAME}}/target/wasm32-wasip2/debug/{{MODULE_NAME}}.wasm"
 schema_path = "path/to/schemas/{{MODULE_NAME}}.binpb"
 # database = true              # uncomment if module uses database
 # migrations_path = "path/to/{{MODULE_NAME}}/migrations"  # uncomment if using migrations
@@ -258,6 +258,6 @@ secret_access_key = "rustfsadmin"
 ## Build command
 
 ```bash
-cargo component build --release
-# Output: target/wasm32-wasip2/release/{{MODULE_NAME}}.wasm
+cargo component build
+# Output: target/wasm32-wasip2/debug/{{MODULE_NAME}}.wasm
 ```

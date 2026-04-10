@@ -24,9 +24,9 @@ check:
 
 # Generate local CA + localhost certs for development
 certs:
-    cargo run -p wr-cli -- cert init-ca --output certs/
-    cargo run -p wr-cli -- cert generate 127.0.0.1 --ca-dir certs/
-    cargo run -p wr-cli -- cert generate manager --ca-dir certs/
+    just cli cert init-ca --output certs/
+    just cli cert generate 127.0.0.1 --ca-dir certs/
+    just cli cert generate manager --ca-dir certs/
 
 # ── Lint & Format ─────────────────────────────────────────────────────────────
 
@@ -212,11 +212,11 @@ build-test-schemas:
 
 # Build WASM test guest components
 build-test-guests: build-test-schemas
-    (cd wr-tests/guests/db-guest && cargo component build --release --target wasm32-wasip2)
-    (cd wr-tests/guests/tracing-guest && cargo component build --release --target wasm32-wasip2)
-    (cd wr-tests/guests/blobstore-guest && cargo component build --release --target wasm32-wasip2)
-    (cd wr-tests/guests/http-guest && cargo component build --release --target wasm32-wasip2)
-    (cd wr-tests/guests/llm-guest && cargo component build --release --target wasm32-wasip2)
+    (cd wr-tests/guests/db-guest && cargo component build --target wasm32-wasip2)
+    (cd wr-tests/guests/tracing-guest && cargo component build --target wasm32-wasip2)
+    (cd wr-tests/guests/blobstore-guest && cargo component build --target wasm32-wasip2)
+    (cd wr-tests/guests/http-guest && cargo component build --target wasm32-wasip2)
+    (cd wr-tests/guests/llm-guest && cargo component build --target wasm32-wasip2)
 
 # Run all WASM host binding tests (sets env vars for dev infrastructure automatically)
 test-wasm: build-test-guests
@@ -255,8 +255,8 @@ build-ecommerce-schemas:
 
 # Build WASM components and schemas for the ecommerce example
 build-ecommerce: build-ecommerce-schemas
-    (cd examples/ecommerce/inventory && cargo component build --release --target wasm32-wasip2)
-    (cd examples/ecommerce/client && cargo component build --release --target wasm32-wasip2)
+    (cd examples/ecommerce/inventory && cargo component build --target wasm32-wasip2)
+    (cd examples/ecommerce/client && cargo component build --target wasm32-wasip2)
 
 # Run the full ecommerce example (requires Postgres — see `just dev-up`)
 ecommerce: build-ecommerce build
@@ -284,9 +284,9 @@ build-stockmarket-schemas:
 
 # Build WASM components and schemas for the stockmarket example
 build-stockmarket: build-stockmarket-schemas
-    (cd examples/stockmarket/exchange && cargo component build --release --target wasm32-wasip2)
-    (cd examples/stockmarket/ledger && cargo component build --release --target wasm32-wasip2)
-    (cd examples/stockmarket/simulator && cargo component build --release --target wasm32-wasip2)
+    (cd examples/stockmarket/exchange && cargo component build --target wasm32-wasip2)
+    (cd examples/stockmarket/ledger && cargo component build --target wasm32-wasip2)
+    (cd examples/stockmarket/simulator && cargo component build --target wasm32-wasip2)
 
 # Run the full stockmarket example (requires Postgres + RustFS S3 — see `just dev-up`)
 # Pass exchanges=N to run N exchange engines in parallel (default: 1)
@@ -319,10 +319,10 @@ build-codegen-schemas:
 
 # Build WASM components and schemas for the codegen example
 build-codegen: build-codegen-schemas
-    (cd examples/codegen/collector && cargo component build --release --target wasm32-wasip2)
-    (cd examples/codegen/agent && cargo component build --release --target wasm32-wasip2)
-    (cd examples/codegen/coordinator && cargo component build --release --target wasm32-wasip2)
-    (cd examples/codegen/worker && cargo component build --release --target wasm32-wasip2)
+    (cd examples/codegen/collector && cargo component build --target wasm32-wasip2)
+    (cd examples/codegen/agent && cargo component build --target wasm32-wasip2)
+    (cd examples/codegen/coordinator && cargo component build --target wasm32-wasip2)
+    (cd examples/codegen/worker && cargo component build --target wasm32-wasip2)
 
 # Run the full codegen example (requires Postgres + RustFS S3 — see `just dev-up`)
 codegen: build-codegen build
@@ -335,6 +335,11 @@ codegen-inline: build-codegen build
     DB_URL={{db_url_example}} bash examples/codegen/run.sh --inline
 
 # ── Dev Workflow ──────────────────────────────────────────────────────────────
+
+# Run the CLI, passing all arguments through
+[positional-arguments]
+cli *args:
+    cargo run --bin wr-cli -- "$@"
 
 # Run bacon (continuous compilation on file save)
 # Jobs: check, clippy, test, build, build-ecommerce, build-codegen, build-stockmarket

@@ -11,7 +11,7 @@ PIDS=()
 TMPDIR_OUT="$(mktemp -d)"
 
 for i in $(seq 1 50); do
-    cargo run -p wr-cli -- invoke \
+    just cli invoke \
         --proxy http://127.0.0.1:9001 \
         --destination http://ecommerce.client/Run \
         --source loadtest --source-ns ecommerce \

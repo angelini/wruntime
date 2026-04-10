@@ -27,7 +27,7 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
     let (status, body) = proxy_get(proxy, "store", "inventory-service", Some("1.0.0")).await?;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains("/store.inventory-service"),
+        body.contains("/Ping"),
         "expected stub to echo request path, got: {body}"
     );
 

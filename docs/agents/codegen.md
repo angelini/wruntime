@@ -43,10 +43,10 @@ pub fn inventory_service_router<T: InventoryService>(
     body: &[u8],
 ) -> (u16, Vec<u8>) {
     match path {
-        "/ecommerce.inventory/Seed"     => { /* decode SeedRequest → svc.seed() → encode */ }
-        "/ecommerce.inventory/Buy"      => { /* decode BuyRequest → svc.buy() → encode */ }
-        "/ecommerce.inventory/GetStock" => { /* ... */ }
-        "/ecommerce.inventory/Return"   => { /* ... */ }
+        "/Seed"     => { /* decode SeedRequest → svc.seed() → encode */ }
+        "/Buy"      => { /* decode BuyRequest → svc.buy() → encode */ }
+        "/GetStock" => { /* ... */ }
+        "/Return"   => { /* ... */ }
         _ => (404, r#"{"error":"no handler for {path}"}"#)
     }
 }

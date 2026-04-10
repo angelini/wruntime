@@ -168,8 +168,7 @@ impl ManagerService for Manager {
                         module.name
                     )));
                 }
-                let first =
-                    seen.insert((&module.namespace, &module.name, &module.version));
+                let first = seen.insert((&module.namespace, &module.name, &module.version));
                 if first && module.proto_schema.is_empty() {
                     return Err(Status::invalid_argument(format!(
                         "module '{}' in namespace '{}' has no schema — proto_schema is required",

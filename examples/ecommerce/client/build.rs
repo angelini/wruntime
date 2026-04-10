@@ -1,8 +1,11 @@
 fn main() {
-    // Compile inventory.proto with WrClientGenerator to emit a typed InventoryServiceClient.
-    // Include client.proto in the same pass so RunRequest/RunResponse are available.
+    // Generate service handler for client.proto (client_service_handle) plus
+    // client stubs for inventory.proto (InventoryServiceClient).
     prost_build::Config::new()
-        .service_generator(Box::new(wr_build::WrClientGenerator))
+        .service_generator(Box::new(wr_build::WrCombinedGenerator::new(
+            wr_build::WrServiceGenerator,
+            wr_build::WrClientGenerator,
+        )))
         .compile_protos(
             &["../schemas/inventory.proto", "../schemas/client.proto"],
             &["../schemas"],

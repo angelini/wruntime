@@ -86,9 +86,6 @@ impl prost_build::ServiceGenerator for WrServiceGenerator {
         let trait_ident = format_ident!("{}", service.name);
         let router_ident = format_ident!("{}_router", to_snake(&service.name));
         let handle_ident = format_ident!("{}_handle", to_snake(&service.name));
-        let service_snake = to_snake(&service.name)
-            .trim_end_matches("_service")
-            .to_string();
 
         // ── trait methods ──
         let trait_methods: Vec<_> = service
@@ -109,7 +106,7 @@ impl prost_build::ServiceGenerator for WrServiceGenerator {
             .methods
             .iter()
             .map(|m| {
-                let route = format!("/{}.{}/{}", service.package, service_snake, m.proto_name);
+                let route = format!("/{}", m.proto_name);
                 let name = method_ident(&m.name);
                 let input = parse_type(&m.input_type);
                 quote! {
@@ -213,7 +210,7 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
                 quote! {
                     pub fn #method_ident(&self, req: #input) -> Result<#output, wr_sdk::http::HttpError> {
                         let body = prost::Message::encode_to_vec(&req);
-                        let path = format!("/{}/{}", self.authority, #proto_name);
+                        let path = format!("/{}", #proto_name);
                         wr_sdk::http::http_request(&wr_sdk::http::HttpRequest {
                             authority: &self.authority,
                             path: &path,
@@ -273,9 +270,6 @@ impl prost_build::ServiceGenerator for WrWorkerClientGenerator {
             return;
         }
         let struct_ident = format_ident!("{}Client", service.name);
-        let service_snake = to_snake(&service.name)
-            .trim_end_matches("_service")
-            .to_string();
 
         let methods: Vec<_> = service
             .methods
@@ -283,7 +277,7 @@ impl prost_build::ServiceGenerator for WrWorkerClientGenerator {
             .map(|m| {
                 let method_name = method_ident(&m.name);
                 let input = parse_type(&m.input_type);
-                let job_type = format!("/{}.{}/{}", service.package, service_snake, m.proto_name);
+                let job_type = format!("/{}", m.proto_name);
                 quote! {
                     pub fn #method_name(&self, req: #input) -> Result<String, wr_sdk::http::HttpError> {
                         let payload = prost::Message::encode_to_vec(&req);

@@ -2,7 +2,11 @@
 
 WASM + WASI Runtime
 
-Sandboxed agents with a strict API for building modules
+Sandboxed execution with a built in GRPC API
+
+With integrated systems: Postgres, S3, OTEL Tracing
+
+And operational tools: load balancing, versioned APIs, circuit breakers
 
 ---
 
@@ -24,11 +28,22 @@ Sandboxed agents with a strict API for building modules
 
 wruntime builds on [wasmtime](https://wasmtime.dev) and the WASI Preview 2 component model.
 
+```wit
+package wruntime:db@0.4.0;
+
+interface database {
+    query: func(
+        sql:    string,
+        params: list<pg-value>,
+    ) -> result<list<row>, db-error>;
+}
+```
+
 ---
 
-# Why Not Just Containers?
+# Why Not Containers?
 
-**Containers share too much by default**
+**Containers share a lot of the host by default**
 
 - Shared kernel — container escapes are real
 - Coarse network policies, ambient env vars
@@ -40,13 +55,13 @@ wruntime builds on [wasmtime](https://wasmtime.dev) and the WASI Preview 2 compo
 - No syscalls, no ambient authority
 - Memory-safe by construction
 - Module calls only APIs it imports (WIT) and the host enables (TOML)
-- Ideal for untrusted code: external teams or LLM-generated modules get the same guarantees without trusting the code
+- Ideal for untrusted code: external teams or LLM-generated modules
 
 ---
 
 # Built for LLM-Generated Guests
 
-LLMs write module code — you can't review every line. wruntime makes that safe:
+LLMs / Customers write module code that you can't trust. wruntime makes that safe:
 
 - **Structured APIs only** — `.proto` defines the contract, codegen produces boilerplate, LLM fills in traits
 - **Sandboxed capabilities** — module uses only what WIT imports + engine.toml allow, no surprise network calls or filesystem escape
@@ -54,6 +69,17 @@ LLMs write module code — you can't review every line. wruntime makes that safe
 - **Blast radius is bounded** — a buggy module can't affect other modules, read their memory, or access their DB
 
 The host is the trust boundary, not the guest code.
+
+```rust
+impl WasiHttpHooks for ModuleHttpHooks {
+    fn send_request(
+        &mut self,
+        mut request: hyper::Request<HyperOutgoingBody>,
+        config: OutgoingRequestConfig,
+    ) -> HttpResult<HostFutureIncomingResponse> {
+        let original_uri = request.uri().to_string();
+        let client = self.http_pool.get().clone();
+```
 
 ---
 
@@ -73,12 +99,12 @@ The host is the trust boundary, not the guest code.
        │ :9001 (local) │  │ :9001 (local)│  │ :9001 (local) │
        │ :9443 (mTLS)  │  │ :9443 (mTLS) │  │ :9443 (mTLS)  │
        └───────┬───────┘  └──────┬───────┘  └───────┬───────┘
-               │ HTTP            │ HTTP             │ HTTP
-       ┌───────▼───────┐  ┌──────▼───────┐  ┌───────▼───────┐
-       │  wr-engine    │  │  wr-engine   │  │  wr-engine    │
-       │  :9100        │  │  :9100       │  │  :9100        │
-       │  [inventory]  │  │  [client]    │  │  [client]     │
-       └───────────────┘  └──────────────┘  └───────────────┘
+               │ HTTP            │ HTTP             │─ HTTP ───────────┐
+       ┌───────▼───────┐  ┌──────▼───────┐  ┌───────▼───────┐  ┌───────▼───────┐
+       │  wr-engine    │  │  wr-engine   │  │  wr-engine    │  │  wr-engine    │
+       │  :9100        │  │  :9100       │  │  :9100        │  │  :9100        │
+       │  [inventory]  │  │  [client]    │  │  [client]     │  │  [client]     │
+       └───────────────┘  └──────────────┘  └───────────────┘  └───────────────┘
 ```
 
 - **Manager**: module registry, routing table, schema store, secrets
@@ -162,39 +188,6 @@ let agent_resp = agent.run_task(proto::RunTaskRequest {
 - `ServiceClient::new("ns.module")` — address modules by name, proxy routes by header
 - `.proto` → `wr-build` generates **trait**, **router**, and **typed client** — no hand-written serialization
 - Type-safe: proto mismatch = compile error
-
----
-
-# Capability Model
-
-Modules declare imports at **compile time**:
-
-```wit
-world agent {
-    import wruntime:db/database@0.4.0;
-    import wruntime:blobstore/store@0.1.0;
-    import wruntime:llm/inference@0.1.0;
-    import wruntime:tracing/span@0.1.0;
-    // + wasi:http, wasi:io, wasi:clocks, wasi:random
-    export wasi:http/incoming-handler@0.2.6;
-}
-```
-
-Host enables capabilities at **deploy time** via `engine.toml`:
-
-```toml
-[[module]]
-name       = "agent"
-namespace  = "codegen"
-version    = "1.0.0"
-wasm_path  = "agent.wasm"
-database   = true
-blobstore  = true
-llm        = true
-fs         = "tempdir"
-```
-
-Missing import = **link-time error** (fail-closed, not a runtime surprise)
 
 ---
 

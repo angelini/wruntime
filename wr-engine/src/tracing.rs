@@ -26,10 +26,7 @@ impl wruntime::tracing::span::Host for ModuleState {
         // Parent the new span to the top of the guest span stack, falling back
         // to the request-level `active_span`. This gives automatic nesting:
         // e.g. db.query becomes a child of db.transaction.
-        let parent = self
-            .span_stack
-            .last()
-            .unwrap_or(&self.active_span);
+        let parent = self.span_stack.last().unwrap_or(&self.active_span);
         let child = tracing::info_span!(
             parent: parent,
             "module",
@@ -118,7 +115,11 @@ impl wruntime::tracing::span::HostActiveSpan for ModuleState {
     async fn drop(&mut self, self_: Resource<SpanState>) -> wasmtime::Result<()> {
         let state = self.table().delete(self_)?;
         // Remove this span from the stack so subsequent spans don't parent to it.
-        if let Some(pos) = self.span_stack.iter().position(|s| s.id() == state.span.id()) {
+        if let Some(pos) = self
+            .span_stack
+            .iter()
+            .position(|s| s.id() == state.span.id())
+        {
             self.span_stack.remove(pos);
         }
         // If this span was the outbound parent, clear it so subsequent
