@@ -1,5 +1,8 @@
 # Wruntime
 
+> [!NOTE]
+> This project was an experiement in LLM assisted development. Much of the code in this repo was written with Claude.
+
 A distributed runtime that networks WASM modules via transparent HTTP interception. Modules make ordinary HTTP calls to each other — Wruntime intercepts, validates, routes, and delivers them automatically.
 
 ```
