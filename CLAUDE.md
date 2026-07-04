@@ -72,7 +72,7 @@ After refactoring, always run `just tidy` and `just ecommerce-inline` to verify 
 
 `docs/agents/` contains structured documentation for AI agents building WASM guest modules. Key files: `module_template.md`, `api_reference.md` (must stay in sync with code), `constraints.md`, `decision_matrix.md`, `codegen.md`, `examples.md`.
 
-**Prerequisites:** `rustc`, `cargo`, `just`, `protoc`, `sccache`, `taplo`. WASM modules additionally require `cargo-component` and `wasm-tools`. Cross-compilation requires `zig` and `cargo-zigbuild`.
+**Prerequisites:** `rustc`, `cargo`, `just`, `protoc`, `sccache`, `taplo`. WASM modules additionally require the `wasm32-wasip2` target (`rustup target add wasm32-wasip2`) and `wasm-tools`. Cross-compilation requires `zig` and `cargo-zigbuild`.
 
 **Integration tests with a real DB:** set `WRT_TEST_DB_URL=postgres://postgres@localhost:5433/wruntime_test` (matches `just dev-up`); omitting it skips DB-backed tests. `just test-wasm` sets all required env vars automatically.
 

@@ -33,6 +33,32 @@ fn build_pool_with_options(
         .map_err(Into::into)
 }
 
+/// Redact credentials from a database URL before including it in logs or errors.
+pub fn redact_database_url(database_url: &str) -> String {
+    let Some((scheme, rest)) = database_url.split_once("://") else {
+        return if database_url.contains('@') {
+            "<redacted database url>".to_string()
+        } else {
+            database_url.to_string()
+        };
+    };
+
+    let split_at = rest.find(|c| c == '/' || c == '?').unwrap_or(rest.len());
+    let (authority, path_and_query) = rest.split_at(split_at);
+    let redacted_authority = match authority.rsplit_once('@') {
+        Some((userinfo, host)) => {
+            let redacted_userinfo = userinfo
+                .split_once(':')
+                .map(|(user, _)| format!("{user}:***"))
+                .unwrap_or_else(|| userinfo.to_string());
+            format!("{redacted_userinfo}@{host}")
+        }
+        None => authority.to_string(),
+    };
+
+    format!("{scheme}://{redacted_authority}{path_and_query}")
+}
+
 /// Build a connection URL by replacing the user:password in `admin_url` with
 /// `role` and `password`. Preserves host, port, dbname, and query params.
 pub fn guest_pool_url(admin_url: &str, role: &str, password: &str) -> String {
@@ -79,7 +105,23 @@ pub fn pg_error_string(e: &tokio_postgres::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::guest_pool_url;
+    use super::{guest_pool_url, redact_database_url};
+
+    #[test]
+    fn test_redact_database_url_with_password() {
+        assert_eq!(
+            redact_database_url("postgres://admin:secret@localhost:5432/mydb?sslmode=require"),
+            "postgres://admin:***@localhost:5432/mydb?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn test_redact_database_url_without_password() {
+        assert_eq!(
+            redact_database_url("postgres://postgres@localhost:5433/wruntime_example"),
+            "postgres://postgres@localhost:5433/wruntime_example"
+        );
+    }
 
     #[test]
     fn test_guest_pool_url_with_user_pass() {

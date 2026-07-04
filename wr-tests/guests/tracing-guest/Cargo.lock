@@ -400,6 +400,7 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "prost-build",
+ "wit-bindgen",
  "wit-bindgen-rt",
  "wr-build",
  "wr-sdk",

@@ -4,7 +4,13 @@ mod proto {
 }
 
 #[allow(dead_code, unused_imports)]
-mod bindings;
+mod bindings {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "simulator",
+        generate_all,
+    });
+}
 
 use proto::{ExchangeServiceClient, LedgerServiceClient};
 use wr_sdk::prelude::*;

@@ -1,5 +1,6 @@
 .claude/settings.local.json
 .pg-test-data
+.pi-subagents
 .wr-dev.pid
 bindings.rs
 observability

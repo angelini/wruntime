@@ -18,6 +18,10 @@ use wr_common::wruntime::{
 };
 
 fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .on_thread_start(|| {
@@ -80,7 +84,7 @@ async fn async_main() -> Result<()> {
             .max_delay(Duration::from_secs(5))
             .take(10);
         let addr = config.node.control_address.clone();
-        Retry::spawn(strategy, || {
+        Retry::start(strategy, || {
             let addr = addr.clone();
             async move {
                 let c = NodeServiceClient::connect(addr).await?;
@@ -171,7 +175,7 @@ async fn async_main() -> Result<()> {
             }),
         };
         let cl = client.clone();
-        Retry::spawn(strategy, || {
+        Retry::start(strategy, || {
             let req = req.clone();
             let mut cl = cl.clone();
             async move { cl.register_engine(req).await }
@@ -292,7 +296,7 @@ async fn async_main() -> Result<()> {
                     healthy_modules: healthy,
                 };
                 let strategy = FixedInterval::from_millis(50).take(2);
-                let sent = Retry::spawn(strategy, || {
+                let sent = Retry::start(strategy, || {
                     let mut c = hb_client.clone();
                     let r = hb_req.clone();
                     async move { c.heartbeat(r).await }

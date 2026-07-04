@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wasmtime = { version = "43", features = [
+wasmtime = { version = "46", features = [
   "component-model",
   "component-model-async",
 ] }
-wasmtime-wasi = "43"
-wasmtime-wasi-http = { version = "43", features = ["default-send-request"] }
+wasmtime-wasi = "46"
+wasmtime-wasi-http = { version = "46", features = ["default-send-request"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["transport"] }
@@ -36,8 +36,8 @@ wr-common = { path = "../wr-common", features = [
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-opentelemetry = "0.32"
-opentelemetry = "0.31"
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
 tokio-postgres = { version = "0.7", features = [
   "with-chrono-0_4",
   "with-uuid-1",
@@ -47,15 +47,17 @@ deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
 chrono = "0.4"
 serde_json = "1"
 rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
-rust-s3 = { version = "0.37", default-features = false, features = [
-  "tags",
-  "tokio-rustls-tls",
-] }
-hashbrown = "0.15"
-refinery = { version = "0.8", features = ["tokio-postgres"] }
+hashbrown = "0.17"
+refinery = { version = "0.9", features = ["tokio-postgres"] }
 tokio-retry = "0.3"
-reqwest = { version = "0.12", default-features = false, features = [
-  "rustls-tls",
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls-no-provider",
   "json",
   "stream",
+] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+object_store = { version = "0.14.0", default-features = false, features = [
+  "aws-base",
+  "reqwest",
+  "ring",
 ] }

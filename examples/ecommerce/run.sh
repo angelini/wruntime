@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run from the repo root: bash examples/ecommerce/run.sh
-# Prerequisites: cargo, cargo-component, rustup target add wasm32-wasip2,
+# Prerequisites: cargo, rustup target add wasm32-wasip2, wasm-tools,
 #                Postgres running with an 'ecommerce' database. `just dev-up`
 source "$(dirname "$0")/../helpers.sh" "$@"
 

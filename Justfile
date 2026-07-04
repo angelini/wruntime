@@ -212,11 +212,11 @@ build-test-schemas:
 
 # Build WASM test guest components
 build-test-guests: build-test-schemas
-    (cd wr-tests/guests/db-guest && cargo component build --target wasm32-wasip2)
-    (cd wr-tests/guests/tracing-guest && cargo component build --target wasm32-wasip2)
-    (cd wr-tests/guests/blobstore-guest && cargo component build --target wasm32-wasip2)
-    (cd wr-tests/guests/http-guest && cargo component build --target wasm32-wasip2)
-    (cd wr-tests/guests/llm-guest && cargo component build --target wasm32-wasip2)
+    (cd wr-tests/guests/db-guest && cargo build --target wasm32-wasip2)
+    (cd wr-tests/guests/tracing-guest && cargo build --target wasm32-wasip2)
+    (cd wr-tests/guests/blobstore-guest && cargo build --target wasm32-wasip2)
+    (cd wr-tests/guests/http-guest && cargo build --target wasm32-wasip2)
+    (cd wr-tests/guests/llm-guest && cargo build --target wasm32-wasip2)
 
 # Run all WASM host binding tests (sets env vars for dev infrastructure automatically)
 test-wasm: build-test-guests
@@ -255,8 +255,8 @@ build-ecommerce-schemas:
 
 # Build WASM components and schemas for the ecommerce example
 build-ecommerce: build-ecommerce-schemas
-    (cd examples/ecommerce/inventory && cargo component build --target wasm32-wasip2)
-    (cd examples/ecommerce/client && cargo component build --target wasm32-wasip2)
+    (cd examples/ecommerce/inventory && cargo build --target wasm32-wasip2)
+    (cd examples/ecommerce/client && cargo build --target wasm32-wasip2)
 
 # Run the full ecommerce example (requires Postgres — see `just dev-up`)
 ecommerce: build-ecommerce build
@@ -284,9 +284,9 @@ build-stockmarket-schemas:
 
 # Build WASM components and schemas for the stockmarket example
 build-stockmarket: build-stockmarket-schemas
-    (cd examples/stockmarket/exchange && cargo component build --target wasm32-wasip2)
-    (cd examples/stockmarket/ledger && cargo component build --target wasm32-wasip2)
-    (cd examples/stockmarket/simulator && cargo component build --target wasm32-wasip2)
+    (cd examples/stockmarket/exchange && cargo build --target wasm32-wasip2)
+    (cd examples/stockmarket/ledger && cargo build --target wasm32-wasip2)
+    (cd examples/stockmarket/simulator && cargo build --target wasm32-wasip2)
 
 # Run the full stockmarket example (requires Postgres + RustFS S3 — see `just dev-up`)
 # Pass exchanges=N to run N exchange engines in parallel (default: 1)
@@ -319,10 +319,10 @@ build-codegen-schemas:
 
 # Build WASM components and schemas for the codegen example
 build-codegen: build-codegen-schemas
-    (cd examples/codegen/collector && cargo component build --target wasm32-wasip2)
-    (cd examples/codegen/agent && cargo component build --target wasm32-wasip2)
-    (cd examples/codegen/coordinator && cargo component build --target wasm32-wasip2)
-    (cd examples/codegen/worker && cargo component build --target wasm32-wasip2)
+    (cd examples/codegen/collector && cargo build --target wasm32-wasip2)
+    (cd examples/codegen/agent && cargo build --target wasm32-wasip2)
+    (cd examples/codegen/coordinator && cargo build --target wasm32-wasip2)
+    (cd examples/codegen/worker && cargo build --target wasm32-wasip2)
 
 # Run the full codegen example (requires Postgres + RustFS S3 — see `just dev-up`)
 codegen: build-codegen build

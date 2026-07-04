@@ -278,7 +278,7 @@ pub async fn list_engines(pool: &Pool) -> Result<Vec<EngineRegistration>, Status
 /// Upsert a routing rule. Acquires the global lock and bumps the version.
 /// Retries automatically on NOWAIT lock contention with exponential backoff.
 pub async fn upsert_routing_rule(pool: &Pool, rule: &RoutingRule) -> Result<(), Status> {
-    RetryIf::spawn(
+    RetryIf::start(
         lock_retry_strategy(),
         || upsert_routing_rule_once(pool, rule),
         is_lock_contention,
@@ -335,7 +335,7 @@ async fn upsert_routing_rule_once(pool: &Pool, rule: &RoutingRule) -> Result<(),
 /// Delete a routing rule by ID. Returns true if a rule was actually deleted.
 /// Retries automatically on NOWAIT lock contention with exponential backoff.
 pub async fn delete_routing_rule(pool: &Pool, rule_id: &str) -> Result<bool, Status> {
-    RetryIf::spawn(
+    RetryIf::start(
         lock_retry_strategy(),
         || delete_routing_rule_once(pool, rule_id),
         is_lock_contention,

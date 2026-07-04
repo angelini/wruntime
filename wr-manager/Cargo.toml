@@ -22,7 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 aes-gcm = "0.10"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
-chitchat = "0.10.0"
+chitchat = "0.11"
 tokio-retry = "0.3"
 hyper = { version = "1", features = ["client", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -30,4 +30,9 @@ http-body-util = "0.1"
 http = "1"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+  "logging",
+] }

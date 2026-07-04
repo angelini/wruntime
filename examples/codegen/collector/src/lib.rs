@@ -4,7 +4,13 @@ mod proto {
 }
 
 #[allow(dead_code, unused_imports)]
-mod bindings;
+mod bindings {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "collector",
+        generate_all,
+    });
+}
 
 use serde::{Deserialize, Serialize};
 use wr_sdk::bindings::wruntime::blobstore::store;

@@ -103,28 +103,30 @@ pub fn compile_schemas(modules: &[BuildModule]) -> Result<()> {
     Ok(())
 }
 
-/// Build WASM modules via `cargo component build`
+/// Build WASM modules via native Cargo `wasm32-wasip2`.
 pub fn build_wasm_modules(modules: &[BuildModule], release: bool) -> Result<()> {
     for module in modules {
         let cargo_dir = derive_cargo_dir(&module.wasm_path)?;
         print!("[build]   {} ... ", cargo_dir.display());
-        let mut args = vec!["component", "build"];
+        let mut args = vec!["build", "--target", "wasm32-wasip2"];
         if release {
             args.push("--release");
         }
-        args.extend(["--target", "wasm32-wasip2"]);
         let output = Command::new("cargo")
             .args(&args)
             .current_dir(&cargo_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
-            .context("failed to run cargo component build")?;
+            .context("failed to run cargo build --target wasm32-wasip2")?;
         if !output.status.success() {
             println!("FAILED");
             let stderr = String::from_utf8_lossy(&output.stderr);
             eprintln!("{stderr}");
-            bail!("cargo component build failed for module '{}'", module.name);
+            bail!(
+                "cargo build --target wasm32-wasip2 failed for module '{}'",
+                module.name
+            );
         }
         println!("OK");
 

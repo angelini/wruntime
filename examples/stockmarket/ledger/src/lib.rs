@@ -4,7 +4,13 @@ mod proto {
 }
 
 #[allow(dead_code, unused_imports)]
-mod bindings;
+mod bindings {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "ledger",
+        generate_all,
+    });
+}
 
 use prost::Message;
 use wr_sdk::bindings::wruntime::blobstore::store;

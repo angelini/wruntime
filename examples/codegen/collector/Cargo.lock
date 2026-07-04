@@ -51,6 +51,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "wit-bindgen",
  "wit-bindgen-rt",
  "wr-build",
  "wr-sdk",

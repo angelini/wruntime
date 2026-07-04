@@ -43,6 +43,7 @@ dependencies = [
  "prost-build",
  "serde",
  "serde_json",
+ "wit-bindgen",
  "wit-bindgen-rt",
  "wr-build",
  "wr-sdk",

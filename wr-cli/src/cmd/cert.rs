@@ -83,11 +83,8 @@ fn generate(args: GenerateArgs) -> Result<()> {
         .context("reading ca.key — run `wr cert init-ca` first")?;
 
     let ca_key_pair = KeyPair::from_pem(&ca_key_pem).context("parsing CA private key")?;
-    let ca_params =
-        CertificateParams::from_ca_cert_pem(&ca_cert_pem).context("parsing CA certificate")?;
-    let ca_cert = ca_params
-        .self_signed(&ca_key_pair)
-        .context("reconstructing CA certificate")?;
+    let issuer = rcgen::Issuer::from_ca_cert_pem(&ca_cert_pem, ca_key_pair)
+        .context("parsing CA certificate")?;
 
     let mut params = CertificateParams::new(vec![])?;
     let mut sans = vec![
@@ -109,7 +106,7 @@ fn generate(args: GenerateArgs) -> Result<()> {
 
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let node_cert = params
-        .signed_by(&key_pair, &ca_cert, &ca_key_pair)
+        .signed_by(&key_pair, &issuer)
         .context("signing node certificate")?;
 
     let cert_path = args.ca_dir.join(format!("{}.crt", args.hostname));

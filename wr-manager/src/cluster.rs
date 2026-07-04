@@ -23,7 +23,7 @@ impl ClusterHandle {
         gossip_interval: Duration,
     ) -> anyhow::Result<Self> {
         let chitchat_id = ChitchatId {
-            node_id: manager_id.to_string(),
+            node_id: manager_id.to_string().into(),
             generation_id: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

@@ -93,6 +93,10 @@ fn require_manager(manager: &Option<String>) -> Result<&str> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     let cli = Cli::parse();
 
     cmd::helpers::set_verbose(cli.verbose);

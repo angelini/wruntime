@@ -4,7 +4,13 @@ mod proto {
 }
 
 #[allow(dead_code, unused_imports)]
-mod bindings;
+mod bindings {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "tracing-guest",
+        generate_all,
+    });
+}
 
 use wr_sdk::prelude::*;
 use wr_sdk::tracing as sdk_tracing;

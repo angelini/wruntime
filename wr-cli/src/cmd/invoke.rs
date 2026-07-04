@@ -4,7 +4,7 @@ use prost::Message as _;
 use prost_reflect::{DescriptorPool, DynamicMessage};
 use reqwest::header::CONTENT_TYPE;
 
-use wr_common::wruntime::{GetSchemaRequest, ListEnginesRequest};
+use wr_common::wruntime::{GetRoutingTableRequest, GetSchemaRequest, ListEnginesRequest};
 
 #[derive(Args)]
 pub struct InvokeArgs {
@@ -113,8 +113,30 @@ async fn fetch_schema(
         .iter()
         .flat_map(|e| &e.modules)
         .find(|m| m.namespace == namespace && m.name == module)
-        .map(|m| m.version.clone())
-        .with_context(|| format!("no registered module '{namespace}.{module}' found"))?;
+        .map(|m| m.version.clone());
+
+    // Engines may briefly lag routing-rule updates during local dev restarts.
+    // Fall back to the routing table, which is also what `services list` uses.
+    let version = match version {
+        Some(version) => version,
+        None => {
+            let rules = client
+                .get_routing_table(GetRoutingTableRequest { known_version: 0 })
+                .await
+                .context("failed to get routing table")?
+                .into_inner()
+                .table
+                .map(|table| table.rules)
+                .unwrap_or_default();
+
+            rules
+                .iter()
+                .filter(|r| r.healthy)
+                .find(|r| r.destination_namespace == namespace && r.destination_module == module)
+                .map(|r| r.destination_version.clone())
+                .with_context(|| format!("no registered module '{namespace}.{module}' found"))?
+        }
+    };
 
     let resp = client
         .get_schema(GetSchemaRequest {

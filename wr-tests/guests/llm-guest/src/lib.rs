@@ -4,7 +4,13 @@ mod proto {
 }
 
 #[allow(dead_code, unused_imports)]
-mod bindings;
+mod bindings {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "llm-guest",
+        generate_all,
+    });
+}
 
 use wr_sdk::bindings::wruntime::llm::inference;
 use wr_sdk::llm::CompletionBuilder;

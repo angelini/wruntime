@@ -70,7 +70,7 @@ impl NodeAgent {
                 healthy_modules: state.healthy_modules.clone(),
             };
             let strategy = FixedInterval::from_millis(50).take(2);
-            let result = Retry::spawn(strategy, || {
+            let result = Retry::start(strategy, || {
                 let mut c = client.clone();
                 let r = req.clone();
                 async move { c.heartbeat(r).await }

@@ -11,24 +11,9 @@ crate-type = ["cdylib"]
 [dependencies]
 prost          = "0.14"
 wr-sdk         = { path = "../../../wr-sdk" }
+wit-bindgen    = "0.51.0"
 wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
 
 [build-dependencies]
 prost-build = "0.14"
 wr-build    = { path = "../../../wr-build" }
-
-[package.metadata.component]
-package = "test:db-guest"
-
-[package.metadata.component.target]
-world = "test:db-guest/db-guest"
-
-[package.metadata.component.target.dependencies]
-"wruntime:db"        = { path = "../../../wr-sdk/wit/deps/db.wit" }
-"wruntime:tracing"   = { path = "../../../wr-sdk/wit/deps/tracing.wit" }
-"wruntime:blobstore" = { path = "../../../wr-sdk/wit/deps/blobstore.wit" }
-"wasi:http"          = { path = "../../../wr-sdk/wit/deps/http.wit" }
-"wasi:clocks"        = { path = "../../../wr-sdk/wit/deps/clocks.wit" }
-"wasi:io"            = { path = "../../../wr-sdk/wit/deps/io.wit" }
-"wasi:random"        = { path = "../../../wr-sdk/wit/deps/random.wit" }
-"wasi:cli"           = { path = "../../../wr-sdk/wit/deps/cli.wit" }

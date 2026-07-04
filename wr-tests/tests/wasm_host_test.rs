@@ -69,7 +69,7 @@ async fn wasm_db_execute() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.db_test/Execute", req.encode_to_vec()),
+        rpc_request("/Execute", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -96,7 +96,7 @@ async fn wasm_db_query() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.db_test/Query", req.encode_to_vec()),
+        rpc_request("/Query", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -122,7 +122,7 @@ async fn wasm_db_query_types() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.db_test/QueryTypes", req.encode_to_vec()),
+        rpc_request("/QueryTypes", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -153,7 +153,7 @@ async fn wasm_db_transaction_commit() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.db_test/TransactionCommit", req.encode_to_vec()),
+        rpc_request("/TransactionCommit", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -178,7 +178,7 @@ async fn wasm_db_transaction_rollback() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.db_test/TransactionRollback", req.encode_to_vec()),
+        rpc_request("/TransactionRollback", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -203,7 +203,7 @@ async fn wasm_db_transaction_drop() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.db_test/TransactionDrop", req.encode_to_vec()),
+        rpc_request("/TransactionDrop", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -231,7 +231,7 @@ async fn wasm_db_error() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.db_test/Error", req.encode_to_vec()),
+        rpc_request("/Error", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -259,7 +259,7 @@ async fn wasm_db_query_stream() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.db_test/QueryStream", req.encode_to_vec()),
+        rpc_request("/QueryStream", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -287,7 +287,7 @@ async fn wasm_db_query_stream_drop() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.db_test/QueryStreamDrop", req.encode_to_vec()),
+        rpc_request("/QueryStreamDrop", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -323,7 +323,7 @@ async fn wasm_tracing_start_span() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.tracing_test/StartSpan", req.encode_to_vec()),
+        rpc_request("/StartSpan", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -349,7 +349,7 @@ async fn wasm_tracing_span_attributes() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.tracing_test/SpanAttributes", req.encode_to_vec()),
+        rpc_request("/SpanAttributes", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -376,7 +376,7 @@ async fn wasm_tracing_span_event() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.tracing_test/SpanEvent", req.encode_to_vec()),
+        rpc_request("/SpanEvent", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -402,7 +402,7 @@ async fn wasm_tracing_span_error() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.tracing_test/SpanError", req.encode_to_vec()),
+        rpc_request("/SpanError", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -428,7 +428,7 @@ async fn wasm_tracing_nested_spans() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.tracing_test/NestedSpans", req.encode_to_vec()),
+        rpc_request("/NestedSpans", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -479,7 +479,7 @@ async fn wasm_blobstore_put_get() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.blobstore_test/Put", req.encode_to_vec()),
+        rpc_request("/Put", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -494,7 +494,7 @@ async fn wasm_blobstore_put_get() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.blobstore_test/Get", req.encode_to_vec()),
+        rpc_request("/Get", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -524,7 +524,7 @@ async fn wasm_blobstore_delete() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.blobstore_test/Put", req.encode_to_vec()),
+        rpc_request("/Put", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -539,7 +539,7 @@ async fn wasm_blobstore_delete() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.blobstore_test/Delete", req.encode_to_vec()),
+        rpc_request("/Delete", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -554,7 +554,7 @@ async fn wasm_blobstore_delete() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.blobstore_test/NotFound", req.encode_to_vec()),
+        rpc_request("/NotFound", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -585,7 +585,7 @@ async fn wasm_blobstore_list() -> Result<()> {
             &engine,
             &pre,
             state,
-            rpc_request("/test.blobstore_test/Put", req.encode_to_vec()),
+            rpc_request("/Put", req.encode_to_vec()),
         )
         .await?;
         assert_eq!(resp.status(), 200);
@@ -601,7 +601,7 @@ async fn wasm_blobstore_list() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.blobstore_test/List", req.encode_to_vec()),
+        rpc_request("/List", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -636,7 +636,7 @@ async fn wasm_blobstore_head() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.blobstore_test/Put", req.encode_to_vec()),
+        rpc_request("/Put", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -650,7 +650,7 @@ async fn wasm_blobstore_head() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.blobstore_test/Head", req.encode_to_vec()),
+        rpc_request("/Head", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -680,7 +680,7 @@ async fn wasm_blobstore_round_trip() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.blobstore_test/RoundTrip", req.encode_to_vec()),
+        rpc_request("/RoundTrip", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -708,7 +708,7 @@ async fn wasm_blobstore_not_found() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.blobstore_test/NotFound", req.encode_to_vec()),
+        rpc_request("/NotFound", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -758,7 +758,7 @@ async fn wasm_llm_complete() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.llm_test/Complete", req.encode_to_vec()),
+        rpc_request("/Complete", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -793,7 +793,7 @@ async fn wasm_llm_complete_text() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.llm_test/CompleteText", req.encode_to_vec()),
+        rpc_request("/CompleteText", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -828,7 +828,7 @@ async fn wasm_llm_tool_use() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.llm_test/ToolUse", req.encode_to_vec()),
+        rpc_request("/ToolUse", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -862,7 +862,7 @@ async fn wasm_llm_error() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.llm_test/Error", req.encode_to_vec()),
+        rpc_request("/Error", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -893,7 +893,7 @@ async fn wasm_llm_stream() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.llm_test/Stream", req.encode_to_vec()),
+        rpc_request("/Stream", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -958,7 +958,7 @@ async fn wasm_http_egress() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/test.http_test/Egress", req.encode_to_vec()),
+        rpc_request("/Egress", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -1000,7 +1000,7 @@ async fn wasm_http_ingress() -> Result<()> {
     let ingress_addr = start_ingress_proxy(
         table,
         vec![ExternalRoute {
-            path: "/test.http_test/Echo".into(),
+            path: "/Echo".into(),
             methods: vec!["POST".into()],
             module: "http-svc".into(),
             namespace: "test-ns".into(),
@@ -1016,7 +1016,7 @@ async fn wasm_http_ingress() -> Result<()> {
         .request(
             http::Request::builder()
                 .method("POST")
-                .uri(format!("http://{ingress_addr}/test.http_test/Echo"))
+                .uri(format!("http://{ingress_addr}/Echo"))
                 .body(Full::new(Bytes::from(req_body.encode_to_vec())))?,
         )
         .await?;

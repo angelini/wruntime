@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run from the repo root: bash examples/stockmarket/run.sh
-# Prerequisites: cargo, cargo-component, rustup target add wasm32-wasip2,
+# Prerequisites: cargo, rustup target add wasm32-wasip2, wasm-tools,
 #                Postgres + RustFS S3 running. `just dev-up`
 #
 # Options:

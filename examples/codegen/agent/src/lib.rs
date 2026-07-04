@@ -4,7 +4,13 @@ mod proto {
 }
 
 #[allow(dead_code, unused_imports)]
-mod bindings;
+mod bindings {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "agent",
+        generate_all,
+    });
+}
 
 use serde::Deserialize;
 use wr_sdk::bindings::wasi::clocks::monotonic_clock;

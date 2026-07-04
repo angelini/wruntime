@@ -4,7 +4,13 @@ mod proto {
 }
 
 #[allow(dead_code, unused_imports)]
-mod bindings;
+mod bindings {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "blobstore-guest",
+        generate_all,
+    });
+}
 
 use wr_sdk::bindings::wruntime::blobstore::store::{self, BlobError};
 use wr_sdk::prelude::*;

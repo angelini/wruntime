@@ -158,8 +158,8 @@ schema_path = "schemas/echo.binpb"
 
 ```bash
 # Build the WASM components
-cargo component build -p echo
-cargo component build -p caller
+cargo build --target wasm32-wasip2 -p echo
+cargo build --target wasm32-wasip2 -p caller
 
 # Start the services (in separate terminals, or background them)
 just manager
@@ -210,7 +210,8 @@ Manager deployment follows the same pattern (`wr managers bundle` / `wr managers
 | Rust + Cargo (stable) | Build all binaries |
 | [`just`](https://github.com/casey/just) | Run project recipes (see `Justfile`) |
 | `protoc` | Compile `.proto` schemas to `FileDescriptorSet` binaries |
-| `cargo-component` | Build WASM component modules |
+| `wasm32-wasip2` target | `rustup target add wasm32-wasip2` — build WASM component modules |
+| [`wasm-tools`](https://github.com/bytecodealliance/wasm-tools) | Strip/inspect WASM components (install: `cargo install --locked wasm-tools`) |
 | [`sccache`](https://github.com/mozilla/sccache) | Compilation cache — speeds up rebuilds and fresh clones (install: `cargo install sccache`) |
 
 ```bash

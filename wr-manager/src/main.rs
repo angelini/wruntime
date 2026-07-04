@@ -10,7 +10,7 @@ pub mod state;
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tonic::transport::Server;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -33,16 +33,31 @@ async fn main() -> Result<()> {
 
     // Database — create wr_system schema before building the pool (which
     // sets search_path = wr_system and would fail if the schema doesn't exist).
+    let database_url = wr_common::pool::redact_database_url(&config.database.url);
     {
-        let bootstrap = wr_common::pool::build_pool(&config.database.url, 1)?;
-        let client = bootstrap.get().await?;
+        let bootstrap =
+            wr_common::pool::build_pool(&config.database.url, 1).with_context(|| {
+                format!("failed to create manager bootstrap database pool for {database_url}")
+            })?;
+        let client = bootstrap.get().await.with_context(|| {
+            format!(
+                "failed to connect to manager database {database_url} while bootstrapping wr_system schema"
+            )
+        })?;
         client
             .batch_execute("CREATE SCHEMA IF NOT EXISTS wr_system")
-            .await?;
+            .await
+            .with_context(|| format!("failed to create wr_system schema in {database_url}"))?;
     }
-    let db_pool = pool::build_pool(&config.database.url, config.database.max_connections)?;
-    let client = db_pool.get().await?;
-    migrate::run_migrations(&client).await?;
+    let db_pool = pool::build_pool(&config.database.url, config.database.max_connections)
+        .with_context(|| format!("failed to create manager database pool for {database_url}"))?;
+    let client = db_pool
+        .get()
+        .await
+        .with_context(|| format!("failed to connect to manager database {database_url}"))?;
+    migrate::run_migrations(&client)
+        .await
+        .with_context(|| format!("failed to run manager database migrations in {database_url}"))?;
     drop(client);
 
     // ── Cluster self-registration ────────────────────────────────────────

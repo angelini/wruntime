@@ -67,6 +67,7 @@ pub fn generate_test_pki() -> TestPki {
         .push(rcgen::DnType::CommonName, "test-ca");
     let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_issuer = rcgen::Issuer::from_params(&ca_params, ca_key);
 
     // Node cert signed by CA
     let mut node_params = CertificateParams::new(vec![]).unwrap();
@@ -78,7 +79,7 @@ pub fn generate_test_pki() -> TestPki {
         .distinguished_name
         .push(rcgen::DnType::CommonName, "test-node");
     let node_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-    let node_cert = node_params.signed_by(&node_key, &ca_cert, &ca_key).unwrap();
+    let node_cert = node_params.signed_by(&node_key, &ca_issuer).unwrap();
 
     TestPki {
         ca_cert_der: vec![ca_cert.der().clone()],

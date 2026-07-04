@@ -233,7 +233,7 @@ pub async fn wait_for_engine_at_address(
     let attempt = std::sync::atomic::AtomicU32::new(0);
     let normalized = &normalized;
     let strategy = FixedInterval::from_millis(1000).take(timeout.as_secs() as usize);
-    Retry::spawn(strategy, || {
+    Retry::start(strategy, || {
         let n = attempt.fetch_add(1, Ordering::Relaxed) + 1;
         async move {
             match client::connect(manager).await {
@@ -278,7 +278,7 @@ pub async fn wait_for_manager_ready(manager_addr: &str, timeout: Duration) -> bo
     );
     let attempt = std::sync::atomic::AtomicU32::new(0);
     let strategy = FixedInterval::from_millis(2000).take(timeout.as_secs() as usize / 2);
-    Retry::spawn(strategy, || {
+    Retry::start(strategy, || {
         let n = attempt.fetch_add(1, Ordering::Relaxed) + 1;
         async move {
             debug!("attempt {n}: connecting to {manager_addr}");
@@ -456,7 +456,7 @@ pub async fn wait_for_modules(
     );
     let attempt = std::sync::atomic::AtomicU32::new(0);
     let strategy = FixedInterval::from_millis(2000).take(timeout.as_secs() as usize / 2);
-    Retry::spawn(strategy, || {
+    Retry::start(strategy, || {
         let n = attempt.fetch_add(1, Ordering::Relaxed) + 1;
         async move {
             match client::connect(manager).await {
