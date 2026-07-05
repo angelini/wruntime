@@ -12,6 +12,7 @@ use tracing::{info_span, warn, Instrument};
 
 use super::{full_body, ProxyBody, ResBody};
 use crate::config::EgressConfig;
+use wr_common::http_headers::{strip_before_egress, WR_SOURCE};
 
 type EgressClient = Client<HttpsConnector<HttpConnector>, ProxyBody>;
 
@@ -97,7 +98,7 @@ where
 
             let source = req
                 .headers()
-                .get("x-wr-source")
+                .get(WR_SOURCE)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown")
                 .to_string();
@@ -147,17 +148,7 @@ where
                 // Strip all x-wr-* headers before forwarding to the external host.
                 let (mut parts, body) = req.into_parts();
 
-                for name in &[
-                    "x-wr-destination",
-                    "x-wr-source",
-                    "x-wr-source-ns",
-                    "x-wr-module",
-                    "x-wr-namespace",
-                    "x-wr-version",
-                    "x-wr-via-proxy",
-                ] {
-                    parts.headers.remove(*name);
-                }
+                strip_before_egress(&mut parts.headers);
 
                 parts.uri = egress.dest_uri.clone();
                 // Reset the HTTP version so the client can negotiate freely via

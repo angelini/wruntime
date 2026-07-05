@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::Deserialize;
-use wr_common::node::NodeConfig;
+use wr_common::node::{is_loopback_addr, NodeConfig};
 
 #[derive(Deserialize, Clone)]
 pub struct ProxyConfig {
@@ -124,6 +124,15 @@ impl ProxyConfig {
         v.check(
             !self.control_address.is_empty(),
             "control_address is required",
+        );
+        v.check(
+            is_loopback_addr(&self.listen_address),
+            "listen_address must bind to loopback (127.0.0.1, ::1, or localhost); \
+             network traffic uses the mTLS peer listener",
+        );
+        v.check(
+            is_loopback_addr(&self.control_address),
+            "control_address must bind to loopback (127.0.0.1, ::1, or localhost)",
         );
         v.check(!self.database.url.is_empty(), "database.url is required");
         v.check(

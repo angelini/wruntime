@@ -84,8 +84,8 @@ wr-proxy A  (Node A)
   │  1. TracingLayer       — opens an OTel span (captures source, destination,
   │                          status, duration); injects W3C traceparent header
   │  2. RoutingLayer       — single routing table read per request;
-  │                          reads optional x-wr-version header; defaults to
-  │                          highest semver among healthy rules for the module;
+  │                          reads optional x-wr-version header; when omitted,
+  │                          load-balances across all healthy versions;
   │                          returns 503 if no healthy instance matches;
   │                          injects x-wr-module, x-wr-namespace, x-wr-version;
   │                          round-robins across healthy instances at the same
@@ -132,7 +132,7 @@ All internal routing uses a set of reserved `x-wr-*` HTTP headers. The proxy str
 | `x-wr-destination` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (public routes) | `wr-proxy` RoutingLayer, TracingLayer | Full destination URI of the original call — e.g. `http://ecommerce.inventory/GetItems`. The host encodes the destination as `{namespace}.{module}`; the path is the RPC method name. Stripped by ForwardService before reaching the destination engine. |
 | `x-wr-source` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (set to `"external"` for public routes) | `wr-proxy` TracingLayer | Name of the calling module. Recorded as a span attribute for metrics attribution and error reporting. Stripped by ForwardService before reaching the destination engine. |
 | `x-wr-source-ns` | `wr-engine` (outbound WASM call) | — | Namespace of the calling module. Carried alongside `x-wr-source` for attribution; not used for routing decisions. Stripped by ForwardService before reaching the destination engine. |
-| `x-wr-version` | Caller (optional — WASM module or `wr-cli`) | `wr-proxy` RoutingLayer | Pins the request to a specific semver of the destination module (e.g. `1.2.0`). When omitted the proxy routes to the highest healthy semver. RoutingLayer overwrites the value with the resolved version before forwarding. |
+| `x-wr-version` | Caller (optional — WASM module or `wr-cli`) | `wr-proxy` RoutingLayer | Pins the request to a specific semver of the destination module (e.g. `1.2.0`). When omitted the proxy load-balances across all healthy versions of the module. RoutingLayer overwrites the value with the resolved version before forwarding. |
 | `x-wr-module` | `wr-proxy` RoutingLayer | `wr-engine` inbound server | Resolved destination module name. The engine uses this (together with `x-wr-namespace` and `x-wr-version`) to select the correct WASM instance. |
 | `x-wr-namespace` | `wr-proxy` RoutingLayer | `wr-engine` inbound server | Resolved destination module namespace. |
 | `x-wr-via-proxy` | `wr-proxy` ForwardService (cross-node hop) | `wr-proxy` RoutingLayer | Set to `1` when forwarding to a peer proxy on another node. Stripped by ForwardService on the local-engine path. |

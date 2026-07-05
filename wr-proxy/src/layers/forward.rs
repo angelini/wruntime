@@ -6,6 +6,7 @@ use std::task::{Context, Poll};
 use http::Request;
 use tower::Service;
 use tracing::{info_span, warn, Instrument};
+use wr_common::http_headers::{strip_before_engine, WR_VIA_PROXY};
 use wr_common::http_pool::{HttpClientPool, DEFAULT_POOL_SIZE};
 
 use super::{Destination, ProxyBody, ResBody, ResolvedDestination};
@@ -64,16 +65,13 @@ impl Service<Request<ProxyBody>> for ForwardService {
 
             let forward_addr = match &destination {
                 Destination::LocalEngine(addr) => {
-                    parts.headers.remove("x-wr-destination");
-                    parts.headers.remove("x-wr-source");
-                    parts.headers.remove("x-wr-source-ns");
-                    parts.headers.remove("x-wr-via-proxy");
+                    strip_before_engine(&mut parts.headers);
                     addr.clone()
                 }
                 Destination::RemoteProxy(addr) => {
                     parts
                         .headers
-                        .insert("x-wr-via-proxy", http::HeaderValue::from_static("1"));
+                        .insert(WR_VIA_PROXY, http::HeaderValue::from_static("1"));
                     addr.clone()
                 }
             };

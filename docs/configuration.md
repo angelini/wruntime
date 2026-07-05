@@ -81,7 +81,7 @@ url = "postgres://postgres@localhost:5433/wruntime_example"
 routing_table_ttl_secs = 5   # how often to poll the manager for routing updates
 ```
 
-`listen_address` should bind to `127.0.0.1` — only engines on the same host need to reach it. Cross-node traffic uses the mTLS peer listener on `peer_port` (default 9443, binds `0.0.0.0`). The peer address is derived automatically from `proxy_address` host + `peer_port`. The routing layer uses the derived peer address to distinguish local vs. remote rules.
+`listen_address` and `control_address` **must** bind to loopback (`127.0.0.1`, `::1`, or `localhost`) — only engines on the same host reach them, and the proxy now rejects a non-loopback value at config load. Cross-node traffic uses the mTLS peer listener on `peer_port` (default 9443, binds `0.0.0.0`). The peer address is derived automatically from `proxy_address` host + `peer_port`. The routing layer uses the derived peer address to distinguish local vs. remote rules.
 
 `control_address` exposes a gRPC `NodeService` that engines on the same node use for registration and heartbeats instead of connecting directly to the manager. This decouples engines from the manager address and enables local-first orchestration.
 
@@ -159,6 +159,8 @@ wasm_path   = "modules/inventory_service.wasm"
 schema_path = "schemas/inventory_service.binpb"
 # request_timeout_secs omitted — uses the default of 30 seconds
 ```
+
+`listen_address` **must** bind to loopback (`127.0.0.1`, `::1`, or `localhost`); the engine rejects a non-loopback value at config load. To bind a routable interface anyway, set `allow_non_loopback_internal = true` at the top level of `engine.toml` (defaults to `false`; omitting it keeps existing configs valid). When enabled with a `0.0.0.0` bind, the engine still advertises `127.0.0.1` to peers, so the address is only reachable same-host — operators enabling this flag own end-to-end reachability.
 
 > **`schema_path` is required.** Every module must declare a compiled `FileDescriptorSet`. The engine will refuse to start if the file is absent. Schemas are uploaded to the manager on registration for discovery purposes.
 
@@ -351,22 +353,22 @@ grpcurl -plaintext -d '{
 
 To run **multiple instances** of the same module version across different engines (on the same or different nodes), create one rule per engine pointing at the same `(destination_module, destination_namespace, destination_version)`. The proxy round-robins across all healthy rules for that tuple.
 
-To deploy a **new version** alongside the old one, register a new engine with `version = "2.0.0"` and add a corresponding rule. Callers that omit `x-wr-version` are automatically upgraded to the highest semver. Callers that pin a version with the `x-wr-version` request header continue to reach the older instance.
+To deploy a **new version** alongside the old one, register a new engine with `version = "2.0.0"` and add a corresponding rule. Callers that omit `x-wr-version` are load-balanced across all healthy versions; the proxy injects the concrete selected version into `x-wr-version` before forwarding. Callers that pin a version with the `x-wr-version` request header continue to reach the older instance.
 
 ### Multi-node deployment
 
-Each node uses different ports and a matching `proxy_address`:
+Each node binds its internal `listen_address`/`control_address` to loopback and uses a matching `proxy_address`; only the mTLS peer listener (`peer_port`) is exposed to other nodes:
 
 ```toml
 # examples/multi-node/node-a/proxy.toml
-listen_address  = "0.0.0.0:9001"
+listen_address  = "127.0.0.1:9001"
 manager_address = "http://127.0.0.1:9000"
 
 [node]
 proxy_address = "http://node-a-host:9001"
 
 # examples/multi-node/node-a/engine-1.toml
-listen_address  = "0.0.0.0:9100"
+listen_address  = "127.0.0.1:9100"
 manager_address = "http://127.0.0.1:9000"
 
 [node]
@@ -375,14 +377,14 @@ proxy_address = "http://node-a-host:9001"
 
 ```toml
 # examples/multi-node/node-b/proxy.toml
-listen_address  = "0.0.0.0:9002"
+listen_address  = "127.0.0.1:9002"
 manager_address = "http://127.0.0.1:9000"
 
 [node]
 proxy_address = "http://node-b-host:9002"
 
 # examples/multi-node/node-b/engine-1.toml
-listen_address  = "0.0.0.0:9200"
+listen_address  = "127.0.0.1:9200"
 manager_address = "http://127.0.0.1:9000"
 
 [node]

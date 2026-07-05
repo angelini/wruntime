@@ -10,6 +10,9 @@ const V6_SQL: &str = include_str!("../migrations/V6__peer_address.sql");
 const V7_SQL: &str = include_str!("../migrations/V7__system_schema.sql");
 const V8_SQL: &str = include_str!("../migrations/V8__module_heartbeats.sql");
 const V9_SQL: &str = include_str!("../migrations/V9__schedule_leases.sql");
+const V10_SQL: &str = include_str!("../migrations/V10__routing_rule_proxy_address.sql");
+const V11_SQL: &str = include_str!("../migrations/V11__drop_routing_rule_proxy_address.sql");
+const V12_SQL: &str = include_str!("../migrations/V12__routing_rule_peer_address_not_empty.sql");
 
 const MIGRATIONS: &[(i32, &str)] = &[
     (1, V1_SQL),
@@ -21,6 +24,9 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (7, V7_SQL),
     (8, V8_SQL),
     (9, V9_SQL),
+    (10, V10_SQL),
+    (11, V11_SQL),
+    (12, V12_SQL),
 ];
 
 /// Run all pending manager migrations.

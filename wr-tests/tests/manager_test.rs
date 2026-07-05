@@ -115,8 +115,7 @@ async fn test_routing_table_upsert_and_get() -> Result<()> {
         destination_version: "1.0.0".into(),
         engine_id: "e1".into(),
         engine_address: "http://127.0.0.1:9103".into(),
-        proxy_address: String::new(),
-        peer_address: String::new(),
+        peer_address: "https://127.0.0.1:9443".into(),
         healthy: false, // server sets this to true on upsert
     })
     .await?;
@@ -133,6 +132,30 @@ async fn test_routing_table_upsert_and_get() -> Result<()> {
     assert_eq!(table.rules[0].destination_namespace, "store");
     assert!(table.rules[0].healthy, "upserted rule should be healthy");
     assert_eq!(table.version, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_routing_rule_rejects_empty_peer_address() -> Result<()> {
+    let (_pool, _addr, mut c) = manager_trio().await?;
+
+    let err = c
+        .upsert_routing_rule(RoutingRule {
+            rule_id: "empty-peer-r1".into(),
+            source_module: String::new(),
+            source_namespace: String::new(),
+            destination_module: "svc".into(),
+            destination_namespace: "ns".into(),
+            destination_version: "1.0.0".into(),
+            engine_id: "e1".into(),
+            engine_address: "http://127.0.0.1:9103".into(),
+            peer_address: String::new(),
+            healthy: false,
+        })
+        .await
+        .expect_err("empty peer_address must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
     Ok(())
 }

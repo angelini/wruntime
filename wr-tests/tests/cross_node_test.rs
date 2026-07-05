@@ -22,7 +22,7 @@ async fn test_cross_node_routing() -> Result<()> {
         EngineSpec {
             id: "engine-b-id",
             addr: &engine_b_addr,
-            proxy_address: &node_b.proxy_address,
+            peer_address: &node_b.proxy_address,
         },
         ModuleSpec {
             namespace: "store",
@@ -35,7 +35,7 @@ async fn test_cross_node_routing() -> Result<()> {
     sync_table(&mgr_addr, &node_b.table).await?;
 
     // Start node A after registration so its initial sync picks up engine B's rule.
-    // Since node_a.proxy_address ≠ node_b.proxy_address, node A will forward cross-node.
+    // Since node A's self peer address ≠ node B's peer address, node A will forward cross-node.
     let node_a = start_node(&mgr_addr).await?;
 
     let (status, body) =

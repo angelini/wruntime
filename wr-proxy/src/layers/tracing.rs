@@ -43,8 +43,8 @@ where
             .path_and_query()
             .map(|pq| pq.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
-        let source = header_str(req.headers(), "x-wr-source").to_string();
-        let dest = header_str(req.headers(), "x-wr-destination").to_string();
+        let source = header_str(req.headers(), WR_SOURCE).to_string();
+        let dest = header_str(req.headers(), WR_DESTINATION).to_string();
 
         let span = info_span!(
             "proxy.request",
@@ -89,4 +89,4 @@ where
     }
 }
 
-use wr_common::http_headers::header_str;
+use wr_common::http_headers::{header_str, WR_DESTINATION, WR_SOURCE};

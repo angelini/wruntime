@@ -30,8 +30,9 @@ message RoutingRule {
   bool   healthy                   = 7; // set by manager; false means no traffic
   string source_namespace          = 8;
   string destination_namespace     = 9;
-  string proxy_address             = 10; // node proxy address for this engine
-  string peer_address              = 11; // mTLS peer address for cross-node routing
+  reserved 10;
+  reserved "proxy_address";
+  string peer_address              = 11; // sole cross-node forwarding address (required, non-empty)
 }
 
 message RoutingTable {

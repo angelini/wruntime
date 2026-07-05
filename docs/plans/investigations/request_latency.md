@@ -61,9 +61,9 @@ Follow-up to `wasm_guest_request_path.md`. The proxy now streams bodies end-to-e
 │  ■ CPU: Version resolution (routing.rs:151-223)                 │
 │     semver::VersionReq::parse() + filter + max_by over healthy  │
 │     rules. Linear scan; cost scales with rule count.            │
-│  ■ LOCK: Round-robin Mutex (routing.rs:254)                     │
-│     counters.lock().unwrap() — std::sync::Mutex, blocks the    │
-│     tokio task. Brief but contended under high fan-in.          │
+│  [x] Round-robin: per-route AtomicUsize (item 7 done)           │
+│     fetch_add(1, Relaxed) % len; no mutex, lock-free            │
+│     Selection state moved into the routing table.               │
 │  ■ ALLOC: HashMap key construction (routing.rs:256-260)         │
 │     .entry((ns.clone(), module.clone(), version.clone()))       │
 │     3 String clones per request for the round-robin counter     │
@@ -162,7 +162,7 @@ Follow-up to `wasm_guest_request_path.md`. The proxy now streams bodies end-to-e
 | 5 | **WASM response body buffering** | `engine.rs:407-411` | Memory copy | Collected before sending through oneshot channel |
 | 6 | **WASM guest execution** | `engine.rs:398-401` | CPU (guest) | Dominates for compute-heavy modules |
 | 7 | **Routing table RwLock** | `routing.rs:132` | Lock contention | Single read per request (down from 2) |
-| 8 | **Round-robin counter Mutex** | `routing.rs:254` | Lock contention | Sync Mutex — blocks tokio task briefly |
+| 8 | **Round-robin counter Mutex** _(resolved, item 7)_ | `routing.rs` | — | Replaced by per-route `AtomicUsize` in `IndexedRoutingTable`; hot path is lock-free |
 | 9 | **Circuit breaker Mutex + clone** | `circuit_breaker.rs:27` | Lock + alloc | `HashMap` lookup + `StateMachine` clone per request |
 | 10 | **Registry key String allocs** | `registry.rs:62` | Alloc | 3 owned Strings built to query HashMap |
 | 11 | **ModuleState per-request alloc** | `engine.rs:362-374` | Alloc | WasiCtx, ResourceTable, clones of Arc pools |
@@ -191,7 +191,7 @@ The previous investigation noted two `RwLock` reads per request (egress + routin
 
 ### The round-robin counter uses a sync Mutex
 
-`routing.rs:254` uses `std::sync::Mutex` inside an async context. While the critical section is tiny (increment + modulo), under high concurrency this blocks the tokio worker thread rather than yielding. The HashMap key also allocates 3 Strings per request.
+**Resolved (item 7):** the round-robin `Mutex<HashMap<_, usize>>` was replaced with per-route `AtomicUsize` counters (`all_versions_counter` plus a per-version `counter`) living inside `IndexedRoutingTable`, seeded best-effort from the previous table on each sync. The hot path is now lock-free (`fetch_add(1, Relaxed) % len`) with no per-request `HashMap` key allocation.
 
 ### Registry lookup allocates 3 throwaway Strings
 
@@ -252,6 +252,6 @@ Add a body-size limit on the engine (413 Payload Too Large) and route large payl
 
 1. **Registry key interning** — Replace `HashMap<(String, String, String), _>` with a pre-hashed or interned key to avoid 3 String allocations per lookup in both `registry.rs:62` and `routing.rs:256-260`.
 
-2. **Atomic round-robin** — Replace `Mutex<HashMap<_, usize>>` in the routing layer with per-entry `AtomicUsize` (similar to what `registry.rs` already does with `AtomicUsize` in `InstanceList`).
+2. **Atomic round-robin** — Replace `Mutex<HashMap<_, usize>>` in the routing layer with per-entry `AtomicUsize` (similar to what `registry.rs` already does with `AtomicUsize` in `InstanceList`). — **Implemented (item 7).**
 
 3. **Circuit breaker per-entry lock** — Move from a single `Mutex<HashMap>` to a concurrent map (e.g., `DashMap`) or pre-populate breakers on routing table sync so the hot path is lock-free.

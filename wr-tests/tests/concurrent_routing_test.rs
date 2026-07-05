@@ -20,8 +20,7 @@ fn make_rule(rule_id: &str, dest_module: &str, engine_id: &str) -> RoutingRule {
         destination_version: "1.0.0".into(),
         engine_id: engine_id.into(),
         engine_address: "http://127.0.0.1:9999".into(),
-        proxy_address: String::new(),
-        peer_address: String::new(),
+        peer_address: "https://127.0.0.1:9443".into(),
         healthy: true,
     }
 }

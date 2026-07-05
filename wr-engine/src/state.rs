@@ -21,6 +21,7 @@ use wasmtime_wasi_http::{
     },
     WasiHttpCtx,
 };
+use wr_common::http_headers::{WR_DESTINATION, WR_SOURCE, WR_SOURCE_NS};
 use wr_common::http_pool::HttpClientPool;
 
 /// Hooks that intercept every outbound HTTP request from a WASM module.
@@ -73,15 +74,15 @@ impl WasiHttpHooks for ModuleHttpHooks {
         );
 
         request.headers_mut().insert(
-            HeaderName::from_static("x-wr-destination"),
+            HeaderName::from_static(WR_DESTINATION),
             HeaderValue::from_str(&original_uri).map_err(|_| ErrorCode::InternalError(None))?,
         );
         request.headers_mut().insert(
-            HeaderName::from_static("x-wr-source"),
+            HeaderName::from_static(WR_SOURCE),
             HeaderValue::from_str(&self.module_name).map_err(|_| ErrorCode::InternalError(None))?,
         );
         request.headers_mut().insert(
-            HeaderName::from_static("x-wr-source-ns"),
+            HeaderName::from_static(WR_SOURCE_NS),
             HeaderValue::from_str(&self.module_namespace)
                 .map_err(|_| ErrorCode::InternalError(None))?,
         );

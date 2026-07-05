@@ -20,6 +20,7 @@ pub async fn sync_once(
     client: &mut ManagerServiceClient<tonic::transport::Channel>,
     table: &CachedRoutingTable,
     cb_registry: &CircuitBreakerRegistry,
+    self_peer_address: &str,
 ) -> Result<(), tonic::Status> {
     let known_version = table.read().await.version;
     let resp = client
@@ -27,10 +28,14 @@ pub async fn sync_once(
         .await?;
     if let Some(incoming) = resp.into_inner().table {
         let version = incoming.version;
-        let indexed = IndexedRoutingTable::from_proto(&incoming);
-        let active = indexed.active_engines();
-        cb_registry.evict_missing(&active);
-        *table.write().await = indexed;
+        let mut guard = table.write().await;
+        let indexed = IndexedRoutingTable::from_proto(&incoming, Some(&*guard));
+        {
+            let active = indexed.active_forward_addrs(self_peer_address);
+            cb_registry.evict_missing(&active);
+        }
+        *guard = indexed;
+        drop(guard);
         info!(version, "routing table updated");
     }
     Ok(())
@@ -42,13 +47,16 @@ pub async fn sync_routing_table(
     table: CachedRoutingTable,
     ttl_secs: u64,
     cb_registry: Arc<CircuitBreakerRegistry>,
+    self_peer_address: String,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(ttl_secs));
     loop {
         interval.tick().await;
         match discovery.get_client().await {
             Ok(mut client) => {
-                if let Err(e) = sync_once(&mut client, &table, &cb_registry).await {
+                if let Err(e) =
+                    sync_once(&mut client, &table, &cb_registry, &self_peer_address).await
+                {
                     warn!(error = %e, "routing table sync failed");
                 }
             }

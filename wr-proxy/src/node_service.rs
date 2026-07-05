@@ -21,6 +21,22 @@ struct EngineState {
     healthy_modules: Vec<ModuleDescriptor>,
 }
 
+/// Compact copy of `EngineState` captured under the read lock so
+/// `flush_heartbeats` can drop the guard before issuing manager RPCs.
+struct EngineStateSnapshot {
+    engine_id: String,
+    healthy_modules: Vec<ModuleDescriptor>,
+}
+
+impl From<&EngineState> for EngineStateSnapshot {
+    fn from(state: &EngineState) -> Self {
+        Self {
+            engine_id: state.engine_id.clone(),
+            healthy_modules: state.healthy_modules.clone(),
+        }
+    }
+}
+
 /// Node-local gRPC service that engines use instead of connecting to managers.
 /// Forwards registration/deregistration to the manager and aggregates heartbeats.
 pub struct NodeAgent {
@@ -50,10 +66,19 @@ impl NodeAgent {
     }
 
     async fn flush_heartbeats(&self) {
-        let engines = self.engines.read().await;
-        if engines.is_empty() {
-            return;
-        }
+        // Snapshot engine state under the lock, then release it before any
+        // manager RPC. This keeps register_engine/heartbeat/deregister_engine
+        // (write-lock holders) from blocking on manager RPC latency. Tradeoff:
+        // a concurrent mutation after the snapshot means one stale (or
+        // just-deregistered) engine flush can still reach the manager; the next
+        // cycle self-corrects and the manager tolerates a stale heartbeat.
+        let snapshot: Vec<EngineStateSnapshot> = {
+            let engines = self.engines.read().await;
+            if engines.is_empty() {
+                return;
+            }
+            engines.values().map(EngineStateSnapshot::from).collect()
+        };
 
         let client = match self.discovery.get_client().await {
             Ok(c) => c,
@@ -64,7 +89,7 @@ impl NodeAgent {
         };
 
         let mut any_failed = false;
-        for state in engines.values() {
+        for state in &snapshot {
             let req = wr_common::wruntime::HeartbeatRequest {
                 engine_id: state.engine_id.clone(),
                 healthy_modules: state.healthy_modules.clone(),

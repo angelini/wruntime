@@ -1,7 +1,7 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use http::{Request, StatusCode};
@@ -10,8 +10,9 @@ use tracing::{info_span, Instrument};
 
 use super::egress::{domain_matches, ExternalEgress};
 use super::{error_response, Destination, ProxyBody, ResBody, ResolvedDestination};
-use crate::indexed_routing::ParsedRule;
+use crate::indexed_routing::{IndexedRoutingTable, RouteGroup};
 use crate::routing::CachedRoutingTable;
+use wr_common::http_headers::{WR_DESTINATION, WR_MODULE, WR_NAMESPACE, WR_VERSION};
 
 /// A routing candidate with its resolved version attached so the caller can
 /// inject the correct `x-wr-version` header after round-robin selection.
@@ -21,14 +22,41 @@ struct VersionedCandidate {
     version: Arc<str>,
 }
 
-type RoundRobinCounters = Arc<Mutex<HashMap<(Arc<str>, Arc<str>, Arc<str>), usize>>>;
+/// Route-aware classification of an `x-wr-destination`. Produced by
+/// `classify_destination` using the routing table + egress allowlist.
+#[derive(Debug)]
+enum ParsedDestination {
+    Internal {
+        namespace: Arc<str>,
+        module: Arc<str>,
+        #[allow(dead_code)]
+        uri: http::Uri,
+    },
+    External {
+        host: String,
+        uri: http::Uri,
+    },
+}
+
+/// The routing-layer decision, computed under a single read guard so no table
+/// state is borrowed after the guard is dropped.
+enum RouteOutcome {
+    Internal {
+        namespace: Arc<str>,
+        module: Arc<str>,
+        chosen: VersionedCandidate,
+    },
+    External {
+        host: String,
+        dest_uri: http::Uri,
+    },
+    Reject(StatusCode, String),
+}
 
 pub struct RoutingLayer {
     table: CachedRoutingTable,
     /// This proxy's own address — used to distinguish local vs. remote rules.
-    self_proxy_address: Arc<str>,
-    /// Monotonic counters per (namespace, module, version) for round-robin selection.
-    counters: RoundRobinCounters,
+    self_peer_address: Arc<str>,
     /// Egress allowlist patterns. Only destinations matching one of these
     /// patterns are forwarded via egress; all other unroutable destinations
     /// get a 503. Empty means egress is disabled.
@@ -36,11 +64,10 @@ pub struct RoutingLayer {
 }
 
 impl RoutingLayer {
-    pub fn new(table: CachedRoutingTable, self_proxy_address: impl Into<String>) -> Self {
+    pub fn new(table: CachedRoutingTable, self_peer_address: impl Into<String>) -> Self {
         Self {
             table,
-            self_proxy_address: Arc::from(self_proxy_address.into()),
-            counters: Arc::new(Mutex::new(HashMap::new())),
+            self_peer_address: Arc::from(self_peer_address.into()),
             egress_allowed_domains: Arc::new(Vec::new()),
         }
     }
@@ -63,8 +90,7 @@ impl<S> Layer<S> for RoutingLayer {
         RoutingService {
             inner,
             table: self.table.clone(),
-            self_proxy_address: self.self_proxy_address.clone(),
-            counters: self.counters.clone(),
+            self_peer_address: self.self_peer_address.clone(),
             egress_allowed_domains: self.egress_allowed_domains.clone(),
         }
     }
@@ -74,124 +100,145 @@ impl<S> Layer<S> for RoutingLayer {
 pub struct RoutingService<S> {
     inner: S,
     table: CachedRoutingTable,
-    self_proxy_address: Arc<str>,
-    counters: RoundRobinCounters,
+    self_peer_address: Arc<str>,
     egress_allowed_domains: Arc<Vec<String>>,
 }
 
 // ── Routing helpers ─────────────────────────────────────────────────────────
 
-/// Parse the x-wr-destination header into (namespace, module) and the raw URI.
-#[allow(clippy::type_complexity)]
-fn parse_destination(
-    headers: &http::HeaderMap,
-) -> Result<(Arc<str>, Arc<str>, Option<http::Uri>), String> {
-    let dest_uri: Option<http::Uri> = headers
-        .get("x-wr-destination")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok());
-
-    let host = dest_uri
-        .as_ref()
-        .and_then(|u: &http::Uri| u.host())
-        .unwrap_or("");
-
-    match host.split_once('.') {
-        Some((ns, svc)) => Ok((Arc::from(ns), Arc::from(svc), dest_uri)),
-        None => Err(format!(
-            "destination host '{host}' must use the format \
-             '{{namespace}}.{{service}}' — namespace is required"
-        )),
-    }
-}
-
 fn make_destination(
     rule: &wr_common::wruntime::RoutingRule,
-    self_proxy_address: &str,
+    self_peer_address: &str,
 ) -> Destination {
-    if rule.proxy_address == self_proxy_address {
+    if rule.peer_address == self_peer_address {
         Destination::LocalEngine(Arc::from(rule.engine_address.as_str()))
     } else {
-        Destination::RemoteProxy(Arc::from(rule.proxy_address.as_str()))
+        Destination::RemoteProxy(Arc::from(rule.peer_address.as_str()))
     }
 }
 
-/// Resolve candidates from the indexed routing table.
-///
-/// When a version requirement is provided (`x-wr-version` header), returns only
-/// candidates matching the highest satisfying semver version.
-///
-/// When no version is specified, returns **all** healthy candidates regardless
-/// of version so traffic is spread across every available engine.  The first
-/// element of the returned tuple is the round-robin key version: the resolved
-/// version when pinned, or an empty string when unversioned (so all candidates
-/// share a single counter).
-async fn resolve_candidates(
-    table: &CachedRoutingTable,
-    namespace: &str,
-    module: &str,
-    requested_version: &Option<String>,
-    self_proxy_address: &str,
-) -> (Arc<str>, Vec<VersionedCandidate>) {
-    let t = table.read().await;
-    let rules = t.get(namespace, module);
-
-    if rules.is_empty() {
-        return (Arc::from(""), vec![]);
-    }
-
-    if let Some(ref version_str) = requested_version {
-        // Filter the (already small) per-module group using pre-parsed versions.
-        let req = semver::VersionReq::parse(version_str).ok();
-        let satisfying: Vec<&ParsedRule> = rules
-            .iter()
-            .filter(|r| match (&req, &r.parsed_version) {
-                (Some(req), Some(v)) => req.matches(v),
-                (None, _) => r.rule.destination_version == *version_str,
-                _ => false,
-            })
-            .collect();
-
-        if satisfying.is_empty() {
-            return (Arc::from(version_str.as_str()), vec![]);
+/// Classify an `x-wr-destination` into an internal module route or an external
+/// egress target. Route-aware: a two-label host is Internal only when a route
+/// exists for `(namespace, module)`; otherwise, an egress-allowlisted host is
+/// External. Returns `Err((status, message))` for malformed input (400) or for
+/// a destination that is neither routable nor allowlisted (503).
+fn classify_destination(
+    table: &IndexedRoutingTable,
+    egress_allowed_domains: &[String],
+    dest_uri: Option<http::Uri>,
+) -> Result<ParsedDestination, (StatusCode, String)> {
+    let uri = match dest_uri {
+        Some(u) => u,
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "missing or malformed x-wr-destination header".to_string(),
+            ))
         }
+    };
+    let host = match uri.host() {
+        Some(h) if !h.is_empty() => h.to_string(),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "x-wr-destination has no host".to_string(),
+            ))
+        }
+    };
 
-        // satisfying is already sorted descending (inherits order from the index).
-        let best_ver = &satisfying[0].rule.destination_version;
-        let cands = satisfying
-            .iter()
-            .take_while(|r| r.rule.destination_version == *best_ver)
-            .map(|r| VersionedCandidate {
-                dest: make_destination(&r.rule, self_proxy_address),
-                version: Arc::from(best_ver.as_str()),
-            })
-            .collect();
-        (Arc::from(best_ver.as_str()), cands)
-    } else {
-        // No version requested — load-balance across all healthy candidates
-        // regardless of version.
-        let cands = rules
-            .iter()
-            .map(|r| VersionedCandidate {
-                dest: make_destination(&r.rule, self_proxy_address),
-                version: Arc::from(r.rule.destination_version.as_str()),
-            })
-            .collect();
-        (Arc::from(""), cands)
+    // A single-label host (no dot) is a malformed internal destination: the
+    // namespace is missing. Return 400 regardless of egress configuration.
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "destination host '{host}' is missing a namespace (expected '{{namespace}}.{{module}}')"
+            ),
+        ));
     }
+
+    // Internal: exactly two dot-separated labels AND a route exists for them.
+    if labels.len() == 2 && !labels[0].is_empty() && !labels[1].is_empty() {
+        let namespace: Arc<str> = Arc::from(labels[0]);
+        let module: Arc<str> = Arc::from(labels[1]);
+        if table.get(&namespace, &module).is_some() {
+            return Ok(ParsedDestination::Internal {
+                namespace,
+                module,
+                uri,
+            });
+        }
+    }
+
+    // External: egress configured AND the full host matches the allowlist.
+    let host_lc = host.to_ascii_lowercase();
+    if !egress_allowed_domains.is_empty()
+        && egress_allowed_domains
+            .iter()
+            .any(|pattern| domain_matches(pattern, &host_lc))
+    {
+        return Ok(ParsedDestination::External { host: host_lc, uri });
+    }
+
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("no route for destination '{host}'"),
+    ))
 }
 
-/// Pick a candidate via round-robin from the counter map.
-fn select_round_robin(
-    counters: &RoundRobinCounters,
-    key: (Arc<str>, Arc<str>, Arc<str>),
-    candidates: &[VersionedCandidate],
-) -> VersionedCandidate {
-    let mut map = counters.lock().unwrap();
-    let counter = map.entry(key).or_insert(0);
-    let idx = *counter % candidates.len();
-    *counter = counter.wrapping_add(1);
-    candidates[idx].clone()
+/// Round-robin select one candidate from a route group, honoring an optional
+/// version requirement. Returns `None` when no candidate satisfies the request.
+///
+/// Unpinned (no `x-wr-version`): spread across all versions via
+/// `all_versions_counter`. Pinned semver: pick the highest satisfying version
+/// (candidates are pre-sorted descending), then round-robin within that
+/// version's `VersionGroup::counter`. Exact non-semver string: direct
+/// `by_version` lookup.
+fn select_candidate(
+    group: &RouteGroup,
+    requested_version: &Option<String>,
+    self_peer_address: &str,
+) -> Option<VersionedCandidate> {
+    let make = |r: &crate::indexed_routing::ParsedRule| VersionedCandidate {
+        dest: make_destination(&r.rule, self_peer_address),
+        version: Arc::from(r.rule.destination_version.as_str()),
+    };
+
+    match requested_version {
+        None => {
+            let len = group.candidates.len();
+            if len == 0 {
+                return None;
+            }
+            let idx = group.all_versions_counter.fetch_add(1, Ordering::Relaxed) % len;
+            Some(make(&group.candidates[idx]))
+        }
+        Some(version_str) => {
+            let req = semver::VersionReq::parse(version_str).ok();
+            let best_ver: Arc<str> = match req {
+                Some(req) => group
+                    .candidates
+                    .iter()
+                    .find(|r| r.parsed_version.as_ref().is_some_and(|v| req.matches(v)))
+                    .map(|r| Arc::from(r.rule.destination_version.as_str()))?,
+                None => {
+                    if group.by_version.contains_key(version_str.as_str()) {
+                        Arc::from(version_str.as_str())
+                    } else {
+                        return None;
+                    }
+                }
+            };
+            let vg = group.by_version.get(&best_ver)?;
+            let len = vg.candidate_indexes.len();
+            if len == 0 {
+                return None;
+            }
+            let slot = vg.counter.fetch_add(1, Ordering::Relaxed) % len;
+            Some(make(&group.candidates[vg.candidate_indexes[slot]]))
+        }
+    }
 }
 
 /// Inject x-wr-namespace, x-wr-module, and x-wr-version headers.
@@ -202,15 +249,15 @@ fn inject_routing_headers(
     version: &str,
 ) {
     if let Ok(v) = http::HeaderValue::from_str(namespace) {
-        req.headers_mut().insert("x-wr-namespace", v);
+        req.headers_mut().insert(WR_NAMESPACE, v);
     }
     if !module.is_empty() {
         if let Ok(v) = http::HeaderValue::from_str(module) {
-            req.headers_mut().insert("x-wr-module", v);
+            req.headers_mut().insert(WR_MODULE, v);
         }
     }
     if let Ok(v) = http::HeaderValue::from_str(version) {
-        req.headers_mut().insert("x-wr-version", v);
+        req.headers_mut().insert(WR_VERSION, v);
     }
 }
 
@@ -232,94 +279,191 @@ where
 
     fn call(&mut self, mut req: Request<ProxyBody>) -> Self::Future {
         let table = self.table.clone();
-        let counters = self.counters.clone();
-        let self_proxy_address = self.self_proxy_address.clone();
+        let self_peer_address = self.self_peer_address.clone();
         let egress_allowed_domains = self.egress_allowed_domains.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            let (dest_namespace, module_name, dest_uri) = match parse_destination(req.headers()) {
-                Ok(v) => v,
-                Err(msg) => return Ok(error_response(StatusCode::BAD_REQUEST, &msg)),
+            let dest_uri: Option<http::Uri> = req
+                .headers()
+                .get(WR_DESTINATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+
+            let requested_version: Option<String> = req
+                .headers()
+                .get(WR_VERSION)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            // Classify + (for internal) select under a single read guard so no
+            // table state is borrowed once we start forwarding.
+            let outcome = {
+                let t = table.read().await;
+                match classify_destination(&t, &egress_allowed_domains, dest_uri) {
+                    Err((status, msg)) => RouteOutcome::Reject(status, msg),
+                    Ok(ParsedDestination::External { host, uri }) => RouteOutcome::External {
+                        host,
+                        dest_uri: uri,
+                    },
+                    Ok(ParsedDestination::Internal {
+                        namespace, module, ..
+                    }) => {
+                        let chosen = t.get(&namespace, &module).and_then(|group| {
+                            select_candidate(group, &requested_version, &self_peer_address)
+                        });
+                        match chosen {
+                            Some(chosen) => RouteOutcome::Internal {
+                                namespace,
+                                module,
+                                chosen,
+                            },
+                            None => {
+                                let msg = match &requested_version {
+                                    Some(v) => format!(
+                                        "no route for module '{namespace}.{module}' matching version requirement '{v}'"
+                                    ),
+                                    None => format!("no route for module '{namespace}.{module}'"),
+                                };
+                                RouteOutcome::Reject(StatusCode::SERVICE_UNAVAILABLE, msg)
+                            }
+                        }
+                    }
+                }
             };
 
             let span = info_span!(
                 "proxy.route",
-                wr.module        = %module_name,
-                wr.namespace     = %dest_namespace,
-                wr.version       = tracing::field::Empty,
-                wr.engine        = tracing::field::Empty,
+                wr.module = tracing::field::Empty,
+                wr.namespace = tracing::field::Empty,
+                wr.version = tracing::field::Empty,
+                wr.engine = tracing::field::Empty,
                 otel.status_code = tracing::field::Empty,
             );
 
-            let requested_version: Option<String> = req
-                .headers()
-                .get("x-wr-version")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-
-            let (resolved_version, candidates) = resolve_candidates(
-                &table,
-                &dest_namespace,
-                &module_name,
-                &requested_version,
-                &self_proxy_address,
-            )
-            .await;
-
-            if candidates.is_empty() {
-                // Check egress allowlist before returning 503.
-                let egress_host = dest_uri
-                    .as_ref()
-                    .and_then(|u| u.host())
-                    .map(|h| h.to_ascii_lowercase());
-
-                let egress_allowed = egress_host.as_ref().is_some_and(|host| {
-                    egress_allowed_domains
-                        .iter()
-                        .any(|pattern| domain_matches(pattern, host))
-                });
-
-                if egress_allowed {
-                    let host = egress_host.unwrap();
-                    req.extensions_mut().insert(ExternalEgress {
-                        host,
-                        dest_uri: dest_uri.unwrap().clone(),
-                    });
-                    return inner.call(req).instrument(span).await;
+            match outcome {
+                RouteOutcome::Internal {
+                    namespace,
+                    module,
+                    chosen,
+                } => {
+                    span.record("wr.namespace", &*namespace);
+                    span.record("wr.module", &*module);
+                    span.record("wr.version", &*chosen.version);
+                    span.record("wr.engine", chosen.dest.address());
+                    inject_routing_headers(&mut req, &namespace, &module, &chosen.version);
+                    req.extensions_mut()
+                        .insert(ResolvedDestination(chosen.dest));
+                    inner.call(req).instrument(span).await
                 }
-
-                let msg = match requested_version {
-                    Some(v) => format!(
-                        "no route for module '{module_name}.{dest_namespace}' matching version requirement '{v}'"
-                    ),
-                    None => format!("no route for module '{module_name}.{dest_namespace}'"),
-                };
-                span.record("otel.status_code", "ERROR");
-                return Ok(error_response(StatusCode::SERVICE_UNAVAILABLE, &msg));
+                RouteOutcome::External { host, dest_uri } => {
+                    req.extensions_mut()
+                        .insert(ExternalEgress { host, dest_uri });
+                    inner.call(req).instrument(span).await
+                }
+                RouteOutcome::Reject(status, msg) => {
+                    span.record("otel.status_code", "ERROR");
+                    Ok(error_response(status, &msg))
+                }
             }
-
-            let chosen = select_round_robin(
-                &counters,
-                (
-                    dest_namespace.clone(),
-                    module_name.clone(),
-                    resolved_version.clone(),
-                ),
-                &candidates,
-            );
-            let first_addr = chosen.dest.address();
-
-            // Use the selected candidate's version for the header — this
-            // matters when no version was requested and candidates span
-            // multiple versions.
-            inject_routing_headers(&mut req, &dest_namespace, &module_name, &chosen.version);
-            span.record("wr.version", &*chosen.version);
-            span.record("wr.engine", first_addr);
-
-            req.extensions_mut()
-                .insert(ResolvedDestination(chosen.dest));
-            inner.call(req).instrument(span).await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::indexed_routing::IndexedRoutingTable;
+    use wr_common::wruntime::{RoutingRule, RoutingTable};
+
+    fn rule(ns: &str, module: &str, version: &str) -> RoutingRule {
+        RoutingRule {
+            rule_id: format!("{ns}/{module}/{version}"),
+            source_module: String::new(),
+            destination_module: module.to_string(),
+            engine_id: "e1".to_string(),
+            engine_address: format!("http://engine-{version}"),
+            destination_version: version.to_string(),
+            healthy: true,
+            source_namespace: String::new(),
+            destination_namespace: ns.to_string(),
+            peer_address: "http://self-peer".to_string(),
+        }
+    }
+
+    fn table_with(rules: Vec<RoutingRule>) -> IndexedRoutingTable {
+        IndexedRoutingTable::from_proto(&RoutingTable { rules, version: 1 }, None)
+    }
+
+    fn uri(s: &str) -> Option<http::Uri> {
+        s.parse().ok()
+    }
+
+    #[test]
+    fn classify_two_label_with_route_is_internal() {
+        let t = table_with(vec![rule("store", "inventory", "1.0.0")]);
+        match classify_destination(&t, &[], uri("http://store.inventory/Ping")).unwrap() {
+            ParsedDestination::Internal {
+                namespace, module, ..
+            } => {
+                assert_eq!(&*namespace, "store");
+                assert_eq!(&*module, "inventory");
+            }
+            _ => panic!("expected Internal"),
+        }
+    }
+
+    #[test]
+    fn classify_two_label_no_route_allowlisted_is_external() {
+        let t = table_with(vec![]);
+        let domains = vec!["example.com".to_string()];
+        assert!(matches!(
+            classify_destination(&t, &domains, uri("http://example.com/x")).unwrap(),
+            ParsedDestination::External { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_two_label_no_route_no_egress_is_503() {
+        let t = table_with(vec![]);
+        let err = classify_destination(&t, &[], uri("http://example.com/x")).unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn classify_multi_label_allowlisted_is_external() {
+        let t = table_with(vec![]);
+        let domains = vec!["*.openai.com".to_string()];
+        assert!(matches!(
+            classify_destination(&t, &domains, uri("http://api.openai.com/v1")).unwrap(),
+            ParsedDestination::External { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_multi_label_not_allowlisted_is_503() {
+        let t = table_with(vec![]);
+        let err = classify_destination(&t, &[], uri("http://api.openai.com/v1")).unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn classify_missing_destination_is_400() {
+        let t = table_with(vec![]);
+        let err = classify_destination(&t, &[], None).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn select_candidate_unpinned_spreads_across_versions() {
+        let t = table_with(vec![rule("ns", "svc", "1.0.0"), rule("ns", "svc", "2.0.0")]);
+        let group = t.get("ns", "svc").unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..6 {
+            let c = select_candidate(group, &None, "http://self-peer").unwrap();
+            seen.insert(c.version.to_string());
+        }
+        assert!(seen.contains("1.0.0"));
+        assert!(seen.contains("2.0.0"));
     }
 }

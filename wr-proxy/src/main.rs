@@ -57,13 +57,15 @@ async fn main() -> Result<()> {
     discovery.spawn_refresh_task();
     info!("manager discovery initialized");
 
+    let self_address = config.node.peer_address();
+
     // ── Initial routing table sync (blocks until first fetch succeeds) ──
     {
         let mut client = discovery
             .get_client()
             .await
             .map_err(|e| anyhow::anyhow!("initial manager connect failed: {e}"))?;
-        routing::sync_once(&mut client, &routing_table, &cb_registry)
+        routing::sync_once(&mut client, &routing_table, &cb_registry, &self_address)
             .await
             .context("initial routing table sync failed")?;
         info!("initial routing table sync complete");
@@ -75,6 +77,7 @@ async fn main() -> Result<()> {
         routing_table.clone(),
         config.cache.routing_table_ttl_secs,
         cb_registry.clone(),
+        self_address.clone(),
     ));
 
     // ── NodeService gRPC control plane ───────────────────────────────────
@@ -99,19 +102,6 @@ async fn main() -> Result<()> {
         mtls_client_config,
     );
     let tls_acceptor = wr_common::tls::build_acceptor(&config.node.tls)?;
-    let self_address = config.node.peer_address();
-
-    // Warn if internal listener binds to a non-loopback interface
-    if !config.listen_address.starts_with("127.0.0.1:")
-        && !config.listen_address.starts_with("localhost:")
-    {
-        warn!(
-            "listen_address binds to a non-loopback interface — \
-             internal traffic should be loopback only; \
-             network traffic uses the mTLS peer listener on port {}",
-            config.node.peer_port
-        );
-    }
 
     // ── Internal Tower service stack ──────────────────────────────────────
     //

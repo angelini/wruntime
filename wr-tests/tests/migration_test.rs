@@ -31,7 +31,7 @@ async fn test_concurrent_run_migrations_cold_race() -> Result<()> {
         .iter()
         .map(|r| r.get(0))
         .collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 
     Ok(())
 }
@@ -57,7 +57,7 @@ async fn test_run_migrations_second_run_is_noop() -> Result<()> {
         .iter()
         .map(|r| r.get(0))
         .collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 
     Ok(())
 }

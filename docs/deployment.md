@@ -204,6 +204,8 @@ wr-cli node bundle --engine-config examples/multi-node/node-b/engine-1.toml --ou
 wr-cli node deploy node-b.tar.gz deploy@10.0.1.51
 ```
 
+Each node's proxy/engine internal listeners (`listen_address`, `control_address`) bind loopback; only the proxy's mTLS peer listener (`peer_port`, default 9443) is reachable across nodes. The example configs above bind loopback accordingly.
+
 Without the config file, pass all values explicitly:
 
 ```bash

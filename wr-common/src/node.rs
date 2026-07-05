@@ -1,3 +1,5 @@
+use std::net::{IpAddr, SocketAddr};
+
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -20,6 +22,31 @@ pub struct NodeConfig {
 
 fn default_peer_port() -> u16 {
     9443
+}
+
+/// Returns `true` if `addr` binds a loopback interface.
+///
+/// Accepts an optional `http://`/`https://` scheme, an optional port, bracketed
+/// IPv6 (`[::1]:9001`), and the literal host `localhost` (matched WITHOUT DNS
+/// resolution). Any authority that fails to parse is treated as NON-loopback so
+/// it becomes a hard config error rather than being silently accepted.
+pub fn is_loopback_addr(addr: &str) -> bool {
+    let authority = addr
+        .strip_prefix("http://")
+        .or_else(|| addr.strip_prefix("https://"))
+        .unwrap_or(addr);
+
+    if let Ok(sock) = authority.parse::<SocketAddr>() {
+        return sock.ip().is_loopback();
+    }
+    if let Ok(ip) = authority.parse::<IpAddr>() {
+        return ip.is_loopback();
+    }
+
+    // Not an IP literal: accept only the explicit host `localhost`
+    // (with or without a port); never resolve DNS.
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
+    host == "localhost"
 }
 
 /// TLS certificate paths for mutual TLS authentication.
@@ -117,5 +144,32 @@ mod tests {
     fn missing_tls_fails() {
         let toml = r#"proxy_address = "http://127.0.0.1:9001""#;
         assert!(toml::from_str::<NodeConfig>(toml).is_err());
+    }
+
+    #[test]
+    fn is_loopback_addr_accepts_loopback() {
+        assert!(is_loopback_addr("127.0.0.1:9001"));
+        assert!(is_loopback_addr("http://127.0.0.1:9001"));
+        assert!(is_loopback_addr("https://127.0.0.1:9001"));
+        assert!(is_loopback_addr("[::1]:9001"));
+        assert!(is_loopback_addr("localhost:9001"));
+        assert!(is_loopback_addr("localhost"));
+        assert!(is_loopback_addr("127.0.0.1"));
+        assert!(is_loopback_addr("::1"));
+    }
+
+    #[test]
+    fn is_loopback_addr_rejects_non_loopback() {
+        assert!(!is_loopback_addr("0.0.0.0:9001"));
+        assert!(!is_loopback_addr("192.168.1.5:9001"));
+        assert!(!is_loopback_addr("::"));
+    }
+
+    #[test]
+    fn is_loopback_addr_rejects_malformed() {
+        assert!(!is_loopback_addr(""));
+        assert!(!is_loopback_addr("http://"));
+        assert!(!is_loopback_addr("nonsense"));
+        assert!(!is_loopback_addr("example.com:80"));
     }
 }

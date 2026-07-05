@@ -8,6 +8,7 @@ use tower::{Layer, Service};
 
 use super::{error_response, ProxyBody, ResBody};
 use crate::config::ExternalRoute;
+use wr_common::http_headers::{strip_external_spoofable_headers, WR_DESTINATION, WR_SOURCE};
 
 pub struct IngressLayer {
     routes: Arc<Vec<ExternalRoute>>,
@@ -82,17 +83,7 @@ where
 
             // Strip all x-wr-* headers to prevent external callers from spoofing
             // internal routing identity.
-            for name in &[
-                "x-wr-destination",
-                "x-wr-source",
-                "x-wr-source-ns",
-                "x-wr-module",
-                "x-wr-namespace",
-                "x-wr-version",
-                "x-wr-via-proxy",
-            ] {
-                parts.headers.remove(*name);
-            }
+            strip_external_spoofable_headers(&mut parts.headers);
 
             // Match the request against the configured public routes.
             let matched = match router.at(&path) {
@@ -124,11 +115,11 @@ where
             // Set routing headers and pass through to the inner stack.
             let dest = format!("http://{namespace}.{module}/");
             if let Ok(v) = http::HeaderValue::from_str(&dest) {
-                parts.headers.insert("x-wr-destination", v);
+                parts.headers.insert(WR_DESTINATION, v);
             }
             parts
                 .headers
-                .insert("x-wr-source", http::HeaderValue::from_static("external"));
+                .insert(WR_SOURCE, http::HeaderValue::from_static("external"));
             inner.call(Request::from_parts(parts, body)).await
         })
     }

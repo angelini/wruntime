@@ -59,13 +59,13 @@ for ((i=0; i<NUM_EXCHANGES; i++)); do
     port=$((EXCHANGE_BASE_PORT + i))
     cfg="/tmp/sm-exchange-${i}.toml"
     cp examples/stockmarket/engine-exchange.toml "$cfg"
-    sed_replace "$cfg" "0.0.0.0:9100" "0.0.0.0:${port}"
+    sed_replace "$cfg" "127.0.0.1:9100" "127.0.0.1:${port}"
     update_config "$cfg"
 done
 
 # ── Generate ledger engine config ────────────────────────────────────────
 cp examples/stockmarket/engine-ledger.toml /tmp/sm-ledger.toml
-sed_replace /tmp/sm-ledger.toml "0.0.0.0:9101" "0.0.0.0:${LEDGER_PORT}"
+sed_replace /tmp/sm-ledger.toml "127.0.0.1:9101" "127.0.0.1:${LEDGER_PORT}"
 update_config /tmp/sm-ledger.toml
 
 # ── Prepare manager + proxy configs ──────────────────────────────────────

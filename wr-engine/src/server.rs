@@ -38,9 +38,9 @@ pub async fn serve(addr: &str, registry: ModuleRegistry, db_pool: Option<Arc<Poo
                 let registry = registry.clone();
                 let db_pool = db_pool.clone();
                 async move {
-                    let namespace = header_owned(req.headers(), "x-wr-namespace");
-                    let module = header_owned(req.headers(), "x-wr-module");
-                    let version = header_owned(req.headers(), "x-wr-version");
+                    let namespace = header_owned(req.headers(), WR_NAMESPACE);
+                    let module = header_owned(req.headers(), WR_MODULE);
+                    let version = header_owned(req.headers(), WR_VERSION);
                     let method = req.method().to_string();
                     let path = req.uri().path().to_string();
 
@@ -104,7 +104,7 @@ async fn handle(
     // know which module instance to dispatch to.
     let namespace = match req
         .headers()
-        .get("x-wr-namespace")
+        .get(WR_NAMESPACE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
     {
@@ -114,7 +114,7 @@ async fn handle(
 
     let module = match req
         .headers()
-        .get("x-wr-module")
+        .get(WR_MODULE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
     {
@@ -124,7 +124,7 @@ async fn handle(
 
     let version = match req
         .headers()
-        .get("x-wr-version")
+        .get(WR_VERSION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
     {
@@ -179,7 +179,7 @@ async fn handle(
     }
 }
 
-use wr_common::http_headers::header_owned;
+use wr_common::http_headers::{header_owned, WR_MODULE, WR_NAMESPACE, WR_VERSION};
 
 fn too_many_requests(module: &str) -> Response<Full<Bytes>> {
     let body = json!({

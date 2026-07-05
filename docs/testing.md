@@ -13,7 +13,7 @@ The `wr-tests` crate contains integration tests that spin up in-process instance
 - Proxy routing end-to-end with a stub engine
 - Schema validation: invalid protobuf bodies rejected with `400`; unknown method paths rejected with `404`; missing schema returns `503`
 - All three example TOML files parse without error
-- Version routing: `x-wr-version` header routes to the correct instance; no header routes to the highest semver
+- Version routing: `x-wr-version` header routes to the correct instance; no header load-balances across all healthy versions
 - Returns 503 when the requested version has no healthy instance
 - Load balancing: requests distributed across multiple instances of the same `(module, version)`
 - Failover: deregistering an instance immediately redirects traffic to remaining healthy instances

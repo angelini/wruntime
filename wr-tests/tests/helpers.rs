@@ -296,7 +296,7 @@ pub async fn register_test_module(
         EngineSpec {
             id: engine_id,
             addr: engine_addr,
-            proxy_address: "",
+            peer_address: TEST_SELF_PEER,
         },
         ModuleSpec {
             namespace,
@@ -350,13 +350,18 @@ pub async fn get_routing_table_version(
 
 // ── Proxy ─────────────────────────────────────────────────────────────────────
 
+/// Non-empty sentinel peer address for single-node tests.  Shared by the
+/// engine-registration helpers and the proxy start helpers so that
+/// `rule.peer_address == self_peer_address` holds and dispatch stays local.
+pub const TEST_SELF_PEER: &str = "http://test-node";
+
 /// Identifies an engine instance and the node it belongs to.
 pub struct EngineSpec<'a> {
     pub id: &'a str,
     pub addr: &'a str,
-    /// Node proxy address for local-vs-remote dispatch.  Use `""` in
-    /// single-node tests where cross-node routing is not exercised.
-    pub proxy_address: &'a str,
+    /// Peer address for local-vs-remote dispatch.  Use [`TEST_SELF_PEER`] in
+    /// single-node tests so `peer == self` yields local dispatch.
+    pub peer_address: &'a str,
 }
 
 /// Identifies a single WASM module hosted by an engine.
@@ -379,8 +384,8 @@ pub async fn register_module(
         registration: Some(EngineRegistration {
             engine_id: engine.id.into(),
             address: engine.addr.into(),
-            proxy_address: engine.proxy_address.into(),
-            peer_address: engine.proxy_address.into(),
+            proxy_address: engine.peer_address.into(),
+            peer_address: engine.peer_address.into(),
             modules: vec![ModuleDescriptor {
                 name: module.name.into(),
                 namespace: module.namespace.into(),
@@ -404,8 +409,7 @@ pub async fn register_module(
         destination_version: module.version.into(),
         engine_id: engine.id.into(),
         engine_address: engine.addr.into(),
-        proxy_address: engine.proxy_address.into(),
-        peer_address: engine.proxy_address.into(),
+        peer_address: engine.peer_address.into(),
         healthy: false, // manager overrides to true on upsert
     })
     .await?;
@@ -425,25 +429,25 @@ pub async fn sync_table(
         .table
     {
         *table.write().await =
-            wr_proxy::indexed_routing::IndexedRoutingTable::from_proto(&incoming);
+            wr_proxy::indexed_routing::IndexedRoutingTable::from_proto(&incoming, None);
     }
     Ok(())
 }
 
 /// Build and start a proxy; returns the bound address.
 pub async fn start_proxy(table: wr_proxy::routing::CachedRoutingTable) -> Result<SocketAddr> {
-    start_proxy_on(table, "").await
+    start_proxy_on(table, TEST_SELF_PEER).await
 }
 
-/// Build and start a proxy with a custom `self_proxy_address`; returns the bound address.
+/// Build and start a proxy with a custom `self_peer_address`; returns the bound address.
 pub async fn start_proxy_on(
     table: wr_proxy::routing::CachedRoutingTable,
-    self_proxy_address: &str,
+    self_peer_address: &str,
 ) -> Result<SocketAddr> {
     let svc = tower::ServiceBuilder::new()
         .layer(wr_proxy::layers::RoutingLayer::new(
             table,
-            self_proxy_address,
+            self_peer_address,
         ))
         .service(wr_proxy::layers::ForwardService::new(
             std::sync::Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
@@ -465,7 +469,7 @@ pub async fn start_ingress_proxy(
 ) -> Result<SocketAddr> {
     let svc = tower::ServiceBuilder::new()
         .layer(wr_proxy::layers::IngressLayer::new(routes))
-        .layer(wr_proxy::layers::RoutingLayer::new(table, ""))
+        .layer(wr_proxy::layers::RoutingLayer::new(table, TEST_SELF_PEER))
         .service(wr_proxy::layers::ForwardService::new(
             std::sync::Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
                 Default::default(),
@@ -490,7 +494,9 @@ pub async fn start_egress_proxy(
         .map(|e| e.allowed_domains.clone())
         .unwrap_or_default();
     let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::RoutingLayer::new(table, "").with_egress(egress_domains))
+        .layer(
+            wr_proxy::layers::RoutingLayer::new(table, TEST_SELF_PEER).with_egress(egress_domains),
+        )
         .layer(wr_proxy::layers::EgressLayer::new(egress_cfg))
         .service(wr_proxy::layers::ForwardService::new(
             Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
@@ -935,7 +941,7 @@ pub async fn start_proxy_with_cb(
     cb_config: wr_proxy::config::CircuitBreakerConfig,
 ) -> Result<SocketAddr> {
     let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::RoutingLayer::new(table, ""))
+        .layer(wr_proxy::layers::RoutingLayer::new(table, TEST_SELF_PEER))
         .service(wr_proxy::layers::ForwardService::new(
             Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
                 cb_config,

@@ -2,12 +2,19 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use serde::Deserialize;
-use wr_common::node::NodeConfig;
+use wr_common::node::{is_loopback_addr, NodeConfig};
 
 #[derive(Deserialize, Clone)]
 pub struct EngineConfig {
     /// Address this engine listens on for inbound requests from the proxy
     pub listen_address: String,
+    /// Escape hatch: permit `listen_address` to bind a non-loopback interface.
+    /// Defaults to `false` — engine listeners should be loopback (the local
+    /// proxy reaches them directly; cross-node traffic uses the mTLS peer
+    /// listener). Operators enabling this own reachability of the advertised
+    /// address (the `0.0.0.0`→`127.0.0.1` rewrite in main.rs stays same-host only).
+    #[serde(default)]
+    pub allow_non_loopback_internal: bool,
     /// Node configuration — identifies the local proxy for this engine.
     pub node: NodeConfig,
     #[serde(rename = "module", default)]
@@ -337,6 +344,11 @@ impl EngineConfig {
         v.check(
             !self.listen_address.is_empty(),
             "listen_address is required",
+        );
+        v.check(
+            self.allow_non_loopback_internal || is_loopback_addr(&self.listen_address),
+            "listen_address must bind to loopback (127.0.0.1, ::1, or localhost); \
+             set allow_non_loopback_internal = true to override",
         );
         v.check(
             !self.node.proxy_address.is_empty(),

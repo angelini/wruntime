@@ -59,6 +59,60 @@ async fn test_circuit_breaker_opens_after_consecutive_failures() -> Result<()> {
     Ok(())
 }
 
+/// The circuit breaker also protects the RemoteProxy forwarding path: after
+/// `failure_threshold` consecutive failures forwarding to an unreachable peer
+/// proxy, the circuit opens and rejects with 503 without attempting a forward.
+#[tokio::test]
+async fn test_circuit_breaker_opens_for_remote_peer() -> Result<()> {
+    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+
+    // peer_address ("https://127.0.0.1:1") differs from the proxy's self peer
+    // address (TEST_SELF_PEER) → make_destination yields RemoteProxy; the peer
+    // is unreachable so every forward fails.
+    register_module(
+        &mut mgr,
+        EngineSpec {
+            id: "cb-remote-e1",
+            addr: "http://127.0.0.1:1",
+            peer_address: "https://127.0.0.1:1",
+        },
+        ModuleSpec {
+            namespace: "cb-remote-ns",
+            name: "remote-svc",
+            version: "1.0.0",
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await?;
+
+    let table = synced_routing_table(&mgr_addr).await?;
+
+    let proxy = start_proxy_with_cb(
+        table,
+        CircuitBreakerConfig {
+            failure_threshold: 3,
+            open_duration_secs: 2,
+        },
+    )
+    .await?;
+
+    // First 3 requests attempt the remote forward and fail (counted as failures).
+    for _ in 0..3 {
+        let (status, _) = proxy_get(proxy, "cb-remote-ns", "remote-svc", Some("1.0.0")).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // 4th request: circuit is now OPEN — rejected as "circuit open".
+    let (status, body) = proxy_get(proxy, "cb-remote-ns", "remote-svc", Some("1.0.0")).await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        body.contains("circuit open"),
+        "expected circuit open body, got: {body}"
+    );
+
+    Ok(())
+}
+
 /// Verify the 503 response includes a `Retry-After` header matching the
 /// configured `open_duration_secs`.
 #[tokio::test]

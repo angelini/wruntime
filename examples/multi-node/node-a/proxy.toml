@@ -1,5 +1,5 @@
-listen_address  = "0.0.0.0:9001"
-control_address = "0.0.0.0:9002"
+listen_address  = "127.0.0.1:9001"
+control_address = "127.0.0.1:9002"
 
 [node]
 proxy_address = "http://127.0.0.1:9001" # this proxy's own address, as reachable by peers

@@ -148,9 +148,8 @@ pub async fn register_engine_and_routes(
     }
 
     // Publish one default routing rule per unique schema-bearing module tuple.
-    // Field values lifted verbatim from the old proxy path (node_service.rs:114-128):
     // source_* = "", destination_* = module tuple, engine_address = reg.address,
-    // proxy_address = peer_address, peer_address = peer_address, healthy = true.
+    // peer_address = reg.peer_address, healthy = true.
     let empty = String::new();
     let healthy = true;
     let mut seen = std::collections::HashSet::new();
@@ -181,8 +180,8 @@ pub async fn register_engine_and_routes(
             "INSERT INTO wr_routing_rules (
                 rule_id, source_namespace, source_module,
                 destination_namespace, destination_module, destination_version,
-                engine_id, engine_address, proxy_address, peer_address, healthy
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                engine_id, engine_address, peer_address, healthy
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (rule_id) DO UPDATE SET
                 source_namespace = EXCLUDED.source_namespace,
                 source_module = EXCLUDED.source_module,
@@ -191,7 +190,6 @@ pub async fn register_engine_and_routes(
                 destination_version = EXCLUDED.destination_version,
                 engine_id = EXCLUDED.engine_id,
                 engine_address = EXCLUDED.engine_address,
-                proxy_address = EXCLUDED.proxy_address,
                 peer_address = EXCLUDED.peer_address,
                 healthy = EXCLUDED.healthy,
                 updated_at = NOW()",
@@ -204,7 +202,6 @@ pub async fn register_engine_and_routes(
                 &module.version,
                 &reg.engine_id,
                 &reg.address,
-                &reg.peer_address,
                 &reg.peer_address,
                 &healthy,
             ],
@@ -459,6 +456,11 @@ pub async fn list_engines(pool: &Pool) -> Result<Vec<EngineRegistration>, Status
 /// Upsert a routing rule. Acquires the global lock and bumps the version.
 /// Retries automatically on NOWAIT lock contention with exponential backoff.
 pub async fn upsert_routing_rule(pool: &Pool, rule: &RoutingRule) -> Result<(), Status> {
+    if rule.peer_address.is_empty() {
+        return Err(Status::invalid_argument(
+            "routing rule peer_address must be non-empty",
+        ));
+    }
     RetryIf::start(
         lock_retry_strategy(),
         || upsert_routing_rule_once(pool, rule),
@@ -477,8 +479,8 @@ async fn upsert_routing_rule_once(pool: &Pool, rule: &RoutingRule) -> Result<(),
         "INSERT INTO wr_routing_rules (
             rule_id, source_namespace, source_module,
             destination_namespace, destination_module, destination_version,
-            engine_id, engine_address, proxy_address, peer_address, healthy
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            engine_id, engine_address, peer_address, healthy
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (rule_id) DO UPDATE SET
             source_namespace = EXCLUDED.source_namespace,
             source_module = EXCLUDED.source_module,
@@ -487,7 +489,6 @@ async fn upsert_routing_rule_once(pool: &Pool, rule: &RoutingRule) -> Result<(),
             destination_version = EXCLUDED.destination_version,
             engine_id = EXCLUDED.engine_id,
             engine_address = EXCLUDED.engine_address,
-            proxy_address = EXCLUDED.proxy_address,
             peer_address = EXCLUDED.peer_address,
             healthy = EXCLUDED.healthy,
             updated_at = NOW()",
@@ -500,7 +501,6 @@ async fn upsert_routing_rule_once(pool: &Pool, rule: &RoutingRule) -> Result<(),
             &rule.destination_version,
             &rule.engine_id,
             &rule.engine_address,
-            &rule.proxy_address,
             &rule.peer_address,
             &rule.healthy,
         ],
@@ -569,7 +569,7 @@ pub async fn get_routing_table(
         .query(
             "SELECT rule_id, source_namespace, source_module,
                     destination_namespace, destination_module, destination_version,
-                    engine_id, engine_address, proxy_address, healthy, peer_address
+                    engine_id, engine_address, healthy, peer_address
              FROM wr_routing_rules",
             &[],
         )
@@ -587,9 +587,8 @@ pub async fn get_routing_table(
             destination_version: row.get(5),
             engine_id: row.get(6),
             engine_address: row.get(7),
-            proxy_address: row.get(8),
-            healthy: row.get(9),
-            peer_address: row.get(10),
+            healthy: row.get(8),
+            peer_address: row.get(9),
         })
         .collect();
 
