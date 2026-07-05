@@ -239,7 +239,7 @@ impl EngineRunner {
     }
 
     /// Load and spawn a task for every module listed in the config, registering
-    /// HTTP-handler modules in `registry` so the inbound server can route to them.
+    /// each module for dispatch by service HTTP requests and worker jobs.
     pub async fn load_modules(
         &self,
         registry: &ModuleRegistry,
@@ -454,9 +454,8 @@ struct HandlerContext {
 
 /// Module identity and runtime config — shared across requests.
 ///
-/// All `String` fields that were cloned per-request are now `Arc<str>` or
-/// `Arc<HashMap>` so that cloning `ModuleContext` is O(1) reference-count
-/// bumps instead of O(n) heap copies.
+/// Uses `Arc<str>` and `Arc<HashMap>` fields so cloning `ModuleContext` is
+/// O(1) reference-count bumps.
 #[derive(Clone)]
 struct ModuleContext {
     name: Arc<str>,

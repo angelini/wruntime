@@ -2,7 +2,7 @@ listen_address  = "127.0.0.1:9001"
 control_address = "127.0.0.1:9002"
 
 [node]
-proxy_address = "http://127.0.0.1:9001" # this proxy's own address, as reachable by peers
+proxy_address = "http://127.0.0.1:9001" # local proxy address; mTLS peer address derives from this host + peer_port
 peer_port     = 9443
 
 [node.tls]

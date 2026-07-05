@@ -19,7 +19,7 @@ async fn test_register_and_list_engines() -> Result<()> {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9100".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "inventory-service".into(),
                 namespace: "store".into(),
@@ -53,7 +53,7 @@ async fn test_deregister_engine() -> Result<()> {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9101".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![],
             secrets: vec![],
             db_namespaces: vec![],
@@ -85,7 +85,7 @@ async fn test_heartbeat() -> Result<()> {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9102".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![],
             secrets: vec![],
             db_namespaces: vec![],
@@ -173,7 +173,7 @@ async fn test_get_schema_after_registration() -> Result<()> {
             engine_id: "schema-e1".into(),
             address: "http://127.0.0.1:9200".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "orders".into(),
                 namespace: "shop".into(),
@@ -275,7 +275,7 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
             engine_id: "ver-e1".into(),
             address: "http://127.0.0.1:9210".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "catalog".into(),
                 namespace: "retail".into(),
@@ -294,7 +294,7 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
             engine_id: "ver-e2".into(),
             address: "http://127.0.0.1:9211".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "catalog".into(),
                 namespace: "retail".into(),
@@ -343,7 +343,7 @@ async fn test_get_schema_cross_namespace_isolation() -> Result<()> {
             engine_id: "ns-e1".into(),
             address: "http://127.0.0.1:9220".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "gateway".into(),
                 namespace: "alpha".into(),
@@ -393,7 +393,7 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
             engine_id: "reup-e1".into(),
             address: "http://127.0.0.1:9230".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "payments".into(),
                 namespace: "billing".into(),
@@ -423,7 +423,7 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
             engine_id: "reup-e1".into(),
             address: "http://127.0.0.1:9230".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "payments".into(),
                 namespace: "billing".into(),
@@ -466,7 +466,7 @@ async fn test_get_schema_multi_module_engine() -> Result<()> {
             engine_id: "multi-e1".into(),
             address: "http://127.0.0.1:9240".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![
                 ModuleDescriptor {
                     name: "auth".into(),
@@ -552,7 +552,6 @@ async fn test_register_engine_creates_default_routing_rule() -> Result<()> {
     assert_eq!(r.destination_version, "1.0.0");
     assert_eq!(r.engine_id, "route-e1");
     assert_eq!(r.engine_address, "http://127.0.0.1:9600");
-    assert_eq!(r.proxy_address, "https://127.0.0.1:9443");
     assert_eq!(r.peer_address, "https://127.0.0.1:9443");
     assert_eq!(r.source_namespace, "");
     assert_eq!(r.source_module, "");
@@ -570,7 +569,7 @@ async fn test_register_engine_dedups_duplicate_module_instances() -> Result<()> 
             engine_id: "dup-e1".into(),
             address: "http://127.0.0.1:9610".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![
                 ModuleDescriptor {
                     name: "inventory".into(),
@@ -612,7 +611,7 @@ async fn test_register_engine_missing_schema_rejected_no_writes() -> Result<()> 
                 engine_id: "badschema-e1".into(),
                 address: "http://127.0.0.1:9620".into(),
                 proxy_address: String::new(),
-                peer_address: String::new(),
+                peer_address: TEST_SELF_PEER.into(),
                 modules: vec![ModuleDescriptor {
                     name: "inventory".into(),
                     namespace: "store".into(),
@@ -663,7 +662,7 @@ async fn test_register_engine_missing_secret_leaves_no_routes() -> Result<()> {
                 engine_id: "secret-e1".into(),
                 address: "http://127.0.0.1:9630".into(),
                 proxy_address: String::new(),
-                peer_address: String::new(),
+                peer_address: TEST_SELF_PEER.into(),
                 modules: vec![ModuleDescriptor {
                     name: "inventory".into(),
                     namespace: "store".into(),
@@ -812,7 +811,7 @@ async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Re
             engine_id: "recon-e2".into(),
             address: "http://127.0.0.1:9650".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "inventory".into(),
                 namespace: "store".into(),
@@ -837,7 +836,7 @@ async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Re
             engine_id: "recon-e2".into(),
             address: "http://127.0.0.1:9650".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![],
             secrets: vec![],
             db_namespaces: vec![],

@@ -10,8 +10,8 @@ cert_path    = "certs/127.0.0.1.crt"
 key_path     = "certs/127.0.0.1.key"
 ca_cert_path = "certs/ca.crt"
 
-# Three instances of the same client module — the proxy load-balances Run requests
-# across all three, so concurrent callers each land on a different WASM instance.
+# Three instances of the same client module — the engine ModuleRegistry
+# round-robins Run requests across local WASM instances.
 [[module]]
 name        = "client"
 namespace   = "ecommerce"

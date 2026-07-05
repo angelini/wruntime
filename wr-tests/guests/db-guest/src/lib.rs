@@ -30,7 +30,7 @@ fn parse_params(json: &str) -> Vec<PgValue> {
         return vec![];
     }
     // Minimal JSON parsing without serde — each param is {"type":"<t>","value":"<v>"}
-    // For test purposes we support: null, text, int4, int8, boolean, float8
+    // For test purposes we support: null, text, int4, int8, boolean, float8, numeric
     let mut params = vec![];
     // Strip outer brackets
     let inner = json.trim().trim_start_matches('[').trim_end_matches(']');
@@ -126,14 +126,14 @@ fn column_to_json(name: &str, col: &database::Column) -> String {
         PgValue::UuidArray(a) => ("uuid[]", format!("{:?}", a)),
         PgValue::JsonbArray(a) => ("jsonb[]", format!("{:?}", a)),
     };
-    format!("{{\"name\":\"{}\",\"type\":\"{}\",\"value\":\"{}\"}}", name, typ, val)
+    format!(
+        "{{\"name\":\"{}\",\"type\":\"{}\",\"value\":\"{}\"}}",
+        name, typ, val
+    )
 }
 
 impl proto::DbTestService for Component {
-    fn execute(
-        &self,
-        req: proto::ExecuteRequest,
-    ) -> Result<proto::ExecuteResponse, ServiceError> {
+    fn execute(&self, req: proto::ExecuteRequest) -> Result<proto::ExecuteResponse, ServiceError> {
         let params = parse_params(&req.params_json);
         let affected = database::execute(&req.sql, &params)?;
         Ok(proto::ExecuteResponse { affected })
@@ -143,7 +143,6 @@ impl proto::DbTestService for Component {
         let params = parse_params(&req.params_json);
         match database::query(&req.sql, &params) {
             Ok(rows) => {
-
                 let proto_rows = rows
                     .iter()
                     .map(|row| {
@@ -172,8 +171,7 @@ impl proto::DbTestService for Component {
                 f4 real, f8 double precision, t text, ts timestamptz
             )",
             &[],
-        )
-        ?;
+        )?;
 
         database::execute(
             "INSERT INTO type_test (b, i2, i4, i8, f4, f8, t, ts) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -182,16 +180,15 @@ impl proto::DbTestService for Component {
                 PgValue::Int2(42),
                 PgValue::Int4(1000),
                 PgValue::Int8(9999999),
-                PgValue::Float4(3.14),
-                PgValue::Float8(2.71828),
+                PgValue::Float4(std::f32::consts::PI),
+                PgValue::Float8(std::f64::consts::E),
                 PgValue::Text("hello".to_string()),
                 PgValue::Timestamptz(1700000000),
             ],
         )
         ?;
 
-        let rows = database::query("SELECT * FROM type_test LIMIT 1", &[])
-            ?;
+        let rows = database::query("SELECT * FROM type_test LIMIT 1", &[])?;
 
         let row_json = if let Some(row) = rows.first() {
             let parts: Vec<String> = row
@@ -220,24 +217,22 @@ impl proto::DbTestService for Component {
         database::execute(
             &format!("CREATE TABLE IF NOT EXISTS {table} (id integer)"),
             &[],
-        )
-        ?;
+        )?;
 
         // Clean up from prior runs
-        database::execute(&format!("DELETE FROM {table}"), &[])
-            ?;
+        database::execute(&format!("DELETE FROM {table}"), &[])?;
 
-        let tx = database::begin_transaction()
-            ?;
-        tx.execute(&format!("INSERT INTO {table} (id) VALUES (1)"), &[])
-            ?;
-        tx.commit()
-            ?;
+        let tx = database::begin_transaction()?;
+        tx.execute(&format!("INSERT INTO {table} (id) VALUES (1)"), &[])?;
+        tx.commit()?;
 
-        let rows = database::query(&format!("SELECT count(*) as cnt FROM {table}"), &[])
-            ?;
+        let rows = database::query(&format!("SELECT count(*) as cnt FROM {table}"), &[])?;
 
-        let count = rows.first().map(|r| r.get_i64(0)).transpose()?.unwrap_or(-1);
+        let count = rows
+            .first()
+            .map(|r| r.get_i64(0))
+            .transpose()?
+            .unwrap_or(-1);
 
         Ok(proto::TransactionCommitResponse { count })
     }
@@ -255,23 +250,21 @@ impl proto::DbTestService for Component {
         database::execute(
             &format!("CREATE TABLE IF NOT EXISTS {table} (id integer)"),
             &[],
-        )
-        ?;
+        )?;
 
-        database::execute(&format!("DELETE FROM {table}"), &[])
-            ?;
+        database::execute(&format!("DELETE FROM {table}"), &[])?;
 
-        let tx = database::begin_transaction()
-            ?;
-        tx.execute(&format!("INSERT INTO {table} (id) VALUES (1)"), &[])
-            ?;
-        tx.rollback()
-            ?;
+        let tx = database::begin_transaction()?;
+        tx.execute(&format!("INSERT INTO {table} (id) VALUES (1)"), &[])?;
+        tx.rollback()?;
 
-        let rows = database::query(&format!("SELECT count(*) as cnt FROM {table}"), &[])
-            ?;
+        let rows = database::query(&format!("SELECT count(*) as cnt FROM {table}"), &[])?;
 
-        let count = rows.first().map(|r| r.get_i64(0)).transpose()?.unwrap_or(-1);
+        let count = rows
+            .first()
+            .map(|r| r.get_i64(0))
+            .transpose()?
+            .unwrap_or(-1);
 
         Ok(proto::TransactionRollbackResponse { count })
     }
@@ -289,24 +282,23 @@ impl proto::DbTestService for Component {
         database::execute(
             &format!("CREATE TABLE IF NOT EXISTS {table} (id integer)"),
             &[],
-        )
-        ?;
+        )?;
 
-        database::execute(&format!("DELETE FROM {table}"), &[])
-            ?;
+        database::execute(&format!("DELETE FROM {table}"), &[])?;
 
         {
-            let tx = database::begin_transaction()
-                ?;
-            tx.execute(&format!("INSERT INTO {table} (id) VALUES (1)"), &[])
-                ?;
+            let tx = database::begin_transaction()?;
+            tx.execute(&format!("INSERT INTO {table} (id) VALUES (1)"), &[])?;
             // tx is dropped here without commit or rollback
         }
 
-        let rows = database::query(&format!("SELECT count(*) as cnt FROM {table}"), &[])
-            ?;
+        let rows = database::query(&format!("SELECT count(*) as cnt FROM {table}"), &[])?;
 
-        let count = rows.first().map(|r| r.get_i64(0)).transpose()?.unwrap_or(-1);
+        let count = rows
+            .first()
+            .map(|r| r.get_i64(0))
+            .transpose()?
+            .unwrap_or(-1);
 
         Ok(proto::TransactionDropResponse { count })
     }
@@ -336,15 +328,16 @@ impl proto::DbTestService for Component {
         req: proto::QueryStreamRequest,
     ) -> Result<proto::QueryStreamResponse, ServiceError> {
         let params = parse_params(&req.params_json);
-        let batch_size = if req.batch_size == 0 { 10 } else { req.batch_size };
-        let cursor = database::query_stream(&req.sql, &params)
-            ?;
+        let batch_size = if req.batch_size == 0 {
+            10
+        } else {
+            req.batch_size
+        };
+        let cursor = database::query_stream(&req.sql, &params)?;
         let mut all_rows = vec![];
         let mut batch_count: u32 = 0;
         loop {
-            let batch = cursor
-                .next_batch(batch_size)
-                ?;
+            let batch = cursor.next_batch(batch_size)?;
             batch_count += 1;
             if batch.is_empty() {
                 break;
@@ -368,14 +361,11 @@ impl proto::DbTestService for Component {
         &self,
         req: proto::QueryStreamDropRequest,
     ) -> Result<proto::QueryStreamDropResponse, ServiceError> {
-        let cursor = database::query_stream(&req.sql, &[])
-            ?;
+        let cursor = database::query_stream(&req.sql, &[])?;
         let mut fetched: u32 = 0;
         while fetched < req.fetch_count {
             let remaining = req.fetch_count - fetched;
-            let batch = cursor
-                .next_batch(remaining)
-                ?;
+            let batch = cursor.next_batch(remaining)?;
             if batch.is_empty() {
                 break;
             }
@@ -392,11 +382,21 @@ impl proto::DbTestService for Component {
     ) -> Result<proto::AllocResourcesResponse, ServiceError> {
         let mut held = Vec::new();
         let mut resp = proto::AllocResourcesResponse::default();
-        alloc_loop(req.initial, &mut resp, || database::begin_transaction(), &mut held);
+        alloc_loop(
+            req.initial,
+            &mut resp,
+            database::begin_transaction,
+            &mut held,
+        );
         for _ in 0..req.drop_count {
             held.pop(); // Transaction dropped here -> host drop -> live-count decrement
         }
-        alloc_loop(req.additional, &mut resp, || database::begin_transaction(), &mut held);
+        alloc_loop(
+            req.additional,
+            &mut resp,
+            database::begin_transaction,
+            &mut held,
+        );
         resp.held = held.len() as u32;
         Ok(resp)
     }
@@ -408,11 +408,21 @@ impl proto::DbTestService for Component {
         let sql = "SELECT generate_series(1, 100) AS n";
         let mut held = Vec::new();
         let mut resp = proto::AllocResourcesResponse::default();
-        alloc_loop(req.initial, &mut resp, || database::query_stream(sql, &[]), &mut held);
+        alloc_loop(
+            req.initial,
+            &mut resp,
+            || database::query_stream(sql, &[]),
+            &mut held,
+        );
         for _ in 0..req.drop_count {
             held.pop(); // RowCursor dropped here -> host drop -> live-count decrement
         }
-        alloc_loop(req.additional, &mut resp, || database::query_stream(sql, &[]), &mut held);
+        alloc_loop(
+            req.additional,
+            &mut resp,
+            || database::query_stream(sql, &[]),
+            &mut held,
+        );
         resp.held = held.len() as u32;
         Ok(resp)
     }

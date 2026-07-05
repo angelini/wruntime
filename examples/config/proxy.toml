@@ -17,8 +17,8 @@ url = "postgres://postgres@localhost:5433/wruntime_example"
 routing_table_ttl_secs = 1
 
 # Circuit breaker — protects downstream engines from overload.
-# Each engine address gets its own independent breaker; one open circuit
-# does not affect routing to the other engines.
+# Each forwarding target (local engine address or remote peer proxy address)
+# gets its own independent breaker.
 # All fields are optional; the values below are the defaults.
 #
 # [circuit_breaker]

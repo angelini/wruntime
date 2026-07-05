@@ -562,7 +562,7 @@ async fn test_worker_pool_handles_dropped_response() {
     assert!(status.error_message.contains("module dropped response"));
 }
 
-// ── New integration tests ───────────────────────────────────────────────────
+// ── Worker pool timeout, claiming, notification, and recovery tests ─────────
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_worker_pool_job_timeout() {

@@ -1,7 +1,7 @@
-//! Shared TOML config structs for engine and proxy configurations.
+//! Shared TOML config structs for engine, proxy, and manager configurations.
 //!
-//! Used by both `dev` (local development) and `node` (remote deployment) commands
-//! to parse and generate config files via serde, avoiding manual TOML string building.
+//! Used by development and deployment commands to parse and generate config files
+//! via serde, avoiding manual TOML string building.
 
 use serde::{Deserialize, Serialize};
 

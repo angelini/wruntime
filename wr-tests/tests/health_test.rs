@@ -218,7 +218,7 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
             engine_id: "mh-e1".into(),
             address: "http://127.0.0.1:9800".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![
                 ModuleDescriptor {
                     name: "mod-a".into(),
@@ -298,7 +298,7 @@ async fn test_engine_stale_marks_all_module_routes_unhealthy() -> Result<()> {
             engine_id: "mh-stale-e1".into(),
             address: "http://127.0.0.1:9810".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![
                 ModuleDescriptor {
                     name: "stale-a".into(),
@@ -365,7 +365,7 @@ async fn test_malformed_module_entry_skipped_not_fatal() -> Result<()> {
             engine_id: "mh-bad-e1".into(),
             address: "http://127.0.0.1:9830".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![
                 ModuleDescriptor {
                     name: "good-svc".into(),
@@ -447,8 +447,7 @@ async fn test_admin_route_without_module_heartbeat_flips_unhealthy() -> Result<(
         destination_version: "1.0.0".into(),
         engine_id: "mh-admin-e1".into(),
         engine_address: "http://127.0.0.1:9840".into(),
-        proxy_address: String::new(),
-        peer_address: String::new(),
+        peer_address: TEST_SELF_PEER.into(),
         healthy: true,
     })
     .await?;

@@ -6,9 +6,6 @@ CREATE SCHEMA IF NOT EXISTS wr_system;
 
 -- Move each table only if it currently lives in public.
 DO $$ BEGIN
-  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'wr_migrations') THEN
-    ALTER TABLE public.wr_migrations SET SCHEMA wr_system;
-  END IF;
   IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'wr_manager_lock') THEN
     ALTER TABLE public.wr_manager_lock SET SCHEMA wr_system;
   END IF;

@@ -233,7 +233,6 @@ async fn handle_submit_job(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>> {
         Err(e) => return err(StatusCode::BAD_REQUEST, &format!("decode: {e}")),
     };
 
-    // Extract source from gRPC headers (set by the proxy).
     match wr_engine::worker::insert_job(
         pool,
         &req.worker_namespace,
@@ -243,8 +242,8 @@ async fn handle_submit_job(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>> {
         &req.payload,
         req.timeout_secs,
         req.max_attempts,
-        "", // source_namespace — could be extracted from headers
-        "", // source_module
+        "", // source_namespace (not available on this path)
+        "", // source_module (not available on this path)
     )
     .await
     {

@@ -11,7 +11,7 @@ thread_local! {
 }
 
 /// Enable automatic tracing spans for all `db::*` helpers and `TxGuard` methods.
-/// Call once at module init (e.g., top of your `handle` function).
+/// Call once before first DB use; `ServiceGuest::init()` is preferred.
 pub fn enable_tracing() {
     DB_TRACING.with(|c| c.set(true));
 }

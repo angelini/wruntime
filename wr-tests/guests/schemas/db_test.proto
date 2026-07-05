@@ -37,10 +37,10 @@ message QueryResponse {
   repeated QueryRow rows = 1;
 }
 
-// Insert one row of every PgValue type, then query it back.
+// Insert one row containing several scalar PgValue types, then query it back.
 message QueryTypesRequest {}
 message QueryTypesResponse {
-  // JSON-serialised map of column names to their string representations.
+  // JSON-serialised array of column descriptors and string representations.
   string row_json = 1;
 }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run from the repo root: bash examples/ecommerce/run.sh
 # Prerequisites: cargo, rustup target add wasm32-wasip2, wasm-tools,
-#                Postgres running with an 'ecommerce' database. `just dev-up`
+#                Postgres running via `just dev-up` (uses wruntime_example by default).
 source "$(dirname "$0")/../helpers.sh" "$@"
 
 # ── Kill stale processes from a previous run ─────────────────────────────
@@ -11,9 +11,9 @@ echo "DB_URL: ${DB_URL}"
 
 # ── Substitute the DB URL into the engine configs ────────────────────────
 update_db_url() {
-    local file="$1"
-    sed_replace "$file" "postgres://user:pass@localhost:5432/ecommerce" "${DB_URL}"
-    sed_replace "$file" "postgres://wr_guest@localhost:5433/wruntime_example" "${GUEST_DB_URL}"
+	local file="$1"
+	sed_replace "$file" "postgres://user:pass@localhost:5432/ecommerce" "${DB_URL}"
+	sed_replace "$file" "postgres://wr_guest@localhost:5433/wruntime_example" "${GUEST_DB_URL}"
 }
 
 cp examples/ecommerce/engine-inventory-1.toml /tmp/inv1.toml
@@ -39,11 +39,11 @@ list_services
 # ── Seed inventory via the proxy ─────────────────────────────────────────
 echo "==> Seeding inventory..."
 just cli invoke \
-    --proxy http://127.0.0.1:9001 \
-    --destination http://ecommerce.inventory/Seed \
-    --source bootstrap \
-    --source-ns ecommerce \
-    --body '' || echo " (seed may already exist)"
+	--proxy http://127.0.0.1:9001 \
+	--destination http://ecommerce.inventory/Seed \
+	--source bootstrap \
+	--source-ns ecommerce \
+	--body '' || echo " (seed may already exist)"
 
 # ── Deploy client engine ─────────────────────────────────────────────────
 deploy_engine examples/ecommerce/engine-client.toml "client engine" 9200
@@ -52,14 +52,14 @@ list_services
 setup_cleanup_trap
 
 if [ "$INLINE" = true ]; then
-    echo "==> Running client inline with {\"count\": 1}..."
-    just cli invoke \
-        --proxy http://127.0.0.1:9001 \
-        --destination http://ecommerce.client/Run \
-        --source loadtest --source-ns ecommerce \
-        --body '{"count": 1}'
-    # cleanup runs via EXIT trap; exit with invoke's exit code
-    exit $?
+	echo "==> Running client inline with {\"count\": 1}..."
+	just cli invoke \
+		--proxy http://127.0.0.1:9001 \
+		--destination http://ecommerce.client/Run \
+		--source loadtest --source-ns ecommerce \
+		--body '{"count": 1}'
+	# cleanup runs via EXIT trap; exit with invoke's exit code
+	exit $?
 fi
 
 cat <<'USAGE'

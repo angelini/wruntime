@@ -166,7 +166,7 @@ dev-logs service="":
 dev-ps:
     docker compose ps
 
-# Reset example DB — drops all module schemas, manager tables, and refinery migration history
+# Reset example DB — drops module schemas, manager schema, and migration history
 dev-reset-db:
     @echo "==> Resetting example database..."
     psql "{{db_url_example}}" -c " \
@@ -178,6 +178,7 @@ dev-reset-db:
                 EXECUTE 'DROP SCHEMA \"' || r.schema_name || '\" CASCADE'; \
                 RAISE NOTICE 'dropped schema %', r.schema_name; \
             END LOOP; \
+            DROP SCHEMA IF EXISTS wr_system CASCADE; \
             DROP TABLE IF EXISTS refinery_schema_history CASCADE; \
             FOR r IN SELECT tablename FROM pg_tables \
                      WHERE schemaname = 'public' AND tablename LIKE 'wr_%' \

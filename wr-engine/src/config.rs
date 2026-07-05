@@ -68,8 +68,7 @@ impl Default for PoolConfig {
 
 /// Per-store ceilings on guest-created host resources. Enforced live (one
 /// running count per kind), so a guest cannot exhaust the wasmtime
-/// `ResourceTable` and crash the engine. Global for now; per-module override
-/// can be layered on later without breaking the default.
+/// `ResourceTable` and crash the engine. Applies globally across modules.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct ResourceLimits {

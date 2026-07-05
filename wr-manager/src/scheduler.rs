@@ -120,13 +120,11 @@ async fn evaluate_schedules(
     Ok(())
 }
 
-/// Submit a scheduled job through the local proxy loopback using the verified
-/// routing contract (see docs/plans/.../proxy-routing-contract.md):
-/// POST `/SubmitJob` with `x-wr-destination: http://{ns}.{module}/SubmitJob`.
-/// Returns the response body on HTTP 2xx; `Err` on connect/timeout/non-2xx.
+/// Submit a scheduled job through the local proxy loopback.
 ///
-/// `/SubmitJob` is the path the real wr-engine accepts today; it is Area-4-owned.
-/// If Area 4 renames the worker endpoint, reconcile this one string.
+/// Uses `POST /SubmitJob` with
+/// `x-wr-destination: http://{ns}.{module}/SubmitJob`.
+/// Returns the response body on HTTP 2xx; `Err` on connect/timeout/non-2xx.
 pub async fn submit_job(
     local_proxy_address: &str,
     schedule: &db::ScheduleRow,

@@ -4,7 +4,7 @@ use wr_common::node::{is_loopback_addr, NodeConfig};
 
 #[derive(Deserialize, Clone)]
 pub struct ProxyConfig {
-    /// TCP address to listen on for inbound HTTP, e.g. "0.0.0.0:9001"
+    /// Loopback TCP address to listen on for inbound HTTP, e.g. "127.0.0.1:9001".
     pub listen_address: String,
     /// gRPC listen address for the NodeService control plane (engines connect here).
     pub control_address: String,

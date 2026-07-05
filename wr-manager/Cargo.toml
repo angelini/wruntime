@@ -23,6 +23,7 @@ aes-gcm = "0.10"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
 chitchat = "0.11"
+refinery = { version = "0.9", features = ["tokio-postgres"] }
 tokio-retry = "0.3"
 hyper = { version = "1", features = ["client", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

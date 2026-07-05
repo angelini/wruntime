@@ -29,7 +29,7 @@ interface store {
     /// Download an object's full contents.
     get-object: func(bucket: string, key: string) -> result<list<u8>, blob-error>;
 
-    /// Delete an object. Succeeds even if the object does not exist.
+    /// Delete an object. Missing objects return `not-found`.
     delete-object: func(bucket: string, key: string) -> result<_, blob-error>;
 
     /// List objects in a bucket, optionally filtered by key prefix.

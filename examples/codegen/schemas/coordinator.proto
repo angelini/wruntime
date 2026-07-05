@@ -6,7 +6,7 @@ service CoordinatorService {
   rpc GetTask     (GetTaskRequest)     returns (GetTaskResponse);
   rpc ListTasks   (ListTasksRequest)   returns (ListTasksResponse);
 
-  // Used by the worker runner to claim and complete tasks.
+  // Worker lifecycle RPCs for task status updates and completion.
   rpc ClaimTask        (ClaimTaskRequest)        returns (ClaimTaskResponse);
   rpc UpdateTaskStatus (UpdateTaskStatusRequest) returns (UpdateTaskStatusResponse);
   rpc CompleteTask     (CompleteTaskRequest)      returns (CompleteTaskResponse);

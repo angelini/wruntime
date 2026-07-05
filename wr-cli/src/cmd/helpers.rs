@@ -1,4 +1,4 @@
-//! Shared CLI helpers used by both `dev` and `node` commands.
+//! Shared CLI and deployment helpers.
 
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};

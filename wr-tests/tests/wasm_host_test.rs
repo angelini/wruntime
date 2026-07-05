@@ -1,5 +1,5 @@
-/// WASM guest test harness — exercises host bindings (DB, tracing, blobstore)
-/// through real WASM components using protobuf-encoded requests/responses.
+/// WASM guest test harness — exercises host bindings and WASI HTTP through real
+/// WASM components using protobuf-encoded requests/responses.
 #[allow(dead_code, unused_imports)]
 mod helpers;
 use helpers::*;

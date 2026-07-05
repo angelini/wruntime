@@ -103,7 +103,11 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 
 **`wr-engine`** — on startup: registers with manager → receives per-namespace DB credentials → provisions schemas/roles → runs migrations → builds connection pools → loads WASM components → starts heartbeat loop. DB-enabled modules connect through per-namespace roles (`wr_ns_{namespace}`). Guest roles are never granted access to the `wr_system` schema, so WASM modules cannot read manager system tables.
 
-**Database migrations** — `migrations_path` in `engine.toml`, `V{n}__description.sql` files, run via refinery at startup. Schema-isolated and serialized across replicas via advisory locks. See `docs/configuration.md`.
+**Database migrations** — Manager migrations are embedded SQL migrations run via
+refinery under an advisory lock. Module migrations use `migrations_path` in
+`engine.toml`, `V{n}__description.sql` files, run via refinery at startup.
+Schema-isolated and serialized across replicas via advisory locks. See
+`docs/configuration.md`.
 
 **`wr-cli`** — all communication via gRPC to manager (`--manager` or `WR_MANAGER`). No direct DB access. TLS cert args default to `certs/` for local dev.
 

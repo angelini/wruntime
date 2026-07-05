@@ -3,8 +3,8 @@ set -e
 psql -U postgres -c "CREATE DATABASE wruntime_example;"
 psql -U postgres -c "CREATE DATABASE wruntime_test;"
 
-# Lower-privilege role for guest WASM module database pools.
-# Modules connect as wr_guest; schema provisioning and migrations use postgres.
+# Bootstrap the local guest role referenced by example database URLs.
+# Engine startup provisions per-namespace runtime roles separately.
 psql -U postgres <<'SQL'
 DO $$
 BEGIN

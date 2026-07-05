@@ -133,7 +133,7 @@ async fn test_health_convergence_on_missed_heartbeat() {
     assert!(!healthy, "should be unhealthy after missed heartbeat");
 }
 
-/// A cluster of one manager works identically to the current behavior.
+/// A one-manager cluster can register a module, process heartbeats, and keep routes healthy.
 #[tokio::test]
 async fn test_single_manager_cluster() {
     let pool = manager_pool().await;
@@ -204,7 +204,7 @@ async fn test_module_health_convergence_across_managers() {
             engine_id: "mm-e1".into(),
             address: "http://127.0.0.1:19500".into(),
             proxy_address: String::new(),
-            peer_address: String::new(),
+            peer_address: TEST_SELF_PEER.into(),
             modules: vec![
                 ModuleDescriptor {
                     name: "mm-a".into(),

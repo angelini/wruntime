@@ -359,9 +359,8 @@ pub async fn upsert_module_heartbeats(
 /// A rule is healthy iff its engine's heartbeat is fresh (within
 /// `engine_timeout_secs`) AND a matching `wr_module_heartbeats` row for the
 /// rule's destination `(namespace, module, version)` on that engine is fresh
-/// (within `module_timeout_secs`). This subsumes the old engine-only logic: a
-/// stale engine fails the join for all its rules, and additionally a single
-/// stale or missing module takes only its own routes out of rotation.
+/// (within `module_timeout_secs`). A stale engine fails all its rules; a stale
+/// or missing module takes only its own routes out of rotation.
 ///
 /// The health UPDATEs run without the global lock (they are idempotent). The
 /// global lock is acquired only briefly to bump the routing table version when

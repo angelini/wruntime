@@ -171,9 +171,9 @@ impl prost_build::ServiceGenerator for WrServiceGenerator {
 
 // ── WrClientGenerator ───────────────────────────────────────────────────────
 
-/// A `prost_build::ServiceGenerator` that emits a typed gRPC client struct for
-/// each service.  Add it to your `build.rs` to get zero-boilerplate RPC calls
-/// via `wr_sdk::http::http_request`.
+/// A `prost_build::ServiceGenerator` that emits a typed service client struct
+/// for each service. Add it to your `build.rs` to get zero-boilerplate RPC
+/// calls via `wr_sdk::http::http_request`.
 ///
 /// For a service `InventoryService` in package `ecommerce` with a `Seed` RPC,
 /// the generator emits:
@@ -251,12 +251,12 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
 /// for worker modules.  Each RPC method becomes a function that serializes the
 /// request, submits a job via `wr_sdk::jobs::submit_job`, and returns the job_id.
 ///
-/// For a service `TaskWorker` with RPC `ProcessTask`:
+/// For a service `TaskWorkerService` with RPC `ProcessTask`:
 ///
 /// ```rust,ignore
-/// pub struct TaskWorkerClient { authority: String }
+/// pub struct TaskWorkerServiceClient { authority: String }
 ///
-/// impl TaskWorkerClient {
+/// impl TaskWorkerServiceClient {
 ///     pub fn new(authority: impl Into<String>) -> Self { ... }
 ///     pub fn process_task(&self, req: ProcessTaskRequest) -> Result<String, wr_sdk::http::HttpError> { ... }
 /// }

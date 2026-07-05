@@ -338,7 +338,7 @@ impl Default for ModuleServices {
     }
 }
 
-/// DB capability: pool + schema + timeouts, plus plan-2 tx/cursor accounting.
+/// DB capability: pool, schema, timeouts, and transaction/cursor accounting.
 pub(crate) struct DbCapability {
     pub(crate) pool: Arc<Pool>,
     pub(crate) schema: Option<Arc<str>>,
@@ -353,14 +353,14 @@ pub(crate) struct BlobstoreCapability {
     pub(crate) limits: BlobstoreLimits,
 }
 
-/// LLM capability: inference runtime + plan-2 stream accounting.
+/// LLM capability: inference runtime and stream accounting.
 pub(crate) struct LlmCapability {
     pub(crate) runtime: Arc<LlmRuntime>,
     pub(crate) accounting: ResourceAccounting,
 }
 
-/// Tracing capability (always present): request-level span, guest span stack, the
-/// shared outbound-parent handle, plus plan-2 live-span accounting.
+/// Tracing capability (always present): request-level span, guest span stack,
+/// shared outbound-parent handle, and live-span accounting.
 pub(crate) struct TracingCapability {
     pub(crate) active_span: tracing::Span,
     pub(crate) span_stack: Vec<tracing::Span>,

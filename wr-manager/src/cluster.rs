@@ -97,8 +97,8 @@ impl ClusterHandle {
     }
 
     /// Managers chitchat considers live, keyed on `node_id`. Includes self.
-    /// A live node that has not yet published `grpc_address` (gossip race, or a
-    /// pre-plan-6 peer) is skipped — reconciliation fills it from the DB record.
+    /// A live node without `grpc_address` is omitted from live gossip output;
+    /// reconciliation only uses the DB record through the unknown-gossip bootstrap path.
     pub async fn live_managers(&self) -> Vec<ManagerLiveness> {
         self.handle
             .with_chitchat(|c| {

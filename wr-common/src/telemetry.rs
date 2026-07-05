@@ -41,7 +41,8 @@ impl Drop for TelemetryGuard {
 
 /// Initialise OpenTelemetry (traces, metrics, logs) and the `tracing` subscriber.
 ///
-/// All three signals are exported via OTLP/gRPC to [`OTLP_ENDPOINT`].
+/// All three signals are exported via OTLP/gRPC to [`OTLP_ENDPOINT`] unless
+/// `OTEL_SDK_DISABLED` is true or 1.
 /// The returned [`TelemetryGuard`] must be kept alive for the duration of the
 /// process — dropping it flushes and shuts down all providers.
 pub fn init(service_name: &'static str) -> Result<TelemetryGuard> {

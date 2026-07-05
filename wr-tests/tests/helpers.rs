@@ -557,7 +557,7 @@ async fn http1_stub(listener: TcpListener) {
 pub struct Node {
     /// TCP address this node listens on — pass to [`proxy_get`] and friends.
     pub addr: std::net::SocketAddr,
-    /// `"http://127.0.0.1:{port}"` — store in routing rules for engines on this node.
+    /// TLS peer URL stored in routing rules for engines on this node.
     pub proxy_address: String,
     /// Shared routing table — call [`sync_table`] on it after registering new engines.
     pub table: wr_proxy::routing::CachedRoutingTable,
@@ -1209,7 +1209,8 @@ pub fn db_state(pool_size: usize) -> ModuleState {
 }
 
 /// Build a `ModuleState` for a specific `(namespace, name)` pair, provisioning
-/// the module's Postgres schema (`wr__{namespace}__{name}`) if it does not
+/// the module's Postgres schema (`wr__{sanitized_namespace}__{sanitized_name}`)
+/// if it does not
 /// already exist. Panics if `WRT_TEST_DB_URL` is not set.
 pub async fn db_state_for_module(pool_size: usize, namespace: &str, name: &str) -> ModuleState {
     let url = require_db_url();
@@ -1772,7 +1773,7 @@ pub async fn worker_pool() -> deadpool_postgres::Pool {
 /// Spawn a stub engine that processes worker job requests.
 ///
 /// For each inbound request, the stub reads the path (job_type) and body (payload),
-/// then responds with 200 OK and the body `"processed:{path}"`.
+/// then responds with 200 OK and the body `"processed:{path}:{payload_len}"`.
 /// If the path contains "fail", responds with 500 instead.
 pub async fn spawn_worker_stub_engine() -> Result<(String, oneshot::Sender<()>)> {
     let (tx, rx) = oneshot::channel::<()>();

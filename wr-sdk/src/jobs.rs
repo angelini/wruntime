@@ -12,9 +12,11 @@ pub fn submit_job(
     submit_job_with_options(engine_authority, job_type, payload, 0, 0)
 }
 
-/// Submit a job with explicit timeout and retry settings.
+/// Submit a job with explicit stale-running timeout and retry settings.
 ///
-/// Pass 0 for `timeout_secs` or `max_attempts` to use the worker's defaults.
+/// `timeout_secs` controls stale-running recovery in the queue; worker dispatch
+/// uses the worker pool's configured job timeout. Pass 0 for `timeout_secs` or
+/// `max_attempts` to use the engine queue defaults.
 pub fn submit_job_with_options(
     engine_authority: &str,
     job_type: &str,

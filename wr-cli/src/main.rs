@@ -9,7 +9,7 @@ mod display;
 #[derive(Parser)]
 #[command(name = "wr-cli", about = "wruntime deployment management CLI")]
 struct Cli {
-    /// Manager gRPC address (required for most commands; not needed for node init/bundle/status)
+    /// Manager gRPC address (required for most commands; not needed for node bundle/status)
     #[arg(long, env = "WR_MANAGER", global = true)]
     manager: Option<String>,
 
@@ -76,7 +76,7 @@ enum Commands {
     Schedules(cmd::schedules::SchedulesArgs),
     /// Manage namespace-scoped secrets
     Secrets(cmd::secrets::SecretsArgs),
-    /// Remote node deployment (init, bundle, deploy, status)
+    /// Remote node deployment (bundle, deploy, status)
     Node(cmd::node::NodeArgs),
     /// View logs from remote services
     Logs(cmd::logs::LogsArgs),

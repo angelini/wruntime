@@ -12,9 +12,9 @@ message ModuleDescriptor {
 
 message EngineRegistration {
   string                    engine_id     = 1;
-  string                    address       = 2; // host:port wr-proxy uses to reach this engine
+  string                    address       = 2; // HTTP URL the local proxy uses to reach this engine
   repeated ModuleDescriptor modules       = 3;
-  string                    proxy_address = 4; // local proxy address (node identity)
+  string                    proxy_address = 4; // local proxy URL used by this engine
   repeated SecretRequest    secrets       = 5; // secrets this engine needs (resolved from config)
   string                    peer_address  = 6; // mTLS peer address (https://host:peer_port)
   repeated string           db_namespaces = 7; // namespaces that need DB access

@@ -13,7 +13,7 @@ ca_cert_path = "certs/ca.crt"
 # Optional — remove this section if no modules need database access.
 [database]
 url             = "postgres://postgres@localhost:5433/wruntime_example"
-max_connections = 20                                                    # default pool size for all DB-enabled modules
+max_connections = 20                                                    # default per-namespace pool size contribution
 # statement_timeout_secs              = 30   # per-statement timeout for guest queries (default: 30)
 # idle_in_transaction_timeout_secs    = 60   # kill idle-in-transaction sessions (default: 60)
 
@@ -24,7 +24,7 @@ max_connections = 20                                                    # defaul
 # base_url         = "https://api.anthropic.com"  # default
 # max_tokens_limit = 8192                  # host-enforced ceiling
 
-# Optional — remove this section to use the default on-demand allocator.
+# Optional — remove this section to use the default pooling allocator settings.
 [pool]
 total_component_instances = 1000     # max concurrent WASM instances across all modules
 max_memory_size           = 10485760 # 10 MiB per instance linear memory
@@ -35,8 +35,8 @@ namespace   = "payments"
 version     = "1.0.0"
 wasm_path   = "modules/order_service.wasm"
 schema_path = "schemas/order_service.binpb" # required: compiled FileDescriptorSet
-database    = true                          # opt in to the shared connection pool
-# db_max_connections = 10   # override pool size for this module (default: [database].max_connections)
+database    = true                          # opt in to DB host access
+# db_max_connections = 10   # override this module's namespace pool size contribution
 # channel_capacity   = 256  # inbound request queue depth before 429 (default: 128)
 
 [[module]]

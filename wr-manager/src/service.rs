@@ -51,8 +51,8 @@ pub fn reconcile_managers(
         let db = db_records.get(id);
 
         // Chitchat affirmatively dead → exclude immediately, regardless of DB
-        // freshness or cluster size (this is the N1 fix). A DB-fresh row that
-        // gossip says is dead is the ONLY genuine discrepancy worth a warning;
+        // freshness or cluster size. A DB-fresh row that gossip says is dead is
+        // the ONLY genuine discrepancy worth a warning;
         // never warn about self.
         if dead.contains(id) {
             if db.is_some() && id != self_id {

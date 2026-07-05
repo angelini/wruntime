@@ -2,62 +2,84 @@
 mod helpers;
 use helpers::*;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+
+async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Result<()> {
+    let app_tables_exist: bool = client
+        .query_one(
+            "SELECT to_regclass('wr_engines') IS NOT NULL
+                    AND to_regclass('wr_routing_rules') IS NOT NULL
+                    AND to_regclass('wr_schemas') IS NOT NULL",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(app_tables_exist, "expected manager application tables");
+
+    let latest_constraint_exists: bool = client
+        .query_one(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname = current_schema()
+                  AND t.relname = 'wr_routing_rules'
+                  AND c.conname = 'wr_routing_rules_peer_address_not_empty'
+            )",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(
+        latest_constraint_exists,
+        "expected latest manager schema constraint"
+    );
+
+    Ok(())
+}
 
 /// Cold race: two managers run migrations concurrently against one empty schema.
-/// Both must succeed (the advisory lock serializes the check-run-record
-/// sequence, so no duplicate-key / relation-already-exists errors) and the
-/// `wr_migrations` table must end up with exactly one row per migration version.
+/// Both must succeed; the advisory lock serializes manager startup migrations so
+/// active-active managers do not race on application DDL.
 #[tokio::test]
 async fn test_concurrent_run_migrations_cold_race() -> Result<()> {
     let schema = "mig_concurrent";
     let pool_a = manager_pool_in_schema(schema).await;
     let pool_b = wr_common::pool::build_pool_with_search_path(&require_db_url(), 1, schema)
-        .expect("failed to build second migration pool");
+        .context("failed to build second migration pool")?;
 
-    let mut client_a = pool_a.get().await.expect("conn a");
-    let mut client_b = pool_b.get().await.expect("conn b");
+    let mut client_a = pool_a.get().await.context("conn a")?;
+    let mut client_b = pool_b.get().await.context("conn b")?;
 
     let (ra, rb) = tokio::join!(
         wr_manager::migrate::run_migrations(&mut client_a),
         wr_manager::migrate::run_migrations(&mut client_b),
     );
-    ra.expect("run_migrations A failed");
-    rb.expect("run_migrations B failed");
+    ra.context("run_migrations A failed")?;
+    rb.context("run_migrations B failed")?;
 
-    let versions: Vec<i32> = client_a
-        .query("SELECT version FROM wr_migrations ORDER BY version", &[])
-        .await?
-        .iter()
-        .map(|r| r.get(0))
-        .collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_manager_schema_ready(&client_a).await?;
 
     Ok(())
 }
 
-/// A second run after the first fully completed is a clean no-op: still exactly
-/// one row per version, no errors.
+/// Repeated startup against an already-migrated schema succeeds and leaves the
+/// manager application schema available.
 #[tokio::test]
 async fn test_run_migrations_second_run_is_noop() -> Result<()> {
     let schema = "mig_noop";
     let pool = manager_pool_in_schema(schema).await;
-    let mut client = pool.get().await.expect("conn");
+    let mut client = pool.get().await.context("conn")?;
 
     wr_manager::migrate::run_migrations(&mut client)
         .await
-        .expect("first run");
+        .context("first run")?;
     wr_manager::migrate::run_migrations(&mut client)
         .await
-        .expect("second run");
+        .context("second run")?;
 
-    let versions: Vec<i32> = client
-        .query("SELECT version FROM wr_migrations ORDER BY version", &[])
-        .await?
-        .iter()
-        .map(|r| r.get(0))
-        .collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_manager_schema_ready(&client).await?;
 
     Ok(())
 }

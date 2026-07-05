@@ -47,7 +47,9 @@ gossip_listen_address = "0.0.0.0:9010"      # UDP address for chitchat gossip
 
 The `[tls]` section is required. All gRPC clients must present a certificate signed by the same CA.
 
-The `[database]` section is required. The manager persists engines, routing rules, and schemas to Postgres. Migrations run automatically on startup.
+The `[database]` section is required. The manager persists engines, routing rules,
+and schemas to Postgres. Embedded SQL migrations run automatically on startup via
+refinery, serialized across active-active managers by a Postgres advisory lock.
 
 The `[cluster]` section is required. Multiple managers can run active-active against the same Postgres database. Each manager registers itself in the `wr_managers` table, heartbeats every 15 seconds, and participates in a chitchat gossip mesh for failure detection. Chitchat is now load-bearing for manager liveness — `gossip_listen_address` must be a reachable UDP address; a manager fails to start (fail-fast) if gossip cannot bind. Concurrent writes are serialized via Postgres row locks. Set `advertise_grpc_address` when the manager is behind a load balancer or NAT.
 
@@ -165,6 +167,7 @@ schema_path = "schemas/inventory_service.binpb"
 > **`schema_path` is required.** Every module must declare a compiled `FileDescriptorSet`. The engine will refuse to start if the file is absent. Schemas are uploaded to the manager on registration for discovery purposes.
 
 On startup the engine:
+
 1. Loads every listed WASM component from disk.
 2. Registers itself and its modules with the manager (including schema bytes).
 3. Starts an inbound HTTP server on `listen_address`.
@@ -199,6 +202,7 @@ modules/inventory/migrations/
 ```
 
 Key behaviors:
+
 - **Per-namespace DB roles:** The manager automatically generates and stores a random password for each namespace that needs database access. At engine registration, the manager returns per-namespace credentials (`wr_ns_{namespace}` roles). The engine creates these roles, grants them access to the relevant schemas, and connects module pools using the namespace role — modules never see the DB password. This provides namespace-level privilege isolation without any manual role or secret configuration.
 - **Schema isolation:** `search_path` is set to the module's own schema before migrations run. A migration cannot modify tables belonging to another module.
 - **Advisory locking:** An engine acquires a Postgres advisory lock before running migrations, preventing concurrent execution across engine replicas for the same module.
@@ -242,6 +246,7 @@ llm         = true
 ```
 
 Key behaviors:
+
 - **Credential isolation:** The API key is resolved from an environment variable at engine startup and never enters the WASM sandbox.
 - **Host-enforced token limit:** `max_tokens_limit` caps the `max_tokens` field on every request before forwarding to the API, preventing runaway generation.
 - **Provider mapping:** Currently only `"anthropic"` is supported. The WIT interface is provider-agnostic so future providers can be added without changing guest code.
@@ -270,6 +275,7 @@ blobstore   = true
 ```
 
 Key behaviors:
+
 - **`max_object_size`** (default **16 MiB**) is enforced on both `put-object` (checked before upload) and `get-object` (the download is aborted mid-stream once the running total would exceed the limit — an oversized object is never fully buffered). Exceeding it returns `blob-error::too-large`.
 - **`max_list_objects`** (default **1000**) caps a single `list-objects` call; exceeding it returns `blob-error::too-large` rather than silently truncating.
 
