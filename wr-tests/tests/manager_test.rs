@@ -7,6 +7,7 @@ use anyhow::Result;
 use wr_common::wruntime::{
     DeregisterEngineRequest, EngineRegistration, GetRoutingTableRequest, GetSchemaRequest,
     HeartbeatRequest, ListEnginesRequest, ModuleDescriptor, RegisterEngineRequest, RoutingRule,
+    SecretRequest,
 };
 
 #[tokio::test]
@@ -483,6 +484,382 @@ async fn test_get_schema_multi_module_engine() -> Result<()> {
         .await?
         .into_inner();
     assert_eq!(resp_users.proto_schema, schema);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_register_engine_creates_default_routing_rule() -> Result<()> {
+    let (_pool, _addr, mut c) = manager_trio().await?;
+
+    c.register_engine(RegisterEngineRequest {
+        registration: Some(EngineRegistration {
+            engine_id: "route-e1".into(),
+            address: "http://127.0.0.1:9600".into(),
+            proxy_address: String::new(),
+            peer_address: "https://127.0.0.1:9443".into(),
+            modules: vec![ModuleDescriptor {
+                name: "inventory".into(),
+                namespace: "store".into(),
+                version: "1.0.0".into(),
+                proto_schema: minimal_file_descriptor_set(),
+            }],
+            secrets: vec![],
+            db_namespaces: vec![],
+        }),
+    })
+    .await?;
+
+    let table = c
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
+        .await?
+        .into_inner()
+        .table
+        .unwrap();
+
+    assert_eq!(
+        table.rules.len(),
+        1,
+        "manager creates exactly one default rule"
+    );
+    let r = &table.rules[0];
+    assert_eq!(r.rule_id, "route-e1/store/inventory/1.0.0");
+    assert_eq!(r.destination_namespace, "store");
+    assert_eq!(r.destination_module, "inventory");
+    assert_eq!(r.destination_version, "1.0.0");
+    assert_eq!(r.engine_id, "route-e1");
+    assert_eq!(r.engine_address, "http://127.0.0.1:9600");
+    assert_eq!(r.proxy_address, "https://127.0.0.1:9443");
+    assert_eq!(r.peer_address, "https://127.0.0.1:9443");
+    assert_eq!(r.source_namespace, "");
+    assert_eq!(r.source_module, "");
+    assert!(r.healthy, "default rule starts healthy");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_register_engine_dedups_duplicate_module_instances() -> Result<()> {
+    let (_pool, _addr, mut c) = manager_trio().await?;
+    let schema = minimal_file_descriptor_set();
+
+    c.register_engine(RegisterEngineRequest {
+        registration: Some(EngineRegistration {
+            engine_id: "dup-e1".into(),
+            address: "http://127.0.0.1:9610".into(),
+            proxy_address: String::new(),
+            peer_address: String::new(),
+            modules: vec![
+                ModuleDescriptor {
+                    name: "inventory".into(),
+                    namespace: "store".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: schema.clone(),
+                },
+                ModuleDescriptor {
+                    name: "inventory".into(),
+                    namespace: "store".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: schema.clone(),
+                },
+            ],
+            secrets: vec![],
+            db_namespaces: vec![],
+        }),
+    })
+    .await?;
+
+    let table = c
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
+        .await?
+        .into_inner()
+        .table
+        .unwrap();
+    assert_eq!(table.rules.len(), 1, "duplicate instances produce one rule");
+    assert_eq!(table.rules[0].rule_id, "dup-e1/store/inventory/1.0.0");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_register_engine_missing_schema_rejected_no_writes() -> Result<()> {
+    let (_pool, _addr, mut c) = manager_trio().await?;
+
+    let err = c
+        .register_engine(RegisterEngineRequest {
+            registration: Some(EngineRegistration {
+                engine_id: "badschema-e1".into(),
+                address: "http://127.0.0.1:9620".into(),
+                proxy_address: String::new(),
+                peer_address: String::new(),
+                modules: vec![ModuleDescriptor {
+                    name: "inventory".into(),
+                    namespace: "store".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: vec![], // empty first descriptor -> rejected
+                }],
+                secrets: vec![],
+                db_namespaces: vec![],
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    let engines = c
+        .list_engines(ListEnginesRequest {})
+        .await?
+        .into_inner()
+        .engines;
+    assert!(
+        engines.iter().all(|e| e.engine_id != "badschema-e1"),
+        "rejected registration must write no engine row",
+    );
+
+    let table = c
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
+        .await?
+        .into_inner()
+        .table
+        .unwrap();
+    assert!(
+        table
+            .rules
+            .iter()
+            .all(|r| !r.rule_id.starts_with("badschema-e1/")),
+        "rejected registration must write no routing rules",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_register_engine_missing_secret_leaves_no_routes() -> Result<()> {
+    let (_pool, _addr, mut c) = manager_trio().await?;
+
+    let err = c
+        .register_engine(RegisterEngineRequest {
+            registration: Some(EngineRegistration {
+                engine_id: "secret-e1".into(),
+                address: "http://127.0.0.1:9630".into(),
+                proxy_address: String::new(),
+                peer_address: String::new(),
+                modules: vec![ModuleDescriptor {
+                    name: "inventory".into(),
+                    namespace: "store".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: minimal_file_descriptor_set(),
+                }],
+                secrets: vec![SecretRequest {
+                    namespace: "store".into(),
+                    key: "api-key".into(), // never stored -> resolve_secrets fails
+                }],
+                db_namespaces: vec![],
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    assert!(err.message().contains("missing secrets"));
+
+    let engines = c
+        .list_engines(ListEnginesRequest {})
+        .await?
+        .into_inner()
+        .engines;
+    assert!(
+        engines.iter().all(|e| e.engine_id != "secret-e1"),
+        "failed secret resolution must leave no engine row",
+    );
+
+    let table = c
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
+        .await?
+        .into_inner()
+        .table
+        .unwrap();
+    assert!(
+        table
+            .rules
+            .iter()
+            .all(|r| !r.rule_id.starts_with("secret-e1/")),
+        "failed registration must leave zero routing rules",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_reregister_removes_dropped_module_route_and_heartbeat() -> Result<()> {
+    let (pool, _addr, mut c) = manager_trio().await?;
+    let schema = minimal_file_descriptor_set();
+
+    let module = |name: &str| ModuleDescriptor {
+        name: name.into(),
+        namespace: "store".into(),
+        version: "1.0.0".into(),
+        proto_schema: schema.clone(),
+    };
+
+    c.register_engine(RegisterEngineRequest {
+        registration: Some(EngineRegistration {
+            engine_id: "recon-e1".into(),
+            address: "http://127.0.0.1:9640".into(),
+            proxy_address: String::new(),
+            peer_address: "https://127.0.0.1:9443".into(),
+            modules: vec![module("alpha"), module("beta")],
+            secrets: vec![],
+            db_namespaces: vec![],
+        }),
+    })
+    .await?;
+
+    let v_before: i64 = pool
+        .get()
+        .await?
+        .query_one("SELECT version FROM wr_manager_lock WHERE id = 1", &[])
+        .await?
+        .get(0);
+
+    c.register_engine(RegisterEngineRequest {
+        registration: Some(EngineRegistration {
+            engine_id: "recon-e1".into(),
+            address: "http://127.0.0.1:9640".into(),
+            proxy_address: String::new(),
+            peer_address: "https://127.0.0.1:9443".into(),
+            modules: vec![module("alpha")],
+            secrets: vec![],
+            db_namespaces: vec![],
+        }),
+    })
+    .await?;
+
+    let table = c
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
+        .await?
+        .into_inner()
+        .table
+        .unwrap();
+    let recon_rules: Vec<&str> = table
+        .rules
+        .iter()
+        .filter(|r| r.rule_id.starts_with("recon-e1/"))
+        .map(|r| r.rule_id.as_str())
+        .collect();
+    assert_eq!(
+        recon_rules,
+        vec!["recon-e1/store/alpha/1.0.0"],
+        "only the retained module's default rule should survive re-registration",
+    );
+
+    let hb_modules: Vec<String> = pool
+        .get()
+        .await?
+        .query(
+            "SELECT module_name FROM wr_module_heartbeats
+             WHERE engine_id = $1 ORDER BY module_name",
+            &[&"recon-e1"],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    assert_eq!(
+        hb_modules,
+        vec!["alpha".to_string()],
+        "dropped module's heartbeat row must be removed; retained module's remains",
+    );
+
+    let v_after: i64 = pool
+        .get()
+        .await?
+        .query_one("SELECT version FROM wr_manager_lock WHERE id = 1", &[])
+        .await?
+        .get(0);
+    assert!(
+        v_after > v_before,
+        "removing a default route must bump the version"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Result<()> {
+    let (pool, _addr, mut c) = manager_trio().await?;
+
+    c.register_engine(RegisterEngineRequest {
+        registration: Some(EngineRegistration {
+            engine_id: "recon-e2".into(),
+            address: "http://127.0.0.1:9650".into(),
+            proxy_address: String::new(),
+            peer_address: String::new(),
+            modules: vec![ModuleDescriptor {
+                name: "inventory".into(),
+                namespace: "store".into(),
+                version: "1.0.0".into(),
+                proto_schema: minimal_file_descriptor_set(),
+            }],
+            secrets: vec![],
+            db_namespaces: vec![],
+        }),
+    })
+    .await?;
+
+    let v_before: i64 = pool
+        .get()
+        .await?
+        .query_one("SELECT version FROM wr_manager_lock WHERE id = 1", &[])
+        .await?
+        .get(0);
+
+    c.register_engine(RegisterEngineRequest {
+        registration: Some(EngineRegistration {
+            engine_id: "recon-e2".into(),
+            address: "http://127.0.0.1:9650".into(),
+            proxy_address: String::new(),
+            peer_address: String::new(),
+            modules: vec![],
+            secrets: vec![],
+            db_namespaces: vec![],
+        }),
+    })
+    .await?;
+
+    let table = c
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
+        .await?
+        .into_inner()
+        .table
+        .unwrap();
+    assert!(
+        table
+            .rules
+            .iter()
+            .all(|r| !r.rule_id.starts_with("recon-e2/")),
+        "re-registration with no modules must remove all of the engine's default rules",
+    );
+
+    let hb_count: i64 = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT COUNT(*) FROM wr_module_heartbeats WHERE engine_id = $1",
+            &[&"recon-e2"],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        hb_count, 0,
+        "all module heartbeats for the engine must be removed"
+    );
+
+    let v_after: i64 = pool
+        .get()
+        .await?
+        .query_one("SELECT version FROM wr_manager_lock WHERE id = 1", &[])
+        .await?
+        .get(0);
+    assert!(
+        v_after > v_before,
+        "delete-only reconciliation must still bump the routing version",
+    );
 
     Ok(())
 }

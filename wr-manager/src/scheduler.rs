@@ -2,96 +2,135 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use deadpool_postgres::Pool;
-use http_body_util::BodyExt;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message;
 use tokio::net::TcpStream;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use wr_common::wruntime::{SubmitJobRequest, SubmitJobResponse};
 
 use crate::db;
 
-/// Background task: every `interval`, claim due schedules from the DB
-/// using SKIP LOCKED, submit jobs to the appropriate engine, and mark fired.
-pub async fn run_scheduler(pool: Pool, interval: Duration) {
+/// Submissions must return quickly (the engine only enqueues the job and returns
+/// a job_id); the job's own `timeout_secs` is enforced engine-side and is
+/// independent of this. Kept below any sane `scheduler_lease_secs` so a hung
+/// proxy connection cannot silently outlive the lease.
+const SUBMIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Background task. Every `interval`: claim due schedules (short txn), submit each
+/// through the local proxy (no txn), then finalize each with a fenced update.
+/// Delivery is at-least-once — jobs must be idempotent.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_scheduler(
+    pool: Pool,
+    manager_id: String,
+    interval: Duration,
+    lease_secs: f64,
+    retry_base_secs: f64,
+    retry_cap_secs: f64,
+    local_proxy_address: String,
+) {
     let mut tick = tokio::time::interval(interval);
     loop {
         tick.tick().await;
-        if let Err(e) = evaluate_schedules(&pool).await {
+        if let Err(e) = evaluate_schedules(
+            &pool,
+            &manager_id,
+            lease_secs,
+            retry_base_secs,
+            retry_cap_secs,
+            &local_proxy_address,
+        )
+        .await
+        {
             warn!(error = %e, "scheduler tick failed");
         }
     }
 }
 
-async fn evaluate_schedules(pool: &Pool) -> Result<(), anyhow::Error> {
+async fn evaluate_schedules(
+    pool: &Pool,
+    manager_id: &str,
+    lease_secs: f64,
+    retry_base_secs: f64,
+    retry_cap_secs: f64,
+    local_proxy_address: &str,
+) -> Result<(), anyhow::Error> {
+    // ── Phase 1: claim (short txn) ───────────────────────────────────────────
     let mut client = pool.get().await?;
     let txn = client.transaction().await?;
-
-    let due = db::claim_due_schedules(&txn)
+    let due = db::claim_due_schedules(&txn, manager_id, lease_secs)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    txn.commit().await?;
+
     if due.is_empty() {
-        txn.commit().await?;
         return Ok(());
     }
 
+    // ── Phase 2 + 3: submit (no txn) then fenced finalize (own connection) ────
     for schedule in &due {
-        let engine_addr = db::resolve_engine_for_worker(
-            pool,
-            &schedule.worker_namespace,
-            &schedule.worker_name,
-            &schedule.worker_version,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let engine_addr = match engine_addr {
-            Some(addr) => addr,
-            None => {
-                warn!(
-                    schedule_id = %schedule.schedule_id,
-                    worker = %format!(
-                        "{}/{}/{}",
-                        schedule.worker_namespace, schedule.worker_name, schedule.worker_version
-                    ),
-                    "no healthy engine found, skipping"
-                );
-                continue;
-            }
+        let Some(claim_id) = schedule.claim_id.as_deref() else {
+            warn!(schedule_id = %schedule.schedule_id, "claimed schedule missing claim_id, skipping");
+            continue;
         };
 
-        match submit_job_to_engine(&engine_addr, schedule).await {
-            Ok(job_id) => {
+        match submit_job(local_proxy_address, schedule).await {
+            Ok(body) => {
+                let job_id = SubmitJobResponse::decode(body.as_ref())
+                    .map(|r| r.job_id)
+                    .unwrap_or_default();
                 info!(
                     schedule_id = %schedule.schedule_id,
                     job_id,
-                    engine = %engine_addr,
-                    "schedule fired"
+                    "scheduled job submitted"
                 );
-                db::mark_schedule_fired(&txn, &schedule.schedule_id)
+                let n = db::mark_schedule_succeeded(pool, &schedule.schedule_id, claim_id)
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if n == 0 {
+                    debug!(schedule_id = %schedule.schedule_id, "dropped stale success finalize (reclaimed)");
+                }
             }
             Err(e) => {
+                let backoff = (retry_base_secs * 2f64.powi(schedule.consecutive_failures))
+                    .min(retry_cap_secs);
                 warn!(
                     schedule_id = %schedule.schedule_id,
-                    engine = %engine_addr,
                     error = %e,
-                    "failed to submit scheduled job, will retry next tick"
+                    backoff_secs = backoff,
+                    "scheduled job submission failed, will retry"
                 );
+                let n = db::mark_schedule_failed(
+                    pool,
+                    &schedule.schedule_id,
+                    claim_id,
+                    &e.to_string(),
+                    backoff,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if n == 0 {
+                    debug!(schedule_id = %schedule.schedule_id, "dropped stale failure finalize (reclaimed)");
+                }
             }
         }
     }
 
-    txn.commit().await?;
     Ok(())
 }
 
-async fn submit_job_to_engine(
-    engine_addr: &str,
+/// Submit a scheduled job through the local proxy loopback using the verified
+/// routing contract (see docs/plans/.../proxy-routing-contract.md):
+/// POST `/SubmitJob` with `x-wr-destination: http://{ns}.{module}/SubmitJob`.
+/// Returns the response body on HTTP 2xx; `Err` on connect/timeout/non-2xx.
+///
+/// `/SubmitJob` is the path the real wr-engine accepts today; it is Area-4-owned.
+/// If Area 4 renames the worker endpoint, reconcile this one string.
+pub async fn submit_job(
+    local_proxy_address: &str,
     schedule: &db::ScheduleRow,
-) -> Result<String, anyhow::Error> {
+) -> Result<Bytes, anyhow::Error> {
     let req = SubmitJobRequest {
         worker_namespace: schedule.worker_namespace.clone(),
         worker_name: schedule.worker_name.clone(),
@@ -103,36 +142,48 @@ async fn submit_job_to_engine(
     };
     let body = req.encode_to_vec();
 
-    // engine_addr is "http://host:port" — strip scheme for TCP connect
-    let addr = engine_addr
+    // Proxy loopback speaks HTTP/2 prior knowledge (h2c) — matches wr-cli invoke
+    // and the proxy's serve_connection. Strip scheme for the raw TCP connect.
+    let addr = local_proxy_address
         .trim_start_matches("http://")
         .trim_start_matches("https://");
 
-    let stream = TcpStream::connect(addr).await?;
-    let io = TokioIo::new(stream);
+    let destination = format!(
+        "http://{}.{}/SubmitJob",
+        schedule.worker_namespace, schedule.worker_name
+    );
 
-    let (mut sender, conn) =
-        hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await?;
-    tokio::spawn(conn);
+    let do_submit = async {
+        let stream = TcpStream::connect(addr).await?;
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await?;
+        tokio::spawn(conn);
 
-    let http_req = http::Request::builder()
-        .method("POST")
-        .uri("/wruntime.WorkerService/SubmitJob")
-        .header("content-type", "application/x-protobuf")
-        .body(Full::new(Bytes::from(body)))?;
+        let http_req = http::Request::builder()
+            .method("POST")
+            .uri("/SubmitJob")
+            .header("content-type", "application/x-protobuf")
+            .header("x-wr-destination", &destination)
+            .header("x-wr-version", &schedule.worker_version)
+            .header("x-wr-source", "wr-manager-scheduler")
+            .body(Full::new(Bytes::from(body)))?;
 
-    let resp = sender.send_request(http_req).await?;
-    let status = resp.status();
-    let resp_body = resp.into_body().collect().await?.to_bytes();
+        let resp = sender.send_request(http_req).await?;
+        let status = resp.status();
+        let resp_body = resp.into_body().collect().await?.to_bytes();
+        if !status.is_success() {
+            anyhow::bail!(
+                "proxy returned {}: {}",
+                status,
+                String::from_utf8_lossy(&resp_body)
+            );
+        }
+        Ok::<Bytes, anyhow::Error>(resp_body)
+    };
 
-    if !status.is_success() {
-        anyhow::bail!(
-            "engine returned {}: {}",
-            status,
-            String::from_utf8_lossy(&resp_body)
-        );
+    match tokio::time::timeout(SUBMIT_TIMEOUT, do_submit).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("submission timed out after {SUBMIT_TIMEOUT:?}"),
     }
-
-    let submit_resp = SubmitJobResponse::decode(resp_body.as_ref())?;
-    Ok(submit_resp.job_id)
 }

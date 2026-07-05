@@ -345,3 +345,53 @@ async fn test_schedule_fields_preserved() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_list_schedules_exposes_new_state_fields() -> Result<()> {
+    let (pool, _addr, mut c) = manager_trio().await?;
+
+    let sid = c
+        .upsert_schedule(UpsertScheduleRequest {
+            worker_namespace: "ns".into(),
+            worker_name: "mod".into(),
+            worker_version: "1.0.0".into(),
+            job_type: "/Run".into(),
+            interval_secs: 60,
+            immediate: true,
+            payload: vec![],
+            timeout_secs: 30,
+            max_attempts: 1,
+        })
+        .await?
+        .into_inner()
+        .schedule_id;
+
+    // Claim it to obtain a valid claim_id, then record a failure.
+    let mut cl = pool.get().await?;
+    let txn = cl.transaction().await?;
+    let due = wr_manager::db::claim_due_schedules(&txn, "m1", 60.0).await?;
+    txn.commit().await?;
+    let claim_id = due
+        .iter()
+        .find(|r| r.schedule_id == sid)
+        .and_then(|r| r.claim_id.clone())
+        .expect("claim_id");
+
+    let n = wr_manager::db::mark_schedule_failed(&pool, &sid, &claim_id, "boom", 3600.0).await?;
+    assert_eq!(n, 1);
+
+    let s = c
+        .list_schedules(ListSchedulesRequest {
+            worker_namespace: "ns".into(),
+        })
+        .await?
+        .into_inner()
+        .schedules
+        .into_iter()
+        .find(|s| s.schedule_id == sid)
+        .expect("schedule present");
+    assert_eq!(s.last_error, "boom");
+    assert_eq!(s.consecutive_failures, 1);
+    assert!(!s.next_fire_at.is_empty());
+    Ok(())
+}

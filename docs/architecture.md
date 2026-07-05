@@ -41,7 +41,7 @@ A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. 
 
 | Binary | Default port | Role |
 |--------|-------------|------|
-| `wr-manager` | `9000` (gRPC) + `9010` (gossip) | Registry — engines register here, proxies sync routing tables from here. Runs active-active behind shared Postgres; chitchat gossip provides manager-to-manager liveness detection |
+| `wr-manager` | `9000` (gRPC) + `9010` (gossip) | Registry — engines register here, proxies sync routing tables from here. Runs active-active behind shared Postgres; chitchat gossip provides manager-to-manager liveness detection. On registration the manager resolves the engine's requested secrets and per-namespace DB credentials, then persists the engine, its schemas, and one default routing rule per schema-bearing module in a single transaction — a failed registration leaves no routing rules. |
 | `wr-proxy` | `9001` (HTTP) + `9002` (gRPC control plane) | Streaming header-based router — intercepts and routes inter-module traffic; forwards cross-node requests to peer proxies; request and response bodies flow through without buffering. The control plane (`NodeService`) handles engine registration and heartbeats |
 | `wr-engine` | `9100` (HTTP) | Loads WASM modules, runs them, and receives forwarded requests |
 
@@ -53,10 +53,20 @@ Multiple `wr-manager` instances can run simultaneously for high availability. Al
 
 1. Registers itself in the `wr_managers` table on startup (UUID, gRPC address, gossip address).
 2. Heartbeats every 15 seconds; cleans up stale managers (60 s timeout).
-3. Participates in a [chitchat](https://docs.rs/chitchat) gossip mesh (UDP) for phi-accrual failure detection between managers.
+3. Participates in a [chitchat](https://docs.rs/chitchat) gossip mesh (UDP), publishing its own `grpc_address`/`gossip_address` into gossip node state. Chitchat's phi-accrual failure detector is the **primary** manager liveness mechanism — `gossip_listen_address` is required and must be reachable, or the manager fails to start.
 4. Deregisters itself on graceful shutdown.
 
-Proxies and engines can point at any single manager. Clients (including `wr-cli`) can discover all active managers via the `ListManagers` gRPC RPC — connect to any one seed manager and get back the full set of healthy peers.
+`ListManagers` returns a per-manager reconciliation of the DB-heartbeat-fresh set against chitchat — peers chitchat has marked dead are dropped immediately; peers gossip has never seen are included only during a short bootstrap convergence window after a manager starts, then excluded. Proxies discover managers via `ListManagers` (chitchat-reconciled), bootstrapping and falling back to a direct `wr_managers` query only when no manager RPC is reachable. The Postgres 60s heartbeat cleanup (`cleanup_stale_managers`) remains as a secondary safety-net backstop — no behavior change.
+
+## Scheduler (routed job control plane)
+
+Each manager runs a background scheduler that fires `wr_schedules` rows as jobs, using Postgres as a claim/lease queue with a fencing token (`claim_id`) so active-active managers cannot double-fire or clobber each other's in-flight attempts. Every tick runs three short phases:
+
+1. **Claim** — a short transaction claims due, unleased (or lease-expired) rows with `FOR UPDATE SKIP LOCKED`, stamping `claimed_by`, `claimed_until` (a lease), and a fresh `claim_id`, then commits immediately.
+2. **Submit** — outside any transaction, the manager submits each claimed job through its own configured `local_proxy_address` (the local proxy loopback), exactly like `wr-cli invoke`: POST `/SubmitJob` with `x-wr-destination: http://{namespace}.{module}/SubmitJob`, using the same routing/mTLS path as normal inter-module traffic.
+3. **Finalize** — a fenced `UPDATE ... WHERE claim_id = $claim_id` records success (advances `next_fire_at`, clears the lease) or failure (records `last_error`, bumps `consecutive_failures`, backs off `next_fire_at`); a finalize whose `claim_id` no longer matches (row reclaimed by another manager) affects zero rows and is dropped.
+
+Delivery is **at-least-once** — a manager crash between submit and finalize leaves the lease to expire (`claimed_until < NOW()`), and the row becomes claimable again — so scheduled jobs must be idempotent. The manager's `/SubmitJob` submission path is the one place the scheduler couples to the worker/job subsystem's endpoint contract; if that endpoint changes, only `wr_manager::scheduler::submit_job` needs to change.
 
 ## Request flow
 

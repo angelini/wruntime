@@ -504,3 +504,132 @@ async fn test_secret_deleted_then_registration_fails() -> Result<()> {
     let _ = engine_shutdown.send(());
     Ok(())
 }
+
+#[tokio::test]
+async fn test_concurrent_db_credential_registration_same_password() -> Result<()> {
+    let (_pool, _addr, c) = manager_trio().await?;
+
+    const N: usize = 8;
+    let namespace = "concurrent-db-ns";
+
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let mut client = c.clone();
+        let ns = namespace.to_string();
+        handles.push(tokio::spawn(async move {
+            client
+                .register_engine(RegisterEngineRequest {
+                    registration: Some(EngineRegistration {
+                        engine_id: format!("db-race-engine-{i}"),
+                        address: "http://127.0.0.1:9999".into(),
+                        proxy_address: "http://127.0.0.1:9001".into(),
+                        peer_address: String::new(),
+                        modules: vec![],
+                        secrets: vec![],
+                        db_namespaces: vec![ns],
+                    }),
+                })
+                .await
+                .map(|r| r.into_inner())
+        }));
+    }
+
+    let mut passwords = Vec::with_capacity(N);
+    for h in handles {
+        let resp = h.await.expect("task panicked")?;
+        assert!(resp.accepted);
+        assert_eq!(resp.db_credentials.len(), 1);
+        assert_eq!(resp.db_credentials[0].namespace, namespace);
+        passwords.push(resp.db_credentials[0].password.clone());
+    }
+
+    let first = &passwords[0];
+    assert!(!first.is_empty(), "db password should not be empty");
+    assert!(
+        passwords.iter().all(|p| p == first),
+        "all concurrent registrations must return the same db password"
+    );
+
+    // Fast-path read after the race must match the persisted password.
+    let mut client = c.clone();
+    let resp = client
+        .register_engine(RegisterEngineRequest {
+            registration: Some(EngineRegistration {
+                engine_id: "db-race-engine-after".into(),
+                address: "http://127.0.0.1:9999".into(),
+                proxy_address: "http://127.0.0.1:9001".into(),
+                peer_address: String::new(),
+                modules: vec![],
+                secrets: vec![],
+                db_namespaces: vec![namespace.into()],
+            }),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(&resp.db_credentials[0].password, first);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_db_credential_reregistration_returns_same_password() -> Result<()> {
+    let (_pool, _addr, mut c) = manager_trio().await?;
+    let namespace = "reg-db-ns";
+
+    let first = c
+        .register_engine(RegisterEngineRequest {
+            registration: Some(EngineRegistration {
+                engine_id: "reg-engine-1".into(),
+                address: "http://127.0.0.1:9999".into(),
+                proxy_address: "http://127.0.0.1:9001".into(),
+                peer_address: String::new(),
+                modules: vec![],
+                secrets: vec![],
+                db_namespaces: vec![namespace.into()],
+            }),
+        })
+        .await?
+        .into_inner();
+
+    let second = c
+        .register_engine(RegisterEngineRequest {
+            registration: Some(EngineRegistration {
+                engine_id: "reg-engine-2".into(),
+                address: "http://127.0.0.1:9999".into(),
+                proxy_address: "http://127.0.0.1:9001".into(),
+                peer_address: String::new(),
+                modules: vec![],
+                secrets: vec![],
+                db_namespaces: vec![namespace.into()],
+            }),
+        })
+        .await?
+        .into_inner();
+
+    assert_eq!(first.db_credentials.len(), 1);
+    assert_eq!(second.db_credentials.len(), 1);
+    assert!(!first.db_credentials[0].password.is_empty());
+    assert_eq!(
+        first.db_credentials[0].password,
+        second.db_credentials[0].password
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_set_secret_reserved_db_password_key_rejected() -> Result<()> {
+    let (_pool, _addr, mut c) = manager_trio().await?;
+
+    let result = c
+        .set_secret(SetSecretRequest {
+            namespace: "ns".into(),
+            key: "__db_password".into(),
+            value: "hacked".into(),
+        })
+        .await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+    Ok(())
+}

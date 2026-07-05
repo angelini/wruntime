@@ -98,7 +98,7 @@ message ListSecretsResponse { repeated SecretEntry secrets = 1; }
 // ── Manager discovery ─────────────────────────────────────────────────────
 
 message ListManagersRequest  {}
-message ManagerInfo          { string manager_id = 1; string grpc_address = 2; }
+message ManagerInfo          { string manager_id = 1; string grpc_address = 2; string gossip_address = 3; }
 message ListManagersResponse { repeated ManagerInfo managers = 1; }
 
 // ── Schemas ───────────────────────────────────────────────────────────────
@@ -150,6 +150,9 @@ message Schedule {
   int32  max_attempts      = 10;
   bool   enabled           = 11;
   string last_fired_at     = 12; // RFC 3339 or empty
+  string next_fire_at         = 13; // RFC 3339 or empty
+  string last_error           = 14;
+  int32  consecutive_failures = 15;
 }
 
 message UpsertScheduleRequest {

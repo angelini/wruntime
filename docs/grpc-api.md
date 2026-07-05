@@ -6,9 +6,9 @@ All inter-service communication uses the `wruntime.ManagerService` gRPC service.
 
 | RPC | Request | Response | Description |
 |-----|---------|----------|-------------|
-| `RegisterEngine` | `EngineRegistration` | `{ accepted }` | Engine announces itself and its modules |
+| `RegisterEngine` | `EngineRegistration` | `{ accepted }` | Engine announces itself and its modules; the manager resolves requested secrets and DB credentials, then persists the engine, its schemas, and one default routing rule per schema-bearing module in a single transaction |
 | `DeregisterEngine` | `{ engine_id }` | — | Engine removes itself on shutdown |
-| `Heartbeat` | `{ engine_id, healthy_modules }` | — | Sent every 10 s; carries the list of currently healthy modules; manager uses this to update per-module health and mark routing rules unhealthy when a module goes silent |
+| `Heartbeat` | `{ engine_id, healthy_modules }` | — | Bumps the engine's liveness unconditionally, then upserts a per-module heartbeat for each valid `healthy_modules` entry. Entries missing `namespace`/`name`/`version` are skipped and logged, never fatal. The background monitor marks a routing rule unhealthy when either its engine heartbeat or its specific module's heartbeat goes stale |
 | `ListEngines` | — | `[EngineRegistration]` | Returns all currently registered engines |
 
 ## Routing table
@@ -38,7 +38,7 @@ message RoutingRule {
 
 `proxy_address` is set automatically from the engine's `[node] proxy_address` when the engine registers. The routing layer on each proxy compares this field against its own `[node] proxy_address` to decide whether to forward the request directly to the local `engine_address` (`LocalEngine`) or to relay it to the peer proxy at `proxy_address` (`RemoteProxy`).
 
-The `healthy` field is managed entirely by the manager — it is always set to `true` on `UpsertRoutingRule` and is flipped to `false` automatically when the engine's heartbeat stops reporting the module as healthy, or immediately on `DeregisterEngine`. The routing table version is incremented whenever health status changes, so proxies pick up failover events within one TTL cycle.
+The `healthy` field is managed entirely by the manager — it is always set to `true` on `UpsertRoutingRule` and is flipped to `false` automatically when the engine's heartbeat stops reporting the module as healthy, or immediately on `DeregisterEngine`. The routing table version is incremented whenever health status changes, so proxies pick up failover events within one TTL cycle. Default routing rules created at registration start healthy = true.
 
 ## Manager discovery
 

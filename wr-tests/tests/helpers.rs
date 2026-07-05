@@ -171,13 +171,62 @@ pub async fn manager_pool() -> deadpool_postgres::Pool {
     let pool = wr_common::pool::build_pool_with_search_path(&base_url, 5, &schema)
         .expect("failed to build manager test pool");
 
-    let client = pool.get().await.expect("migration connection");
-    wr_manager::migrate::run_migrations(&client)
+    let mut client = pool.get().await.expect("migration connection");
+    wr_manager::migrate::run_migrations(&mut client)
         .await
         .expect("manager migrations failed");
     drop(client);
 
     pool
+}
+
+/// Drop-and-recreate `schema` (leaving it empty), ensure `wr_system` exists, and
+/// return a 1-connection pool whose `search_path` is pinned to `schema`.
+/// Unlike [`manager_pool`], migrations are NOT run — the caller runs them, which
+/// lets a test point multiple pools at the SAME schema to exercise concurrent
+/// `run_migrations`.
+pub async fn manager_pool_in_schema(schema: &str) -> deadpool_postgres::Pool {
+    let base_url = require_db_url();
+    let setup_pool = wr_common::pool::build_pool(&base_url, 1).expect("failed to build setup pool");
+    let client = setup_pool.get().await.expect("setup connection");
+    client
+        .batch_execute("CREATE SCHEMA IF NOT EXISTS wr_system")
+        .await
+        .expect("create wr_system schema");
+    client
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .await
+        .expect("drop test schema");
+    client
+        .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+        .await
+        .expect("create test schema");
+    drop(client);
+    drop(setup_pool);
+
+    wr_common::pool::build_pool_with_search_path(&base_url, 1, schema)
+        .expect("failed to build manager test pool")
+}
+
+/// A single-node chitchat handle for in-process managers that are not part of a
+/// multi-manager cluster test. Binds a free UDP port; default failure detector.
+async fn test_cluster_handle() -> Result<std::sync::Arc<wr_manager::cluster::ClusterHandle>> {
+    let gossip_port = {
+        let tmp = TcpListener::bind("127.0.0.1:0").await?;
+        tmp.local_addr()?.port()
+    };
+    let listen: std::net::SocketAddr = format!("127.0.0.1:{gossip_port}").parse()?;
+    Ok(std::sync::Arc::new(
+        wr_manager::cluster::ClusterHandle::new(
+            &uuid::Uuid::new_v4().to_string(),
+            "test-cluster",
+            listen,
+            vec![],
+            std::time::Duration::from_millis(100),
+            chitchat::FailureDetectorConfig::default(),
+        )
+        .await?,
+    ))
 }
 
 /// Start an in-process wr-manager on a random port; returns its gRPC address.
@@ -191,9 +240,12 @@ pub async fn start_manager(pool: deadpool_postgres::Pool) -> Result<String> {
         )
         .expect("test encryption key"),
     );
+    let cluster = test_cluster_handle().await?;
     tokio::spawn(
         Server::builder()
-            .add_service(ManagerServiceServer::new(Manager::new(pool, crypto)))
+            .add_service(ManagerServiceServer::new(Manager::new(
+                pool, crypto, cluster,
+            )))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
     );
     Ok(format!("http://{addr}"))
@@ -914,16 +966,19 @@ pub async fn start_manager_with_monitor(
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    let cluster = test_cluster_handle().await?;
     tokio::spawn(
         Server::builder()
             .add_service(ManagerServiceServer::new(Manager::new(
                 pool.clone(),
                 crypto,
+                cluster,
             )))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
     );
     tokio::spawn(wr_manager::state::monitor_heartbeats(
         pool,
+        timeout_secs,
         timeout_secs,
         std::time::Duration::from_millis(200),
     ));
@@ -952,14 +1007,51 @@ pub async fn backdate_engine_heartbeat(
 pub struct ClusteredManager {
     /// gRPC address of this manager.
     pub addr: String,
+    /// This manager's chitchat node id (== manager_id).
+    pub manager_id: String,
+    /// The live cluster handle (test hook to simulate death via `initiate_shutdown`).
+    pub cluster: std::sync::Arc<wr_manager::cluster::ClusterHandle>,
 }
 
 /// Start `count` managers with chitchat gossip, all sharing the same Postgres.
-/// Chitchat is used only for manager liveness — engine heartbeats are in Postgres.
+/// Chitchat is the primary manager liveness signal — engine heartbeats are in Postgres.
 pub async fn start_manager_cluster(
     pool: deadpool_postgres::Pool,
     count: usize,
     heartbeat_timeout_secs: u64,
+) -> Result<Vec<ClusteredManager>> {
+    start_manager_cluster_inner(
+        pool,
+        count,
+        heartbeat_timeout_secs,
+        chitchat::FailureDetectorConfig::default(),
+    )
+    .await
+}
+
+/// Like `start_manager_cluster` but with a short failure detector so a killed
+/// peer is detected dead by chitchat within a couple of seconds (deterministic,
+/// bounded — used by tests that must observe a real chitchat death).
+pub async fn start_manager_cluster_fast_death(
+    pool: deadpool_postgres::Pool,
+    count: usize,
+    heartbeat_timeout_secs: u64,
+) -> Result<Vec<ClusteredManager>> {
+    let fd = chitchat::FailureDetectorConfig {
+        phi_threshold: 8.0,
+        sampling_window_size: 10,
+        max_interval: std::time::Duration::from_millis(500),
+        initial_interval: std::time::Duration::from_millis(200),
+        dead_node_grace_period: std::time::Duration::from_secs(10),
+    };
+    start_manager_cluster_inner(pool, count, heartbeat_timeout_secs, fd).await
+}
+
+async fn start_manager_cluster_inner(
+    pool: deadpool_postgres::Pool,
+    count: usize,
+    heartbeat_timeout_secs: u64,
+    failure_detector: chitchat::FailureDetectorConfig,
 ) -> Result<Vec<ClusteredManager>> {
     let mut managers = Vec::with_capacity(count);
     let mut gossip_addrs: Vec<String> = Vec::new();
@@ -985,17 +1077,18 @@ pub async fn start_manager_cluster(
             .await
             .map_err(|e| anyhow::anyhow!("register_manager: {e}"))?;
 
-        // Bootstrap chitchat for manager liveness (no application keys)
-        let _cluster = Arc::new(
+        let cluster = std::sync::Arc::new(
             wr_manager::cluster::ClusterHandle::new(
                 &manager_id,
                 "test-cluster",
                 gossip_listen,
                 gossip_addrs.clone(),
                 std::time::Duration::from_millis(100),
+                failure_detector.clone(),
             )
             .await?,
         );
+        cluster.publish_metadata(&grpc_url, &gossip_addr_str).await;
 
         gossip_addrs.push(gossip_addr_str);
 
@@ -1006,7 +1099,7 @@ pub async fn start_manager_cluster(
             .expect("test encryption key"),
         );
 
-        let manager = Manager::new(pool.clone(), crypto);
+        let manager = Manager::new(pool.clone(), crypto, cluster.clone());
 
         // Start gRPC server
         tokio::spawn(
@@ -1021,10 +1114,15 @@ pub async fn start_manager_cluster(
         tokio::spawn(wr_manager::state::monitor_heartbeats(
             pool.clone(),
             heartbeat_timeout_secs,
+            heartbeat_timeout_secs,
             std::time::Duration::from_millis(200),
         ));
 
-        managers.push(ClusteredManager { addr: grpc_url });
+        managers.push(ClusteredManager {
+            addr: grpc_url,
+            manager_id,
+            cluster,
+        });
     }
 
     Ok(managers)

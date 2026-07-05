@@ -51,11 +51,11 @@ async fn main() -> Result<()> {
     }
     let db_pool = pool::build_pool(&config.database.url, config.database.max_connections)
         .with_context(|| format!("failed to create manager database pool for {database_url}"))?;
-    let client = db_pool
+    let mut client = db_pool
         .get()
         .await
         .with_context(|| format!("failed to connect to manager database {database_url}"))?;
-    migrate::run_migrations(&client)
+    migrate::run_migrations(&mut client)
         .await
         .with_context(|| format!("failed to run manager database migrations in {database_url}"))?;
     drop(client);
@@ -117,6 +117,7 @@ async fn main() -> Result<()> {
             gossip_listen,
             seed_addrs,
             std::time::Duration::from_millis(config.cluster.gossip_interval_ms),
+            chitchat::FailureDetectorConfig::default(),
         )
         .await?,
     );
@@ -125,20 +126,58 @@ async fn main() -> Result<()> {
         config.cluster.gossip_listen_address
     );
 
+    cluster_handle
+        .publish_metadata(&grpc_address, &gossip_address)
+        .await;
+
+    {
+        let mut watcher = cluster_handle.live_nodes_watcher().await;
+        tokio::spawn(async move {
+            let mut known: std::collections::HashSet<String> = watcher
+                .borrow_and_update()
+                .keys()
+                .map(|id| id.node_id.to_string())
+                .collect();
+            while watcher.changed().await.is_ok() {
+                let current: std::collections::HashSet<String> = watcher
+                    .borrow()
+                    .keys()
+                    .map(|id| id.node_id.to_string())
+                    .collect();
+                for id in current.difference(&known) {
+                    info!(manager_id = %id, "manager joined cluster");
+                }
+                for id in known.difference(&current) {
+                    info!(manager_id = %id, "manager left cluster");
+                }
+                known = current;
+            }
+        });
+    }
+
     let crypto = Arc::new(crypto::SecretCrypto::from_env()?);
-    let manager = service::Manager::new(db_pool.clone(), crypto);
+    let manager = service::Manager::new(db_pool.clone(), crypto, cluster_handle.clone());
 
     // Monitor for engines that miss their heartbeat deadline
+    let module_heartbeat_timeout_secs = config
+        .module_heartbeat_timeout_secs
+        .expect("module_heartbeat_timeout_secs is filled by ManagerConfig::load");
     let monitor_handle = tokio::spawn(state::monitor_heartbeats(
         db_pool.clone(),
         config.engine_heartbeat_timeout_secs,
+        module_heartbeat_timeout_secs,
         std::time::Duration::from_secs(5),
     ));
 
     // Evaluate scheduled jobs
     let scheduler_handle = tokio::spawn(scheduler::run_scheduler(
         db_pool.clone(),
+        manager_id.clone(),
         std::time::Duration::from_secs(10),
+        config.scheduler_lease_secs as f64,
+        config.scheduler_retry_base_secs as f64,
+        config.scheduler_retry_cap_secs as f64,
+        config.local_proxy_address.clone(),
     ));
 
     info!(address = %addr, "manager listening");

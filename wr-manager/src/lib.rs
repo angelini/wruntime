@@ -4,5 +4,6 @@ pub mod crypto;
 pub mod db;
 pub mod migrate;
 pub mod pool;
+pub mod scheduler;
 pub mod service;
 pub mod state;

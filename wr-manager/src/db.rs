@@ -4,7 +4,7 @@ use tokio_retry::strategy::ExponentialBackoff;
 use tokio_retry::RetryIf;
 use tonic::Status;
 
-use wr_common::wruntime::{EngineRegistration, RoutingRule, RoutingTable};
+use wr_common::wruntime::{EngineRegistration, ModuleDescriptor, RoutingRule, RoutingTable};
 
 /// Exponential backoff strategy for NOWAIT lock retries: 10ms, 20ms, 40ms, 80ms.
 fn lock_retry_strategy() -> impl Iterator<Item = std::time::Duration> {
@@ -90,14 +90,18 @@ impl<T, E: std::fmt::Display> IntoInternalStatus<T> for Result<T, E> {
 
 // ── Engine operations ────────────────────────────────────────────────────────
 
-/// Upsert an engine registration and its module schemas.
-/// Does NOT acquire the global lock (engine registration doesn't affect routing).
-pub async fn upsert_engine_and_schemas(
+/// Register an engine, its module schemas, and one default routing rule per
+/// unique schema-bearing module tuple — all in a single transaction under the
+/// global routing lock. Routes are the last statements before commit, so any
+/// earlier failure rolls back the whole registration (no partial routes).
+pub async fn register_engine_and_routes(
     pool: &Pool,
     reg: &EngineRegistration,
 ) -> Result<(), Status> {
     let mut client = pool.get().await.internal()?;
     let txn = client.transaction().await.internal()?;
+
+    acquire_global_lock_wait(&txn).await?;
 
     let registration_bytes = reg.encode_to_vec();
 
@@ -143,6 +147,130 @@ pub async fn upsert_engine_and_schemas(
         .internal()?;
     }
 
+    // Publish one default routing rule per unique schema-bearing module tuple.
+    // Field values lifted verbatim from the old proxy path (node_service.rs:114-128):
+    // source_* = "", destination_* = module tuple, engine_address = reg.address,
+    // proxy_address = peer_address, peer_address = peer_address, healthy = true.
+    let empty = String::new();
+    let healthy = true;
+    let mut seen = std::collections::HashSet::new();
+    let mut seen_advertised = std::collections::HashSet::new();
+    let mut desired_rule_ids: Vec<String> = Vec::new();
+    let mut advertised_ns: Vec<String> = Vec::new();
+    let mut advertised_name: Vec<String> = Vec::new();
+    let mut advertised_ver: Vec<String> = Vec::new();
+    for module in &reg.modules {
+        // Track every advertised tuple (schema-bearing or not) so heartbeat
+        // reconciliation only removes modules this engine no longer advertises.
+        if seen_advertised.insert((&module.namespace, &module.name, &module.version)) {
+            advertised_ns.push(module.namespace.clone());
+            advertised_name.push(module.name.clone());
+            advertised_ver.push(module.version.clone());
+        }
+        if module.proto_schema.is_empty() {
+            continue;
+        }
+        if !seen.insert((&module.namespace, &module.name, &module.version)) {
+            continue;
+        }
+        let rule_id = format!(
+            "{}/{}/{}/{}",
+            reg.engine_id, module.namespace, module.name, module.version
+        );
+        txn.execute(
+            "INSERT INTO wr_routing_rules (
+                rule_id, source_namespace, source_module,
+                destination_namespace, destination_module, destination_version,
+                engine_id, engine_address, proxy_address, peer_address, healthy
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             ON CONFLICT (rule_id) DO UPDATE SET
+                source_namespace = EXCLUDED.source_namespace,
+                source_module = EXCLUDED.source_module,
+                destination_namespace = EXCLUDED.destination_namespace,
+                destination_module = EXCLUDED.destination_module,
+                destination_version = EXCLUDED.destination_version,
+                engine_id = EXCLUDED.engine_id,
+                engine_address = EXCLUDED.engine_address,
+                proxy_address = EXCLUDED.proxy_address,
+                peer_address = EXCLUDED.peer_address,
+                healthy = EXCLUDED.healthy,
+                updated_at = NOW()",
+            &[
+                &rule_id,
+                &empty,
+                &empty,
+                &module.namespace,
+                &module.name,
+                &module.version,
+                &reg.engine_id,
+                &reg.address,
+                &reg.peer_address,
+                &reg.peer_address,
+                &healthy,
+            ],
+        )
+        .await
+        .internal()?;
+        txn.execute(
+            "INSERT INTO wr_module_heartbeats (engine_id, namespace, module_name, version)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (engine_id, namespace, module_name, version)
+             DO UPDATE SET last_healthy = NOW()",
+            &[
+                &reg.engine_id,
+                &module.namespace,
+                &module.name,
+                &module.version,
+            ],
+        )
+        .await
+        .internal()?;
+        desired_rule_ids.push(rule_id);
+    }
+    let rules_written = desired_rule_ids.len() as u64;
+
+    // Reconcile: remove engine-owned DEFAULT rules this registration no longer
+    // advertises. Only rows with this engine's canonical default prefix
+    // "{engine_id}/" are touched; admin rules from UpsertRoutingRule use a
+    // different rule_id shape and are left intact. When desired_rule_ids is empty
+    // (no schema-bearing modules), `<> ALL('{}')` is true for every prefixed row,
+    // so all of this engine's default rules are removed — the authoritative result.
+    let engine_prefix = format!("{}/", reg.engine_id);
+    let deleted_rules = txn
+        .execute(
+            "DELETE FROM wr_routing_rules
+             WHERE engine_id = $1
+               AND starts_with(rule_id, $2)
+               AND rule_id <> ALL($3::text[])",
+            &[&reg.engine_id, &engine_prefix, &desired_rule_ids],
+        )
+        .await
+        .internal()?;
+
+    // Drop per-module heartbeats for modules this engine no longer advertises,
+    // so a removed module cannot be resurrected as healthy by the health sweep.
+    // Keep-set is every advertised tuple; NOT IN over an empty unnest deletes all
+    // of this engine's heartbeat rows (zero-module re-registration).
+    txn.execute(
+        "DELETE FROM wr_module_heartbeats
+         WHERE engine_id = $1
+           AND (namespace, module_name, version) NOT IN (
+             SELECT n, m, v FROM unnest($2::text[], $3::text[], $4::text[]) AS t(n, m, v)
+           )",
+        &[
+            &reg.engine_id,
+            &advertised_ns,
+            &advertised_name,
+            &advertised_ver,
+        ],
+    )
+    .await
+    .internal()?;
+
+    if rules_written > 0 || deleted_rules > 0 {
+        increment_version(&txn).await?;
+    }
+
     txn.commit().await.internal()?;
     Ok(())
 }
@@ -167,6 +295,13 @@ pub async fn deregister_engine(pool: &Pool, engine_id: &str) -> Result<(), Statu
     txn.execute("DELETE FROM wr_engines WHERE engine_id = $1", &[&engine_id])
         .await
         .internal()?;
+
+    txn.execute(
+        "DELETE FROM wr_module_heartbeats WHERE engine_id = $1",
+        &[&engine_id],
+    )
+    .await
+    .internal()?;
 
     if changed > 0 {
         increment_version(&txn).await?;
@@ -194,50 +329,96 @@ pub async fn heartbeat_engine(pool: &Pool, engine_id: &str) -> Result<(), Status
     Ok(())
 }
 
-/// Batch-update rule health based on engine heartbeat timestamps.
-/// Finds stale engines (heartbeat older than `timeout_secs`) and marks their
-/// healthy rules unhealthy, and finds recovered engines and marks their
-/// unhealthy rules healthy.
+/// Upsert a per-module heartbeat (`last_healthy = NOW()`) for each module an
+/// engine reports healthy. Idempotent per
+/// (engine_id, namespace, module_name, version). Does not bump the routing
+/// version — route health is recomputed by the background monitor.
+pub async fn upsert_module_heartbeats(
+    pool: &Pool,
+    engine_id: &str,
+    modules: &[ModuleDescriptor],
+) -> Result<(), Status> {
+    if modules.is_empty() {
+        return Ok(());
+    }
+    let client = pool.get().await.internal()?;
+    for module in modules {
+        client
+            .execute(
+                "INSERT INTO wr_module_heartbeats (engine_id, namespace, module_name, version)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (engine_id, namespace, module_name, version)
+                 DO UPDATE SET last_healthy = NOW()",
+                &[&engine_id, &module.namespace, &module.name, &module.version],
+            )
+            .await
+            .internal()?;
+    }
+    Ok(())
+}
+
+/// Recompute routing-rule health from BOTH engine and per-module heartbeats.
 ///
-/// The health UPDATEs run without the global lock (they are idempotent).
-/// The global lock is only acquired briefly to bump the routing table version
-/// when changes occurred.
+/// A rule is healthy iff its engine's heartbeat is fresh (within
+/// `engine_timeout_secs`) AND a matching `wr_module_heartbeats` row for the
+/// rule's destination `(namespace, module, version)` on that engine is fresh
+/// (within `module_timeout_secs`). This subsumes the old engine-only logic: a
+/// stale engine fails the join for all its rules, and additionally a single
+/// stale or missing module takes only its own routes out of rotation.
+///
+/// The health UPDATEs run without the global lock (they are idempotent). The
+/// global lock is acquired only briefly to bump the routing table version when
+/// changes occurred.
 ///
 /// Returns `(stale_rule_ids, recovered_rule_ids)`.
-pub async fn update_rule_health_from_heartbeats(
+pub async fn update_route_health(
     pool: &Pool,
-    timeout_secs: f64,
+    engine_timeout_secs: f64,
+    module_timeout_secs: f64,
 ) -> Result<(Vec<String>, Vec<String>), Status> {
     let mut client = pool.get().await.internal()?;
 
-    // Mark stale engines' rules unhealthy (no lock needed — idempotent)
+    // Mark unhealthy: currently healthy but no longer backed by BOTH a fresh
+    // engine heartbeat and a fresh matching module heartbeat.
     let stale_rows = client
         .query(
-            "UPDATE wr_routing_rules SET healthy = FALSE, updated_at = NOW()
-             WHERE rule_id IN (
-                 SELECT r.rule_id FROM wr_routing_rules r
-                 JOIN wr_engines e ON r.engine_id = e.engine_id
-                 WHERE e.last_heartbeat < NOW() - make_interval(secs => $1::double precision)
-                   AND r.healthy = TRUE
-             )
+            "UPDATE wr_routing_rules r SET healthy = FALSE, updated_at = NOW()
+             WHERE r.healthy = TRUE
+               AND NOT EXISTS (
+                 SELECT 1 FROM wr_engines e
+                 JOIN wr_module_heartbeats m
+                   ON m.engine_id   = e.engine_id
+                  AND m.namespace   = r.destination_namespace
+                  AND m.module_name = r.destination_module
+                  AND m.version     = r.destination_version
+                 WHERE e.engine_id = r.engine_id
+                   AND e.last_heartbeat >= NOW() - make_interval(secs => $1::double precision)
+                   AND m.last_healthy   >= NOW() - make_interval(secs => $2::double precision)
+               )
              RETURNING rule_id",
-            &[&timeout_secs],
+            &[&engine_timeout_secs, &module_timeout_secs],
         )
         .await
         .internal()?;
 
-    // Mark recovered engines' rules healthy (no lock needed — idempotent)
+    // Mark healthy: currently unhealthy but now backed by BOTH fresh signals.
     let recovered_rows = client
         .query(
-            "UPDATE wr_routing_rules SET healthy = TRUE, updated_at = NOW()
-             WHERE rule_id IN (
-                 SELECT r.rule_id FROM wr_routing_rules r
-                 JOIN wr_engines e ON r.engine_id = e.engine_id
-                 WHERE e.last_heartbeat >= NOW() - make_interval(secs => $1::double precision)
-                   AND r.healthy = FALSE
-             )
+            "UPDATE wr_routing_rules r SET healthy = TRUE, updated_at = NOW()
+             WHERE r.healthy = FALSE
+               AND EXISTS (
+                 SELECT 1 FROM wr_engines e
+                 JOIN wr_module_heartbeats m
+                   ON m.engine_id   = e.engine_id
+                  AND m.namespace   = r.destination_namespace
+                  AND m.module_name = r.destination_module
+                  AND m.version     = r.destination_version
+                 WHERE e.engine_id = r.engine_id
+                   AND e.last_heartbeat >= NOW() - make_interval(secs => $1::double precision)
+                   AND m.last_healthy   >= NOW() - make_interval(secs => $2::double precision)
+               )
              RETURNING rule_id",
-            &[&timeout_secs],
+            &[&engine_timeout_secs, &module_timeout_secs],
         )
         .await
         .internal()?;
@@ -446,6 +627,29 @@ pub async fn upsert_secret(
     Ok(())
 }
 
+/// Insert an encrypted secret only if no row exists for (namespace, key).
+/// Uses `ON CONFLICT DO NOTHING` so racing callers converge on a single stored
+/// row; the caller must re-read (via `get_secrets`) to obtain the winning value.
+pub async fn insert_secret_if_absent(
+    pool: &Pool,
+    namespace: &str,
+    key: &str,
+    ciphertext: &[u8],
+    nonce: &[u8],
+) -> Result<(), Status> {
+    let client = pool.get().await.internal()?;
+    client
+        .execute(
+            "INSERT INTO wr_secrets (namespace, key, ciphertext, nonce)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (namespace, key) DO NOTHING",
+            &[&namespace, &key, &ciphertext, &nonce],
+        )
+        .await
+        .internal()?;
+    Ok(())
+}
+
 /// Delete a secret by (namespace, key). Returns true if a row was deleted.
 pub async fn delete_secret(pool: &Pool, namespace: &str, key: &str) -> Result<bool, Status> {
     let client = pool.get().await.internal()?;
@@ -625,6 +829,10 @@ pub async fn get_schema(
 
 // ── Schedule operations ────────────────────────────────────────────────────
 
+const SCHEDULE_COLUMNS: &str = "schedule_id, worker_namespace, worker_name, worker_version, \
+    job_type, interval_secs, immediate, payload, timeout_secs, max_attempts, enabled, \
+    last_fired_at, next_fire_at, last_error, consecutive_failures, claim_id::text AS claim_id";
+
 pub struct ScheduleRow {
     pub schedule_id: String,
     pub worker_namespace: String,
@@ -638,6 +846,10 @@ pub struct ScheduleRow {
     pub max_attempts: i32,
     pub enabled: bool,
     pub last_fired_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub next_fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_error: Option<String>,
+    pub consecutive_failures: i32,
+    pub claim_id: Option<String>,
 }
 
 fn row_to_schedule(row: &tokio_postgres::Row) -> ScheduleRow {
@@ -654,6 +866,10 @@ fn row_to_schedule(row: &tokio_postgres::Row) -> ScheduleRow {
         max_attempts: row.get(9),
         enabled: row.get(10),
         last_fired_at: row.get(11),
+        next_fire_at: row.get(12),
+        last_error: row.get(13),
+        consecutive_failures: row.get(14),
+        claim_id: row.get(15),
     }
 }
 
@@ -677,8 +893,10 @@ pub async fn upsert_schedule(
         .query_one(
             "INSERT INTO wr_schedules
                 (worker_namespace, worker_name, worker_version, job_type,
-                 interval_secs, immediate, payload, timeout_secs, max_attempts, enabled)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)
+                 interval_secs, immediate, payload, timeout_secs, max_attempts, enabled, next_fire_at)
+             VALUES ($1, $2, $3, $4, $5::int, $6, $7, $8, $9, TRUE,
+                 CASE WHEN $6 THEN NOW()
+                      ELSE NOW() + make_interval(secs => $5::double precision) END)
              ON CONFLICT (worker_namespace, worker_name, worker_version, job_type)
              DO UPDATE SET
                 interval_secs = EXCLUDED.interval_secs,
@@ -687,6 +905,15 @@ pub async fn upsert_schedule(
                 timeout_secs  = EXCLUDED.timeout_secs,
                 max_attempts  = EXCLUDED.max_attempts,
                 enabled       = TRUE,
+                next_fire_at  = CASE
+                    WHEN wr_schedules.last_fired_at IS NULL AND EXCLUDED.immediate THEN NOW()
+                    WHEN wr_schedules.last_fired_at IS NULL
+                        THEN NOW() + make_interval(secs => EXCLUDED.interval_secs::double precision)
+                    ELSE wr_schedules.last_fired_at + make_interval(secs => EXCLUDED.interval_secs::double precision)
+                  END,
+                claimed_by    = NULL,
+                claimed_until = NULL,
+                claim_id      = NULL,
                 updated_at    = NOW()
              RETURNING schedule_id",
             &[
@@ -734,95 +961,105 @@ pub async fn list_schedules(
 ) -> Result<Vec<ScheduleRow>, Status> {
     let client = pool.get().await.internal()?;
     let rows = if worker_namespace.is_empty() {
-        client
-            .query(
-                "SELECT schedule_id, worker_namespace, worker_name, worker_version,
-                        job_type, interval_secs, immediate, payload, timeout_secs,
-                        max_attempts, enabled, last_fired_at
-                 FROM wr_schedules
-                 ORDER BY worker_namespace, worker_name, job_type",
-                &[],
-            )
-            .await
-            .internal()?
+        let sql = format!(
+            "SELECT {SCHEDULE_COLUMNS} FROM wr_schedules
+             ORDER BY worker_namespace, worker_name, job_type"
+        );
+        client.query(&sql, &[]).await.internal()?
     } else {
-        client
-            .query(
-                "SELECT schedule_id, worker_namespace, worker_name, worker_version,
-                        job_type, interval_secs, immediate, payload, timeout_secs,
-                        max_attempts, enabled, last_fired_at
-                 FROM wr_schedules
-                 WHERE worker_namespace = $1
-                 ORDER BY worker_name, job_type",
-                &[&worker_namespace],
-            )
-            .await
-            .internal()?
+        let sql = format!(
+            "SELECT {SCHEDULE_COLUMNS} FROM wr_schedules
+             WHERE worker_namespace = $1
+             ORDER BY worker_name, job_type"
+        );
+        client.query(&sql, &[&worker_namespace]).await.internal()?
     };
     Ok(rows.iter().map(row_to_schedule).collect())
 }
 
-/// Claim due schedules using FOR UPDATE SKIP LOCKED for multi-manager safety.
-/// Must be called within a transaction — the caller commits after processing.
+/// Claim due, unleased (or lease-expired) schedules atomically, stamping a fresh
+/// lease + fencing `claim_id`. Runs in a short transaction the caller commits
+/// immediately. `SKIP LOCKED` keeps concurrent managers from double-claiming.
 pub async fn claim_due_schedules(
     txn: &deadpool_postgres::Transaction<'_>,
+    claimer_id: &str,
+    lease_secs: f64,
 ) -> Result<Vec<ScheduleRow>, Status> {
-    let rows = txn
-        .query(
-            "SELECT schedule_id, worker_namespace, worker_name, worker_version,
-                    job_type, interval_secs, immediate, payload, timeout_secs,
-                    max_attempts, enabled, last_fired_at
-             FROM wr_schedules
+    let sql = format!(
+        "UPDATE wr_schedules
+         SET claimed_by      = $1,
+             claimed_until   = NOW() + make_interval(secs => $2::double precision),
+             claim_id        = gen_random_uuid(),
+             last_attempt_at = NOW()
+         WHERE schedule_id IN (
+             SELECT schedule_id FROM wr_schedules
              WHERE enabled = TRUE
-               AND (
-                 (last_fired_at IS NULL AND immediate = TRUE)
-                 OR (last_fired_at IS NULL AND immediate = FALSE
-                     AND created_at + make_interval(secs => interval_secs::double precision) <= NOW())
-                 OR (last_fired_at IS NOT NULL
-                     AND last_fired_at + make_interval(secs => interval_secs::double precision) <= NOW())
-               )
-             FOR UPDATE SKIP LOCKED",
-            &[],
-        )
+               AND next_fire_at <= NOW()
+               AND (claimed_until IS NULL OR claimed_until < NOW())
+             FOR UPDATE SKIP LOCKED
+         )
+         RETURNING {SCHEDULE_COLUMNS}"
+    );
+    let rows = txn
+        .query(&sql, &[&claimer_id, &lease_secs])
         .await
         .internal()?;
     Ok(rows.iter().map(row_to_schedule).collect())
 }
 
-/// Mark a schedule as fired (set last_fired_at = NOW()).
-pub async fn mark_schedule_fired(
-    txn: &deadpool_postgres::Transaction<'_>,
-    schedule_id: &str,
-) -> Result<(), Status> {
-    txn.execute(
-        "UPDATE wr_schedules SET last_fired_at = NOW(), updated_at = NOW()
-         WHERE schedule_id = $1",
-        &[&schedule_id],
-    )
-    .await
-    .internal()?;
-    Ok(())
-}
-
-/// Resolve a healthy engine address for a given worker module.
-pub async fn resolve_engine_for_worker(
+/// Fenced success finalize. Advances next_fire_at by one interval, clears the
+/// lease/error/claim. The `claim_id` guard drops stale (reclaimed) attempts.
+/// Returns rows affected (0 == fenced out).
+pub async fn mark_schedule_succeeded(
     pool: &Pool,
-    worker_namespace: &str,
-    worker_name: &str,
-    worker_version: &str,
-) -> Result<Option<String>, Status> {
+    schedule_id: &str,
+    claim_id: &str,
+) -> Result<u64, Status> {
     let client = pool.get().await.internal()?;
-    let row = client
-        .query_opt(
-            "SELECT engine_address FROM wr_routing_rules
-             WHERE destination_namespace = $1
-               AND destination_module = $2
-               AND destination_version = $3
-               AND healthy = TRUE
-             LIMIT 1",
-            &[&worker_namespace, &worker_name, &worker_version],
+    let n = client
+        .execute(
+            "UPDATE wr_schedules
+             SET last_fired_at        = NOW(),
+                 next_fire_at         = NOW() + make_interval(secs => interval_secs::double precision),
+                 last_error           = NULL,
+                 consecutive_failures = 0,
+                 claimed_by           = NULL,
+                 claimed_until        = NULL,
+                 claim_id             = NULL,
+                 updated_at           = NOW()
+             WHERE schedule_id = $1 AND claim_id::text = $2",
+            &[&schedule_id, &claim_id],
         )
         .await
         .internal()?;
-    Ok(row.map(|r| r.get(0)))
+    Ok(n)
+}
+
+/// Fenced failure finalize. Records the error, bumps consecutive_failures, sets a
+/// backed-off next_fire_at, clears the lease/claim. `claim_id` guard as above.
+/// Returns rows affected (0 == fenced out).
+pub async fn mark_schedule_failed(
+    pool: &Pool,
+    schedule_id: &str,
+    claim_id: &str,
+    error: &str,
+    backoff_secs: f64,
+) -> Result<u64, Status> {
+    let client = pool.get().await.internal()?;
+    let n = client
+        .execute(
+            "UPDATE wr_schedules
+             SET last_error           = $3,
+                 consecutive_failures = consecutive_failures + 1,
+                 next_fire_at         = NOW() + make_interval(secs => $4::double precision),
+                 claimed_by           = NULL,
+                 claimed_until        = NULL,
+                 claim_id             = NULL,
+                 updated_at           = NOW()
+             WHERE schedule_id = $1 AND claim_id::text = $2",
+            &[&schedule_id, &claim_id, &error, &backoff_secs],
+        )
+        .await
+        .internal()?;
+    Ok(n)
 }

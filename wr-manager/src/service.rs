@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use deadpool_postgres::Pool;
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{info, warn};
 
 use wr_common::naming::namespace_role;
 use wr_common::wruntime::{
@@ -19,26 +19,111 @@ use wr_common::wruntime::{
     UpsertScheduleResponse,
 };
 
+use crate::cluster::{ClusterHandle, ManagerLiveness};
 use crate::crypto::SecretCrypto;
 use crate::db;
+
+/// A genuine liveness discrepancy surfaced by reconciliation: a manager the DB
+/// still considers fresh that chitchat has affirmatively marked dead.
+pub struct ReconcileWarning {
+    pub manager_id: String,
+}
+
+/// Per-manager reconciliation of the DB-fresh set against chitchat, keyed on
+/// `manager_id`. Pure (no I/O, no clock) so it is unit-testable without gossip
+/// timing. `within_window` is the caller's `ClusterHandle::within_convergence_window()`.
+pub fn reconcile_managers(
+    db_records: &HashMap<String, db::ManagerRecord>,
+    live: &HashMap<String, ManagerLiveness>,
+    dead: &HashSet<String>,
+    within_window: bool,
+    self_id: &str,
+) -> (Vec<ManagerInfo>, Vec<ReconcileWarning>) {
+    let mut managers = Vec::new();
+    let mut warnings = Vec::new();
+
+    // Stable, deterministic order over the union of DB and gossip ids.
+    let mut ids: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    ids.extend(db_records.keys().map(String::as_str));
+    ids.extend(live.keys().map(String::as_str));
+
+    for id in ids {
+        let db = db_records.get(id);
+
+        // Chitchat affirmatively dead → exclude immediately, regardless of DB
+        // freshness or cluster size (this is the N1 fix). A DB-fresh row that
+        // gossip says is dead is the ONLY genuine discrepancy worth a warning;
+        // never warn about self.
+        if dead.contains(id) {
+            if db.is_some() && id != self_id {
+                warnings.push(ReconcileWarning {
+                    manager_id: id.to_string(),
+                });
+            }
+            continue;
+        }
+
+        // Live in gossip → include, preferring gossip addresses and filling any
+        // blank field from the DB record for this manager_id.
+        if let Some(l) = live.get(id) {
+            let grpc_address = if !l.grpc_address.is_empty() {
+                l.grpc_address.clone()
+            } else {
+                db.map(|d| d.grpc_address.clone()).unwrap_or_default()
+            };
+            let gossip_address = if !l.gossip_address.is_empty() {
+                l.gossip_address.clone()
+            } else {
+                db.map(|d| d.gossip_address.clone()).unwrap_or_default()
+            };
+            managers.push(ManagerInfo {
+                manager_id: id.to_string(),
+                grpc_address,
+                gossip_address,
+            });
+            continue;
+        }
+
+        // DB-fresh but never observed in gossip (neither live nor dead):
+        // include during the bootstrap window, else trust chitchat and drop
+        // (no warn — ordinary post-window state).
+        if let Some(d) = db {
+            if within_window {
+                managers.push(ManagerInfo {
+                    manager_id: id.to_string(),
+                    grpc_address: d.grpc_address.clone(),
+                    gossip_address: d.gossip_address.clone(),
+                });
+            }
+        }
+    }
+
+    (managers, warnings)
+}
 
 pub struct Manager {
     pool: Pool,
     crypto: Arc<SecretCrypto>,
+    cluster: Arc<ClusterHandle>,
 }
 
 impl Manager {
-    pub fn new(pool: Pool, crypto: Arc<SecretCrypto>) -> Self {
-        Self { pool, crypto }
+    pub fn new(pool: Pool, crypto: Arc<SecretCrypto>, cluster: Arc<ClusterHandle>) -> Self {
+        Self {
+            pool,
+            crypto,
+            cluster,
+        }
     }
 
     /// Ensure a DB password exists for the given namespace, creating one if not.
     /// Returns the plaintext password.
     async fn ensure_db_password(&self, namespace: &str) -> Result<String, Status> {
         let key = "__db_password";
+
+        // Fast path: already stored — decrypt and return.
         let existing =
             db::get_secrets(&self.pool, &[(namespace.to_string(), key.to_string())]).await?;
-
         if let Some((_, _, ciphertext, nonce)) = existing.into_iter().next() {
             return self
                 .crypto
@@ -46,14 +131,27 @@ impl Manager {
                 .map_err(|e| Status::internal(format!("failed to decrypt db password: {e}")));
         }
 
-        // Generate and store a new random password
-        let password = SecretCrypto::generate_random_password();
+        // Miss: generate + encrypt a candidate, then insert only if absent.
+        // Concurrent callers race here; ON CONFLICT DO NOTHING lets the DB pick
+        // a single winning row.
+        let candidate = SecretCrypto::generate_random_password();
         let (ciphertext, nonce) = self
             .crypto
-            .encrypt(&password)
+            .encrypt(&candidate)
             .map_err(|e| Status::internal(format!("encryption failed: {e}")))?;
-        db::upsert_secret(&self.pool, namespace, key, &ciphertext, &nonce).await?;
-        Ok(password)
+        db::insert_secret_if_absent(&self.pool, namespace, key, &ciphertext, &nonce).await?;
+
+        // Re-read unconditionally and decrypt the STORED value, so a caller
+        // whose insert lost the conflict still returns the persisted password.
+        let stored =
+            db::get_secrets(&self.pool, &[(namespace.to_string(), key.to_string())]).await?;
+        let (_, _, ciphertext, nonce) = stored
+            .into_iter()
+            .next()
+            .ok_or_else(|| Status::internal("db password missing immediately after insert"))?;
+        self.crypto
+            .decrypt(&ciphertext, &nonce)
+            .map_err(|e| Status::internal(format!("failed to decrypt db password: {e}")))
     }
 
     /// Resolve DB credentials for each namespace that needs database access.
@@ -180,14 +278,17 @@ impl ManagerService for Manager {
 
         let engine_id = reg.engine_id.clone();
 
-        // Persist to DB (sets last_heartbeat = NOW() via column default / ON CONFLICT)
-        db::upsert_engine_and_schemas(&self.pool, &reg).await?;
-
-        // Resolve requested secrets
+        // Resolve requested secrets (fails before any write).
         let secrets = self.resolve_secrets(&reg.secrets).await?;
 
         // Resolve DB credentials for namespaces that need database access
+        // (fails before any write).
         let db_credentials = self.resolve_db_credentials(&reg.db_namespaces).await?;
+
+        // Persist engine, schemas, and default routing rules atomically. Routes are
+        // published last, so a failure in either resolver above leaves no engine,
+        // schema, or routing-rule rows.
+        db::register_engine_and_routes(&self.pool, &reg).await?;
 
         info!(engine_id, "engine registered");
         Ok(Response::new(RegisterEngineResponse {
@@ -214,8 +315,36 @@ impl ManagerService for Manager {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        let engine_id = request.into_inner().engine_id;
+        let HeartbeatRequest {
+            engine_id,
+            healthy_modules,
+        } = request.into_inner();
+
+        // Bump engine liveness FIRST and unconditionally. Engine liveness keeps
+        // every route on the engine healthy, so a single malformed module
+        // descriptor must never starve it (which would flip ALL the engine's
+        // routes unhealthy after the timeout).
         db::heartbeat_engine(&self.pool, &engine_id).await?;
+
+        // Validate each reported module independently; skip and log invalid
+        // entries rather than rejecting the whole heartbeat.
+        let mut valid = Vec::with_capacity(healthy_modules.len());
+        for m in healthy_modules {
+            if m.namespace.is_empty() || m.name.is_empty() || m.version.is_empty() {
+                warn!(
+                    engine_id = %engine_id,
+                    namespace = %m.namespace,
+                    module = %m.name,
+                    version = %m.version,
+                    "skipping malformed module heartbeat entry",
+                );
+                continue;
+            }
+            valid.push(m);
+        }
+
+        db::upsert_module_heartbeats(&self.pool, &engine_id, &valid).await?;
+
         Ok(Response::new(HeartbeatResponse {}))
     }
 
@@ -233,14 +362,33 @@ impl ManagerService for Manager {
         &self,
         _request: Request<ListManagersRequest>,
     ) -> Result<Response<ListManagersResponse>, Status> {
-        let records = db::list_managers(&self.pool).await?;
-        let managers = records
+        let db_records: HashMap<String, db::ManagerRecord> = db::list_managers(&self.pool)
+            .await?
             .into_iter()
-            .map(|r| ManagerInfo {
-                manager_id: r.manager_id,
-                grpc_address: r.grpc_address,
-            })
+            .map(|r| (r.manager_id.clone(), r))
             .collect();
+
+        let live: HashMap<String, ManagerLiveness> = self
+            .cluster
+            .live_managers()
+            .await
+            .into_iter()
+            .map(|m| (m.manager_id.clone(), m))
+            .collect();
+        let dead = self.cluster.dead_manager_ids().await;
+        let within_window = self.cluster.within_convergence_window();
+        let self_id = self.cluster.self_id();
+
+        let (managers, warnings) =
+            reconcile_managers(&db_records, &live, &dead, within_window, &self_id);
+
+        for w in warnings {
+            warn!(
+                manager_id = %w.manager_id,
+                "manager is DB-fresh but chitchat reports it dead; excluding from ListManagers",
+            );
+        }
+
         Ok(Response::new(ListManagersResponse { managers }))
     }
 
@@ -461,8 +609,133 @@ impl ManagerService for Manager {
                 max_attempts: r.max_attempts,
                 enabled: r.enabled,
                 last_fired_at: r.last_fired_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                next_fire_at: r.next_fire_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                last_error: r.last_error.unwrap_or_default(),
+                consecutive_failures: r.consecutive_failures,
             })
             .collect();
         Ok(Response::new(ListSchedulesResponse { schedules }))
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+
+    fn rec(id: &str, grpc: &str, gossip: &str) -> db::ManagerRecord {
+        db::ManagerRecord {
+            manager_id: id.to_string(),
+            grpc_address: grpc.to_string(),
+            gossip_address: gossip.to_string(),
+        }
+    }
+    fn live(id: &str, grpc: &str, gossip: &str) -> ManagerLiveness {
+        ManagerLiveness {
+            manager_id: id.to_string(),
+            grpc_address: grpc.to_string(),
+            gossip_address: gossip.to_string(),
+        }
+    }
+    fn map<T>(items: Vec<(&str, T)>) -> HashMap<String, T> {
+        items.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    // 2-manager: peer is chitchat-dead while still DB-fresh (the N1 case).
+    #[test]
+    fn dead_peer_excluded_and_warned() {
+        let db = map(vec![
+            ("self", rec("self", "https://self:9000", "self:9010")),
+            ("peer", rec("peer", "https://peer:9000", "peer:9010")),
+        ]);
+        let live = map(vec![(
+            "self",
+            live("self", "https://self:9000", "self:9010"),
+        )]);
+        let dead: HashSet<String> = ["peer".to_string()].into_iter().collect();
+
+        let (managers, warnings) = reconcile_managers(&db, &live, &dead, true, "self");
+
+        let ids: Vec<_> = managers.iter().map(|m| m.manager_id.as_str()).collect();
+        assert_eq!(ids, vec!["self"]);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].manager_id, "peer");
+    }
+
+    // Single manager (live = just self, no dead) → self included, no warn.
+    #[test]
+    fn single_manager_self_only_no_warn() {
+        let db = map(vec![(
+            "self",
+            rec("self", "https://self:9000", "self:9010"),
+        )]);
+        let live = map(vec![(
+            "self",
+            live("self", "https://self:9000", "self:9010"),
+        )]);
+        let dead: HashSet<String> = HashSet::new();
+
+        let (managers, warnings) = reconcile_managers(&db, &live, &dead, true, "self");
+
+        assert_eq!(managers.len(), 1);
+        assert_eq!(managers[0].manager_id, "self");
+        assert_eq!(managers[0].gossip_address, "self:9010");
+        assert!(warnings.is_empty());
+    }
+
+    // DB-fresh peer unknown to gossip, within window → included (bootstrap).
+    #[test]
+    fn db_fresh_unknown_within_window_included() {
+        let db = map(vec![
+            ("self", rec("self", "https://self:9000", "self:9010")),
+            ("peer", rec("peer", "https://peer:9000", "peer:9010")),
+        ]);
+        let live = map(vec![(
+            "self",
+            live("self", "https://self:9000", "self:9010"),
+        )]);
+        let dead: HashSet<String> = HashSet::new();
+
+        let (managers, warnings) = reconcile_managers(&db, &live, &dead, true, "self");
+
+        let ids: Vec<_> = managers.iter().map(|m| m.manager_id.as_str()).collect();
+        assert_eq!(ids, vec!["peer", "self"]); // BTreeSet order
+        assert!(warnings.is_empty());
+    }
+
+    // DB-fresh peer unknown to gossip, window elapsed → excluded, no warn.
+    #[test]
+    fn db_fresh_unknown_after_window_excluded() {
+        let db = map(vec![
+            ("self", rec("self", "https://self:9000", "self:9010")),
+            ("peer", rec("peer", "https://peer:9000", "peer:9010")),
+        ]);
+        let live = map(vec![(
+            "self",
+            live("self", "https://self:9000", "self:9010"),
+        )]);
+        let dead: HashSet<String> = HashSet::new();
+
+        let (managers, warnings) = reconcile_managers(&db, &live, &dead, false, "self");
+
+        let ids: Vec<_> = managers.iter().map(|m| m.manager_id.as_str()).collect();
+        assert_eq!(ids, vec!["self"]);
+        assert!(warnings.is_empty());
+    }
+
+    // Live peer missing grpc_address in gossip but present in DB → filled from DB.
+    #[test]
+    fn live_missing_grpc_filled_from_db() {
+        let db = map(vec![(
+            "peer",
+            rec("peer", "https://peer:9000", "peer:9010"),
+        )]);
+        let live = map(vec![("peer", live("peer", "", ""))]);
+        let dead: HashSet<String> = HashSet::new();
+
+        let (managers, _warnings) = reconcile_managers(&db, &live, &dead, false, "self");
+
+        assert_eq!(managers.len(), 1);
+        assert_eq!(managers[0].grpc_address, "https://peer:9000");
+        assert_eq!(managers[0].gossip_address, "peer:9010");
     }
 }

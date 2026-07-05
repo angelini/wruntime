@@ -12,7 +12,7 @@ use wr_common::discovery::ManagerDiscovery;
 use wr_common::wruntime::{
     node_service_server::NodeService, DeregisterEngineRequest, DeregisterEngineResponse,
     HeartbeatRequest, HeartbeatResponse, ModuleDescriptor, RegisterEngineRequest,
-    RegisterEngineResponse, RoutingRule,
+    RegisterEngineResponse,
 };
 
 /// Cached heartbeat state for a single engine.
@@ -104,31 +104,6 @@ impl NodeService for NodeAgent {
         // Forward registration to manager
         let mut client = self.discovery.get_client().await?;
         let response = client.register_engine(req.clone()).await?.into_inner();
-
-        // Forward routing rules for each module with a schema
-        for module in &reg.modules {
-            if module.proto_schema.is_empty() {
-                continue;
-            }
-            client
-                .upsert_routing_rule(RoutingRule {
-                    rule_id: format!(
-                        "{}/{}/{}/{}",
-                        engine_id, module.namespace, module.name, module.version,
-                    ),
-                    source_module: String::new(),
-                    source_namespace: String::new(),
-                    destination_module: module.name.clone(),
-                    destination_namespace: module.namespace.clone(),
-                    destination_version: module.version.clone(),
-                    engine_id: engine_id.clone(),
-                    engine_address: reg.address.clone(),
-                    proxy_address: reg.peer_address.clone(),
-                    peer_address: reg.peer_address.clone(),
-                    healthy: true,
-                })
-                .await?;
-        }
 
         // Cache engine for heartbeat aggregation
         {

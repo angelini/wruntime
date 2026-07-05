@@ -2,6 +2,11 @@
 mod helpers;
 use helpers::*;
 
+use wr_common::wruntime::{
+    EngineRegistration, HeartbeatRequest, ListManagersRequest, ModuleDescriptor,
+    RegisterEngineRequest,
+};
+
 // ── Multi-manager integration tests ──────────────────────────────────────────
 //
 // These tests verify DB-based health monitoring across multiple managers
@@ -182,5 +187,141 @@ async fn test_manager_self_registration() {
         let gossip: String = row.get(2);
         assert!(grpc.starts_with("http://"), "grpc_address should be a URL");
         assert!(!gossip.is_empty(), "gossip_address should be non-empty");
+    }
+}
+
+/// Module-level health converges across managers via shared Postgres: an engine
+/// reports only one of its two modules; the module whose heartbeat ages out has
+/// its route marked unhealthy, and a second manager observes the same outcome.
+#[tokio::test]
+async fn test_module_health_convergence_across_managers() {
+    let pool = manager_pool().await;
+    let managers = start_manager_cluster(pool.clone(), 2, 1).await.unwrap();
+
+    let mut c1 = manager_client(&managers[0].addr).await.unwrap();
+    c1.register_engine(RegisterEngineRequest {
+        registration: Some(EngineRegistration {
+            engine_id: "mm-e1".into(),
+            address: "http://127.0.0.1:19500".into(),
+            proxy_address: String::new(),
+            peer_address: String::new(),
+            modules: vec![
+                ModuleDescriptor {
+                    name: "mm-a".into(),
+                    namespace: "mm-ns".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: minimal_file_descriptor_set(),
+                },
+                ModuleDescriptor {
+                    name: "mm-b".into(),
+                    namespace: "mm-ns".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: minimal_file_descriptor_set(),
+                },
+            ],
+            secrets: vec![],
+            db_namespaces: vec![],
+        }),
+    })
+    .await
+    .unwrap();
+
+    // Heartbeat only mm-a to manager-1 for longer than the 1s timeout.
+    for _ in 0..8 {
+        c1.heartbeat(HeartbeatRequest {
+            engine_id: "mm-e1".into(),
+            healthy_modules: vec![ModuleDescriptor {
+                name: "mm-a".into(),
+                namespace: "mm-ns".into(),
+                version: "1.0.0".into(),
+                proto_schema: vec![],
+            }],
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Manager-2 sees the shared outcome.
+    let mut c2 = manager_client(&managers[1].addr).await.unwrap();
+    let (a_healthy, _) = get_rule_health(&mut c2, "mm-a").await.unwrap();
+    let (b_healthy, _) = get_rule_health(&mut c2, "mm-b").await.unwrap();
+    assert!(a_healthy, "reported module healthy via shared Postgres");
+    assert!(!b_healthy, "omitted module unhealthy via shared Postgres");
+}
+
+#[tokio::test]
+async fn test_single_manager_list_managers_returns_self() {
+    let pool = manager_pool().await;
+    let managers = start_manager_cluster(pool.clone(), 1, 30).await.unwrap();
+    let mut c = manager_client(&managers[0].addr).await.unwrap();
+
+    let infos = c
+        .list_managers(ListManagersRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .managers;
+
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0].manager_id, managers[0].manager_id);
+    assert!(!infos[0].grpc_address.is_empty());
+    assert!(!infos[0].gossip_address.is_empty());
+}
+
+#[tokio::test]
+async fn test_dead_peer_excluded_from_list_managers() {
+    let pool = manager_pool().await;
+    let managers = start_manager_cluster_fast_death(pool.clone(), 2, 30)
+        .await
+        .unwrap();
+    let survivor = &managers[0];
+    let victim = &managers[1];
+    let mut c = manager_client(&survivor.addr).await.unwrap();
+
+    // Wait for gossip to converge: survivor reports both managers.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let n = c
+            .list_managers(ListManagersRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .managers
+            .len();
+        if n == 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gossip did not converge"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // Kill the victim's gossip (its DB row stays fresh, well inside 60s).
+    victim.cluster.initiate_shutdown().unwrap();
+
+    // Survivor must drop the victim via the chitchat-dead path, faster than 60s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let ids: Vec<String> = c
+            .list_managers(ListManagersRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .managers
+            .into_iter()
+            .map(|m| m.manager_id)
+            .collect();
+        if !ids.contains(&victim.manager_id) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "victim not excluded after chitchat death"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 }

@@ -23,6 +23,7 @@ just manager
 ```toml
 listen_address                = "0.0.0.0:9000"
 engine_heartbeat_timeout_secs = 30
+local_proxy_address           = "http://127.0.0.1:9001"  # required — scheduler posts jobs here
 
 [tls]
 cert_path    = "certs/manager.crt"
@@ -38,13 +39,19 @@ cluster_id            = "default"           # all managers in the same cluster m
 gossip_listen_address = "0.0.0.0:9010"      # UDP address for chitchat gossip
 # advertise_grpc_address = "http://manager-1:9000"  # optional; defaults to listen_address
 # gossip_interval_ms = 500                           # optional; default 500
+
+# scheduler_lease_secs       = 30    # optional; lease before another manager may reclaim
+# scheduler_retry_base_secs  = 5     # optional; base backoff, doubles per failure
+# scheduler_retry_cap_secs   = 300   # optional; max backoff cap
 ```
 
 The `[tls]` section is required. All gRPC clients must present a certificate signed by the same CA.
 
 The `[database]` section is required. The manager persists engines, routing rules, and schemas to Postgres. Migrations run automatically on startup.
 
-The `[cluster]` section is required. Multiple managers can run active-active against the same Postgres database. Each manager registers itself in the `wr_managers` table, heartbeats every 15 seconds, and participates in a chitchat gossip mesh for failure detection. Concurrent writes are serialized via Postgres row locks. Set `advertise_grpc_address` when the manager is behind a load balancer or NAT.
+The `[cluster]` section is required. Multiple managers can run active-active against the same Postgres database. Each manager registers itself in the `wr_managers` table, heartbeats every 15 seconds, and participates in a chitchat gossip mesh for failure detection. Chitchat is now load-bearing for manager liveness — `gossip_listen_address` must be a reachable UDP address; a manager fails to start (fail-fast) if gossip cannot bind. Concurrent writes are serialized via Postgres row locks. Set `advertise_grpc_address` when the manager is behind a load balancer or NAT.
+
+The manager also runs a Postgres-backed claim/lease job scheduler that submits scheduled jobs through `local_proxy_address` (the local proxy loopback) using the same routing/mTLS path as normal traffic; delivery is **at-least-once** (jobs must be idempotent). `local_proxy_address` is **required** — startup fails if it is unset or empty. `scheduler_lease_secs` must exceed the worst-case per-tick submission time, or a schedule can be reclaimed by another manager while still legitimately in flight.
 
 ## wr-proxy
 
@@ -323,7 +330,7 @@ If the health handler returns a non-`2xx` status or does not respond within 5 se
 
 ### Routing rules
 
-Engines register themselves but do not create routing rules automatically — you create rules via the manager's gRPC API (or a management tool) after the engine is running:
+When an engine registers, the manager automatically creates one default routing rule per module that carries a schema, in the same transaction as the registration (and only after the engine's requested secrets and per-namespace DB credentials resolve successfully). You do not need to create these rules manually. The `UpsertRoutingRule` RPC remains available as an admin override — for example to add an extra rule or force a rule healthy:
 
 ```
 # example using grpcurl
@@ -390,7 +397,8 @@ Run multiple managers against the same Postgres database for active-active HA. E
 
 ```toml
 # manager-1.toml
-listen_address = "0.0.0.0:9000"
+listen_address       = "0.0.0.0:9000"
+local_proxy_address  = "http://127.0.0.1:9001"
 
 [database]
 url = "postgres://postgres@db-host:5432/wruntime"
@@ -401,7 +409,8 @@ gossip_listen_address  = "0.0.0.0:9010"
 advertise_grpc_address = "http://manager-1:9000"
 
 # manager-2.toml
-listen_address = "0.0.0.0:9000"
+listen_address       = "0.0.0.0:9000"
+local_proxy_address  = "http://127.0.0.1:9001"
 
 [database]
 url = "postgres://postgres@db-host:5432/wruntime"
@@ -428,7 +437,9 @@ wr-cli engines list
 
 # Discover all managers in the cluster from any seed
 wr-cli --manager http://manager-1:9000 engines list
-# The ListManagers RPC returns all active managers if peer discovery is needed
+# Proxies and clients discover managers via ListManagers, which reconciles the
+# DB-fresh set against chitchat; direct wr_managers reads are a documented
+# bootstrap-only fallback when no manager RPC is reachable.
 ```
 
 ### Remote deployment via CLI
