@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::Result;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
-use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message as _;
@@ -22,14 +22,9 @@ use prost_types::{
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tonic::transport::Server;
-use wasmtime::component::{Component, Linker};
-use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi_http::p2::{
-    bindings::http::types::{ErrorCode, Scheme},
-    bindings::ProxyPre,
-    body::{HyperIncomingBody, HyperOutgoingBody},
-    WasiHttpView as _,
-};
+use wasmtime::component::Component;
+use wasmtime::Engine;
+use wasmtime_wasi_http::p2::bindings::ProxyPre;
 
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, manager_service_server::ManagerServiceServer,
@@ -1148,7 +1143,60 @@ pub async fn db_state_for_module(pool_size: usize, namespace: &str, name: &str) 
     .expect("ModuleState")
 }
 
+/// Same schema-provisioning body as `db_state_for_module`, but with `limits`.
+pub async fn db_state_for_module_with_limits(
+    pool_size: usize,
+    namespace: &str,
+    name: &str,
+    limits: wr_engine::config::ResourceLimits,
+) -> ModuleState {
+    let url = require_db_url();
+    let schema = wr_engine::pool::module_schema(namespace, name);
+    let pool = Arc::new(wr_engine::pool::build_pool(&url, pool_size).expect("build_pool"));
+    let client = pool
+        .get()
+        .await
+        .expect("get connection for schema provisioning");
+    if let Err(e) = client
+        .simple_query(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
+        .await
+    {
+        let is_duplicate = e
+            .as_db_error()
+            .is_some_and(|db| db.code().code() == "23505");
+        if !is_duplicate {
+            panic!("provision schema: {e}");
+        }
+    }
+    drop(client);
+    ModuleState::new(
+        name.into(),
+        namespace.into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        http_pool(),
+        ModuleServices {
+            db_pool: Some(pool),
+            db_schema: Some(Arc::from(schema)),
+            limits,
+            ..Default::default()
+        },
+    )
+    .expect("ModuleState")
+}
+
 // ── WASM guest dispatch ──────────────────────────────────────────────────────
+
+/// Fixed pool config for the test harness. Preserves the harness's historical
+/// hardcoded limits: 100 component instances (which `build_engine` also uses for
+/// `total_memories`/`total_tables`) and a 10 MiB per-instance memory cap — so the
+/// runtime extraction does not silently change test capacity.
+fn test_pool_config() -> wr_engine::config::PoolConfig {
+    wr_engine::config::PoolConfig {
+        total_component_instances: 100,
+        max_memory_size: 10 * 1024 * 1024,
+        epoch_tick_interval_ms: 10,
+    }
+}
 
 /// Set up a wasmtime `Engine` + `ProxyPre` from a compiled WASM component path.
 ///
@@ -1156,20 +1204,7 @@ pub async fn db_state_for_module(pool_size: usize, namespace: &str, name: &str) 
 /// concurrent instantiations reuse pre-allocated memory slots instead of
 /// issuing per-request mmap/mprotect syscalls.
 pub fn wasm_module_pre(wasm_path: &str) -> Result<(Arc<Engine>, Arc<ProxyPre<ModuleState>>)> {
-    use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
-
-    let mut wt_config = Config::new();
-    wt_config.wasm_component_model(true);
-    wt_config.epoch_interruption(true);
-
-    let mut pool = PoolingAllocationConfig::new();
-    pool.total_component_instances(100);
-    pool.max_memory_size(10 * 1024 * 1024);
-    pool.total_memories(100);
-    pool.total_tables(100);
-    wt_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
-
-    let engine = Engine::new(&wt_config)?;
+    let engine = wr_engine::runtime::build_engine(&test_pool_config())?;
     {
         let e = engine.clone();
         tokio::spawn(async move {
@@ -1181,28 +1216,8 @@ pub fn wasm_module_pre(wasm_path: &str) -> Result<(Arc<Engine>, Arc<ProxyPre<Mod
         });
     }
     let component = Component::from_file(&engine, wasm_path)?;
-
-    let mut linker: Linker<ModuleState> = Linker::new(&engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-    wr_engine::db::wruntime::db::database::add_to_linker::<
-        ModuleState,
-        wasmtime::component::HasSelf<ModuleState>,
-    >(&mut linker, |s| s)?;
-    wr_engine::tracing::add_to_linker::<ModuleState, wasmtime::component::HasSelf<ModuleState>>(
-        &mut linker,
-        |s| s,
-    )?;
-    wr_engine::blobstore::add_to_linker::<ModuleState, wasmtime::component::HasSelf<ModuleState>>(
-        &mut linker,
-        |s| s,
-    )?;
-    wr_engine::llm::add_to_linker::<ModuleState, wasmtime::component::HasSelf<ModuleState>>(
-        &mut linker,
-        |s| s,
-    )?;
-
-    let pre = ProxyPre::new(linker.instantiate_pre(&component)?)?;
+    let linker = wr_engine::runtime::configure_linker(&engine)?;
+    let pre = wr_engine::runtime::instantiate_pre(&engine, &linker, &component)?;
     Ok((Arc::new(engine), Arc::new(pre)))
 }
 
@@ -1213,43 +1228,7 @@ pub async fn dispatch_to_wasm(
     state: ModuleState,
     request: http::Request<Bytes>,
 ) -> Result<http::Response<Bytes>> {
-    let mut store = Store::new(engine, state);
-    store.set_epoch_deadline(1);
-    store.epoch_deadline_async_yield_and_update(1);
-    let proxy = pre.instantiate_async(&mut store).await?;
-
-    let (req_parts, req_body) = request.into_parts();
-    let hyper_body: HyperIncomingBody = UnsyncBoxBody::new(
-        Full::new(req_body).map_err(|_: Infallible| ErrorCode::InternalError(None)),
-    );
-    let hyper_req = hyper::Request::from_parts(req_parts, hyper_body);
-    let req_resource = store
-        .data_mut()
-        .http()
-        .new_incoming_request(Scheme::Http, hyper_req)?;
-
-    let (resp_tx, resp_rx) =
-        tokio::sync::oneshot::channel::<Result<hyper::Response<HyperOutgoingBody>, ErrorCode>>();
-    let out_resource = store.data_mut().http().new_response_outparam(resp_tx)?;
-
-    proxy
-        .wasi_http_incoming_handler()
-        .call_handle(&mut store, req_resource, out_resource)
-        .await?;
-
-    match resp_rx.await {
-        Ok(Ok(wasm_resp)) => {
-            let (rp, rb) = wasm_resp.into_parts();
-            let bytes = rb
-                .collect()
-                .await
-                .map_err(|e| anyhow::anyhow!("collecting WASM response body: {e:?}"))?
-                .to_bytes();
-            Ok(http::Response::from_parts(rp, bytes))
-        }
-        Ok(Err(e)) => anyhow::bail!("WASM handler returned ErrorCode: {e:?}"),
-        Err(_) => anyhow::bail!("WASM handler dropped the response outparam"),
-    }
+    wr_engine::runtime::run_incoming_handler(engine, pre, state, request).await
 }
 
 /// Spawn a WASM-backed HTTP/2 engine on an ephemeral port.
@@ -1357,6 +1336,7 @@ async fn wasm_engine_serve(
 /// Build a `BlobstoreRuntime` from `WRT_TEST_S3_*` environment variables.
 /// Panics if the env vars are not set.
 pub fn blobstore_client() -> Arc<BlobstoreRuntime> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let endpoint = std::env::var("WRT_TEST_S3_ENDPOINT")
         .expect("WRT_TEST_S3_ENDPOINT must be set for this test");
     let access_key = std::env::var("WRT_TEST_S3_ACCESS_KEY")
@@ -1368,6 +1348,8 @@ pub fn blobstore_client() -> Arc<BlobstoreRuntime> {
         access_key_id: access_key,
         secret_access_key: secret_key,
         region: "us-east-1".into(),
+        max_object_size: 16 * 1024 * 1024,
+        max_list_objects: 1000,
     };
     Arc::new(BlobstoreRuntime::new(&config).expect("BlobstoreRuntime"))
 }
@@ -1387,6 +1369,25 @@ pub fn blobstore_state(blobstore: Arc<BlobstoreRuntime>) -> ModuleState {
     .expect("ModuleState")
 }
 
+/// Build a `ModuleState` with a blobstore client and explicit size/list limits.
+pub fn blobstore_state_with_limits(
+    blobstore: Arc<BlobstoreRuntime>,
+    blob_limits: wr_engine::config::BlobstoreLimits,
+) -> ModuleState {
+    ModuleState::new(
+        "blobstore-test".into(),
+        "test-ns".into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        http_pool(),
+        ModuleServices {
+            blobstore: Some(blobstore),
+            blob_limits,
+            ..Default::default()
+        },
+    )
+    .expect("ModuleState")
+}
+
 /// Build a `ModuleState` with no services (tracing tests only need WASI + HTTP).
 pub fn tracing_state() -> ModuleState {
     ModuleState::new(
@@ -1395,6 +1396,20 @@ pub fn tracing_state() -> ModuleState {
         "http://127.0.0.1:9001".parse().unwrap(),
         http_pool(),
         ModuleServices::default(),
+    )
+    .expect("ModuleState")
+}
+
+pub fn tracing_state_with_limits(limits: wr_engine::config::ResourceLimits) -> ModuleState {
+    ModuleState::new(
+        "tracing-test".into(),
+        "test-ns".into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        http_pool(),
+        ModuleServices {
+            limits,
+            ..Default::default()
+        },
     )
     .expect("ModuleState")
 }
@@ -1422,6 +1437,8 @@ pub enum MockLlmMode {
     Error { status: u16, body: String },
     /// Return a streaming SSE response with the given text chunks.
     Stream { chunks: Vec<String> },
+    /// Return a streaming SSE response that emits partial text then a stream-level `error` event.
+    StreamError,
 }
 
 /// Spawn a mock Claude API HTTP server that returns canned responses.
@@ -1532,20 +1549,22 @@ async fn handle_mock_llm_request(
             .unwrap()),
         MockLlmMode::Stream { chunks } => {
             let mut sse = String::new();
-            // message_start
-            sse.push_str("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_mock_003\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"usage\":{\"input_tokens\":25,\"output_tokens\":0}}}\n\n");
+            // message_start — CRLF line endings (exercises CRLF normalization). Carries input_tokens.
+            sse.push_str("event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_mock_003\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"usage\":{\"input_tokens\":25,\"output_tokens\":0}}}\r\n\r\n");
             // content_block_start
             sse.push_str("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
-            // content_block_delta for each chunk
+            // ping — CRLF, must be skipped (no guest event)
+            sse.push_str("event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n");
+            // content_block_delta per chunk, JSON split across two data: lines (multiline accumulation)
             for chunk in &chunks {
                 let escaped = chunk.replace('\\', "\\\\").replace('"', "\\\"");
                 sse.push_str(&format!(
-                    "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n"
+                    "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\ndata: \"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n"
                 ));
             }
             // content_block_stop
             sse.push_str("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
-            // message_delta with usage
+            // message_delta with stop_reason + cumulative output_tokens
             let output_tokens = chunks.iter().map(|c| c.len() as u32).sum::<u32>();
             sse.push_str(&format!(
                 "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":{output_tokens}}}}}\n\n"
@@ -1559,11 +1578,25 @@ async fn handle_mock_llm_request(
                 .body(Full::new(Bytes::from(sse)))
                 .unwrap())
         }
+        MockLlmMode::StreamError => {
+            let mut sse = String::new();
+            sse.push_str("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_mock_004\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n");
+            sse.push_str("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
+            sse.push_str("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n");
+            sse.push_str("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"server overloaded\"}}\n\n");
+
+            Ok(hyper::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Full::new(Bytes::from(sse)))
+                .unwrap())
+        }
     }
 }
 
 /// Build an `LlmRuntime` pointing at the given mock base URL.
 pub fn mock_llm_runtime(base_url: &str) -> Arc<LlmRuntime> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     use wr_engine::config::LlmConfig;
     // Set a temp env var for the API key
     std::env::set_var("WRT_TEST_LLM_KEY", "mock-key");
@@ -1585,6 +1618,24 @@ pub fn llm_state(llm: Arc<LlmRuntime>) -> ModuleState {
         http_pool(),
         ModuleServices {
             llm: Some(llm),
+            ..Default::default()
+        },
+    )
+    .expect("ModuleState")
+}
+
+pub fn llm_state_with_limits(
+    llm: Arc<LlmRuntime>,
+    limits: wr_engine::config::ResourceLimits,
+) -> ModuleState {
+    ModuleState::new(
+        "llm-test".into(),
+        "test-ns".into(),
+        "http://127.0.0.1:9001".parse().unwrap(),
+        http_pool(),
+        ModuleServices {
+            llm: Some(llm),
+            limits,
             ..Default::default()
         },
     )

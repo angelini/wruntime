@@ -25,7 +25,7 @@ impl wr_sdk::ServiceGuest for Component {
 
 impl proto::HttpTestService for Component {
     fn egress(&self, req: proto::EgressRequest) -> Result<proto::EgressResponse, ServiceError> {
-        match wr_sdk::http::http_rpc(&req.authority, &req.path, &[]) {
+        match wr_sdk::http::http_rpc(&req.authority, &req.path, &req.body) {
             Ok((status, body)) => Ok(proto::EgressResponse {
                 status: status as u32,
                 body: String::from_utf8_lossy(&body).into_owned(),

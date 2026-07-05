@@ -236,7 +236,63 @@ Key behaviors:
 - **Credential isolation:** The API key is resolved from an environment variable at engine startup and never enters the WASM sandbox.
 - **Host-enforced token limit:** `max_tokens_limit` caps the `max_tokens` field on every request before forwarding to the API, preventing runaway generation.
 - **Provider mapping:** Currently only `"anthropic"` is supported. The WIT interface is provider-agnostic so future providers can be added without changing guest code.
-- **Streaming:** Guests can use `complete-stream` to get a cursor that yields text deltas, following the same resource pattern as `row-cursor` for database queries.
+- **Streaming:** Guests can use `complete-stream` to get a cursor that yields typed stream events — zero or more text deltas, then one final usage event, then one stop event — following the same resource pattern as `row-cursor` for database queries. Tool-enabled requests cannot be streamed (they are rejected with `invalid-request`); use `complete` for tool calls.
+
+### Blobstore
+
+Modules can read and write objects in an S3-compatible store through a host binding. Add a `[blobstore]` section and set `blobstore = true` on each module that needs access.
+
+```toml
+[blobstore]
+endpoint          = "http://127.0.0.1:8900"   # S3-compatible endpoint
+access_key_id     = "..."
+secret_access_key = "..."
+region            = "us-east-1"   # optional; this is the default
+max_object_size   = 16777216      # optional; bytes, default 16 MiB
+max_list_objects  = 1000          # optional; default 1000
+
+[[module]]
+name        = "report-service"
+namespace   = "example"
+version     = "1.0.0"
+wasm_path   = "modules/report_service.wasm"
+schema_path = "schemas/report_service.binpb"
+blobstore   = true
+```
+
+Key behaviors:
+- **`max_object_size`** (default **16 MiB**) is enforced on both `put-object` (checked before upload) and `get-object` (the download is aborted mid-stream once the running total would exceed the limit — an oversized object is never fully buffered). Exceeding it returns `blob-error::too-large`.
+- **`max_list_objects`** (default **1000**) caps a single `list-objects` call; exceeding it returns `blob-error::too-large` rather than silently truncating.
+
+### Resource limits
+
+Every request has per-store ceilings on the number of concurrently live guest-created host resources. They are enforced live (one running count per kind) so a guest cannot exhaust the wasmtime resource table and crash the engine. Omit the `[limits]` section to use the defaults.
+
+```toml
+[limits]
+max_spans           = 1024   # concurrent guest-created tracing spans
+max_db_transactions = 64     # concurrent open DB transactions
+max_db_cursors      = 256    # concurrent open DB row cursors
+max_llm_streams     = 32     # concurrent open LLM completion streams
+```
+
+| Key | Default | Resource | Over-cap behavior |
+|-----|---------|----------|-------------------|
+| `max_spans` | 1024 | tracing spans (`start`/`start-root`) | guest instance is **trapped** (request fails); engine survives |
+| `max_db_transactions` | 64 | DB transactions (`begin-transaction`) | returns `db-error::connection` |
+| `max_db_cursors` | 256 | DB row cursors (`query-stream`) | returns `db-error::connection` |
+| `max_llm_streams` | 32 | LLM completion streams (`complete-stream`) | returns `llm-error::api` |
+
+A resource frees its slot when the guest drops it, so long-lived requests should drop transactions, cursors, spans, and streams promptly to stay under the caps.
+
+### Outbound HTTP body limit
+
+`max_outbound_body_bytes` (top-level engine key, default **16 MiB**) bounds the size of an outbound HTTP request body a guest may send. The body is buffered incrementally up to this bound; a request whose body exceeds it is aborted (never fully buffered) and the guest's outbound call fails with an `HttpRequestBodySize` error. Response bodies are not affected (they stream through).
+
+```toml
+listen_address          = "127.0.0.1:9100"
+max_outbound_body_bytes = 16777216   # optional; default 16 MiB
+```
 
 ### Module health checks
 

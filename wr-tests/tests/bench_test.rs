@@ -182,6 +182,7 @@ async fn bench_hot_path() -> Result<()> {
     let egress_req = proto::EgressRequest {
         authority: "bench-ns.echo-svc".into(),
         path: "/test.http_test/Echo".into(),
+        body: Vec::new(),
     };
     let egress_body = egress_req.encode_to_vec();
 

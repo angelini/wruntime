@@ -8,7 +8,9 @@ async fn test_tracing_span_start_and_drop() {
 
     let mut state = tracing_state();
 
-    let span = Host::start(&mut state, "my-operation".into(), vec![]).await;
+    let span = Host::start(&mut state, "my-operation".into(), vec![])
+        .await
+        .expect("start");
     HostActiveSpan::drop(&mut state, span)
         .await
         .expect("drop span");
@@ -20,7 +22,9 @@ async fn test_tracing_span_set_attribute() {
 
     let mut state = tracing_state();
 
-    let span = Host::start(&mut state, "op".into(), vec![]).await;
+    let span = Host::start(&mut state, "op".into(), vec![])
+        .await
+        .expect("start");
     let rep = span.rep();
     HostActiveSpan::set_attribute(
         &mut state,
@@ -28,7 +32,8 @@ async fn test_tracing_span_set_attribute() {
         "db.table".into(),
         "users".into(),
     )
-    .await;
+    .await
+    .expect("set_attribute");
     HostActiveSpan::drop(&mut state, span).await.expect("drop");
 }
 
@@ -38,7 +43,9 @@ async fn test_tracing_span_record_event() {
 
     let mut state = tracing_state();
 
-    let span = Host::start(&mut state, "op".into(), vec![]).await;
+    let span = Host::start(&mut state, "op".into(), vec![])
+        .await
+        .expect("start");
     let rep = span.rep();
     HostActiveSpan::record_event(
         &mut state,
@@ -46,7 +53,8 @@ async fn test_tracing_span_record_event() {
         "cache.miss".into(),
         vec![("key".into(), "user:42".into())],
     )
-    .await;
+    .await
+    .expect("record_event");
     HostActiveSpan::drop(&mut state, span).await.expect("drop");
 }
 
@@ -56,13 +64,16 @@ async fn test_tracing_span_set_error() {
 
     let mut state = tracing_state();
 
-    let span = Host::start(&mut state, "op".into(), vec![]).await;
+    let span = Host::start(&mut state, "op".into(), vec![])
+        .await
+        .expect("start");
     let rep = span.rep();
     HostActiveSpan::set_error(
         &mut state,
         wasmtime::component::Resource::new_borrow(rep),
         "connection refused".into(),
     )
-    .await;
+    .await
+    .expect("set_error");
     HostActiveSpan::drop(&mut state, span).await.expect("drop");
 }

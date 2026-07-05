@@ -1,5 +1,7 @@
 # Plan: WASM Guest Test Harness for Host Bindings
 
+> **STATUS: IMPLEMENTED — historical.** This plan has shipped and is superseded by the guests under `wr-tests/guests/` (`db-guest`, `tracing-guest`, `blobstore-guest`, plus `http-guest` and `llm-guest`) and the `wr-tests/tests/wasm_host_test.rs` suite, which exercises DB, tracing, blobstore, LLM, and HTTP (egress/ingress) through the real engine code path. The directory layout, env-var names, and Justfile recipes below describe the original plan and may differ from the current tree (e.g. the live env vars are `WRT_TEST_DB_URL` / `WRT_TEST_S3_*`, and the guest set is larger). Retained for historical context only — do not treat it as pending work.
+
 ## Context
 
 Host bindings (db, tracing, blobstore) are currently tested by calling `ModuleState` methods directly from Rust, bypassing the WASM boundary entirely. This means WIT type marshalling, resource lifecycle (transactions, spans), and component-model canonicalization are untested. Blobstore has zero tests. The goal is to create slim WASM guest modules that exercise each host interface through the real engine code path.

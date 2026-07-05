@@ -11,6 +11,8 @@ service DbTestService {
   rpc Error               (ErrorRequest)               returns (ErrorResponse);
   rpc QueryStream         (QueryStreamRequest)         returns (QueryStreamResponse);
   rpc QueryStreamDrop     (QueryStreamDropRequest)     returns (QueryStreamDropResponse);
+  rpc AllocTransactions (AllocResourcesRequest) returns (AllocResourcesResponse);
+  rpc AllocCursors      (AllocResourcesRequest) returns (AllocResourcesResponse);
 }
 
 message ExecuteRequest {
@@ -65,6 +67,7 @@ message TransactionDropResponse {
 
 message ErrorRequest {
   string sql = 1;
+  string params_json = 2;
 }
 message ErrorResponse {
   string error_kind    = 1;
@@ -88,4 +91,16 @@ message QueryStreamDropRequest {
 }
 message QueryStreamDropResponse {
   uint32 fetched = 1;
+}
+
+message AllocResourcesRequest {
+  uint32 initial    = 1;
+  uint32 drop_count = 2;
+  uint32 additional = 3;
+}
+message AllocResourcesResponse {
+  uint32 held          = 1;  // resources still held when the handler returns
+  bool   hit_cap       = 2;  // whether a cap error (DbError::Connection) was observed
+  string error_kind    = 3;  // "connection" / "query" / "" (none)
+  string error_message = 4;
 }

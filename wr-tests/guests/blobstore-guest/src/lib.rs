@@ -98,6 +98,7 @@ impl proto::BlobstoreTestService for Component {
                     BlobError::NotFound(m) => ("not-found", m),
                     BlobError::AccessDenied(m) => ("access-denied", m),
                     BlobError::Io(m) => ("io", m),
+                    BlobError::TooLarge(m) => ("too-large", m),
                 };
                 Ok(proto::NotFoundResponse {
                     error_kind: kind.into(),

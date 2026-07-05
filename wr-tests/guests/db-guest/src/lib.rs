@@ -48,6 +48,7 @@ fn parse_params(json: &str) -> Vec<PgValue> {
             "int8" => PgValue::Int8(val.parse().unwrap_or(0)),
             "boolean" => PgValue::Boolean(val == "true"),
             "float8" => PgValue::Float8(val.parse().unwrap_or(0.0)),
+            "numeric" => PgValue::Numeric(val),
             _ => PgValue::Text(val),
         };
         params.push(pg);
@@ -311,7 +312,8 @@ impl proto::DbTestService for Component {
     }
 
     fn error(&self, req: proto::ErrorRequest) -> Result<proto::ErrorResponse, ServiceError> {
-        match database::execute(&req.sql, &[]) {
+        let params = parse_params(&req.params_json);
+        match database::execute(&req.sql, &params) {
             Ok(_) => Ok(proto::ErrorResponse {
                 error_kind: "none".into(),
                 error_message: "unexpectedly succeeded".into(),
@@ -382,5 +384,60 @@ impl proto::DbTestService for Component {
         // Drop the cursor without consuming all rows
         drop(cursor);
         Ok(proto::QueryStreamDropResponse { fetched })
+    }
+
+    fn alloc_transactions(
+        &self,
+        req: proto::AllocResourcesRequest,
+    ) -> Result<proto::AllocResourcesResponse, ServiceError> {
+        let mut held = Vec::new();
+        let mut resp = proto::AllocResourcesResponse::default();
+        alloc_loop(req.initial, &mut resp, || database::begin_transaction(), &mut held);
+        for _ in 0..req.drop_count {
+            held.pop(); // Transaction dropped here -> host drop -> live-count decrement
+        }
+        alloc_loop(req.additional, &mut resp, || database::begin_transaction(), &mut held);
+        resp.held = held.len() as u32;
+        Ok(resp)
+    }
+
+    fn alloc_cursors(
+        &self,
+        req: proto::AllocResourcesRequest,
+    ) -> Result<proto::AllocResourcesResponse, ServiceError> {
+        let sql = "SELECT generate_series(1, 100) AS n";
+        let mut held = Vec::new();
+        let mut resp = proto::AllocResourcesResponse::default();
+        alloc_loop(req.initial, &mut resp, || database::query_stream(sql, &[]), &mut held);
+        for _ in 0..req.drop_count {
+            held.pop(); // RowCursor dropped here -> host drop -> live-count decrement
+        }
+        alloc_loop(req.additional, &mut resp, || database::query_stream(sql, &[]), &mut held);
+        resp.held = held.len() as u32;
+        Ok(resp)
+    }
+}
+
+fn alloc_loop<T>(
+    n: u32,
+    resp: &mut proto::AllocResourcesResponse,
+    mut make: impl FnMut() -> Result<T, database::DbError>,
+    held: &mut Vec<T>,
+) {
+    for _ in 0..n {
+        match make() {
+            Ok(v) => held.push(v),
+            Err(database::DbError::Connection(m)) => {
+                resp.hit_cap = true;
+                resp.error_kind = "connection".into();
+                resp.error_message = m;
+                break;
+            }
+            Err(database::DbError::Query(m)) => {
+                resp.error_kind = "query".into();
+                resp.error_message = m;
+                break;
+            }
+        }
     }
 }

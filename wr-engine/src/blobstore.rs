@@ -5,7 +5,7 @@ use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjectPath;
 use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutPayload};
 
-use crate::config::BlobstoreConfig;
+use crate::config::{BlobstoreConfig, BlobstoreLimits};
 use crate::state::ModuleState;
 
 /// Shared S3 client configuration. One `AmazonS3` store is built per bucket on
@@ -62,7 +62,8 @@ wasmtime::component::bindgen!({
     imports: { default: async },
 });
 
-use wruntime::blobstore::store::{BlobError, Host, ObjectMeta};
+pub use wruntime::blobstore::store::BlobError;
+use wruntime::blobstore::store::{Host, ObjectMeta};
 
 // ── Namespace isolation helpers ───────────────────────────────────────────────
 
@@ -102,6 +103,23 @@ fn unscoped_key(prefix: &Option<Arc<str>>, key: &str) -> String {
     }
 }
 
+impl ModuleState {
+    /// Fold the per-operation boilerplate shared by the single-key methods:
+    /// capability lookup → bucket store → namespace-scoped object path. Returns the
+    /// per-store size/list limits alongside, so callers enforce them without a second
+    /// capability borrow. Composes the existing `scoped_key`/`map_os_err` unchanged.
+    fn resolve_object(
+        &mut self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(Arc<AmazonS3>, ObjectPath, BlobstoreLimits), BlobError> {
+        let cap = self.blobstore()?;
+        let store = cap.runtime.bucket(bucket).map_err(map_os_err)?;
+        let path = ObjectPath::from(scoped_key(&cap.prefix, key)?);
+        Ok((store, path, cap.limits))
+    }
+}
+
 // ── Host implementation ───────────────────────────────────────────────────────
 
 impl Host for ModuleState {
@@ -111,36 +129,44 @@ impl Host for ModuleState {
         key: String,
         data: Vec<u8>,
     ) -> Result<(), BlobError> {
-        let rt = require_blobstore(&self.blobstore)?;
-        let store = rt.bucket(&bucket).map_err(map_os_err)?;
-        let full_key = scoped_key(&self.blob_prefix, &key)?;
+        let (store, path, limits) = self.resolve_object(&bucket, &key)?;
+        if data.len() > limits.max_object_size {
+            return Err(BlobError::TooLarge(format!(
+                "upload of {} bytes exceeds max_object_size of {} bytes",
+                data.len(),
+                limits.max_object_size
+            )));
+        }
         store
-            .put(&ObjectPath::from(full_key), PutPayload::from(data))
+            .put(&path, PutPayload::from(data))
             .await
             .map_err(map_os_err)?;
         Ok(())
     }
 
     async fn get_object(&mut self, bucket: String, key: String) -> Result<Vec<u8>, BlobError> {
-        let rt = require_blobstore(&self.blobstore)?;
-        let store = rt.bucket(&bucket).map_err(map_os_err)?;
-        let full_key = scoped_key(&self.blob_prefix, &key)?;
-        let result = store
-            .get(&ObjectPath::from(full_key))
-            .await
-            .map_err(map_os_err)?;
-        let bytes = result.bytes().await.map_err(map_os_err)?;
-        Ok(bytes.to_vec())
+        use futures::StreamExt;
+
+        let (store, path, limits) = self.resolve_object(&bucket, &key)?;
+        let result = store.get(&path).await.map_err(map_os_err)?;
+        let mut stream = result.into_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(map_os_err)?;
+            if buf.len() + chunk.len() > limits.max_object_size {
+                return Err(BlobError::TooLarge(format!(
+                    "download exceeds max_object_size of {} bytes",
+                    limits.max_object_size
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
     }
 
     async fn delete_object(&mut self, bucket: String, key: String) -> Result<(), BlobError> {
-        let rt = require_blobstore(&self.blobstore)?;
-        let store = rt.bucket(&bucket).map_err(map_os_err)?;
-        let full_key = scoped_key(&self.blob_prefix, &key)?;
-        store
-            .delete(&ObjectPath::from(full_key))
-            .await
-            .map_err(map_os_err)?;
+        let (store, path, _) = self.resolve_object(&bucket, &key)?;
+        store.delete(&path).await.map_err(map_os_err)?;
         Ok(())
     }
 
@@ -151,17 +177,29 @@ impl Host for ModuleState {
     ) -> Result<Vec<ObjectMeta>, BlobError> {
         use futures::StreamExt;
 
-        let rt = require_blobstore(&self.blobstore)?;
-        let store = rt.bucket(&bucket).map_err(map_os_err)?;
-        let scoped_prefix = scoped_key(&self.blob_prefix, &prefix.unwrap_or_default())?;
+        let (store, key_prefix, limits) = {
+            let cap = self.blobstore()?;
+            (
+                cap.runtime.bucket(&bucket).map_err(map_os_err)?,
+                cap.prefix.clone(),
+                cap.limits,
+            )
+        };
+        let scoped_prefix = scoped_key(&key_prefix, &prefix.unwrap_or_default())?;
         let prefix_path = (!scoped_prefix.is_empty()).then(|| ObjectPath::from(scoped_prefix));
 
         let mut all: Vec<ObjectMeta> = Vec::new();
         let mut stream = store.list(prefix_path.as_ref());
         while let Some(meta) = stream.next().await {
             let meta = meta.map_err(map_os_err)?;
+            if all.len() >= limits.max_list_objects {
+                return Err(BlobError::TooLarge(format!(
+                    "listing exceeds max_list_objects of {}",
+                    limits.max_list_objects
+                )));
+            }
             all.push(ObjectMeta {
-                key: unscoped_key(&self.blob_prefix, meta.location.as_ref()),
+                key: unscoped_key(&key_prefix, meta.location.as_ref()),
                 size: meta.size,
                 last_modified: meta.last_modified.timestamp(),
                 etag: meta.e_tag.unwrap_or_default(),
@@ -171,13 +209,8 @@ impl Host for ModuleState {
     }
 
     async fn head_object(&mut self, bucket: String, key: String) -> Result<ObjectMeta, BlobError> {
-        let rt = require_blobstore(&self.blobstore)?;
-        let store = rt.bucket(&bucket).map_err(map_os_err)?;
-        let full_key = scoped_key(&self.blob_prefix, &key)?;
-        let meta = store
-            .head(&ObjectPath::from(full_key))
-            .await
-            .map_err(map_os_err)?;
+        let (store, path, _) = self.resolve_object(&bucket, &key)?;
+        let meta = store.head(&path).await.map_err(map_os_err)?;
         Ok(ObjectMeta {
             key,
             size: meta.size,
@@ -188,14 +221,6 @@ impl Host for ModuleState {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn require_blobstore(
-    client: &Option<Arc<BlobstoreRuntime>>,
-) -> Result<&BlobstoreRuntime, BlobError> {
-    client
-        .as_deref()
-        .ok_or_else(|| BlobError::Io("no blobstore configured for this module".into()))
-}
 
 fn map_os_err(e: ObjectStoreError) -> BlobError {
     match e {
@@ -231,6 +256,8 @@ mod tests {
             access_key_id: "test-key".into(),
             secret_access_key: "test-secret".into(),
             region: "us-east-1".into(),
+            max_object_size: 16 * 1024 * 1024,
+            max_list_objects: 1000,
         }
     }
 
@@ -326,23 +353,6 @@ mod tests {
             Arc::ptr_eq(&a, &b),
             "second call should return cached store"
         );
-    }
-
-    // ── require_blobstore tests ──────────────────────────────────────────────
-
-    #[test]
-    fn test_require_blobstore_none_returns_error() {
-        let result = require_blobstore(&None);
-        assert!(matches!(result, Err(BlobError::Io(_))));
-        if let Err(BlobError::Io(msg)) = result {
-            assert!(msg.contains("no blobstore configured"));
-        }
-    }
-
-    #[test]
-    fn test_require_blobstore_some_returns_runtime() {
-        let rt = Arc::new(BlobstoreRuntime::new(&test_config()).unwrap());
-        assert!(require_blobstore(&Some(rt)).is_ok());
     }
 
     // ── map_os_err tests ─────────────────────────────────────────────────────

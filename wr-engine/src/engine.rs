@@ -1,26 +1,18 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use deadpool_postgres::Pool;
-use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{info, warn, Instrument};
-use wasmtime::component::{Component, Linker};
-use wasmtime::Store;
-use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Trap};
-use wasmtime_wasi_http::p2::{
-    bindings::http::types::{ErrorCode, Scheme},
-    bindings::ProxyPre,
-    body::{HyperIncomingBody, HyperOutgoingBody},
-    WasiHttpView as _,
-};
+use wasmtime::component::Component;
+use wasmtime::{Engine, Trap};
+use wasmtime_wasi_http::p2::bindings::ProxyPre;
 
 use crate::registry::{InboundRequest, ModuleRegistry, ModuleTx};
 use wr_engine::blobstore::BlobstoreRuntime;
-use wr_engine::config::{EngineConfig, ModuleConfig, ModuleMode};
+use wr_engine::config::{BlobstoreLimits, EngineConfig, ModuleConfig, ModuleMode, ResourceLimits};
 use wr_engine::llm::LlmRuntime;
 use wr_engine::pool::{blob_key_prefix, module_schema};
 use wr_engine::state::{DbTimeouts, ModuleServices, ModuleState};
@@ -30,6 +22,7 @@ struct ResolvedServices {
     db_schema: Option<Arc<str>>,
     blobstore: Option<Arc<BlobstoreRuntime>>,
     blob_prefix: Option<Arc<str>>,
+    blob_limits: BlobstoreLimits,
     llm: Option<Arc<LlmRuntime>>,
 }
 
@@ -51,21 +44,7 @@ pub struct EngineRunner {
 
 impl EngineRunner {
     pub fn new(config: EngineConfig) -> Result<Self> {
-        let mut wt_config = Config::new();
-        wt_config.wasm_component_model(true);
-        wt_config.epoch_interruption(true);
-        wt_config.memory_reservation(4 * (1 << 30));
-        wt_config.memory_guard_size(32 * (1 << 20));
-        wt_config.memory_init_cow(true);
-
-        let mut pool = PoolingAllocationConfig::new();
-        pool.total_component_instances(config.pool.total_component_instances);
-        pool.max_memory_size(config.pool.max_memory_size);
-        pool.total_memories(config.pool.total_component_instances);
-        pool.total_tables(config.pool.total_component_instances);
-        wt_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
-
-        let engine = Engine::new(&wt_config)?;
+        let engine = wr_engine::runtime::build_engine(&config.pool)?;
 
         let db_pool = config
             .database
@@ -278,29 +257,6 @@ impl EngineRunner {
         Ok(())
     }
 
-    fn configure_linker(&self) -> Result<Linker<ModuleState>> {
-        let mut linker: Linker<ModuleState> = Linker::new(&self.engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-        wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-        wr_engine::db::wruntime::db::database::add_to_linker::<
-            ModuleState,
-            wasmtime::component::HasSelf<ModuleState>,
-        >(&mut linker, |s| s)?;
-        wr_engine::tracing::add_to_linker::<ModuleState, wasmtime::component::HasSelf<ModuleState>>(
-            &mut linker,
-            |s| s,
-        )?;
-        wr_engine::blobstore::add_to_linker::<
-            ModuleState,
-            wasmtime::component::HasSelf<ModuleState>,
-        >(&mut linker, |s| s)?;
-        wr_engine::llm::add_to_linker::<ModuleState, wasmtime::component::HasSelf<ModuleState>>(
-            &mut linker,
-            |s| s,
-        )?;
-        Ok(linker)
-    }
-
     /// Resolve database pool, blobstore client, and LLM client for a module
     /// based on its config flags.
     fn resolve_module_services(
@@ -329,11 +285,21 @@ impl EngineRunner {
         } else {
             None
         };
+        let blob_limits = self
+            .config
+            .blobstore
+            .as_ref()
+            .map(|c| BlobstoreLimits {
+                max_object_size: c.max_object_size,
+                max_list_objects: c.max_list_objects,
+            })
+            .unwrap_or_default();
         ResolvedServices {
             db_pool,
             db_schema,
             blobstore,
             blob_prefix,
+            blob_limits,
             llm,
         }
     }
@@ -384,7 +350,7 @@ impl EngineRunner {
         let module_namespace: Arc<str> = Arc::from(module_config.namespace.as_str());
         let module_version = module_config.version.clone();
 
-        let linker = self.configure_linker()?;
+        let linker = wr_engine::runtime::configure_linker(&self.engine)?;
         let svc = self.resolve_module_services(module_config, &module_namespace, &module_name);
 
         let pre = ProxyPre::new(linker.instantiate_pre(&component)?).map_err(|e| {
@@ -434,10 +400,13 @@ impl EngineRunner {
             db_timeouts,
             blobstore: svc.blobstore,
             blob_prefix: svc.blob_prefix,
+            blob_limits: svc.blob_limits,
             llm: svc.llm,
             fs: module_config.fs.clone(),
             env_vars: Arc::new(env_vars),
             request_timeout: Duration::from_secs(module_config.request_timeout_secs),
+            limits: self.config.limits.clone(),
+            max_outbound_body_bytes: self.config.max_outbound_body_bytes,
         };
         tokio::spawn(http_handler_task(handler, module, rx));
 
@@ -502,10 +471,13 @@ struct ModuleContext {
     db_timeouts: DbTimeouts,
     blobstore: Option<Arc<BlobstoreRuntime>>,
     blob_prefix: Option<Arc<str>>,
+    blob_limits: BlobstoreLimits,
     llm: Option<Arc<LlmRuntime>>,
     fs: Option<wr_engine::config::FsMode>,
     env_vars: Arc<HashMap<String, String>>,
     request_timeout: Duration,
+    limits: ResourceLimits,
+    max_outbound_body_bytes: usize,
 }
 
 /// Task that owns the module's channel receiver and spawns a sub-task per
@@ -608,68 +580,28 @@ async fn dispatch_request(
             db_timeouts: module.db_timeouts.clone(),
             blobstore: module.blobstore.clone(),
             blob_prefix: module.blob_prefix.clone(),
+            blob_limits: module.blob_limits,
             llm: module.llm.clone(),
             fs: module.fs.clone(),
             env_vars: module.env_vars.clone(),
             active_span: tracing::Span::current(),
+            limits: module.limits.clone(),
+            max_outbound_body_bytes: module.max_outbound_body_bytes,
         },
     )?;
-    let mut store = Store::new(&handler.engine, state);
-    // Yield back to tokio on every epoch tick so CPU-bound WASM doesn't
-    // block the async runtime. The outer tokio::time::timeout still
-    // enforces the total request deadline.
-    store.set_epoch_deadline(1);
-    store.epoch_deadline_async_yield_and_update(1);
-    let proxy = handler.pre.instantiate_async(&mut store).await?;
-
-    // ── Build the incoming request resource ──────────────────────────────
-    let (req_parts, req_body) = request.into_parts();
-
-    // Wrap the buffered Bytes as a HyperIncomingBody
-    // (UnsyncBoxBody<Bytes, ErrorCode>).
-    let hyper_body: HyperIncomingBody = UnsyncBoxBody::new(
-        Full::new(req_body).map_err(|_: Infallible| ErrorCode::InternalError(None)),
-    );
-    let hyper_req = hyper::Request::from_parts(req_parts, hyper_body);
-    let req_resource = store
-        .data_mut()
-        .http()
-        .new_incoming_request(Scheme::Http, hyper_req)?;
-
-    // ── Build the response outparam resource ─────────────────────────────
-    let (resp_tx, resp_rx) =
-        tokio::sync::oneshot::channel::<Result<hyper::Response<HyperOutgoingBody>, ErrorCode>>();
-    let out_resource = store.data_mut().http().new_response_outparam(resp_tx)?;
-
-    // ── Call the WASM incoming handler ───────────────────────────────────
-    if let Err(e) = proxy
-        .wasi_http_incoming_handler()
-        .call_handle(&mut store, req_resource, out_resource)
+    match wr_engine::runtime::run_incoming_handler(&handler.engine, &handler.pre, state, request)
         .await
     {
-        if e.downcast_ref::<Trap>() == Some(&Trap::Interrupt) {
-            return Ok(http::Response::builder()
-                .status(http::StatusCode::GATEWAY_TIMEOUT)
-                .body(Bytes::from("execution deadline exceeded"))
-                .unwrap());
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            if e.downcast_ref::<Trap>() == Some(&Trap::Interrupt) {
+                return Ok(http::Response::builder()
+                    .status(http::StatusCode::GATEWAY_TIMEOUT)
+                    .body(Bytes::from("execution deadline exceeded"))
+                    .unwrap());
+            }
+            Err(e)
         }
-        return Err(e.into());
-    }
-
-    // ── Collect and return the response ──────────────────────────────────
-    // The `_permit` is held until this point, released on drop.
-    match resp_rx.await {
-        Ok(Ok(wasm_resp)) => {
-            let (rp, rb) = wasm_resp.into_parts();
-            let bytes = rb
-                .collect()
-                .await
-                .map_err(|e| anyhow::anyhow!("collecting WASM response body: {e:?}"))?
-                .to_bytes();
-            Ok(http::Response::from_parts(rp, bytes))
-        }
-        Ok(Err(e)) => anyhow::bail!("WASM handler returned ErrorCode: {e:?}"),
-        Err(_) => anyhow::bail!("WASM handler dropped the response outparam"),
     }
 }
 

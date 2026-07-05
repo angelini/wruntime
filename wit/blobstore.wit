@@ -8,6 +8,8 @@ interface store {
         access-denied(string),
         /// Any other I/O or transport error.
         io(string),
+        /// The object or listing exceeds a host-configured size/count limit.
+        too-large(string),
     }
 
     /// Metadata returned by list-objects and head-object.

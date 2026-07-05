@@ -84,4 +84,23 @@ impl proto::TracingTestService for Component {
         drop(outer);
         Ok(proto::NestedSpansResponse { ok: true })
     }
+
+    fn alloc_spans(
+        &self,
+        req: proto::AllocSpansRequest,
+    ) -> Result<proto::AllocSpansResponse, ServiceError> {
+        let mut spans = Vec::new();
+        for i in 0..req.initial {
+            spans.push(sdk_tracing::start(&format!("span-{i}"), &[]));
+        }
+        for _ in 0..req.drop_count {
+            spans.pop(); // ActiveSpan dropped here -> host drop -> live-count decrement
+        }
+        for i in 0..req.additional {
+            spans.push(sdk_tracing::start(&format!("more-{i}"), &[]));
+        }
+        Ok(proto::AllocSpansResponse {
+            held: spans.len() as u32,
+        })
+    }
 }

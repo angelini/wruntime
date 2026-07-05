@@ -7,6 +7,7 @@ service TracingTestService {
   rpc SpanEvent      (SpanEventRequest)      returns (SpanEventResponse);
   rpc SpanError      (SpanErrorRequest)      returns (SpanErrorResponse);
   rpc NestedSpans    (NestedSpansRequest)    returns (NestedSpansResponse);
+  rpc AllocSpans     (AllocSpansRequest)     returns (AllocSpansResponse);
 }
 
 message StartSpanRequest {
@@ -48,4 +49,13 @@ message NestedSpansRequest {
 }
 message NestedSpansResponse {
   bool ok = 1;
+}
+
+message AllocSpansRequest {
+  uint32 initial    = 1;  // spans to start and hold
+  uint32 drop_count = 2;  // held spans to drop before the next batch
+  uint32 additional = 3;  // spans to start and hold after dropping
+}
+message AllocSpansResponse {
+  uint32 held = 1;  // spans still held when the handler returns
 }

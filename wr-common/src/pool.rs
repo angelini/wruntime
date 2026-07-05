@@ -43,7 +43,7 @@ pub fn redact_database_url(database_url: &str) -> String {
         };
     };
 
-    let split_at = rest.find(|c| c == '/' || c == '?').unwrap_or(rest.len());
+    let split_at = rest.find(['/', '?']).unwrap_or(rest.len());
     let (authority, path_and_query) = rest.split_at(split_at);
     let redacted_authority = match authority.rsplit_once('@') {
         Some((userinfo, host)) => {

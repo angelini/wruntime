@@ -407,8 +407,14 @@ enum BlobError {
     NotFound(String),
     AccessDenied(String),
     Io(String),
+    TooLarge(String),  // upload/download/listing exceeds a host-configured limit
 }
 ```
+
+Host-enforced limits (from the engine `[blobstore]` config, global across modules):
+`max_object_size` (default 16 MiB) caps both `put_object` uploads and `get_object` downloads —
+an oversized download is aborted mid-stream, never fully buffered; `max_list_objects` (default 1000)
+caps `list_objects`. Exceeding either returns `BlobError::TooLarge`.
 
 ## wruntime:tracing/span@0.1.0
 
@@ -438,22 +444,35 @@ Source: `wit/llm.wit`. Import path: `wr_sdk::bindings::wruntime::llm::inference`
 /// Single-shot completion.
 inference::complete(req: &CompletionRequest) -> Result<CompletionResponse, LlmError>
 
-/// Streaming completion — returns a cursor that yields text deltas.
+/// Streaming completion — returns a cursor of typed stream events.
 inference::complete_stream(req: &CompletionRequest) -> Result<CompletionStream, LlmError>
+```
+
+Types:
+
+```rust
+enum StreamEvent {
+    TextDelta(String),   // incremental text
+    Usage(TokenUsage),   // final aggregate usage (emitted once, before Stop)
+    Stop(String),        // terminal stop_reason, emitted once
+}
 ```
 
 ### CompletionStream resource
 
 ```rust
 impl CompletionStream {
-    /// Pull the next text chunk. Returns None when stream is finished.
-    fn next(&self) -> Result<Option<String>, LlmError>
+    /// Pull the next event. Ok(None) when finished (idempotent thereafter).
+    /// Event order: zero+ TextDelta, then exactly one Usage, then one Stop, then None.
+    fn next(&self) -> Result<Option<StreamEvent>, LlmError>
 
-    /// Final usage stats (available after stream exhausted).
+    /// Final usage — None until the terminal Usage event has been observed via next().
     fn usage(&self) -> Option<TokenUsage>
 }
 // Dropping cancels the stream.
 ```
+
+Tool-use is not supported while streaming: `complete_stream` rejects tool-enabled requests with `LlmError::InvalidRequest` before any upstream call; use `complete()` for tool calls. Stream-level errors, transport failures, and truncated streams surface as an `LlmError` from `next()`. Extended-thinking / signature / citation deltas are dropped (no WIT representation).
 
 ### Types
 
@@ -498,6 +517,12 @@ struct ToolUse {
 struct TokenUsage {
     input_tokens: u32,
     output_tokens: u32,
+}
+
+enum StreamEvent {
+    TextDelta(String),
+    Usage(TokenUsage),
+    Stop(String),
 }
 
 enum LlmError {

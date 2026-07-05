@@ -9,6 +9,9 @@ impl From<BlobError> for ServiceError {
                 ServiceError::internal(format!("blobstore access denied: {msg}"))
             }
             BlobError::Io(msg) => ServiceError::internal(format!("blobstore io: {msg}")),
+            BlobError::TooLarge(msg) => {
+                ServiceError::internal(format!("blobstore too large: {msg}"))
+            }
         }
     }
 }

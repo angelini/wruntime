@@ -4,6 +4,8 @@
 
 WASM modules running in `wr-engine` can access host-provided capabilities through WIT interfaces defined under `wit/`. When using `wr-sdk`, these types are available via `wr_sdk::bindings` — no separate `wit_bindgen::generate!` call is required.
 
+> **Compatibility policy.** The `wruntime:*` WIT packages (`wruntime:db`, `wruntime:llm`, `wruntime:blobstore`, `wruntime:tracing`) are **pre-1.0 and may change incompatibly** at any time until the project declares a stable API. Pin the runtime and SDK versions you build against, and expect to update guest code when these interfaces change.
+
 ## Database (Postgres)
 
 Defined in `wit/db.wit`. Provides parameterized SQL queries and transactions against a shared Postgres connection pool managed by the engine.
@@ -75,14 +77,31 @@ fn create_order(id: i32, status: &str, total: &str) -> u64 {
 | `PgValue::Text(String)` | `TEXT` / `VARCHAR` / `CHAR` | `String` |
 | `PgValue::Bytea(Vec<u8>)` | `BYTEA` | `Vec<u8>` |
 | `PgValue::Timestamptz(i64)` | `TIMESTAMPTZ` | µs since Unix epoch (UTC) |
+| `PgValue::Timestamp(i64)` | `TIMESTAMP` | µs since Unix epoch (naive) |
 | `PgValue::Date(i32)` | `DATE` | days since Unix epoch |
 | `PgValue::Time(i64)` | `TIME` | µs since midnight |
+| `PgValue::Interval(PgInterval)` | `INTERVAL` | `{ months, days, microseconds }` |
 | `PgValue::Numeric(String)` | `NUMERIC` / `DECIMAL` | decimal string (lossless) |
 | `PgValue::Uuid((u64, u64))` | `UUID` | 128-bit value as `(high, low)` |
 | `PgValue::Jsonb(String)` | `JSON` / `JSONB` | serialised JSON string |
 | `PgValue::Oid(u32)` | `OID` | `u32` |
+| `PgValue::BoolArray(Vec<Option<bool>>)` | `BOOL[]` | `Vec<Option<bool>>` |
+| `PgValue::Int2Array(Vec<Option<i16>>)` | `INT2[]` | `Vec<Option<i16>>` |
+| `PgValue::Int4Array(Vec<Option<i32>>)` | `INT4[]` | `Vec<Option<i32>>` |
+| `PgValue::Int8Array(Vec<Option<i64>>)` | `INT8[]` | `Vec<Option<i64>>` |
+| `PgValue::Float4Array(Vec<Option<f32>>)` | `FLOAT4[]` | `Vec<Option<f32>>` |
+| `PgValue::Float8Array(Vec<Option<f64>>)` | `FLOAT8[]` | `Vec<Option<f64>>` |
+| `PgValue::TextArray(Vec<Option<String>>)` | `TEXT[]` | `Vec<Option<String>>` |
+| `PgValue::TimestamptzArray(Vec<Option<i64>>)` | `TIMESTAMPTZ[]` | `Vec<Option<i64>>` |
+| `PgValue::TimestampArray(Vec<Option<i64>>)` | `TIMESTAMP[]` | `Vec<Option<i64>>` |
+| `PgValue::UuidArray(Vec<Option<(u64, u64)>>)` | `UUID[]` | `Vec<Option<(u64, u64)>>` |
+| `PgValue::JsonbArray(Vec<Option<String>>)` | `JSONB[]` | `Vec<Option<String>>` |
 
 Parameters are bound positionally as `$1`, `$2`, … in the SQL string. Use explicit casts (e.g. `$1::numeric`, `$1::jsonb`) when Postgres cannot infer the type from context.
+
+### Input validation
+
+Parameter values are converted strictly. A value that cannot be represented in its target Postgres type is **rejected** with `DbError::Query(...)` (a descriptive message) rather than silently coerced. This applies to: malformed `Jsonb`/`JsonbArray` JSON, a non-numeric `Numeric` string, an out-of-range `Timestamp`/`Timestamptz`/`Time` value, and invalid elements inside array variants. There is a deliberate **read-path asymmetry**: on the way *out*, a result column of a Postgres type the engine does not explicitly map is logged as a warning and returned as `PgValue::Null` (lenient), whereas input conversion is strict.
 
 ## Blobstore (S3-compatible)
 
@@ -124,6 +143,15 @@ fn list_reports() -> Vec<String> {
 }
 ```
 
+### Limits and errors
+
+`BlobError` has four variants: `NotFound`, `AccessDenied`, `Io`, and `TooLarge`. Host-enforced limits come from the engine `[blobstore]` config (global across modules):
+
+- `max_object_size` (default **16 MiB**) caps both `put_object` uploads and `get_object` downloads. An oversized download is aborted mid-stream — never fully buffered — and returns `BlobError::TooLarge`.
+- `max_list_objects` (default **1000**) caps `list_objects`; exceeding it returns `BlobError::TooLarge` rather than silently truncating.
+
+See [configuration.md](configuration.md#blobstore) for the config keys.
+
 ## Tracing (OpenTelemetry)
 
 Defined in `wit/tracing.wit`. Allows modules to create and annotate OpenTelemetry spans that appear alongside the proxy's own request traces.
@@ -138,6 +166,8 @@ tracing::record_event(&span, "validation-passed", &[]);
 ```
 
 Access via `wr_sdk::bindings::wruntime::tracing::span`.
+
+Each request has a ceiling on the number of concurrently live guest-created spans (`[limits] max_spans`, default **1024**). A span resource is created by `start`/`start-root` and freed when dropped. If a guest tries to open a span beyond the cap, the guest instance is **trapped** (the request fails) — this protects the engine's resource table; it does not crash the engine. Drop spans you no longer need to stay under the cap.
 
 ## LLM Inference
 
@@ -189,6 +219,12 @@ fn stream_response(prompt: &str) -> String {
 ```
 
 Access via `wr_sdk::bindings::wruntime::llm::inference` (raw WIT binding) or `wr_sdk::llm` (ergonomic helpers).
+
+### Streaming
+
+`complete-stream` returns a `CompletionStream` cursor whose `next()` yields typed `StreamEvent` values in a guaranteed order: zero or more `TextDelta`, then exactly one `Usage`, then exactly one `Stop`, then `None` (idempotent thereafter). `usage()` returns `None` until the terminal `Usage` event has been observed via `next()`. Stream-level errors, transport failures, and truncated streams surface as an `LlmError` from `next()`.
+
+Tool-use is **not** supported while streaming: `complete-stream` pre-rejects tool-enabled requests with `LlmError::InvalidRequest` before any upstream call — use `complete()` for tool calls. Extended-thinking, signature, and citation deltas from the upstream API are dropped (they have no WIT representation). The `wr_sdk::llm::collect_stream` helper (used above) drains the cursor and accumulates the text deltas into a `String`. See [`api_reference.md`](agents/api_reference.md#wruntimellminference010) for the full type/ordering contract.
 
 ## Filesystem
 

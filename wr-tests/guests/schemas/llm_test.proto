@@ -58,11 +58,32 @@ message LlmErrorResponse {
 
 message StreamRequest {
   string user_message = 1;
+  bool with_tools = 2;   // when true, attach a tool def -> host must pre-reject
 }
 
 message StreamResponse {
   string text = 1;
-  uint32 chunk_count = 2;
+  uint32 chunk_count = 2;          // number of text-delta events observed
+  repeated string events = 3;      // ordered event-kind tags: "text-delta" | "usage" | "stop"
+  uint32 input_tokens = 4;
+  uint32 output_tokens = 5;
+  string stop_reason = 6;
+  bool usage_mid_none = 7;         // stream.usage() was None after the first text-delta
+  bool usage_present_after = 8;    // stream.usage() was Some after next() returned None
+  string error_kind = 9;           // set on error: "invalid-request"|"auth"|"rate-limited"|"api"; "" if ok
+  string error_message = 10;
+}
+
+message AllocStreamsRequest {
+  uint32 initial    = 1;
+  uint32 drop_count = 2;
+  uint32 additional = 3;
+}
+message AllocStreamsResponse {
+  uint32 held          = 1;
+  bool   hit_cap       = 2;  // whether a cap error (LlmError::Api) was observed
+  string error_kind    = 3;  // "api" / "other" / ""
+  string error_message = 4;
 }
 
 service LlmTestService {
@@ -71,4 +92,5 @@ service LlmTestService {
   rpc ToolUse(ToolUseRequest) returns (ToolUseResponse);
   rpc Error(LlmErrorRequest) returns (LlmErrorResponse);
   rpc Stream(StreamRequest) returns (StreamResponse);
+  rpc AllocStreams(AllocStreamsRequest) returns (AllocStreamsResponse);
 }

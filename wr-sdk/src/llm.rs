@@ -126,12 +126,13 @@ impl CompletionBuilder {
     }
 }
 
-/// Collect a stream into a single string.
+/// Collect a stream's text into a single string (ignores usage/stop events).
 pub fn collect_stream(stream: CompletionStream) -> Result<String, LlmError> {
     let mut buf = String::new();
     loop {
         match stream.next()? {
-            Some(chunk) => buf.push_str(&chunk),
+            Some(StreamEvent::TextDelta(s)) => buf.push_str(&s),
+            Some(StreamEvent::Usage(_)) | Some(StreamEvent::Stop(_)) => {}
             None => return Ok(buf),
         }
     }

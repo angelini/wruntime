@@ -1,6 +1,6 @@
 use wasmtime::component::Resource;
 
-use crate::state::ModuleState;
+use crate::state::{CounterGuard, ModuleState, ResourceKind};
 
 /// Host-side state for an active WIT `active-span` resource.
 ///
@@ -10,23 +10,29 @@ use crate::state::ModuleState;
 /// which closes the span in the OTel pipeline.
 pub struct SpanState {
     span: tracing::Span,
+    _count: CounterGuard,
 }
 
 wasmtime::component::bindgen!({
     path: "../wit/tracing.wit",
     world: "tracing-access",
-    imports: { default: async },
+    imports: { default: async | trappable },
     with: {
         "wruntime:tracing/span.active-span": SpanState,
     },
 });
 
 impl wruntime::tracing::span::Host for ModuleState {
-    async fn start(&mut self, name: String, attrs: Vec<(String, String)>) -> Resource<SpanState> {
+    async fn start(
+        &mut self,
+        name: String,
+        attrs: Vec<(String, String)>,
+    ) -> wasmtime::Result<Resource<SpanState>> {
+        let (tc, table) = self.tracing_mut();
         // Parent the new span to the top of the guest span stack, falling back
         // to the request-level `active_span`. This gives automatic nesting:
         // e.g. db.query becomes a child of db.transaction.
-        let parent = self.span_stack.last().unwrap_or(&self.active_span);
+        let parent = tc.span_stack.last().unwrap_or(&tc.active_span);
         let child = tracing::info_span!(
             parent: parent,
             "module",
@@ -42,17 +48,25 @@ impl wruntime::tracing::span::Host for ModuleState {
                 );
             }
         }
-        self.span_stack.push(child.clone());
-        self.table()
-            .push(SpanState { span: child })
-            .expect("ResourceTable capacity exceeded")
+        let guard = tc
+            .accounting
+            .try_track(ResourceKind::Span)
+            .ok_or_else(|| wasmtime::Error::msg("tracing span cap exceeded"))?;
+        let handle = table
+            .push(SpanState {
+                span: child.clone(),
+                _count: guard,
+            })
+            .map_err(|_| wasmtime::Error::msg("tracing span table exhausted"))?;
+        tc.span_stack.push(child);
+        Ok(handle)
     }
 
     async fn start_root(
         &mut self,
         name: String,
         attrs: Vec<(String, String)>,
-    ) -> Resource<SpanState> {
+    ) -> wasmtime::Result<Resource<SpanState>> {
         let root = tracing::info_span!(
             parent: tracing::Span::none(),
             "module",
@@ -68,17 +82,31 @@ impl wruntime::tracing::span::Host for ModuleState {
                 );
             }
         }
+        let (tc, table) = self.tracing_mut();
+        let guard = tc
+            .accounting
+            .try_track(ResourceKind::Span)
+            .ok_or_else(|| wasmtime::Error::msg("tracing span cap exceeded"))?;
+        let handle = table
+            .push(SpanState {
+                span: root.clone(),
+                _count: guard,
+            })
+            .map_err(|_| wasmtime::Error::msg("tracing span table exhausted"))?;
         // Set as outbound parent so subsequent HTTP calls inherit this trace.
-        *self.outbound_parent.lock().unwrap() = Some(root.clone());
-        self.span_stack.push(root.clone());
-        self.table()
-            .push(SpanState { span: root })
-            .expect("ResourceTable capacity exceeded")
+        *tc.outbound_parent.lock().unwrap() = Some(root.clone());
+        tc.span_stack.push(root);
+        Ok(handle)
     }
 }
 
 impl wruntime::tracing::span::HostActiveSpan for ModuleState {
-    async fn set_attribute(&mut self, self_: Resource<SpanState>, key: String, value: String) {
+    async fn set_attribute(
+        &mut self,
+        self_: Resource<SpanState>,
+        key: String,
+        value: String,
+    ) -> wasmtime::Result<()> {
         if let Ok(state) = self.table().get(&self_) {
             use tracing_opentelemetry::OpenTelemetrySpanExt as _;
             state.span.set_attribute(
@@ -86,6 +114,7 @@ impl wruntime::tracing::span::HostActiveSpan for ModuleState {
                 opentelemetry::Value::String(value.into()),
             );
         }
+        Ok(())
     }
 
     async fn record_event(
@@ -93,15 +122,20 @@ impl wruntime::tracing::span::HostActiveSpan for ModuleState {
         self_: Resource<SpanState>,
         name: String,
         attrs: Vec<(String, String)>,
-    ) {
+    ) -> wasmtime::Result<()> {
         if let Ok(state) = self.table().get(&self_) {
             state.span.in_scope(|| {
                 tracing::info!(event = name.as_str(), attrs = ?attrs);
             });
         }
+        Ok(())
     }
 
-    async fn set_error(&mut self, self_: Resource<SpanState>, message: String) {
+    async fn set_error(
+        &mut self,
+        self_: Resource<SpanState>,
+        message: String,
+    ) -> wasmtime::Result<()> {
         if let Ok(state) = self.table().get(&self_) {
             state.span.in_scope(|| {
                 tracing::error!(
@@ -110,22 +144,20 @@ impl wruntime::tracing::span::HostActiveSpan for ModuleState {
                 );
             });
         }
+        Ok(())
     }
 
     async fn drop(&mut self, self_: Resource<SpanState>) -> wasmtime::Result<()> {
         let state = self.table().delete(self_)?;
+        let tc = self.tracing_context();
         // Remove this span from the stack so subsequent spans don't parent to it.
-        if let Some(pos) = self
-            .span_stack
-            .iter()
-            .position(|s| s.id() == state.span.id())
-        {
-            self.span_stack.remove(pos);
+        if let Some(pos) = tc.span_stack.iter().position(|s| s.id() == state.span.id()) {
+            tc.span_stack.remove(pos);
         }
         // If this span was the outbound parent, clear it so subsequent
         // outbound calls start fresh traces again.
         {
-            let mut parent = self.outbound_parent.lock().unwrap();
+            let mut parent = tc.outbound_parent.lock().unwrap();
             if parent.as_ref().and_then(|s| s.id()) == state.span.id() {
                 *parent = None;
             }
@@ -163,7 +195,9 @@ mod tests {
             Default::default(),
         )
         .expect("state");
-        let span = Host::start(&mut state, "my-operation".into(), vec![]).await;
+        let span = Host::start(&mut state, "my-operation".into(), vec![])
+            .await
+            .expect("start");
         HostActiveSpan::drop(&mut state, span).await.expect("drop");
     }
 
@@ -177,7 +211,9 @@ mod tests {
             Default::default(),
         )
         .expect("state");
-        let span = Host::start(&mut state, "op".into(), vec![]).await;
+        let span = Host::start(&mut state, "op".into(), vec![])
+            .await
+            .expect("start");
         let rep = span.rep();
         HostActiveSpan::set_attribute(
             &mut state,
@@ -185,7 +221,8 @@ mod tests {
             "db.table".into(),
             "users".into(),
         )
-        .await;
+        .await
+        .expect("set_attribute");
         HostActiveSpan::drop(&mut state, span).await.expect("drop");
     }
 
@@ -199,7 +236,9 @@ mod tests {
             Default::default(),
         )
         .expect("state");
-        let span = Host::start(&mut state, "op".into(), vec![]).await;
+        let span = Host::start(&mut state, "op".into(), vec![])
+            .await
+            .expect("start");
         let rep = span.rep();
         HostActiveSpan::record_event(
             &mut state,
@@ -207,7 +246,8 @@ mod tests {
             "cache.miss".into(),
             vec![("key".into(), "user:42".into())],
         )
-        .await;
+        .await
+        .expect("record_event");
         HostActiveSpan::drop(&mut state, span).await.expect("drop");
     }
 
@@ -221,14 +261,17 @@ mod tests {
             Default::default(),
         )
         .expect("state");
-        let span = Host::start(&mut state, "op".into(), vec![]).await;
+        let span = Host::start(&mut state, "op".into(), vec![])
+            .await
+            .expect("start");
         let rep = span.rep();
         HostActiveSpan::set_error(
             &mut state,
             wasmtime::component::Resource::new_borrow(rep),
             "connection refused".into(),
         )
-        .await;
+        .await
+        .expect("set_error");
         HostActiveSpan::drop(&mut state, span).await.expect("drop");
     }
 }

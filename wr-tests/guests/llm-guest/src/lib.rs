@@ -123,23 +123,97 @@ impl proto::LlmTestService for Component {
         &self,
         req: proto::StreamRequest,
     ) -> Result<proto::StreamResponse, ServiceError> {
-        let stream = CompletionBuilder::sonnet()
-            .user(&req.user_message)
-            .stream()?;
-
-        let mut text = String::new();
-        let mut chunk_count: u32 = 0;
-        loop {
-            match stream.next() {
-                Ok(Some(chunk)) => {
-                    text.push_str(&chunk);
-                    chunk_count += 1;
-                }
-                Ok(None) => break,
-                Err(e) => return Err(ServiceError::from(e)),
-            }
+        let mut builder = CompletionBuilder::sonnet().user(&req.user_message);
+        if req.with_tools {
+            builder = builder.tool("dummy", "dummy tool", r#"{"type":"object"}"#);
         }
 
-        Ok(proto::StreamResponse { text, chunk_count })
+        let stream = match builder.stream() {
+            Ok(s) => s,
+            Err(e) => {
+                let (kind, msg) = llm_error_parts(e);
+                return Ok(proto::StreamResponse {
+                    error_kind: kind,
+                    error_message: msg,
+                    ..Default::default()
+                });
+            }
+        };
+
+        let mut resp = proto::StreamResponse::default();
+        loop {
+            match stream.next() {
+                Ok(Some(inference::StreamEvent::TextDelta(chunk))) => {
+                    resp.text.push_str(&chunk);
+                    resp.chunk_count += 1;
+                    resp.events.push("text-delta".into());
+                    if resp.chunk_count == 1 {
+                        resp.usage_mid_none = stream.usage().is_none();
+                    }
+                }
+                Ok(Some(inference::StreamEvent::Usage(u))) => {
+                    resp.events.push("usage".into());
+                    resp.input_tokens = u.input_tokens;
+                    resp.output_tokens = u.output_tokens;
+                }
+                Ok(Some(inference::StreamEvent::Stop(reason))) => {
+                    resp.events.push("stop".into());
+                    resp.stop_reason = reason;
+                }
+                Ok(None) => {
+                    resp.usage_present_after = stream.usage().is_some();
+                    break;
+                }
+                Err(e) => {
+                    let (kind, msg) = llm_error_parts(e);
+                    resp.error_kind = kind;
+                    resp.error_message = msg;
+                    break;
+                }
+            }
+        }
+        Ok(resp)
+    }
+
+    fn alloc_streams(
+        &self,
+        req: proto::AllocStreamsRequest,
+    ) -> Result<proto::AllocStreamsResponse, ServiceError> {
+        let mut held = Vec::new();
+        let mut resp = proto::AllocStreamsResponse::default();
+        let open = |resp: &mut proto::AllocStreamsResponse, held: &mut Vec<_>, n: u32| {
+            for _ in 0..n {
+                match CompletionBuilder::sonnet().user("hi").stream() {
+                    Ok(s) => held.push(s),
+                    Err(inference::LlmError::Api(m)) => {
+                        resp.hit_cap = true;
+                        resp.error_kind = "api".into();
+                        resp.error_message = m;
+                        break;
+                    }
+                    Err(e) => {
+                        resp.error_kind = "other".into();
+                        resp.error_message = format!("{e:?}");
+                        break;
+                    }
+                }
+            }
+        };
+        open(&mut resp, &mut held, req.initial);
+        for _ in 0..req.drop_count {
+            held.pop(); // CompletionStream dropped -> host drop -> live-count decrement
+        }
+        open(&mut resp, &mut held, req.additional);
+        resp.held = held.len() as u32;
+        Ok(resp)
+    }
+}
+
+fn llm_error_parts(e: inference::LlmError) -> (String, String) {
+    match e {
+        inference::LlmError::InvalidRequest(m) => ("invalid-request".into(), m),
+        inference::LlmError::Auth(m) => ("auth".into(), m),
+        inference::LlmError::RateLimited(_) => ("rate-limited".into(), "rate limited".into()),
+        inference::LlmError::Api(m) => ("api".into(), m),
     }
 }

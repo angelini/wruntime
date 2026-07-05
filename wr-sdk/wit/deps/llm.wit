@@ -75,12 +75,31 @@ interface inference {
     /// Single-shot completion (request → response).
     complete: func(req: completion-request) -> result<completion-response, llm-error>;
 
-    /// Streaming completion — returns a cursor that yields text deltas.
-    resource completion-stream {
-        /// Pull the next chunk. Returns `none` when the stream is finished.
-        next: func() -> result<option<string>, llm-error>;
+    /// A single event from a streaming completion.
+    variant stream-event {
+        /// Incremental text output.
+        text-delta(string),
+        /// Final aggregate usage (input tokens from stream start, cumulative output tokens).
+        usage(token-usage),
+        /// Terminal stop reason ("end_turn" | "tool_use" | "max_tokens" | ...).
+        stop(string),
+    }
 
-        /// Final usage stats (available after stream exhausted).
+    /// Streaming completion cursor.
+    ///
+    /// Event order is guaranteed: zero or more `text-delta`, then exactly one
+    /// `usage`, then exactly one `stop`, then `next()` returns `none`. `next()`
+    /// returns `none` idempotently after the stream ends. `usage()` returns
+    /// `none` until the terminal `usage` event has been observed via `next()`,
+    /// then the final `token-usage`. A stream-level error, transport error, or
+    /// truncated stream surfaces as an `llm-error` from `next()`. Tool-use is not
+    /// supported while streaming — `complete-stream` rejects tool-enabled
+    /// requests with `invalid-request`; use `complete` for tool calls.
+    resource completion-stream {
+        /// Pull the next event. Returns `none` when the stream is finished.
+        next: func() -> result<option<stream-event>, llm-error>;
+
+        /// Final usage stats — `none` until the terminal event is observed.
         usage: func() -> option<token-usage>;
     }
 

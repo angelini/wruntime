@@ -1,8 +1,10 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use crate::blobstore::BlobstoreRuntime;
-use crate::config::FsMode;
-use crate::llm::LlmRuntime;
+use crate::blobstore::{BlobError, BlobstoreRuntime};
+use crate::config::{BlobstoreLimits, FsMode, ResourceLimits};
+use crate::db::wruntime::db::database::DbError;
+use crate::llm::{LlmError, LlmRuntime};
 use deadpool_postgres::Pool;
 use http_body_util::{BodyExt, Full};
 use hyper::header::{HeaderName, HeaderValue};
@@ -39,6 +41,9 @@ struct ModuleHttpHooks {
     /// When set, outbound requests are parented to this span instead of
     /// starting a new trace. Modules set this via `start-root`.
     outbound_parent: Arc<std::sync::Mutex<Option<tracing::Span>>>,
+    /// Max buffered outbound request body size in bytes; larger bodies are
+    /// rejected with `ErrorCode::HttpRequestBodySize`.
+    max_outbound_body_bytes: usize,
 }
 
 impl WasiHttpHooks for ModuleHttpHooks {
@@ -109,18 +114,38 @@ impl WasiHttpHooks for ModuleHttpHooks {
 
         let client = self.http_pool.get().clone();
         let between_bytes_timeout = config.between_bytes_timeout;
+        let max_outbound_body_bytes = self.max_outbound_body_bytes;
 
         let handle = wasmtime_wasi::runtime::spawn(async move {
             Ok(async move {
-                // Buffer the outgoing body so we can hand it to the pooled client,
-                // which requires a Send + 'static body type (Full<Bytes>).
-                let (parts, body) = request.into_parts();
-                let body_bytes = body
-                    .collect()
-                    .await
-                    .map_err(|e| ErrorCode::InternalError(Some(e.to_string())))?
-                    .to_bytes();
-                let buffered = hyper::Request::from_parts(parts, Full::new(body_bytes));
+                // Buffer the outgoing body up to `max_outbound_body_bytes`, aborting as
+                // soon as the running total exceeds the cap so an oversized body is never
+                // fully materialized. The pooled client requires a single concrete
+                // Send + 'static body type (Full<Bytes>), so the under-cap path is buffered.
+                let (parts, mut body) = request.into_parts();
+
+                // Fast pre-check: reject without reading a frame if the body advertises an
+                // upper bound over the cap. `upper` is usually absent for guest bodies, so
+                // the running-total guard below is the authoritative check.
+                if let Some(upper) = http_body::Body::size_hint(&body).upper() {
+                    if upper > max_outbound_body_bytes as u64 {
+                        return Err(ErrorCode::HttpRequestBodySize(Some(upper)));
+                    }
+                }
+
+                let mut collected = bytes::BytesMut::new();
+                while let Some(frame) = body.frame().await {
+                    let frame = frame?;
+                    if let Ok(data) = frame.into_data() {
+                        if collected.len() + data.len() > max_outbound_body_bytes {
+                            return Err(ErrorCode::HttpRequestBodySize(Some(
+                                (collected.len() + data.len()) as u64,
+                            )));
+                        }
+                        collected.extend_from_slice(data.as_ref());
+                    }
+                }
+                let buffered = hyper::Request::from_parts(parts, Full::new(collected.freeze()));
 
                 let resp = client.request(buffered).await.map_err(|e| {
                     tracing::warn!(error = ?e, "outgoing http request failed");
@@ -175,6 +200,89 @@ impl Default for DbTimeouts {
     }
 }
 
+/// The four guest-creatable host resource kinds subject to per-store caps.
+#[derive(Clone, Copy, Debug)]
+pub enum ResourceKind {
+    Span,
+    DbTransaction,
+    DbCursor,
+    LlmStream,
+}
+
+/// Decrements the live-count for one resource kind when dropped.
+///
+/// Stored as a field inside the resource-state struct (`SpanState`, `TxState`,
+/// `CursorState`, `CompletionStreamState`) so the decrement is tied to the
+/// resource's lifetime: it fires exactly when the state is removed from the
+/// `ResourceTable` (via `delete`), and — because a failed `ResourceTable::push`
+/// consumes and drops the never-inserted state — a failed push self-corrects the
+/// count. Never construct one except via `ResourceAccounting::try_track`.
+pub struct CounterGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl Drop for CounterGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Per-store live-resource accounting: one running count per resource kind plus
+/// the configured caps. Cloneable (shares the atomics) and relocatable as a unit
+/// into the capability structs.
+///
+/// Invariant: the live count is incremented only via `try_track` (which returns a
+/// `CounterGuard`) and decremented only when that guard drops — i.e. after a
+/// successful `ResourceTable::delete`, or when a failed `push` drops the state.
+/// A failed push nets to zero; a failed/early-return delete never decrements.
+/// Host calls on a store are serialized (`&mut self`), so the load-then-add in
+/// `try_track` cannot race.
+#[derive(Clone)]
+pub struct ResourceAccounting {
+    spans: Arc<AtomicU32>,
+    db_transactions: Arc<AtomicU32>,
+    db_cursors: Arc<AtomicU32>,
+    llm_streams: Arc<AtomicU32>,
+    limits: ResourceLimits,
+}
+
+impl ResourceAccounting {
+    pub fn new(limits: ResourceLimits) -> Self {
+        Self {
+            spans: Arc::new(AtomicU32::new(0)),
+            db_transactions: Arc::new(AtomicU32::new(0)),
+            db_cursors: Arc::new(AtomicU32::new(0)),
+            llm_streams: Arc::new(AtomicU32::new(0)),
+            limits,
+        }
+    }
+
+    fn slot(&self, kind: ResourceKind) -> (&Arc<AtomicU32>, u32) {
+        match kind {
+            ResourceKind::Span => (&self.spans, self.limits.max_spans),
+            ResourceKind::DbTransaction => (&self.db_transactions, self.limits.max_db_transactions),
+            ResourceKind::DbCursor => (&self.db_cursors, self.limits.max_db_cursors),
+            ResourceKind::LlmStream => (&self.llm_streams, self.limits.max_llm_streams),
+        }
+    }
+
+    /// Reserve one live slot for `kind`. On success increments the live-count and
+    /// returns a `CounterGuard` the caller MUST move into the resource-state
+    /// struct it is about to `ResourceTable::push`. Returns `None` when already at
+    /// cap (no increment performed); the caller maps that to a trap (spans) or an
+    /// error variant (DB/LLM).
+    pub fn try_track(&self, kind: ResourceKind) -> Option<CounterGuard> {
+        let (counter, cap) = self.slot(kind);
+        if counter.load(Ordering::Relaxed) >= cap {
+            return None;
+        }
+        counter.fetch_add(1, Ordering::Relaxed);
+        Some(CounterGuard {
+            counter: counter.clone(),
+        })
+    }
+}
+
 /// Optional services and capabilities for a module.
 /// All fields default to `None`/no-op, so tests can simply use `Default::default()`.
 pub struct ModuleServices {
@@ -190,6 +298,8 @@ pub struct ModuleServices {
     /// S3 key prefix for namespace isolation (e.g. `wr/ecommerce/`).
     /// Set when blobstore access is enabled; transparently prepended to all object keys.
     pub blob_prefix: Option<Arc<str>>,
+    /// Host-enforced blobstore size/list ceilings. Defaults in tests.
+    pub blob_limits: BlobstoreLimits,
     /// Shared LLM inference client, present when the module has LLM access enabled.
     pub llm: Option<Arc<LlmRuntime>>,
     /// WASI filesystem mode (e.g. `FsMode::Tempdir`).
@@ -201,6 +311,11 @@ pub struct ModuleServices {
     /// child spans even when wasmtime's synchronous call stack is outside the
     /// async instrumented context.
     pub active_span: tracing::Span,
+    /// Per-store resource caps. From `EngineConfig.limits`; defaults in tests.
+    pub limits: ResourceLimits,
+    /// Max outbound HTTP request body size in bytes. From
+    /// `EngineConfig.max_outbound_body_bytes`; default in tests.
+    pub max_outbound_body_bytes: usize,
 }
 
 impl Default for ModuleServices {
@@ -211,12 +326,58 @@ impl Default for ModuleServices {
             db_timeouts: DbTimeouts::default(),
             blobstore: None,
             blob_prefix: None,
+            blob_limits: BlobstoreLimits::default(),
             llm: None,
             fs: None,
             env_vars: Arc::new(std::collections::HashMap::new()),
             active_span: tracing::Span::none(),
+            limits: ResourceLimits::default(),
+            max_outbound_body_bytes: 16 * 1024 * 1024,
         }
     }
+}
+
+/// DB capability: pool + schema + timeouts, plus plan-2 tx/cursor accounting.
+pub(crate) struct DbCapability {
+    pub(crate) pool: Arc<Pool>,
+    pub(crate) schema: Option<Arc<str>>,
+    pub(crate) timeouts: DbTimeouts,
+    pub(crate) accounting: ResourceAccounting,
+}
+
+/// Blobstore capability: S3 runtime + namespace key prefix + host-enforced size/list limits.
+pub(crate) struct BlobstoreCapability {
+    pub(crate) runtime: Arc<BlobstoreRuntime>,
+    pub(crate) prefix: Option<Arc<str>>,
+    pub(crate) limits: BlobstoreLimits,
+}
+
+/// LLM capability: inference runtime + plan-2 stream accounting.
+pub(crate) struct LlmCapability {
+    pub(crate) runtime: Arc<LlmRuntime>,
+    pub(crate) accounting: ResourceAccounting,
+}
+
+/// Tracing capability (always present): request-level span, guest span stack, the
+/// shared outbound-parent handle, plus plan-2 live-span accounting.
+pub(crate) struct TracingCapability {
+    pub(crate) active_span: tracing::Span,
+    pub(crate) span_stack: Vec<tracing::Span>,
+    pub(crate) outbound_parent: Arc<std::sync::Mutex<Option<tracing::Span>>>,
+    pub(crate) accounting: ResourceAccounting,
+}
+
+/// Filesystem capability: holds the ephemeral tempdir alive for the store's lifetime.
+pub(crate) struct FsCapability {
+    _root: Option<TempDir>,
+}
+
+struct ModuleCapabilities {
+    db: Option<DbCapability>,
+    blobstore: Option<BlobstoreCapability>,
+    llm: Option<LlmCapability>,
+    tracing: TracingCapability,
+    _fs: FsCapability,
 }
 
 pub struct ModuleState {
@@ -224,31 +385,7 @@ pub struct ModuleState {
     http: WasiHttpCtx,
     table: ResourceTable,
     hooks: ModuleHttpHooks,
-    /// Shared connection pool, present when the module has DB access enabled.
-    pub db_pool: Option<Arc<Pool>>,
-    /// Postgres schema name for this module (`wr__{namespace}__{name}`).
-    /// Set when DB access is enabled; used to scope all queries to the module's schema.
-    pub db_schema: Option<Arc<str>>,
-    /// Timeout configuration for guest DB connections.
-    pub db_timeouts: DbTimeouts,
-    /// Ephemeral temp directory backing the module's WASI filesystem.
-    /// `Some` only when `fs = "tempdir"` is set; kept alive so it isn't
-    /// deleted until the store is dropped.
-    _fs_root: Option<TempDir>,
-    /// Shared S3-compatible blobstore client, present when the module has blobstore access enabled.
-    pub blobstore: Option<Arc<BlobstoreRuntime>>,
-    /// S3 key prefix for namespace isolation (e.g. `wr/ecommerce/`).
-    pub blob_prefix: Option<Arc<str>>,
-    /// Shared LLM inference client, present when the module has LLM access enabled.
-    pub llm: Option<Arc<LlmRuntime>>,
-    /// The `engine.dispatch` span for the current request.
-    pub active_span: tracing::Span,
-    /// Stack of guest-created spans for automatic parent-child nesting.
-    /// New spans are parented to the top of the stack (or `active_span` if empty).
-    pub span_stack: Vec<tracing::Span>,
-    /// Shared with `ModuleHttpHooks` — when set, outbound requests parent to
-    /// this span. Modules set it via `start-root`.
-    pub outbound_parent: Arc<std::sync::Mutex<Option<tracing::Span>>>,
+    capabilities: ModuleCapabilities,
 }
 
 impl ModuleState {
@@ -273,6 +410,22 @@ impl ModuleState {
             None => None,
         };
         let outbound_parent = Arc::new(std::sync::Mutex::new(None));
+        let accounting = ResourceAccounting::new(services.limits);
+        let db = services.db_pool.map(|pool| DbCapability {
+            pool,
+            schema: services.db_schema,
+            timeouts: services.db_timeouts,
+            accounting: accounting.clone(),
+        });
+        let blobstore = services.blobstore.map(|runtime| BlobstoreCapability {
+            runtime,
+            prefix: services.blob_prefix,
+            limits: services.blob_limits,
+        });
+        let llm = services.llm.map(|runtime| LlmCapability {
+            runtime,
+            accounting: accounting.clone(),
+        });
         Ok(Self {
             wasi: builder.build(),
             http: WasiHttpCtx::new(),
@@ -283,18 +436,50 @@ impl ModuleState {
                 module_namespace,
                 http_pool,
                 outbound_parent: outbound_parent.clone(),
+                max_outbound_body_bytes: services.max_outbound_body_bytes,
             },
-            db_pool: services.db_pool,
-            db_schema: services.db_schema,
-            db_timeouts: services.db_timeouts,
-            blobstore: services.blobstore,
-            blob_prefix: services.blob_prefix,
-            llm: services.llm,
-            _fs_root: fs_root,
-            active_span: services.active_span,
-            span_stack: Vec::new(),
-            outbound_parent,
+            capabilities: ModuleCapabilities {
+                db,
+                blobstore,
+                llm,
+                tracing: TracingCapability {
+                    active_span: services.active_span,
+                    span_stack: Vec::new(),
+                    outbound_parent,
+                    accounting,
+                },
+                _fs: FsCapability { _root: fs_root },
+            },
         })
+    }
+
+    pub(crate) fn db(&mut self) -> Result<&mut DbCapability, DbError> {
+        self.capabilities
+            .db
+            .as_mut()
+            .ok_or_else(|| DbError::Connection("no database configured for this module".into()))
+    }
+
+    pub(crate) fn blobstore(&mut self) -> Result<&mut BlobstoreCapability, BlobError> {
+        self.capabilities
+            .blobstore
+            .as_mut()
+            .ok_or_else(|| BlobError::Io("no blobstore configured for this module".into()))
+    }
+
+    pub(crate) fn llm(&mut self) -> Result<&mut LlmCapability, LlmError> {
+        self.capabilities
+            .llm
+            .as_mut()
+            .ok_or_else(|| LlmError::InvalidRequest("no LLM configured for this module".into()))
+    }
+
+    pub(crate) fn tracing_context(&mut self) -> &mut TracingCapability {
+        &mut self.capabilities.tracing
+    }
+
+    pub(crate) fn tracing_mut(&mut self) -> (&mut TracingCapability, &mut ResourceTable) {
+        (&mut self.capabilities.tracing, &mut self.table)
     }
 
     pub fn table(&mut self) -> &mut ResourceTable {

@@ -78,6 +78,23 @@ Hard rules and common mistakes when building wruntime guest modules. Read this b
 | Using `prost = "0.13"` with `prost-build = "0.14"` (version mismatch) | Build errors | Keep `prost` and `prost-build` on the same minor version |
 | Missing `[workspace]` at top of guest Cargo.toml | Build picks up parent workspace settings, may fail or produce wrong output | Add a bare `[workspace]` line before `[package]` in every guest module's Cargo.toml |
 | Calling `store::*` without `blobstore = true` in engine.toml | Runtime panic when module tries to access blobstore | Set `blobstore = true` in the `[[module]]` block AND add a `[blobstore]` section with endpoint/credentials to the engine config |
+| Calling `complete_stream()` with tools set | `LlmError::InvalidRequest` before any upstream call | Streaming does not support tool-use; use `complete()` for tool calls |
+| Uploading/downloading an object larger than `max_object_size`, or listing more than `max_list_objects` | `BlobError::TooLarge` | Stay within the engine `[blobstore]` limits (default 16 MiB / 1000 objects) or split the work |
+| Sending an outbound HTTP request body larger than `max_outbound_body_bytes` | Outbound call fails with an `HttpRequestBodySize` error | Keep outbound bodies under the engine limit (default 16 MiB) |
+
+## Runtime limits and enforced behavior
+
+These host-enforced limits and behaviors were introduced by the runtime cleanups. Defaults are configurable on the engine (see [configuration.md](../configuration.md#wr-engine)).
+
+1. **Per-request resource caps.** Concurrently live guest-created host resources are capped per request: tracing spans (default 1024), DB transactions (64), DB row cursors (256), LLM completion streams (32). Exceeding the **span** cap **traps** the guest instance (the request fails); exceeding the DB caps returns `db-error::connection`; exceeding the LLM cap returns `llm-error::api`. Drop resources you no longer need — a slot frees on drop.
+
+2. **Strict DB input conversion.** Parameter values are no longer silently coerced. Malformed JSON (`Jsonb`/`JsonbArray`), a non-numeric `Numeric` string, an out-of-range `Timestamp`/`Timestamptz`/`Time`, or invalid array elements are rejected with `DbError::Query(...)`. (Reads remain lenient: an unmapped result column type comes back as `PgValue::Null` with a host-side warning.)
+
+3. **Blobstore size/count limits.** `put_object`/`get_object` are bounded by `max_object_size` (default 16 MiB) and `list_objects` by `max_list_objects` (default 1000); exceeding either returns `BlobError::TooLarge`. Oversized downloads are aborted mid-stream, never fully buffered.
+
+4. **LLM streaming.** `complete_stream` yields `StreamEvent` values in a fixed order (text deltas → one usage → one stop → `None`) and **pre-rejects tool-enabled requests** with `LlmError::InvalidRequest`. Thinking/signature/citation deltas are dropped.
+
+5. **Outbound HTTP body limit.** Outbound request bodies are bounded by `max_outbound_body_bytes` (default 16 MiB); an oversized body aborts the call with an `HttpRequestBodySize` error.
 
 ## Version pinning
 

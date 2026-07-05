@@ -24,6 +24,15 @@ pub struct EngineConfig {
     /// `[pool]` section (or omitting it entirely) enables pooling with defaults.
     #[serde(default)]
     pub pool: PoolConfig,
+    /// Ceilings on guest-created host resources (spans, DB tx/cursors, LLM streams).
+    /// Omitting the `[limits]` section uses the defaults.
+    #[serde(default)]
+    pub limits: ResourceLimits,
+    /// Maximum outbound HTTP request body size in bytes that a guest may send.
+    /// Bodies are buffered up to this bound and rejected beyond it with
+    /// `HttpRequestBodySize`. Defaults to 16 MiB.
+    #[serde(default = "default_max_outbound_body_bytes")]
+    pub max_outbound_body_bytes: usize,
 }
 
 #[derive(Deserialize, Clone)]
@@ -46,6 +55,34 @@ impl Default for PoolConfig {
             total_component_instances: 1000,
             max_memory_size: 10 * 1024 * 1024, // 10 MiB
             epoch_tick_interval_ms: 10,
+        }
+    }
+}
+
+/// Per-store ceilings on guest-created host resources. Enforced live (one
+/// running count per kind), so a guest cannot exhaust the wasmtime
+/// `ResourceTable` and crash the engine. Global for now; per-module override
+/// can be layered on later without breaking the default.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct ResourceLimits {
+    /// Max concurrent guest-created tracing spans per request. Defaults to 1024.
+    pub max_spans: u32,
+    /// Max concurrent open DB transactions per request. Defaults to 64.
+    pub max_db_transactions: u32,
+    /// Max concurrent open DB row cursors per request. Defaults to 256.
+    pub max_db_cursors: u32,
+    /// Max concurrent open LLM completion streams per request. Defaults to 32.
+    pub max_llm_streams: u32,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_spans: 1024,
+            max_db_transactions: 64,
+            max_db_cursors: 256,
+            max_llm_streams: 32,
         }
     }
 }
@@ -91,10 +128,49 @@ pub struct BlobstoreConfig {
     /// S3 region. Defaults to "us-east-1".
     #[serde(default = "default_bs_region")]
     pub region: String,
+    /// Max object size in bytes, enforced on both upload and download.
+    /// Defaults to 16 MiB.
+    #[serde(default = "default_max_object_size")]
+    pub max_object_size: usize,
+    /// Max objects returned by a single list-objects call. Defaults to 1000.
+    #[serde(default = "default_max_list_objects")]
+    pub max_list_objects: usize,
 }
 
 fn default_bs_region() -> String {
     "us-east-1".into()
+}
+
+fn default_max_object_size() -> usize {
+    16 * 1024 * 1024
+}
+
+fn default_max_list_objects() -> usize {
+    1000
+}
+
+fn default_max_outbound_body_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+/// Host-enforced blobstore size/count ceilings. Global (the blobstore client is
+/// shared across modules). Carried to enforcement via `ModuleServices` →
+/// `BlobstoreCapability`, mirroring how `blob_prefix` flows.
+#[derive(Clone, Copy, Debug)]
+pub struct BlobstoreLimits {
+    /// Upload + download byte ceiling. Checked before `put` and during streaming `get`.
+    pub max_object_size: usize,
+    /// Per-call listing cap; `list_objects` returns `too-large` beyond this.
+    pub max_list_objects: usize,
+}
+
+impl Default for BlobstoreLimits {
+    fn default() -> Self {
+        Self {
+            max_object_size: default_max_object_size(),
+            max_list_objects: default_max_list_objects(),
+        }
+    }
 }
 
 #[derive(Deserialize, Clone)]

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use anyhow::Context as _;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -7,7 +5,7 @@ use tokio::sync::mpsc;
 use wasmtime::component::Resource;
 
 use crate::config::LlmConfig;
-use crate::state::ModuleState;
+use crate::state::{CounterGuard, ModuleState, ResourceKind};
 
 // ── LlmRuntime — host-side HTTP client for the Claude Messages API ──────────
 
@@ -53,12 +51,12 @@ impl LlmRuntime {
             .map_err(|e| LlmErrorKind::Api(format!("failed to parse response: {e}")))
     }
 
-    /// Streaming Messages API call. Returns an mpsc receiver that yields text
-    /// deltas and a final usage event.
+    /// Streaming Messages API call. Returns an mpsc receiver yielding host
+    /// stream events per the completion-stream state machine.
     pub async fn complete_stream(
         &self,
         mut req: ApiRequest,
-    ) -> Result<mpsc::Receiver<StreamEvent>, LlmErrorKind> {
+    ) -> Result<mpsc::Receiver<HostStreamEvent>, LlmErrorKind> {
         req.stream = Some(true);
         let url = format!("{}/v1/messages", self.base_url);
         let resp = self
@@ -82,32 +80,71 @@ impl LlmRuntime {
             use futures::StreamExt;
             let mut stream = resp.bytes_stream();
             let mut parser = SseParser::new();
-            while let Some(chunk) = stream.next().await {
+            let mut input_tokens: u32 = 0;
+            let mut terminal_sent = false;
+            'outer: while let Some(chunk) = stream.next().await {
                 let chunk = match chunk {
                     Ok(c) => c,
-                    Err(_) => break,
+                    Err(e) => {
+                        let _ = tx
+                            .send(HostStreamEvent::Error(LlmErrorKind::Api(format!(
+                                "stream connection error: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
                 };
                 for event in parser.feed(&String::from_utf8_lossy(&chunk)) {
                     match event {
-                        SseEvent::Delta(text) => {
-                            if tx.send(StreamEvent::Delta(text)).await.is_err() {
+                        SseEvent::MessageStart { input_tokens: it } => {
+                            input_tokens = it;
+                        }
+                        SseEvent::TextDelta(text) => {
+                            if tx.send(HostStreamEvent::TextDelta(text)).await.is_err() {
                                 return;
                             }
                         }
-                        SseEvent::Usage {
-                            input_tokens,
+                        SseEvent::ToolUseDelta => {
+                            let _ = tx
+                                .send(HostStreamEvent::Error(LlmErrorKind::InvalidRequest(
+                                    "tool-use streaming is not supported; use complete()".into(),
+                                )))
+                                .await;
+                            return;
+                        }
+                        SseEvent::MessageDelta {
                             output_tokens,
+                            stop_reason,
                         } => {
                             let _ = tx
-                                .send(StreamEvent::Usage {
+                                .send(HostStreamEvent::Usage {
                                     input_tokens,
                                     output_tokens,
                                 })
                                 .await;
+                            let _ = tx
+                                .send(HostStreamEvent::Stop(
+                                    stop_reason.unwrap_or_else(|| "end_turn".into()),
+                                ))
+                                .await;
+                            terminal_sent = true;
                         }
-                        SseEvent::Stop => return,
+                        SseEvent::MessageStop => break 'outer,
+                        SseEvent::Error(msg) => {
+                            let _ = tx
+                                .send(HostStreamEvent::Error(LlmErrorKind::Api(msg)))
+                                .await;
+                            return;
+                        }
                     }
                 }
+            }
+            if !terminal_sent {
+                let _ = tx
+                    .send(HostStreamEvent::Error(LlmErrorKind::Api(
+                        "stream ended before completion".into(),
+                    )))
+                    .await;
             }
         });
 
@@ -123,12 +160,17 @@ impl LlmRuntime {
 // ── SSE stream parser ───────────────────────────────────────────────────────
 
 enum SseEvent {
-    Delta(String),
-    Usage {
+    MessageStart {
         input_tokens: u32,
-        output_tokens: u32,
     },
-    Stop,
+    TextDelta(String),
+    ToolUseDelta,
+    MessageDelta {
+        output_tokens: u32,
+        stop_reason: Option<String>,
+    },
+    MessageStop,
+    Error(String),
 }
 
 struct SseParser {
@@ -142,11 +184,17 @@ impl SseParser {
 
     fn feed(&mut self, chunk: &str) -> Vec<SseEvent> {
         self.buf.push_str(chunk);
+        // Normalize CRLF -> LF over the whole retained buffer so frame splitting
+        // on "\n\n" is line-ending agnostic (handles \r\n\r\n and a \r split
+        // across chunk boundaries).
+        if self.buf.contains('\r') {
+            self.buf = self.buf.replace("\r\n", "\n");
+        }
         let mut events = Vec::new();
         while let Some(pos) = self.buf.find("\n\n") {
-            let event_block = self.buf[..pos].to_string();
+            let block = self.buf[..pos].to_string();
             self.buf = self.buf[pos + 2..].to_string();
-            if let Some(event) = Self::parse_block(&event_block) {
+            if let Some(event) = Self::parse_block(&block) {
                 events.push(event);
             }
         }
@@ -154,38 +202,50 @@ impl SseParser {
     }
 
     fn parse_block(block: &str) -> Option<SseEvent> {
-        let mut event_type = "";
-        let mut data = String::new();
+        let mut event_name = String::new();
+        let mut data_lines: Vec<&str> = Vec::new();
         for line in block.lines() {
-            if let Some(t) = line.strip_prefix("event: ") {
-                event_type = match t.trim() {
-                    "content_block_delta" => "content_block_delta",
-                    "message_delta" => "message_delta",
-                    "message_stop" => "message_stop",
-                    _ => "",
-                };
-            } else if let Some(d) = line.strip_prefix("data: ") {
-                data = d.to_string();
+            if let Some(v) = line.strip_prefix("event:") {
+                event_name = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("data:") {
+                // SSE strips exactly one leading space after the field name.
+                data_lines.push(v.strip_prefix(' ').unwrap_or(v));
             }
         }
-        match event_type {
+        let data = data_lines.join("\n");
+        match event_name.as_str() {
+            "message_start" => {
+                let m: MessageStartEvent = serde_json::from_str(&data).ok()?;
+                Some(SseEvent::MessageStart {
+                    input_tokens: m.message.usage.input_tokens,
+                })
+            }
             "content_block_delta" => {
-                let delta: ContentBlockDelta = serde_json::from_str(&data).ok()?;
-                if delta.delta.delta_type == "text_delta" {
-                    Some(SseEvent::Delta(delta.delta.text))
-                } else {
-                    None
+                let d: ContentBlockDelta = serde_json::from_str(&data).ok()?;
+                match d.delta.delta_type.as_str() {
+                    "text_delta" => Some(SseEvent::TextDelta(d.delta.text)),
+                    "input_json_delta" => Some(SseEvent::ToolUseDelta),
+                    // thinking_delta / signature_delta / citations_delta: no WIT
+                    // representation — dropped.
+                    _ => None,
                 }
             }
             "message_delta" => {
-                let msg: MessageDelta = serde_json::from_str(&data).ok()?;
-                let usage = msg.usage?;
-                Some(SseEvent::Usage {
-                    input_tokens: usage.input_tokens.unwrap_or(0),
-                    output_tokens: usage.output_tokens,
+                let m: MessageDelta = serde_json::from_str(&data).ok()?;
+                Some(SseEvent::MessageDelta {
+                    output_tokens: m.usage.map(|u| u.output_tokens).unwrap_or(0),
+                    stop_reason: m.delta.and_then(|d| d.stop_reason),
                 })
             }
-            "message_stop" => Some(SseEvent::Stop),
+            "message_stop" => Some(SseEvent::MessageStop),
+            "error" => {
+                let e: StreamErrorEvent = serde_json::from_str(&data).unwrap_or_default();
+                Some(SseEvent::Error(format!(
+                    "{}: {}",
+                    e.error.error_type, e.error.message
+                )))
+            }
+            // content_block_start, content_block_stop, ping, unknown → ignored.
             _ => None,
         }
     }
@@ -266,23 +326,58 @@ struct DeltaPayload {
 }
 
 #[derive(Deserialize)]
+struct MessageStartEvent {
+    message: MessageStartBody,
+}
+
+#[derive(Deserialize)]
+struct MessageStartBody {
+    #[serde(default)]
+    usage: ApiUsage,
+}
+
+#[derive(Deserialize)]
 struct MessageDelta {
+    #[serde(default)]
+    delta: Option<MessageDeltaDelta>,
+    #[serde(default)]
     usage: Option<MessageDeltaUsage>,
 }
 
 #[derive(Deserialize)]
+struct MessageDeltaDelta {
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct MessageDeltaUsage {
-    input_tokens: Option<u32>,
     output_tokens: u32,
 }
 
-/// Events produced by the streaming API.
-pub enum StreamEvent {
-    Delta(String),
+#[derive(Deserialize, Default)]
+struct StreamErrorEvent {
+    #[serde(default)]
+    error: StreamErrorBody,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamErrorBody {
+    #[serde(rename = "type", default)]
+    error_type: String,
+    #[serde(default)]
+    message: String,
+}
+
+/// Host-internal events sent from the SSE producer task to `next()`.
+pub enum HostStreamEvent {
+    TextDelta(String),
     Usage {
         input_tokens: u32,
         output_tokens: u32,
     },
+    Stop(String),
+    Error(LlmErrorKind),
 }
 
 /// Internal error kind used by `LlmRuntime`.
@@ -314,8 +409,10 @@ async fn error_from_response(resp: reqwest::Response) -> LlmErrorKind {
 
 /// Resource state for a streaming completion.
 pub struct CompletionStreamState {
-    rx: mpsc::Receiver<StreamEvent>,
+    rx: mpsc::Receiver<HostStreamEvent>,
     usage: Option<(u32, u32)>,
+    finished: bool,
+    _count: CounterGuard,
 }
 
 wasmtime::component::bindgen!({
@@ -327,17 +424,18 @@ wasmtime::component::bindgen!({
     },
 });
 
+pub use wruntime::llm::inference::LlmError;
 use wruntime::llm::inference::{
-    Completion, CompletionRequest, CompletionResponse, Host, HostCompletionStream, LlmError,
-    MessageRole, TokenUsage, ToolUse,
+    Completion, CompletionRequest, CompletionResponse, Host, HostCompletionStream, MessageRole,
+    StreamEvent, TokenUsage, ToolUse,
 };
 
 // ── Host implementation ─────────────────────────────────────────────────────
 
 impl Host for ModuleState {
     async fn complete(&mut self, req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let runtime = require_llm(&self.llm)?;
-        let api_req = to_api_request(runtime, &req);
+        let runtime = self.llm()?.runtime.clone();
+        let api_req = to_api_request(&runtime, &req);
         match runtime.complete(api_req).await {
             Ok(resp) => Ok(from_api_response(resp)),
             Err(e) => Err(e.into()),
@@ -348,13 +446,28 @@ impl Host for ModuleState {
         &mut self,
         req: CompletionRequest,
     ) -> Result<Resource<CompletionStreamState>, LlmError> {
-        let runtime = require_llm(&self.llm)?;
-        let api_req = to_api_request(runtime, &req);
+        if !req.tools.is_empty() {
+            return Err(LlmError::InvalidRequest(
+                "tool use is not supported in streaming; use complete()".into(),
+            ));
+        }
+        let cap = self.llm()?;
+        let guard = cap
+            .accounting
+            .try_track(ResourceKind::LlmStream)
+            .ok_or_else(|| LlmError::Api("llm stream cap exceeded".into()))?;
+        let runtime = cap.runtime.clone();
+        let api_req = to_api_request(&runtime, &req);
         match runtime.complete_stream(api_req).await {
             Ok(rx) => {
                 let handle = self
                     .table()
-                    .push(CompletionStreamState { rx, usage: None })
+                    .push(CompletionStreamState {
+                        rx,
+                        usage: None,
+                        finished: false,
+                        _count: guard,
+                    })
                     .map_err(|e| LlmError::Api(format!("resource table full: {e}")))?;
                 Ok(handle)
             }
@@ -367,21 +480,35 @@ impl HostCompletionStream for ModuleState {
     async fn next(
         &mut self,
         self_: Resource<CompletionStreamState>,
-    ) -> Result<Option<String>, LlmError> {
+    ) -> Result<Option<StreamEvent>, LlmError> {
         let state = self
             .table()
             .get_mut(&self_)
             .map_err(|e| LlmError::Api(format!("invalid stream handle: {e}")))?;
+        if state.finished {
+            return Ok(None);
+        }
         match state.rx.recv().await {
-            Some(StreamEvent::Delta(text)) => Ok(Some(text)),
-            Some(StreamEvent::Usage {
+            Some(HostStreamEvent::TextDelta(text)) => Ok(Some(StreamEvent::TextDelta(text))),
+            Some(HostStreamEvent::Usage {
                 input_tokens,
                 output_tokens,
             }) => {
                 state.usage = Some((input_tokens, output_tokens));
+                Ok(Some(StreamEvent::Usage(TokenUsage {
+                    input_tokens,
+                    output_tokens,
+                })))
+            }
+            Some(HostStreamEvent::Stop(reason)) => Ok(Some(StreamEvent::Stop(reason))),
+            Some(HostStreamEvent::Error(kind)) => {
+                state.finished = true;
+                Err(kind.into())
+            }
+            None => {
+                state.finished = true;
                 Ok(None)
             }
-            None => Ok(None),
         }
     }
 
@@ -403,12 +530,6 @@ impl HostCompletionStream for ModuleState {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-fn require_llm(client: &Option<Arc<LlmRuntime>>) -> Result<&LlmRuntime, LlmError> {
-    client
-        .as_deref()
-        .ok_or_else(|| LlmError::InvalidRequest("no LLM configured for this module".into()))
-}
 
 fn to_api_request(runtime: &LlmRuntime, req: &CompletionRequest) -> ApiRequest {
     ApiRequest {
