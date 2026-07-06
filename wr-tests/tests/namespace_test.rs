@@ -1,6 +1,11 @@
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::{
+    db::{db_state_for_module, DbHost, PgValue},
+    manager::{manager_trio, register_test_module, synced_routing_table},
+    proxy::{http_client, proxy_get, start_proxy, TEST_SELF_PEER},
+    stubs::spawn_identified_stub,
+    wasm::invalid_protobuf,
+};
 
 use anyhow::Result;
 use http::{Request, StatusCode};

@@ -1,6 +1,18 @@
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::{
+    db::manager_pool,
+    manager::{
+        get_rule_health, manager_client, register_test_module, start_manager_cluster,
+        start_manager_cluster_fast_death,
+    },
+    proxy::TEST_SELF_PEER,
+    wait::{
+        wait_for_manager_absent, wait_for_manager_count, wait_for_rule_health, DEFAULT_WAIT_TIMEOUT,
+    },
+    wasm::minimal_file_descriptor_set,
+};
+
+use std::time::Duration;
 
 use wr_common::wruntime::{
     EngineRegistration, HeartbeatRequest, ListManagersRequest, ModuleDescriptor,
@@ -41,8 +53,6 @@ async fn test_heartbeat_visible_across_managers() {
     .unwrap();
 
     // No gossip wait needed — DB writes are immediately visible.
-    // Wait for a monitor tick (200ms interval + padding).
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Manager-2 can see the healthy rule via the shared DB.
     let mut c2 = manager_client(&managers[1].addr).await.unwrap();
@@ -79,9 +89,6 @@ async fn test_health_preserved_across_managers() {
     })
     .await
     .unwrap();
-
-    // Wait for monitor cycle
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Check via manager-2 that the rule is still healthy
     let mut c2 = manager_client(&managers[1].addr).await.unwrap();
@@ -120,16 +127,16 @@ async fn test_health_convergence_on_missed_heartbeat() {
     .unwrap();
 
     // Verify healthy via manager-2
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let mut c2 = manager_client(&managers[1].addr).await.unwrap();
-    let (healthy, _) = get_rule_health(&mut c2, "svc3").await.unwrap();
+    let (healthy, _) = wait_for_rule_health(&mut c2, "svc3", true, DEFAULT_WAIT_TIMEOUT)
+        .await
+        .unwrap();
     assert!(healthy, "should be healthy after heartbeat");
 
     // Stop heartbeating — wait for timeout + monitor cycle
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-    // Either manager should have marked the rule unhealthy
-    let (healthy, _) = get_rule_health(&mut c2, "svc3").await.unwrap();
+    let (healthy, _) = wait_for_rule_health(&mut c2, "svc3", false, Duration::from_secs(5))
+        .await
+        .unwrap();
     assert!(!healthy, "should be unhealthy after missed heartbeat");
 }
 
@@ -157,8 +164,6 @@ async fn test_single_manager_cluster() {
     })
     .await
     .unwrap();
-
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let (healthy, _) = get_rule_health(&mut c, "solo").await.unwrap();
     assert!(healthy, "single-manager cluster should work normally");
@@ -226,7 +231,8 @@ async fn test_module_health_convergence_across_managers() {
     .await
     .unwrap();
 
-    // Heartbeat only mm-a to manager-1 for longer than the 1s timeout.
+    // Intentional elapsed-time interval: heartbeat only mm-a for longer than the 1s timeout.
+    let mut interval = tokio::time::interval(Duration::from_millis(200));
     for _ in 0..8 {
         c1.heartbeat(HeartbeatRequest {
             engine_id: "mm-e1".into(),
@@ -239,12 +245,14 @@ async fn test_module_health_convergence_across_managers() {
         })
         .await
         .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        interval.tick().await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // Manager-2 sees the shared outcome.
     let mut c2 = manager_client(&managers[1].addr).await.unwrap();
+    wait_for_rule_health(&mut c2, "mm-b", false, DEFAULT_WAIT_TIMEOUT)
+        .await
+        .unwrap();
     let (a_healthy, _) = get_rule_health(&mut c2, "mm-a").await.unwrap();
     let (b_healthy, _) = get_rule_health(&mut c2, "mm-b").await.unwrap();
     assert!(a_healthy, "reported module healthy via shared Postgres");
@@ -281,47 +289,15 @@ async fn test_dead_peer_excluded_from_list_managers() {
     let mut c = manager_client(&survivor.addr).await.unwrap();
 
     // Wait for gossip to converge: survivor reports both managers.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let n = c
-            .list_managers(ListManagersRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .managers
-            .len();
-        if n == 2 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "gossip did not converge"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
+    wait_for_manager_count(&mut c, 2, Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Kill the victim's gossip (its DB row stays fresh, well inside 60s).
     victim.cluster.initiate_shutdown().unwrap();
 
     // Survivor must drop the victim via the chitchat-dead path, faster than 60s.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        let ids: Vec<String> = c
-            .list_managers(ListManagersRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .managers
-            .into_iter()
-            .map(|m| m.manager_id)
-            .collect();
-        if !ids.contains(&victim.manager_id) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "victim not excluded after chitchat death"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
+    wait_for_manager_absent(&mut c, &victim.manager_id, Duration::from_secs(20))
+        .await
+        .unwrap();
 }

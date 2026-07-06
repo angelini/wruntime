@@ -1,6 +1,14 @@
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::{
+    db::manager_pool,
+    manager::{
+        backdate_engine_heartbeat, get_routing_table_version, manager_client, manager_trio,
+        manager_trio_with_monitor, register_test_module,
+    },
+    proxy::TEST_SELF_PEER,
+    stubs::spawn_stub_engine,
+    wasm::minimal_file_descriptor_set,
+};
 
 use anyhow::Result;
 
@@ -25,18 +33,16 @@ fn make_rule(rule_id: &str, dest_module: &str, engine_id: &str) -> RoutingRule {
     }
 }
 
-// ── Lock contention: upsert retries and succeeds ────────────────────────────
-
-/// Hold the lock briefly — upsert's built-in retry succeeds after the lock is released.
-#[tokio::test]
-async fn test_upsert_retries_on_contention() -> Result<()> {
-    let pool = manager_pool().await;
-
-    // Hold the lock for 50ms, then release. The upsert's retry loop should
-    // succeed on a subsequent attempt.
-    let pool2 = pool.clone();
-    let blocker = tokio::spawn(async move {
-        let mut client = pool2.get().await.unwrap();
+async fn hold_manager_lock(
+    pool: deadpool_postgres::Pool,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let mut client = pool.get().await.unwrap();
         let txn = client.transaction().await.unwrap();
         txn.query_one(
             "SELECT version FROM wr_manager_lock WHERE id = 1 FOR UPDATE",
@@ -44,16 +50,32 @@ async fn test_upsert_retries_on_contention() -> Result<()> {
         )
         .await
         .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = locked_tx.send(());
+        let _ = release_rx.await;
         txn.commit().await.unwrap();
     });
+    locked_rx.await.expect("blocker acquired wr_manager_lock");
+    (release_tx, handle)
+}
 
-    // Give the blocker time to acquire the lock.
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+// ── Lock contention: upsert retries and succeeds ────────────────────────────
+
+/// Hold the lock briefly — upsert's built-in retry succeeds after the lock is released.
+#[tokio::test]
+async fn test_upsert_retries_on_contention() -> Result<()> {
+    let pool = manager_pool().await;
+
+    let (release_lock, blocker) = hold_manager_lock(pool.clone()).await;
 
     // Upsert should succeed after internal retries.
-    wr_manager::db::upsert_routing_rule(&pool, &make_rule("retry-r1", "retry-svc", "e1")).await?;
-
+    let upsert_pool = pool.clone();
+    let upsert = tokio::spawn(async move {
+        wr_manager::db::upsert_routing_rule(&upsert_pool, &make_rule("retry-r1", "retry-svc", "e1"))
+            .await
+    });
+    tokio::task::yield_now().await;
+    release_lock.send(()).unwrap();
+    upsert.await??;
     blocker.await?;
 
     // Verify the rule was actually written.
@@ -78,27 +100,17 @@ async fn test_delete_retries_on_contention() -> Result<()> {
     // Insert a rule first.
     wr_manager::db::upsert_routing_rule(&pool, &make_rule("del-retry-r1", "del-svc", "e1")).await?;
 
-    // Hold the lock briefly.
-    let pool2 = pool.clone();
-    let blocker = tokio::spawn(async move {
-        let mut client = pool2.get().await.unwrap();
-        let txn = client.transaction().await.unwrap();
-        txn.query_one(
-            "SELECT version FROM wr_manager_lock WHERE id = 1 FOR UPDATE",
-            &[],
-        )
-        .await
-        .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        txn.commit().await.unwrap();
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let (release_lock, blocker) = hold_manager_lock(pool.clone()).await;
 
     // Delete should succeed after retries.
-    let deleted = wr_manager::db::delete_routing_rule(&pool, "del-retry-r1").await?;
+    let delete_pool = pool.clone();
+    let deleted = tokio::spawn(async move {
+        wr_manager::db::delete_routing_rule(&delete_pool, "del-retry-r1").await
+    });
+    tokio::task::yield_now().await;
+    release_lock.send(()).unwrap();
+    let deleted = deleted.await??;
     assert!(deleted, "rule should have been deleted");
-
     blocker.await?;
 
     Ok(())
@@ -133,31 +145,19 @@ async fn test_deregister_waits_for_lock() -> Result<()> {
     c.upsert_routing_rule(make_rule("dereg-r1", "dereg-svc", "dereg-e1"))
         .await?;
 
-    // Hold the lock briefly, then release.
-    let pool2 = pool.clone();
-    let blocker = tokio::spawn(async move {
-        let mut client = pool2.get().await.unwrap();
-        let txn = client.transaction().await.unwrap();
-        txn.query_one(
-            "SELECT version FROM wr_manager_lock WHERE id = 1 FOR UPDATE",
-            &[],
-        )
-        .await
-        .unwrap();
-        // Hold lock for 100ms then release.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        txn.commit().await.unwrap();
-    });
-
-    // Give the blocker a moment to acquire the lock.
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (release_lock, blocker) = hold_manager_lock(pool.clone()).await;
 
     // Deregister should block until the lock is released, then succeed.
-    c.deregister_engine(DeregisterEngineRequest {
-        engine_id: "dereg-e1".into(),
-    })
-    .await?;
-
+    let deregister = tokio::spawn(async move {
+        c.deregister_engine(DeregisterEngineRequest {
+            engine_id: "dereg-e1".into(),
+        })
+        .await?;
+        anyhow::Ok(c)
+    });
+    tokio::task::yield_now().await;
+    release_lock.send(()).unwrap();
+    let mut c = deregister.await??;
     blocker.await?;
 
     // Engine should be gone.

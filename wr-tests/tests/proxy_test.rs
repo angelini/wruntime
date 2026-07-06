@@ -1,6 +1,11 @@
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::{
+    db::manager_pool,
+    manager::{manager_trio, register_test_module, start_manager_cluster, synced_routing_table},
+    proxy::{proxy_get, start_proxy},
+    stubs::spawn_stub_engine,
+    wasm::minimal_file_descriptor_set,
+};
 
 use std::sync::Arc;
 

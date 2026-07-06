@@ -6,9 +6,13 @@
 ///
 /// Run:  just test-one bench_hot_path
 /// Or:   cargo test -p wr-tests --test bench_test --release -- --nocapture
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::{
+    manager::{manager_trio, register_test_module, sync_table, synced_routing_table},
+    proxy::{http_pool, proxy_get, start_proxy},
+    stubs::spawn_stub_engine,
+    wasm::{spawn_wasm_stub_engine, wasm_module_pre},
+};
 
 use std::time::{Duration, Instant};
 

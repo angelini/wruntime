@@ -1,6 +1,8 @@
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::{
+    db::{db_state, DbError, ModuleState, PgValue},
+    proxy::http_pool,
+};
 
 // ── DB integration tests ──────────────────────────────────────────────────────
 //

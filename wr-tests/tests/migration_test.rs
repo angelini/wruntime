@@ -1,6 +1,5 @@
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::db::{manager_pool_in_schema, require_db_url};
 
 use anyhow::{Context, Result};
 

@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 use wasmtime::{Config, Engine};
 
 /// Raise the file descriptor soft limit to avoid `ProcessFdQuotaExceeded` during
@@ -35,10 +36,22 @@ pub fn raise_fd_limit() {
 }
 
 /// Minimal module config for build operations
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct BuildModule {
     pub name: String,
     pub wasm_path: String,
-    pub schema_path: Option<String>,
+    #[serde(default)]
+    pub schema_path: String,
+    #[serde(default)]
+    pub proto_path: Option<String>,
+    #[serde(default)]
+    pub cargo_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BuildManifest {
+    #[serde(rename = "module", default)]
+    pub modules: Vec<BuildModule>,
 }
 
 /// Derive .proto path from .binpb schema_path
@@ -66,35 +79,68 @@ pub fn derive_cargo_dir(wasm_path: &str) -> Result<PathBuf> {
     );
 }
 
+pub fn load_manifest(path: &str) -> Result<Vec<BuildModule>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read build manifest: {path}"))?;
+    let manifest: BuildManifest = toml::from_str(&content)
+        .with_context(|| format!("failed to parse build manifest: {path}"))?;
+    Ok(manifest.modules)
+}
+
+pub fn module_proto_path(module: &BuildModule) -> Option<PathBuf> {
+    if module.schema_path.is_empty() {
+        return None;
+    }
+    Some(
+        module
+            .proto_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(derive_proto_path(&module.schema_path))),
+    )
+}
+
+pub fn module_cargo_dir(module: &BuildModule) -> Result<PathBuf> {
+    module
+        .cargo_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(|| derive_cargo_dir(&module.wasm_path))
+}
+
 /// Compile .proto → .binpb for each module that has a schema_path
 pub fn compile_schemas(modules: &[BuildModule]) -> Result<()> {
     for module in modules {
-        let Some(schema_path) = module.schema_path.as_deref().filter(|s| !s.is_empty()) else {
+        if module.schema_path.is_empty() {
             continue;
-        };
-        let proto_path = derive_proto_path(schema_path);
-        if !Path::new(&proto_path).exists() {
+        }
+        let proto_path = module_proto_path(module).expect("schema_path is non-empty");
+        if !proto_path.exists() {
             bail!(
-                "Proto file not found for module '{}': {} (derived from schema_path '{}')",
+                "Proto file not found for module '{}': {} (metadata schema_path '{}')",
                 module.name,
-                proto_path,
-                schema_path,
+                proto_path.display(),
+                module.schema_path,
             );
         }
-        let proto_dir = Path::new(&proto_path)
+        let proto_dir = proto_path
             .parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        print!("[schema]  {schema_path} ... ");
+        let descriptor_arg = format!("--descriptor_set_out={}", module.schema_path);
+        let proto_path_arg = format!("--proto_path={proto_dir}");
+        let proto_file_arg = proto_path.to_string_lossy().to_string();
+        print!("[schema]  {} ... ", module.schema_path);
         let status = Command::new("protoc")
             .args([
-                &format!("--descriptor_set_out={schema_path}"),
+                descriptor_arg.as_str(),
                 "--include_imports",
-                &format!("--proto_path={}", proto_dir),
-                &proto_path,
+                proto_path_arg.as_str(),
+                proto_file_arg.as_str(),
             ])
             .status()
-            .context("failed to run protoc")?;
+            .context("failed to run protoc; ensure protoc is installed")?;
         if !status.success() {
             bail!("protoc failed for module '{}'", module.name);
         }
@@ -106,7 +152,15 @@ pub fn compile_schemas(modules: &[BuildModule]) -> Result<()> {
 /// Build WASM modules via native Cargo `wasm32-wasip2`.
 pub fn build_wasm_modules(modules: &[BuildModule], release: bool) -> Result<()> {
     for module in modules {
-        let cargo_dir = derive_cargo_dir(&module.wasm_path)?;
+        let cargo_dir = module_cargo_dir(module)?;
+        let cargo_toml = cargo_dir.join("Cargo.toml");
+        if !cargo_toml.exists() {
+            bail!(
+                "Cargo.toml not found for module '{}': {}",
+                module.name,
+                cargo_toml.display()
+            );
+        }
         print!("[build]   {} ... ", cargo_dir.display());
         let mut args = vec!["build", "--target", "wasm32-wasip2"];
         if release {
@@ -124,11 +178,19 @@ pub fn build_wasm_modules(modules: &[BuildModule], release: bool) -> Result<()> 
             let stderr = String::from_utf8_lossy(&output.stderr);
             eprintln!("{stderr}");
             bail!(
-                "cargo build --target wasm32-wasip2 failed for module '{}'",
+                "cargo build --target wasm32-wasip2 failed for module '{}'. Ensure the wasm32-wasip2 target is installed with `rustup target add wasm32-wasip2`.",
                 module.name
             );
         }
         println!("OK");
+
+        if !Path::new(&module.wasm_path).exists() {
+            bail!(
+                "WASM output not found for module '{}' after cargo build: {}",
+                module.name,
+                module.wasm_path
+            );
+        }
 
         // Strip debug info and custom sections to reduce .wasm size
         print!("[strip]   {} ... ", module.name);
@@ -137,7 +199,7 @@ pub fn build_wasm_modules(modules: &[BuildModule], release: bool) -> Result<()> 
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
-            .context("failed to run wasm-tools strip")?;
+            .context("failed to run wasm-tools strip; ensure wasm-tools is installed")?;
         if !strip_output.status.success() {
             println!("FAILED");
             let stderr = String::from_utf8_lossy(&strip_output.stderr);
@@ -231,4 +293,51 @@ pub fn build_host_binaries(target: &str) -> Result<()> {
     }
     println!("OK");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_manifest_rejects_malformed_toml() {
+        let path = std::env::temp_dir().join(format!(
+            "wr-build-manifest-malformed-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "[[module]\nname =").unwrap();
+
+        let err = load_manifest(path.to_str().unwrap()).expect_err("manifest must fail to parse");
+        assert!(
+            format!("{err:#}").contains("failed to parse build manifest"),
+            "unexpected error: {err:#}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn compile_schemas_reports_missing_explicit_proto() {
+        let missing_proto = std::env::temp_dir().join(format!(
+            "wr-missing-explicit-proto-{}.proto",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing_proto);
+
+        let err = compile_schemas(&[BuildModule {
+            name: "missing-proto".into(),
+            wasm_path: "unused/target/wasm32-wasip2/debug/unused.wasm".into(),
+            schema_path: missing_proto
+                .with_extension("binpb")
+                .to_string_lossy()
+                .to_string(),
+            proto_path: Some(missing_proto.to_string_lossy().to_string()),
+            cargo_dir: Some("unused".into()),
+        }])
+        .expect_err("missing explicit proto must fail before protoc is invoked");
+        assert!(
+            format!("{err:#}").contains("Proto file not found for module 'missing-proto'"),
+            "unexpected error: {err:#}"
+        );
+    }
 }

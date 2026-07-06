@@ -1,6 +1,10 @@
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::{
+    manager::{manager_trio, sync_table},
+    proxy::{proxy_get, register_module, start_node, EngineSpec, ModuleSpec},
+    stubs::spawn_identified_stub,
+    wasm::minimal_file_descriptor_set,
+};
 
 use anyhow::Result;
 use http::StatusCode;

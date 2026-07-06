@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -11,7 +12,19 @@ use super::config::EngineConfig;
 use super::helpers;
 use crate::client;
 
-const PID_FILE: &str = ".wr-dev.pid";
+const PID_FILE_NAME: &str = ".wr-dev.pid";
+const TEST_GUEST_MANIFEST: &str = "wr-tests/guests/build.toml";
+const ECOMMERCE_ENGINE_CONFIGS: &[&str] = &[
+    "examples/ecommerce/engine-client.toml",
+    "examples/ecommerce/engine-inventory-1.toml",
+    "examples/ecommerce/engine-inventory-2.toml",
+];
+const STOCKMARKET_ENGINE_CONFIGS: &[&str] = &[
+    "examples/stockmarket/engine-exchange.toml",
+    "examples/stockmarket/engine-ledger.toml",
+    "examples/stockmarket/engine-simulator.toml",
+];
+const CODEGEN_ENGINE_CONFIGS: &[&str] = &["examples/codegen/engine.toml"];
 
 /// Resolve the path to a prebuilt binary. Checks ./target/debug/ first,
 /// then falls back to $PATH lookup.
@@ -25,6 +38,10 @@ fn resolve_binary(name: &str) -> String {
 
 #[derive(Args)]
 pub struct DevArgs {
+    /// Directory containing dev lifecycle state such as the PID file
+    #[arg(long, value_name = "DIR", default_value = ".", global = true)]
+    pub state_dir: PathBuf,
+
     #[command(subcommand)]
     pub command: DevCommand,
 }
@@ -42,6 +59,8 @@ pub enum DevCommand {
     },
     /// Stop all dev processes
     Down,
+    /// Build WASM guests and schemas from build metadata
+    Build(BuildArgs),
     /// Build WASM + schemas and (re)deploy an engine
     Deploy(DeployArgs),
     /// Show running dev processes and modules
@@ -63,24 +82,45 @@ pub struct DeployArgs {
     modules: Vec<String>,
 }
 
+#[derive(Args, Clone, Debug)]
+pub struct BuildArgs {
+    /// Build group: tests, ecommerce, stockmarket, codegen, or all
+    #[arg(value_name = "GROUP")]
+    group: Option<String>,
+    /// Explicit engine TOML to use as build metadata (repeatable)
+    #[arg(long = "config", value_name = "ENGINE_TOML")]
+    configs: Vec<String>,
+    /// Explicit build manifest to use as metadata (repeatable)
+    #[arg(long = "manifest", value_name = "BUILD_MANIFEST")]
+    manifests: Vec<String>,
+    /// Skip protoc schema compilation
+    #[arg(long)]
+    skip_schemas: bool,
+    /// Only build modules with this name (repeatable)
+    #[arg(long = "module", value_name = "NAME")]
+    modules: Vec<String>,
+}
+
 pub async fn run(args: DevArgs, manager: Option<&str>) -> Result<()> {
+    let pid_file = args.state_dir.join(PID_FILE_NAME);
     match args.command {
         DevCommand::Up {
             manager_config,
             proxy_config,
-        } => up(&manager_config, &proxy_config).await,
-        DevCommand::Down => down().await,
+        } => up(&manager_config, &proxy_config, &pid_file).await,
+        DevCommand::Down => down(&pid_file).await,
+        DevCommand::Build(build_args) => build(build_args),
         DevCommand::Deploy(deploy_args) => {
             let addr = manager.ok_or_else(|| {
                 anyhow::anyhow!("--manager (or WR_MANAGER env var) is required for dev deploy")
             })?;
-            deploy(deploy_args, addr).await
+            deploy(deploy_args, addr, &pid_file).await
         }
         DevCommand::Status => {
             let addr = manager.ok_or_else(|| {
                 anyhow::anyhow!("--manager (or WR_MANAGER env var) is required for dev status")
             })?;
-            status(addr).await
+            status(addr, &pid_file).await
         }
     }
 }
@@ -93,12 +133,11 @@ struct PidEntry {
     config: Option<String>,
 }
 
-fn read_pid_file() -> Result<Vec<PidEntry>> {
-    let path = Path::new(PID_FILE);
-    if !path.exists() {
+fn read_pid_file(pid_file: &Path) -> Result<Vec<PidEntry>> {
+    if !pid_file.exists() {
         return Ok(vec![]);
     }
-    let content = std::fs::read_to_string(path)?;
+    let content = std::fs::read_to_string(pid_file)?;
     let mut entries = Vec::new();
     for line in content.lines() {
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
@@ -116,7 +155,7 @@ fn read_pid_file() -> Result<Vec<PidEntry>> {
     Ok(entries)
 }
 
-fn write_pid_file(entries: &[PidEntry]) -> Result<()> {
+fn write_pid_file(pid_file: &Path, entries: &[PidEntry]) -> Result<()> {
     let content: String = entries
         .iter()
         .map(|e| {
@@ -128,8 +167,13 @@ fn write_pid_file(entries: &[PidEntry]) -> Result<()> {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    if let Some(parent) = pid_file.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     std::fs::write(
-        PID_FILE,
+        pid_file,
         if content.is_empty() {
             content
         } else {
@@ -197,8 +241,8 @@ async fn start_or_reuse_service(
     Ok(())
 }
 
-async fn up(manager_config: &str, proxy_config: &str) -> Result<()> {
-    let existing = read_pid_file().unwrap_or_default();
+async fn up(manager_config: &str, proxy_config: &str, pid_file: &Path) -> Result<()> {
+    let existing = read_pid_file(pid_file).unwrap_or_default();
     let manager_alive = existing
         .iter()
         .any(|e| e.role == "manager" && is_process_alive(e.pid));
@@ -246,13 +290,13 @@ async fn up(manager_config: &str, proxy_config: &str) -> Result<()> {
         }
     }
 
-    write_pid_file(&new_entries)?;
+    write_pid_file(pid_file, &new_entries)?;
     println!("Infrastructure ready.");
     Ok(())
 }
 
-async fn down() -> Result<()> {
-    let entries = read_pid_file()?;
+async fn down(pid_file: &Path) -> Result<()> {
+    let entries = read_pid_file(pid_file)?;
     if entries.is_empty() {
         println!("No dev processes running.");
         return Ok(());
@@ -299,12 +343,12 @@ async fn down() -> Result<()> {
     }
 
     // Clean up PID file
-    let _ = std::fs::remove_file(PID_FILE);
+    let _ = std::fs::remove_file(pid_file);
     println!("All dev processes stopped.");
     Ok(())
 }
 
-async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
+async fn deploy(args: DeployArgs, manager: &str, pid_file: &Path) -> Result<()> {
     let config_path = &args.config;
     let config = EngineConfig::from_file(config_path)?;
 
@@ -332,7 +376,9 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
             .map(|m| BuildModule {
                 name: m.name.clone(),
                 wasm_path: m.wasm_path.clone(),
-                schema_path: m.schema_path.clone(),
+                schema_path: m.schema_path.clone().unwrap_or_default(),
+                proto_path: None,
+                cargo_dir: None,
             })
             .collect();
 
@@ -368,7 +414,7 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     }
 
     // Also kill any tracked engine process for this config
-    let mut entries = read_pid_file().unwrap_or_default();
+    let mut entries = read_pid_file(pid_file).unwrap_or_default();
     for e in &entries {
         if e.role == "engine" && e.config.as_deref() == Some(config_path) && is_process_alive(e.pid)
         {
@@ -408,7 +454,7 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
         pid: engine_pid,
         config: Some(config_path.to_string()),
     });
-    write_pid_file(&entries)?;
+    write_pid_file(pid_file, &entries)?;
 
     // Print summary
     println!("[engine]  registered");
@@ -424,8 +470,165 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     Ok(())
 }
 
-async fn status(manager: &str) -> Result<()> {
-    let entries = read_pid_file()?;
+fn build(args: BuildArgs) -> Result<()> {
+    let modules = resolve_build_modules(&args)?;
+    if !args.skip_schemas {
+        build_helpers::compile_schemas(&modules)?;
+    }
+    build_helpers::build_wasm_modules(&modules, false)
+}
+
+fn resolve_build_modules(args: &BuildArgs) -> Result<Vec<BuildModule>> {
+    let mut modules = Vec::new();
+    if let Some(group) = &args.group {
+        append_group_modules(group, &mut modules)?;
+    }
+    for config in &args.configs {
+        append_config_modules(config, &mut modules)?;
+    }
+    for manifest in &args.manifests {
+        append_manifest_modules(manifest, &mut modules)?;
+    }
+    if modules.is_empty() {
+        bail!("no build modules requested; pass a group (tests, ecommerce, stockmarket, codegen, all), --config, or --manifest");
+    }
+    let modules = dedupe_build_modules(modules)?;
+    filter_build_modules(modules, &args.modules)
+}
+
+fn append_group_modules(group: &str, modules: &mut Vec<BuildModule>) -> Result<()> {
+    match group {
+        "tests" => append_manifest_modules(TEST_GUEST_MANIFEST, modules),
+        "ecommerce" => append_config_group(ECOMMERCE_ENGINE_CONFIGS, modules),
+        "stockmarket" => append_config_group(STOCKMARKET_ENGINE_CONFIGS, modules),
+        "codegen" => append_config_group(CODEGEN_ENGINE_CONFIGS, modules),
+        "all" => {
+            append_group_modules("tests", modules)?;
+            append_group_modules("ecommerce", modules)?;
+            append_group_modules("stockmarket", modules)?;
+            append_group_modules("codegen", modules)
+        }
+        other => bail!("unknown build group '{other}'; expected tests, ecommerce, stockmarket, codegen, all, or use --config/--manifest"),
+    }
+}
+
+fn append_config_group(configs: &[&str], modules: &mut Vec<BuildModule>) -> Result<()> {
+    for config in configs {
+        append_config_modules(config, modules)?;
+    }
+    Ok(())
+}
+
+fn resolve_metadata_path(path: &str) -> String {
+    let direct = Path::new(path);
+    if direct.exists() || direct.is_absolute() {
+        return path.to_string();
+    }
+    if let Some(workspace_root) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
+        let candidate = workspace_root.join(path);
+        if candidate.exists() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+    path.to_string()
+}
+
+fn append_config_modules(path: &str, modules: &mut Vec<BuildModule>) -> Result<()> {
+    let resolved_path = resolve_metadata_path(path);
+    let config = EngineConfig::from_file(&resolved_path)
+        .with_context(|| format!("failed to resolve build modules from engine config: {path}"))?;
+    modules.extend(config.modules.into_iter().map(|m| BuildModule {
+        name: m.name,
+        wasm_path: m.wasm_path,
+        schema_path: m.schema_path.unwrap_or_default(),
+        proto_path: None,
+        cargo_dir: None,
+    }));
+    Ok(())
+}
+
+fn append_manifest_modules(path: &str, modules: &mut Vec<BuildModule>) -> Result<()> {
+    let resolved_path = resolve_metadata_path(path);
+    let loaded = build_helpers::load_manifest(&resolved_path)
+        .with_context(|| format!("failed to resolve build modules from manifest: {path}"))?;
+    modules.extend(loaded);
+    Ok(())
+}
+
+fn dedupe_build_modules(modules: Vec<BuildModule>) -> Result<Vec<BuildModule>> {
+    let mut by_wasm: BTreeMap<String, BuildModule> = BTreeMap::new();
+    for module in modules {
+        if module.name.is_empty() {
+            bail!(
+                "build metadata contains a module with an empty name for wasm_path '{}'",
+                module.wasm_path
+            );
+        }
+        if module.wasm_path.is_empty() {
+            bail!(
+                "build metadata for module '{}' has an empty wasm_path",
+                module.name
+            );
+        }
+        match by_wasm.get_mut(&module.wasm_path) {
+            None => {
+                by_wasm.insert(module.wasm_path.clone(), module);
+            }
+            Some(existing) => {
+                if existing.schema_path.is_empty() && !module.schema_path.is_empty() {
+                    existing.schema_path = module.schema_path.clone();
+                    existing.proto_path = module.proto_path.clone();
+                } else if !module.schema_path.is_empty()
+                    && existing.schema_path != module.schema_path
+                {
+                    bail!(
+                        "conflicting schema paths for wasm '{}': '{}' vs '{}'",
+                        module.wasm_path,
+                        existing.schema_path,
+                        module.schema_path
+                    );
+                }
+                if existing.cargo_dir.is_none() {
+                    existing.cargo_dir = module.cargo_dir.clone();
+                } else if module.cargo_dir.is_some() && existing.cargo_dir != module.cargo_dir {
+                    bail!(
+                        "conflicting cargo directories for wasm '{}': {:?} vs {:?}",
+                        module.wasm_path,
+                        existing.cargo_dir,
+                        module.cargo_dir
+                    );
+                }
+            }
+        }
+    }
+    Ok(by_wasm.into_values().collect())
+}
+
+fn filter_build_modules(
+    modules: Vec<BuildModule>,
+    requested: &[String],
+) -> Result<Vec<BuildModule>> {
+    if requested.is_empty() {
+        return Ok(modules);
+    }
+    let requested: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
+    let available: BTreeSet<String> = modules.iter().map(|m| m.name.clone()).collect();
+    let filtered: Vec<BuildModule> = modules
+        .into_iter()
+        .filter(|m| requested.contains(m.name.as_str()))
+        .collect();
+    if filtered.is_empty() {
+        bail!(
+            "no modules matched {:?}; available modules: {:?}",
+            requested,
+            available
+        );
+    }
+    Ok(filtered)
+}
+
+async fn status(manager: &str, pid_file: &Path) -> Result<()> {
+    let entries = read_pid_file(pid_file)?;
     if entries.is_empty() {
         println!("No dev processes tracked. Run `wr dev up` to start.");
         return Ok(());
@@ -485,4 +688,146 @@ async fn wait_for_port_or_exit(pid: u32, addr: &str, timeout: Duration) -> Resul
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     bail!("Timed out waiting for {connect_addr} to accept connections");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_temp_state_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("wr-cli-{label}-{}-{nanos}", std::process::id()))
+    }
+
+    fn build_args(group: Option<&str>) -> BuildArgs {
+        BuildArgs {
+            group: group.map(str::to_string),
+            configs: vec![],
+            manifests: vec![],
+            skip_schemas: false,
+            modules: vec![],
+        }
+    }
+
+    #[test]
+    fn pid_file_helpers_use_supplied_state_path() {
+        let dir_a = unique_temp_state_dir("pid-a");
+        let dir_b = unique_temp_state_dir("pid-b");
+        let pid_file_a = dir_a.join(PID_FILE_NAME);
+        let pid_file_b = dir_b.join(PID_FILE_NAME);
+
+        write_pid_file(
+            &pid_file_a,
+            &[PidEntry {
+                role: "manager".into(),
+                pid: 12345,
+                config: Some("manager.toml".into()),
+            }],
+        )
+        .unwrap();
+
+        let entries = read_pid_file(&pid_file_a).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, "manager");
+        assert_eq!(entries[0].pid, 12345);
+        assert_eq!(entries[0].config.as_deref(), Some("manager.toml"));
+        assert!(read_pid_file(&pid_file_b).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn dev_args_accept_state_dir_before_subcommand() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            dev: DevArgs,
+        }
+
+        let parsed =
+            TestCli::try_parse_from(["test", "--state-dir", "/tmp/wr-run", "down"]).unwrap();
+        assert_eq!(parsed.dev.state_dir, PathBuf::from("/tmp/wr-run"));
+        assert!(matches!(parsed.dev.command, DevCommand::Down));
+    }
+
+    #[test]
+    fn build_group_rejects_unknown_group() {
+        let args = BuildArgs {
+            group: Some("bogus".into()),
+            configs: vec![],
+            manifests: vec![],
+            skip_schemas: false,
+            modules: vec![],
+        };
+        let err = resolve_build_modules(&args).expect_err("unknown group must be rejected");
+        assert!(
+            format!("{err:#}").contains("unknown build group 'bogus'"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn tests_group_resolves_explicit_manifest() {
+        let modules = resolve_build_modules(&build_args(Some("tests"))).unwrap();
+        let names: BTreeSet<String> = modules.iter().map(|m| m.name.clone()).collect();
+        assert_eq!(modules.len(), 5);
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "db-guest".to_string(),
+                "tracing-guest".to_string(),
+                "blobstore-guest".to_string(),
+                "http-guest".to_string(),
+                "llm-guest".to_string(),
+            ])
+        );
+        assert!(modules.iter().all(|m| m.proto_path.is_some()));
+        assert!(modules.iter().all(|m| m.cargo_dir.is_some()));
+    }
+
+    #[test]
+    fn stockmarket_group_does_not_select_duplicate_schema_ledger_crate() {
+        let modules = resolve_build_modules(&build_args(Some("stockmarket"))).unwrap();
+        let names: BTreeSet<String> = modules.iter().map(|m| m.name.clone()).collect();
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "exchange".to_string(),
+                "ledger".to_string(),
+                "simulator".to_string(),
+            ])
+        );
+        assert!(modules
+            .iter()
+            .all(|m| !m.wasm_path.contains("examples/stockmarket/schemas/ledger")));
+        assert!(modules.iter().all(|m| !m
+            .cargo_dir
+            .as_deref()
+            .unwrap_or_default()
+            .contains("examples/stockmarket/schemas/ledger")));
+    }
+
+    #[test]
+    fn explicit_missing_config_reports_path() {
+        let args = BuildArgs {
+            group: None,
+            configs: vec!["does/not/exist.toml".into()],
+            manifests: vec![],
+            skip_schemas: false,
+            modules: vec![],
+        };
+        let err = resolve_build_modules(&args).expect_err("missing config must be rejected");
+        assert!(
+            format!("{err:#}").contains(
+                "failed to resolve build modules from engine config: does/not/exist.toml"
+            ),
+            "unexpected error: {err:#}"
+        );
+    }
 }

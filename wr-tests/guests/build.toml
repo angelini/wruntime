@@ -1,0 +1,34 @@
+[[module]]
+name        = "db-guest"
+proto_path  = "wr-tests/guests/schemas/db_test.proto"
+schema_path = "wr-tests/guests/schemas/db_test.binpb"
+cargo_dir   = "wr-tests/guests/db-guest"
+wasm_path   = "wr-tests/guests/db-guest/target/wasm32-wasip2/debug/db_guest.wasm"
+
+[[module]]
+name        = "tracing-guest"
+proto_path  = "wr-tests/guests/schemas/tracing_test.proto"
+schema_path = "wr-tests/guests/schemas/tracing_test.binpb"
+cargo_dir   = "wr-tests/guests/tracing-guest"
+wasm_path   = "wr-tests/guests/tracing-guest/target/wasm32-wasip2/debug/tracing_guest.wasm"
+
+[[module]]
+name        = "blobstore-guest"
+proto_path  = "wr-tests/guests/schemas/blobstore_test.proto"
+schema_path = "wr-tests/guests/schemas/blobstore_test.binpb"
+cargo_dir   = "wr-tests/guests/blobstore-guest"
+wasm_path   = "wr-tests/guests/blobstore-guest/target/wasm32-wasip2/debug/blobstore_guest.wasm"
+
+[[module]]
+name        = "http-guest"
+proto_path  = "wr-tests/guests/schemas/http_test.proto"
+schema_path = "wr-tests/guests/schemas/http_test.binpb"
+cargo_dir   = "wr-tests/guests/http-guest"
+wasm_path   = "wr-tests/guests/http-guest/target/wasm32-wasip2/debug/http_guest.wasm"
+
+[[module]]
+name        = "llm-guest"
+proto_path  = "wr-tests/guests/schemas/llm_test.proto"
+schema_path = "wr-tests/guests/schemas/llm_test.binpb"
+cargo_dir   = "wr-tests/guests/llm-guest"
+wasm_path   = "wr-tests/guests/llm-guest/target/wasm32-wasip2/debug/llm_guest.wasm"

@@ -31,6 +31,10 @@ pub struct InvokeArgs {
     /// Request body (JSON — transcoded to protobuf using the module's schema)
     #[arg(long)]
     pub body: Option<String>,
+
+    /// Print only the transcoded response JSON to stdout for scripts
+    #[arg(long)]
+    pub json: bool,
 }
 
 pub async fn run(args: InvokeArgs, manager_addr: &str) -> Result<()> {
@@ -75,11 +79,21 @@ pub async fn run(args: InvokeArgs, manager_addr: &str) -> Result<()> {
     let status = resp.status();
     let body = resp.bytes().await?;
 
-    println!("HTTP {status}");
-    if !body.is_empty() {
-        match transcode_proto_to_json(&schema_bytes, path, &body) {
-            Ok(json) => println!("{json}"),
-            Err(_) => println!("{}", String::from_utf8_lossy(&body)),
+    if args.json {
+        if body.is_empty() {
+            println!("{{}}");
+        } else {
+            let json = transcode_proto_to_json(&schema_bytes, path, &body)
+                .context("--json requires a protobuf response matching the module schema")?;
+            println!("{json}");
+        }
+    } else {
+        println!("HTTP {status}");
+        if !body.is_empty() {
+            match transcode_proto_to_json(&schema_bytes, path, &body) {
+                Ok(json) => println!("{json}"),
+                Err(_) => println!("{}", String::from_utf8_lossy(&body)),
+            }
         }
     }
 

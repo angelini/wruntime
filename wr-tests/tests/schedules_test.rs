@@ -1,6 +1,5 @@
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::manager::manager_trio;
 
 use anyhow::Result;
 

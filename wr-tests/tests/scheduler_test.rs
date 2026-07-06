@@ -1,6 +1,9 @@
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::{
+    manager::{manager_trio, register_test_module, synced_routing_table},
+    proxy::start_proxy,
+    worker::spawn_worker_stub_engine,
+};
 
 use anyhow::Result;
 use wr_common::wruntime::UpsertScheduleRequest;

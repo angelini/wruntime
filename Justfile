@@ -37,9 +37,18 @@ fmt:
     cargo fmt --all
     taplo fmt
 
+# Check workspace formatting without writing changes
+fmt-check:
+    cargo fmt --all -- --check
+    taplo fmt --check
+
 # Format example guest crates
 fmt-examples:
     for d in {{guest_crates}}; do (cd "$d" && cargo fmt); done
+
+# Check example guest formatting without writing changes
+fmt-examples-check:
+    for d in {{guest_crates}}; do (cd "$d" && cargo fmt -- --check); done
 
 # Run Clippy lints across the workspace
 lint:
@@ -198,26 +207,9 @@ dev-reset-blobstore bucket="codegen":
 
 # ── WASM Guest Test Harness ───────────────────────────────────────────────────
 
-# Compile test guest protobuf schemas to FileDescriptorSet binaries (.binpb)
-build-test-schemas:
-    protoc --descriptor_set_out=wr-tests/guests/schemas/db_test.binpb \
-           --include_imports wr-tests/guests/schemas/db_test.proto
-    protoc --descriptor_set_out=wr-tests/guests/schemas/tracing_test.binpb \
-           --include_imports wr-tests/guests/schemas/tracing_test.proto
-    protoc --descriptor_set_out=wr-tests/guests/schemas/blobstore_test.binpb \
-           --include_imports wr-tests/guests/schemas/blobstore_test.proto
-    protoc --descriptor_set_out=wr-tests/guests/schemas/http_test.binpb \
-           --include_imports wr-tests/guests/schemas/http_test.proto
-    protoc --descriptor_set_out=wr-tests/guests/schemas/llm_test.binpb \
-           --include_imports wr-tests/guests/schemas/llm_test.proto
-
-# Build WASM test guest components
-build-test-guests: build-test-schemas
-    (cd wr-tests/guests/db-guest && cargo build --target wasm32-wasip2)
-    (cd wr-tests/guests/tracing-guest && cargo build --target wasm32-wasip2)
-    (cd wr-tests/guests/blobstore-guest && cargo build --target wasm32-wasip2)
-    (cd wr-tests/guests/http-guest && cargo build --target wasm32-wasip2)
-    (cd wr-tests/guests/llm-guest && cargo build --target wasm32-wasip2)
+# Build WASM test guest components and protobuf schemas
+build-test-guests:
+    cargo run --bin wr-cli -- dev build tests
 
 # Run all WASM host binding tests (sets env vars for dev infrastructure automatically)
 test-wasm: build-test-guests
@@ -225,15 +217,34 @@ test-wasm: build-test-guests
     WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
     WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
     WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-    cargo test -p wr-tests --test wasm_host_test
+    cargo test -p wr-tests \
+        --test wasm_db_host_test \
+        --test wasm_blobstore_host_test \
+        --test wasm_tracing_host_test \
+        --test wasm_llm_host_test \
+        --test wasm_http_host_test
 
-# Run a subset of WASM tests by filter (e.g. `just test-wasm-one db`, `just test-wasm-one tracing`, `just test-wasm-one blobstore`)
-test-wasm-one filter: build-test-guests
+# Run one split WASM host binding test target (db, blobstore, tracing, llm, http, or a full target name)
+test-wasm-one target: build-test-guests
+    @case "{{target}}" in \
+        db) test_target="wasm_db_host_test" ;; \
+        blobstore) test_target="wasm_blobstore_host_test" ;; \
+        tracing) test_target="wasm_tracing_host_test" ;; \
+        llm) test_target="wasm_llm_host_test" ;; \
+        http) test_target="wasm_http_host_test" ;; \
+        wasm_*) test_target="{{target}}" ;; \
+        *) echo "unknown WASM test target '{{target}}'; use db, blobstore, tracing, llm, http, or a wasm_* target" >&2; exit 2 ;; \
+    esac; \
     WRT_TEST_DB_URL={{db_url_test}} \
     WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
     WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
     WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-    cargo test -p wr-tests --test wasm_host_test wasm_{{filter}}
+    cargo test -p wr-tests --test "$test_target"
+
+# Run the comprehensive validation suite (format, lints, WASM, tests, E2E examples)
+[positional-arguments]
+validate-all *args:
+    bash dev/validate-all.sh "$@"
 
 # Run hot-path benchmarks (WASM→proxy→WASM). Override iterations/concurrency via env vars.
 bench: build-test-guests
@@ -245,19 +256,9 @@ bench: build-test-guests
 
 # ── Ecommerce Example ─────────────────────────────────────────────────────────
 
-# Compile ecommerce protobuf schemas to FileDescriptorSet binaries (.binpb)
-build-ecommerce-schemas:
-    protoc --descriptor_set_out=examples/ecommerce/schemas/inventory.binpb \
-           --include_imports \
-           examples/ecommerce/schemas/inventory.proto
-    protoc --descriptor_set_out=examples/ecommerce/schemas/client.binpb \
-           --include_imports \
-           examples/ecommerce/schemas/client.proto
-
 # Build WASM components and schemas for the ecommerce example
-build-ecommerce: build-ecommerce-schemas
-    (cd examples/ecommerce/inventory && cargo build --target wasm32-wasip2)
-    (cd examples/ecommerce/client && cargo build --target wasm32-wasip2)
+build-ecommerce:
+    cargo run --bin wr-cli -- dev build ecommerce
 
 # Run the full ecommerce example (requires Postgres — see `just dev-up`)
 ecommerce: build-ecommerce build
@@ -269,25 +270,27 @@ ecommerce-inline: build-ecommerce build
     WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
     DB_URL={{db_url_example}} bash examples/ecommerce/run.sh --inline
 
+# Run ecommerce inline and fail if any warning is emitted
+validate-ecommerce:
+    @log="$(mktemp -t wr-ecommerce-inline.XXXXXX.log)"; \
+    trap 'rm -f "$log"' EXIT; \
+    set +e; \
+    just ecommerce-inline >"$log" 2>&1; \
+    status=$?; \
+    cat "$log"; \
+    if [ $status -ne 0 ]; then exit $status; fi; \
+    matches="$(grep -En '(^|[^[:alnum:]_])(WARN|WARNING)([^[:alnum:]_]|$)|level="?warn(ing)?"?|"level":"warn(ing)?"' "$log" || true)"; \
+    if [ -n "$matches" ]; then \
+        echo "ERROR: ecommerce output contained warning lines:" >&2; \
+        printf '%s\n' "$matches" >&2; \
+        exit 1; \
+    fi
+
 # ── Stock Market Example ──────────────────────────────────────────────────────
 
-# Compile stockmarket protobuf schemas to FileDescriptorSet binaries (.binpb)
-build-stockmarket-schemas:
-    protoc --descriptor_set_out=examples/stockmarket/schemas/exchange.binpb \
-           --include_imports \
-           examples/stockmarket/schemas/exchange.proto
-    protoc --descriptor_set_out=examples/stockmarket/schemas/ledger.binpb \
-           --include_imports \
-           examples/stockmarket/schemas/ledger.proto
-    protoc --descriptor_set_out=examples/stockmarket/schemas/simulator.binpb \
-           --include_imports \
-           examples/stockmarket/schemas/simulator.proto
-
 # Build WASM components and schemas for the stockmarket example
-build-stockmarket: build-stockmarket-schemas
-    (cd examples/stockmarket/exchange && cargo build --target wasm32-wasip2)
-    (cd examples/stockmarket/ledger && cargo build --target wasm32-wasip2)
-    (cd examples/stockmarket/simulator && cargo build --target wasm32-wasip2)
+build-stockmarket:
+    cargo run --bin wr-cli -- dev build stockmarket
 
 # Run the full stockmarket example (requires Postgres + RustFS S3 — see `just dev-up`)
 # Pass exchanges=N to run N exchange engines in parallel (default: 1)
@@ -302,28 +305,9 @@ stockmarket-inline exchanges="1": build-stockmarket build
 
 # ── Codegen Example ───────────────────────────────────────────────────────────
 
-# Compile codegen protobuf schemas to FileDescriptorSet binaries (.binpb)
-build-codegen-schemas:
-    protoc --descriptor_set_out=examples/codegen/schemas/collector.binpb \
-           --include_imports \
-           examples/codegen/schemas/collector.proto
-    protoc --descriptor_set_out=examples/codegen/schemas/agent.binpb \
-           --include_imports \
-           examples/codegen/schemas/agent.proto
-    protoc --descriptor_set_out=examples/codegen/schemas/coordinator.binpb \
-           --include_imports \
-           examples/codegen/schemas/coordinator.proto
-    protoc --descriptor_set_out=examples/codegen/schemas/worker.binpb \
-           --include_imports \
-           --proto_path=examples/codegen/schemas \
-           examples/codegen/schemas/worker.proto
-
 # Build WASM components and schemas for the codegen example
-build-codegen: build-codegen-schemas
-    (cd examples/codegen/collector && cargo build --target wasm32-wasip2)
-    (cd examples/codegen/agent && cargo build --target wasm32-wasip2)
-    (cd examples/codegen/coordinator && cargo build --target wasm32-wasip2)
-    (cd examples/codegen/worker && cargo build --target wasm32-wasip2)
+build-codegen:
+    cargo run --bin wr-cli -- dev build codegen
 
 # Run the full codegen example (requires Postgres + RustFS S3 — see `just dev-up`)
 codegen: build-codegen build

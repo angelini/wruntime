@@ -30,42 +30,43 @@ EXCHANGE_BASE_PORT=9100
 LEDGER_PORT=$((EXCHANGE_BASE_PORT + NUM_EXCHANGES))
 SIMULATOR_PORT=9200
 
-# Build list of all ports to kill on startup
-KILL_PORTS=(9000 9001 9002 9010)
-for ((i = 0; i < NUM_EXCHANGES; i++)); do
-	KILL_PORTS+=($((EXCHANGE_BASE_PORT + i)))
-done
-KILL_PORTS+=($LEDGER_PORT $SIMULATOR_PORT)
-
-kill_stale_ports "${KILL_PORTS[@]}"
-
 echo "DB_URL: ${DB_URL}"
 echo "S3_ENDPOINT: ${S3_ENDPOINT}"
 echo "Exchange engines: ${NUM_EXCHANGES} (ports ${EXCHANGE_BASE_PORT}..$((EXCHANGE_BASE_PORT + NUM_EXCHANGES - 1)))"
 echo "Ledger engine: port ${LEDGER_PORT}"
 
-# ── Substitute DB and S3 URLs into engine configs ────────────────────────
-update_config() {
-	local file="$1"
-	sed_replace "$file" "postgres://user:pass@localhost:5432/stockmarket" "${DB_URL}"
-	sed_replace "$file" "http://127.0.0.1:8900" "${S3_ENDPOINT}"
-	sed_replace "$file" "access_key_id     = \"rustfsadmin\"" "access_key_id     = \"${S3_ACCESS_KEY}\""
-	sed_replace "$file" "secret_access_key = \"rustfsadmin\"" "secret_access_key = \"${S3_SECRET_KEY}\""
+# ── Substitute fields present in each engine config ─────────────────────
+render_exchange_config() {
+	local src="$1" dest="$2"
+	render_config "$src" "$dest" \
+		"postgres://user:pass@localhost:5432/stockmarket" "${DB_URL}"
+}
+
+render_ledger_config() {
+	local src="$1" dest="$2"
+	render_config "$src" "$dest" \
+		"postgres://user:pass@localhost:5432/stockmarket" "${DB_URL}" \
+		"http://127.0.0.1:8900" "${S3_ENDPOINT}" \
+		"access_key_id     = \"rustfsadmin\"" "access_key_id     = \"${S3_ACCESS_KEY}\"" \
+		"secret_access_key = \"rustfsadmin\"" "secret_access_key = \"${S3_SECRET_KEY}\""
 }
 
 # ── Generate exchange engine configs ─────────────────────────────────────
+EXCHANGE_CONFIGS=()
 for ((i = 0; i < NUM_EXCHANGES; i++)); do
 	port=$((EXCHANGE_BASE_PORT + i))
-	cfg="/tmp/sm-exchange-${i}.toml"
-	cp examples/stockmarket/engine-exchange.toml "$cfg"
-	sed_replace "$cfg" "127.0.0.1:9100" "127.0.0.1:${port}"
-	update_config "$cfg"
+	cfg="${CONFIG_DIR}/stockmarket-exchange-${i}.toml"
+	render_exchange_config examples/stockmarket/engine-exchange.toml "$cfg"
+	render_config "$cfg" "$cfg" "127.0.0.1:9100" "127.0.0.1:${port}"
+	EXCHANGE_CONFIGS+=("$cfg")
 done
 
-# ── Generate ledger engine config ────────────────────────────────────────
-cp examples/stockmarket/engine-ledger.toml /tmp/sm-ledger.toml
-sed_replace /tmp/sm-ledger.toml "127.0.0.1:9101" "127.0.0.1:${LEDGER_PORT}"
-update_config /tmp/sm-ledger.toml
+# ── Generate ledger and simulator engine configs ─────────────────────────
+LEDGER_CFG="${CONFIG_DIR}/stockmarket-ledger.toml"
+SIMULATOR_CFG="${CONFIG_DIR}/stockmarket-simulator.toml"
+render_ledger_config examples/stockmarket/engine-ledger.toml "$LEDGER_CFG"
+render_config "$LEDGER_CFG" "$LEDGER_CFG" "127.0.0.1:9101" "127.0.0.1:${LEDGER_PORT}"
+copy_config examples/stockmarket/engine-simulator.toml "$SIMULATOR_CFG"
 
 # ── Prepare manager + proxy configs ──────────────────────────────────────
 MANAGER_CFG=$(prepare_manager_config)
@@ -83,18 +84,18 @@ start_manager_proxy "$MANAGER_CFG" "$PROXY_CFG"
 # ── Deploy exchange engines ──────────────────────────────────────────────
 for ((i = 0; i < NUM_EXCHANGES; i++)); do
 	port=$((EXCHANGE_BASE_PORT + i))
-	deploy_engine "/tmp/sm-exchange-${i}.toml" "exchange engine $((i + 1))/${NUM_EXCHANGES}" "$port"
+	deploy_engine "${EXCHANGE_CONFIGS[$i]}" "exchange engine $((i + 1))/${NUM_EXCHANGES}" "$port"
 done
 
 # ── Deploy ledger engine ─────────────────────────────────────────────────
-deploy_engine /tmp/sm-ledger.toml "ledger engine" "$LEDGER_PORT"
+deploy_engine "$LEDGER_CFG" "ledger engine" "$LEDGER_PORT"
 list_services
+dev_status
 
 # ── Deploy simulator engine ──────────────────────────────────────────────
-deploy_engine examples/stockmarket/engine-simulator.toml "simulator engine" "$SIMULATOR_PORT"
+deploy_engine "$SIMULATOR_CFG" "simulator engine" "$SIMULATOR_PORT"
 list_services
-
-setup_cleanup_trap
+dev_status
 
 if [ "$INLINE" = true ]; then
 	echo "==> Running simulator inline (10 traders, 20 orders each, 5 symbols, ${NUM_EXCHANGES} exchange(s))..."

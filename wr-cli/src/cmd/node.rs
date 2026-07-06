@@ -554,7 +554,9 @@ fn bundle(args: BundleArgs) -> Result<()> {
             .map(|m| BuildModule {
                 name: m.name.clone(),
                 wasm_path: m.wasm_path.clone(),
-                schema_path: m.schema_path.clone(),
+                schema_path: m.schema_path.clone().unwrap_or_default(),
+                proto_path: None,
+                cargo_dir: None,
             })
             .collect();
 

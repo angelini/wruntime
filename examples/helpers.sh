@@ -18,11 +18,30 @@ cd "$REPO_ROOT"
 
 # ── Environment defaults ─────────────────────────────────────────────────────
 DB_URL="${DB_URL:-${WRT_EXAMPLE_DB_URL:-postgres://postgres@localhost:5433/wruntime_example}}"
+GUEST_DB_URL="${GUEST_DB_URL:-postgres://wr_guest@localhost:5433/wruntime_example}"
 S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:8900}"
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-rustfsadmin}"
 export RUST_LOG="${RUST_LOG:-info}"
 export WR_MANAGER="${WR_MANAGER:-https://127.0.0.1:9000}"
+
+RUN_DIR="${WR_EXAMPLE_RUN_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/wr-example.XXXXXX")}"
+CONFIG_DIR="${RUN_DIR}/config"
+WR_DEV_STATE_DIR="${RUN_DIR}/dev-state"
+mkdir -p "${CONFIG_DIR}" "${WR_DEV_STATE_DIR}"
+DEV_STATE_ARGS=(--state-dir "${WR_DEV_STATE_DIR}")
+
+cleanup_example_run() {
+	local status=$?
+	trap - EXIT INT TERM
+	echo "==> Shutting down..."
+	./target/debug/wr-cli dev "${DEV_STATE_ARGS[@]}" down 2>/dev/null || true
+	rm -rf "${RUN_DIR}"
+	exit "$status"
+}
+trap cleanup_example_run EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ── Generate TLS certificates if missing ─────────────────────────────────────
 if [ ! -f certs/ca.crt ]; then
@@ -32,45 +51,48 @@ if [ ! -f certs/ca.crt ]; then
 	./target/debug/wr-cli cert generate manager --ca-dir certs/
 fi
 
-# ── Kill stale processes ─────────────────────────────────────────────────────
-# Usage: kill_stale_ports 9000 9001 9100 9101
-kill_stale_ports() {
-	./target/debug/wr-cli dev down 2>/dev/null || true
-	for port in "$@"; do
-		pid=$(lsof -ti ":$port" 2>/dev/null || true)
-		if [ -n "$pid" ]; then
-			echo "   killing stale process on :$port (pid $pid)"
-			kill -INT $pid 2>/dev/null || true
-		fi
-	done
-	sleep 1
+# ── Config rendering ─────────────────────────────────────────────────────────
+render_config() {
+	local src="$1" dest="$2"
+	shift 2
+	python3 - "$src" "$dest" "$@" <<'PY'
+import pathlib
+import sys
+
+src = pathlib.Path(sys.argv[1])
+dest = pathlib.Path(sys.argv[2])
+pairs = sys.argv[3:]
+if len(pairs) % 2:
+    raise SystemExit("render_config requires OLD NEW replacement pairs")
+text = src.read_text()
+for old, new in zip(pairs[0::2], pairs[1::2]):
+    if old not in text:
+        raise SystemExit(f"{src}: expected template value not found: {old!r}")
+    text = text.replace(old, new)
+dest.parent.mkdir(parents=True, exist_ok=True)
+dest.write_text(text)
+PY
 }
 
-# ── Sed-based config substitution ────────────────────────────────────────────
-# Usage: sed_replace <file> <old> <new>
-sed_replace() {
-	local file="$1" old="$2" new="$3"
-	sed -i.bak "s|${old}|${new}|g" "$file"
-	rm -f "${file}.bak"
+copy_config() {
+	render_config "$1" "$2"
 }
 
 # ── Prepare manager config ───────────────────────────────────────────────────
-# Copies manager.toml to /tmp and substitutes DB_URL.
+# Copies manager.toml to the run config dir and substitutes DB_URL.
 # Returns the path via stdout.
 prepare_manager_config() {
-	local dest="/tmp/wr-manager.toml"
-	cp examples/config/manager.toml "$dest"
-	sed_replace "$dest" "postgres://postgres@localhost:5433/wruntime_example" "${DB_URL}"
+	local dest="${CONFIG_DIR}/manager.toml"
+	render_config examples/config/manager.toml "$dest" "postgres://postgres@localhost:5433/wruntime_example" "${DB_URL}"
 	echo "$dest"
 }
 
 # ── Prepare proxy config ─────────────────────────────────────────────────────
-# Copies proxy.toml to /tmp and substitutes DB_URL.
+# Copies proxy.toml to the run config dir and substitutes DB_URL.
 # Returns the path via stdout. Caller can append extra config after.
 prepare_proxy_config() {
-	local dest="${1:-/tmp/wr-proxy.toml}"
-	cp examples/config/proxy.toml "$dest"
-	sed_replace "$dest" "postgres://postgres@localhost:5433/wruntime_example" "${DB_URL}"
+	local dest="${1:-${CONFIG_DIR}/proxy.toml}"
+	render_config examples/config/proxy.toml "$dest" "postgres://postgres@localhost:5433/wruntime_example" "${DB_URL}"
 	echo "$dest"
 }
 
@@ -86,7 +108,7 @@ clean_manager_state() {
 start_manager_proxy() {
 	local manager_cfg="$1" proxy_cfg="$2"
 	echo "==> Starting manager + proxy..."
-	./target/debug/wr-cli dev up \
+	./target/debug/wr-cli dev "${DEV_STATE_ARGS[@]}" up \
 		--manager-config "$manager_cfg" \
 		--proxy-config "$proxy_cfg"
 }
@@ -96,7 +118,11 @@ start_manager_proxy() {
 deploy_engine() {
 	local config="$1" label="$2" port="$3"
 	echo "==> Deploying ${label} on :${port}"
-	./target/debug/wr-cli dev deploy "$config" --skip-build
+	./target/debug/wr-cli dev "${DEV_STATE_ARGS[@]}" deploy "$config" --skip-build
+}
+
+dev_status() {
+	./target/debug/wr-cli dev "${DEV_STATE_ARGS[@]}" status
 }
 
 # ── Print engine/service lists ───────────────────────────────────────────────
@@ -112,16 +138,6 @@ create_s3_bucket() {
 	echo "==> Creating S3 bucket '${bucket}'"
 	AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${S3_SECRET_KEY}" \
 		aws --endpoint-url "${S3_ENDPOINT}" s3 mb "s3://${bucket}" 2>/dev/null || true
-}
-
-# ── Setup cleanup trap ───────────────────────────────────────────────────────
-setup_cleanup_trap() {
-	cleanup() {
-		echo "==> Shutting down..."
-		./target/debug/wr-cli dev down
-	}
-	trap cleanup EXIT
-	trap 'exit 0' INT TERM
 }
 
 # ── Wait forever (block until Ctrl-C) ────────────────────────────────────────

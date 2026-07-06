@@ -1,6 +1,14 @@
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::{
+    manager::{
+        backdate_engine_heartbeat, get_routing_table_version, get_rule_health,
+        manager_trio_with_monitor, register_test_module, sync_table, synced_routing_table,
+    },
+    proxy::{proxy_get, start_proxy, TEST_SELF_PEER},
+    stubs::spawn_stub_engine,
+    wait::{wait_for_routing_table_version_gt, wait_for_rule_health, DEFAULT_WAIT_TIMEOUT},
+    wasm::minimal_file_descriptor_set,
+};
 
 use anyhow::Result;
 use http::StatusCode;
@@ -31,11 +39,8 @@ async fn test_heartbeat_timeout_marks_module_unhealthy() -> Result<()> {
     // Backdate the engine heartbeat so the monitor considers it stale.
     backdate_engine_heartbeat(&pool, "hc-e1", 60).await;
 
-    // Wait for the monitor to run (200ms tick in tests) — add padding.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    // The module should now be marked unhealthy.
-    let (healthy, _) = get_rule_health(&mut mgr, "heartbeat-svc").await?;
+    let (healthy, _) =
+        wait_for_rule_health(&mut mgr, "heartbeat-svc", false, DEFAULT_WAIT_TIMEOUT).await?;
     assert!(
         !healthy,
         "module should be unhealthy after heartbeat timeout"
@@ -62,7 +67,8 @@ async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
     )
     .await?;
 
-    // Send heartbeats continuously through several monitor ticks (200ms each).
+    // Intentional elapsed-time interval: this test proves repeated heartbeats keep the route healthy across monitor ticks.
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
     for _ in 0..5 {
         mgr.heartbeat(HeartbeatRequest {
             engine_id: "hc-keep-e1".into(),
@@ -74,7 +80,7 @@ async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
             }],
         })
         .await?;
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        interval.tick().await;
     }
 
     // Module should still be healthy.
@@ -105,10 +111,8 @@ async fn test_engine_health_recovery_after_heartbeat() -> Result<()> {
     // Backdate engine heartbeat so the monitor marks it unhealthy.
     backdate_engine_heartbeat(&pool, "hc-rec-e1", 60).await;
 
-    // Wait for the monitor tick (200ms interval) to detect the stale timestamp.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let (healthy, _) = get_rule_health(&mut mgr, "recovering-svc").await?;
+    let (healthy, _) =
+        wait_for_rule_health(&mut mgr, "recovering-svc", false, DEFAULT_WAIT_TIMEOUT).await?;
     assert!(!healthy, "module should be unhealthy before recovery");
 
     // Send a heartbeat — refreshes last_heartbeat in the DB.
@@ -123,10 +127,8 @@ async fn test_engine_health_recovery_after_heartbeat() -> Result<()> {
     })
     .await?;
 
-    // Wait for the next monitor tick to see the fresh timestamp.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let (healthy, _) = get_rule_health(&mut mgr, "recovering-svc").await?;
+    let (healthy, _) =
+        wait_for_rule_health(&mut mgr, "recovering-svc", true, DEFAULT_WAIT_TIMEOUT).await?;
     assert!(healthy, "module should recover after heartbeat");
 
     let _ = engine_shutdown.send(());
@@ -158,9 +160,7 @@ async fn test_unhealthy_module_excluded_from_routing() -> Result<()> {
 
     // Backdate engine heartbeat and wait for monitor to mark unhealthy.
     backdate_engine_heartbeat(&pool, "hc-route-e1", 60).await;
-
-    // Wait for the monitor tick (200ms interval) to detect the stale timestamp.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    wait_for_rule_health(&mut mgr, "routed-svc", false, DEFAULT_WAIT_TIMEOUT).await?;
 
     // Re-sync the routing table — the rule should now be unhealthy.
     sync_table(&mgr_addr, &table).await?;
@@ -195,10 +195,8 @@ async fn test_health_change_bumps_routing_table_version() -> Result<()> {
     // Backdate engine heartbeat so the monitor marks the module unhealthy.
     backdate_engine_heartbeat(&pool, "hc-ver-e1", 60).await;
 
-    // Wait for the monitor tick (200ms interval) to detect the stale timestamp.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let version_after = get_routing_table_version(&mut mgr).await?;
+    let version_after =
+        wait_for_routing_table_version_gt(&mut mgr, version_before, DEFAULT_WAIT_TIMEOUT).await?;
 
     assert!(
         version_after > version_before,
@@ -239,8 +237,8 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
     })
     .await?;
 
-    // Heartbeat reporting ONLY mod-a for longer than the module timeout (1s).
-    // This keeps the engine and mod-a fresh while mod-b's seeded heartbeat ages out.
+    // Intentional elapsed-time interval: keep the engine and mod-a fresh while mod-b's seeded heartbeat ages out.
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
     for _ in 0..8 {
         mgr.heartbeat(HeartbeatRequest {
             engine_id: "mh-e1".into(),
@@ -252,9 +250,9 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
             }],
         })
         .await?;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        interval.tick().await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    wait_for_rule_health(&mut mgr, "mod-b", false, DEFAULT_WAIT_TIMEOUT).await?;
 
     let (a_healthy, _) = get_rule_health(&mut mgr, "mod-a").await?;
     let (b_healthy, _) = get_rule_health(&mut mgr, "mod-b").await?;
@@ -280,7 +278,7 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
         ],
     })
     .await?;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    wait_for_rule_health(&mut mgr, "mod-b", true, DEFAULT_WAIT_TIMEOUT).await?;
 
     let (a_healthy, _) = get_rule_health(&mut mgr, "mod-a").await?;
     let (b_healthy, _) = get_rule_health(&mut mgr, "mod-b").await?;
@@ -320,10 +318,10 @@ async fn test_engine_stale_marks_all_module_routes_unhealthy() -> Result<()> {
     .await?;
 
     backdate_engine_heartbeat(&pool, "mh-stale-e1", 60).await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let (a_healthy, _) = get_rule_health(&mut mgr, "stale-a").await?;
-    let (b_healthy, _) = get_rule_health(&mut mgr, "stale-b").await?;
+    let (a_healthy, _) =
+        wait_for_rule_health(&mut mgr, "stale-a", false, DEFAULT_WAIT_TIMEOUT).await?;
+    let (b_healthy, _) =
+        wait_for_rule_health(&mut mgr, "stale-b", false, DEFAULT_WAIT_TIMEOUT).await?;
     assert!(!a_healthy, "stale engine marks all its routes unhealthy");
     assert!(!b_healthy, "stale engine marks all its routes unhealthy");
     Ok(())
@@ -343,8 +341,8 @@ async fn test_registration_seed_survives_first_sweep() -> Result<()> {
     )
     .await?;
 
-    // No heartbeat sent. Let several monitor ticks run. Without the registration
-    // seed, the module-heartbeat join would fail and the route would flip
+    // Intentional elapsed-time coverage: no observable state changes on a successful sweep.
+    // Without the registration seed, the module-heartbeat join would fail and the route would flip
     // unhealthy on the first sweep.
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
@@ -408,6 +406,7 @@ async fn test_malformed_module_entry_skipped_not_fatal() -> Result<()> {
         .await;
     assert!(resp.is_ok(), "malformed entry must not fail the heartbeat");
 
+    // Intentional elapsed-time coverage of a monitor sweep that should not change health.
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
     // Engine liveness was bumped and neither route was starved.
@@ -452,9 +451,8 @@ async fn test_admin_route_without_module_heartbeat_flips_unhealthy() -> Result<(
     })
     .await?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let (ghost_healthy, _) = get_rule_health(&mut mgr, "ghost-svc").await?;
+    let (ghost_healthy, _) =
+        wait_for_rule_health(&mut mgr, "ghost-svc", false, DEFAULT_WAIT_TIMEOUT).await?;
     let (real_healthy, _) = get_rule_health(&mut mgr, "real-svc").await?;
     assert!(
         !ghost_healthy,

@@ -4,21 +4,17 @@
 #                Postgres running via `just dev-up` (uses wruntime_example by default).
 source "$(dirname "$0")/../helpers.sh" "$@"
 
-# ── Kill stale processes from a previous run ─────────────────────────────
-kill_stale_ports 9000 9001 9002 9010 9100 9101 9200
-
 echo "DB_URL: ${DB_URL}"
 
-# ── Substitute the DB URL into the engine configs ────────────────────────
-update_db_url() {
-	local file="$1"
-	sed_replace "$file" "postgres://user:pass@localhost:5432/ecommerce" "${DB_URL}"
-}
+INV1_CFG="${CONFIG_DIR}/ecommerce-inventory-1.toml"
+INV2_CFG="${CONFIG_DIR}/ecommerce-inventory-2.toml"
+CLIENT_CFG="${CONFIG_DIR}/ecommerce-client.toml"
 
-cp examples/ecommerce/engine-inventory-1.toml /tmp/inv1.toml
-cp examples/ecommerce/engine-inventory-2.toml /tmp/inv2.toml
-update_db_url /tmp/inv1.toml
-update_db_url /tmp/inv2.toml
+render_config examples/ecommerce/engine-inventory-1.toml "$INV1_CFG" \
+	"postgres://postgres@localhost:5433/wruntime_example" "${DB_URL}"
+render_config examples/ecommerce/engine-inventory-2.toml "$INV2_CFG" \
+	"postgres://postgres@localhost:5433/wruntime_example" "${DB_URL}"
+copy_config examples/ecommerce/engine-client.toml "$CLIENT_CFG"
 
 # ── Prepare manager + proxy configs ──────────────────────────────────────
 MANAGER_CFG=$(prepare_manager_config)
@@ -31,9 +27,10 @@ clean_manager_state
 start_manager_proxy "$MANAGER_CFG" "$PROXY_CFG"
 
 # ── Deploy inventory engines ─────────────────────────────────────────────
-deploy_engine /tmp/inv1.toml "inventory engine 1" 9100
-deploy_engine /tmp/inv2.toml "inventory engine 2" 9101
+deploy_engine "$INV1_CFG" "inventory engine 1" 9100
+deploy_engine "$INV2_CFG" "inventory engine 2" 9101
 list_services
+dev_status
 
 # ── Seed inventory via the proxy ─────────────────────────────────────────
 echo "==> Seeding inventory..."
@@ -45,10 +42,9 @@ just cli invoke \
 	--body '' || echo " (seed may already exist)"
 
 # ── Deploy client engine ─────────────────────────────────────────────────
-deploy_engine examples/ecommerce/engine-client.toml "client engine" 9200
+deploy_engine "$CLIENT_CFG" "client engine" 9200
 list_services
-
-setup_cleanup_trap
+dev_status
 
 if [ "$INLINE" = true ]; then
 	echo "==> Running client inline with {\"count\": 1}..."

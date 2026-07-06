@@ -1,6 +1,8 @@
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::{
+    manager::manager_trio, proxy::TEST_SELF_PEER, stubs::spawn_stub_engine,
+    wasm::minimal_file_descriptor_set,
+};
 
 use anyhow::Result;
 

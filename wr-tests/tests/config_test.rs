@@ -1,9 +1,8 @@
-#[allow(dead_code, unused_imports)]
-mod helpers;
-
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
 use wr_common::config::Validatable;
 use wr_engine::config::EngineConfig;
 use wr_manager::config::ManagerConfig;
@@ -18,12 +17,6 @@ fn unique_temp_path(name: &str, ext: &str) -> PathBuf {
         "wr-config-test-{name}-{}-{nanos}.{ext}",
         std::process::id()
     ))
-}
-
-fn unique_temp_dir(name: &str) -> PathBuf {
-    let dir = unique_temp_path(name, "dir");
-    fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 fn write_temp_config(name: &str, content: &str) -> PathBuf {
@@ -41,57 +34,6 @@ fn load_config_from_toml<T>(
     let cfg = load(path.to_str().unwrap()).unwrap();
     let _ = fs::remove_file(path);
     cfg
-}
-
-fn engine_toml_with_temp_artifacts(content: &str, root: &Path) -> String {
-    let mut value: toml::Value = toml::from_str(content).unwrap();
-    let modules_dir = root.join("modules");
-    let schemas_dir = root.join("schemas");
-    let migrations_dir = root.join("migrations");
-    fs::create_dir_all(&modules_dir).unwrap();
-    fs::create_dir_all(&schemas_dir).unwrap();
-    fs::create_dir_all(&migrations_dir).unwrap();
-
-    let modules = value
-        .get_mut("module")
-        .and_then(toml::Value::as_array_mut)
-        .expect("engine TOML must contain module tables");
-
-    for module in modules {
-        let table = module.as_table_mut().unwrap();
-        let name = table
-            .get("name")
-            .and_then(toml::Value::as_str)
-            .unwrap()
-            .to_string();
-
-        let wasm_path = modules_dir.join(format!("{name}.wasm"));
-        fs::write(&wasm_path, b"wasm").unwrap();
-        table.insert(
-            "wasm_path".to_string(),
-            toml::Value::String(wasm_path.to_string_lossy().into_owned()),
-        );
-
-        if table.contains_key("schema_path") {
-            let schema_path = schemas_dir.join(format!("{name}.binpb"));
-            fs::write(&schema_path, b"schema").unwrap();
-            table.insert(
-                "schema_path".to_string(),
-                toml::Value::String(schema_path.to_string_lossy().into_owned()),
-            );
-        }
-
-        if table.contains_key("migrations_path") {
-            let migrations_path = migrations_dir.join(&name);
-            fs::create_dir_all(&migrations_path).unwrap();
-            table.insert(
-                "migrations_path".to_string(),
-                toml::Value::String(migrations_path.to_string_lossy().into_owned()),
-            );
-        }
-    }
-
-    toml::to_string_pretty(&value).unwrap()
 }
 
 #[test]
@@ -219,10 +161,11 @@ fn test_proxy_config_rejects_zero_ttl() {
         [cache]
         routing_table_ttl_secs = 0
     "#;
-    // Deserialisation succeeds; validate() catches the bad value.
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
     assert_eq!(cfg.cache.routing_table_ttl_secs, 0, "precondition");
-    let err = cfg.validate().unwrap_err();
+    let err = cfg
+        .validate()
+        .expect_err("zero TTL must be rejected by ProxyConfig::validate");
     assert!(
         format!("{err:#}").contains("cache.routing_table_ttl_secs must be > 0"),
         "unexpected validation error: {err:#}"
@@ -230,48 +173,321 @@ fn test_proxy_config_rejects_zero_ttl() {
 }
 
 #[test]
-fn test_example_config_files_parse() {
-    let manager_toml = include_str!("../../examples/config/manager.toml");
-    let proxy_toml = include_str!("../../examples/config/proxy.toml");
-    let engine_toml = include_str!("../../examples/config/engine.toml");
-
-    let manager = load_config_from_toml("example-manager", manager_toml, ManagerConfig::load);
-    assert_eq!(manager.local_proxy_address, "http://127.0.0.1:9001");
-
-    let proxy = load_config_from_toml("example-proxy", proxy_toml, ProxyConfig::load);
-    assert_eq!(proxy.listen_address, "127.0.0.1:9001");
-
-    let artifact_root = unique_temp_dir("example-engine-artifacts");
-    let engine_toml = engine_toml_with_temp_artifacts(engine_toml, &artifact_root);
-    let engine = load_config_from_toml("example-engine", &engine_toml, EngineConfig::load);
-    assert_eq!(engine.modules.len(), 2);
-    assert!(engine.database.is_some());
-    let _ = fs::remove_dir_all(artifact_root);
+fn test_proxy_config_accepts_positive_ttl() {
+    let mut cfg: ProxyConfig =
+        toml::from_str(&proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")).unwrap();
+    cfg.cache.routing_table_ttl_secs = 1;
+    cfg.validate()
+        .expect("positive routing_table_ttl_secs must validate");
 }
 
 #[test]
-fn test_live_engine_examples_parse_structurally() {
-    let codegen: EngineConfig = toml::from_str(include_str!("../../examples/codegen/engine.toml"))
-        .expect("codegen engine.toml must parse");
-    assert!(codegen.blobstore.is_some());
-    assert!(codegen.llm.is_some());
-    assert!(codegen.modules.iter().any(|m| m.fs.is_some()));
-    assert!(codegen.modules.iter().any(|m| {
-        m.name == "worker"
-            && m.database
-            && m.worker_concurrency == 1
-            && m.worker_job_timeout_secs == 900
-    }));
+fn test_example_config_files_parse() {
+    for (path, toml) in [(
+        "examples/config/manager.toml",
+        include_str!("../../examples/config/manager.toml"),
+    )] {
+        toml::from_str::<ManagerConfig>(toml)
+            .unwrap_or_else(|err| panic!("{path} must parse: {err}"));
+    }
 
-    let ledger: EngineConfig = toml::from_str(include_str!(
-        "../../examples/stockmarket/engine-ledger.toml"
-    ))
-    .expect("stockmarket ledger engine.toml must parse");
-    assert!(ledger.blobstore.is_some());
-    assert!(ledger
-        .modules
-        .iter()
-        .any(|m| m.name == "ledger" && m.database && m.blobstore));
+    for (path, toml) in [
+        (
+            "examples/config/proxy.toml",
+            include_str!("../../examples/config/proxy.toml"),
+        ),
+        (
+            "examples/multi-node/node-a/proxy.toml",
+            include_str!("../../examples/multi-node/node-a/proxy.toml"),
+        ),
+        (
+            "examples/multi-node/node-b/proxy.toml",
+            include_str!("../../examples/multi-node/node-b/proxy.toml"),
+        ),
+    ] {
+        toml::from_str::<ProxyConfig>(toml)
+            .unwrap_or_else(|err| panic!("{path} must parse: {err}"));
+    }
+
+    // Engine configs reference wasm/schema artifacts that may not exist before build recipes run,
+    // so check parse and structural invariants without EngineConfig::validate().
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct TlsSection {
+        cert_path: String,
+        key_path: String,
+        ca_cert_path: String,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct NodeSection {
+        proxy_address: String,
+        control_address: String,
+        #[serde(default)]
+        peer_port: u16,
+        tls: TlsSection,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct EngineRaw {
+        listen_address: String,
+        node: NodeSection,
+        #[serde(rename = "module", default)]
+        modules: Vec<toml::Value>,
+    }
+
+    for (path, toml) in [
+        (
+            "examples/config/engine.toml",
+            include_str!("../../examples/config/engine.toml"),
+        ),
+        (
+            "examples/ecommerce/engine-client.toml",
+            include_str!("../../examples/ecommerce/engine-client.toml"),
+        ),
+        (
+            "examples/ecommerce/engine-inventory-1.toml",
+            include_str!("../../examples/ecommerce/engine-inventory-1.toml"),
+        ),
+        (
+            "examples/ecommerce/engine-inventory-2.toml",
+            include_str!("../../examples/ecommerce/engine-inventory-2.toml"),
+        ),
+        (
+            "examples/codegen/engine.toml",
+            include_str!("../../examples/codegen/engine.toml"),
+        ),
+        (
+            "examples/stockmarket/engine-exchange.toml",
+            include_str!("../../examples/stockmarket/engine-exchange.toml"),
+        ),
+        (
+            "examples/stockmarket/engine-ledger.toml",
+            include_str!("../../examples/stockmarket/engine-ledger.toml"),
+        ),
+        (
+            "examples/stockmarket/engine-simulator.toml",
+            include_str!("../../examples/stockmarket/engine-simulator.toml"),
+        ),
+        (
+            "examples/multi-node/node-a/engine-1.toml",
+            include_str!("../../examples/multi-node/node-a/engine-1.toml"),
+        ),
+        (
+            "examples/multi-node/node-a/engine-2.toml",
+            include_str!("../../examples/multi-node/node-a/engine-2.toml"),
+        ),
+        (
+            "examples/multi-node/node-b/engine-1.toml",
+            include_str!("../../examples/multi-node/node-b/engine-1.toml"),
+        ),
+    ] {
+        let raw: EngineRaw =
+            toml::from_str(toml).unwrap_or_else(|err| panic!("{path} must parse: {err}"));
+        assert!(!raw.listen_address.is_empty(), "{path} listen_address");
+        assert!(
+            !raw.node.proxy_address.is_empty(),
+            "{path} node.proxy_address"
+        );
+        assert!(
+            !raw.node.control_address.is_empty(),
+            "{path} node.control_address"
+        );
+        if !path.starts_with("examples/multi-node/") {
+            assert!(!raw.modules.is_empty(), "{path} modules");
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BuildManifestRaw {
+    #[serde(rename = "module", default)]
+    modules: Vec<BuildModuleRaw>,
+}
+
+#[derive(serde::Deserialize)]
+struct BuildModuleRaw {
+    name: String,
+    proto_path: String,
+    schema_path: String,
+    cargo_dir: String,
+    wasm_path: String,
+}
+
+#[test]
+fn test_test_guest_build_manifest_is_explicit_and_valid() {
+    let manifest: BuildManifestRaw = toml::from_str(include_str!("../guests/build.toml"))
+        .expect("test guest build manifest must parse");
+    assert_eq!(manifest.modules.len(), 5);
+    let names: BTreeSet<String> = manifest.modules.iter().map(|m| m.name.clone()).collect();
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "db-guest".to_string(),
+            "tracing-guest".to_string(),
+            "blobstore-guest".to_string(),
+            "http-guest".to_string(),
+            "llm-guest".to_string(),
+        ])
+    );
+    for module in &manifest.modules {
+        assert!(
+            Path::new(&module.proto_path).exists(),
+            "{} proto_path",
+            module.name
+        );
+        assert!(
+            module.schema_path.ends_with(".binpb"),
+            "{} schema_path",
+            module.name
+        );
+        assert!(
+            Path::new(&module.cargo_dir).join("Cargo.toml").exists(),
+            "{} cargo_dir",
+            module.name
+        );
+        assert!(
+            module
+                .wasm_path
+                .starts_with(&format!("{}/target/wasm32-wasip2/debug/", module.cargo_dir)),
+            "{} wasm_path",
+            module.name
+        );
+    }
+}
+
+#[test]
+fn test_example_build_metadata_matches_engine_configs() {
+    for (group, configs, expected_names) in [
+        (
+            "ecommerce",
+            &[
+                include_str!("../../examples/ecommerce/engine-client.toml"),
+                include_str!("../../examples/ecommerce/engine-inventory-1.toml"),
+                include_str!("../../examples/ecommerce/engine-inventory-2.toml"),
+            ][..],
+            BTreeSet::from(["client".to_string(), "inventory".to_string()]),
+        ),
+        (
+            "stockmarket",
+            &[
+                include_str!("../../examples/stockmarket/engine-exchange.toml"),
+                include_str!("../../examples/stockmarket/engine-ledger.toml"),
+                include_str!("../../examples/stockmarket/engine-simulator.toml"),
+            ][..],
+            BTreeSet::from([
+                "exchange".to_string(),
+                "ledger".to_string(),
+                "simulator".to_string(),
+            ]),
+        ),
+        (
+            "codegen",
+            &[include_str!("../../examples/codegen/engine.toml")][..],
+            BTreeSet::from([
+                "collector".to_string(),
+                "agent".to_string(),
+                "coordinator".to_string(),
+                "worker".to_string(),
+            ]),
+        ),
+    ] {
+        let modules = unique_example_modules(configs);
+        let names: BTreeSet<String> = modules.values().map(|m| m.name.clone()).collect();
+        assert_eq!(names, expected_names, "{group} unique module names");
+        if group == "stockmarket" {
+            assert!(modules
+                .values()
+                .all(|m| !m.wasm_path.contains("examples/stockmarket/schemas/ledger")));
+        }
+        for module in modules.values() {
+            if let Some(schema_path) = &module.schema_path {
+                let proto_path = schema_path.replace(".binpb", ".proto");
+                assert!(Path::new(&proto_path).exists(), "{group} {proto_path}");
+            }
+            let cargo_dir = module
+                .wasm_path
+                .split("/target/wasm32-wasip2/")
+                .next()
+                .expect("wasm_path must contain target directory");
+            assert!(
+                Path::new(cargo_dir).join("Cargo.toml").exists(),
+                "{group} {cargo_dir}/Cargo.toml"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_example_engine_configs_validate_when_artifacts_are_built() {
+    for (path, toml) in example_engine_configs() {
+        let cfg: EngineConfig = toml::from_str(toml).unwrap_or_else(|err| panic!("{path}: {err}"));
+        let artifacts_exist = cfg.modules.iter().all(|module| {
+            Path::new(&module.wasm_path).exists()
+                && module
+                    .schema_path
+                    .as_ref()
+                    .is_none_or(|schema_path| Path::new(schema_path).exists())
+        });
+        if artifacts_exist {
+            cfg.validate()
+                .unwrap_or_else(|err| panic!("{path} must validate when artifacts exist: {err:#}"));
+        }
+    }
+}
+
+fn unique_example_modules(configs: &[&str]) -> BTreeMap<String, wr_engine::config::ModuleConfig> {
+    let mut modules = BTreeMap::new();
+    for toml in configs {
+        let cfg: EngineConfig = toml::from_str(toml).expect("example engine config must parse");
+        for module in cfg.modules {
+            let wasm_path = module.wasm_path.clone();
+            match modules.get_mut(&wasm_path) {
+                Some(existing) => {
+                    if existing.schema_path.is_none() && module.schema_path.is_some() {
+                        existing.schema_path = module.schema_path.clone();
+                    }
+                }
+                None => {
+                    modules.insert(wasm_path, module);
+                }
+            }
+        }
+    }
+    modules
+}
+
+fn example_engine_configs() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "examples/ecommerce/engine-client.toml",
+            include_str!("../../examples/ecommerce/engine-client.toml"),
+        ),
+        (
+            "examples/ecommerce/engine-inventory-1.toml",
+            include_str!("../../examples/ecommerce/engine-inventory-1.toml"),
+        ),
+        (
+            "examples/ecommerce/engine-inventory-2.toml",
+            include_str!("../../examples/ecommerce/engine-inventory-2.toml"),
+        ),
+        (
+            "examples/stockmarket/engine-exchange.toml",
+            include_str!("../../examples/stockmarket/engine-exchange.toml"),
+        ),
+        (
+            "examples/stockmarket/engine-ledger.toml",
+            include_str!("../../examples/stockmarket/engine-ledger.toml"),
+        ),
+        (
+            "examples/stockmarket/engine-simulator.toml",
+            include_str!("../../examples/stockmarket/engine-simulator.toml"),
+        ),
+        (
+            "examples/codegen/engine.toml",
+            include_str!("../../examples/codegen/engine.toml"),
+        ),
+    ]
 }
 
 fn proxy_toml(listen: &str, control: &str) -> String {

@@ -1,6 +1,9 @@
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::{
+    manager::{manager_trio, register_test_module, synced_routing_table},
+    proxy::{http_client, proxy_get, start_egress_proxy, EgressConfig},
+    stubs::{spawn_http1_stub, spawn_stub_engine},
+};
 
 use anyhow::Result;
 use bytes::Bytes;

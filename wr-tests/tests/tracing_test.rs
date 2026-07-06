@@ -1,6 +1,5 @@
-#[allow(dead_code, unused_imports)]
 mod helpers;
-use helpers::*;
+use helpers::wasm::tracing_state;
 
 #[tokio::test]
 async fn test_tracing_span_start_and_drop() {

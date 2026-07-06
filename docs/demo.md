@@ -702,9 +702,10 @@ pub fn generate_test_pki() -> TestPki {
 ```
 
 A single test can stand up the full system:
+
 - `start_manager()` — gRPC server on a random port
 - `start_proxy()` — proxy with live routing table sync
 - `spawn_stub_engine()` — minimal HTTP server for assertions
 - `manager_pool()` — isolated Postgres schema per test with automatic cleanup
 
-Every integration test is fully isolated, runs in parallel, and completes in milliseconds.
+Integration tests are isolated and can run in parallel. DB-, S3-, and WASM-backed cases use the shared test helper policy for prerequisites and may take longer than pure in-process routing tests.

@@ -221,9 +221,12 @@ Manager deployment follows the same pattern (`wr managers bundle` / `wr managers
 | [`sccache`](https://github.com/mozilla/sccache) | Compilation cache — speeds up rebuilds and fresh clones (install: `cargo install sccache`) |
 
 ```bash
-just build          # debug build
-just build-release  # release build
-just test           # all tests
+just build               # debug build
+just build-release       # release build
+just dev-up              # start Postgres/RustFS for integration tests and examples
+just test                # all tests with test DB/S3 env vars set
+just test-wasm           # WASM host binding tests
+just validate-ecommerce  # ecommerce inline run with zero-warning enforcement
 ```
 
 ## Project layout
