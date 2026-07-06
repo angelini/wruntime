@@ -49,7 +49,7 @@ wr-node/
 │   ├── wr-proxy
 │   └── wr-engine
 ├── config/
-│   ├── proxy.toml               # template with {db_url}, {host}
+│   ├── proxy.toml               # template generated or sourced from --proxy-config; {db_url}, {host}
 │   └── engine.toml              # template with {db_url}
 ├── modules/
 │   ├── order-service.wasm
@@ -81,10 +81,11 @@ Instead of passing every flag on the command line, you can create a `wr-deploy.t
 format     = "systemd"
 target     = "aarch64-unknown-linux-gnu"
 workdir    = "/opt/wruntime"
+proxy_config = "examples/config/proxy.toml"
 db_url     = "postgres://postgres@10.0.1.1:5432/wruntime"
 secret_key = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 ssh_key    = "~/.ssh/deploy_key"
-seed_nodes = ["10.0.1.11:9010", "10.0.1.12:9010"]
+seed_nodes = ["10.0.1.11:9010", "10.0.1.12:9010"] # metadata/reserved; not emitted into manager runtime TOML
 cert_dir   = "./certs"    # CA + node certs from `wr cert`
 peer_port  = 9443         # mTLS peer listener port
 # ssh_port     = 22
@@ -92,6 +93,10 @@ peer_port  = 9443         # mTLS peer listener port
 ```
 
 All fields are optional. Fields that only apply to specific commands (e.g. `secret_key` for managers) are silently ignored when unused. CLI flags always override the config file.
+
+`proxy_config` applies to `wr node bundle`: when set (or passed as `--proxy-config` / `WR_PROXY_CONFIG`), the node bundle uses that source proxy TOML, templates deploy-varying database/node/TLS values, and preserves proxy runtime sections such as `[circuit_breaker]`, `[egress]`, and `[external]`. When omitted, the CLI keeps generating a minimal proxy config from the engine node settings.
+
+`seed_nodes` is deployment metadata/reserved for future gossip bootstrapping UX. It is accepted from `wr-deploy.toml` / `--seed-node` for compatibility, but the deploy flow does not write `cluster.seed_nodes` into runtime `manager.toml` by default because the runtime manager config has no such field.
 
 **Environment variables** are also supported for all deploy-related fields:
 
@@ -103,6 +108,7 @@ All fields are optional. Fields that only apply to specific commands (e.g. `secr
 | `--ssh-key` | `WR_SSH_KEY` | — |
 | `--ssh-port` | `WR_SSH_PORT` | SSH default |
 | `--target` | `WR_TARGET` | `x86_64-unknown-linux-gnu` |
+| `--proxy-config` | `WR_PROXY_CONFIG` | — |
 | `--advertise-address` | `WR_ADVERTISE_ADDRESS` | derived from remote host |
 | `--manager` | `WR_MANAGER` | — |
 | `--cert-dir` | `WR_CERT_DIR` | — |
@@ -142,7 +148,11 @@ wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.1
 
 # 3. Bundle node
 wr-cli node bundle --engine-config engine.toml
+```
 
+Add `--proxy-config examples/config/proxy.toml` (or set `proxy_config` in `wr-deploy.toml`) when the source proxy config has runtime sections such as egress allowlists, external routes, or non-default circuit-breaker settings that must be preserved in the bundle.
+
+```bash
 # 4. Deploy node
 wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.1 --manager http://10.0.1.1:9000
 
@@ -172,7 +182,7 @@ wr-cli node deploy myapp.tar.gz deploy@10.0.1.1 \
     --manager http://10.0.1.1:9000
 ```
 
-Deploy steps (systemd): SCP tarball, unpack to `--workdir` (default `/opt/wruntime`), install systemd units, resolve config templates, restart services, poll manager until the engine registers (60s timeout).
+Deploy steps (systemd): SCP tarball, unpack to `--workdir` (default `/opt/wruntime`), install static units, resolve and upload config templates, provision TLS certificates, start services once with the final runtime files in place, then poll manager until the engine registers (60s timeout).
 
 ## Multi-node cluster setup
 

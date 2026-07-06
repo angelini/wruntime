@@ -135,11 +135,17 @@ impl ServiceGuest for Component {
 `engine.toml`:
 
 ```toml
-listen_address  = "0.0.0.0:9100"
-manager_address = "http://127.0.0.1:9000"
+listen_address = "127.0.0.1:9100"
 
 [node]
-proxy_address = "http://127.0.0.1:9001"
+proxy_address   = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_port       = 9443
+
+[node.tls]
+cert_path    = "certs/127.0.0.1.crt"
+key_path     = "certs/127.0.0.1.key"
+ca_cert_path = "certs/ca.crt"
 
 [[module]]
 name        = "echo"

@@ -322,6 +322,56 @@ fn bundle(args: BundleArgs) -> Result<()> {
 
 // --- deploy ---
 
+fn resolve_manager_config_template(
+    config_template: &str,
+    db_url: &str,
+    advertise_address: &str,
+) -> Result<String> {
+    let mut vars = HashMap::new();
+    vars.insert("db_url", db_url);
+    vars.insert("advertise_address", advertise_address);
+    helpers::resolve_template(config_template, &vars)
+        .context("failed to resolve template in manager.toml")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagerDeployPhase {
+    PrepareBundle,
+    InstallResolvedRuntimeArtifacts,
+    UploadResolvedConfig,
+    ProvisionTls,
+    CaptureFirstStartTimestamp,
+    FirstStart,
+}
+
+const MANAGER_DEPLOY_PHASE_ORDER: [ManagerDeployPhase; 6] = [
+    ManagerDeployPhase::PrepareBundle,
+    ManagerDeployPhase::InstallResolvedRuntimeArtifacts,
+    ManagerDeployPhase::UploadResolvedConfig,
+    ManagerDeployPhase::ProvisionTls,
+    ManagerDeployPhase::CaptureFirstStartTimestamp,
+    ManagerDeployPhase::FirstStart,
+];
+
+fn manager_deploy_phase_order(_format: &DeployFormat) -> &'static [ManagerDeployPhase] {
+    &MANAGER_DEPLOY_PHASE_ORDER
+}
+
+fn manager_secret_template_archive_paths() -> &'static [&'static str] {
+    &[
+        "wr-manager/systemd/wr-manager.service",
+        "wr-manager/docker/Dockerfile.manager",
+    ]
+}
+
+fn manager_systemd_start_command() -> &'static str {
+    "sudo systemctl daemon-reload && sudo systemctl enable --now wr-manager.service"
+}
+
+fn manager_docker_start_command(workdir: &str) -> String {
+    format!("cd {workdir}/wr-manager && sudo docker compose -f docker/docker-compose.yml up -d")
+}
+
 async fn deploy(args: DeployArgs) -> Result<()> {
     if !Path::new(&args.bundle).exists() {
         bail!("Bundle not found: {}", args.bundle);
@@ -357,145 +407,108 @@ async fn deploy(args: DeployArgs) -> Result<()> {
             }
         };
 
-    // Merge seed_nodes: CLI wins if non-empty, otherwise use config
-    let seed_nodes = if args.seed_nodes.is_empty() {
-        deploy_cfg.seed_nodes.unwrap_or_default()
-    } else {
-        args.seed_nodes
-    };
-
     let config_template = bundle::read_file_from_tarball(&args.bundle, "manager.toml")?;
+    let resolved = resolve_manager_config_template(&config_template, &db_url, &advertise_address)?;
 
-    // Resolve template variables
-    let mut vars = HashMap::new();
-    vars.insert("db_url", db_url.as_str());
-    vars.insert("advertise_address", advertise_address.as_str());
-    let mut resolved = helpers::resolve_template(&config_template, &vars)
-        .context("failed to resolve template in manager.toml")?;
-
-    // Inject seed_nodes if provided (append to [cluster] section)
-    if !seed_nodes.is_empty() {
-        let mut config: ManagerConfig =
-            toml::from_str(&resolved).context("failed to parse resolved manager config")?;
-        config.cluster.seed_nodes = seed_nodes;
-        resolved = config.to_toml()?;
-    }
-
-    match format {
-        DeployFormat::Systemd => {
-            deploy_systemd(
-                &args.bundle,
-                &args.remote,
-                ssh_key.as_deref(),
-                ssh_port,
-                &manifest,
-                &ssh_base,
-            )?;
-        }
-        DeployFormat::Docker => {
-            deploy_docker(
-                &args.bundle,
-                &args.remote,
-                ssh_key.as_deref(),
-                ssh_port,
-                &manifest,
-                &ssh_base,
-            )?;
-        }
-    }
-
-    // Resolve {secret_key}, {run_user}, {run_group} in systemd unit and reinstall
-    print!("[deploy]  resolving secrets ... ");
-    let workdir = &manifest.workdir;
-    let run_user = helpers::extract_remote_user(&args.remote)
-        .unwrap_or("root")
-        .to_string();
-    let service_template =
-        bundle::read_file_from_tarball(&args.bundle, "wr-manager/systemd/wr-manager.service")?;
-    let mut secret_vars = HashMap::new();
-    secret_vars.insert("secret_key", secret_key.as_str());
-    secret_vars.insert("run_user", run_user.as_str());
-    secret_vars.insert("run_group", run_user.as_str());
-    let resolved_service = helpers::resolve_template(&service_template, &secret_vars)
-        .context("failed to resolve secret_key in systemd unit")?;
-    let service_path = format!("{workdir}/wr-manager/systemd/wr-manager.service");
-    helpers::scp_bytes(
-        resolved_service.as_bytes(),
-        &args.remote,
-        &service_path,
-        ssh_key.as_deref(),
-        ssh_port,
-    )?;
-    if matches!(format, DeployFormat::Systemd) {
-        helpers::run_ssh(
-            &ssh_base,
-            &format!("sudo cp {service_path} /etc/systemd/system/ && sudo systemctl daemon-reload"),
-        )?;
-    }
-    println!("OK");
-
-    // Overwrite template config with resolved version
-    print!("[deploy]  writing resolved config ... ");
-    let remote_path = format!("{}/wr-manager/config/manager.toml", manifest.workdir);
-    helpers::scp_bytes(
-        resolved.as_bytes(),
-        &args.remote,
-        &remote_path,
-        ssh_key.as_deref(),
-        ssh_port,
-    )
-    .context("failed to upload resolved manager.toml")?;
-    println!("OK");
-
-    // Provision TLS certificates on the remote host
-    {
-        print!("[deploy]  provisioning TLS certificates ... ");
-        let remote_cert_dir = format!("{}/wr-manager/certs", manifest.workdir);
-
-        let host = helpers::extract_remote_host(&args.remote);
-        let ca_cert = format!("{cert_dir}/ca.crt");
-        let host_cert = format!("{cert_dir}/{host}.crt");
-        let host_key = format!("{cert_dir}/{host}.key");
-
-        for (local, remote_name) in [
-            (&ca_cert, "ca.crt"),
-            (&host_cert, "manager.crt"),
-            (&host_key, "manager.key"),
-        ] {
-            if !Path::new(local).exists() {
-                bail!("Certificate file not found: {local}. Run `wr cert generate {host}` first.");
+    let mut first_start_timestamp = String::new();
+    for phase in manager_deploy_phase_order(&format) {
+        match phase {
+            ManagerDeployPhase::PrepareBundle => match format {
+                DeployFormat::Systemd => {
+                    prepare_systemd(
+                        &args.bundle,
+                        &args.remote,
+                        ssh_key.as_deref(),
+                        ssh_port,
+                        &manifest,
+                        &ssh_base,
+                    )?;
+                }
+                DeployFormat::Docker => {
+                    prepare_docker(
+                        &args.bundle,
+                        &args.remote,
+                        ssh_key.as_deref(),
+                        ssh_port,
+                        &manifest,
+                        &ssh_base,
+                    )?;
+                }
+            },
+            ManagerDeployPhase::InstallResolvedRuntimeArtifacts => {
+                install_resolved_manager_runtime_artifacts(&ManagerRuntimeArtifactInstall {
+                    bundle: &args.bundle,
+                    remote: &args.remote,
+                    ssh_key: ssh_key.as_deref(),
+                    ssh_port,
+                    manifest: &manifest,
+                    ssh_base: &ssh_base,
+                    secret_key: &secret_key,
+                    format: &format,
+                })?;
             }
-            let tmp_path = format!("/tmp/{remote_name}");
-            helpers::scp_file(local, &args.remote, &tmp_path, ssh_key.as_deref(), ssh_port)
-                .with_context(|| format!("failed to upload {local}"))?;
-            helpers::run_ssh(
-                &ssh_base,
-                &format!("sudo mkdir -p {remote_cert_dir} && sudo mv {tmp_path} {remote_cert_dir}/{remote_name}"),
-            )?;
-        }
-        println!("OK");
-    }
+            ManagerDeployPhase::UploadResolvedConfig => {
+                // Overwrite template config with resolved version
+                print!("[deploy]  writing resolved config ... ");
+                let remote_path = format!("{}/wr-manager/config/manager.toml", manifest.workdir);
+                helpers::scp_bytes(
+                    resolved.as_bytes(),
+                    &args.remote,
+                    &remote_path,
+                    ssh_key.as_deref(),
+                    ssh_port,
+                )
+                .context("failed to upload resolved manager.toml")?;
+                println!("OK");
+            }
+            ManagerDeployPhase::ProvisionTls => {
+                // Provision TLS certificates on the remote host
+                print!("[deploy]  provisioning TLS certificates ... ");
+                let remote_cert_dir = format!("{}/wr-manager/certs", manifest.workdir);
 
-    // Capture remote timestamp before restart to anchor the post-deploy log dump
-    let restart_timestamp = helpers::get_remote_timestamp(&ssh_base).unwrap_or_default();
+                let host = helpers::extract_remote_host(&args.remote);
+                let ca_cert = format!("{cert_dir}/ca.crt");
+                let host_cert = format!("{cert_dir}/{host}.crt");
+                let host_key = format!("{cert_dir}/{host}.key");
 
-    // Restart service so it picks up the resolved config
-    print!("[deploy]  restarting service ... ");
-    match format {
-        DeployFormat::Systemd => {
-            helpers::run_ssh(&ssh_base, "sudo systemctl restart wr-manager.service")?;
-        }
-        DeployFormat::Docker => {
-            helpers::run_ssh(
-                &ssh_base,
-                &format!(
-                    "cd {}/wr-manager && sudo docker compose -f docker/docker-compose.yml restart",
-                    manifest.workdir
-                ),
-            )?;
+                for (local, remote_name) in [
+                    (&ca_cert, "ca.crt"),
+                    (&host_cert, "manager.crt"),
+                    (&host_key, "manager.key"),
+                ] {
+                    if !Path::new(local).exists() {
+                        bail!("Certificate file not found: {local}. Run `wr cert generate {host}` first.");
+                    }
+                    let tmp_path = format!("/tmp/{remote_name}");
+                    helpers::scp_file(local, &args.remote, &tmp_path, ssh_key.as_deref(), ssh_port)
+                        .with_context(|| format!("failed to upload {local}"))?;
+                    helpers::run_ssh(
+                        &ssh_base,
+                        &format!("sudo mkdir -p {remote_cert_dir} && sudo mv {tmp_path} {remote_cert_dir}/{remote_name}"),
+                    )?;
+                }
+                println!("OK");
+            }
+            ManagerDeployPhase::CaptureFirstStartTimestamp => {
+                // Capture remote timestamp before first start to anchor the post-deploy log dump
+                first_start_timestamp =
+                    helpers::get_remote_timestamp(&ssh_base).unwrap_or_default();
+            }
+            ManagerDeployPhase::FirstStart => {
+                match format {
+                    DeployFormat::Systemd => {
+                        print!("[deploy]  starting service ... ");
+                        start_systemd(&ssh_base)?;
+                    }
+                    DeployFormat::Docker => {
+                        print!("[deploy]  starting container ... ");
+                        start_docker(&ssh_base, &manifest)?;
+                    }
+                }
+                println!("OK");
+            }
         }
     }
-    println!("OK");
 
     // Configure mTLS so the readiness check can connect to the TLS-enabled manager.
     // Cert files are named by the SSH host alias; the cert must include the resolved
@@ -538,14 +551,14 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     }
 
     // Dump all startup logs from the deploy window (catches fast starts the tail missed)
-    if !restart_timestamp.is_empty() {
+    if !first_start_timestamp.is_empty() {
         println!();
         println!("[deploy]  startup logs:");
         let dump_cmd = match format {
             DeployFormat::Systemd => super::logs::build_journalctl_command_absolute(
                 Some("wr-manager"),
                 200,
-                &restart_timestamp,
+                &first_start_timestamp,
                 false,
             ),
             DeployFormat::Docker => {
@@ -559,7 +572,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     Ok(())
 }
 
-fn deploy_systemd(
+fn prepare_systemd(
     bundle: &str,
     remote: &str,
     ssh_key: Option<&str>,
@@ -587,24 +600,10 @@ fn deploy_systemd(
     )?;
     println!("OK");
 
-    print!("[deploy]  installing systemd unit ... ");
-    helpers::run_ssh(
-        ssh_base,
-        &format!("sudo cp {workdir}/wr-manager/systemd/wr-manager.service /etc/systemd/system/"),
-    )?;
-    println!("OK");
-
-    print!("[deploy]  starting service ... ");
-    helpers::run_ssh(
-        ssh_base,
-        "sudo systemctl daemon-reload && sudo systemctl enable --now wr-manager.service",
-    )?;
-    println!("OK");
-
     Ok(())
 }
 
-fn deploy_docker(
+fn prepare_docker(
     bundle: &str,
     remote: &str,
     ssh_key: Option<&str>,
@@ -631,16 +630,64 @@ fn deploy_docker(
     )?;
     println!("OK");
 
-    print!("[deploy]  starting container ... ");
-    helpers::run_ssh(
-        ssh_base,
-        &format!(
-            "cd {workdir}/wr-manager && sudo docker compose -f docker/docker-compose.yml up -d"
-        ),
-    )?;
-    println!("OK");
-
     Ok(())
+}
+
+struct ManagerRuntimeArtifactInstall<'a> {
+    bundle: &'a str,
+    remote: &'a str,
+    ssh_key: Option<&'a str>,
+    ssh_port: Option<u16>,
+    manifest: &'a ManagerManifest,
+    ssh_base: &'a [String],
+    secret_key: &'a str,
+    format: &'a DeployFormat,
+}
+
+fn install_resolved_manager_runtime_artifacts(
+    params: &ManagerRuntimeArtifactInstall<'_>,
+) -> Result<()> {
+    print!("[deploy]  resolving secrets ... ");
+    let workdir = &params.manifest.workdir;
+    let run_user = helpers::extract_remote_user(params.remote)
+        .unwrap_or("root")
+        .to_string();
+    let mut secret_vars = HashMap::new();
+    secret_vars.insert("secret_key", params.secret_key);
+    secret_vars.insert("run_user", run_user.as_str());
+    secret_vars.insert("run_group", run_user.as_str());
+
+    for archive_path in manager_secret_template_archive_paths() {
+        let template = bundle::read_file_from_tarball(params.bundle, archive_path)?;
+        let resolved = helpers::resolve_template(&template, &secret_vars)
+            .with_context(|| format!("failed to resolve secrets in {archive_path}"))?;
+        let remote_path = format!("{workdir}/{archive_path}");
+        helpers::scp_bytes(
+            resolved.as_bytes(),
+            params.remote,
+            &remote_path,
+            params.ssh_key,
+            params.ssh_port,
+        )?;
+    }
+
+    if matches!(params.format, DeployFormat::Systemd) {
+        let service_path = format!("{workdir}/wr-manager/systemd/wr-manager.service");
+        helpers::run_ssh(
+            params.ssh_base,
+            &format!("sudo cp {service_path} /etc/systemd/system/ && sudo systemctl daemon-reload"),
+        )?;
+    }
+    println!("OK");
+    Ok(())
+}
+
+fn start_systemd(ssh_base: &[String]) -> Result<()> {
+    helpers::run_ssh(ssh_base, manager_systemd_start_command())
+}
+
+fn start_docker(ssh_base: &[String], manifest: &ManagerManifest) -> Result<()> {
+    helpers::run_ssh(ssh_base, &manager_docker_start_command(&manifest.workdir))
 }
 
 // --- status ---
@@ -676,4 +723,122 @@ fn status(args: StatusArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manager_deploy_resolution_does_not_inject_seed_nodes() {
+        let deploy_cfg: DeployConfig = toml::from_str(
+            r#"
+seed_nodes = ["10.0.0.2:9010"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            deploy_cfg.seed_nodes.as_ref().unwrap(),
+            &vec!["10.0.0.2:9010".to_string()]
+        );
+
+        let template = r#"
+listen_address = "127.0.0.1:9000"
+local_proxy_address = "http://127.0.0.1:9001"
+
+[database]
+url = "{db_url}"
+
+[cluster]
+cluster_id = "local"
+gossip_listen_address = "127.0.0.1:9010"
+advertise_grpc_address = "{advertise_address}"
+"#;
+        let resolved = resolve_manager_config_template(
+            template,
+            "postgres://postgres@localhost/wruntime",
+            "https://10.0.0.1:9000",
+        )
+        .unwrap();
+        let value: toml::Value = toml::from_str(&resolved).unwrap();
+        assert!(value["cluster"].get("seed_nodes").is_none());
+        assert_eq!(
+            value["database"]["url"].as_str(),
+            Some("postgres://postgres@localhost/wruntime")
+        );
+        assert_eq!(
+            value["cluster"]["advertise_grpc_address"].as_str(),
+            Some("https://10.0.0.1:9000")
+        );
+    }
+
+    fn index_of<T: PartialEq + std::fmt::Debug>(items: &[T], needle: T) -> usize {
+        items
+            .iter()
+            .position(|item| item == &needle)
+            .expect("expected item in deploy phase order")
+    }
+
+    #[test]
+    fn manager_systemd_deploy_sequence_starts_after_runtime_artifacts() {
+        let phases = manager_deploy_phase_order(&DeployFormat::Systemd);
+        assert!(
+            index_of(phases, ManagerDeployPhase::PrepareBundle)
+                < index_of(phases, ManagerDeployPhase::InstallResolvedRuntimeArtifacts)
+        );
+        assert!(
+            index_of(phases, ManagerDeployPhase::InstallResolvedRuntimeArtifacts)
+                < index_of(phases, ManagerDeployPhase::UploadResolvedConfig)
+        );
+        assert!(
+            index_of(phases, ManagerDeployPhase::UploadResolvedConfig)
+                < index_of(phases, ManagerDeployPhase::ProvisionTls)
+        );
+        assert!(
+            index_of(phases, ManagerDeployPhase::ProvisionTls)
+                < index_of(phases, ManagerDeployPhase::CaptureFirstStartTimestamp)
+        );
+        assert!(
+            index_of(phases, ManagerDeployPhase::CaptureFirstStartTimestamp)
+                < index_of(phases, ManagerDeployPhase::FirstStart)
+        );
+        assert!(manager_systemd_start_command().contains("enable --now wr-manager.service"));
+        assert!(!manager_systemd_start_command().contains("restart"));
+        let cfg: DeployConfig = toml::from_str(r#"seed_nodes = ["10.0.0.2:9010"]"#).unwrap();
+        assert_eq!(cfg.seed_nodes.as_ref().unwrap().len(), 1);
+        assert_eq!(phases, manager_deploy_phase_order(&DeployFormat::Systemd));
+    }
+
+    #[test]
+    fn manager_docker_deploy_sequence_resolves_artifacts_before_compose_start() {
+        let phases = manager_deploy_phase_order(&DeployFormat::Docker);
+        assert!(
+            index_of(phases, ManagerDeployPhase::PrepareBundle)
+                < index_of(phases, ManagerDeployPhase::InstallResolvedRuntimeArtifacts)
+        );
+        assert!(
+            index_of(phases, ManagerDeployPhase::InstallResolvedRuntimeArtifacts)
+                < index_of(phases, ManagerDeployPhase::UploadResolvedConfig)
+        );
+        assert!(
+            index_of(phases, ManagerDeployPhase::UploadResolvedConfig)
+                < index_of(phases, ManagerDeployPhase::ProvisionTls)
+        );
+        assert!(
+            index_of(phases, ManagerDeployPhase::ProvisionTls)
+                < index_of(phases, ManagerDeployPhase::CaptureFirstStartTimestamp)
+        );
+        assert!(
+            index_of(phases, ManagerDeployPhase::CaptureFirstStartTimestamp)
+                < index_of(phases, ManagerDeployPhase::FirstStart)
+        );
+        assert!(manager_secret_template_archive_paths()
+            .contains(&"wr-manager/systemd/wr-manager.service"));
+        assert!(manager_secret_template_archive_paths()
+            .contains(&"wr-manager/docker/Dockerfile.manager"));
+        let command = manager_docker_start_command("/opt/wruntime");
+        assert!(command.contains("docker compose"));
+        assert!(command.contains("up -d"));
+        assert!(!command.contains("restart"));
+    }
 }

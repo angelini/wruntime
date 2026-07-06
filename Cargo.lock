@@ -5238,6 +5238,9 @@ dependencies = [
  "tonic",
  "wasmtime",
  "wr-common",
+ "wr-engine",
+ "wr-manager",
+ "wr-proxy",
 ]
 
 [[package]]

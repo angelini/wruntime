@@ -10,7 +10,7 @@ use flate2::Compression;
 
 use super::build_helpers::{self, BuildModule};
 use super::bundle;
-use super::config::EngineConfig;
+use super::config::{EngineConfig, ProxyConfig};
 use super::deploy_config::{self, DeployConfig, DeployFormat};
 use super::helpers;
 use super::schedules::SchedulesFile;
@@ -40,6 +40,9 @@ pub struct BundleArgs {
     /// Deploy config file (default: auto-discover wr-deploy.toml in CWD)
     #[arg(long)]
     config: Option<String>,
+    /// Source proxy config file to preserve proxy-specific runtime sections
+    #[arg(long = "proxy-config", value_name = "PATH")]
+    proxy_config: Option<String>,
     /// Cargo target triple for cross-compilation
     #[arg(long, default_value = "x86_64-unknown-linux-gnu", env = "WR_TARGET")]
     target: String,
@@ -217,8 +220,8 @@ fn add_engine_artifacts(
                 )?;
             }
 
-            if !module.schema_path.is_empty() {
-                let schema_src = Path::new(&module.schema_path);
+            if let Some(schema_path) = module.schema_path.as_deref().filter(|s| !s.is_empty()) {
+                let schema_src = Path::new(schema_path);
                 if schema_src.exists() {
                     bundle::tar_add_file(
                         tar,
@@ -241,7 +244,7 @@ fn add_engine_artifacts(
                 name: module.name.clone(),
                 namespace: module.namespace.clone(),
                 version: module.version.clone(),
-                has_schema: !module.schema_path.is_empty(),
+                has_schema: module.schema_path.as_deref().is_some_and(|s| !s.is_empty()),
             });
         }
     }
@@ -250,12 +253,38 @@ fn add_engine_artifacts(
 }
 
 /// Generate a proxy config template from the engine configs and add it to the bundle.
-/// Returns the proxy listen port and control port.
+/// Returns the proxy listen port, control port, and artifact peer port.
 fn add_proxy_config(
     tar: &mut tar::Builder<GzEncoder<fs::File>>,
     config_names: &mut Vec<String>,
     all_engine_configs: &[(String, EngineConfig)],
-) -> Result<(u16, u16)> {
+    source_proxy_config: Option<&ProxyConfig>,
+    fallback_artifact_peer_port: u16,
+) -> Result<(u16, u16, u16)> {
+    if let Some(source) = source_proxy_config {
+        let control_address = source
+            .control_address
+            .as_deref()
+            .filter(|address| !address.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("--proxy-config requires control_address"))?;
+        let node = source
+            .node
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--proxy-config requires node"))?;
+        let proxy_port = helpers::extract_port(&source.listen_address);
+        let control_port = helpers::extract_port(control_address);
+        let artifact_peer_port = node.peer_port.unwrap_or(fallback_artifact_peer_port);
+        let proxy = source.to_bundle_config();
+        bundle::tar_add_bytes(
+            tar,
+            "wr-node/config/proxy.toml",
+            proxy.to_toml()?.as_bytes(),
+            0o644,
+        )?;
+        config_names.push("proxy.toml".to_string());
+        return Ok((proxy_port, control_port, artifact_peer_port));
+    }
+
     // Derive proxy/control ports from the first engine's node config
     let first = &all_engine_configs[0].1;
     let (proxy_port, control_port) = if let Some(ref node) = first.node {
@@ -274,7 +303,7 @@ fn add_proxy_config(
         .and_then(|n| n.peer_port)
         .unwrap_or(9443);
 
-    let proxy = super::config::ProxyConfig {
+    let proxy = ProxyConfig {
         listen_address: format!("127.0.0.1:{proxy_port}"),
         control_address: Some(format!("127.0.0.1:{control_port}")),
         node: Some(super::config::ProxyNodeConfig {
@@ -284,25 +313,30 @@ fn add_proxy_config(
                 cert_path: "certs/node.crt".to_string(),
                 key_path: "certs/node.key".to_string(),
                 ca_cert_path: "certs/ca.crt".to_string(),
+                extra: super::config::empty_extra_fields(),
             }),
+            extra: super::config::empty_extra_fields(),
         }),
         database: Some(super::config::ProxyDatabaseConfig {
             url: "{db_url}".to_string(),
+            extra: super::config::empty_extra_fields(),
         }),
         cache: Some(super::config::ProxyCacheConfig {
             routing_table_ttl_secs: 5,
+            extra: super::config::empty_extra_fields(),
         }),
+        extra: super::config::empty_extra_fields(),
     };
 
     bundle::tar_add_bytes(
         tar,
         "wr-node/config/proxy.toml",
-        proxy.to_toml()?.as_bytes(),
+        proxy.to_bundle_config().to_toml()?.as_bytes(),
         0o644,
     )?;
     config_names.push("proxy.toml".to_string());
 
-    Ok((proxy_port, control_port))
+    Ok((proxy_port, control_port, fallback_artifact_peer_port))
 }
 
 struct DeployArtifactParams<'a> {
@@ -487,6 +521,15 @@ fn bundle(args: BundleArgs) -> Result<()> {
     );
     let no_otel = deploy_config::resolve_no_otel(args.no_otel, deploy_cfg.no_otel);
     let peer_port = deploy_config::resolve_peer_port(args.peer_port, deploy_cfg.peer_port);
+    let proxy_config_path = deploy_config::resolve_string(
+        args.proxy_config,
+        deploy_cfg.proxy_config,
+        "WR_PROXY_CONFIG",
+    );
+    let source_proxy_config = proxy_config_path
+        .as_deref()
+        .map(ProxyConfig::from_file)
+        .transpose()?;
 
     // Parse all engine configs
     let mut all_engine_configs: Vec<(String, EngineConfig)> = Vec::new();
@@ -560,9 +603,14 @@ fn bundle(args: BundleArgs) -> Result<()> {
         bundle::tar_add_file(&mut tar, &mut checksums, &archive_path, &src, 0o755)?;
     }
 
-    // Add proxy config template (generated from engine node config)
-    let (proxy_port, control_port) =
-        add_proxy_config(&mut tar, &mut config_names, &all_engine_configs)?;
+    // Add proxy config template (generated from engine node config or source proxy config)
+    let (proxy_port, control_port, artifact_peer_port) = add_proxy_config(
+        &mut tar,
+        &mut config_names,
+        &all_engine_configs,
+        source_proxy_config.as_ref(),
+        peer_port,
+    )?;
 
     // Add engine configs + collect modules and artifacts
     let (engine_names, engine_listen_ports) = add_engine_artifacts(
@@ -589,7 +637,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
             engine_names: &engine_names,
             proxy_port,
             control_port,
-            peer_port,
+            peer_port: artifact_peer_port,
             engine_listen_ports: &engine_listen_ports,
             no_otel,
         },
@@ -635,6 +683,47 @@ fn bundle(args: BundleArgs) -> Result<()> {
 
 // --- deploy ---
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeDeployPhase {
+    PrepareBundle,
+    UploadResolvedConfigs,
+    ProvisionTls,
+    CaptureFirstStartTimestamp,
+    FirstStart,
+}
+
+const NODE_DEPLOY_PHASE_ORDER: [NodeDeployPhase; 5] = [
+    NodeDeployPhase::PrepareBundle,
+    NodeDeployPhase::UploadResolvedConfigs,
+    NodeDeployPhase::ProvisionTls,
+    NodeDeployPhase::CaptureFirstStartTimestamp,
+    NodeDeployPhase::FirstStart,
+];
+
+fn node_deploy_phase_order(_format: &DeployFormat) -> &'static [NodeDeployPhase] {
+    &NODE_DEPLOY_PHASE_ORDER
+}
+
+fn node_service_names(configs: &[String]) -> Vec<String> {
+    let mut service_names = vec!["wr-proxy.service".to_string()];
+    for config in configs {
+        if config != "proxy.toml" {
+            let stem = config.strip_suffix(".toml").unwrap_or(config);
+            service_names.push(format!("wr-engine-{stem}.service"));
+        }
+    }
+    service_names
+}
+
+fn node_systemd_start_command(configs: &[String]) -> String {
+    let services = node_service_names(configs).join(" ");
+    format!("sudo systemctl daemon-reload && sudo systemctl enable --now {services}")
+}
+
+fn node_docker_start_command(workdir: &str) -> String {
+    format!("cd {workdir}/wr-node && sudo docker compose -f docker/docker-compose.yml up -d")
+}
+
 async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     if !Path::new(&args.bundle).exists() {
         bail!("Bundle not found: {}", args.bundle);
@@ -672,101 +761,95 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
         resolved_configs.push((name.clone(), resolved));
     }
 
-    match format {
-        DeployFormat::Systemd => {
-            deploy_systemd(
-                &args.bundle,
-                &args.remote,
-                ssh_key.as_deref(),
-                ssh_port,
-                &manifest,
-                &ssh_base,
-            )
-            .await?;
-        }
-        DeployFormat::Docker => {
-            deploy_docker(
-                &args.bundle,
-                &args.remote,
-                ssh_key.as_deref(),
-                ssh_port,
-                &manifest,
-                &ssh_base,
-            )
-            .await?;
-        }
-    }
-
-    // Overwrite template configs with resolved versions
-    print!("[deploy]  writing resolved configs ... ");
-    for (name, content) in &resolved_configs {
-        let remote_path = format!("{}/wr-node/config/{name}", manifest.workdir);
-        helpers::scp_bytes(
-            content.as_bytes(),
-            &args.remote,
-            &remote_path,
-            ssh_key.as_deref(),
-            ssh_port,
-        )
-        .with_context(|| format!("failed to upload resolved {name}"))?;
-    }
-    println!("OK");
-
-    // Provision TLS certificates on the remote host
-    {
-        print!("[deploy]  provisioning TLS certificates ... ");
-        let remote_cert_dir = format!("{}/wr-node/certs", manifest.workdir);
-        let ca_cert = format!("{cert_dir}/ca.crt");
-        let host_cert = format!("{cert_dir}/{host_name}.crt");
-        let host_key = format!("{cert_dir}/{host_name}.key");
-
-        for (local, remote_name) in [
-            (&ca_cert, "ca.crt"),
-            (&host_cert, "node.crt"),
-            (&host_key, "node.key"),
-        ] {
-            if !Path::new(local).exists() {
-                bail!("Certificate file not found: {local}. Run `wr cert generate {host_name}` first.");
-            }
-            let tmp_path = format!("/tmp/{remote_name}");
-            helpers::scp_file(local, &args.remote, &tmp_path, ssh_key.as_deref(), ssh_port)
-                .with_context(|| format!("failed to upload {local}"))?;
-            helpers::run_ssh(
-                &ssh_base,
-                &format!("sudo mkdir -p {remote_cert_dir} && sudo mv {tmp_path} {remote_cert_dir}/{remote_name}"),
-            )?;
-        }
-        println!("OK");
-    }
-
-    // Capture remote timestamp before restart to anchor the post-deploy log dump
-    let restart_timestamp = helpers::get_remote_timestamp(&ssh_base).unwrap_or_default();
-
-    // Restart services so they pick up the resolved configs
-    print!("[deploy]  restarting services ... ");
-    match format {
-        DeployFormat::Systemd => {
-            let mut service_names = vec!["wr-proxy.service".to_string()];
-            for config in &manifest.configs {
-                if config != "proxy.toml" {
-                    let stem = config.strip_suffix(".toml").unwrap_or(config);
-                    service_names.push(format!("wr-engine-{stem}.service"));
+    let mut first_start_timestamp = String::new();
+    for phase in node_deploy_phase_order(&format) {
+        match phase {
+            NodeDeployPhase::PrepareBundle => match format {
+                DeployFormat::Systemd => {
+                    prepare_systemd(
+                        &args.bundle,
+                        &args.remote,
+                        ssh_key.as_deref(),
+                        ssh_port,
+                        &manifest,
+                        &ssh_base,
+                    )
+                    .await?;
                 }
+                DeployFormat::Docker => {
+                    prepare_docker(
+                        &args.bundle,
+                        &args.remote,
+                        ssh_key.as_deref(),
+                        ssh_port,
+                        &manifest,
+                        &ssh_base,
+                    )
+                    .await?;
+                }
+            },
+            NodeDeployPhase::UploadResolvedConfigs => {
+                // Overwrite template configs with resolved versions
+                print!("[deploy]  writing resolved configs ... ");
+                for (name, content) in &resolved_configs {
+                    let remote_path = format!("{}/wr-node/config/{name}", manifest.workdir);
+                    helpers::scp_bytes(
+                        content.as_bytes(),
+                        &args.remote,
+                        &remote_path,
+                        ssh_key.as_deref(),
+                        ssh_port,
+                    )
+                    .with_context(|| format!("failed to upload resolved {name}"))?;
+                }
+                println!("OK");
             }
-            let services = service_names.join(" ");
-            helpers::run_ssh(&ssh_base, &format!("sudo systemctl restart {services}"))?;
-        }
-        DeployFormat::Docker => {
-            helpers::run_ssh(
-                &ssh_base,
-                &format!(
-                    "cd {}/wr-node && sudo docker compose -f docker/docker-compose.yml restart",
-                    manifest.workdir
-                ),
-            )?;
+            NodeDeployPhase::ProvisionTls => {
+                // Provision TLS certificates on the remote host
+                print!("[deploy]  provisioning TLS certificates ... ");
+                let remote_cert_dir = format!("{}/wr-node/certs", manifest.workdir);
+                let ca_cert = format!("{cert_dir}/ca.crt");
+                let host_cert = format!("{cert_dir}/{host_name}.crt");
+                let host_key = format!("{cert_dir}/{host_name}.key");
+
+                for (local, remote_name) in [
+                    (&ca_cert, "ca.crt"),
+                    (&host_cert, "node.crt"),
+                    (&host_key, "node.key"),
+                ] {
+                    if !Path::new(local).exists() {
+                        bail!("Certificate file not found: {local}. Run `wr cert generate {host_name}` first.");
+                    }
+                    let tmp_path = format!("/tmp/{remote_name}");
+                    helpers::scp_file(local, &args.remote, &tmp_path, ssh_key.as_deref(), ssh_port)
+                        .with_context(|| format!("failed to upload {local}"))?;
+                    helpers::run_ssh(
+                        &ssh_base,
+                        &format!("sudo mkdir -p {remote_cert_dir} && sudo mv {tmp_path} {remote_cert_dir}/{remote_name}"),
+                    )?;
+                }
+                println!("OK");
+            }
+            NodeDeployPhase::CaptureFirstStartTimestamp => {
+                // Capture remote timestamp before first start to anchor the post-deploy log dump
+                first_start_timestamp =
+                    helpers::get_remote_timestamp(&ssh_base).unwrap_or_default();
+            }
+            NodeDeployPhase::FirstStart => {
+                match format {
+                    DeployFormat::Systemd => {
+                        print!("[deploy]  starting services ... ");
+                        start_systemd(&ssh_base, &manifest)?;
+                    }
+                    DeployFormat::Docker => {
+                        print!("[deploy]  starting containers ... ");
+                        start_docker(&ssh_base, &manifest)?;
+                    }
+                }
+                println!("OK");
+            }
         }
     }
-    println!("OK");
 
     // Poll until engines serving all schema-bearing modules are registered.
     let expected_modules: Vec<(String, String)> = manifest
@@ -823,13 +906,16 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     }
 
     // Dump all startup logs from the deploy window (catches fast starts the tail missed)
-    if !restart_timestamp.is_empty() {
+    if !first_start_timestamp.is_empty() {
         println!();
         println!("[deploy]  startup logs:");
         let dump_cmd = match format {
-            DeployFormat::Systemd => {
-                super::logs::build_journalctl_command_absolute(None, 200, &restart_timestamp, false)
-            }
+            DeployFormat::Systemd => super::logs::build_journalctl_command_absolute(
+                None,
+                200,
+                &first_start_timestamp,
+                false,
+            ),
             DeployFormat::Docker => {
                 super::logs::build_docker_logs_command(&manifest.workdir, None, 200, false)
             }
@@ -840,7 +926,7 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     Ok(())
 }
 
-async fn deploy_systemd(
+async fn prepare_systemd(
     bundle: &str,
     remote: &str,
     ssh_key: Option<&str>,
@@ -887,25 +973,10 @@ async fn deploy_systemd(
     )?;
     println!("OK");
 
-    print!("[deploy]  starting services ... ");
-    let mut service_names = vec!["wr-proxy.service".to_string()];
-    for config in &manifest.configs {
-        if config != "proxy.toml" {
-            let stem = config.strip_suffix(".toml").unwrap_or(config);
-            service_names.push(format!("wr-engine-{stem}.service"));
-        }
-    }
-    let services = service_names.join(" ");
-    helpers::run_ssh(
-        ssh_base,
-        &format!("sudo systemctl daemon-reload && sudo systemctl enable --now {services}"),
-    )?;
-    println!("OK");
-
     Ok(())
 }
 
-async fn deploy_docker(
+async fn prepare_docker(
     bundle: &str,
     remote: &str,
     ssh_key: Option<&str>,
@@ -926,14 +997,15 @@ async fn deploy_docker(
     )?;
     println!("OK");
 
-    print!("[deploy]  starting containers ... ");
-    helpers::run_ssh(
-        ssh_base,
-        &format!("cd {workdir}/wr-node && sudo docker compose -f docker/docker-compose.yml up -d"),
-    )?;
-    println!("OK");
-
     Ok(())
+}
+
+fn start_systemd(ssh_base: &[String], manifest: &Manifest) -> Result<()> {
+    helpers::run_ssh(ssh_base, &node_systemd_start_command(&manifest.configs))
+}
+
+fn start_docker(ssh_base: &[String], manifest: &Manifest) -> Result<()> {
+    helpers::run_ssh(ssh_base, &node_docker_start_command(&manifest.workdir))
 }
 
 // --- status ---
@@ -1002,4 +1074,247 @@ fn add_migrations_dir(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_bundle_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{name}-{}-{nanos}.tar.gz", std::process::id()))
+    }
+
+    fn index_of<T: PartialEq + std::fmt::Debug>(items: &[T], needle: T) -> usize {
+        items
+            .iter()
+            .position(|item| item == &needle)
+            .expect("expected item in deploy phase order")
+    }
+
+    #[test]
+    fn node_systemd_deploy_sequence_uploads_configs_and_certs_before_start() {
+        let configs = vec![
+            "proxy.toml".to_string(),
+            "engine-a.toml".to_string(),
+            "engine-b.toml".to_string(),
+        ];
+        let phases = node_deploy_phase_order(&DeployFormat::Systemd);
+        assert!(
+            index_of(phases, NodeDeployPhase::PrepareBundle)
+                < index_of(phases, NodeDeployPhase::UploadResolvedConfigs)
+        );
+        assert!(
+            index_of(phases, NodeDeployPhase::UploadResolvedConfigs)
+                < index_of(phases, NodeDeployPhase::ProvisionTls)
+        );
+        assert!(
+            index_of(phases, NodeDeployPhase::ProvisionTls)
+                < index_of(phases, NodeDeployPhase::CaptureFirstStartTimestamp)
+        );
+        assert!(
+            index_of(phases, NodeDeployPhase::CaptureFirstStartTimestamp)
+                < index_of(phases, NodeDeployPhase::FirstStart)
+        );
+        assert_eq!(
+            node_service_names(&configs),
+            vec![
+                "wr-proxy.service".to_string(),
+                "wr-engine-engine-a.service".to_string(),
+                "wr-engine-engine-b.service".to_string()
+            ]
+        );
+        let command = node_systemd_start_command(&configs);
+        assert!(command.contains("enable --now"));
+        assert!(command.contains("wr-proxy.service"));
+        assert!(command.contains("wr-engine-engine-a.service"));
+        assert!(command.contains("wr-engine-engine-b.service"));
+        assert!(!command.contains("restart"));
+    }
+
+    #[test]
+    fn node_docker_deploy_sequence_uploads_source_proxy_config_before_compose_start() {
+        let configs = ["proxy.toml".to_string(), "engine.toml".to_string()];
+        let phases = node_deploy_phase_order(&DeployFormat::Docker);
+        assert!(
+            index_of(phases, NodeDeployPhase::UploadResolvedConfigs)
+                < index_of(phases, NodeDeployPhase::ProvisionTls)
+        );
+        assert!(
+            index_of(phases, NodeDeployPhase::ProvisionTls)
+                < index_of(phases, NodeDeployPhase::FirstStart)
+        );
+        assert_eq!(configs[0], "proxy.toml");
+        let command = node_docker_start_command("/opt/wruntime");
+        assert!(command.contains("docker compose"));
+        assert!(command.contains("up -d"));
+        assert!(!command.contains("restart"));
+    }
+
+    #[test]
+    fn node_proxy_source_config_is_templated_and_drives_artifact_ports() {
+        let path = temp_bundle_path("node-proxy-source");
+        let result = (|| -> Result<()> {
+            let output_file = fs::File::create(&path)?;
+            let enc = GzEncoder::new(output_file, Compression::default());
+            let mut tar = tar::Builder::new(enc);
+            let mut config_names = Vec::new();
+            let engine: EngineConfig = toml::from_str(
+                r#"
+listen_address = "127.0.0.1:9100"
+
+[node]
+proxy_address = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_port = 9443
+
+[[module]]
+name = "inventory"
+namespace = "ecommerce"
+version = "1.0.0"
+wasm_path = "inventory.wasm"
+"#,
+            )?;
+            let source: ProxyConfig = toml::from_str(
+                r#"
+listen_address = "127.0.0.1:9101"
+control_address = "127.0.0.1:9102"
+
+[database]
+url = "postgres://localhost/source"
+max_connections = 12
+
+[node]
+proxy_address = "http://10.0.0.5:9555"
+peer_port = 9555
+
+[node.tls]
+cert_path = "certs/source.crt"
+key_path = "certs/source.key"
+ca_cert_path = "certs/source-ca.crt"
+
+[circuit_breaker]
+failure_threshold = 7
+
+[egress]
+allowed_hosts = ["api.example.com"]
+"#,
+            )?;
+            let engines = vec![("engine.toml".to_string(), engine)];
+            let (proxy_port, control_port, artifact_peer_port) =
+                add_proxy_config(&mut tar, &mut config_names, &engines, Some(&source), 9443)?;
+            assert_eq!(
+                (proxy_port, control_port, artifact_peer_port),
+                (9101, 9102, 9555)
+            );
+            config_names.push("engine.toml".to_string());
+            add_deployment_artifacts(
+                &mut tar,
+                &DeployArtifactParams {
+                    workdir: "/opt/wruntime",
+                    config_names: &config_names,
+                    engine_names: &["engine".to_string()],
+                    proxy_port,
+                    control_port,
+                    peer_port: artifact_peer_port,
+                    engine_listen_ports: &[9100],
+                    no_otel: false,
+                },
+            )?;
+            tar.into_inner()?.finish()?;
+
+            let proxy_toml = bundle::read_file_from_tarball(path.to_str().unwrap(), "proxy.toml")?;
+            let proxy_value: toml::Value = toml::from_str(&proxy_toml)?;
+            assert_eq!(proxy_value["database"]["url"].as_str(), Some("{db_url}"));
+            assert_eq!(
+                proxy_value["node"]["proxy_address"].as_str(),
+                Some("http://{host}:9555")
+            );
+            assert_eq!(
+                proxy_value["circuit_breaker"]["failure_threshold"].as_integer(),
+                Some(7)
+            );
+            assert_eq!(
+                proxy_value["egress"]["allowed_hosts"].as_array().unwrap()[0].as_str(),
+                Some("api.example.com")
+            );
+            assert_eq!(
+                proxy_value["node"]["tls"]["cert_path"].as_str(),
+                Some("certs/node.crt")
+            );
+            assert_eq!(
+                proxy_value["node"]["tls"]["key_path"].as_str(),
+                Some("certs/node.key")
+            );
+            assert_eq!(
+                proxy_value["node"]["tls"]["ca_cert_path"].as_str(),
+                Some("certs/ca.crt")
+            );
+
+            let compose =
+                bundle::read_file_from_tarball(path.to_str().unwrap(), "docker-compose.yml")?;
+            assert!(compose.contains("9101:9101"));
+            assert!(compose.contains("9102:9102"));
+            assert!(compose.contains("9555:9555"));
+            Ok(())
+        })();
+        let _ = fs::remove_file(&path);
+        result.unwrap();
+    }
+
+    #[test]
+    fn node_proxy_generated_config_fallback_still_writes_minimal_proxy() {
+        let path = temp_bundle_path("node-proxy-generated");
+        let result = (|| -> Result<()> {
+            let output_file = fs::File::create(&path)?;
+            let enc = GzEncoder::new(output_file, Compression::default());
+            let mut tar = tar::Builder::new(enc);
+            let mut config_names = Vec::new();
+            let engine: EngineConfig = toml::from_str(
+                r#"
+listen_address = "127.0.0.1:9100"
+
+[node]
+proxy_address = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_port = 9444
+
+[[module]]
+name = "inventory"
+namespace = "ecommerce"
+version = "1.0.0"
+wasm_path = "inventory.wasm"
+"#,
+            )?;
+            let engines = vec![("engine.toml".to_string(), engine)];
+            let (proxy_port, control_port, artifact_peer_port) =
+                add_proxy_config(&mut tar, &mut config_names, &engines, None, 9443)?;
+            assert_eq!(
+                (proxy_port, control_port, artifact_peer_port),
+                (9001, 9002, 9443)
+            );
+            tar.into_inner()?.finish()?;
+
+            let proxy_toml = bundle::read_file_from_tarball(path.to_str().unwrap(), "proxy.toml")?;
+            let proxy_value: toml::Value = toml::from_str(&proxy_toml)?;
+            assert_eq!(
+                proxy_value["listen_address"].as_str(),
+                Some("127.0.0.1:9001")
+            );
+            assert_eq!(
+                proxy_value["control_address"].as_str(),
+                Some("127.0.0.1:9002")
+            );
+            assert_eq!(proxy_value["database"]["url"].as_str(), Some("{db_url}"));
+            assert!(proxy_value.get("external").is_none());
+            assert!(proxy_value.get("egress").is_none());
+            Ok(())
+        })();
+        let _ = fs::remove_file(&path);
+        result.unwrap();
+    }
 }

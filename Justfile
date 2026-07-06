@@ -121,7 +121,7 @@ node-a-engine-1:
 node-a-engine-2:
     cargo run -p wr-engine -- --config examples/multi-node/node-a/engine-2.toml
 
-# Start node B proxy (listens :9002, proxy_address = "http://127.0.0.1:9002")
+# Start node B proxy (listens :9003, control :9004, proxy_address = "http://127.0.0.1:9003")
 node-b-proxy:
     cargo run -p wr-proxy -- --config examples/multi-node/node-b/proxy.toml
 

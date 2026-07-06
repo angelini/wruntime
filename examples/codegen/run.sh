@@ -14,7 +14,6 @@ echo "S3_ENDPOINT: ${S3_ENDPOINT}"
 update_config() {
 	local file="$1"
 	sed_replace "$file" "postgres://user:pass@localhost:5432/codegen" "${DB_URL}"
-	sed_replace "$file" "postgres://wr_guest:pass@localhost:5432/codegen" "${GUEST_DB_URL}"
 	sed_replace "$file" "http://127.0.0.1:8900" "${S3_ENDPOINT}"
 	sed_replace "$file" "access_key_id     = \"rustfsadmin\"" "access_key_id     = \"${S3_ACCESS_KEY}\""
 	sed_replace "$file" "secret_access_key = \"rustfsadmin\"" "secret_access_key = \"${S3_SECRET_KEY}\""

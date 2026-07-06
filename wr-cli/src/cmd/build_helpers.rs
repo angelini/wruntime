@@ -38,7 +38,7 @@ pub fn raise_fd_limit() {
 pub struct BuildModule {
     pub name: String,
     pub wasm_path: String,
-    pub schema_path: String,
+    pub schema_path: Option<String>,
 }
 
 /// Derive .proto path from .binpb schema_path
@@ -69,26 +69,26 @@ pub fn derive_cargo_dir(wasm_path: &str) -> Result<PathBuf> {
 /// Compile .proto → .binpb for each module that has a schema_path
 pub fn compile_schemas(modules: &[BuildModule]) -> Result<()> {
     for module in modules {
-        if module.schema_path.is_empty() {
+        let Some(schema_path) = module.schema_path.as_deref().filter(|s| !s.is_empty()) else {
             continue;
-        }
-        let proto_path = derive_proto_path(&module.schema_path);
+        };
+        let proto_path = derive_proto_path(schema_path);
         if !Path::new(&proto_path).exists() {
             bail!(
                 "Proto file not found for module '{}': {} (derived from schema_path '{}')",
                 module.name,
                 proto_path,
-                module.schema_path,
+                schema_path,
             );
         }
         let proto_dir = Path::new(&proto_path)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        print!("[schema]  {} ... ", module.schema_path);
+        print!("[schema]  {schema_path} ... ");
         let status = Command::new("protoc")
             .args([
-                &format!("--descriptor_set_out={}", module.schema_path),
+                &format!("--descriptor_set_out={schema_path}"),
                 "--include_imports",
                 &format!("--proto_path={}", proto_dir),
                 &proto_path,

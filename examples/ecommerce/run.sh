@@ -13,7 +13,6 @@ echo "DB_URL: ${DB_URL}"
 update_db_url() {
 	local file="$1"
 	sed_replace "$file" "postgres://user:pass@localhost:5432/ecommerce" "${DB_URL}"
-	sed_replace "$file" "postgres://wr_guest@localhost:5433/wruntime_example" "${GUEST_DB_URL}"
 }
 
 cp examples/ecommerce/engine-inventory-1.toml /tmp/inv1.toml

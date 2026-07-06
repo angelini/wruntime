@@ -33,7 +33,10 @@ pub struct DeployConfig {
     pub workdir: Option<String>,
     /// Docker image name prefix
     pub image_prefix: Option<String>,
+    /// Source proxy config file for node bundle generation
+    pub proxy_config: Option<String>,
     /// Gossip seed node addresses (manager deploy only)
+    #[allow(dead_code)]
     pub seed_nodes: Option<Vec<String>>,
     /// Disable OpenTelemetry export in generated service units
     pub no_otel: Option<bool>,

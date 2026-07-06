@@ -99,7 +99,7 @@ failure_threshold  = 5    # consecutive failures (5xx / 429 / network error) bef
 open_duration_secs = 30   # seconds the breaker stays open before probing again
 ```
 
-Both fields are optional and default to the values shown above. Omit the `[circuit_breaker]` section entirely to disable circuit breaking.
+Both fields are optional and default to the values shown above. Omitting the `[circuit_breaker]` section keeps circuit breaking enabled with these defaults; there is currently no config flag to disable it.
 
 ### External routes (public API)
 
@@ -351,11 +351,11 @@ grpcurl -plaintext -d '{
   "destination_version": "1.0.0",
   "engine_id": "<engine-uuid>",
   "engine_address": "http://127.0.0.1:9100",
-  "proxy_address": "http://127.0.0.1:9001"
+  "peer_address": "https://127.0.0.1:9443"
 }' 127.0.0.1:9000 wruntime.ManagerService/UpsertRoutingRule
 ```
 
-`proxy_address` tells every proxy which node owns this rule. A proxy whose own `[node] proxy_address` matches will route directly to `engine_address`; all other proxies will relay to `proxy_address` and let that node route locally.
+`peer_address` tells every proxy which node owns this rule. A proxy whose own derived `[node]` peer address matches will route directly to `engine_address`; all other proxies relay to `peer_address` and let that node route locally. The old `proxy_address` routing-rule field is reserved in `proto/wruntime.proto` and must not be used in new rules.
 
 To run **multiple instances** of the same module version across different engines (on the same or different nodes), create one rule per engine pointing at the same `(destination_module, destination_namespace, destination_version)`. The proxy round-robins across all healthy rules for that tuple.
 
@@ -363,41 +363,71 @@ To deploy a **new version** alongside the old one, register a new engine with `v
 
 ### Multi-node deployment
 
-Each node binds its internal `listen_address`/`control_address` to loopback and uses a matching `proxy_address`; only the mTLS peer listener (`peer_port`) is exposed to other nodes:
+Each proxy and engine binds its internal `listen_address`/`control_address` to loopback. Cross-node traffic uses the proxy mTLS peer listener on `peer_port`; each node's peer address is derived from `[node].proxy_address` host + `peer_port`.
 
 ```toml
 # examples/multi-node/node-a/proxy.toml
 listen_address  = "127.0.0.1:9001"
-manager_address = "http://127.0.0.1:9000"
+control_address = "127.0.0.1:9002"
 
 [node]
 proxy_address = "http://node-a-host:9001"
+peer_port     = 9443
+
+[node.tls]
+cert_path    = "certs/127.0.0.1.crt"
+key_path     = "certs/127.0.0.1.key"
+ca_cert_path = "certs/ca.crt"
+
+[database]
+url = "postgres://postgres@db-host:5432/wruntime"
 
 # examples/multi-node/node-a/engine-1.toml
-listen_address  = "127.0.0.1:9100"
-manager_address = "http://127.0.0.1:9000"
+listen_address = "127.0.0.1:9100"
 
 [node]
-proxy_address = "http://node-a-host:9001"
+proxy_address   = "http://node-a-host:9001"
+control_address = "http://127.0.0.1:9002"
+peer_port       = 9443
+
+[node.tls]
+cert_path    = "certs/127.0.0.1.crt"
+key_path     = "certs/127.0.0.1.key"
+ca_cert_path = "certs/ca.crt"
 ```
 
 ```toml
 # examples/multi-node/node-b/proxy.toml
-listen_address  = "127.0.0.1:9002"
-manager_address = "http://127.0.0.1:9000"
+listen_address  = "127.0.0.1:9003"
+control_address = "127.0.0.1:9004"
 
 [node]
-proxy_address = "http://node-b-host:9002"
+proxy_address = "http://node-b-host:9003"
+peer_port     = 9443
+
+[node.tls]
+cert_path    = "certs/127.0.0.1.crt"
+key_path     = "certs/127.0.0.1.key"
+ca_cert_path = "certs/ca.crt"
+
+[database]
+url = "postgres://postgres@db-host:5432/wruntime"
 
 # examples/multi-node/node-b/engine-1.toml
-listen_address  = "127.0.0.1:9200"
-manager_address = "http://127.0.0.1:9000"
+listen_address = "127.0.0.1:9200"
 
 [node]
-proxy_address = "http://node-b-host:9002"
+proxy_address   = "http://node-b-host:9003"
+control_address = "http://127.0.0.1:9004"
+peer_port       = 9443
+
+[node.tls]
+cert_path    = "certs/127.0.0.1.crt"
+key_path     = "certs/127.0.0.1.key"
+ca_cert_path = "certs/ca.crt"
 ```
 
-When a module on Node A calls a module whose routing rule has `proxy_address = "http://node-b-host:9002"`, Node A's proxy adds `x-wr-via-proxy: 1` and forwards the request to Node B's proxy. Node B's `RoutingLayer` resolves the destination as a local engine and forwards to it.
+When a module on Node A calls a module whose routing rule has `peer_address = "https://node-b-host:9443"`, Node A's proxy adds `x-wr-via-proxy: 1` and forwards the request to Node B's mTLS peer listener. Node B's `RoutingLayer` resolves the destination as a local engine and forwards to it.
 
 ### Manager high availability
 
@@ -487,12 +517,10 @@ wr-cli node bundle --engine-config examples/codegen/engine.toml
 export WR_MANAGER=http://10.0.1.10:9000
 
 wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.20 \
-  --db-url "postgres://postgres@10.0.1.10:5432/wruntime" \
-  --guest-db-url "postgres://wr_guest:pass@10.0.1.10:5432/codegen"
+  --db-url "postgres://postgres@10.0.1.10:5432/wruntime"
 
 wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.30 \
-  --db-url "postgres://postgres@10.0.1.10:5432/wruntime" \
-  --guest-db-url "postgres://wr_guest:pass@10.0.1.10:5432/codegen"
+  --db-url "postgres://postgres@10.0.1.10:5432/wruntime"
 ```
 
 Use `--skip-build` to reuse compiled artifacts when only rebuilding the bundle metadata.
