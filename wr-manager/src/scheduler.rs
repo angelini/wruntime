@@ -16,6 +16,7 @@ use crate::db;
 /// independent of this. Kept below any sane `scheduler_lease_secs` so a hung
 /// proxy connection cannot silently outlive the lease.
 const SUBMIT_TIMEOUT: Duration = Duration::from_secs(10);
+const SUBMIT_JOB_PATH: &str = "/wruntime.WorkerService/SubmitJob";
 
 /// Background task. Every `interval`: claim due schedules (short txn), submit each
 /// through the local proxy (no txn), then finalize each with a fenced update.
@@ -122,8 +123,8 @@ async fn evaluate_schedules(
 
 /// Submit a scheduled job through the local proxy loopback.
 ///
-/// Uses `POST /SubmitJob` with
-/// `x-wr-destination: http://{ns}.{module}/SubmitJob`.
+/// Uses `POST /wruntime.WorkerService/SubmitJob` with
+/// `x-wr-destination: http://{ns}.{module}/wruntime.WorkerService/SubmitJob`.
 /// Returns the response body on HTTP 2xx; `Err` on connect/timeout/non-2xx.
 pub async fn submit_job(
     local_proxy_address: &str,
@@ -147,8 +148,8 @@ pub async fn submit_job(
         .trim_start_matches("https://");
 
     let destination = format!(
-        "http://{}.{}/SubmitJob",
-        schedule.worker_namespace, schedule.worker_name
+        "http://{}.{}{}",
+        schedule.worker_namespace, schedule.worker_name, SUBMIT_JOB_PATH
     );
 
     let do_submit = async {
@@ -160,7 +161,7 @@ pub async fn submit_job(
 
         let http_req = http::Request::builder()
             .method("POST")
-            .uri("/SubmitJob")
+            .uri(SUBMIT_JOB_PATH)
             .header("content-type", "application/x-protobuf")
             .header("x-wr-destination", &destination)
             .header("x-wr-version", &schedule.worker_version)

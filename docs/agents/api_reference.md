@@ -24,6 +24,23 @@ pub fn send_response_with_content_type(
     response_out: ResponseOutparam, status: u16, body: Vec<u8>, content_type: &str,
 )
 
+/// Response returned by generated service routers.
+pub struct ServiceResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub content_type: &'static str,
+}
+
+impl ServiceResponse {
+    pub fn new(status: u16, body: Vec<u8>, content_type: &'static str) -> Self;
+    pub fn protobuf(status: u16, body: Vec<u8>) -> Self;
+    pub fn json(status: u16, body: Vec<u8>) -> Self;
+    pub fn json_error(status: u16, msg: &str) -> Self;
+}
+
+/// Write a generated service response with its declared content-type.
+pub fn send_service_response(response_out: ResponseOutparam, response: ServiceResponse)
+
 /// Return a JSON error body: (status, b'{"error":"msg"}')
 pub fn err_body(status: u16, msg: &str) -> (u16, Vec<u8>)
 
@@ -177,6 +194,7 @@ wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 ```
 
 Error conversions — all error types convert to `ServiceError` via `From`, enabling `?`:
+
 - `From<HttpError> for ServiceError` — HTTP client errors
 - `From<DbError> for ServiceError` — database errors
 - `From<BlobError> for ServiceError` — blobstore errors
@@ -188,7 +206,7 @@ Source: `wr-sdk/src/prelude.rs`. Import with `use wr_sdk::prelude::*` to get:
 
 `IncomingRequest`, `Method`, `ResponseOutparam`, `database`, `PgValue`, `UnpackRow`,
 `err_body`, `read_body`, `send_response`, `send_json_response`,
-`json_body` (requires `serde` feature),
+`send_service_response`, `ServiceResponse`, `json_body` (requires `serde` feature),
 `ServiceError`, `tracing`, `ServiceGuest`.
 
 ## wr_sdk::db
@@ -250,6 +268,16 @@ impl TxGuard {
 
 ## Generated code (wr-build)
 
+The service generator emits a router returning `wr_sdk::io::ServiceResponse` and a `_handle` function alongside each router. Successful generated responses are protobuf; generated errors are JSON.
+
+```rust
+pub fn inventory_service_router<T: InventoryService>(
+    svc: &T,
+    path: &str,
+    body: &[u8],
+) -> wr_sdk::io::ServiceResponse;
+```
+
 The service generator emits a `_handle` function alongside each router:
 
 ```rust
@@ -262,6 +290,7 @@ pub fn inventory_service_handle<T: InventoryService>(
 ```
 
 Usage in handler modules:
+
 ```rust
 impl wr_sdk::ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
@@ -627,4 +656,4 @@ impl<A, B> WrCombinedGenerator<A, B> {
 }
 ```
 
-All implement `prost_build::ServiceGenerator`.
+All implement `prost_build::ServiceGenerator`. Generated paths require non-empty proto packages and use `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`.

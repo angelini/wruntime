@@ -39,7 +39,7 @@ list_services
 echo "==> Seeding inventory..."
 just cli invoke \
 	--proxy http://127.0.0.1:9001 \
-	--destination http://ecommerce.inventory/Seed \
+	--destination http://ecommerce.inventory/ecommerce.InventoryService/Seed \
 	--source bootstrap \
 	--source-ns ecommerce \
 	--body '' || echo " (seed may already exist)"
@@ -54,7 +54,7 @@ if [ "$INLINE" = true ]; then
 	echo "==> Running client inline with {\"count\": 1}..."
 	just cli invoke \
 		--proxy http://127.0.0.1:9001 \
-		--destination http://ecommerce.client/Run \
+		--destination http://ecommerce.client/ecommerce.ClientService/Run \
 		--source loadtest --source-ns ecommerce \
 		--body '{"count": 1}'
 	# cleanup runs via EXIT trap; exit with invoke's exit code
@@ -73,7 +73,7 @@ Trigger a load run (default 100 iterations):
   just cli invoke \
     --manager https://127.0.0.1:9000 \
     --proxy http://127.0.0.1:9001 \
-    --destination http://ecommerce.client/Run \
+    --destination http://ecommerce.client/ecommerce.ClientService/Run \
     --source loadtest --source-ns ecommerce \
     --body ''
 
@@ -81,7 +81,7 @@ Trigger with a custom request count (e.g. 1000):
   just cli invoke \
     --manager https://127.0.0.1:9000 \
     --proxy http://127.0.0.1:9001 \
-    --destination http://ecommerce.client/Run \
+    --destination http://ecommerce.client/ecommerce.ClientService/Run \
     --source loadtest --source-ns ecommerce \
     --body '{"count": 1000}'
 

@@ -68,7 +68,7 @@ if [ "$INLINE" = true ]; then
 	echo "==> Creating codegen task (worker will process it automatically)..."
 	CREATE_OUTPUT=$(just cli invoke \
 		--proxy http://127.0.0.1:9001 \
-		--destination http://codegen.coordinator/CreateTask \
+		--destination http://codegen.coordinator/codegen.CoordinatorService/CreateTask \
 		--source test --source-ns codegen \
 		--body '{"repo_url":"https://github.com/dtolnay/anyhow","doc_sources":[{"source_type":"docs_rs","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}')
 	echo "$CREATE_OUTPUT"
@@ -83,7 +83,7 @@ if [ "$INLINE" = true ]; then
 	while true; do
 		TASK_OUTPUT=$(just cli invoke \
 			--proxy http://127.0.0.1:9001 \
-			--destination http://codegen.coordinator/GetTask \
+			--destination http://codegen.coordinator/codegen.CoordinatorService/GetTask \
 			--source test --source-ns codegen \
 			--body "{\"task_id\":\"${TASK_ID}\"}" 2>/dev/null)
 		STATUS=$(echo "$TASK_OUTPUT" | grep -o '"status": *"[^"]*"' | head -1 | sed 's/"status": *"//;s/"//')

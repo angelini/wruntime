@@ -100,7 +100,7 @@ if [ "$INLINE" = true ]; then
 	echo "==> Running simulator inline (10 traders, 20 orders each, 5 symbols, ${NUM_EXCHANGES} exchange(s))..."
 	just cli invoke \
 		--proxy http://127.0.0.1:9001 \
-		--destination http://stockmarket.simulator/Run \
+		--destination http://stockmarket.simulator/stockmarket.SimulatorService/Run \
 		--source loadtest --source-ns stockmarket \
 		--body '{"num_traders": 10, "orders_per_trader": 20, "num_symbols": 5}'
 	exit $?
@@ -130,7 +130,7 @@ Run a simulation (default: 10 traders, 20 orders each, 5 symbols):
   just cli invoke \\
     --manager https://127.0.0.1:9000 \\
     --proxy http://127.0.0.1:9001 \\
-    --destination http://stockmarket.simulator/Run \\
+    --destination http://stockmarket.simulator/stockmarket.SimulatorService/Run \\
     --source loadtest --source-ns stockmarket \\
     --body ''
 
@@ -138,7 +138,7 @@ Stress test (100 traders, 100 orders each, 10 symbols = 10,000 orders):
   just cli invoke \\
     --manager https://127.0.0.1:9000 \\
     --proxy http://127.0.0.1:9001 \\
-    --destination http://stockmarket.simulator/Run \\
+    --destination http://stockmarket.simulator/stockmarket.SimulatorService/Run \\
     --source loadtest --source-ns stockmarket \\
     --body '{"num_traders": 100, "orders_per_trader": 100, "num_symbols": 10}'
 

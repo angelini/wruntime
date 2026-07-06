@@ -25,12 +25,13 @@ impl wr_sdk::ServiceGuest for Component {
         let path = request.path_with_query().unwrap_or_default();
         let body = read_body(request.consume().unwrap());
 
-        let (status, resp) = if path.starts_with("/tasks") {
-            handle_external(&method, &path, &body)
+        let response = if path.starts_with("/tasks") {
+            let (status, body) = handle_external(&method, &path, &body);
+            ServiceResponse::json(status, body)
         } else {
             proto::coordinator_service_router(&Component, &path, &body)
         };
-        send_response(response_out, status, resp);
+        send_service_response(response_out, response);
     }
 }
 

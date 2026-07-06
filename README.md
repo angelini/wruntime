@@ -6,7 +6,7 @@
 A distributed runtime that networks WASM modules via transparent HTTP interception. Modules make ordinary HTTP calls to each other — Wruntime intercepts, validates, routes, and delivers them automatically.
 
 ```
-┌────────────┐  ①  http://example.echo/Echo  ┌────────────┐
+┌────────────┐  ①  http://example.echo/echo.EchoService/Echo  ┌────────────┐
 │   caller   │ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─►   │    echo    │
 │   (WASM)   │        (appears direct)        │   (WASM)   │
 └──────┬─────┘                                └──────▲─────┘
@@ -26,7 +26,7 @@ A distributed runtime that networks WASM modules via transparent HTTP intercepti
                    └─────────────┘
 ```
 
-Modules address each other using `http://{namespace}.{module}/{Method}` URLs. The runtime handles service discovery, version routing, load balancing across instances, and OpenTelemetry tracing — all transparent to the module code. Request and response bodies are streamed through the proxy with zero buffering.
+Modules address each other using `http://{namespace}.{module}/{proto_package}.{ProtoServiceName}/{ProtoMethodName}` URLs. The runtime handles service discovery, version routing, load balancing across instances, and OpenTelemetry tracing — all transparent to the module code. Request and response bodies are streamed through the proxy with zero buffering.
 
 ## Quick start: Echo service
 
@@ -128,7 +128,7 @@ impl ServiceGuest for Component {
 }
 ```
 
-`WrClientGenerator` generates a typed `EchoServiceClient` struct with one method per RPC. The client calls `http://example.echo/Echo` under the hood via `wr_sdk::http::http_request`.
+`WrClientGenerator` generates a typed `EchoServiceClient` struct with one method per RPC. The client calls `http://example.echo/echo.EchoService/Echo` under the hood via `wr_sdk::http::http_request`.
 
 ### 4. Configure and run
 

@@ -126,7 +126,7 @@ wr engines get <engine-id>                # modules on a specific engine
 Module A        Engine A        Proxy         Engine B        Module B
    │                │              │              │              │
    │ POST http://   │              │              │              │
-   │ ns.b/Method    │              │              │              │
+   │ ns.b/pkg.Service/Method    │              │              │              │
    │───────────────►│              │              │              │
    │                │ rewrite URL  │              │              │
    │                │ add x-wr-*   │              │              │
@@ -156,7 +156,7 @@ namespace = "ecommerce"
 
 ```bash
 # invoke a module endpoint through the proxy (JSON auto-transcoded to protobuf)
-wr invoke --destination http://ecommerce.inventory/Seed --body '{"item_count": 10}'
+wr invoke --destination http://ecommerce.inventory/ecommerce.InventoryService/Seed --body '{"item_count": 10}'
 ```
 
 ---

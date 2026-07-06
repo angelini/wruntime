@@ -436,7 +436,9 @@ async fn test_routed_firing_reaches_worker_via_proxy() -> Result<()> {
         .expect("claimed");
 
     let body = wr_manager::scheduler::submit_job(&format!("http://{proxy_addr}"), &row).await?;
-    assert!(String::from_utf8_lossy(&body).starts_with("processed:/SubmitJob:"));
+    assert!(
+        String::from_utf8_lossy(&body).starts_with("processed:/wruntime.WorkerService/SubmitJob:")
+    );
 
     Ok(())
 }

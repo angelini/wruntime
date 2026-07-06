@@ -181,7 +181,7 @@ async fn bench_hot_path() -> Result<()> {
     // ── Build the request payload ────────────────────────────────────────────
     let egress_req = proto::EgressRequest {
         authority: "bench-ns.echo-svc".into(),
-        path: "/test.http_test/Echo".into(),
+        path: "/test.HttpTestService/Echo".into(),
         body: Vec::new(),
     };
     let egress_body = egress_req.encode_to_vec();
@@ -198,7 +198,7 @@ async fn bench_hot_path() -> Result<()> {
                 body: Vec<u8>| async move {
         let req = http::Request::builder()
             .method("POST")
-            .uri(format!("{caller_addr}/test.http_test/Egress"))
+            .uri(format!("{caller_addr}/test.HttpTestService/Egress"))
             .body(Full::new(Bytes::from(body)))
             .unwrap();
         pool.get().request(req).await

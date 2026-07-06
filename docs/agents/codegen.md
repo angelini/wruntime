@@ -41,13 +41,13 @@ pub fn inventory_service_router<T: InventoryService>(
     svc: &T,
     path: &str,
     body: &[u8],
-) -> (u16, Vec<u8>) {
+) -> wr_sdk::io::ServiceResponse {
     match path {
-        "/Seed"     => { /* decode SeedRequest → svc.seed() → encode */ }
-        "/Buy"      => { /* decode BuyRequest → svc.buy() → encode */ }
-        "/GetStock" => { /* ... */ }
-        "/Return"   => { /* ... */ }
-        _ => (404, r#"{"error":"no handler for {path}"}"#)
+        "/ecommerce.InventoryService/Seed"     => { /* decode SeedRequest → svc.seed() → encode */ }
+        "/ecommerce.InventoryService/Buy"      => { /* decode BuyRequest → svc.buy() → encode */ }
+        "/ecommerce.InventoryService/GetStock" => { /* ... */ }
+        "/ecommerce.InventoryService/Return"   => { /* ... */ }
+        _ => wr_sdk::io::ServiceResponse::json_error(404, &format!("no handler for {path}"))
     }
 }
 ```
@@ -60,12 +60,7 @@ pub fn inventory_service_router<T: InventoryService>(
 | Service `InventoryService` | Router: `inventory_service_router` |
 | Method `GetStock` | Trait method: `get_stock` |
 | Method `Return` (keyword) | Trait method: `r#return` |
-| Route path | `/{package}.{service_snake}/{ProtoMethodName}` |
-
-**service_snake** = snake_case of service name, with `_service` suffix stripped:
-- `InventoryService` → `inventory_service` → strip `_service` → `inventory`
-- `OrderService` → `order_service` → strip `_service` → `order`
-- `Gateway` → `gateway` (no suffix to strip)
+| Route path | `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}` |
 
 ## WrClientGenerator output
 
@@ -83,7 +78,7 @@ impl InventoryServiceClient {
 
     pub fn seed(&self, req: SeedRequest) -> Result<SeedResponse, wr_sdk::http::HttpError> {
         let body = prost::Message::encode_to_vec(&req);
-        let path = format!("/{}/Seed", self.authority);
+        let path = "/ecommerce.InventoryService/Seed";
         wr_sdk::http::http_request(&wr_sdk::http::HttpRequest {
             authority: &self.authority,
             path: &path,
@@ -108,7 +103,7 @@ impl InventoryServiceClient {
 | Service `InventoryService` | Struct: `InventoryServiceClient` |
 | Method `GetStock` | Method: `get_stock` |
 | Constructor authority | `"namespace.module"` (e.g. `"ecommerce.inventory"`) |
-| RPC path | `/{authority}/{ProtoMethodName}` (e.g. `/ecommerce.inventory/GetStock`) |
+| RPC path | `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}` (full URI example: `http://ecommerce.inventory/ecommerce.InventoryService/GetStock`) |
 
 ### Error handling difference
 

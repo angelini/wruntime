@@ -20,6 +20,10 @@ use wr_common::wruntime::{
     GetJobStatusRequest, GetJobStatusResponse, SubmitJobRequest, SubmitJobResponse,
 };
 
+const WORKER_SERVICE_PREFIX: &str = "/wruntime.WorkerService/";
+const SUBMIT_JOB_PATH: &str = "/wruntime.WorkerService/SubmitJob";
+const GET_JOB_STATUS_PATH: &str = "/wruntime.WorkerService/GetJobStatus";
+
 /// Start the engine's inbound HTTP server.  The proxy forwards module-to-module
 /// requests here; we route each request to the appropriate WASM module task
 /// via the registry.
@@ -95,7 +99,7 @@ async fn handle(
     }
 
     // ── Worker job queue gRPC endpoints ──────────────────────────────────
-    if req.uri().path() == "/SubmitJob" || req.uri().path() == "/GetJobStatus" {
+    if req.uri().path().starts_with(WORKER_SERVICE_PREFIX) {
         let path = req.uri().path().to_owned();
         return handle_worker_grpc(req, &path, db_pool).await;
     }
@@ -202,35 +206,57 @@ fn err(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+fn worker_err(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
+    let body = json!({ "error": msg });
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(body.to_string())))
+        .unwrap()
+}
+
 async fn handle_worker_grpc(
     req: Request<hyper::body::Incoming>,
     path: &str,
     db_pool: Option<Arc<Pool>>,
 ) -> Response<Full<Bytes>> {
-    let pool = match db_pool {
-        Some(p) => p,
-        None => return err(StatusCode::SERVICE_UNAVAILABLE, "no database configured"),
-    };
-
     let body = match BodyExt::collect(req.into_body()).await {
         Ok(c) => c.to_bytes(),
         Err(e) => {
             warn!(error = %e, "worker grpc body read error");
-            return err(StatusCode::BAD_REQUEST, "failed to read body");
+            return worker_err(StatusCode::BAD_REQUEST, "failed to read body");
         }
     };
 
+    handle_worker_grpc_bytes(path, body, db_pool).await
+}
+
+async fn handle_worker_grpc_bytes(
+    path: &str,
+    body: Bytes,
+    db_pool: Option<Arc<Pool>>,
+) -> Response<Full<Bytes>> {
     match path {
-        "/SubmitJob" => handle_submit_job(&pool, &body).await,
-        "/GetJobStatus" => handle_get_job_status(&pool, &body).await,
-        _ => err(StatusCode::NOT_FOUND, "unknown worker endpoint"),
+        SUBMIT_JOB_PATH | GET_JOB_STATUS_PATH => {}
+        _ => return worker_err(StatusCode::NOT_FOUND, "unknown worker endpoint"),
+    }
+
+    let pool = match db_pool {
+        Some(p) => p,
+        None => return worker_err(StatusCode::SERVICE_UNAVAILABLE, "no database configured"),
+    };
+
+    match path {
+        SUBMIT_JOB_PATH => handle_submit_job(&pool, &body).await,
+        GET_JOB_STATUS_PATH => handle_get_job_status(&pool, &body).await,
+        _ => unreachable!("worker endpoint path checked above"),
     }
 }
 
 async fn handle_submit_job(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>> {
     let req = match SubmitJobRequest::decode(body) {
         Ok(r) => r,
-        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("decode: {e}")),
+        Err(e) => return worker_err(StatusCode::BAD_REQUEST, &format!("decode: {e}")),
     };
 
     match wr_engine::worker::insert_job(
@@ -257,7 +283,7 @@ async fn handle_submit_job(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>> {
         }
         Err(e) => {
             warn!(error = %e, "submit job failed");
-            err(StatusCode::INTERNAL_SERVER_ERROR, &format!("insert: {e}"))
+            worker_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("insert: {e}"))
         }
     }
 }
@@ -265,7 +291,7 @@ async fn handle_submit_job(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>> {
 async fn handle_get_job_status(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>> {
     let req = match GetJobStatusRequest::decode(body) {
         Ok(r) => r,
-        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("decode: {e}")),
+        Err(e) => return worker_err(StatusCode::BAD_REQUEST, &format!("decode: {e}")),
     };
 
     match wr_engine::worker::get_job_status(pool, &req.job_id).await {
@@ -284,10 +310,58 @@ async fn handle_get_job_status(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>
                 .body(Full::new(Bytes::from(resp.encode_to_vec())))
                 .unwrap()
         }
-        Ok(None) => err(StatusCode::NOT_FOUND, "job not found"),
+        Ok(None) => worker_err(StatusCode::NOT_FOUND, "job not found"),
         Err(e) => {
             warn!(error = %e, "get job status failed");
-            err(StatusCode::INTERNAL_SERVER_ERROR, &format!("query: {e}"))
+            worker_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("query: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn response_json(resp: Response<Full<Bytes>>) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        assert_eq!(
+            resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn worker_err_returns_json() {
+        let (status, value) =
+            response_json(worker_err(StatusCode::BAD_REQUEST, "decode: \"bad\"")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(value, json!({"error": "decode: \"bad\""}));
+    }
+
+    #[tokio::test]
+    async fn unknown_worker_endpoint_is_json_404() {
+        let (status, value) = response_json(
+            handle_worker_grpc_bytes("/wruntime.WorkerService/Nope", Bytes::new(), None).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(value, json!({"error": "unknown worker endpoint"}));
+    }
+
+    #[tokio::test]
+    async fn missing_worker_db_pool_is_json_503() {
+        let (status, value) =
+            response_json(handle_worker_grpc_bytes(SUBMIT_JOB_PATH, Bytes::new(), None).await)
+                .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(value, json!({"error": "no database configured"}));
+    }
+
+    #[test]
+    fn short_worker_paths_are_not_worker_management_routes() {
+        assert!(!"/SubmitJob".starts_with(WORKER_SERVICE_PREFIX));
+        assert!(!"/GetJobStatus".starts_with(WORKER_SERVICE_PREFIX));
     }
 }

@@ -70,7 +70,7 @@ async fn wasm_db_execute() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Execute", req.encode_to_vec()),
+        rpc_request("/test.DbTestService/Execute", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -97,7 +97,7 @@ async fn wasm_db_query() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Query", req.encode_to_vec()),
+        rpc_request("/test.DbTestService/Query", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -123,7 +123,7 @@ async fn wasm_db_query_types() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/QueryTypes", req.encode_to_vec()),
+        rpc_request("/test.DbTestService/QueryTypes", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -154,7 +154,7 @@ async fn wasm_db_transaction_commit() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/TransactionCommit", req.encode_to_vec()),
+        rpc_request("/test.DbTestService/TransactionCommit", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -179,7 +179,10 @@ async fn wasm_db_transaction_rollback() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/TransactionRollback", req.encode_to_vec()),
+        rpc_request(
+            "/test.DbTestService/TransactionRollback",
+            req.encode_to_vec(),
+        ),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -204,7 +207,7 @@ async fn wasm_db_transaction_drop() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/TransactionDrop", req.encode_to_vec()),
+        rpc_request("/test.DbTestService/TransactionDrop", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -233,7 +236,7 @@ async fn wasm_db_error() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Error", req.encode_to_vec()),
+        rpc_request("/test.DbTestService/Error", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -260,7 +263,7 @@ async fn wasm_db_invalid_param() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Error", req.encode_to_vec()),
+        rpc_request("/test.DbTestService/Error", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -288,7 +291,7 @@ async fn wasm_db_query_stream() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/QueryStream", req.encode_to_vec()),
+        rpc_request("/test.DbTestService/QueryStream", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -316,7 +319,7 @@ async fn wasm_db_query_stream_drop() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/QueryStreamDrop", req.encode_to_vec()),
+        rpc_request("/test.DbTestService/QueryStreamDrop", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -338,7 +341,10 @@ async fn wasm_db_resource_caps() -> Result<()> {
         ..Default::default()
     };
 
-    for path in ["/AllocTransactions", "/AllocCursors"] {
+    for path in [
+        "/test.DbTestService/AllocTransactions",
+        "/test.DbTestService/AllocCursors",
+    ] {
         // Cap + 1 rejected as a normal error, not a trap.
         let state =
             db_state_for_module_with_limits(5, "test-ns", "db-cap-test", limits.clone()).await;
@@ -401,7 +407,7 @@ async fn wasm_tracing_start_span() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/StartSpan", req.encode_to_vec()),
+        rpc_request("/test.TracingTestService/StartSpan", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -427,7 +433,10 @@ async fn wasm_tracing_span_attributes() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/SpanAttributes", req.encode_to_vec()),
+        rpc_request(
+            "/test.TracingTestService/SpanAttributes",
+            req.encode_to_vec(),
+        ),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -454,7 +463,7 @@ async fn wasm_tracing_span_event() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/SpanEvent", req.encode_to_vec()),
+        rpc_request("/test.TracingTestService/SpanEvent", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -480,7 +489,7 @@ async fn wasm_tracing_span_error() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/SpanError", req.encode_to_vec()),
+        rpc_request("/test.TracingTestService/SpanError", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -506,7 +515,7 @@ async fn wasm_tracing_nested_spans() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/NestedSpans", req.encode_to_vec()),
+        rpc_request("/test.TracingTestService/NestedSpans", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -538,7 +547,7 @@ async fn wasm_tracing_span_cap() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/AllocSpans", req.encode_to_vec()),
+        rpc_request("/test.TracingTestService/AllocSpans", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -556,7 +565,7 @@ async fn wasm_tracing_span_cap() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/AllocSpans", req.encode_to_vec()),
+        rpc_request("/test.TracingTestService/AllocSpans", req.encode_to_vec()),
     )
     .await;
     assert!(result.is_err(), "expected trap when exceeding span cap");
@@ -572,7 +581,7 @@ async fn wasm_tracing_span_cap() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/AllocSpans", req.encode_to_vec()),
+        rpc_request("/test.TracingTestService/AllocSpans", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -588,7 +597,7 @@ async fn wasm_tracing_span_cap() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/AllocSpans", req.encode_to_vec()),
+        rpc_request("/test.TracingTestService/AllocSpans", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -639,7 +648,7 @@ async fn wasm_blobstore_put_get() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Put", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/Put", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -654,7 +663,7 @@ async fn wasm_blobstore_put_get() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Get", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/Get", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -684,7 +693,7 @@ async fn wasm_blobstore_delete() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Put", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/Put", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -699,7 +708,7 @@ async fn wasm_blobstore_delete() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Delete", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/Delete", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -714,7 +723,7 @@ async fn wasm_blobstore_delete() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/NotFound", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/NotFound", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -745,7 +754,7 @@ async fn wasm_blobstore_list() -> Result<()> {
             &engine,
             &pre,
             state,
-            rpc_request("/Put", req.encode_to_vec()),
+            rpc_request("/test.BlobstoreTestService/Put", req.encode_to_vec()),
         )
         .await?;
         assert_eq!(resp.status(), 200);
@@ -761,7 +770,7 @@ async fn wasm_blobstore_list() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/List", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/List", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -796,7 +805,7 @@ async fn wasm_blobstore_head() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Put", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/Put", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -810,7 +819,7 @@ async fn wasm_blobstore_head() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Head", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/Head", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -840,7 +849,7 @@ async fn wasm_blobstore_round_trip() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/RoundTrip", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/RoundTrip", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -868,7 +877,7 @@ async fn wasm_blobstore_not_found() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/NotFound", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/NotFound", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -902,7 +911,7 @@ async fn wasm_blobstore_put_too_large_rejected() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Put", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/Put", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200, "at-cap upload should be accepted");
@@ -918,7 +927,7 @@ async fn wasm_blobstore_put_too_large_rejected() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Put", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/Put", req.encode_to_vec()),
     )
     .await?;
     assert_ne!(resp.status(), 200, "over-cap upload should be rejected");
@@ -950,7 +959,7 @@ async fn wasm_blobstore_get_too_large_rejected() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Put", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/Put", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -969,7 +978,7 @@ async fn wasm_blobstore_get_too_large_rejected() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Get", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/Get", req.encode_to_vec()),
     )
     .await?;
     assert_ne!(resp.status(), 200, "over-cap download should be rejected");
@@ -1002,7 +1011,7 @@ async fn wasm_blobstore_list_too_large_rejected() -> Result<()> {
             &engine,
             &pre,
             state,
-            rpc_request("/Put", req.encode_to_vec()),
+            rpc_request("/test.BlobstoreTestService/Put", req.encode_to_vec()),
         )
         .await?;
         assert_eq!(resp.status(), 200);
@@ -1022,7 +1031,7 @@ async fn wasm_blobstore_list_too_large_rejected() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/List", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/List", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200, "listing at cap should succeed");
@@ -1043,7 +1052,7 @@ async fn wasm_blobstore_list_too_large_rejected() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/List", req.encode_to_vec()),
+        rpc_request("/test.BlobstoreTestService/List", req.encode_to_vec()),
     )
     .await?;
     assert_ne!(resp.status(), 200, "listing over cap should be rejected");
@@ -1095,7 +1104,7 @@ async fn wasm_llm_complete() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Complete", req.encode_to_vec()),
+        rpc_request("/test.LlmTestService/Complete", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -1130,7 +1139,7 @@ async fn wasm_llm_complete_text() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/CompleteText", req.encode_to_vec()),
+        rpc_request("/test.LlmTestService/CompleteText", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -1165,7 +1174,7 @@ async fn wasm_llm_tool_use() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/ToolUse", req.encode_to_vec()),
+        rpc_request("/test.LlmTestService/ToolUse", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -1199,7 +1208,7 @@ async fn wasm_llm_error() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Error", req.encode_to_vec()),
+        rpc_request("/test.LlmTestService/Error", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -1231,7 +1240,7 @@ async fn wasm_llm_stream() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Stream", req.encode_to_vec()),
+        rpc_request("/test.LlmTestService/Stream", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -1270,7 +1279,7 @@ async fn wasm_llm_stream_error() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Stream", req.encode_to_vec()),
+        rpc_request("/test.LlmTestService/Stream", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -1307,7 +1316,7 @@ async fn wasm_llm_stream_tool_use_rejected() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/Stream", req.encode_to_vec()),
+        rpc_request("/test.LlmTestService/Stream", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -1350,7 +1359,7 @@ async fn wasm_llm_stream_cap() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/AllocStreams", req.encode_to_vec()),
+        rpc_request("/test.LlmTestService/AllocStreams", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -1372,7 +1381,7 @@ async fn wasm_llm_stream_cap() -> Result<()> {
         &engine,
         &pre,
         state,
-        rpc_request("/AllocStreams", req.encode_to_vec()),
+        rpc_request("/test.LlmTestService/AllocStreams", req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -1444,7 +1453,7 @@ async fn wasm_http_egress() -> Result<()> {
         &engine,
         &pre,
         under_state,
-        rpc_request("/Egress", under_req.encode_to_vec()),
+        rpc_request("/test.HttpTestService/Egress", under_req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 200);
@@ -1473,7 +1482,7 @@ async fn wasm_http_egress() -> Result<()> {
         &engine,
         &pre,
         over_state,
-        rpc_request("/Egress", over_req.encode_to_vec()),
+        rpc_request("/test.HttpTestService/Egress", over_req.encode_to_vec()),
     )
     .await?;
     assert_eq!(resp.status(), 500);
@@ -1512,12 +1521,12 @@ async fn wasm_http_ingress() -> Result<()> {
     )
     .await?;
 
-    // Ingress proxy with a public route for Echo.
+    // Ingress proxy with a public route for the canonical Echo generated service path.
     let table = synced_routing_table(&mgr_addr).await?;
     let ingress_addr = start_ingress_proxy(
         table,
         vec![ExternalRoute {
-            path: "/Echo".into(),
+            path: "/test.HttpTestService/Echo".into(),
             methods: vec!["POST".into()],
             module: "http-svc".into(),
             namespace: "test-ns".into(),
@@ -1533,7 +1542,7 @@ async fn wasm_http_ingress() -> Result<()> {
         .request(
             http::Request::builder()
                 .method("POST")
-                .uri(format!("http://{ingress_addr}/Echo"))
+                .uri(format!("http://{ingress_addr}/test.HttpTestService/Echo"))
                 .body(Full::new(Bytes::from(req_body.encode_to_vec())))?,
         )
         .await?;

@@ -7,20 +7,16 @@ Hard rules and common mistakes when building wruntime guest modules. Read this b
 1. **`crate-type = ["cdylib"]`** is mandatory in Cargo.toml. Without it, `cargo build --target wasm32-wasip2` produces nothing useful.
 
 2. **Proto package name determines the generated Rust module name.** `package ecommerce;` in proto generates `ecommerce.rs` in `OUT_DIR`. Include it as:
+
    ```rust
    mod proto { include!(concat!(env!("OUT_DIR"), "/ecommerce.rs")); }
    ```
 
-3. **Router path format** is `/{package}.{service_snake}/{MethodName}` where:
-   - `{package}` = proto package name (e.g. `ecommerce`)
-   - `{service_snake}` = service name in snake_case with `_service` suffix stripped (e.g. `InventoryService` becomes `inventory`)
-   - `{MethodName}` = proto method name in PascalCase (e.g. `GetStock`)
-   - Example: `/ecommerce.inventory/GetStock`
+3. **Generated router path format** is `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`.
+   - Example: `/ecommerce.InventoryService/GetStock`
 
-4. **Client RPC path format** is `/{authority}/{MethodName}` where:
-   - `{authority}` = the `namespace.module` address (e.g. `ecommerce.inventory`)
-   - `{MethodName}` = proto method name in PascalCase
-   - Example: `/ecommerce.inventory/GetStock`
+4. **Generated clients use authority `namespace.module` plus canonical path `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`.**
+   - Full URI example: `http://ecommerce.inventory/ecommerce.InventoryService/GetStock`
 
 5. **`schema_path` in engine.toml is required.** The engine refuses to start without it.
 
@@ -35,6 +31,7 @@ Hard rules and common mistakes when building wruntime guest modules. Read this b
 8. **Outbound HTTP is transparently intercepted.** Use `wr_sdk::http::http_request` (or generated client methods) for inter-module calls. The engine rewrites the URI to the local proxy automatically.
 
 9. **The `bindings` module must be generated in-source** in every guest module:
+
    ```rust
    #[allow(dead_code, unused_imports)]
    mod bindings {
@@ -45,9 +42,11 @@ Hard rules and common mistakes when building wruntime guest modules. Read this b
        });
    }
    ```
+
    This emits the component-type metadata section from the crate's `wit/world.wit`. Without it, the WASM component will not declare its imports/exports correctly. WIT dependencies are resolved from `wit/deps/` (symlink it to `wr-sdk/wit/deps`).
 
 10. **`wit-bindgen` and `wit-bindgen-rt`** must both be in `[dependencies]`:
+
     ```toml
     wit-bindgen = "0.51.0"
     wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }

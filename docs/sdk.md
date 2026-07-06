@@ -4,7 +4,7 @@
 
 Two crates eliminate boilerplate from wruntime WASM modules:
 
-- **`wr-sdk`** — shared WASI helpers that every module links against: `http_rpc`, `read_body`, `send_response`, `err_body`, `log`, export macros, and the `ServiceGuest` trait.
+- **`wr-sdk`** — shared WASI helpers that every module links against: `http_rpc`, `read_body`, `send_response`, `ServiceResponse`, `send_service_response`, `err_body`, `log`, export macros, and the `ServiceGuest` trait.
 - **`wr-build`** — a `build.rs` library providing `prost-build` service generators that emit typed server traits/routers (`WrServiceGenerator`) and typed client structs (`WrClientGenerator`) from `.proto` files.
 
 ## Building a handler module (HTTP request/response)
@@ -57,19 +57,14 @@ mod proto {
     include!(concat!(env!("OUT_DIR"), "/inventory.rs"));
 }
 
-use wr_sdk::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
-use wr_sdk::io::{read_body, send_response};
-use wr_sdk::ServiceError;
+use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
 impl wr_sdk::ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        let path = request.path_with_query().unwrap_or_default();
-        let body = read_body(request.consume().unwrap());
-        let (status, resp) = proto::inventory_service_router(&Component, &path, &body);
-        send_response(response_out, status, resp);
+        proto::inventory_service_handle(&Component, request, response_out);
     }
 }
 
@@ -92,7 +87,7 @@ pub trait InventoryService {
 
 pub fn inventory_service_router<T: InventoryService>(
     svc: &T, path: &str, body: &[u8],
-) -> (u16, Vec<u8>) { /* decode → dispatch → encode */ }
+) -> wr_sdk::io::ServiceResponse { /* decode → dispatch → encode */ }
 ```
 
 ## SDK reference
@@ -101,7 +96,9 @@ pub fn inventory_service_router<T: InventoryService>(
 |------|-------------|
 | `wr_sdk::http::http_rpc(authority, path, body)` | POST a protobuf body to `http://{authority}{path}`; returns `Result<(u16, Vec<u8>), String>` |
 | `wr_sdk::io::read_body(incoming)` | Drain an `IncomingBody` into `Vec<u8>` |
-| `wr_sdk::io::send_response(out, status, body)` | Write a response with the given status and body |
+| `wr_sdk::io::send_response(out, status, body)` | Manual protobuf response helper; writes `application/x-protobuf` |
+| `wr_sdk::io::ServiceResponse` | Generated-router response envelope with status, body, and content type |
+| `wr_sdk::io::send_service_response(out, response)` | Write a generated service response with its declared content type |
 | `wr_sdk::io::err_body(status, msg)` | Return `(status, {"error":"msg"})` |
 | `wr_sdk::log::log(msg)` | Write a line to WASI stderr |
 | `wr_sdk::export!(T with_types_in wr_sdk::bindings)` | Register `T` as the `wasi:http/incoming-handler` implementation |

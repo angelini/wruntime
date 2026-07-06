@@ -63,20 +63,20 @@ Multiple `wr-manager` instances can run simultaneously for high availability. Al
 Each manager runs a background scheduler that fires `wr_schedules` rows as jobs, using Postgres as a claim/lease queue with a fencing token (`claim_id`) so active-active managers cannot double-fire or clobber each other's in-flight attempts. Every tick runs three short phases:
 
 1. **Claim** — a short transaction claims due, unleased (or lease-expired) rows with `FOR UPDATE SKIP LOCKED`, stamping `claimed_by`, `claimed_until` (a lease), and a fresh `claim_id`, then commits immediately.
-2. **Submit** — outside any transaction, the manager submits each claimed job through its own configured `local_proxy_address` (the local proxy loopback), exactly like `wr-cli invoke`: POST `/SubmitJob` with `x-wr-destination: http://{namespace}.{module}/SubmitJob`, using the same routing/mTLS path as normal inter-module traffic.
+2. **Submit** — outside any transaction, the manager submits each claimed job through its own configured `local_proxy_address` (the local proxy loopback), exactly like `wr-cli invoke`: POST `/wruntime.WorkerService/SubmitJob` with `x-wr-destination: http://{namespace}.{module}/wruntime.WorkerService/SubmitJob`, using the same routing/mTLS path as normal inter-module traffic.
 3. **Finalize** — a fenced `UPDATE ... WHERE claim_id = $claim_id` records success (advances `next_fire_at`, clears the lease) or failure (records `last_error`, bumps `consecutive_failures`, backs off `next_fire_at`); a finalize whose `claim_id` no longer matches (row reclaimed by another manager) affects zero rows and is dropped.
 
-Delivery is **at-least-once** — a manager crash between submit and finalize leaves the lease to expire (`claimed_until < NOW()`), and the row becomes claimable again — so scheduled jobs must be idempotent. The manager's `/SubmitJob` submission path is the one place the scheduler couples to the worker/job subsystem's endpoint contract; if that endpoint changes, only `wr_manager::scheduler::submit_job` needs to change.
+Delivery is **at-least-once** — a manager crash between submit and finalize leaves the lease to expire (`claimed_until < NOW()`), and the row becomes claimable again — so scheduled jobs must be idempotent. The manager's `/wruntime.WorkerService/SubmitJob` submission path is the one place the scheduler couples to the worker/job subsystem's endpoint contract; if that endpoint changes, only `wr_manager::scheduler::submit_job` needs to change.
 
 ## Request flow
 
 ```
-WASM module makes HTTP call to "http://ecommerce.inventory/GetItems"
+WASM module makes HTTP call to "http://ecommerce.inventory/inventory.InventoryService/GetItems"
   │
   ▼  [WasiHttpView::send_request intercepts — transparent to the module]
   │  Adds headers:
   │    x-wr-source:      "order-service"
-  │    x-wr-destination: "http://ecommerce.inventory/GetItems"
+  │    x-wr-destination: "http://ecommerce.inventory/inventory.InventoryService/GetItems"
   │  Rewrites URI to the local wr-proxy (Node A)
   │
   ▼
@@ -129,7 +129,7 @@ All internal routing uses a set of reserved `x-wr-*` HTTP headers. The proxy str
 
 | Header | Set by | Read by | Description |
 |--------|--------|---------|-------------|
-| `x-wr-destination` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (public routes) | `wr-proxy` RoutingLayer, TracingLayer | Full destination URI of the original call — e.g. `http://ecommerce.inventory/GetItems`. The host encodes the destination as `{namespace}.{module}`; the path is the RPC method name. Stripped by ForwardService before reaching the destination engine. |
+| `x-wr-destination` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (public routes) | `wr-proxy` RoutingLayer, TracingLayer | Full destination URI of the original call — e.g. `http://ecommerce.inventory/inventory.InventoryService/GetItems`. The host encodes the destination as `{namespace}.{module}`; the path is the canonical generated RPC path `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`. Stripped by ForwardService before reaching the destination engine. |
 | `x-wr-source` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (set to `"external"` for public routes) | `wr-proxy` TracingLayer | Name of the calling module. Recorded as a span attribute for metrics attribution and error reporting. Stripped by ForwardService before reaching the destination engine. |
 | `x-wr-source-ns` | `wr-engine` (outbound WASM call) | — | Namespace of the calling module. Carried alongside `x-wr-source` for attribution; not used for routing decisions. Stripped by ForwardService before reaching the destination engine. |
 | `x-wr-version` | Caller (optional — WASM module or `wr-cli`) | `wr-proxy` RoutingLayer | Pins the request to a specific semver of the destination module (e.g. `1.2.0`). When omitted the proxy load-balances across all healthy versions of the module. RoutingLayer overwrites the value with the resolved version before forwarding. |

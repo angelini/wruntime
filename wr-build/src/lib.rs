@@ -70,7 +70,9 @@ impl<A: prost_build::ServiceGenerator, B: prost_build::ServiceGenerator>
 ///
 /// pub fn inventory_service_router<T: InventoryService>(
 ///     svc: &T, path: &str, body: &[u8],
-/// ) -> (u16, Vec<u8>) { ... }
+/// ) -> wr_sdk::io::ServiceResponse { ... }
+///
+/// Routes use `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`.
 ///
 /// /// Default `ServiceGuest` handler that routes to the service trait impl.
 /// pub fn inventory_service_handle<T: InventoryService>(
@@ -83,6 +85,13 @@ pub struct WrServiceGenerator;
 
 impl prost_build::ServiceGenerator for WrServiceGenerator {
     fn generate(&mut self, service: prost_build::Service, buf: &mut String) {
+        if service.package.trim().is_empty() {
+            panic!(
+                "wr-build requires a non-empty proto package for service {}",
+                service.proto_name
+            );
+        }
+
         let trait_ident = format_ident!("{}", service.name);
         let router_ident = format_ident!("{}_router", to_snake(&service.name));
         let handle_ident = format_ident!("{}_handle", to_snake(&service.name));
@@ -106,7 +115,7 @@ impl prost_build::ServiceGenerator for WrServiceGenerator {
             .methods
             .iter()
             .map(|m| {
-                let route = format!("/{}", m.proto_name);
+                let route = format!("/{}.{}/{}", service.package, service.proto_name, m.proto_name);
                 let name = method_ident(&m.name);
                 let input = parse_type(&m.input_type);
                 quote! {
@@ -114,18 +123,12 @@ impl prost_build::ServiceGenerator for WrServiceGenerator {
                         let req = match <#input as prost::Message>::decode(body) {
                             Ok(r) => r,
                             Err(e) => {
-                                return (
-                                    400,
-                                    format!("{{\"error\":\"decode: {e}\"}}").into_bytes(),
-                                )
+                                return wr_sdk::io::ServiceResponse::json_error(400, &format!("decode: {e}"));
                             }
                         };
                         match svc.#name(req) {
-                            Ok(resp) => (200, prost::Message::encode_to_vec(&resp)),
-                            Err(e) => (
-                                e.status,
-                                format!("{{\"error\":\"{}\"}}", e.message).into_bytes(),
-                            ),
+                            Ok(resp) => wr_sdk::io::ServiceResponse::protobuf(200, prost::Message::encode_to_vec(&resp)),
+                            Err(e) => wr_sdk::io::ServiceResponse::json_error(e.status, &e.message),
                         }
                     }
                 }
@@ -141,13 +144,10 @@ impl prost_build::ServiceGenerator for WrServiceGenerator {
                 svc: &T,
                 path: &str,
                 body: &[u8],
-            ) -> (u16, Vec<u8>) {
+            ) -> wr_sdk::io::ServiceResponse {
                 match path {
                     #(#match_arms)*
-                    _ => (
-                        404,
-                        format!("{{\"error\":\"no handler for {}\"}}", path).into_bytes(),
-                    ),
+                    _ => wr_sdk::io::ServiceResponse::json_error(404, &format!("no handler for {}", path)),
                 }
             }
 
@@ -160,8 +160,8 @@ impl prost_build::ServiceGenerator for WrServiceGenerator {
             ) {
                 let path = request.path_with_query().unwrap_or_default();
                 let body = wr_sdk::io::read_body(request.consume().unwrap());
-                let (status, resp) = #router_ident(svc, &path, &body);
-                wr_sdk::io::send_response(response_out, status, resp);
+                let resp = #router_ident(svc, &path, &body);
+                wr_sdk::io::send_service_response(response_out, resp);
             }
         };
 
@@ -187,7 +187,7 @@ impl prost_build::ServiceGenerator for WrServiceGenerator {
 /// }
 /// ```
 ///
-/// The RPC path is derived from the proto method name, producing paths like `/Seed`.
+/// The RPC path uses `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`.
 /// The authority (e.g. `ecommerce.inventory`) is used only as the HTTP host.
 pub struct WrClientGenerator;
 
@@ -197,6 +197,13 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
         if service.name.ends_with("WorkerService") {
             return;
         }
+        if service.package.trim().is_empty() {
+            panic!(
+                "wr-build requires a non-empty proto package for service {}",
+                service.proto_name
+            );
+        }
+
         let struct_ident = format_ident!("{}Client", service.name);
 
         let methods: Vec<_> = service
@@ -206,11 +213,11 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
                 let method_ident = method_ident(&m.name);
                 let input = parse_type(&m.input_type);
                 let output = parse_type(&m.output_type);
-                let proto_name = &m.proto_name;
+                let route = format!("/{}.{}/{}", service.package, service.proto_name, m.proto_name);
                 quote! {
                     pub fn #method_ident(&self, req: #input) -> Result<#output, wr_sdk::http::HttpError> {
                         let body = prost::Message::encode_to_vec(&req);
-                        let path = format!("/{}", #proto_name);
+                        let path = #route;
                         wr_sdk::http::http_request(&wr_sdk::http::HttpRequest {
                             authority: &self.authority,
                             path: &path,
@@ -250,6 +257,8 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
 /// A `prost_build::ServiceGenerator` that emits typed job submission clients
 /// for worker modules.  Each RPC method becomes a function that serializes the
 /// request, submits a job via `wr_sdk::jobs::submit_job`, and returns the job_id.
+/// Worker job types use the canonical generated worker-service method path
+/// `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`.
 ///
 /// For a service `TaskWorkerService` with RPC `ProcessTask`:
 ///
@@ -269,6 +278,13 @@ impl prost_build::ServiceGenerator for WrWorkerClientGenerator {
         if !service.name.ends_with("WorkerService") {
             return;
         }
+        if service.package.trim().is_empty() {
+            panic!(
+                "wr-build requires a non-empty proto package for service {}",
+                service.proto_name
+            );
+        }
+
         let struct_ident = format_ident!("{}Client", service.name);
 
         let methods: Vec<_> = service
@@ -277,7 +293,7 @@ impl prost_build::ServiceGenerator for WrWorkerClientGenerator {
             .map(|m| {
                 let method_name = method_ident(&m.name);
                 let input = parse_type(&m.input_type);
-                let job_type = format!("/{}", m.proto_name);
+                let job_type = format!("/{}.{}/{}", service.package, service.proto_name, m.proto_name);
                 quote! {
                     pub fn #method_name(&self, req: #input) -> Result<String, wr_sdk::http::HttpError> {
                         let payload = prost::Message::encode_to_vec(&req);
@@ -304,5 +320,104 @@ impl prost_build::ServiceGenerator for WrWorkerClientGenerator {
         };
 
         buf.push_str(&pretty(tokens));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost_build::ServiceGenerator;
+
+    fn method(name: &str, proto_name: &str, input: &str, output: &str) -> prost_build::Method {
+        prost_build::Method {
+            name: name.into(),
+            proto_name: proto_name.into(),
+            comments: Default::default(),
+            input_type: input.into(),
+            output_type: output.into(),
+            input_proto_type: input.into(),
+            output_proto_type: output.into(),
+            options: Default::default(),
+            client_streaming: false,
+            server_streaming: false,
+        }
+    }
+
+    fn service(package: &str, name: &str, proto_name: &str) -> prost_build::Service {
+        prost_build::Service {
+            name: name.into(),
+            proto_name: proto_name.into(),
+            package: package.into(),
+            comments: Default::default(),
+            methods: vec![method("seed", "Seed", "SeedRequest", "SeedResponse")],
+            options: Default::default(),
+        }
+    }
+
+    #[test]
+    fn service_generator_uses_canonical_routes_and_service_response() {
+        let mut generator = WrServiceGenerator;
+        let mut buf = String::new();
+        generator.generate(
+            service("ecommerce", "InventoryService", "InventoryService"),
+            &mut buf,
+        );
+
+        assert!(
+            buf.contains("\"/ecommerce.InventoryService/Seed\""),
+            "{buf}"
+        );
+        assert!(!buf.contains("\"/Seed\""), "{buf}");
+        assert!(buf.contains("-> wr_sdk::io::ServiceResponse"), "{buf}");
+        assert!(buf.contains("ServiceResponse::protobuf"), "{buf}");
+        assert!(buf.contains("ServiceResponse::json_error"), "{buf}");
+        assert!(buf.contains("send_service_response"), "{buf}");
+    }
+
+    #[test]
+    fn client_generator_uses_canonical_routes() {
+        let mut generator = WrClientGenerator;
+        let mut buf = String::new();
+        generator.generate(
+            service("ecommerce", "InventoryService", "InventoryService"),
+            &mut buf,
+        );
+
+        assert!(
+            buf.contains("let path = \"/ecommerce.InventoryService/Seed\";"),
+            "{buf}"
+        );
+        assert!(!buf.contains("format!(\"/{}\""), "{buf}");
+    }
+
+    #[test]
+    fn worker_client_generator_uses_canonical_job_types() {
+        let mut generator = WrWorkerClientGenerator;
+        let mut svc = service("codegen", "WorkerService", "WorkerService");
+        svc.methods = vec![method(
+            "process_task",
+            "ProcessTask",
+            "ProcessTaskRequest",
+            "ProcessTaskResponse",
+        )];
+        let mut buf = String::new();
+        generator.generate(svc, &mut buf);
+
+        assert!(
+            buf.contains("\"/codegen.WorkerService/ProcessTask\""),
+            "{buf}"
+        );
+        assert!(!buf.contains("\"/ProcessTask\""), "{buf}");
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty proto package")]
+    fn service_generator_rejects_empty_packages() {
+        let mut generator = WrServiceGenerator;
+        let mut buf = String::new();
+        generator.generate(
+            service("", "InventoryService", "InventoryService"),
+            &mut buf,
+        );
     }
 }

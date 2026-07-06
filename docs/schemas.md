@@ -44,10 +44,12 @@ The resulting `.binpb` file is the value of `schema_path` in `engine.toml`.
 
 ## How routing works
 
-When the proxy receives a request with `x-wr-destination: http://ecommerce.inventory/GetItems` it:
+When the proxy receives a request with `x-wr-destination: http://ecommerce.inventory/inventory.InventoryService/GetItems` it:
 
 1. Parses the host (`ecommerce.inventory`) as `namespace.module`.
 2. Looks up healthy routing rules for that module in the cached routing table.
 3. Selects a candidate via round-robin and forwards the request — body is streamed through without buffering.
+
+Generated routers match the canonical path `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`; public ingress routes must use that path unless a manual wrapper handles a different public route.
 
 The proxy only inspects headers — it never reads, decodes, or validates the request or response body.

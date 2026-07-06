@@ -168,19 +168,14 @@ mod bindings {
     });
 }
 
-use wr_sdk::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
-use wr_sdk::io::{read_body, send_response};
-use wr_sdk::ServiceError;
+use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
 impl wr_sdk::ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        let path = request.path_with_query().unwrap_or_default();
-        let body = read_body(request.consume().unwrap());
-        let (status, resp) = proto::{{service_name_snake}}_router(&Component, &path, &body);
-        send_response(response_out, status, resp);
+        proto::{{service_name_snake}}_handle(&Component, request, response_out);
     }
 }
 
@@ -217,6 +212,7 @@ CREATE INDEX idx_items_name ON items (name);
 ```
 
 Key rules:
+
 - Migrations can only modify your module's own schema — `search_path` is restricted to the module's schema at migration time.
 - An advisory lock prevents concurrent migration execution across engine replicas.
 - Already-applied migrations are skipped automatically (tracked in `refinery_schema_history` table).

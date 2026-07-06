@@ -13,7 +13,7 @@ TMPDIR_OUT="$(mktemp -d)"
 for i in $(seq 1 50); do
     just cli invoke \
         --proxy http://127.0.0.1:9001 \
-        --destination http://ecommerce.client/Run \
+        --destination http://ecommerce.client/ecommerce.ClientService/Run \
         --source loadtest --source-ns ecommerce \
         --body '{"count": 1000}' \
         >"${TMPDIR_OUT}/${i}.out" 2>&1 &
