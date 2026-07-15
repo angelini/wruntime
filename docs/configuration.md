@@ -83,7 +83,7 @@ url = "postgres://postgres@localhost:5433/wruntime_example"
 routing_table_ttl_secs = 5   # how often to poll the manager for routing updates
 ```
 
-`listen_address` and `control_address` **must** bind to loopback (`127.0.0.1`, `::1`, or `localhost`) — only engines on the same host reach them, and the proxy now rejects a non-loopback value at config load. Cross-node traffic uses the mTLS peer listener on `peer_port` (default 9443, binds `0.0.0.0`). The peer address is derived automatically from `proxy_address` host + `peer_port`. The routing layer uses the derived peer address to distinguish local vs. remote rules.
+`listen_address` and `control_address` **must** bind to loopback (`127.0.0.1`, `::1`, or `localhost`) — only engines on the same host reach them, and the proxy rejects a non-loopback value at config load. `node.proxy_address` must be an absolute `http` or `https` URI with a host. Cross-node traffic uses the mTLS peer listener on `peer_port` (default 9443, binds `0.0.0.0`). The peer address is derived automatically from `proxy_address` host + `peer_port`, including bracketed IPv6 authorities. The routing layer uses the derived peer address to distinguish local vs. remote rules.
 
 `control_address` exposes a gRPC `NodeService` that engines on the same node use for registration and heartbeats instead of connecting directly to the manager. This decouples engines from the manager address and enables local-first orchestration.
 
@@ -99,7 +99,7 @@ failure_threshold  = 5    # consecutive failures (5xx / 429 / network error) bef
 open_duration_secs = 30   # seconds the breaker stays open before probing again
 ```
 
-Both fields are optional and default to the values shown above. Omitting the `[circuit_breaker]` section keeps circuit breaking enabled with these defaults; there is currently no config flag to disable it.
+Omitting the entire `[circuit_breaker]` section keeps circuit breaking enabled with the defaults shown above; there is currently no config flag to disable it. When the section is present, both fields are required and must be greater than zero. Breakers are keyed by the concrete forwarding address. Routing skips a known-open destination when another eligible replica exists; if every eligible destination is open, the proxy returns `503 circuit open` with `Retry-After`.
 
 ### External routes (public API)
 
@@ -356,7 +356,7 @@ grpcurl -plaintext -d '{
 }' 127.0.0.1:9000 wruntime.ManagerService/UpsertRoutingRule
 ```
 
-`peer_address` tells every proxy which node owns this rule. A proxy whose own derived `[node]` peer address matches will route directly to `engine_address`; all other proxies relay to `peer_address` and let that node route locally. The old `proxy_address` routing-rule field is reserved in `proto/wruntime.proto` and must not be used in new rules.
+`peer_address` tells every proxy which node owns this rule. A proxy whose own derived `[node]` peer address matches will route directly to `engine_address`; all other proxies relay to `peer_address` and let that node route locally. The old `proxy_address` routing-rule field is reserved in `proto/wruntime.proto` and must not be used in new rules. `source_module` and `source_namespace` are retained as metadata for future policy work; current routing matches only the destination namespace, module, and optional version, so these source fields do not restrict callers.
 
 Current worker modules use the same descriptor/default-route path as service modules, so direct worker routes remain available but are gated by the same unhealthy-until-ready lifecycle. Queue-only workers with no default route require a future proto/control-plane route-publication flag or module mode.
 

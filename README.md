@@ -3,7 +3,7 @@
 > [!NOTE]
 > This project was an experiement in LLM assisted development. Much of the code in this repo was written with Claude.
 
-A distributed runtime that networks WASM modules via transparent HTTP interception. Modules make ordinary HTTP calls to each other — Wruntime intercepts, validates, routes, and delivers them automatically.
+A distributed runtime that networks WASM modules via transparent HTTP interception. Modules make ordinary HTTP calls to each other — Wruntime intercepts, routes, and delivers them automatically.
 
 ```
 ┌────────────┐  ①  http://example.echo/echo.EchoService/Echo  ┌────────────┐
@@ -26,7 +26,7 @@ A distributed runtime that networks WASM modules via transparent HTTP intercepti
                    └─────────────┘
 ```
 
-Modules address each other using `http://{namespace}.{module}/{proto_package}.{ProtoServiceName}/{ProtoMethodName}` URLs. The runtime handles service discovery, version routing, load balancing across instances, and OpenTelemetry tracing — all transparent to the module code. Request and response bodies are streamed through the proxy with zero buffering.
+Modules address each other using `http://{namespace}.{module}/{proto_package}.{ProtoServiceName}/{ProtoMethodName}` URLs. The runtime handles service discovery, version routing, circuit-breaker-aware load balancing across instances, and OpenTelemetry tracing — all transparent to the module code. Request and response bodies are streamed through the proxy with zero buffering.
 
 ## Quick start: Echo service
 

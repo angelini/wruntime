@@ -92,6 +92,7 @@ async fn async_main() -> Result<()> {
     let _telemetry = wr_common::telemetry::init("wr-engine")?;
 
     let config = config::EngineConfig::load(&config_path)?;
+    let peer_address = config.node.peer_address()?;
     let engine_id = Uuid::new_v4().to_string();
     // Convert listen_address (may bind on 0.0.0.0) to a routable HTTP URL.
     let advertise_address = {
@@ -235,7 +236,7 @@ async fn async_main() -> Result<()> {
                 engine_id: engine_id.clone(),
                 address: advertise_address.clone(),
                 proxy_address: config.node.proxy_address.clone(),
-                peer_address: config.node.peer_address(),
+                peer_address: peer_address.clone(),
                 modules: module_descriptors,
                 secrets: secret_requests,
                 db_namespaces: db_namespaces.clone(),

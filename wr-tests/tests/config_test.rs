@@ -152,6 +152,43 @@ fn test_proxy_config_defaults() {
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
     assert_eq!(cfg.cache.routing_table_ttl_secs, 2);
     assert_eq!(cfg.node.peer_port, 9443);
+    assert_eq!(cfg.circuit_breaker.failure_threshold, 5);
+    assert_eq!(cfg.circuit_breaker.open_duration_secs, 30);
+}
+
+#[test]
+fn test_proxy_config_circuit_breaker_section_requires_both_fields() {
+    let toml = format!(
+        "{}\n[circuit_breaker]\nfailure_threshold = 2\n",
+        proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")
+    );
+    assert!(toml::from_str::<ProxyConfig>(&toml).is_err());
+}
+
+#[test]
+fn test_proxy_config_rejects_zero_circuit_breaker_values() {
+    let mut cfg: ProxyConfig =
+        toml::from_str(&proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")).unwrap();
+    cfg.circuit_breaker.failure_threshold = 0;
+    cfg.circuit_breaker.open_duration_secs = 0;
+    let error = cfg.validate().unwrap_err().to_string();
+    assert!(error.contains("circuit_breaker.failure_threshold must be > 0"));
+    assert!(error.contains("circuit_breaker.open_duration_secs must be > 0"));
+}
+
+#[test]
+fn test_proxy_config_rejects_malformed_node_proxy_address() {
+    let toml = proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")
+        .replace("http://127.0.0.1:9001", "127.0.0.1:9001");
+    let cfg: ProxyConfig = toml::from_str(&toml).unwrap();
+    assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn test_engine_config_rejects_malformed_node_proxy_address() {
+    let toml = engine_toml("127.0.0.1:9100", "").replace("http://127.0.0.1:9001", "127.0.0.1:9001");
+    let cfg: EngineConfig = toml::from_str(&toml).unwrap();
+    assert!(cfg.validate().is_err());
 }
 
 #[test]

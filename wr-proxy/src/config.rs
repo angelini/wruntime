@@ -135,11 +135,9 @@ impl ProxyConfig {
             "control_address must bind to loopback (127.0.0.1, ::1, or localhost)",
         );
         v.check(!self.database.url.is_empty(), "database.url is required");
-        v.check(
-            !self.node.proxy_address.is_empty(),
-            "node.proxy_address is required",
-        );
-        v.check(self.node.peer_port > 0, "node.peer_port must be > 0");
+        if let Err(error) = self.node.peer_address() {
+            v.check(false, format!("invalid node configuration: {error}"));
+        }
         v.check(
             !self.node.tls.cert_path.is_empty(),
             "node.tls.cert_path is required",

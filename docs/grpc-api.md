@@ -24,19 +24,23 @@ A `RoutingRule` has the fields:
 ```protobuf
 message RoutingRule {
   string rule_id               = 1;   // stable identifier for this rule
-  string source_module         = 2;   // module that initiates the call
+  string source_module         = 2;   // metadata reserved for future source policy
   string destination_module    = 3;   // module name used as the HTTP host
   string engine_id             = 4;   // UUID of the destination engine
   string engine_address        = 5;   // HTTP base URL of the destination engine
   string destination_version   = 6;   // semver of the destination module, e.g. "1.2.0"
   bool   healthy               = 7;   // set by manager; false = proxy will not route to this rule
-  string destination_namespace = 8;   // namespace of the destination module
-  string source_namespace      = 9;   // namespace of the source module
-  string proxy_address         = 10;  // externally-reachable address of the node's proxy
+  string source_namespace      = 8;   // metadata reserved for future source policy
+  string destination_namespace = 9;   // namespace of the destination module
+  reserved 10;
+  reserved "proxy_address";
+  string peer_address          = 11;  // mTLS address of the destination node's proxy
 }
 ```
 
-`proxy_address` is set automatically from the engine's `[node] proxy_address` when the engine registers. The routing layer on each proxy compares this field against its own `[node] proxy_address` to decide whether to forward the request directly to the local `engine_address` (`LocalEngine`) or to relay it to the peer proxy at `proxy_address` (`RemoteProxy`).
+`RoutingRule.peer_address` is the sole cross-node forwarding address. Each proxy compares it with its own peer address, derived from `[node].proxy_address` host plus `peer_port`, to decide whether to forward directly to the local `engine_address` (`LocalEngine`) or relay over mTLS to `peer_address` (`RemoteProxy`). `EngineRegistration.proxy_address` remains separate plain-HTTP metadata: it is the local proxy URL used by an engine for outbound rewriting. The reserved routing-rule field 10 must not be reused.
+
+`source_module` and `source_namespace` are persisted metadata but are not currently routing or authorization constraints. Current matching uses only destination namespace, module, and optional version.
 
 The `healthy` field is managed entirely by the manager — it is always set to `true` on `UpsertRoutingRule`; default routing rules created at registration start `healthy = false`. Matching module heartbeats plus the background monitor's health recomputation make default routes healthy, and routes flip to `false` automatically when the engine or module heartbeat goes stale, or immediately on `DeregisterEngine`. The routing table version is incremented whenever health status changes, so proxies pick up failover events within one TTL cycle.
 

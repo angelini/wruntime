@@ -30,6 +30,14 @@ impl CircuitBreakerRegistry {
             .clone()
     }
 
+    /// Returns whether a call to `addr` is currently permitted.
+    ///
+    /// This uses failsafe's state transition API, so an expired open breaker
+    /// becomes half-open and can be selected for its recovery probe.
+    pub fn is_call_permitted(&self, addr: &str) -> bool {
+        self.get_or_create(addr).is_call_permitted()
+    }
+
     pub fn open_duration_secs(&self) -> u64 {
         self.config.open_duration_secs
     }

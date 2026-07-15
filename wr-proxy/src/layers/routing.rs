@@ -10,6 +10,7 @@ use tracing::{info_span, Instrument};
 
 use super::egress::{domain_matches, ExternalEgress};
 use super::{error_response, Destination, ProxyBody, ResBody, ResolvedDestination};
+use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::indexed_routing::{IndexedRoutingTable, RouteGroup};
 use crate::routing::CachedRoutingTable;
 use wr_common::http_headers::{WR_DESTINATION, WR_MODULE, WR_NAMESPACE, WR_VERSION};
@@ -55,6 +56,7 @@ enum RouteOutcome {
 
 pub struct RoutingLayer {
     table: CachedRoutingTable,
+    cb_registry: Arc<CircuitBreakerRegistry>,
     /// This proxy's own address — used to distinguish local vs. remote rules.
     self_peer_address: Arc<str>,
     /// Egress allowlist patterns. Only destinations matching one of these
@@ -64,9 +66,14 @@ pub struct RoutingLayer {
 }
 
 impl RoutingLayer {
-    pub fn new(table: CachedRoutingTable, self_peer_address: impl Into<String>) -> Self {
+    pub fn new(
+        table: CachedRoutingTable,
+        self_peer_address: impl Into<String>,
+        cb_registry: Arc<CircuitBreakerRegistry>,
+    ) -> Self {
         Self {
             table,
+            cb_registry,
             self_peer_address: Arc::from(self_peer_address.into()),
             egress_allowed_domains: Arc::new(Vec::new()),
         }
@@ -90,6 +97,7 @@ impl<S> Layer<S> for RoutingLayer {
         RoutingService {
             inner,
             table: self.table.clone(),
+            cb_registry: self.cb_registry.clone(),
             self_peer_address: self.self_peer_address.clone(),
             egress_allowed_domains: self.egress_allowed_domains.clone(),
         }
@@ -100,6 +108,7 @@ impl<S> Layer<S> for RoutingLayer {
 pub struct RoutingService<S> {
     inner: S,
     table: CachedRoutingTable,
+    cb_registry: Arc<CircuitBreakerRegistry>,
     self_peer_address: Arc<str>,
     egress_allowed_domains: Arc<Vec<String>>,
 }
@@ -188,32 +197,70 @@ fn classify_destination(
 }
 
 /// Round-robin select one candidate from a route group, honoring an optional
-/// version requirement. Returns `None` when no candidate satisfies the request.
+/// version requirement and skipping candidates whose circuit is currently open.
+/// Returns `None` when no candidate satisfies the version request.
 ///
 /// Unpinned (no `x-wr-version`): spread across all versions via
 /// `all_versions_counter`. Pinned semver: pick the highest satisfying version
 /// (candidates are pre-sorted descending), then round-robin within that
 /// version's `VersionGroup::counter`. Exact non-semver string: direct
-/// `by_version` lookup.
+/// `by_version` lookup. If every eligible circuit is open, return the original
+/// round-robin candidate so `ForwardService` preserves the `circuit open`
+/// response and `Retry-After` header.
+fn choose_candidate<I>(
+    group: &RouteGroup,
+    mut candidate_indexes: I,
+    counter: &std::sync::atomic::AtomicUsize,
+    self_peer_address: &str,
+    cb_registry: &CircuitBreakerRegistry,
+) -> Option<VersionedCandidate>
+where
+    I: ExactSizeIterator<Item = usize> + Clone,
+{
+    let len = candidate_indexes.len();
+    if len == 0 {
+        return None;
+    }
+
+    let make = |index: usize| {
+        let rule = &group.candidates[index].rule;
+        VersionedCandidate {
+            dest: make_destination(rule, self_peer_address),
+            version: Arc::from(rule.destination_version.as_str()),
+        }
+    };
+    let permitted_indexes: Vec<usize> = candidate_indexes
+        .clone()
+        .filter(|&index| {
+            let destination = make_destination(&group.candidates[index].rule, self_peer_address);
+            cb_registry.is_call_permitted(destination.address())
+        })
+        .collect();
+    let slot = counter.fetch_add(1, Ordering::Relaxed);
+
+    if permitted_indexes.is_empty() {
+        // Preserve ForwardService's circuit-open response and Retry-After when
+        // every eligible destination is open.
+        candidate_indexes.nth(slot % len).map(make)
+    } else {
+        Some(make(permitted_indexes[slot % permitted_indexes.len()]))
+    }
+}
+
 fn select_candidate(
     group: &RouteGroup,
     requested_version: &Option<String>,
     self_peer_address: &str,
+    cb_registry: &CircuitBreakerRegistry,
 ) -> Option<VersionedCandidate> {
-    let make = |r: &crate::indexed_routing::ParsedRule| VersionedCandidate {
-        dest: make_destination(&r.rule, self_peer_address),
-        version: Arc::from(r.rule.destination_version.as_str()),
-    };
-
     match requested_version {
-        None => {
-            let len = group.candidates.len();
-            if len == 0 {
-                return None;
-            }
-            let idx = group.all_versions_counter.fetch_add(1, Ordering::Relaxed) % len;
-            Some(make(&group.candidates[idx]))
-        }
+        None => choose_candidate(
+            group,
+            0..group.candidates.len(),
+            &group.all_versions_counter,
+            self_peer_address,
+            cb_registry,
+        ),
         Some(version_str) => {
             let req = semver::VersionReq::parse(version_str).ok();
             let best_ver: Arc<str> = match req {
@@ -231,12 +278,13 @@ fn select_candidate(
                 }
             };
             let vg = group.by_version.get(&best_ver)?;
-            let len = vg.candidate_indexes.len();
-            if len == 0 {
-                return None;
-            }
-            let slot = vg.counter.fetch_add(1, Ordering::Relaxed) % len;
-            Some(make(&group.candidates[vg.candidate_indexes[slot]]))
+            choose_candidate(
+                group,
+                vg.candidate_indexes.iter().copied(),
+                &vg.counter,
+                self_peer_address,
+                cb_registry,
+            )
         }
     }
 }
@@ -279,6 +327,7 @@ where
 
     fn call(&mut self, mut req: Request<ProxyBody>) -> Self::Future {
         let table = self.table.clone();
+        let cb_registry = self.cb_registry.clone();
         let self_peer_address = self.self_peer_address.clone();
         let egress_allowed_domains = self.egress_allowed_domains.clone();
         let mut inner = self.inner.clone();
@@ -310,7 +359,12 @@ where
                         namespace, module, ..
                     }) => {
                         let chosen = t.get(&namespace, &module).and_then(|group| {
-                            select_candidate(group, &requested_version, &self_peer_address)
+                            select_candidate(
+                                group,
+                                &requested_version,
+                                &self_peer_address,
+                                &cb_registry,
+                            )
                         });
                         match chosen {
                             Some(chosen) => RouteOutcome::Internal {
@@ -458,12 +512,84 @@ mod tests {
     fn select_candidate_unpinned_spreads_across_versions() {
         let t = table_with(vec![rule("ns", "svc", "1.0.0"), rule("ns", "svc", "2.0.0")]);
         let group = t.get("ns", "svc").unwrap();
+        let cb_registry = CircuitBreakerRegistry::new(Default::default());
         let mut seen = std::collections::HashSet::new();
         for _ in 0..6 {
-            let c = select_candidate(group, &None, "http://self-peer").unwrap();
+            let c = select_candidate(group, &None, "http://self-peer", &cb_registry).unwrap();
             seen.insert(c.version.to_string());
         }
         assert!(seen.contains("1.0.0"));
         assert!(seen.contains("2.0.0"));
+    }
+
+    #[test]
+    fn select_candidate_skips_open_replica_without_biasing_healthy_replicas() {
+        let mut open = rule("ns", "svc", "1.0.0");
+        open.rule_id = "open".to_string();
+        open.engine_address = "http://open".to_string();
+        let mut healthy_b = rule("ns", "svc", "1.0.0");
+        healthy_b.rule_id = "healthy-b".to_string();
+        healthy_b.engine_address = "http://healthy-b".to_string();
+        let mut healthy_c = rule("ns", "svc", "1.0.0");
+        healthy_c.rule_id = "healthy-c".to_string();
+        healthy_c.engine_address = "http://healthy-c".to_string();
+        let t = table_with(vec![open, healthy_b, healthy_c]);
+        let group = t.get("ns", "svc").unwrap();
+        let cb_registry = CircuitBreakerRegistry::new(crate::config::CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration_secs: 30,
+        });
+        cb_registry.get_or_create("http://open").on_error();
+
+        let selected: Vec<String> = (0..6)
+            .map(|_| {
+                select_candidate(
+                    group,
+                    &Some("1.0.0".to_string()),
+                    "http://self-peer",
+                    &cb_registry,
+                )
+                .unwrap()
+                .dest
+                .address()
+                .to_string()
+            })
+            .collect();
+        assert_eq!(
+            selected,
+            vec![
+                "http://healthy-b",
+                "http://healthy-c",
+                "http://healthy-b",
+                "http://healthy-c",
+                "http://healthy-b",
+                "http://healthy-c",
+            ]
+        );
+
+        let counts = std::sync::Mutex::new(std::collections::HashMap::<String, usize>::new());
+        std::thread::scope(|scope| {
+            for _ in 0..64 {
+                let counts = &counts;
+                let cb_registry = &cb_registry;
+                scope.spawn(move || {
+                    let address = select_candidate(
+                        group,
+                        &Some("1.0.0".to_string()),
+                        "http://self-peer",
+                        cb_registry,
+                    )
+                    .unwrap()
+                    .dest
+                    .address()
+                    .to_string();
+                    *counts.lock().unwrap().entry(address).or_default() += 1;
+                });
+            }
+        });
+        let counts = counts.into_inner().unwrap();
+        assert_eq!(counts.get("http://healthy-b"), Some(&32));
+        assert_eq!(counts.get("http://healthy-c"), Some(&32));
+        assert!(!counts.contains_key("http://open"));
     }
 }

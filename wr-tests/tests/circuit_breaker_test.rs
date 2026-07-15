@@ -324,6 +324,72 @@ async fn test_circuit_breaker_half_open_recovery() -> Result<()> {
     Ok(())
 }
 
+/// An open replica is skipped when another replica serves the same route.
+#[tokio::test]
+async fn test_circuit_breaker_skips_open_replica_for_same_route() -> Result<()> {
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (failing_addr, failing_shutdown) =
+        spawn_status_stub(StatusCode::INTERNAL_SERVER_ERROR).await?;
+    let (healthy_addr, healthy_shutdown) = spawn_stub_engine().await?;
+
+    register_test_module_ready(
+        &pool,
+        &mut mgr,
+        "cb-replica-failing",
+        &failing_addr,
+        "cb-replica-ns",
+        "shared-svc",
+        "1.0.0",
+    )
+    .await?;
+    register_test_module_ready(
+        &pool,
+        &mut mgr,
+        "cb-replica-healthy",
+        &healthy_addr,
+        "cb-replica-ns",
+        "shared-svc",
+        "1.0.0",
+    )
+    .await?;
+
+    let table = synced_routing_table(&mgr_addr).await?;
+    let proxy = start_proxy_with_cb(
+        table,
+        CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration_secs: 30,
+        },
+    )
+    .await?;
+
+    let mut tripped_failing_replica = false;
+    for _ in 0..4 {
+        let (status, _) = proxy_get(proxy, "cb-replica-ns", "shared-svc", Some("1.0.0")).await?;
+        match status {
+            StatusCode::OK => {}
+            StatusCode::INTERNAL_SERVER_ERROR => {
+                tripped_failing_replica = true;
+                break;
+            }
+            other => panic!("unexpected status before circuit opened: {other}"),
+        }
+    }
+    assert!(
+        tripped_failing_replica,
+        "failing replica was never selected"
+    );
+
+    for _ in 0..8 {
+        let (status, _) = proxy_get(proxy, "cb-replica-ns", "shared-svc", Some("1.0.0")).await?;
+        assert_eq!(status, StatusCode::OK, "open replica should be skipped");
+    }
+
+    let _ = failing_shutdown.send(());
+    let _ = healthy_shutdown.send(());
+    Ok(())
+}
+
 /// Circuit breakers are per-engine: one failing engine doesn't affect another.
 #[tokio::test]
 async fn test_circuit_breaker_per_engine_isolation() -> Result<()> {

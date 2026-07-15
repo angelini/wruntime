@@ -22,13 +22,13 @@ message EngineRegistration {
 
 message RoutingRule {
   string rule_id                   = 1;
-  string source_module             = 2;
+  string source_module             = 2; // metadata reserved for future source policy; ignored by routing
   string destination_module        = 3;
   string engine_id                 = 4;
   string engine_address            = 5;
   string destination_version       = 6; // semver string, e.g. "1.2.0"
   bool   healthy                   = 7; // set by manager; false means no traffic
-  string source_namespace          = 8;
+  string source_namespace          = 8; // metadata reserved for future source policy; ignored by routing
   string destination_namespace     = 9;
   reserved 10;
   reserved "proxy_address";

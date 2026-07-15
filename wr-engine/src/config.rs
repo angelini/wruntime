@@ -351,10 +351,9 @@ impl EngineConfig {
             "listen_address must bind to loopback (127.0.0.1, ::1, or localhost); \
              set allow_non_loopback_internal = true to override",
         );
-        v.check(
-            !self.node.proxy_address.is_empty(),
-            "node.proxy_address is required",
-        );
+        if let Err(error) = self.node.peer_address() {
+            v.check(false, format!("invalid node configuration: {error}"));
+        }
         v.check(
             !self.node.control_address.is_empty(),
             "node.control_address is required",

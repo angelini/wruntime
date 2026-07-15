@@ -18,8 +18,8 @@ routing_table_ttl_secs = 1
 
 # Circuit breaker — protects downstream engines from overload.
 # Each forwarding target (local engine address or remote peer proxy address)
-# gets its own independent breaker.
-# All fields are optional; the values below are the defaults.
+# gets its own independent breaker. Omit the whole section to use the defaults;
+# when the section is present, both fields are required.
 #
 # [circuit_breaker]
 # failure_threshold  = 5   # consecutive failures (5xx / 429 / network error) before opening

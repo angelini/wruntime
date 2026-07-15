@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
     discovery.spawn_refresh_task();
     info!("manager discovery initialized");
 
-    let self_address = config.node.peer_address();
+    let self_address = config.node.peer_address()?;
 
     // ── Initial routing table sync (blocks until first fetch succeeds) ──
     {
@@ -118,8 +118,12 @@ async fn main() -> Result<()> {
     let internal_svc = ServiceBuilder::new()
         .layer(TracingLayer)
         .layer(
-            RoutingLayer::new(routing_table.clone(), self_address.clone())
-                .with_egress(egress_domains),
+            RoutingLayer::new(
+                routing_table.clone(),
+                self_address.clone(),
+                cb_registry.clone(),
+            )
+            .with_egress(egress_domains),
         )
         .layer(EgressLayer::new(config.egress.clone()))
         .service(ForwardService::new(cb_registry.clone(), mtls_pool.clone()));
@@ -147,7 +151,11 @@ async fn main() -> Result<()> {
         let external_svc = ServiceBuilder::new()
             .layer(IngressLayer::new(ext.routes.clone()))
             .layer(TracingLayer)
-            .layer(RoutingLayer::new(routing_table, self_address))
+            .layer(RoutingLayer::new(
+                routing_table,
+                self_address,
+                cb_registry.clone(),
+            ))
             .service(ForwardService::new(cb_registry.clone(), mtls_pool));
 
         let external_listener = TcpListener::bind(&ext.listen_address).await?;

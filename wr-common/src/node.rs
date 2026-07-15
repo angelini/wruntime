@@ -1,5 +1,6 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -64,13 +65,30 @@ impl NodeConfig {
     /// Derive the mTLS peer address from `proxy_address` host + `peer_port`.
     ///
     /// Example: `"http://10.0.1.5:9001"` + `peer_port=9443` → `"https://10.0.1.5:9443"`
-    pub fn peer_address(&self) -> String {
-        let uri: http::Uri = self
-            .proxy_address
-            .parse()
-            .expect("proxy_address must be a valid URI");
-        let host = uri.host().expect("proxy_address must have a host");
-        format!("https://{}:{}", host, self.peer_port)
+    pub fn peer_address(&self) -> Result<String> {
+        let uri: http::Uri = self.proxy_address.parse().with_context(|| {
+            format!("proxy_address '{}' is not a valid URI", self.proxy_address)
+        })?;
+        let scheme = uri
+            .scheme_str()
+            .ok_or_else(|| anyhow::anyhow!("proxy_address must include an http or https scheme"))?;
+        if !matches!(scheme, "http" | "https") {
+            bail!("proxy_address scheme must be http or https");
+        }
+        let host = uri
+            .host()
+            .filter(|host| !host.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("proxy_address must include a host"))?;
+        if self.peer_port == 0 {
+            bail!("peer_port must be > 0");
+        }
+
+        let peer_host = if host.parse::<Ipv6Addr>().is_ok() {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        Ok(format!("https://{peer_host}:{}", self.peer_port))
     }
 }
 
@@ -112,19 +130,54 @@ mod tests {
         assert_eq!(cfg.control_address, "");
     }
 
-    #[test]
-    fn peer_address_derived_correctly() {
-        let toml = r#"
-            proxy_address = "http://10.0.1.5:9001"
-            peer_port = 8443
+    fn node_config(proxy_address: &str, peer_port: u16) -> NodeConfig {
+        toml::from_str(&format!(
+            r#"
+            proxy_address = "{proxy_address}"
+            peer_port = {peer_port}
 
             [tls]
             cert_path = "c.crt"
             key_path = "c.key"
             ca_cert_path = "ca.crt"
-        "#;
-        let cfg: NodeConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.peer_address(), "https://10.0.1.5:8443");
+        "#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn peer_address_derived_correctly() {
+        for (proxy_address, expected) in [
+            ("http://10.0.1.5:9001", "https://10.0.1.5:8443"),
+            (
+                "http://service.internal:9001",
+                "https://service.internal:8443",
+            ),
+            ("http://localhost:9001", "https://localhost:8443"),
+            ("http://[::1]:9001", "https://[::1]:8443"),
+        ] {
+            assert_eq!(
+                node_config(proxy_address, 8443).peer_address().unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn peer_address_rejects_malformed_proxy_addresses() {
+        for proxy_address in ["", "127.0.0.1:9001", "http://", "/relative/path"] {
+            assert!(
+                node_config(proxy_address, 9443).peer_address().is_err(),
+                "proxy_address should be rejected: {proxy_address:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_address_rejects_zero_port() {
+        assert!(node_config("http://localhost:9001", 0)
+            .peer_address()
+            .is_err());
     }
 
     #[test]
