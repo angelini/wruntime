@@ -1,3 +1,5 @@
+> Historical note: this plan predates the version-required worker jobs contract. Current worker submissions must include a non-empty `SubmitJobRequest.worker_version`, SDK/generated clients require a version argument, and the canonical endpoints remain `/wruntime.WorkerService/SubmitJob` and `/wruntime.WorkerService/GetJobStatus`.
+
 # Worker Mode for Guest WASM Modules
 
 ## Context
@@ -19,6 +21,7 @@ Workers are **not a new guest type**. A worker is a regular service guest (`expo
 ### How dispatch works
 
 The engine's worker loop:
+
 1. Claims a job from the Postgres queue (`job_type`, `payload`)
 2. Constructs an HTTP request: `POST /{job_type}` with the payload as the request body, `x-wr-job-id` header for tracing
 3. Sends it to the module via the existing `ProxyPre` + `ModuleRegistry` channel (same `InboundRequest` path as proxy-originated traffic)
@@ -118,6 +121,7 @@ pub worker_max_attempts: i32,                  // default: 3
 ```
 
 Example `engine.toml`:
+
 ```toml
 [[module]]
 name = "worker"
@@ -265,6 +269,7 @@ The engine needs the DB pool passed to the server for these endpoints.
 ### 10. Codegen Worker Migration — `examples/codegen/worker/`
 
 Convert to service guest with worker mode:
+
 - **`wit/world.wit`**: Export `wasi:http/incoming-handler`
 - **`src/lib.rs`**: Use `ServiceGuest::handle()` + typed handlers via `WrServiceGenerator`. The handlers are identical to any service module — the engine delivers jobs as HTTP requests.
 - **`build.rs`**: Switch from `WrClientGenerator` to `WrServiceGenerator` (for the handler trait) + keep `WrClientGenerator` for outbound calls to collector/agent

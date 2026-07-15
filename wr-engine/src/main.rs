@@ -61,6 +61,8 @@ async fn async_main() -> Result<()> {
     {
         let reg = registry.clone();
         let addr = config.listen_address.clone();
+        let worker_defaults =
+            std::sync::Arc::new(server::WorkerDefaults::from_modules(&config.modules));
         let server_db_pool = config
             .database
             .as_ref()
@@ -69,7 +71,7 @@ async fn async_main() -> Result<()> {
             })
             .transpose()?;
         tokio::spawn(async move {
-            if let Err(e) = server::serve(&addr, reg, server_db_pool).await {
+            if let Err(e) = server::serve(&addr, reg, server_db_pool, worker_defaults).await {
                 error!(error = %e, "inbound server error");
             }
         });

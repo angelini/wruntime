@@ -217,7 +217,7 @@ impl proto::CoordinatorService for Component {
         )?;
 
         // Submit a job to the engine's worker queue.
-        let worker = proto::WorkerServiceClient::new("codegen.worker");
+        let worker = proto::WorkerServiceClient::new("codegen.worker", "1.0.0");
         if let Err(e) = worker.process_task(proto::ProcessTaskRequest {
             task_id: task_id.clone(),
             session_id,

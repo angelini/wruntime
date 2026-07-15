@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -24,10 +25,47 @@ const WORKER_SERVICE_PREFIX: &str = "/wruntime.WorkerService/";
 const SUBMIT_JOB_PATH: &str = "/wruntime.WorkerService/SubmitJob";
 const GET_JOB_STATUS_PATH: &str = "/wruntime.WorkerService/GetJobStatus";
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WorkerDefaults {
+    max_attempts: HashMap<(String, String, String), i32>,
+}
+
+impl WorkerDefaults {
+    pub(crate) fn from_modules(modules: &[wr_engine::config::ModuleConfig]) -> Self {
+        let mut max_attempts = HashMap::new();
+        for module in modules {
+            if module.mode == wr_engine::config::ModuleMode::Worker {
+                max_attempts.insert(
+                    (
+                        module.namespace.clone(),
+                        module.name.clone(),
+                        module.version.clone(),
+                    ),
+                    module.worker_max_attempts,
+                );
+            }
+        }
+        Self { max_attempts }
+    }
+
+    fn max_attempts_for(&self, namespace: &str, name: &str, version: &str) -> i32 {
+        self.max_attempts
+            .get(&(namespace.to_owned(), name.to_owned(), version.to_owned()))
+            .copied()
+            .filter(|attempts| *attempts > 0)
+            .unwrap_or(3)
+    }
+}
+
 /// Start the engine's inbound HTTP server.  The proxy forwards module-to-module
 /// requests here; we route each request to the appropriate WASM module task
 /// via the registry.
-pub async fn serve(addr: &str, registry: ModuleRegistry, db_pool: Option<Arc<Pool>>) -> Result<()> {
+pub async fn serve(
+    addr: &str,
+    registry: ModuleRegistry,
+    db_pool: Option<Arc<Pool>>,
+    worker_defaults: Arc<WorkerDefaults>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(address = %addr, "inbound server listening");
 
@@ -35,12 +73,14 @@ pub async fn serve(addr: &str, registry: ModuleRegistry, db_pool: Option<Arc<Poo
         let (stream, _peer) = listener.accept().await?;
         let registry = registry.clone();
         let db_pool = db_pool.clone();
+        let worker_defaults = worker_defaults.clone();
 
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
                 let registry = registry.clone();
                 let db_pool = db_pool.clone();
+                let worker_defaults = worker_defaults.clone();
                 async move {
                     let namespace = header_owned(req.headers(), WR_NAMESPACE);
                     let module = header_owned(req.headers(), WR_MODULE);
@@ -61,7 +101,7 @@ pub async fn serve(addr: &str, registry: ModuleRegistry, db_pool: Option<Arc<Poo
                     );
                     wr_common::telemetry::set_parent_from_headers(&span, req.headers());
 
-                    let resp = handle(req, registry, db_pool)
+                    let resp = handle(req, registry, db_pool, worker_defaults)
                         .instrument(span.clone())
                         .await;
 
@@ -89,6 +129,7 @@ async fn handle(
     req: Request<hyper::body::Incoming>,
     registry: ModuleRegistry,
     db_pool: Option<Arc<Pool>>,
+    worker_defaults: Arc<WorkerDefaults>,
 ) -> Response<Full<Bytes>> {
     // ── Health check — no headers required ────────────────────────────────
     if req.uri().path() == "/healthz" {
@@ -101,7 +142,7 @@ async fn handle(
     // ── Worker job queue gRPC endpoints ──────────────────────────────────
     if req.uri().path().starts_with(WORKER_SERVICE_PREFIX) {
         let path = req.uri().path().to_owned();
-        return handle_worker_grpc(req, &path, db_pool).await;
+        return handle_worker_grpc(req, &path, db_pool, worker_defaults).await;
     }
 
     // The proxy injects x-wr-namespace, x-wr-module, and x-wr-version so we
@@ -219,7 +260,13 @@ async fn handle_worker_grpc(
     req: Request<hyper::body::Incoming>,
     path: &str,
     db_pool: Option<Arc<Pool>>,
+    worker_defaults: Arc<WorkerDefaults>,
 ) -> Response<Full<Bytes>> {
+    let routed_version = req
+        .headers()
+        .get(WR_VERSION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let body = match BodyExt::collect(req.into_body()).await {
         Ok(c) => c.to_bytes(),
         Err(e) => {
@@ -228,13 +275,22 @@ async fn handle_worker_grpc(
         }
     };
 
-    handle_worker_grpc_bytes(path, body, db_pool).await
+    handle_worker_grpc_bytes(
+        path,
+        body,
+        db_pool,
+        routed_version.as_deref(),
+        worker_defaults.as_ref(),
+    )
+    .await
 }
 
 async fn handle_worker_grpc_bytes(
     path: &str,
     body: Bytes,
     db_pool: Option<Arc<Pool>>,
+    routed_version: Option<&str>,
+    worker_defaults: &WorkerDefaults,
 ) -> Response<Full<Bytes>> {
     match path {
         SUBMIT_JOB_PATH | GET_JOB_STATUS_PATH => {}
@@ -247,16 +303,44 @@ async fn handle_worker_grpc_bytes(
     };
 
     match path {
-        SUBMIT_JOB_PATH => handle_submit_job(&pool, &body).await,
+        SUBMIT_JOB_PATH => handle_submit_job(&pool, &body, routed_version, worker_defaults).await,
         GET_JOB_STATUS_PATH => handle_get_job_status(&pool, &body).await,
         _ => unreachable!("worker endpoint path checked above"),
     }
 }
 
-async fn handle_submit_job(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>> {
+async fn handle_submit_job(
+    pool: &Pool,
+    body: &[u8],
+    routed_version: Option<&str>,
+    worker_defaults: &WorkerDefaults,
+) -> Response<Full<Bytes>> {
     let req = match SubmitJobRequest::decode(body) {
         Ok(r) => r,
         Err(e) => return worker_err(StatusCode::BAD_REQUEST, &format!("decode: {e}")),
+    };
+
+    if req.worker_version.is_empty() {
+        return worker_err(StatusCode::BAD_REQUEST, "worker_version is required");
+    }
+
+    if let Some(routed_version) = routed_version {
+        if routed_version != req.worker_version {
+            return worker_err(
+                StatusCode::BAD_REQUEST,
+                "x-wr-version does not match SubmitJobRequest.worker_version",
+            );
+        }
+    }
+
+    let max_attempts = if req.max_attempts > 0 {
+        req.max_attempts
+    } else {
+        worker_defaults.max_attempts_for(
+            &req.worker_namespace,
+            &req.worker_name,
+            &req.worker_version,
+        )
     };
 
     match wr_engine::worker::insert_job(
@@ -267,7 +351,7 @@ async fn handle_submit_job(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>> {
         &req.job_type,
         &req.payload,
         req.timeout_secs,
-        req.max_attempts,
+        max_attempts,
         "", // source_namespace (not available on this path)
         "", // source_module (not available on this path)
     )
@@ -321,6 +405,51 @@ async fn handle_get_job_status(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    fn db_url() -> Option<String> {
+        std::env::var("WRT_TEST_DB_URL").ok()
+    }
+
+    async fn test_pool() -> Option<Arc<Pool>> {
+        use tokio::sync::OnceCell;
+        static PROVISIONED: OnceCell<()> = OnceCell::const_new();
+        let url = db_url()?;
+        let pool = wr_engine::pool::build_pool(&url, 2).expect("build pool");
+        PROVISIONED
+            .get_or_init(|| async {
+                wr_engine::worker::provision_job_schema(&pool)
+                    .await
+                    .expect("provision schema");
+            })
+            .await;
+        Some(Arc::new(pool))
+    }
+
+    fn unique_prefix() -> String {
+        format!(
+            "srv_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    fn submit_body(namespace: &str, name: &str, version: &str, max_attempts: i32) -> Bytes {
+        Bytes::from(
+            SubmitJobRequest {
+                worker_namespace: namespace.into(),
+                worker_name: name.into(),
+                worker_version: version.into(),
+                job_type: "/test/Run".into(),
+                payload: b"payload".to_vec(),
+                timeout_secs: 0,
+                max_attempts,
+            }
+            .encode_to_vec(),
+        )
+    }
 
     async fn response_json(resp: Response<Full<Bytes>>) -> (StatusCode, serde_json::Value) {
         let status = resp.status();
@@ -343,7 +472,14 @@ mod tests {
     #[tokio::test]
     async fn unknown_worker_endpoint_is_json_404() {
         let (status, value) = response_json(
-            handle_worker_grpc_bytes("/wruntime.WorkerService/Nope", Bytes::new(), None).await,
+            handle_worker_grpc_bytes(
+                "/wruntime.WorkerService/Nope",
+                Bytes::new(),
+                None,
+                None,
+                &WorkerDefaults::default(),
+            )
+            .await,
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -352,11 +488,115 @@ mod tests {
 
     #[tokio::test]
     async fn missing_worker_db_pool_is_json_503() {
-        let (status, value) =
-            response_json(handle_worker_grpc_bytes(SUBMIT_JOB_PATH, Bytes::new(), None).await)
-                .await;
+        let (status, value) = response_json(
+            handle_worker_grpc_bytes(
+                SUBMIT_JOB_PATH,
+                Bytes::new(),
+                None,
+                None,
+                &WorkerDefaults::default(),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(value, json!({"error": "no database configured"}));
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_empty_body_worker_version_even_with_header() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping (no WRT_TEST_DB_URL)");
+            return;
+        };
+        let ns = unique_prefix();
+        let (status, value) = response_json(
+            handle_worker_grpc_bytes(
+                SUBMIT_JOB_PATH,
+                submit_body(&ns, "mod", "", 0),
+                Some(pool),
+                Some("1.0.0"),
+                &WorkerDefaults::default(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(value, json!({"error": "worker_version is required"}));
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_header_body_version_mismatch() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping (no WRT_TEST_DB_URL)");
+            return;
+        };
+        let ns = unique_prefix();
+        let (status, value) = response_json(
+            handle_worker_grpc_bytes(
+                SUBMIT_JOB_PATH,
+                submit_body(&ns, "mod", "1.0.0", 0),
+                Some(pool),
+                Some("2.0.0"),
+                &WorkerDefaults::default(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            value,
+            json!({"error": "x-wr-version does not match SubmitJobRequest.worker_version"})
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_uses_configured_worker_max_attempts_when_request_zero() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping (no WRT_TEST_DB_URL)");
+            return;
+        };
+        let ns = unique_prefix();
+        let defaults = WorkerDefaults {
+            max_attempts: HashMap::from([(
+                (ns.clone(), "mod".to_string(), "1.0.0".to_string()),
+                7,
+            )]),
+        };
+
+        let resp = handle_worker_grpc_bytes(
+            SUBMIT_JOB_PATH,
+            submit_body(&ns, "mod", "1.0.0", 0),
+            Some(pool.clone()),
+            Some("1.0.0"),
+            &defaults,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let job_id = SubmitJobResponse::decode(&body[..]).unwrap().job_id;
+        let status = wr_engine::worker::get_job_status(&pool, &job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.max_attempts, 7);
+
+        let resp = handle_worker_grpc_bytes(
+            SUBMIT_JOB_PATH,
+            submit_body(&ns, "mod", "1.0.0", 4),
+            Some(pool.clone()),
+            Some("1.0.0"),
+            &defaults,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let job_id = SubmitJobResponse::decode(&body[..]).unwrap().job_id;
+        let status = wr_engine::worker::get_job_status(&pool, &job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.max_attempts, 4);
     }
 
     #[test]

@@ -599,14 +599,16 @@ Source: `wr-sdk/src/jobs.rs`
 /// Returns the job_id on success.
 pub fn submit_job(
     engine_authority: &str,
+    worker_version: &str,
     job_type: &str,
     payload: &[u8],
 ) -> Result<String, HttpError>
 
 /// Submit a job with explicit timeout and retry settings.
-/// Pass 0 for timeout_secs or max_attempts to use the worker's defaults.
+/// Pass 0 for timeout_secs or max_attempts to use engine-configured worker defaults.
 pub fn submit_job_with_options(
     engine_authority: &str,
+    worker_version: &str,
     job_type: &str,
     payload: &[u8],
     timeout_secs: i32,
@@ -617,12 +619,14 @@ pub fn submit_job_with_options(
 pub fn get_job_status(engine_authority: &str, job_id: &str) -> Result<JobStatus, HttpError>
 ```
 
+worker_version must be non-empty; submit calls encode it in SubmitJobRequest.worker_version and send x-wr-version for route pinning. Empty versions return HttpError::Transport("worker_version is required") without issuing HTTP.
+
 ### Types
 
 ```rust
 pub struct JobStatus {
     pub job_id: String,
-    pub status: String,         // "pending" | "running" | "complete" | "failed"
+    pub status: String,         // "pending" | "running" | "complete" | "failed" | "dead"
     pub result: Vec<u8>,
     pub error_message: String,
     pub attempt: i32,
@@ -643,8 +647,9 @@ pub struct WrServiceGenerator;
 /// Use for client/runner modules.
 pub struct WrClientGenerator;
 
-/// Generates a job submission client for services ending with `WorkerService`.
-/// Methods return job_id instead of decoded response.
+/// Generates a versioned job submission client for services ending with WorkerService.
+/// Clients store authority and version, use new(authority, version), submit jobs,
+/// query raw status, and fetch typed optional results.
 pub struct WrWorkerClientGenerator;
 
 /// Runs two generators on every service definition.
@@ -657,3 +662,24 @@ impl<A, B> WrCombinedGenerator<A, B> {
 ```
 
 All implement `prost_build::ServiceGenerator`. Generated paths require non-empty proto packages and use `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`.
+
+```rust
+pub struct WorkerServiceClient { authority: String, version: String }
+impl WorkerServiceClient {
+    pub fn new(authority: impl Into<String>, version: impl Into<String>) -> Self;
+    pub fn process_task(&self, req: ProcessTaskRequest) -> Result<String, wr_sdk::http::HttpError>;
+    pub fn process_task_with_options(
+        &self,
+        req: ProcessTaskRequest,
+        timeout_secs: i32,
+        max_attempts: i32,
+    ) -> Result<String, wr_sdk::http::HttpError>;
+    pub fn get_status(&self, job_id: &str) -> Result<wr_sdk::jobs::JobStatus, wr_sdk::http::HttpError>;
+    pub fn get_process_task_result(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<ProcessTaskResponse>, wr_sdk::http::HttpError>;
+}
+```
+
+Result helpers map pending/running to `Ok(None)`, complete to a decoded non-empty result, completed empty/invalid result to `HttpError::Decode`, failed/dead to `HttpError::Status { code: 500, body }`, not-found propagates `404`, and unknown status to `HttpError::Decode`.

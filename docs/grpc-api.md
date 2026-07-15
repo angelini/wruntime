@@ -71,6 +71,8 @@ This decouples engines from the manager address — engines only need to know th
 
 Worker jobs use HTTP RPC via the proxy (not a gRPC service). The SDK provides ergonomic wrappers in `wr_sdk::jobs`.
 
+The canonical endpoints are fully-qualified only; /SubmitJob and /GetJobStatus are not supported aliases.
+
 | Endpoint | Request | Response | Description |
 |----------|---------|----------|-------------|
 | `POST /wruntime.WorkerService/SubmitJob` | `SubmitJobRequest` | `SubmitJobResponse` | Submit a job to a worker module's queue |
@@ -90,12 +92,17 @@ message SubmitJobRequest {
 }
 ```
 
+- `worker_version` is required and must be non-empty in the protobuf body.
+- When `x-wr-version` is present, it must match `worker_version`; mismatches are rejected with HTTP 400.
+- The SDK and generated clients send both body `worker_version` and `x-wr-version`.
+- `max_attempts` precedence is explicit request value > configured worker `worker_max_attempts` for the exact namespace/name/version > hard default 3.
+
 A `GetJobStatusResponse` has the fields:
 
 ```protobuf
 message GetJobStatusResponse {
   string job_id        = 1;
-  string status        = 2;   // "pending" | "running" | "complete" | "failed"
+  string status        = 2;   // "pending" | "running" | "complete" | "failed" | "dead"
   bytes  result        = 3;
   string error_message = 4;
   int32  attempt       = 5;

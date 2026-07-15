@@ -346,6 +346,7 @@ mod tests {
 
     #[test]
     fn test_bucket_builds_and_caches() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let rt = BlobstoreRuntime::new(&test_config()).unwrap();
         let a = rt.bucket("my-bucket").expect("should build store");
         let b = rt.bucket("my-bucket").expect("should return cached store");

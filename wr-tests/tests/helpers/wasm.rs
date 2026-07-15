@@ -124,6 +124,16 @@ impl TestGuest {
         }
     }
 
+    const fn route_prefix(self) -> &'static str {
+        match self {
+            Self::Db => "/test.DbTestService",
+            Self::Tracing => "/test.TracingTestService",
+            Self::Blobstore => "/test.BlobstoreTestService",
+            Self::Llm => "/test.LlmTestService",
+            Self::Http => "/test.HttpTestService",
+        }
+    }
+
     pub fn skip_if_missing(self) -> bool {
         if !Path::new(self.wasm_path()).exists() {
             eprintln!(
@@ -191,14 +201,15 @@ impl GuestHarness {
     pub async fn dispatch<M: prost::Message>(
         &self,
         state: ModuleState,
-        path: &str,
+        method_path: &str,
         message: M,
     ) -> Result<http::Response<Bytes>> {
+        let route = format!("{}{}", self.guest.route_prefix(), method_path);
         dispatch_to_wasm(
             &self.engine,
             &self.pre,
             state,
-            rpc_request(path, message.encode_to_vec()),
+            rpc_request(&route, message.encode_to_vec()),
         )
         .await
     }

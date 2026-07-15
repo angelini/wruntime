@@ -40,8 +40,9 @@ CREATE TABLE IF NOT EXISTS wr__jobs.jobs (
     source_module     TEXT        NOT NULL DEFAULT ''
 );
 
+DROP INDEX IF EXISTS wr__jobs.idx_jobs_pending;
 CREATE INDEX IF NOT EXISTS idx_jobs_pending
-    ON wr__jobs.jobs (worker_namespace, worker_name, created_at)
+    ON wr__jobs.jobs (worker_namespace, worker_name, worker_version, created_at)
     WHERE status = 'pending';
 
 CREATE INDEX IF NOT EXISTS idx_jobs_stale
@@ -50,7 +51,10 @@ CREATE INDEX IF NOT EXISTS idx_jobs_stale
 
 CREATE OR REPLACE FUNCTION wr__jobs.notify_new_job() RETURNS trigger AS $$
 BEGIN
-    PERFORM pg_notify('wr_jobs_' || NEW.worker_namespace || '_' || NEW.worker_name, NEW.job_id);
+    PERFORM pg_notify(
+        'wr_jobs_' || NEW.worker_namespace || '_' || NEW.worker_name || '_' || NEW.worker_version,
+        NEW.job_id
+    );
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -153,19 +157,23 @@ pub async fn claim_job(
     pool: &Pool,
     namespace: &str,
     name: &str,
+    version: &str,
     engine_id: &str,
 ) -> anyhow::Result<Option<ClaimedJob>> {
     let client = pool.get().await?;
     let row = client
         .query_opt(
             "UPDATE wr__jobs.jobs SET status = 'running', claimed_at = now(), \
-             claimed_by = $3, attempt = attempt + 1, updated_at = now() \
+             claimed_by = $4, attempt = attempt + 1, updated_at = now() \
              WHERE job_id = ( \
                SELECT job_id FROM wr__jobs.jobs \
-               WHERE worker_namespace = $1 AND worker_name = $2 AND status = 'pending' \
+               WHERE worker_namespace = $1 \
+                  AND worker_name = $2 \
+                  AND worker_version = $3 \
+                  AND status = 'pending' \
                ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED \
              ) RETURNING job_id, job_type, payload",
-            &[&namespace, &name, &engine_id],
+            &[&namespace, &name, &version, &engine_id],
         )
         .await?;
 
@@ -244,7 +252,10 @@ pub struct WorkerPoolConfig {
 /// The worker loops dispatch jobs as HTTP requests through the provided `ModuleTx`.
 pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx) {
     let notify = Arc::new(Notify::new());
-    let channel = format!("wr_jobs_{}_{}", config.namespace, config.name);
+    let channel = format!(
+        "wr_jobs_{}_{}_{}",
+        config.namespace, config.name, config.version
+    );
 
     // Spawn LISTEN task with a raw tokio-postgres connection.
     {
@@ -252,9 +263,10 @@ pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx
         let channel = channel.clone();
         let ns = config.namespace.clone();
         let name = config.name.clone();
+        let version = config.version.clone();
         let db_url = config.database_url.clone();
         tokio::spawn(async move {
-            listen_task(&db_url, &channel, notify, &ns, &name).await;
+            listen_task(&db_url, &channel, notify, &ns, &name, &version).await;
         });
     }
 
@@ -265,6 +277,7 @@ pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx
         let notify = notify.clone();
         let ns = config.namespace.clone();
         let name = config.name.clone();
+        let version = config.version.clone();
         let engine_id = config.engine_id.clone();
         let poll_interval = config.poll_interval;
         let job_timeout = config.job_timeout;
@@ -276,6 +289,7 @@ pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx
                 &notify,
                 &ns,
                 &name,
+                &version,
                 &engine_id,
                 poll_interval,
                 job_timeout,
@@ -303,13 +317,21 @@ pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx
     info!(
         namespace = %config.namespace,
         module = %config.name,
+        version = %config.version,
         concurrency = config.concurrency,
         "worker pool started",
     );
 }
 
 /// Dedicated connection that runs LISTEN and wakes worker loops via Notify.
-async fn listen_task(db_url: &str, channel: &str, notify: Arc<Notify>, ns: &str, name: &str) {
+async fn listen_task(
+    db_url: &str,
+    channel: &str,
+    notify: Arc<Notify>,
+    ns: &str,
+    name: &str,
+    version: &str,
+) {
     loop {
         match listen_loop(db_url, channel, &notify).await {
             Ok(()) => break,
@@ -317,6 +339,7 @@ async fn listen_task(db_url: &str, channel: &str, notify: Arc<Notify>, ns: &str,
                 warn!(
                     namespace = %ns,
                     module = %name,
+                    version = %version,
                     error = %e,
                     "LISTEN connection lost, reconnecting in 2s",
                 );
@@ -433,6 +456,7 @@ async fn worker_loop(
     notify: &Notify,
     namespace: &str,
     name: &str,
+    version: &str,
     engine_id: &str,
     poll_interval: Duration,
     job_timeout: Duration,
@@ -445,7 +469,7 @@ async fn worker_loop(
 
         // Drain: keep claiming until no more pending jobs.
         loop {
-            let job = match claim_job(pool, namespace, name, engine_id).await {
+            let job = match claim_job(pool, namespace, name, version, engine_id).await {
                 Ok(Some(job)) => job,
                 Ok(None) => break,
                 Err(e) => {
@@ -453,6 +477,7 @@ async fn worker_loop(
                         worker_id,
                         namespace,
                         module = name,
+                        version,
                         error = %e,
                         "claim_job failed",
                     );
@@ -464,6 +489,7 @@ async fn worker_loop(
                 worker_id,
                 namespace,
                 module = name,
+                version,
                 job_id = %job.job_id,
                 job_type = %job.job_type,
                 "processing job",
@@ -579,7 +605,7 @@ mod tests {
         .await
         .unwrap();
 
-        let claimed = claim_job(&pool, &p, "mod", "engine-1")
+        let claimed = claim_job(&pool, &p, "mod", "1.0.0", "engine-1")
             .await
             .expect("claim")
             .expect("should claim a job");
@@ -593,6 +619,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_claim_job_is_version_scoped_and_preserves_order_within_version() {
+        let pool = require_pool!();
+        let p = unique_prefix();
+        let id_v1_old = insert_job(
+            &pool,
+            &p,
+            "mod",
+            "1.0.0",
+            "/type/v1-old",
+            b"v1-old",
+            60,
+            3,
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let id_v2 = insert_job(&pool, &p, "mod", "2.0.0", "/type/v2", b"v2", 60, 3, "", "")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let id_v1_new = insert_job(
+            &pool,
+            &p,
+            "mod",
+            "1.0.0",
+            "/type/v1-new",
+            b"v1-new",
+            60,
+            3,
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+
+        let claimed_v2 = claim_job(&pool, &p, "mod", "2.0.0", "engine-v2")
+            .await
+            .unwrap()
+            .expect("v2 worker should claim v2 job");
+        assert_eq!(claimed_v2.job_id, id_v2);
+        assert_eq!(claimed_v2.job_type, "/type/v2");
+        assert_eq!(claimed_v2.payload, b"v2");
+
+        let claimed_v1_old = claim_job(&pool, &p, "mod", "1.0.0", "engine-v1")
+            .await
+            .unwrap()
+            .expect("v1 worker should claim oldest v1 job");
+        assert_eq!(claimed_v1_old.job_id, id_v1_old);
+
+        let claimed_v1_new = claim_job(&pool, &p, "mod", "1.0.0", "engine-v1")
+            .await
+            .unwrap()
+            .expect("v1 worker should claim second v1 job");
+        assert_eq!(claimed_v1_new.job_id, id_v1_new);
+
+        let no_v2_left = claim_job(&pool, &p, "mod", "2.0.0", "engine-v2")
+            .await
+            .unwrap();
+        assert!(no_v2_left.is_none());
+    }
+
+    #[tokio::test]
     async fn test_claim_job_skips_other_modules() {
         let pool = require_pool!();
         let p = unique_prefix();
@@ -600,7 +690,7 @@ mod tests {
             .await
             .unwrap();
 
-        let claimed = claim_job(&pool, &p, "target", "engine-1")
+        let claimed = claim_job(&pool, &p, "target", "1.0.0", "engine-1")
             .await
             .expect("claim");
         assert!(claimed.is_none(), "should not claim job for other module");
@@ -610,7 +700,7 @@ mod tests {
     async fn test_claim_job_returns_none_when_empty() {
         let pool = require_pool!();
         let p = unique_prefix();
-        let claimed = claim_job(&pool, &p, "mod", "engine-1")
+        let claimed = claim_job(&pool, &p, "mod", "1.0.0", "engine-1")
             .await
             .expect("claim");
         assert!(claimed.is_none());
@@ -623,7 +713,7 @@ mod tests {
         let id = insert_job(&pool, &p, "mod", "1.0.0", "/test", b"", 60, 3, "", "")
             .await
             .unwrap();
-        let _ = claim_job(&pool, &p, "mod", "engine-1").await;
+        let _ = claim_job(&pool, &p, "mod", "1.0.0", "engine-1").await;
 
         complete_job(&pool, &id, b"result-data")
             .await
@@ -640,7 +730,7 @@ mod tests {
         let id = insert_job(&pool, &p, "mod", "1.0.0", "/test", b"", 60, 3, "", "")
             .await
             .unwrap();
-        let _ = claim_job(&pool, &p, "mod", "engine-1").await;
+        let _ = claim_job(&pool, &p, "mod", "1.0.0", "engine-1").await;
 
         fail_job(&pool, &id, "oops").await.expect("fail");
         let status = get_job_status(&pool, &id).await.unwrap().unwrap();
@@ -655,7 +745,7 @@ mod tests {
         let id = insert_job(&pool, &p, "mod", "1.0.0", "/test", b"", 60, 1, "", "")
             .await
             .unwrap();
-        let _ = claim_job(&pool, &p, "mod", "engine-1").await;
+        let _ = claim_job(&pool, &p, "mod", "1.0.0", "engine-1").await;
 
         fail_job(&pool, &id, "final failure").await.expect("fail");
         let status = get_job_status(&pool, &id).await.unwrap().unwrap();
@@ -669,7 +759,7 @@ mod tests {
         let id = insert_job(&pool, &p, "mod", "1.0.0", "/test", b"", 1, 3, "", "")
             .await
             .unwrap();
-        let _ = claim_job(&pool, &p, "mod", "engine-1").await;
+        let _ = claim_job(&pool, &p, "mod", "1.0.0", "engine-1").await;
 
         let client = pool.get().await.unwrap();
         client
@@ -717,11 +807,15 @@ mod tests {
         let id = insert_job(&pool, &p, "mod", "1.0.0", "/test", b"", 60, 3, "", "")
             .await
             .unwrap();
-        let claimed = claim_job(&pool, &p, "mod", "engine-1").await.unwrap();
+        let claimed = claim_job(&pool, &p, "mod", "1.0.0", "engine-1")
+            .await
+            .unwrap();
         assert!(claimed.is_some());
         assert_eq!(claimed.unwrap().job_id, id);
 
-        let claimed2 = claim_job(&pool, &p, "mod", "engine-2").await.unwrap();
+        let claimed2 = claim_job(&pool, &p, "mod", "1.0.0", "engine-2")
+            .await
+            .unwrap();
         assert!(claimed2.is_none());
     }
 
@@ -738,7 +832,10 @@ mod tests {
         let s = get_job_status(&pool, &id).await.unwrap().unwrap();
         assert_eq!(s.status, "pending");
 
-        let claimed = claim_job(&pool, &p, "mod", "e1").await.unwrap().unwrap();
+        let claimed = claim_job(&pool, &p, "mod", "1.0.0", "e1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(claimed.job_id, id);
         assert_eq!(claimed.job_type, "/test/Do");
         assert_eq!(claimed.payload, b"payload");
@@ -760,13 +857,13 @@ mod tests {
             .await
             .unwrap();
 
-        let _ = claim_job(&pool, &p, "mod", "e1").await;
+        let _ = claim_job(&pool, &p, "mod", "1.0.0", "e1").await;
         fail_job(&pool, &id, "transient error").await.unwrap();
         let s = get_job_status(&pool, &id).await.unwrap().unwrap();
         assert_eq!(s.status, "pending");
         assert_eq!(s.attempt, 1);
 
-        let _ = claim_job(&pool, &p, "mod", "e1").await;
+        let _ = claim_job(&pool, &p, "mod", "1.0.0", "e1").await;
         complete_job(&pool, &id, b"ok").await.unwrap();
         let s = get_job_status(&pool, &id).await.unwrap().unwrap();
         assert_eq!(s.status, "complete");

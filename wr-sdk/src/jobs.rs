@@ -6,27 +6,43 @@ const GET_JOB_STATUS_PATH: &str = "/wruntime.WorkerService/GetJobStatus";
 /// Submit a job to a worker module's engine-managed queue.
 ///
 /// `engine_authority` is the worker's `namespace.name` (e.g. `"codegen.worker"`).
+/// `worker_version` must be non-empty.
 /// Returns the job_id on success.
 pub fn submit_job(
     engine_authority: &str,
+    worker_version: &str,
     job_type: &str,
     payload: &[u8],
 ) -> Result<String, HttpError> {
-    submit_job_with_options(engine_authority, job_type, payload, 0, 0)
+    submit_job_with_options(engine_authority, worker_version, job_type, payload, 0, 0)
+}
+
+fn submit_job_headers(worker_version: &str) -> [(&str, &[u8]); 2] {
+    [
+        ("content-type", b"application/x-protobuf" as &[u8]),
+        ("x-wr-version", worker_version.as_bytes()),
+    ]
 }
 
 /// Submit a job with explicit stale-running timeout and retry settings.
 ///
-/// `timeout_secs` controls stale-running recovery in the queue; worker dispatch
-/// uses the worker pool's configured job timeout. Pass 0 for `timeout_secs` or
-/// `max_attempts` to use the engine queue defaults.
+/// `engine_authority` is the worker's `namespace.name` (e.g. `"codegen.worker"`).
+/// `worker_version` must be non-empty. `timeout_secs` controls stale-running
+/// recovery in the queue; worker dispatch uses the worker pool's configured job
+/// timeout. Pass 0 for `timeout_secs`; `max_attempts = 0` uses
+/// engine-configured worker defaults.
 pub fn submit_job_with_options(
     engine_authority: &str,
+    worker_version: &str,
     job_type: &str,
     payload: &[u8],
     timeout_secs: i32,
     max_attempts: i32,
 ) -> Result<String, HttpError> {
+    if worker_version.is_empty() {
+        return Err(HttpError::Transport("worker_version is required".into()));
+    }
+
     // Parse namespace.name from the authority.
     let (namespace, name) = engine_authority.split_once('.').ok_or_else(|| {
         HttpError::Transport(format!(
@@ -37,16 +53,18 @@ pub fn submit_job_with_options(
     let body = encode_submit_job_request(
         namespace,
         name,
+        worker_version,
         job_type,
         payload,
         timeout_secs,
         max_attempts,
     );
+    let headers = submit_job_headers(worker_version);
     let resp = crate::http::http_request(&HttpRequest {
         authority: engine_authority,
         path: SUBMIT_JOB_PATH,
         method: Method::Post,
-        headers: &[("content-type", b"application/x-protobuf" as &[u8])],
+        headers: &headers,
         body: &body,
     })?;
 
@@ -133,6 +151,7 @@ fn encode_int32_field(field: u32, val: i32, buf: &mut Vec<u8>) {
 fn encode_submit_job_request(
     namespace: &str,
     name: &str,
+    worker_version: &str,
     job_type: &str,
     payload: &[u8],
     timeout_secs: i32,
@@ -143,7 +162,8 @@ fn encode_submit_job_request(
     buf.extend_from_slice(&encode_string_field(1, namespace));
     // field 2: worker_name
     buf.extend_from_slice(&encode_string_field(2, name));
-    // field 3: worker_version (empty)
+    // field 3: worker_version
+    buf.extend_from_slice(&encode_string_field(3, worker_version));
     // field 4: job_type
     buf.extend_from_slice(&encode_string_field(4, job_type));
     // field 5: payload
@@ -326,6 +346,23 @@ mod tests {
     }
 
     #[test]
+    fn test_submit_job_rejects_empty_worker_version_locally() {
+        let err = submit_job_with_options("my-ns.my-mod", "", "/test/Rpc", b"payload", 0, 0)
+            .expect_err("empty worker_version must be rejected before HTTP");
+        assert!(matches!(err, HttpError::Transport(msg) if msg == "worker_version is required"));
+    }
+
+    #[test]
+    fn test_submit_job_headers_pin_worker_version() {
+        let headers = submit_job_headers("1.2.3");
+        assert_eq!(
+            headers[0],
+            ("content-type", b"application/x-protobuf" as &[u8])
+        );
+        assert_eq!(headers[1], ("x-wr-version", b"1.2.3" as &[u8]));
+    }
+
+    #[test]
     fn test_encode_varint_single_byte() {
         let mut buf = Vec::new();
         encode_varint(0, &mut buf);
@@ -410,7 +447,8 @@ mod tests {
 
     #[test]
     fn test_submit_job_request_encoding() {
-        let buf = encode_submit_job_request("my-ns", "my-mod", "/test/Rpc", b"payload", 60, 3);
+        let buf =
+            encode_submit_job_request("my-ns", "my-mod", "1.2.3", "/test/Rpc", b"payload", 60, 3);
 
         // Decode individual fields.
         assert_eq!(
@@ -424,6 +462,11 @@ mod tests {
             "name"
         );
         assert_eq!(
+            decode_string_field(&buf, 3).unwrap(),
+            Some("1.2.3".to_string()),
+            "worker_version"
+        );
+        assert_eq!(
             decode_string_field(&buf, 4).unwrap(),
             Some("/test/Rpc".to_string()),
             "job_type"
@@ -431,6 +474,19 @@ mod tests {
         assert_eq!(decode_bytes_field(&buf, 5).unwrap(), b"payload", "payload");
         assert_eq!(decode_int32_field(&buf, 6).unwrap(), 60, "timeout_secs");
         assert_eq!(decode_int32_field(&buf, 7).unwrap(), 3, "max_attempts");
+
+        let override_buf =
+            encode_submit_job_request("my-ns", "my-mod", "1.2.3", "/test/Rpc", b"payload", 0, 9);
+        assert_eq!(
+            decode_int32_field(&override_buf, 6).unwrap(),
+            0,
+            "timeout_secs"
+        );
+        assert_eq!(
+            decode_int32_field(&override_buf, 7).unwrap(),
+            9,
+            "max_attempts"
+        );
     }
 
     #[test]

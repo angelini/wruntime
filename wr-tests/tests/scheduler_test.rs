@@ -250,6 +250,96 @@ async fn test_submit_job_unreachable_proxy_errors() -> Result<()> {
     Ok(())
 }
 
+async fn capture_scheduler_submit_server() -> Result<(
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Receiver<(String, Option<String>, String)>,
+)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        let svc = hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| {
+            let tx = tx.clone();
+            async move {
+                use http_body_util::BodyExt;
+                use prost::Message;
+
+                let path = req.uri().path().to_string();
+                let header = req
+                    .headers()
+                    .get("x-wr-version")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let body = req
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|c| c.to_bytes())
+                    .unwrap_or_default();
+                let decoded = wr_common::wruntime::SubmitJobRequest::decode(&body[..])
+                    .map(|req| req.worker_version)
+                    .unwrap_or_default();
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send((path, header, decoded));
+                }
+                let resp = wr_common::wruntime::SubmitJobResponse {
+                    job_id: "job-1".into(),
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(200)
+                        .body(http_body_util::Full::new(bytes::Bytes::from(
+                            resp.encode_to_vec(),
+                        )))
+                        .unwrap(),
+                )
+            }
+        });
+        let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .serve_connection(io, svc)
+            .await;
+    });
+    Ok((addr, rx))
+}
+
+#[tokio::test]
+async fn test_scheduler_submit_job_sends_version_header_and_body() -> Result<()> {
+    let (addr, captured) = capture_scheduler_submit_server().await?;
+    let row = wr_manager::db::ScheduleRow {
+        schedule_id: "sched-1".into(),
+        worker_namespace: "sched".into(),
+        worker_name: "worker".into(),
+        worker_version: "1.2.3".into(),
+        job_type: "/Run".into(),
+        interval_secs: 300,
+        immediate: true,
+        payload: vec![],
+        timeout_secs: 30,
+        max_attempts: 1,
+        enabled: true,
+        last_fired_at: None,
+        next_fire_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+        claim_id: Some("claim".into()),
+    };
+
+    wr_manager::scheduler::submit_job(&format!("http://{addr}"), &row)
+        .await
+        .unwrap();
+    let (path, header, body_version) = captured.await.unwrap();
+    assert_eq!(path, "/wruntime.WorkerService/SubmitJob");
+    assert_eq!(header, Some("1.2.3".to_string()));
+    assert_eq!(body_version, "1.2.3");
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_upsert_next_fire_at_due_semantics() -> Result<()> {
     let (pool, _addr, mut c) = manager_trio().await?;

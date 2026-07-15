@@ -37,17 +37,13 @@ pub async fn worker_pool() -> deadpool_postgres::Pool {
 
 static WORKER_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub fn unique_worker_namespace(test_name: &str) -> String {
+pub fn unique_worker_namespace(_test_name: &str) -> String {
     let n = WORKER_TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before unix epoch")
-        .as_nanos();
-    let safe_name: String = test_name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    format!("{safe_name}_{n}_{ts}")
+        .as_nanos() as u64;
+    format!("wt{:016x}", ts ^ n.rotate_left(32))
 }
 
 pub struct WorkerPoolHarness {
@@ -145,7 +141,7 @@ impl WorkerPoolHarness {
     }
 
     pub async fn wait_for_listener(&self, timeout: Duration) -> Result<()> {
-        let channel = format!("wr_jobs_{}_{}", self.namespace, self.name);
+        let channel = format!("wr_jobs_{}_{}_{}", self.namespace, self.name, self.version);
         let expected_query = format!("LISTEN \"{channel}\"");
         super::wait::eventually(
             format!("worker LISTEN active for {channel}"),

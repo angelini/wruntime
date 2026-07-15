@@ -140,6 +140,23 @@ async fn test_worker_job_submission_and_status_via_grpc() {
                                     let req =
                                         wr_common::wruntime::SubmitJobRequest::decode(&body[..])
                                             .unwrap();
+                                    if req.worker_version.is_empty() {
+                                        return Ok::<_, std::convert::Infallible>(
+                                            http::Response::builder()
+                                                .status(400)
+                                                .body(http_body_util::Full::new(
+                                                    bytes::Bytes::from(
+                                                        "worker_version is required",
+                                                    ),
+                                                ))
+                                                .unwrap(),
+                                        );
+                                    }
+                                    let max_attempts = if req.max_attempts > 0 {
+                                        req.max_attempts
+                                    } else {
+                                        5
+                                    };
                                     let job_id = wr_engine::worker::insert_job(
                                         &pool,
                                         &req.worker_namespace,
@@ -148,7 +165,7 @@ async fn test_worker_job_submission_and_status_via_grpc() {
                                         &req.job_type,
                                         &req.payload,
                                         req.timeout_secs,
-                                        req.max_attempts,
+                                        max_attempts,
                                         "",
                                         "",
                                     )
@@ -218,7 +235,7 @@ async fn test_worker_job_submission_and_status_via_grpc() {
         job_type: "/test/Process".into(),
         payload: b"test-payload".to_vec(),
         timeout_secs: 60,
-        max_attempts: 3,
+        max_attempts: 0,
     };
     let client = http_client();
     let resp = client
@@ -257,7 +274,121 @@ async fn test_worker_job_submission_and_status_via_grpc() {
     let status_resp = wr_common::wruntime::GetJobStatusResponse::decode(&body[..]).unwrap();
     assert_eq!(status_resp.job_id, submit_resp.job_id);
     assert_eq!(status_resp.status, "pending");
-    assert_eq!(status_resp.max_attempts, 3);
+    assert_eq!(status_resp.max_attempts, 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_worker_grpc_submit_rejects_empty_body_worker_version() {
+    let Some(harness) = WorkerPoolHarness::new(
+        "test_worker_grpc_submit_rejects_empty_body_worker_version",
+        "grpc-version-mod",
+    )
+    .await
+    else {
+        return;
+    };
+    let pool = harness.pool.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let pool_clone = pool.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let pool = pool_clone.clone();
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let svc =
+                    hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                        let pool = pool.clone();
+                        async move {
+                            let path = req.uri().path().to_owned();
+                            let body = http_body_util::BodyExt::collect(req.into_body())
+                                .await
+                                .map(|c| c.to_bytes())
+                                .unwrap_or_default();
+
+                            let resp = match path.as_str() {
+                                "/wruntime.WorkerService/SubmitJob" => {
+                                    use prost::Message;
+                                    let req =
+                                        wr_common::wruntime::SubmitJobRequest::decode(&body[..])
+                                            .unwrap();
+                                    if req.worker_version.is_empty() {
+                                        http::Response::builder()
+                                            .status(400)
+                                            .body(http_body_util::Full::new(bytes::Bytes::from(
+                                                "worker_version is required",
+                                            )))
+                                            .unwrap()
+                                    } else {
+                                        let job_id = wr_engine::worker::insert_job(
+                                            &pool,
+                                            &req.worker_namespace,
+                                            &req.worker_name,
+                                            &req.worker_version,
+                                            &req.job_type,
+                                            &req.payload,
+                                            req.timeout_secs,
+                                            req.max_attempts,
+                                            "",
+                                            "",
+                                        )
+                                        .await
+                                        .unwrap();
+                                        http::Response::builder()
+                                            .status(200)
+                                            .body(http_body_util::Full::new(bytes::Bytes::from(
+                                                wr_common::wruntime::SubmitJobResponse { job_id }
+                                                    .encode_to_vec(),
+                                            )))
+                                            .unwrap()
+                                    }
+                                }
+                                _ => http::Response::builder()
+                                    .status(404)
+                                    .body(http_body_util::Full::new(bytes::Bytes::from(
+                                        "not found",
+                                    )))
+                                    .unwrap(),
+                            };
+                            Ok::<_, std::convert::Infallible>(resp)
+                        }
+                    });
+                let _ =
+                    hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+            });
+        }
+    });
+
+    use prost::Message;
+    let submit_req = wr_common::wruntime::SubmitJobRequest {
+        worker_namespace: "test-ns".into(),
+        worker_name: "test-mod".into(),
+        worker_version: "".into(),
+        job_type: "/test/Process".into(),
+        payload: b"test-payload".to_vec(),
+        timeout_secs: 60,
+        max_attempts: 0,
+    };
+    let resp = http_client()
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{addr}/wruntime.WorkerService/SubmitJob"))
+                .header("content-type", "application/x-protobuf")
+                .header("x-wr-version", "1.0.0")
+                .body(Full::new(Bytes::from(submit_req.encode_to_vec())))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -440,8 +571,20 @@ async fn test_worker_concurrent_claim_across_engines() {
 
     // Two engines claim concurrently — each should get a different job.
     let (claim1, claim2) = tokio::join!(
-        wr_engine::worker::claim_job(&harness.pool, &harness.namespace, "cc-mod", "engine-a"),
-        wr_engine::worker::claim_job(&harness.pool, &harness.namespace, "cc-mod", "engine-b"),
+        wr_engine::worker::claim_job(
+            &harness.pool,
+            &harness.namespace,
+            &harness.name,
+            &harness.version,
+            "engine-a",
+        ),
+        wr_engine::worker::claim_job(
+            &harness.pool,
+            &harness.namespace,
+            &harness.name,
+            &harness.version,
+            "engine-b",
+        ),
     );
 
     let c1 = claim1.unwrap().expect("engine-a should claim a job");
@@ -459,9 +602,15 @@ async fn test_worker_concurrent_claim_across_engines() {
     assert_eq!(claimed_ids, expected);
 
     // No more jobs to claim.
-    let c3 = wr_engine::worker::claim_job(&harness.pool, &harness.namespace, "cc-mod", "engine-c")
-        .await
-        .unwrap();
+    let c3 = wr_engine::worker::claim_job(
+        &harness.pool,
+        &harness.namespace,
+        &harness.name,
+        &harness.version,
+        "engine-c",
+    )
+    .await
+    .unwrap();
     assert!(c3.is_none());
 }
 
@@ -552,6 +701,43 @@ async fn test_worker_listen_notify_immediate_wake() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_worker_listen_notify_is_version_scoped() {
+    let Some(mut v1) = WorkerPoolHarness::new(
+        "test_worker_listen_notify_is_version_scoped_v1",
+        "notify-version-mod",
+    )
+    .await
+    else {
+        return;
+    };
+    let Some(mut v2) = WorkerPoolHarness::new(
+        "test_worker_listen_notify_is_version_scoped_v2",
+        "notify-version-mod",
+    )
+    .await
+    else {
+        return;
+    };
+    v2.namespace.clone_from(&v1.namespace);
+    v2.version = "2.0.0".to_string();
+
+    v1.spawn(1, Duration::from_secs(60), Duration::from_secs(10));
+    v2.spawn(1, Duration::from_secs(60), Duration::from_secs(10));
+    v1.wait_for_listener(Duration::from_secs(5)).await.unwrap();
+    v2.wait_for_listener(Duration::from_secs(5)).await.unwrap();
+
+    let _job_id = v2.insert_job("/test/WakeV2", b"ping", 60, 3).await.unwrap();
+
+    let inbound_v2 = v2.recv_dispatch(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(inbound_v2.request.uri().path(), "/test/WakeV2");
+    v1.expect_no_dispatch(Duration::from_millis(500))
+        .await
+        .unwrap();
+
+    WorkerPoolHarness::respond(inbound_v2, 200, "ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_worker_stale_recovery_marks_dead_when_exhausted() {
     let Some(harness) = WorkerPoolHarness::new(
         "test_worker_stale_recovery_marks_dead_when_exhausted",
@@ -566,10 +752,15 @@ async fn test_worker_stale_recovery_marks_dead_when_exhausted() {
     let id = harness.insert_job("/test/Stale", b"", 1, 1).await.unwrap();
 
     // Claim it (attempt becomes 1, which equals max_attempts).
-    let _ =
-        wr_engine::worker::claim_job(&harness.pool, &harness.namespace, "stale-mod", "engine-1")
-            .await
-            .unwrap();
+    let _ = wr_engine::worker::claim_job(
+        &harness.pool,
+        &harness.namespace,
+        &harness.name,
+        &harness.version,
+        "engine-1",
+    )
+    .await
+    .unwrap();
 
     // Backdate claimed_at so it appears stale.
     let client = harness.pool.get().await.unwrap();

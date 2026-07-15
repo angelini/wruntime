@@ -118,7 +118,7 @@ async fn wasm_http_ingress() -> Result<()> {
     let ingress_addr = start_ingress_proxy(
         table,
         vec![ExternalRoute {
-            path: "/Echo".into(),
+            path: "/test.HttpTestService/Echo".into(),
             methods: vec!["POST".into()],
             module: "http-svc".into(),
             namespace: "test-ns".into(),
@@ -134,7 +134,7 @@ async fn wasm_http_ingress() -> Result<()> {
         .request(
             http::Request::builder()
                 .method("POST")
-                .uri(format!("http://{ingress_addr}/Echo"))
+                .uri(format!("http://{ingress_addr}/test.HttpTestService/Echo"))
                 .body(Full::new(Bytes::from(req_body.encode_to_vec())))?,
         )
         .await?;

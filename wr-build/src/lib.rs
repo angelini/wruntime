@@ -263,11 +263,14 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
 /// For a service `TaskWorkerService` with RPC `ProcessTask`:
 ///
 /// ```rust,ignore
-/// pub struct TaskWorkerServiceClient { authority: String }
+/// pub struct TaskWorkerServiceClient { authority: String, version: String }
 ///
 /// impl TaskWorkerServiceClient {
-///     pub fn new(authority: impl Into<String>) -> Self { ... }
+///     pub fn new(authority: impl Into<String>, version: impl Into<String>) -> Self { ... }
 ///     pub fn process_task(&self, req: ProcessTaskRequest) -> Result<String, wr_sdk::http::HttpError> { ... }
+///     pub fn process_task_with_options(&self, req: ProcessTaskRequest, timeout_secs: i32, max_attempts: i32) -> Result<String, wr_sdk::http::HttpError> { ... }
+///     pub fn get_status(&self, job_id: &str) -> Result<wr_sdk::jobs::JobStatus, wr_sdk::http::HttpError> { ... }
+///     pub fn get_process_task_result(&self, job_id: &str) -> Result<Option<ProcessTaskResponse>, wr_sdk::http::HttpError> { ... }
 /// }
 /// ```
 pub struct WrWorkerClientGenerator;
@@ -292,12 +295,63 @@ impl prost_build::ServiceGenerator for WrWorkerClientGenerator {
             .iter()
             .map(|m| {
                 let method_name = method_ident(&m.name);
+                let with_options_name = method_ident(&format!("{}_with_options", m.name));
+                let result_name = method_ident(&format!("get_{}_result", to_snake(&m.name)));
                 let input = parse_type(&m.input_type);
+                let output = parse_type(&m.output_type);
                 let job_type = format!("/{}.{}/{}", service.package, service.proto_name, m.proto_name);
                 quote! {
                     pub fn #method_name(&self, req: #input) -> Result<String, wr_sdk::http::HttpError> {
                         let payload = prost::Message::encode_to_vec(&req);
-                        wr_sdk::jobs::submit_job(&self.authority, #job_type, &payload)
+                        wr_sdk::jobs::submit_job(&self.authority, &self.version, #job_type, &payload)
+                    }
+
+                    pub fn #with_options_name(
+                        &self,
+                        req: #input,
+                        timeout_secs: i32,
+                        max_attempts: i32,
+                    ) -> Result<String, wr_sdk::http::HttpError> {
+                        let payload = prost::Message::encode_to_vec(&req);
+                        wr_sdk::jobs::submit_job_with_options(
+                            &self.authority,
+                            &self.version,
+                            #job_type,
+                            &payload,
+                            timeout_secs,
+                            max_attempts,
+                        )
+                    }
+
+                    pub fn #result_name(
+                        &self,
+                        job_id: &str,
+                    ) -> Result<Option<#output>, wr_sdk::http::HttpError> {
+                        let status = self.get_status(job_id)?;
+                        match status.status.as_str() {
+                            "pending" | "running" => Ok(None),
+                            "complete" => {
+                                if status.result.is_empty() {
+                                    return Err(wr_sdk::http::HttpError::Decode(
+                                        "missing result for completed job".into(),
+                                    ));
+                                }
+                                <#output as prost::Message>::decode(status.result.as_slice())
+                                    .map(Some)
+                                    .map_err(|e| wr_sdk::http::HttpError::Decode(e.to_string()))
+                            }
+                            "failed" | "dead" => {
+                                let body = if status.error_message.is_empty() {
+                                    format!("job {} {}", status.job_id, status.status).into_bytes()
+                                } else {
+                                    status.error_message.into_bytes()
+                                };
+                                Err(wr_sdk::http::HttpError::Status { code: 500, body })
+                            }
+                            other => Err(wr_sdk::http::HttpError::Decode(format!(
+                                "unknown job status: {other}"
+                            ))),
+                        }
                     }
                 }
             })
@@ -306,13 +360,22 @@ impl prost_build::ServiceGenerator for WrWorkerClientGenerator {
         let tokens = quote! {
             pub struct #struct_ident {
                 authority: String,
+                version: String,
             }
 
             impl #struct_ident {
-                pub fn new(authority: impl Into<String>) -> Self {
+                pub fn new(authority: impl Into<String>, version: impl Into<String>) -> Self {
                     Self {
                         authority: authority.into(),
+                        version: version.into(),
                     }
+                }
+
+                pub fn get_status(
+                    &self,
+                    job_id: &str,
+                ) -> Result<wr_sdk::jobs::JobStatus, wr_sdk::http::HttpError> {
+                    wr_sdk::jobs::get_job_status(&self.authority, job_id)
                 }
 
                 #(#methods)*
@@ -403,11 +466,62 @@ mod tests {
         let mut buf = String::new();
         generator.generate(svc, &mut buf);
 
+        assert!(buf.contains("pub struct WorkerServiceClient"), "{buf}");
+        assert!(buf.contains("authority: String"), "{buf}");
+        assert!(buf.contains("version: String"), "{buf}");
         assert!(
-            buf.contains("\"/codegen.WorkerService/ProcessTask\""),
+            buf.contains(
+                "pub fn new(authority: impl Into<String>, version: impl Into<String>) -> Self"
+            ),
             "{buf}"
         );
+        assert!(buf.contains("wr_sdk::jobs::submit_job("), "{buf}");
+        assert!(
+            buf.contains("&self.authority,\n            &self.version,"),
+            "{buf}"
+        );
+        assert!(
+            buf.contains("\"/codegen.WorkerService/ProcessTask\",\n            &payload"),
+            "{buf}"
+        );
+        assert!(buf.contains("pub fn process_task_with_options"), "{buf}");
+        assert!(
+            buf.contains("wr_sdk::jobs::submit_job_with_options"),
+            "{buf}"
+        );
+        assert!(buf.contains("pub fn get_status"), "{buf}");
+        assert!(
+            buf.contains("wr_sdk::jobs::get_job_status(&self.authority, job_id)"),
+            "{buf}"
+        );
+        assert!(buf.contains("pub fn get_process_task_result"), "{buf}");
+        assert!(
+            buf.contains("Result<Option<ProcessTaskResponse>, wr_sdk::http::HttpError>"),
+            "{buf}"
+        );
+        assert!(
+            buf.contains("\"pending\" | \"running\" => Ok(None)"),
+            "{buf}"
+        );
+        assert!(
+            buf.contains("\"missing result for completed job\""),
+            "{buf}"
+        );
+        assert!(
+            buf.contains(
+                "<ProcessTaskResponse as prost::Message>::decode(status.result.as_slice())"
+            ),
+            "{buf}"
+        );
+        assert!(buf.contains("\"failed\" | \"dead\""), "{buf}");
+        assert!(buf.contains("wr_sdk::http::HttpError::Status"), "{buf}");
+        assert!(buf.contains("code: 500"), "{buf}");
+        assert!(buf.contains("unknown job status"), "{buf}");
         assert!(!buf.contains("\"/ProcessTask\""), "{buf}");
+        assert!(
+            !buf.contains("submit_job(&self.authority, \"/codegen.WorkerService/ProcessTask\""),
+            "{buf}"
+        );
     }
 
     #[test]
