@@ -1,6 +1,6 @@
 mod helpers;
 use helpers::{
-    db::{db_state, DbError, ModuleState, PgValue},
+    db::{db_state, DbError, DbHost, ModuleState, PgValue},
     proxy::http_pool,
 };
 
@@ -251,7 +251,7 @@ async fn test_db_jsonb_roundtrip() {
         panic!("expected Jsonb, got {:?}", rows[0].columns[0].value);
     };
     let want: serde_json::Value = serde_json::from_str(input).unwrap();
-    let got_val: serde_json::Value = serde_json::from_str(got).unwrap();
+    let got_val: serde_json::Value = serde_json::from_str(got.as_str()).unwrap();
     assert_eq!(got_val, want);
 }
 

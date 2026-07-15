@@ -183,13 +183,11 @@ fn test_proxy_config_accepts_positive_ttl() {
 
 #[test]
 fn test_example_config_files_parse() {
-    for (path, toml) in [(
+    let (path, toml) = (
         "examples/config/manager.toml",
         include_str!("../../examples/config/manager.toml"),
-    )] {
-        toml::from_str::<ManagerConfig>(toml)
-            .unwrap_or_else(|err| panic!("{path} must parse: {err}"));
-    }
+    );
+    toml::from_str::<ManagerConfig>(toml).unwrap_or_else(|err| panic!("{path} must parse: {err}"));
 
     for (path, toml) in [
         (
@@ -437,7 +435,7 @@ fn test_example_engine_configs_validate_when_artifacts_are_built() {
 }
 
 fn unique_example_modules(configs: &[&str]) -> BTreeMap<String, wr_engine::config::ModuleConfig> {
-    let mut modules = BTreeMap::new();
+    let mut modules: BTreeMap<String, wr_engine::config::ModuleConfig> = BTreeMap::new();
     for toml in configs {
         let cfg: EngineConfig = toml::from_str(toml).expect("example engine config must parse");
         for module in cfg.modules {

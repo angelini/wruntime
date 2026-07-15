@@ -1,10 +1,7 @@
 mod helpers;
 use helpers::{
     manager::{manager_trio, register_test_module, synced_routing_table},
-    proxy::{
-        http_client, proxy_get, register_module, start_proxy_with_cb, EngineSpec, ModuleSpec,
-        TEST_SELF_PEER,
-    },
+    proxy::{http_client, proxy_get, register_module, start_proxy_with_cb, EngineSpec, ModuleSpec},
     stubs::{spawn_status_stub, spawn_stub_engine, spawn_switchable_stub},
     wasm::minimal_file_descriptor_set,
 };

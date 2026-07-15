@@ -9,7 +9,7 @@
 mod helpers;
 use helpers::{
     manager::{manager_trio, register_test_module, sync_table, synced_routing_table},
-    proxy::{http_pool, proxy_get, start_proxy},
+    proxy::{proxy_get, start_proxy},
     stubs::spawn_stub_engine,
     wasm::{spawn_wasm_stub_engine, wasm_module_pre},
 };

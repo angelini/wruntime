@@ -2,17 +2,14 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::Bytes;
-use http::{Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
-use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use http_body_util::Full;
 
 use wr_engine::llm::LlmRuntime;
 
 use super::db::{ModuleServices, ModuleState};
 use super::proxy::http_pool;
 
+#[derive(Clone)]
 pub enum MockLlmMode {
     /// Return a simple text completion.
     Text {

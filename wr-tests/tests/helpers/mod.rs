@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 pub mod blobstore;
 pub mod db;
 pub mod llm;

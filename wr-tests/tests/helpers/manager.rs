@@ -6,8 +6,7 @@ use tonic::transport::Server;
 
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, manager_service_server::ManagerServiceServer,
-    EngineRegistration, GetRoutingTableRequest, ModuleDescriptor, RegisterEngineRequest,
-    RoutingRule,
+    GetRoutingTableRequest,
 };
 use wr_manager::service::Manager;
 

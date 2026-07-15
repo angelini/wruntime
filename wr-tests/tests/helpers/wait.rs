@@ -59,12 +59,17 @@ pub async fn wait_for_rule_health(
     let context = format!("routing rule {destination_module} healthy={expected_healthy}");
     let started = Instant::now();
     let deadline = started + timeout;
-    let mut last_seen: Option<(bool, u64)> = None;
-
     loop {
         match super::manager::get_rule_health(mgr, destination_module).await {
             Ok((healthy, version)) if healthy == expected_healthy => return Ok((healthy, version)),
-            Ok((healthy, version)) => last_seen = Some((healthy, version)),
+            Ok((healthy, version)) if Instant::now() >= deadline => {
+                bail!(
+                    "timed out after {:?} waiting for {context}; last seen: {:?}",
+                    started.elapsed(),
+                    Some((healthy, version))
+                );
+            }
+            Ok(_) => {}
             Err(err) if Instant::now() >= deadline => {
                 bail!(
                     "timed out after {:?} waiting for {context}; last error: {err:#}",
@@ -74,13 +79,6 @@ pub async fn wait_for_rule_health(
             Err(_) => {}
         }
 
-        if Instant::now() >= deadline {
-            bail!(
-                "timed out after {:?} waiting for {context}; last seen: {:?}",
-                started.elapsed(),
-                last_seen
-            );
-        }
         sleep(DEFAULT_POLL_INTERVAL).await;
     }
 }
@@ -92,18 +90,16 @@ pub async fn wait_for_routing_table_version_gt(
 ) -> Result<u64> {
     let started = Instant::now();
     let deadline = started + timeout;
-    let mut last_seen = None;
     loop {
         let version = super::manager::get_routing_table_version(mgr).await?;
         if version > baseline {
             return Ok(version);
         }
-        last_seen = Some(version);
         if Instant::now() >= deadline {
             bail!(
                 "timed out after {:?} waiting for routing table version > {baseline}; last seen: {:?}",
                 started.elapsed(),
-                last_seen
+                Some(version)
             );
         }
         sleep(DEFAULT_POLL_INTERVAL).await;
@@ -117,7 +113,6 @@ pub async fn wait_for_manager_count(
 ) -> Result<Vec<ManagerInfo>> {
     let started = Instant::now();
     let deadline = started + timeout;
-    let mut last_seen = None;
     loop {
         let managers = mgr
             .list_managers(ListManagersRequest {})
@@ -127,12 +122,11 @@ pub async fn wait_for_manager_count(
         if managers.len() == expected {
             return Ok(managers);
         }
-        last_seen = Some(managers.len());
         if Instant::now() >= deadline {
             bail!(
                 "timed out after {:?} waiting for manager count == {expected}; last seen: {:?}",
                 started.elapsed(),
-                last_seen
+                Some(managers.len())
             );
         }
         sleep(DEFAULT_POLL_INTERVAL).await;
@@ -146,7 +140,6 @@ pub async fn wait_for_manager_absent(
 ) -> Result<Vec<ManagerInfo>> {
     let started = Instant::now();
     let deadline = started + timeout;
-    let mut last_ids: Vec<String> = Vec::new();
     loop {
         let managers = mgr
             .list_managers(ListManagersRequest {})
@@ -156,8 +149,8 @@ pub async fn wait_for_manager_absent(
         if !managers.iter().any(|m| m.manager_id == manager_id) {
             return Ok(managers);
         }
-        last_ids = managers.iter().map(|m| m.manager_id.clone()).collect();
         if Instant::now() >= deadline {
+            let last_ids: Vec<String> = managers.iter().map(|m| m.manager_id.clone()).collect();
             bail!(
                 "timed out after {:?} waiting for manager {manager_id} absent from ListManagers; last ids: {:?}",
                 started.elapsed(),

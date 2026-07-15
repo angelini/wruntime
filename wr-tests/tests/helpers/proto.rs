@@ -4,4 +4,5 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/test.rs"));
 }
 
+#[allow(unused_imports)]
 pub use generated::*;

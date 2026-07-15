@@ -220,7 +220,7 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
                         let path = #route;
                         wr_sdk::http::http_request(&wr_sdk::http::HttpRequest {
                             authority: &self.authority,
-                            path: &path,
+                            path,
                             method: wr_sdk::http::Method::Post,
                             headers: &[("content-type", b"application/x-protobuf" as &[u8])],
                             body: &body,

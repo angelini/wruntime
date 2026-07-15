@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+#[allow(unused_imports)]
 pub use wr_engine::db::wruntime::db::database::{DbError, Host as DbHost, PgValue};
 pub use wr_engine::state::{ModuleServices, ModuleState};
 
@@ -8,13 +9,10 @@ use super::proxy::http_pool;
 pub const TEST_DB_URL_ENV: &str = "WRT_TEST_DB_URL";
 
 pub fn test_db_url() -> Option<String> {
-    match std::env::var_os(TEST_DB_URL_ENV) {
-        None => None,
-        Some(raw) => Some(
-            raw.into_string()
-                .expect("WRT_TEST_DB_URL must be valid UTF-8 when set"),
-        ),
-    }
+    std::env::var_os(TEST_DB_URL_ENV).map(|raw| {
+        raw.into_string()
+            .expect("WRT_TEST_DB_URL must be valid UTF-8 when set")
+    })
 }
 
 pub fn skip_without_db(test_name: &str) -> bool {
