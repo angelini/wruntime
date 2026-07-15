@@ -110,8 +110,10 @@ message GetSchemaResponse   { bytes proto_schema = 1; }
 // ── Worker job queue ──────────────────────────────────────────────────────
 
 message SubmitJobRequest {
+  // Namespace/name must match the proxy-routed worker identity.
   string worker_namespace = 1;
   string worker_name      = 2;
+  // Optional. Empty means name-only dispatch; non-empty pins the exact version.
   string worker_version   = 3;
   string job_type         = 4;
   bytes  payload          = 5;

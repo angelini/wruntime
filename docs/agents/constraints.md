@@ -76,7 +76,8 @@ Hard rules and common mistakes when building wruntime guest modules. Read this b
 | Missing `--include_imports` in protoc | Engine fails to parse schema | Always pass `--include_imports` when generating `.binpb` |
 | Using `prost = "0.13"` with `prost-build = "0.14"` (version mismatch) | Build errors | Keep `prost` and `prost-build` on the same minor version |
 | Missing `[workspace]` at top of guest Cargo.toml | Build picks up parent workspace settings, may fail or produce wrong output | Add a bare `[workspace]` line before `[package]` in every guest module's Cargo.toml |
-| Calling `store::*` without `blobstore = true` in engine.toml | Runtime panic when module tries to access blobstore | Set `blobstore = true` in the `[[module]]` block AND add a `[blobstore]` section with endpoint/credentials to the engine config |
+| Calling `store::*` without `blobstore = true` in engine.toml | Runtime panic when module tries to access blobstore | Set `blobstore = true` in the `[[module]]` block AND add a `[blobstore]` section with endpoint, credentials, and a non-empty `allowed_buckets` list |
+| Passing a bucket outside `[blobstore].allowed_buckets` | `BlobError::AccessDenied` | Add the bucket to the engine allowlist or use an allowed bucket |
 | Calling `complete_stream()` with tools set | `LlmError::InvalidRequest` before any upstream call | Streaming does not support tool-use; use `complete()` for tool calls |
 | Uploading/downloading an object larger than `max_object_size`, or listing more than `max_list_objects` | `BlobError::TooLarge` | Stay within the engine `[blobstore]` limits (default 16 MiB / 1000 objects) or split the work |
 | Sending an outbound HTTP request body larger than `max_outbound_body_bytes` | Outbound call fails with an `HttpRequestBodySize` error | Keep outbound bodies under the engine limit (default 16 MiB) |

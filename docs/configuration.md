@@ -228,7 +228,7 @@ request_timeout_secs = 120
 
 ### LLM inference
 
-Modules can call the Claude API (or other LLM providers) through a host binding. The engine holds the API key — guests never see credentials.
+Modules can call the Anthropic Claude API through a host binding. The engine holds the API key — guests never see credentials. Engine validation rejects every provider value except `"anthropic"`.
 
 ```toml
 [llm]
@@ -262,6 +262,7 @@ Modules can read and write objects in an S3-compatible store through a host bind
 endpoint          = "http://127.0.0.1:8900"   # S3-compatible endpoint
 access_key_id     = "..."
 secret_access_key = "..."
+allowed_buckets   = ["reports"]   # required; guest bucket arguments must match
 region            = "us-east-1"   # optional; this is the default
 max_object_size   = 16777216      # optional; bytes, default 16 MiB
 max_list_objects  = 1000          # optional; default 1000
@@ -277,6 +278,8 @@ blobstore   = true
 
 Key behaviors:
 
+- **`allowed_buckets`** is a required, non-empty host capability boundary. Every guest-provided bucket must appear in the list; other bucket names return `blob-error::access-denied` before an S3 client is created.
+- **Delete semantics:** deleting a missing object returns `blob-error::not-found`.
 - **`max_object_size`** (default **16 MiB**) is enforced on both `put-object` (checked before upload) and `get-object` (the download is aborted mid-stream once the running total would exceed the limit — an oversized object is never fully buffered). Exceeding it returns `blob-error::too-large`.
 - **`max_list_objects`** (default **1000**) caps a single `list-objects` call; exceeding it returns `blob-error::too-large` rather than silently truncating.
 

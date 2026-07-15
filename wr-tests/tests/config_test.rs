@@ -814,3 +814,68 @@ fn test_engine_config_omitting_flag_defaults_false() {
         "loopback engine config must validate"
     );
 }
+
+#[test]
+fn test_engine_accepts_anthropic_llm_provider() {
+    let toml = format!(
+        "{}\n[llm]\nprovider = \"anthropic\"\napi_key_env = \"ANTHROPIC_API_KEY\"\n",
+        engine_toml("127.0.0.1:9100", "")
+    );
+    let cfg: EngineConfig = toml::from_str(&toml).unwrap();
+    cfg.validate().expect("anthropic provider must validate");
+}
+
+#[test]
+fn test_engine_rejects_unsupported_llm_provider() {
+    let toml = format!(
+        "{}\n[llm]\nprovider = \"openai\"\napi_key_env = \"OPENAI_API_KEY\"\n",
+        engine_toml("127.0.0.1:9100", "")
+    );
+    let cfg: EngineConfig = toml::from_str(&toml).unwrap();
+    let err = cfg
+        .validate()
+        .expect_err("unsupported LLM provider must fail validation");
+    assert!(
+        format!("{err:#}").contains("llm.provider must be exactly \"anthropic\""),
+        "unexpected validation error: {err:#}"
+    );
+}
+
+#[test]
+fn test_engine_accepts_nonempty_blobstore_allowlist() {
+    let toml = format!(
+        "{}\n[blobstore]\nendpoint = \"http://127.0.0.1:8900\"\naccess_key_id = \"key\"\nsecret_access_key = \"secret\"\nallowed_buckets = [\"reports\"]\n",
+        engine_toml("127.0.0.1:9100", "")
+    );
+    let cfg: EngineConfig = toml::from_str(&toml).unwrap();
+    cfg.validate()
+        .expect("non-empty blobstore allowlist must validate");
+}
+
+#[test]
+fn test_engine_rejects_empty_blobstore_allowlist() {
+    let toml = format!(
+        "{}\n[blobstore]\nendpoint = \"http://127.0.0.1:8900\"\naccess_key_id = \"key\"\nsecret_access_key = \"secret\"\nallowed_buckets = []\n",
+        engine_toml("127.0.0.1:9100", "")
+    );
+    let cfg: EngineConfig = toml::from_str(&toml).unwrap();
+    let err = cfg
+        .validate()
+        .expect_err("empty blobstore allowlist must fail validation");
+    assert!(
+        format!("{err:#}").contains("blobstore.allowed_buckets must contain at least one bucket"),
+        "unexpected validation error: {err:#}"
+    );
+}
+
+#[test]
+fn test_engine_requires_blobstore_allowlist() {
+    let toml = format!(
+        "{}\n[blobstore]\nendpoint = \"http://127.0.0.1:8900\"\naccess_key_id = \"key\"\nsecret_access_key = \"secret\"\n",
+        engine_toml("127.0.0.1:9100", "")
+    );
+    let err = toml::from_str::<EngineConfig>(&toml)
+        .err()
+        .expect("missing blobstore allowlist must fail parsing");
+    assert!(err.to_string().contains("allowed_buckets"));
+}

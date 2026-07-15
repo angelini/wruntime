@@ -140,18 +140,6 @@ async fn test_worker_job_submission_and_status_via_grpc() {
                                     let req =
                                         wr_common::wruntime::SubmitJobRequest::decode(&body[..])
                                             .unwrap();
-                                    if req.worker_version.is_empty() {
-                                        return Ok::<_, std::convert::Infallible>(
-                                            http::Response::builder()
-                                                .status(400)
-                                                .body(http_body_util::Full::new(
-                                                    bytes::Bytes::from(
-                                                        "worker_version is required",
-                                                    ),
-                                                ))
-                                                .unwrap(),
-                                        );
-                                    }
                                     let max_attempts = if req.max_attempts > 0 {
                                         req.max_attempts
                                     } else {
@@ -278,9 +266,9 @@ async fn test_worker_job_submission_and_status_via_grpc() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_worker_grpc_submit_rejects_empty_body_worker_version() {
+async fn test_worker_grpc_submit_accepts_empty_body_worker_version() {
     let Some(harness) = WorkerPoolHarness::new(
-        "test_worker_grpc_submit_rejects_empty_body_worker_version",
+        "test_worker_grpc_submit_accepts_empty_body_worker_version",
         "grpc-version-mod",
     )
     .await
@@ -317,36 +305,27 @@ async fn test_worker_grpc_submit_rejects_empty_body_worker_version() {
                                     let req =
                                         wr_common::wruntime::SubmitJobRequest::decode(&body[..])
                                             .unwrap();
-                                    if req.worker_version.is_empty() {
-                                        http::Response::builder()
-                                            .status(400)
-                                            .body(http_body_util::Full::new(bytes::Bytes::from(
-                                                "worker_version is required",
-                                            )))
-                                            .unwrap()
-                                    } else {
-                                        let job_id = wr_engine::worker::insert_job(
-                                            &pool,
-                                            &req.worker_namespace,
-                                            &req.worker_name,
-                                            &req.worker_version,
-                                            &req.job_type,
-                                            &req.payload,
-                                            req.timeout_secs,
-                                            req.max_attempts,
-                                            "",
-                                            "",
-                                        )
-                                        .await
-                                        .unwrap();
-                                        http::Response::builder()
-                                            .status(200)
-                                            .body(http_body_util::Full::new(bytes::Bytes::from(
-                                                wr_common::wruntime::SubmitJobResponse { job_id }
-                                                    .encode_to_vec(),
-                                            )))
-                                            .unwrap()
-                                    }
+                                    let job_id = wr_engine::worker::insert_job(
+                                        &pool,
+                                        &req.worker_namespace,
+                                        &req.worker_name,
+                                        &req.worker_version,
+                                        &req.job_type,
+                                        &req.payload,
+                                        req.timeout_secs,
+                                        req.max_attempts,
+                                        "",
+                                        "",
+                                    )
+                                    .await
+                                    .unwrap();
+                                    http::Response::builder()
+                                        .status(200)
+                                        .body(http_body_util::Full::new(bytes::Bytes::from(
+                                            wr_common::wruntime::SubmitJobResponse { job_id }
+                                                .encode_to_vec(),
+                                        )))
+                                        .unwrap()
                                 }
                                 _ => http::Response::builder()
                                     .status(404)
@@ -388,7 +367,21 @@ async fn test_worker_grpc_submit_rejects_empty_body_worker_version() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let job_id = wr_common::wruntime::SubmitJobResponse::decode(&body[..])
+        .unwrap()
+        .job_id;
+    let client = pool.get().await.unwrap();
+    let version: String = client
+        .query_one(
+            "SELECT worker_version FROM wr__jobs.jobs WHERE job_id = $1",
+            &[&job_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(version.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -697,6 +690,43 @@ async fn test_worker_listen_notify_immediate_wake() {
 
     assert_eq!(inbound.request.uri().path(), "/test/Wake");
 
+    WorkerPoolHarness::respond(inbound, 200, "ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_worker_listen_notify_wakes_for_unversioned_job() {
+    let Some(mut harness) = WorkerPoolHarness::new(
+        "test_worker_listen_notify_wakes_for_unversioned_job",
+        "notify-any-version-mod",
+    )
+    .await
+    else {
+        return;
+    };
+
+    harness.spawn(1, Duration::from_secs(60), Duration::from_secs(10));
+    harness
+        .wait_for_listener(Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    wr_engine::worker::insert_job(
+        &harness.pool,
+        &harness.namespace,
+        &harness.name,
+        "",
+        "/test/WakeAnyVersion",
+        b"ping",
+        60,
+        3,
+        "",
+        "",
+    )
+    .await
+    .unwrap();
+
+    let inbound = harness.recv_dispatch(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(inbound.request.uri().path(), "/test/WakeAnyVersion");
     WorkerPoolHarness::respond(inbound, 200, "ok");
 }
 

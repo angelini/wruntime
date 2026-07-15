@@ -18,6 +18,7 @@ pub fn blobstore_client() -> Arc<BlobstoreRuntime> {
         endpoint,
         access_key_id: access_key,
         secret_access_key: secret_key,
+        allowed_buckets: vec!["test-bucket".into()],
         region: "us-east-1".into(),
         max_object_size: 16 * 1024 * 1024,
         max_list_objects: 1000,

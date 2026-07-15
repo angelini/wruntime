@@ -96,6 +96,43 @@ async fn wasm_blobstore_delete() -> Result<()> {
 }
 
 #[tokio::test]
+async fn wasm_blobstore_delete_missing_returns_not_found() -> Result<()> {
+    let Some(harness) = GuestHarness::load(TestGuest::Blobstore).await? else {
+        return Ok(());
+    };
+    let state = blobstore_state(blobstore_client());
+    let req = proto::DeleteRequest {
+        bucket: "test-bucket".into(),
+        key: unique_prefix("delete-missing"),
+    };
+    let resp = harness.dispatch(state, "/DeleteMissing", req).await?;
+    assert_eq!(resp.status(), 200);
+
+    let body = proto::NotFoundResponse::decode(resp.into_body())?;
+    assert_eq!(body.error_kind, "not-found");
+    Ok(())
+}
+
+#[tokio::test]
+async fn wasm_blobstore_rejects_bucket_outside_allowlist() -> Result<()> {
+    let Some(harness) = GuestHarness::load(TestGuest::Blobstore).await? else {
+        return Ok(());
+    };
+    let state = blobstore_state(blobstore_client());
+    let req = proto::NotFoundRequest {
+        bucket: "unauthorized-bucket".into(),
+        key: unique_prefix("denied-bucket"),
+    };
+    let resp = harness.dispatch(state, "/NotFound", req).await?;
+    assert_eq!(resp.status(), 200);
+
+    let body = proto::NotFoundResponse::decode(resp.into_body())?;
+    assert_eq!(body.error_kind, "access-denied");
+    assert!(body.error_message.contains("unauthorized-bucket"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn wasm_blobstore_list() -> Result<()> {
     let Some(harness) = GuestHarness::load(TestGuest::Blobstore).await? else {
         return Ok(());

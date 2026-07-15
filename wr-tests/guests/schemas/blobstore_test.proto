@@ -5,6 +5,7 @@ service BlobstoreTestService {
   rpc Put      (PutRequest)      returns (PutResponse);
   rpc Get      (GetRequest)      returns (GetResponse);
   rpc Delete   (DeleteRequest)   returns (DeleteResponse);
+  rpc DeleteMissing (DeleteRequest) returns (NotFoundResponse);
   rpc List     (ListRequest)     returns (ListResponse);
   rpc Head     (HeadRequest)     returns (HeadResponse);
   rpc RoundTrip (RoundTripRequest) returns (RoundTripResponse);

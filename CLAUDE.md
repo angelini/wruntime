@@ -113,6 +113,10 @@ Schema-isolated and serialized across replicas via advisory locks. See
 
 **Schemas** — compiled protobuf `FileDescriptorSet` (`.binpb`) uploaded on registration. Used for codegen/discovery, **not** validated by proxy at runtime.
 
+**Capability scoping** — `[blobstore].allowed_buckets` is a required, non-empty host allowlist; namespace prefixes still isolate keys within an allowed bucket. `[llm].provider` currently accepts only `anthropic`.
+
+**Worker job routing** — `/wruntime.WorkerService/...` paths are canonical, with short compatibility aliases. Non-empty job versions are claimed exactly; an empty ad-hoc job version is name-only and can be claimed by any matching namespace/name worker. Manager schedules remain version-pinned.
+
 This project targets WASI Preview 2.
 
 ### WIT Host Bindings (async)

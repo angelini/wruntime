@@ -75,7 +75,7 @@ This decouples engines from the manager address — engines only need to know th
 
 Worker jobs use HTTP RPC via the proxy (not a gRPC service). The SDK provides ergonomic wrappers in `wr_sdk::jobs`.
 
-The canonical endpoints are fully-qualified only; /SubmitJob and /GetJobStatus are not supported aliases.
+The fully qualified endpoints are canonical. `/SubmitJob` and `/GetJobStatus` remain supported compatibility aliases; SDKs and new callers should use the canonical paths.
 
 | Endpoint | Request | Response | Description |
 |----------|---------|----------|-------------|
@@ -96,10 +96,11 @@ message SubmitJobRequest {
 }
 ```
 
-- `worker_version` is required and must be non-empty in the protobuf body.
-- When `x-wr-version` is present, it must match `worker_version`; mismatches are rejected with HTTP 400.
-- The SDK and generated clients send both body `worker_version` and `x-wr-version`.
-- `max_attempts` precedence is explicit request value > configured worker `worker_max_attempts` for the exact namespace/name/version > hard default 3.
+- `worker_namespace` and `worker_name` must match the proxy-routed `x-wr-namespace` and `x-wr-module` identity; missing or mismatched routed identity headers are rejected.
+- `worker_version` is optional. An empty value creates a name-only job claimable by any matching namespace/name worker version; a non-empty value is claimable only by that exact version.
+- For non-empty `worker_version`, an `x-wr-version` header must match or the engine returns HTTP 400. The SDK omits that header for empty versions and sends it for pinned versions.
+- `max_attempts` precedence is explicit request value > configured `worker_max_attempts` for the exact body version (or proxy-routed version when the body version is empty) > hard default 3.
+- Manager schedules remain version-pinned and continue to require a non-empty worker version.
 
 A `GetJobStatusResponse` has the fields:
 

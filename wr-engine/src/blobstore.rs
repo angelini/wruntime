@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use object_store::aws::{AmazonS3, AmazonS3Builder};
@@ -16,6 +16,7 @@ pub struct BlobstoreRuntime {
     region: String,
     access_key_id: String,
     secret_access_key: String,
+    allowed_buckets: HashSet<String>,
     buckets: Mutex<HashMap<String, Arc<AmazonS3>>>,
 }
 
@@ -26,11 +27,18 @@ impl BlobstoreRuntime {
             region: config.region.clone(),
             access_key_id: config.access_key_id.clone(),
             secret_access_key: config.secret_access_key.clone(),
+            allowed_buckets: config.allowed_buckets.iter().cloned().collect(),
             buckets: Mutex::new(HashMap::new()),
         })
     }
 
-    fn bucket(&self, name: &str) -> Result<Arc<AmazonS3>, ObjectStoreError> {
+    fn bucket(&self, name: &str) -> Result<Arc<AmazonS3>, BlobError> {
+        if !self.allowed_buckets.contains(name) {
+            return Err(BlobError::AccessDenied(format!(
+                "bucket '{name}' is not allowed"
+            )));
+        }
+
         let mut cache = self
             .buckets
             .lock()
@@ -47,7 +55,8 @@ impl BlobstoreRuntime {
                 .with_secret_access_key(&self.secret_access_key)
                 .with_allow_http(true)
                 .with_virtual_hosted_style_request(false)
-                .build()?,
+                .build()
+                .map_err(map_os_err)?,
         );
         cache.insert(name.to_string(), store.clone());
         Ok(store)
@@ -114,7 +123,7 @@ impl ModuleState {
         key: &str,
     ) -> Result<(Arc<AmazonS3>, ObjectPath, BlobstoreLimits), BlobError> {
         let cap = self.blobstore()?;
-        let store = cap.runtime.bucket(bucket).map_err(map_os_err)?;
+        let store = cap.runtime.bucket(bucket)?;
         let path = ObjectPath::from(scoped_key(&cap.prefix, key)?);
         Ok((store, path, cap.limits))
     }
@@ -166,6 +175,9 @@ impl Host for ModuleState {
 
     async fn delete_object(&mut self, bucket: String, key: String) -> Result<(), BlobError> {
         let (store, path, _) = self.resolve_object(&bucket, &key)?;
+        // S3 DeleteObject is idempotent, so probe first to preserve the WIT
+        // contract that deleting a missing object returns not-found.
+        store.head(&path).await.map_err(map_os_err)?;
         store.delete(&path).await.map_err(map_os_err)?;
         Ok(())
     }
@@ -179,11 +191,7 @@ impl Host for ModuleState {
 
         let (store, key_prefix, limits) = {
             let cap = self.blobstore()?;
-            (
-                cap.runtime.bucket(&bucket).map_err(map_os_err)?,
-                cap.prefix.clone(),
-                cap.limits,
-            )
+            (cap.runtime.bucket(&bucket)?, cap.prefix.clone(), cap.limits)
         };
         let scoped_prefix = scoped_key(&key_prefix, &prefix.unwrap_or_default())?;
         let prefix_path = (!scoped_prefix.is_empty()).then(|| ObjectPath::from(scoped_prefix));
@@ -255,6 +263,7 @@ mod tests {
             endpoint: "http://127.0.0.1:8900".into(),
             access_key_id: "test-key".into(),
             secret_access_key: "test-secret".into(),
+            allowed_buckets: vec!["my-bucket".into()],
             region: "us-east-1".into(),
             max_object_size: 16 * 1024 * 1024,
             max_list_objects: 1000,
@@ -354,6 +363,18 @@ mod tests {
             Arc::ptr_eq(&a, &b),
             "second call should return cached store"
         );
+    }
+
+    #[test]
+    fn test_bucket_rejects_unauthorized_name_before_cache_lookup() {
+        let rt = BlobstoreRuntime::new(&test_config()).unwrap();
+        let err = rt
+            .bucket("other-bucket")
+            .expect_err("bucket must be denied");
+        assert!(
+            matches!(err, BlobError::AccessDenied(message) if message.contains("other-bucket"))
+        );
+        assert!(rt.buckets.lock().unwrap().is_empty());
     }
 
     // ── map_os_err tests ─────────────────────────────────────────────────────

@@ -412,7 +412,7 @@ store::put_object(bucket: &str, key: &str, data: &[u8]) -> Result<(), BlobError>
 /// Download full object.
 store::get_object(bucket: &str, key: &str) -> Result<Vec<u8>, BlobError>
 
-/// Delete object. Succeeds even if object does not exist.
+/// Delete object. A missing object returns BlobError::NotFound.
 store::delete_object(bucket: &str, key: &str) -> Result<(), BlobError>
 
 /// List objects, optionally filtered by key prefix.
@@ -440,8 +440,7 @@ enum BlobError {
 }
 ```
 
-Host-enforced limits (from the engine `[blobstore]` config, global across modules):
-`max_object_size` (default 16 MiB) caps both `put_object` uploads and `get_object` downloads —
+The engine requires a non-empty `[blobstore].allowed_buckets` list. Bucket arguments outside the allowlist return `BlobError::AccessDenied` before any S3 request. Host-enforced limits are global across modules: `max_object_size` (default 16 MiB) caps both `put_object` uploads and `get_object` downloads —
 an oversized download is aborted mid-stream, never fully buffered; `max_list_objects` (default 1000)
 caps `list_objects`. Exceeding either returns `BlobError::TooLarge`.
 
@@ -619,7 +618,7 @@ pub fn submit_job_with_options(
 pub fn get_job_status(engine_authority: &str, job_id: &str) -> Result<JobStatus, HttpError>
 ```
 
-worker_version must be non-empty; submit calls encode it in SubmitJobRequest.worker_version and send x-wr-version for route pinning. Empty versions return HttpError::Transport("worker_version is required") without issuing HTTP.
+The engine requires `SubmitJobRequest.worker_namespace` and `worker_name` to match the proxy-routed worker identity. `worker_version` is optional for ad-hoc submissions. An empty value is encoded as an unversioned, name-only job and omits `x-wr-version`; any worker with the matching namespace/name may claim it. A non-empty value is sent in both `SubmitJobRequest.worker_version` and `x-wr-version`, and only that exact worker version may claim it. Manager schedules remain version-pinned.
 
 ### Types
 
@@ -647,8 +646,8 @@ pub struct WrServiceGenerator;
 /// Use for client/runner modules.
 pub struct WrClientGenerator;
 
-/// Generates a versioned job submission client for services ending with WorkerService.
-/// Clients store authority and version, use new(authority, version), submit jobs,
+/// Generates a job submission client for services ending with WorkerService.
+/// Clients store authority and an optional version string, use new(authority, version), submit jobs,
 /// query raw status, and fetch typed optional results.
 pub struct WrWorkerClientGenerator;
 

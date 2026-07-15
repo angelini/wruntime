@@ -6,8 +6,8 @@ const GET_JOB_STATUS_PATH: &str = "/wruntime.WorkerService/GetJobStatus";
 /// Submit a job to a worker module's engine-managed queue.
 ///
 /// `engine_authority` is the worker's `namespace.name` (e.g. `"codegen.worker"`).
-/// `worker_version` must be non-empty.
-/// Returns the job_id on success.
+/// An empty `worker_version` requests name-only dispatch; a non-empty value pins
+/// the exact worker version. Returns the job_id on success.
 pub fn submit_job(
     engine_authority: &str,
     worker_version: &str,
@@ -17,18 +17,20 @@ pub fn submit_job(
     submit_job_with_options(engine_authority, worker_version, job_type, payload, 0, 0)
 }
 
-fn submit_job_headers(worker_version: &str) -> [(&str, &[u8]); 2] {
-    [
-        ("content-type", b"application/x-protobuf" as &[u8]),
-        ("x-wr-version", worker_version.as_bytes()),
-    ]
+fn submit_job_headers(worker_version: &str) -> Vec<(&'static str, &[u8])> {
+    let mut headers = vec![("content-type", b"application/x-protobuf" as &[u8])];
+    if !worker_version.is_empty() {
+        headers.push(("x-wr-version", worker_version.as_bytes()));
+    }
+    headers
 }
 
 /// Submit a job with explicit stale-running timeout and retry settings.
 ///
 /// `engine_authority` is the worker's `namespace.name` (e.g. `"codegen.worker"`).
-/// `worker_version` must be non-empty. `timeout_secs` controls stale-running
-/// recovery in the queue; worker dispatch uses the worker pool's configured job
+/// An empty `worker_version` requests name-only dispatch; a non-empty value pins
+/// the exact version. `timeout_secs` controls stale-running recovery in the queue;
+/// worker dispatch uses the worker pool's configured job
 /// timeout. Pass 0 for `timeout_secs`; `max_attempts = 0` uses
 /// engine-configured worker defaults.
 pub fn submit_job_with_options(
@@ -39,10 +41,6 @@ pub fn submit_job_with_options(
     timeout_secs: i32,
     max_attempts: i32,
 ) -> Result<String, HttpError> {
-    if worker_version.is_empty() {
-        return Err(HttpError::Transport("worker_version is required".into()));
-    }
-
     // Parse namespace.name from the authority.
     let (namespace, name) = engine_authority.split_once('.').ok_or_else(|| {
         HttpError::Transport(format!(
@@ -346,10 +344,12 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_job_rejects_empty_worker_version_locally() {
-        let err = submit_job_with_options("my-ns.my-mod", "", "/test/Rpc", b"payload", 0, 0)
-            .expect_err("empty worker_version must be rejected before HTTP");
-        assert!(matches!(err, HttpError::Transport(msg) if msg == "worker_version is required"));
+    fn test_submit_job_headers_omit_empty_worker_version() {
+        let headers = submit_job_headers("");
+        assert_eq!(
+            headers,
+            vec![("content-type", b"application/x-protobuf" as &[u8])]
+        );
     }
 
     #[test]
@@ -486,6 +486,14 @@ mod tests {
             decode_int32_field(&override_buf, 7).unwrap(),
             9,
             "max_attempts"
+        );
+
+        let unversioned =
+            encode_submit_job_request("my-ns", "my-mod", "", "/test/Rpc", b"payload", 0, 0);
+        assert_eq!(
+            decode_string_field(&unversioned, 3).unwrap(),
+            None,
+            "empty worker_version must remain absent on the wire"
         );
     }
 

@@ -40,6 +40,19 @@ impl proto::BlobstoreTestService for Component {
         Ok(proto::DeleteResponse {})
     }
 
+    fn delete_missing(
+        &self,
+        req: proto::DeleteRequest,
+    ) -> Result<proto::NotFoundResponse, ServiceError> {
+        match store::delete_object(&req.bucket, &req.key) {
+            Ok(()) => Ok(proto::NotFoundResponse {
+                error_kind: "none".into(),
+                error_message: "unexpectedly succeeded".into(),
+            }),
+            Err(e) => Ok(blob_error_response(e)),
+        }
+    }
+
     fn list(&self, req: proto::ListRequest) -> Result<proto::ListResponse, ServiceError> {
         let prefix = if req.prefix.is_empty() {
             None
@@ -93,18 +106,20 @@ impl proto::BlobstoreTestService for Component {
                 error_kind: "none".into(),
                 error_message: "unexpectedly succeeded".into(),
             }),
-            Err(e) => {
-                let (kind, msg) = match e {
-                    BlobError::NotFound(m) => ("not-found", m),
-                    BlobError::AccessDenied(m) => ("access-denied", m),
-                    BlobError::Io(m) => ("io", m),
-                    BlobError::TooLarge(m) => ("too-large", m),
-                };
-                Ok(proto::NotFoundResponse {
-                    error_kind: kind.into(),
-                    error_message: msg,
-                })
-            }
+            Err(e) => Ok(blob_error_response(e)),
         }
+    }
+}
+
+fn blob_error_response(error: BlobError) -> proto::NotFoundResponse {
+    let (kind, message) = match error {
+        BlobError::NotFound(message) => ("not-found", message),
+        BlobError::AccessDenied(message) => ("access-denied", message),
+        BlobError::Io(message) => ("io", message),
+        BlobError::TooLarge(message) => ("too-large", message),
+    };
+    proto::NotFoundResponse {
+        error_kind: kind.into(),
+        error_message: message,
     }
 }

@@ -242,6 +242,7 @@ If `blobstore = true`, the engine config must also include:
 endpoint          = "http://127.0.0.1:8900"
 access_key_id     = "rustfsadmin"
 secret_access_key = "rustfsadmin"
+allowed_buckets   = ["{{BUCKET_NAME}}"]
 ```
 
 ## Build command

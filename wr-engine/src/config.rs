@@ -131,6 +131,8 @@ pub struct BlobstoreConfig {
     pub endpoint: String,
     pub access_key_id: String,
     pub secret_access_key: String,
+    /// Buckets guests may access. Required and must contain at least one bucket.
+    pub allowed_buckets: Vec<String>,
     /// S3 region. Defaults to "us-east-1".
     #[serde(default = "default_bs_region")]
     pub region: String,
@@ -358,6 +360,26 @@ impl EngineConfig {
             !self.node.control_address.is_empty(),
             "node.control_address is required",
         );
+
+        if let Some(blobstore) = &self.blobstore {
+            v.check(
+                !blobstore.allowed_buckets.is_empty(),
+                "blobstore.allowed_buckets must contain at least one bucket",
+            );
+            v.check(
+                blobstore
+                    .allowed_buckets
+                    .iter()
+                    .all(|bucket| !bucket.trim().is_empty()),
+                "blobstore.allowed_buckets must not contain empty bucket names",
+            );
+        }
+        if let Some(llm) = &self.llm {
+            v.check(
+                llm.provider == "anthropic",
+                "llm.provider must be exactly \"anthropic\"",
+            );
+        }
 
         let mut first_seen_modules = std::collections::HashSet::<(String, String, String)>::new();
         for module in &self.modules {

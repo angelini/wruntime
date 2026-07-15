@@ -50,11 +50,16 @@ CREATE INDEX IF NOT EXISTS idx_jobs_stale
     WHERE status IN ('claimed', 'running');
 
 CREATE OR REPLACE FUNCTION wr__jobs.notify_new_job() RETURNS trigger AS $$
+DECLARE
+    channel_name TEXT := CASE WHEN NEW.worker_version = ''
+        THEN 'wr_jobs_' || NEW.worker_namespace || '_' || NEW.worker_name || '_unversioned'
+        ELSE 'wr_jobs_' || NEW.worker_namespace || '_' || NEW.worker_name || '_' || NEW.worker_version
+    END;
 BEGIN
-    PERFORM pg_notify(
-        'wr_jobs_' || NEW.worker_namespace || '_' || NEW.worker_name || '_' || NEW.worker_version,
-        NEW.job_id
-    );
+    IF octet_length(channel_name) > 63 THEN
+        channel_name := 'wr_jobs_long_identity';
+    END IF;
+    PERFORM pg_notify(channel_name, NEW.job_id);
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -169,7 +174,7 @@ pub async fn claim_job(
                SELECT job_id FROM wr__jobs.jobs \
                WHERE worker_namespace = $1 \
                   AND worker_name = $2 \
-                  AND worker_version = $3 \
+                  AND (worker_version = $3 OR worker_version = '') \
                   AND status = 'pending' \
                ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED \
              ) RETURNING job_id, job_type, payload",
@@ -248,25 +253,41 @@ pub struct WorkerPoolConfig {
     pub database_url: String,
 }
 
+const LONG_IDENTITY_WORKER_CHANNEL: &str = "wr_jobs_long_identity";
+const MAX_POSTGRES_CHANNEL_BYTES: usize = 63;
+
+fn worker_channel(namespace: &str, name: &str, version: &str) -> String {
+    let channel = if version.is_empty() {
+        format!("wr_jobs_{namespace}_{name}_unversioned")
+    } else {
+        format!("wr_jobs_{namespace}_{name}_{version}")
+    };
+    if channel.len() > MAX_POSTGRES_CHANNEL_BYTES {
+        LONG_IDENTITY_WORKER_CHANNEL.to_string()
+    } else {
+        channel
+    }
+}
+
 /// Spawn the worker pool: N worker loops + a LISTEN task + a stale recovery task.
 /// The worker loops dispatch jobs as HTTP requests through the provided `ModuleTx`.
 pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx) {
     let notify = Arc::new(Notify::new());
-    let channel = format!(
-        "wr_jobs_{}_{}_{}",
-        config.namespace, config.name, config.version
-    );
+    let channels = vec![
+        worker_channel(&config.namespace, &config.name, &config.version),
+        worker_channel(&config.namespace, &config.name, ""),
+    ];
 
     // Spawn LISTEN task with a raw tokio-postgres connection.
     {
         let notify = notify.clone();
-        let channel = channel.clone();
+        let channels = channels.clone();
         let ns = config.namespace.clone();
         let name = config.name.clone();
         let version = config.version.clone();
         let db_url = config.database_url.clone();
         tokio::spawn(async move {
-            listen_task(&db_url, &channel, notify, &ns, &name, &version).await;
+            listen_task(&db_url, &channels, notify, &ns, &name, &version).await;
         });
     }
 
@@ -326,14 +347,14 @@ pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx
 /// Dedicated connection that runs LISTEN and wakes worker loops via Notify.
 async fn listen_task(
     db_url: &str,
-    channel: &str,
+    channels: &[String],
     notify: Arc<Notify>,
     ns: &str,
     name: &str,
     version: &str,
 ) {
     loop {
-        match listen_loop(db_url, channel, &notify).await {
+        match listen_loop(db_url, channels, &notify).await {
             Ok(()) => break,
             Err(e) => {
                 warn!(
@@ -349,7 +370,11 @@ async fn listen_task(
     }
 }
 
-async fn listen_loop(db_url: &str, channel: &str, notify: &Arc<Notify>) -> anyhow::Result<()> {
+async fn listen_loop(
+    db_url: &str,
+    channels: &[String],
+    notify: &Arc<Notify>,
+) -> anyhow::Result<()> {
     let (client, mut connection) = tokio_postgres::connect(db_url, tokio_postgres::NoTls).await?;
 
     // Drive the connection manually so we can intercept notifications.
@@ -370,11 +395,14 @@ async fn listen_loop(db_url: &str, channel: &str, notify: &Arc<Notify>) -> anyho
         }
     });
 
-    client
-        .batch_execute(&format!("LISTEN \"{channel}\""))
-        .await?;
+    let listen_sql = channels
+        .iter()
+        .map(|channel| format!("LISTEN \"{}\"", channel.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    client.batch_execute(&listen_sql).await?;
 
-    info!(channel, "LISTEN active");
+    info!(channels = ?channels, "LISTEN active");
 
     // Wait for the connection task to finish (connection lost).
     conn_handle.await?;
@@ -539,6 +567,26 @@ mod tests {
         Some(pool)
     }
 
+    #[test]
+    fn test_worker_channels_distinguish_exact_and_unversioned_jobs() {
+        assert_eq!(
+            worker_channel("shop", "processor", "1.0.0"),
+            "wr_jobs_shop_processor_1.0.0"
+        );
+        assert_eq!(
+            worker_channel("shop", "processor", ""),
+            "wr_jobs_shop_processor_unversioned"
+        );
+        assert_eq!(
+            worker_channel(&"n".repeat(45), "worker", ""),
+            LONG_IDENTITY_WORKER_CHANNEL
+        );
+        assert_eq!(
+            worker_channel(&"n".repeat(45), "worker", "123456789"),
+            LONG_IDENTITY_WORKER_CHANNEL
+        );
+    }
+
     /// Helper macro: skip the test if no DB URL is set.
     macro_rules! require_pool {
         () => {
@@ -579,6 +627,28 @@ mod tests {
         assert_eq!(status.status, "pending");
         assert_eq!(status.attempt, 0);
         assert_eq!(status.max_attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn test_insert_unversioned_job_with_long_identity() {
+        let pool = require_pool!();
+        let namespace = "n".repeat(45);
+        let name = format!("worker_{}", unique_prefix());
+        let job_id = insert_job(
+            &pool,
+            &namespace,
+            &name,
+            "",
+            "/test/Process",
+            b"payload",
+            60,
+            3,
+            "",
+            "",
+        )
+        .await
+        .expect("long unversioned identity must use the bounded fallback channel");
+        assert!(get_job_status(&pool, &job_id).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -680,6 +750,47 @@ mod tests {
             .await
             .unwrap();
         assert!(no_v2_left.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_claim_job_accepts_unversioned_but_not_other_exact_versions() {
+        let pool = require_pool!();
+        let p = unique_prefix();
+        let unversioned = insert_job(
+            &pool,
+            &p,
+            "mod",
+            "",
+            "/type/unversioned",
+            b"any",
+            60,
+            3,
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+        let other_version = insert_job(&pool, &p, "mod", "2.0.0", "/type/v2", b"v2", 60, 3, "", "")
+            .await
+            .unwrap();
+
+        let claimed = claim_job(&pool, &p, "mod", "1.0.0", "engine-v1")
+            .await
+            .unwrap()
+            .expect("v1 worker should claim the unversioned job");
+        assert_eq!(claimed.job_id, unversioned);
+        assert!(
+            claim_job(&pool, &p, "mod", "1.0.0", "engine-v1")
+                .await
+                .unwrap()
+                .is_none(),
+            "v1 worker must not claim an exact v2 job"
+        );
+        let claimed_v2 = claim_job(&pool, &p, "mod", "2.0.0", "engine-v2")
+            .await
+            .unwrap()
+            .expect("v2 worker should claim its exact job");
+        assert_eq!(claimed_v2.job_id, other_version);
     }
 
     #[tokio::test]

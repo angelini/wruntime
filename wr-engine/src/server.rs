@@ -24,6 +24,16 @@ use wr_common::wruntime::{
 const WORKER_SERVICE_PREFIX: &str = "/wruntime.WorkerService/";
 const SUBMIT_JOB_PATH: &str = "/wruntime.WorkerService/SubmitJob";
 const GET_JOB_STATUS_PATH: &str = "/wruntime.WorkerService/GetJobStatus";
+const SHORT_SUBMIT_JOB_PATH: &str = "/SubmitJob";
+const SHORT_GET_JOB_STATUS_PATH: &str = "/GetJobStatus";
+
+fn canonical_worker_path(path: &str) -> Option<&'static str> {
+    match path {
+        SUBMIT_JOB_PATH | SHORT_SUBMIT_JOB_PATH => Some(SUBMIT_JOB_PATH),
+        GET_JOB_STATUS_PATH | SHORT_GET_JOB_STATUS_PATH => Some(GET_JOB_STATUS_PATH),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WorkerDefaults {
@@ -140,8 +150,11 @@ async fn handle(
     }
 
     // ── Worker job queue gRPC endpoints ──────────────────────────────────
-    if req.uri().path().starts_with(WORKER_SERVICE_PREFIX) {
-        let path = req.uri().path().to_owned();
+    let request_path = req.uri().path();
+    if request_path.starts_with(WORKER_SERVICE_PREFIX)
+        || canonical_worker_path(request_path).is_some()
+    {
+        let path = request_path.to_owned();
         return handle_worker_grpc(req, &path, db_pool, worker_defaults).await;
     }
 
@@ -262,6 +275,16 @@ async fn handle_worker_grpc(
     db_pool: Option<Arc<Pool>>,
     worker_defaults: Arc<WorkerDefaults>,
 ) -> Response<Full<Bytes>> {
+    let routed_namespace = req
+        .headers()
+        .get(WR_NAMESPACE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let routed_module = req
+        .headers()
+        .get(WR_MODULE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let routed_version = req
         .headers()
         .get(WR_VERSION)
@@ -279,6 +302,8 @@ async fn handle_worker_grpc(
         path,
         body,
         db_pool,
+        routed_namespace.as_deref(),
+        routed_module.as_deref(),
         routed_version.as_deref(),
         worker_defaults.as_ref(),
     )
@@ -289,13 +314,15 @@ async fn handle_worker_grpc_bytes(
     path: &str,
     body: Bytes,
     db_pool: Option<Arc<Pool>>,
+    routed_namespace: Option<&str>,
+    routed_module: Option<&str>,
     routed_version: Option<&str>,
     worker_defaults: &WorkerDefaults,
 ) -> Response<Full<Bytes>> {
-    match path {
-        SUBMIT_JOB_PATH | GET_JOB_STATUS_PATH => {}
-        _ => return worker_err(StatusCode::NOT_FOUND, "unknown worker endpoint"),
-    }
+    let path = match canonical_worker_path(path) {
+        Some(path) => path,
+        None => return worker_err(StatusCode::NOT_FOUND, "unknown worker endpoint"),
+    };
 
     let pool = match db_pool {
         Some(p) => p,
@@ -303,7 +330,17 @@ async fn handle_worker_grpc_bytes(
     };
 
     match path {
-        SUBMIT_JOB_PATH => handle_submit_job(&pool, &body, routed_version, worker_defaults).await,
+        SUBMIT_JOB_PATH => {
+            handle_submit_job(
+                &pool,
+                &body,
+                routed_namespace,
+                routed_module,
+                routed_version,
+                worker_defaults,
+            )
+            .await
+        }
         GET_JOB_STATUS_PATH => handle_get_job_status(&pool, &body).await,
         _ => unreachable!("worker endpoint path checked above"),
     }
@@ -312,6 +349,8 @@ async fn handle_worker_grpc_bytes(
 async fn handle_submit_job(
     pool: &Pool,
     body: &[u8],
+    routed_namespace: Option<&str>,
+    routed_module: Option<&str>,
     routed_version: Option<&str>,
     worker_defaults: &WorkerDefaults,
 ) -> Response<Full<Bytes>> {
@@ -320,27 +359,43 @@ async fn handle_submit_job(
         Err(e) => return worker_err(StatusCode::BAD_REQUEST, &format!("decode: {e}")),
     };
 
-    if req.worker_version.is_empty() {
-        return worker_err(StatusCode::BAD_REQUEST, "worker_version is required");
-    }
-
-    if let Some(routed_version) = routed_version {
-        if routed_version != req.worker_version {
+    let (routed_namespace, routed_module) = match (routed_namespace, routed_module) {
+        (Some(namespace), Some(module)) => (namespace, module),
+        _ => {
             return worker_err(
                 StatusCode::BAD_REQUEST,
-                "x-wr-version does not match SubmitJobRequest.worker_version",
-            );
+                "missing routed worker identity headers",
+            )
+        }
+    };
+    if req.worker_namespace != routed_namespace || req.worker_name != routed_module {
+        return worker_err(
+            StatusCode::BAD_REQUEST,
+            "SubmitJobRequest worker identity does not match routed destination",
+        );
+    }
+
+    if !req.worker_version.is_empty() {
+        if let Some(routed_version) = routed_version {
+            if routed_version != req.worker_version {
+                return worker_err(
+                    StatusCode::BAD_REQUEST,
+                    "x-wr-version does not match SubmitJobRequest.worker_version",
+                );
+            }
         }
     }
+
+    let defaults_version = if req.worker_version.is_empty() {
+        routed_version.unwrap_or_default()
+    } else {
+        &req.worker_version
+    };
 
     let max_attempts = if req.max_attempts > 0 {
         req.max_attempts
     } else {
-        worker_defaults.max_attempts_for(
-            &req.worker_namespace,
-            &req.worker_name,
-            &req.worker_version,
-        )
+        worker_defaults.max_attempts_for(&req.worker_namespace, &req.worker_name, defaults_version)
     };
 
     match wr_engine::worker::insert_job(
@@ -477,6 +532,8 @@ mod tests {
                 Bytes::new(),
                 None,
                 None,
+                None,
+                None,
                 &WorkerDefaults::default(),
             )
             .await,
@@ -487,34 +544,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_worker_db_pool_is_json_503() {
-        let (status, value) = response_json(
-            handle_worker_grpc_bytes(
-                SUBMIT_JOB_PATH,
-                Bytes::new(),
-                None,
-                None,
-                &WorkerDefaults::default(),
+    async fn canonical_and_short_worker_paths_require_a_database() {
+        for path in [
+            SUBMIT_JOB_PATH,
+            GET_JOB_STATUS_PATH,
+            SHORT_SUBMIT_JOB_PATH,
+            SHORT_GET_JOB_STATUS_PATH,
+        ] {
+            let (status, value) = response_json(
+                handle_worker_grpc_bytes(
+                    path,
+                    Bytes::new(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    &WorkerDefaults::default(),
+                )
+                .await,
             )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(value, json!({"error": "no database configured"}));
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            assert_eq!(value, json!({"error": "no database configured"}), "{path}");
+        }
     }
 
     #[tokio::test]
-    async fn submit_rejects_empty_body_worker_version_even_with_header() {
+    async fn submit_accepts_empty_body_worker_version() {
         let Some(pool) = test_pool().await else {
             eprintln!("skipping (no WRT_TEST_DB_URL)");
             return;
         };
         let ns = unique_prefix();
+        let defaults = WorkerDefaults {
+            max_attempts: HashMap::from([(
+                (ns.clone(), "mod".to_string(), "1.0.0".to_string()),
+                7,
+            )]),
+        };
+        let resp = handle_worker_grpc_bytes(
+            SUBMIT_JOB_PATH,
+            submit_body(&ns, "mod", "", 0),
+            Some(pool.clone()),
+            Some(&ns),
+            Some("mod"),
+            Some("1.0.0"),
+            &defaults,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let job_id = SubmitJobResponse::decode(&body[..]).unwrap().job_id;
+        let client = pool.get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT worker_version, max_attempts FROM wr__jobs.jobs WHERE job_id = $1",
+                &[&job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "");
+        assert_eq!(row.get::<_, i32>(1), 7);
+    }
+
+    #[tokio::test]
+    async fn submit_requires_matching_routed_worker_identity() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping (no WRT_TEST_DB_URL)");
+            return;
+        };
+        let ns = unique_prefix();
+
         let (status, value) = response_json(
             handle_worker_grpc_bytes(
                 SUBMIT_JOB_PATH,
                 submit_body(&ns, "mod", "", 0),
-                Some(pool),
+                Some(pool.clone()),
+                None,
+                None,
                 Some("1.0.0"),
                 &WorkerDefaults::default(),
             )
@@ -522,7 +629,29 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(value, json!({"error": "worker_version is required"}));
+        assert_eq!(
+            value,
+            json!({"error": "missing routed worker identity headers"})
+        );
+
+        let (status, value) = response_json(
+            handle_worker_grpc_bytes(
+                SUBMIT_JOB_PATH,
+                submit_body("other", "mod", "", 0),
+                Some(pool),
+                Some(&ns),
+                Some("mod"),
+                Some("1.0.0"),
+                &WorkerDefaults::default(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            value,
+            json!({"error": "SubmitJobRequest worker identity does not match routed destination"})
+        );
     }
 
     #[tokio::test]
@@ -537,6 +666,8 @@ mod tests {
                 SUBMIT_JOB_PATH,
                 submit_body(&ns, "mod", "1.0.0", 0),
                 Some(pool),
+                Some(&ns),
+                Some("mod"),
                 Some("2.0.0"),
                 &WorkerDefaults::default(),
             )
@@ -568,6 +699,8 @@ mod tests {
             SUBMIT_JOB_PATH,
             submit_body(&ns, "mod", "1.0.0", 0),
             Some(pool.clone()),
+            Some(&ns),
+            Some("mod"),
             Some("1.0.0"),
             &defaults,
         )
@@ -585,6 +718,8 @@ mod tests {
             SUBMIT_JOB_PATH,
             submit_body(&ns, "mod", "1.0.0", 4),
             Some(pool.clone()),
+            Some(&ns),
+            Some("mod"),
             Some("1.0.0"),
             &defaults,
         )
@@ -600,8 +735,14 @@ mod tests {
     }
 
     #[test]
-    fn short_worker_paths_are_not_worker_management_routes() {
-        assert!(!"/SubmitJob".starts_with(WORKER_SERVICE_PREFIX));
-        assert!(!"/GetJobStatus".starts_with(WORKER_SERVICE_PREFIX));
+    fn short_worker_paths_are_compatibility_aliases() {
+        assert_eq!(
+            canonical_worker_path(SHORT_SUBMIT_JOB_PATH),
+            Some(SUBMIT_JOB_PATH)
+        );
+        assert_eq!(
+            canonical_worker_path(SHORT_GET_JOB_STATUS_PATH),
+            Some(GET_JOB_STATUS_PATH)
+        );
     }
 }

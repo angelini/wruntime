@@ -113,7 +113,7 @@ Available functions:
 |----------|-------------|
 | `put-object(bucket, key, data)` | Upload an object |
 | `get-object(bucket, key)` | Download an object's bytes |
-| `delete-object(bucket, key)` | Remove an object |
+| `delete-object(bucket, key)` | Remove an object; returns `NotFound` when it is missing |
 | `list-objects(bucket, prefix)` | List objects matching a prefix |
 | `head-object(bucket, key)` | Get object metadata (size, etag, last-modified) |
 
@@ -145,7 +145,7 @@ fn list_reports() -> Vec<String> {
 
 ### Limits and errors
 
-`BlobError` has four variants: `NotFound`, `AccessDenied`, `Io`, and `TooLarge`. Host-enforced limits come from the engine `[blobstore]` config (global across modules):
+`BlobError` has four variants: `NotFound`, `AccessDenied`, `Io`, and `TooLarge`. The engine's required, non-empty `[blobstore].allowed_buckets` list constrains every guest bucket argument; a bucket outside it returns `AccessDenied` before any S3 request. Host-enforced limits are global across modules:
 
 - `max_object_size` (default **16 MiB**) caps both `put_object` uploads and `get_object` downloads. An oversized download is aborted mid-stream — never fully buffered — and returns `BlobError::TooLarge`.
 - `max_list_objects` (default **1000**) caps `list_objects`; exceeding it returns `BlobError::TooLarge` rather than silently truncating.

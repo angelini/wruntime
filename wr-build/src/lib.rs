@@ -258,7 +258,8 @@ impl prost_build::ServiceGenerator for WrClientGenerator {
 /// for worker modules.  Each RPC method becomes a function that serializes the
 /// request, submits a job via `wr_sdk::jobs::submit_job`, and returns the job_id.
 /// Worker job types use the canonical generated worker-service method path
-/// `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`.
+/// `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`. The client version
+/// may be empty for name-only dispatch or non-empty to pin an exact worker.
 ///
 /// For a service `TaskWorkerService` with RPC `ProcessTask`:
 ///

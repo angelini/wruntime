@@ -14,7 +14,7 @@ Choose the right pattern based on what your module needs to do.
 | Need | engine.toml setting | world.wit import | Cargo.toml dependency |
 |------|--------------------|-----------------|-----------------------|
 | PostgreSQL | `database = true` + `migrations_path` | `import wruntime:db/database@0.4.0;` | `"wruntime:db" = { path = ".../db.wit" }` |
-| S3/Blobstore | `blobstore = true` + `[blobstore]` section | `import wruntime:blobstore/store@0.1.0;` | `"wruntime:blobstore" = { path = ".../blobstore.wit" }` |
+| S3/Blobstore | `blobstore = true` + `[blobstore]` with `allowed_buckets` | `import wruntime:blobstore/store@0.1.0;` | `"wruntime:blobstore" = { path = ".../blobstore.wit" }` |
 | OpenTelemetry tracing | *(always available)* | `import wruntime:tracing/span@0.1.0;` | `"wruntime:tracing" = { path = ".../tracing.wit" }` |
 | Ephemeral filesystem | `fs = "tempdir"` | *(standard WASI)* | *(already included)* |
 | Outbound HTTP to other modules | *(always available)* | `import wasi:http/outgoing-handler@0.2.6;` | *(already included)* |
@@ -22,6 +22,7 @@ Choose the right pattern based on what your module needs to do.
 ## When to use WrCombinedGenerator
 
 Use `WrCombinedGenerator` when a single module needs to:
+
 - Expose its own RPC service (handler)
 - AND call RPCs on other modules (client)
 
@@ -44,5 +45,6 @@ fn main() {
 ```
 
 This generates:
+
 - `OrdersService` trait + `orders_service_router` (from WrServiceGenerator)
 - `InventoryServiceClient` struct (from WrClientGenerator)

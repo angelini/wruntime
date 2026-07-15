@@ -186,9 +186,9 @@ WASM modules can access host-provided capabilities through WIT interfaces:
 | Binding | WIT | Access via | Description |
 |---------|-----|-----------|-------------|
 | **Database** | `wit/db.wit` | `wr_sdk::bindings::wruntime::db::database` | Parameterized SQL queries and transactions against a shared Postgres pool |
-| **Blobstore** | `wit/blobstore.wit` | `wr_sdk::bindings::wruntime::blobstore::store` | S3-compatible object storage (put, get, delete, list, head) |
+| **Blobstore** | `wit/blobstore.wit` | `wr_sdk::bindings::wruntime::blobstore::store` | S3-compatible object storage constrained to a host-configured bucket allowlist |
 | **Tracing** | `wit/tracing.wit` | `wr_sdk::bindings::wruntime::tracing::span` | Create and annotate OpenTelemetry spans from within modules |
-| **LLM** | `wit/llm.wit` | `wr_sdk::bindings::wruntime::llm::inference` | Claude API (and other LLM providers) — completions, streaming, tool use |
+| **LLM** | `wit/llm.wit` | `wr_sdk::bindings::wruntime::llm::inference` | Anthropic Claude completions, streaming, and tool use |
 
 See [docs/host-bindings.md](docs/host-bindings.md) for configuration and usage examples.
 

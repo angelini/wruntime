@@ -142,7 +142,7 @@ impl WorkerPoolHarness {
 
     pub async fn wait_for_listener(&self, timeout: Duration) -> Result<()> {
         let channel = format!("wr_jobs_{}_{}_{}", self.namespace, self.name, self.version);
-        let expected_query = format!("LISTEN \"{channel}\"");
+        let expected_query = format!("%LISTEN \"{channel}\"%");
         super::wait::eventually(
             format!("worker LISTEN active for {channel}"),
             timeout,
@@ -154,7 +154,7 @@ impl WorkerPoolHarness {
                     let client = pool.get().await?;
                     let row = client
                         .query_opt(
-                            "SELECT 1 FROM pg_stat_activity WHERE query = $1 LIMIT 1",
+                            "SELECT 1 FROM pg_stat_activity WHERE query LIKE $1 LIMIT 1",
                             &[&expected_query],
                         )
                         .await?;
