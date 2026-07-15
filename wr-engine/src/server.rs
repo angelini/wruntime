@@ -37,7 +37,7 @@ fn canonical_worker_path(path: &str) -> Option<&'static str> {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WorkerDefaults {
-    max_attempts: HashMap<(String, String, String), i32>,
+    max_attempts: HashMap<(String, String, String), u32>,
 }
 
 impl WorkerDefaults {
@@ -58,7 +58,7 @@ impl WorkerDefaults {
         Self { max_attempts }
     }
 
-    fn max_attempts_for(&self, namespace: &str, name: &str, version: &str) -> i32 {
+    fn max_attempts_for(&self, namespace: &str, name: &str, version: &str) -> u32 {
         self.max_attempts
             .get(&(namespace.to_owned(), name.to_owned(), version.to_owned()))
             .copied()
@@ -437,11 +437,24 @@ async fn handle_get_job_status(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>
         Ok(Some(status)) => {
             let resp = GetJobStatusResponse {
                 job_id: status.job_id,
-                status: status.status,
+                status: match status.status {
+                    wr_common::lifecycle::JobState::Pending => {
+                        wr_common::wruntime::JobState::Pending as i32
+                    }
+                    wr_common::lifecycle::JobState::Running => {
+                        wr_common::wruntime::JobState::Running as i32
+                    }
+                    wr_common::lifecycle::JobState::Complete => {
+                        wr_common::wruntime::JobState::Complete as i32
+                    }
+                    wr_common::lifecycle::JobState::Dead => {
+                        wr_common::wruntime::JobState::Dead as i32
+                    }
+                },
                 result: status.result,
                 error_message: status.error_message,
-                attempt: status.attempt,
-                max_attempts: status.max_attempts,
+                attempt: status.attempt.get(),
+                max_attempts: status.max_attempts.get(),
             };
             Response::builder()
                 .status(StatusCode::OK)
@@ -491,7 +504,7 @@ mod tests {
         )
     }
 
-    fn submit_body(namespace: &str, name: &str, version: &str, max_attempts: i32) -> Bytes {
+    fn submit_body(namespace: &str, name: &str, version: &str, max_attempts: u32) -> Bytes {
         Bytes::from(
             SubmitJobRequest {
                 worker_namespace: namespace.into(),

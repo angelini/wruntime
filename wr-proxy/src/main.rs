@@ -149,7 +149,7 @@ async fn main() -> Result<()> {
     //
     if let Some(ext) = &config.external {
         let external_svc = ServiceBuilder::new()
-            .layer(IngressLayer::new(ext.routes.clone()))
+            .layer(IngressLayer::new(ext.routes.clone())?)
             .layer(TracingLayer)
             .layer(RoutingLayer::new(
                 routing_table,

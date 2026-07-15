@@ -204,7 +204,7 @@ async fn test_module_health_convergence_across_managers() {
         registration: Some(EngineRegistration {
             engine_id: "mm-e1".into(),
             address: "http://127.0.0.1:19500".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![
                 ModuleDescriptor {

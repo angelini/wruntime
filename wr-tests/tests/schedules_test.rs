@@ -275,6 +275,28 @@ async fn test_upsert_schedule_zero_interval_rejected() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_upsert_schedule_zero_timeout_and_attempts_rejected() -> Result<()> {
+    let (_pool, _addr, mut c) = manager_trio().await?;
+    for (timeout_secs, max_attempts) in [(0, 3), (300, 0)] {
+        let error = c
+            .upsert_schedule(UpsertScheduleRequest {
+                worker_namespace: "ns".into(),
+                worker_name: "mod".into(),
+                worker_version: "1.0.0".into(),
+                job_type: "/Run".into(),
+                interval_secs: 60,
+                timeout_secs,
+                max_attempts,
+                ..Default::default()
+            })
+            .await
+            .expect_err("zero lifecycle value must be rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_delete_schedule_empty_fields_rejected() -> Result<()> {
     let (_pool, _addr, mut c) = manager_trio().await?;
 
@@ -340,7 +362,7 @@ async fn test_schedule_fields_preserved() -> Result<()> {
     assert_eq!(s.timeout_secs, 45);
     assert_eq!(s.max_attempts, 7);
     assert!(s.enabled);
-    assert!(s.last_fired_at.is_empty());
+    assert!(s.last_fired_at.is_none());
 
     Ok(())
 }
@@ -391,6 +413,6 @@ async fn test_list_schedules_exposes_new_state_fields() -> Result<()> {
         .expect("schedule present");
     assert_eq!(s.last_error, "boom");
     assert_eq!(s.consecutive_failures, 1);
-    assert!(!s.next_fire_at.is_empty());
+    assert!(s.next_fire_at.is_some());
     Ok(())
 }

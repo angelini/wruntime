@@ -412,12 +412,16 @@ impl ModuleState {
         };
         let outbound_parent = Arc::new(std::sync::Mutex::new(None));
         let accounting = ResourceAccounting::new(services.limits);
-        let db = services.db_pool.map(|pool| DbCapability {
-            pool,
-            schema: services.db_schema,
-            timeouts: services.db_timeouts,
-            accounting: accounting.clone(),
-        });
+        let db = match (services.db_pool, services.db_schema) {
+            (Some(pool), Some(schema)) => Some(DbCapability {
+                pool,
+                schema: Some(schema),
+                timeouts: services.db_timeouts,
+                accounting: accounting.clone(),
+            }),
+            (None, None) => None,
+            _ => anyhow::bail!("database capability requires both pool and schema"),
+        };
         let blobstore = services.blobstore.map(|runtime| BlobstoreCapability {
             runtime,
             prefix: services.blob_prefix,

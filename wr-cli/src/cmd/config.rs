@@ -128,7 +128,7 @@ impl EngineConfig {
     /// Create a bundle-ready copy: rewrite module paths to bundle-relative
     /// directories and insert `{host}`, `{db_url}` template placeholders
     /// for values that vary per deployment target.
-    pub fn to_bundle_config(&self) -> Self {
+    pub fn to_bundle_config(&self) -> anyhow::Result<Self> {
         let mut config = self.clone();
 
         // Rewrite module paths
@@ -145,8 +145,8 @@ impl EngineConfig {
 
         // Template host-dependent node addresses (preserve ports from source)
         if let Some(ref node) = self.node {
-            let proxy_port = super::helpers::extract_port(&node.proxy_address);
-            let control_port = super::helpers::extract_port(&node.control_address);
+            let proxy_port = super::helpers::extract_port(&node.proxy_address)?.get();
+            let control_port = super::helpers::extract_port(&node.control_address)?.get();
             config.node = Some(NodeConfig {
                 proxy_address: format!("http://{{host}}:{proxy_port}"),
                 control_address: format!("http://{{host}}:{control_port}"),
@@ -161,7 +161,7 @@ impl EngineConfig {
             db.url = "{db_url}".to_string();
         }
 
-        config
+        Ok(config)
     }
 }
 
@@ -289,13 +289,13 @@ impl ProxyConfig {
     }
 
     /// Create a bundle-ready copy with `{db_url}` and `{host}` template placeholders.
-    pub fn to_bundle_config(&self) -> Self {
+    pub fn to_bundle_config(&self) -> anyhow::Result<Self> {
         let mut config = self.clone();
         if let Some(ref mut db) = config.database {
             db.url = "{db_url}".to_string();
         }
         if let (Some(source_node), Some(config_node)) = (&self.node, &mut config.node) {
-            let proxy_port = super::helpers::extract_port(&source_node.proxy_address);
+            let proxy_port = super::helpers::extract_port(&source_node.proxy_address)?.get();
             config_node.proxy_address = format!("http://{{host}}:{proxy_port}");
             let mut tls = config_node.tls.take().unwrap_or(CliTlsConfig {
                 cert_path: String::new(),
@@ -308,7 +308,7 @@ impl ProxyConfig {
             tls.ca_cert_path = "certs/ca.crt".to_string();
             config_node.tls = Some(tls);
         }
-        config
+        Ok(config)
     }
 
     /// Serialize to TOML string.
@@ -413,7 +413,7 @@ mod tests {
     }
 
     fn parse_engine_bundle_toml(config: &EngineConfig) -> toml::Value {
-        let toml = config.to_bundle_config().to_toml().unwrap();
+        let toml = config.to_bundle_config().unwrap().to_toml().unwrap();
         toml::from_str(&toml).unwrap()
     }
 
@@ -423,7 +423,7 @@ mod tests {
     }
 
     fn parse_proxy_bundle_toml(config: &ProxyConfig) -> toml::Value {
-        let toml = config.to_bundle_config().to_toml().unwrap();
+        let toml = config.to_bundle_config().unwrap().to_toml().unwrap();
         toml::from_str(&toml).unwrap()
     }
 
@@ -758,7 +758,7 @@ proxy_address = "http://127.0.0.1:9443"
         let cfg =
             runtime_config_from_toml("generated-manager", &resolved, RuntimeManagerConfig::load);
         assert_eq!(cfg.local_proxy_address, "http://127.0.0.1:9001");
-        assert_eq!(cfg.module_heartbeat_timeout_secs, Some(45));
+        assert_eq!(cfg.module_heartbeat_timeout_secs.get(), 45);
         assert_eq!(cfg.scheduler_lease_secs, 60);
         assert_eq!(cfg.scheduler_retry_base_secs, 7);
         assert_eq!(cfg.scheduler_retry_cap_secs, 70);
@@ -807,6 +807,7 @@ proxy_address = "http://127.0.0.1:9443"
         let bundle_toml = toml::from_str::<ProxyConfig>(source)
             .unwrap()
             .to_bundle_config()
+            .unwrap()
             .to_toml()
             .unwrap();
         let resolved = resolve_generated_toml(
@@ -837,6 +838,7 @@ proxy_address = "http://127.0.0.1:9443"
         let codegen_bundle_toml = toml::from_str::<EngineConfig>(codegen_source)
             .unwrap()
             .to_bundle_config()
+            .unwrap()
             .to_toml()
             .unwrap();
         assert!(codegen_bundle_toml.contains("[blobstore]"));
@@ -875,6 +877,7 @@ proxy_address = "http://127.0.0.1:9443"
         let ledger_bundle_toml = toml::from_str::<EngineConfig>(ledger_source)
             .unwrap()
             .to_bundle_config()
+            .unwrap()
             .to_toml()
             .unwrap();
         assert!(ledger_bundle_toml.contains("[blobstore]"));

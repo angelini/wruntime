@@ -1,6 +1,8 @@
 syntax = "proto3";
 package wruntime;
 
+import "google/protobuf/timestamp.proto";
+
 // ── Shared messages ───────────────────────────────────────────────────────
 
 message ModuleDescriptor {
@@ -109,6 +111,14 @@ message GetSchemaResponse   { bytes proto_schema = 1; }
 
 // ── Worker job queue ──────────────────────────────────────────────────────
 
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_PENDING     = 1;
+  JOB_STATE_RUNNING     = 2;
+  JOB_STATE_COMPLETE    = 3;
+  JOB_STATE_DEAD        = 4;
+}
+
 message SubmitJobRequest {
   // Namespace/name must match the proxy-routed worker identity.
   string worker_namespace = 1;
@@ -117,8 +127,8 @@ message SubmitJobRequest {
   string worker_version   = 3;
   string job_type         = 4;
   bytes  payload          = 5;
-  int32  timeout_secs     = 6;
-  int32  max_attempts     = 7;
+  uint32 timeout_secs     = 6; // 0 uses the configured default
+  uint32 max_attempts     = 7; // 0 uses the configured default
 }
 
 message SubmitJobResponse {
@@ -131,11 +141,11 @@ message GetJobStatusRequest {
 
 message GetJobStatusResponse {
   string job_id        = 1;
-  string status        = 2;
+  JobState status      = 2;
   bytes  result        = 3;
   string error_message = 4;
-  int32  attempt       = 5;
-  int32  max_attempts  = 6;
+  uint32 attempt       = 5;
+  uint32 max_attempts  = 6;
 }
 
 // ── Schedules ────────────────────────────────────────────────────────────
@@ -146,16 +156,16 @@ message Schedule {
   string worker_name       = 3;
   string worker_version    = 4;
   string job_type          = 5;
-  int32  interval_secs     = 6;
+  uint32 interval_secs     = 6;
   bool   immediate         = 7;
   bytes  payload           = 8;
-  int32  timeout_secs      = 9;
-  int32  max_attempts      = 10;
+  uint32 timeout_secs      = 9;
+  uint32 max_attempts      = 10;
   bool   enabled           = 11;
-  string last_fired_at     = 12; // RFC 3339 or empty
-  string next_fire_at         = 13; // RFC 3339 or empty
+  optional google.protobuf.Timestamp last_fired_at = 12;
+  optional google.protobuf.Timestamp next_fire_at = 13;
   string last_error           = 14;
-  int32  consecutive_failures = 15;
+  uint32 consecutive_failures = 15;
 }
 
 message UpsertScheduleRequest {
@@ -163,11 +173,11 @@ message UpsertScheduleRequest {
   string worker_name       = 2;
   string worker_version    = 3;
   string job_type          = 4;
-  int32  interval_secs     = 5;
+  uint32 interval_secs     = 5;
   bool   immediate         = 6;
   bytes  payload           = 7;
-  int32  timeout_secs      = 8;
-  int32  max_attempts      = 9;
+  uint32 timeout_secs      = 8;
+  uint32 max_attempts      = 9;
 }
 
 message UpsertScheduleResponse { string schedule_id = 1; }

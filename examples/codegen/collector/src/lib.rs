@@ -54,15 +54,20 @@ impl proto::CollectorService for Component {
     ) -> Result<proto::FetchDocsResponse, ServiceError> {
         let span = wr_sdk::span!("collector.fetch_docs", "sources.count" => req.sources.len());
 
-        let mut sources_fetched: i32 = 0;
-        let mut total_bytes: i64 = 0;
+        let mut sources_fetched: u32 = 0;
+        let mut total_bytes: u64 = 0;
         let mut doc_prefixes = Vec::new();
 
         for source in &req.sources {
             // For github_tarball sources with an empty ref, resolve the default
             // branch up front so the blobstore prefix includes the real ref.
             let mut source = source.clone();
-            if source.source_type == "github_tarball" && source.ref_or_ver.is_empty() {
+            let source_type = proto::DocSourceType::try_from(source.source_type)
+                .map_err(|_| ServiceError::bad_request("unknown source_type"))?;
+            if source_type == proto::DocSourceType::Unspecified {
+                return Err(ServiceError::bad_request("source_type is required"));
+            }
+            if source_type == proto::DocSourceType::GithubTarball && source.ref_or_ver.is_empty() {
                 source.ref_or_ver = resolve_github_ref(&source.owner, &source.repo)?;
             }
 
@@ -80,21 +85,16 @@ impl proto::CollectorService for Component {
             let fetch_span = tracing::start(
                 "collector.fetch_source",
                 &[
-                    ("source.type", source.source_type.as_str()),
+                    ("source.type", doc_source_type_name(source_type)),
                     ("source.owner", source.owner.as_str()),
                     ("source.repo", source.repo.as_str()),
                 ],
             );
-            let bytes = match source.source_type.as_str() {
-                "github_tarball" => fetch_github_tarball(&source, &prefix),
-                "docs_rs" => fetch_docs_rs(&source, &prefix),
-                "crates_io" => fetch_crates_io(&source, &prefix),
-                other => {
-                    tracing::set_error(&fetch_span, &format!("unknown source_type: {other}"));
-                    return Err(ServiceError::bad_request(format!(
-                        "unknown source_type: {other}"
-                    )));
-                }
+            let bytes = match source_type {
+                proto::DocSourceType::GithubTarball => fetch_github_tarball(&source, &prefix),
+                proto::DocSourceType::DocsRs => fetch_docs_rs(&source, &prefix),
+                proto::DocSourceType::CratesIo => fetch_crates_io(&source, &prefix),
+                proto::DocSourceType::Unspecified => unreachable!(),
             }
             .inspect_err(|e| {
                 tracing::set_error(&fetch_span, &e.message);
@@ -103,7 +103,7 @@ impl proto::CollectorService for Component {
             tracing::set_attr(&fetch_span, "source.bytes", bytes);
             drop(fetch_span);
 
-            total_bytes += bytes as i64;
+            total_bytes = total_bytes.saturating_add(bytes as u64);
             sources_fetched += 1;
             doc_prefixes.push(prefix);
         }
@@ -129,7 +129,7 @@ impl proto::CollectorService for Component {
             .into_iter()
             .map(|obj| proto::DocChunkMeta {
                 key: obj.key,
-                size: obj.size as i64,
+                size: obj.size,
                 label: String::new(),
             })
             .collect();
@@ -260,8 +260,19 @@ fn http_get_raw(url: &str) -> Result<(u16, Option<String>, Vec<u8>), String> {
 
 // ── Blobstore helpers ────────────────────────────────────────────────────────
 
+fn doc_source_type_name(source_type: proto::DocSourceType) -> &'static str {
+    match source_type {
+        proto::DocSourceType::GithubTarball => "github_tarball",
+        proto::DocSourceType::DocsRs => "docs_rs",
+        proto::DocSourceType::CratesIo => "crates_io",
+        proto::DocSourceType::Unspecified => "unspecified",
+    }
+}
+
 fn doc_prefix(source: &proto::DocSource) -> String {
-    let st = &source.source_type;
+    let st = proto::DocSourceType::try_from(source.source_type)
+        .map(doc_source_type_name)
+        .unwrap_or("unspecified");
     let owner = &source.owner;
     let repo = if source.repo.is_empty() {
         owner.as_str()

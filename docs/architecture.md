@@ -47,6 +47,8 @@ A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. 
 
 A **node** groups one `wr-proxy` with one or more `wr-engine` instances behind a shared externally-reachable proxy address. Each node knows its own address via `[node] proxy_address` in its config files; the engine sends this value to the manager on registration so the routing table can distinguish local from remote destinations.
 
+At component load, the engine inspects top-level WIT imports and rejects modules that import the DB, blobstore, or LLM host interfaces without enabling the corresponding module capability. Runtime DB capability construction also requires a coherent pool+schema pair. Host-side missing-capability and input validation remain defense in depth for raw generated bindings.
+
 ## Manager clustering (active-active)
 
 Multiple `wr-manager` instances can run simultaneously for high availability. All managers share the same Postgres database — concurrent writes are serialized via `SELECT ... FOR UPDATE NOWAIT` on a lock sentinel row. Each manager:

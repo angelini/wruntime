@@ -27,6 +27,14 @@ impl wr_sdk::ServiceGuest for Component {
     }
 }
 
+fn positive_quantity(quantity: u64) -> Result<i64, ServiceError> {
+    if quantity == 0 {
+        return Err(ServiceError::bad_request("quantity must be > 0"));
+    }
+    i64::try_from(quantity)
+        .map_err(|_| ServiceError::bad_request("quantity exceeds database range"))
+}
+
 impl proto::InventoryService for Component {
     fn seed(&self, _req: proto::SeedRequest) -> Result<proto::SeedResponse, ServiceError> {
         let sp = tracing::start("inventory.seed", &[]);
@@ -75,13 +83,11 @@ impl proto::InventoryService for Component {
     }
 
     fn buy(&self, req: proto::BuyRequest) -> Result<proto::BuyResponse, ServiceError> {
-        if req.quantity <= 0 {
-            return Err(ServiceError::bad_request("quantity must be > 0"));
-        }
+        let quantity = positive_quantity(req.quantity)?;
 
         let sp = wr_sdk::span!("inventory.buy",
             "product.id" => req.product_id.as_str(),
-            "product.quantity" => req.quantity,
+            "product.quantity" => quantity,
         );
 
         let tx = wr_sdk::db::transaction()?;
@@ -100,7 +106,7 @@ impl proto::InventoryService for Component {
 
         let stock = rows[0].get_i64(0)?;
 
-        if stock < req.quantity {
+        if stock < quantity {
             tracing::set_error(&sp, &format!("insufficient stock — available: {stock}"));
             return Err(ServiceError::conflict(format!(
                 "insufficient stock — available: {stock}"
@@ -111,43 +117,41 @@ impl proto::InventoryService for Component {
             "UPDATE inventory SET stock = stock - $2 WHERE product_id = $1",
             &[
                 PgValue::Text(req.product_id.clone()),
-                PgValue::Int8(req.quantity),
+                PgValue::Int8(quantity),
             ],
         )?;
 
         tx.commit()?;
 
-        let remaining = stock - req.quantity;
+        let remaining = stock - quantity;
         tracing::set_attr(&sp, "product.remaining", remaining);
         tracing::record_event(
             &sp,
             "buy.committed",
             &[
                 ("product_id", req.product_id.as_str()),
-                ("quantity", &req.quantity.to_string()),
+                ("quantity", &quantity.to_string()),
             ],
         );
         Ok(proto::BuyResponse {
-            bought: req.quantity,
+            bought: quantity,
             remaining,
         })
     }
 
     fn r#return(&self, req: proto::ReturnRequest) -> Result<proto::ReturnResponse, ServiceError> {
-        if req.quantity <= 0 {
-            return Err(ServiceError::bad_request("quantity must be > 0"));
-        }
+        let quantity = positive_quantity(req.quantity)?;
 
         wr_sdk::span!("inventory.return",
             "product.id" => req.product_id.as_str(),
-            "product.quantity" => req.quantity,
+            "product.quantity" => quantity,
         );
 
         let affected = database::execute(
             "UPDATE inventory SET stock = stock + $2 WHERE product_id = $1",
             &[
                 PgValue::Text(req.product_id.clone()),
-                PgValue::Int8(req.quantity),
+                PgValue::Int8(quantity),
             ],
         )?;
 
@@ -159,7 +163,7 @@ impl proto::InventoryService for Component {
         }
 
         Ok(proto::ReturnResponse {
-            returned: req.quantity,
+            returned: quantity,
             product_id: req.product_id,
         })
     }
@@ -168,9 +172,7 @@ impl proto::InventoryService for Component {
         &self,
         req: proto::TransferRequest,
     ) -> Result<proto::TransferResponse, ServiceError> {
-        if req.quantity <= 0 {
-            return Err(ServiceError::bad_request("quantity must be > 0"));
-        }
+        let quantity = positive_quantity(req.quantity)?;
         if req.from_product_id == req.to_product_id {
             return Err(ServiceError::bad_request(
                 "from and to products must differ",
@@ -180,7 +182,7 @@ impl proto::InventoryService for Component {
         let sp = wr_sdk::span!("inventory.transfer",
             "product.from" => req.from_product_id.as_str(),
             "product.to" => req.to_product_id.as_str(),
-            "product.quantity" => req.quantity,
+            "product.quantity" => quantity,
         );
 
         let tx = wr_sdk::db::transaction()?;
@@ -217,7 +219,7 @@ impl proto::InventoryService for Component {
             .ok_or_else(|| ServiceError::internal("missing row"))?
             .get_i64(0)?;
 
-        if stock_from < req.quantity {
+        if stock_from < quantity {
             tracing::set_error(
                 &sp,
                 &format!("insufficient stock — available: {stock_from}"),
@@ -231,7 +233,7 @@ impl proto::InventoryService for Component {
             "UPDATE inventory SET stock = stock - $2 WHERE product_id = $1",
             &[
                 PgValue::Text(req.from_product_id.clone()),
-                PgValue::Int8(req.quantity),
+                PgValue::Int8(quantity),
             ],
         )?;
 
@@ -239,7 +241,7 @@ impl proto::InventoryService for Component {
             "UPDATE inventory SET stock = stock + $2 WHERE product_id = $1",
             &[
                 PgValue::Text(req.to_product_id.clone()),
-                PgValue::Int8(req.quantity),
+                PgValue::Int8(quantity),
             ],
         )?;
 
@@ -251,29 +253,27 @@ impl proto::InventoryService for Component {
             &[
                 ("from", req.from_product_id.as_str()),
                 ("to", req.to_product_id.as_str()),
-                ("quantity", &req.quantity.to_string()),
+                ("quantity", &quantity.to_string()),
             ],
         );
         Ok(proto::TransferResponse {
-            transferred: req.quantity,
+            transferred: quantity,
         })
     }
 
     fn restock(&self, req: proto::RestockRequest) -> Result<proto::RestockResponse, ServiceError> {
-        if req.quantity <= 0 {
-            return Err(ServiceError::bad_request("quantity must be > 0"));
-        }
+        let quantity = positive_quantity(req.quantity)?;
 
         let sp = wr_sdk::span!("inventory.restock",
             "product.id" => req.product_id.as_str(),
-            "product.quantity" => req.quantity,
+            "product.quantity" => quantity,
         );
 
         let rows = database::query(
             "UPDATE inventory SET stock = stock + $2 WHERE product_id = $1 RETURNING stock",
             &[
                 PgValue::Text(req.product_id.clone()),
-                PgValue::Int8(req.quantity),
+                PgValue::Int8(quantity),
             ],
         )?;
 

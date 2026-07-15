@@ -8,14 +8,14 @@
 BuyRequest
 
 product_id (	R	productId
-quantity (Rquantity"C
+quantity (Rquantity"C
 BuyResponse
 bought (Rbought
 	remaining (R	remaining"J
 ReturnRequest
 
 product_id (	R	productId
-quantity (Rquantity"K
+quantity (Rquantity"K
 ReturnResponse
 returned (Rreturned
 
@@ -30,13 +30,13 @@ product_id (	R	productId
 TransferRequest&
 from_product_id (	RfromProductId"
 to_product_id (	RtoProductId
-quantity (Rquantity"4
+quantity (Rquantity"4
 TransferResponse 
 transferred (Rtransferred"K
 RestockRequest
 
 product_id (	R	productId
-quantity (Rquantity"M
+quantity (Rquantity"M
 RestockResponse
 
 product_id (	R	productId

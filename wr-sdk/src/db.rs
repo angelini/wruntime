@@ -4,6 +4,102 @@ use crate::bindings::wruntime::db::database::{self, DbError, PgValue, Row, Trans
 use crate::bindings::wruntime::tracing::span::ActiveSpan;
 use crate::ServiceError;
 
+#[derive(Clone, Debug)]
+pub struct Jsonb(String);
+impl Jsonb {
+    pub fn parse(value: &str) -> Result<Self, ServiceError> {
+        serde_json::from_str::<serde_json::Value>(value)
+            .map_err(|e| ServiceError::bad_request(format!("invalid JSONB: {e}")))?;
+        Ok(Self(value.to_string()))
+    }
+}
+impl From<Jsonb> for PgValue {
+    fn from(value: Jsonb) -> Self {
+        PgValue::Jsonb(value.0)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PgNumeric(String);
+impl PgNumeric {
+    pub fn parse(value: &str) -> Result<Self, ServiceError> {
+        value.parse::<rust_decimal::Decimal>().map_err(|error| {
+            ServiceError::bad_request(format!("invalid PostgreSQL numeric: {error}"))
+        })?;
+        Ok(Self(value.to_string()))
+    }
+}
+impl From<PgNumeric> for PgValue {
+    fn from(value: PgNumeric) -> Self {
+        PgValue::Numeric(value.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PgTimeMicros(i64);
+impl PgTimeMicros {
+    pub fn new(value: i64) -> Result<Self, ServiceError> {
+        if (0..86_400_000_000).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(ServiceError::bad_request(
+                "time microseconds must be within one day",
+            ))
+        }
+    }
+}
+impl From<PgTimeMicros> for PgValue {
+    fn from(value: PgTimeMicros) -> Self {
+        PgValue::Time(value.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PgTimestampMicros(i64);
+impl PgTimestampMicros {
+    pub fn new(value: i64) -> Result<Self, ServiceError> {
+        chrono::DateTime::from_timestamp_micros(value)
+            .map(|_| Self(value))
+            .ok_or_else(|| ServiceError::bad_request("timestamp microseconds out of range"))
+    }
+}
+impl From<PgTimestampMicros> for PgValue {
+    fn from(value: PgTimestampMicros) -> Self {
+        PgValue::Timestamp(value.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PgDateDays(i32);
+impl PgDateDays {
+    pub fn new(value: i32) -> Result<Self, ServiceError> {
+        let ce_days = value
+            .checked_add(719_163)
+            .ok_or_else(|| ServiceError::bad_request("date days out of range"))?;
+        chrono::NaiveDate::from_num_days_from_ce_opt(ce_days)
+            .map(|_| Self(value))
+            .ok_or_else(|| ServiceError::bad_request("date days out of range"))
+    }
+}
+impl From<PgDateDays> for PgValue {
+    fn from(value: PgDateDays) -> Self {
+        PgValue::Date(value.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BatchSize(std::num::NonZeroU32);
+impl BatchSize {
+    pub fn new(value: u32) -> Result<Self, ServiceError> {
+        std::num::NonZeroU32::new(value)
+            .map(Self)
+            .ok_or_else(|| ServiceError::bad_request("batch size must be > 0"))
+    }
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
 // ── Optional DB tracing ────────────────────────────────────────────────────
 
 thread_local! {
@@ -31,9 +127,18 @@ impl DbSpan {
         let span = crate::tracing::start_owned(
             &format!("db.{operation}"),
             vec![
-                ("db.operation".into(), operation.into()),
-                ("db.statement".into(), sql.into()),
-                ("db.params.count".into(), param_count.to_string()),
+                (
+                    "db.operation".into(),
+                    crate::tracing::AttributeValue::Text(operation.into()),
+                ),
+                (
+                    "db.statement".into(),
+                    crate::tracing::AttributeValue::Text(sql.into()),
+                ),
+                (
+                    "db.params.count".into(),
+                    crate::tracing::AttributeValue::Signed(param_count as i64),
+                ),
             ],
         );
         Self(Some(span))
@@ -262,7 +367,12 @@ impl From<DbError> for ServiceError {
 
 // ── Transaction guard ───────────────────────────────────────────────────────
 
-/// A transaction wrapper that auto-rollbacks on drop unless committed.
+enum TransactionState {
+    Active(Transaction),
+    Completed,
+}
+
+/// An active transaction that auto-rollbacks on drop unless committed.
 ///
 /// ```rust,ignore
 /// let tx = wr_sdk::db::transaction()?;
@@ -270,13 +380,16 @@ impl From<DbError> for ServiceError {
 /// tx.execute("UPDATE ...", &[])?;
 /// tx.commit()?; // consumes the guard — no rollback
 /// ```
-pub struct TxGuard {
-    inner: Option<Transaction>,
+pub struct ActiveTransaction {
+    state: TransactionState,
     span: DbSpan,
 }
 
+/// Compatibility alias for the active transaction guard.
+pub type TxGuard = ActiveTransaction;
+
 /// Begin a transaction and return a guard that auto-rollbacks on drop.
-pub fn transaction() -> Result<TxGuard, ServiceError> {
+pub fn transaction() -> Result<ActiveTransaction, ServiceError> {
     let span = DbSpan::start("transaction", "BEGIN", 0);
     let tx = match database::begin_transaction() {
         Ok(t) => t,
@@ -286,16 +399,22 @@ pub fn transaction() -> Result<TxGuard, ServiceError> {
             return Err(se);
         }
     };
-    Ok(TxGuard {
-        inner: Some(tx),
+    Ok(ActiveTransaction {
+        state: TransactionState::Active(tx),
         span,
     })
 }
 
-impl TxGuard {
+impl ActiveTransaction {
+    fn inner(&self) -> &Transaction {
+        match &self.state {
+            TransactionState::Active(transaction) => transaction,
+            TransactionState::Completed => unreachable!("completed transaction is consumed"),
+        }
+    }
     pub fn query(&self, sql: &str, params: &[PgValue]) -> Result<Vec<Row>, ServiceError> {
         let span = DbSpan::start("query", sql, params.len());
-        match self.inner.as_ref().unwrap().query(sql, params) {
+        match self.inner().query(sql, params) {
             Ok(rows) => {
                 span.set_rows(rows.len());
                 Ok(rows)
@@ -310,7 +429,7 @@ impl TxGuard {
 
     pub fn execute(&self, sql: &str, params: &[PgValue]) -> Result<u64, ServiceError> {
         let span = DbSpan::start("execute", sql, params.len());
-        match self.inner.as_ref().unwrap().execute(sql, params) {
+        match self.inner().execute(sql, params) {
             Ok(n) => {
                 span.set_rows_affected(n);
                 Ok(n)
@@ -338,7 +457,11 @@ impl TxGuard {
 
     /// Commit the transaction, consuming the guard.
     pub fn commit(mut self) -> Result<(), ServiceError> {
-        match self.inner.take().unwrap().commit() {
+        let transaction = match std::mem::replace(&mut self.state, TransactionState::Completed) {
+            TransactionState::Active(transaction) => transaction,
+            TransactionState::Completed => unreachable!("completed transaction is consumed"),
+        };
+        match transaction.commit() {
             Ok(()) => Ok(()),
             Err(e) => {
                 let se = ServiceError::from(e);
@@ -349,11 +472,27 @@ impl TxGuard {
     }
 }
 
-impl Drop for TxGuard {
+impl Drop for ActiveTransaction {
     fn drop(&mut self) {
-        if let Some(tx) = self.inner.take() {
+        if let TransactionState::Active(transaction) =
+            std::mem::replace(&mut self.state, TransactionState::Completed)
+        {
             self.span.set_error("transaction rolled back");
-            let _ = tx.rollback();
+            let _ = transaction.rollback();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_db_values_reject_invalid_inputs() {
+        assert!(Jsonb::parse("not-json").is_err());
+        assert!(PgNumeric::parse("nope").is_err());
+        assert!(PgTimeMicros::new(-1).is_err());
+        assert!(PgTimeMicros::new(86_400_000_000).is_err());
+        assert!(BatchSize::new(0).is_err());
     }
 }

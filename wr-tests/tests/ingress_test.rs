@@ -61,14 +61,19 @@ async fn external_request(
     Ok((status, String::from_utf8_lossy(&body).into_owned()))
 }
 
+fn route(path: &str, methods: &[&str]) -> ExternalRoute {
+    ExternalRoute::new(
+        path,
+        methods.iter().map(|method| (*method).to_string()).collect(),
+        "inventory",
+        "ecommerce",
+    )
+    .expect("test route must be valid")
+}
+
 #[tokio::test]
 async fn test_external_route_dispatches_to_engine() -> Result<()> {
-    let routes = vec![ExternalRoute {
-        path: "/items".into(),
-        methods: vec![],
-        module: "inventory".into(),
-        namespace: "ecommerce".into(),
-    }];
+    let routes = vec![route("/items", &[])];
     let (addr, _shutdown) = ingress_fixture("inventory", "ecommerce", routes).await?;
 
     let (status, body) = external_get(addr, "/items").await?;
@@ -79,12 +84,7 @@ async fn test_external_route_dispatches_to_engine() -> Result<()> {
 
 #[tokio::test]
 async fn test_external_route_wildcard_segment() -> Result<()> {
-    let routes = vec![ExternalRoute {
-        path: "/items/{id}".into(),
-        methods: vec![],
-        module: "inventory".into(),
-        namespace: "ecommerce".into(),
-    }];
+    let routes = vec![route("/items/{id}", &[])];
     let (addr, _shutdown) = ingress_fixture("inventory", "ecommerce", routes).await?;
 
     let (status, body) = external_get(addr, "/items/42").await?;
@@ -95,12 +95,7 @@ async fn test_external_route_wildcard_segment() -> Result<()> {
 
 #[tokio::test]
 async fn test_external_route_unmatched_path_returns_404() -> Result<()> {
-    let routes = vec![ExternalRoute {
-        path: "/items".into(),
-        methods: vec![],
-        module: "inventory".into(),
-        namespace: "ecommerce".into(),
-    }];
+    let routes = vec![route("/items", &[])];
     let (addr, _shutdown) = ingress_fixture("inventory", "ecommerce", routes).await?;
 
     let (status, _) = external_get(addr, "/orders").await?;
@@ -110,12 +105,7 @@ async fn test_external_route_unmatched_path_returns_404() -> Result<()> {
 
 #[tokio::test]
 async fn test_external_route_method_filter() -> Result<()> {
-    let routes = vec![ExternalRoute {
-        path: "/items".into(),
-        methods: vec!["GET".into()],
-        module: "inventory".into(),
-        namespace: "ecommerce".into(),
-    }];
+    let routes = vec![route("/items", &["get"])];
     let (addr, _shutdown) = ingress_fixture("inventory", "ecommerce", routes).await?;
 
     let (get_status, _) = external_request(addr, "GET", "/items", &[]).await?;
@@ -132,12 +122,7 @@ async fn test_external_route_strips_spoofed_internal_headers() -> Result<()> {
     // A malicious caller also sends x-wr-destination pointing to a non-existent
     // module.  The ingress layer must strip it so routing uses the configured
     // destination, not the spoofed one.
-    let routes = vec![ExternalRoute {
-        path: "/items".into(),
-        methods: vec![],
-        module: "inventory".into(),
-        namespace: "ecommerce".into(),
-    }];
+    let routes = vec![route("/items", &[])];
     let (addr, _shutdown) = ingress_fixture("inventory", "ecommerce", routes).await?;
 
     let (status, _) = external_request(

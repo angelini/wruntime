@@ -40,11 +40,30 @@ pub fn normalize_address(addr: &str) -> String {
 }
 
 /// Extract the port number from an address string like "0.0.0.0:9001".
-pub fn extract_port(addr: &str) -> u16 {
-    addr.rsplit(':')
-        .next()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(0)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeployPort(std::num::NonZeroU16);
+
+impl DeployPort {
+    pub fn new(port: u16) -> Result<Self> {
+        std::num::NonZeroU16::new(port)
+            .map(Self)
+            .ok_or_else(|| anyhow::anyhow!("deployment port must be > 0"))
+    }
+
+    pub fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
+pub fn extract_port(addr: &str) -> Result<DeployPort> {
+    let (_, port) = addr
+        .trim()
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("address '{addr}' is missing a port"))?;
+    let parsed = port
+        .parse::<u16>()
+        .with_context(|| format!("invalid port in address '{addr}'"))?;
+    DeployPort::new(parsed).with_context(|| format!("invalid port in address '{addr}'"))
 }
 
 /// Parse the `listen_address` field from a TOML config file.
@@ -535,4 +554,23 @@ pub async fn wait_for_modules(
     })
     .await
     .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_port_accepts_socket_urls_ipv6_and_templates() {
+        assert_eq!(extract_port("127.0.0.1:9001").unwrap().get(), 9001);
+        assert_eq!(extract_port("http://{host}:9002").unwrap().get(), 9002);
+        assert_eq!(extract_port("[::1]:9443").unwrap().get(), 9443);
+    }
+
+    #[test]
+    fn extract_port_rejects_missing_malformed_and_zero_ports() {
+        for address in ["localhost", "localhost:not-a-port", "localhost:0"] {
+            assert!(extract_port(address).is_err(), "{address} must be rejected");
+        }
+    }
 }

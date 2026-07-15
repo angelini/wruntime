@@ -304,6 +304,31 @@ impl EngineRunner {
         }
     }
 
+    fn validate_component_capabilities(
+        &self,
+        component: &Component,
+        module: &ModuleConfig,
+    ) -> Result<()> {
+        let component_type = component.component_type();
+        let imports: Vec<&str> = component_type
+            .imports(&self.engine)
+            .map(|(name, _)| name)
+            .collect();
+        for (interface, enabled, capability) in [
+            ("wruntime:db/database", module.database, "database"),
+            ("wruntime:blobstore/store", module.blobstore, "blobstore"),
+            ("wruntime:llm/inference", module.llm, "llm"),
+        ] {
+            if imports.iter().any(|name| name.starts_with(interface)) && !enabled {
+                anyhow::bail!(
+                    "module '{}' imports {interface} but {capability} capability is not enabled",
+                    module.name
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Load a WASM component, preferring a pre-compiled `.cwasm` artifact when
     /// available and compatible. Falls back to JIT compilation from `.wasm`.
     fn load_component(&self, module_config: &ModuleConfig) -> Result<Component> {
@@ -343,6 +368,7 @@ impl EngineRunner {
         info!(module = %module_config.name, "loading module");
 
         let component = self.load_component(module_config)?;
+        self.validate_component_capabilities(&component, module_config)?;
         let proxy_uri: hyper::Uri = self.config.node.proxy_address.parse()?;
         let http_pool =
             wr_common::http_pool::HttpClientPool::new(wr_common::http_pool::DEFAULT_POOL_SIZE);
@@ -352,6 +378,24 @@ impl EngineRunner {
 
         let linker = wr_engine::runtime::configure_linker(&self.engine)?;
         let svc = self.resolve_module_services(module_config, &module_namespace, &module_name);
+        if module_config.database && svc.db_pool.is_none() {
+            anyhow::bail!(
+                "module '{}' database capability has no namespace pool",
+                module_config.name
+            );
+        }
+        if module_config.blobstore && svc.blobstore.is_none() {
+            anyhow::bail!(
+                "module '{}' blobstore capability has no runtime",
+                module_config.name
+            );
+        }
+        if module_config.llm && svc.llm.is_none() {
+            anyhow::bail!(
+                "module '{}' LLM capability has no runtime",
+                module_config.name
+            );
+        }
 
         let pre = ProxyPre::new(linker.instantiate_pre(&component)?).map_err(|e| {
             let mode_str = if module_config.mode == ModuleMode::Worker {
@@ -428,9 +472,19 @@ impl EngineRunner {
                     name: module_name.to_string(),
                     version: module_version.clone(),
                     engine_id: engine_id.to_string(),
-                    concurrency: module_config.worker_concurrency,
-                    poll_interval: Duration::from_secs(module_config.worker_poll_interval_secs),
-                    job_timeout: Duration::from_secs(module_config.worker_job_timeout_secs),
+                    concurrency: wr_common::lifecycle::WorkerConcurrency::new(
+                        module_config.worker_concurrency,
+                    )?,
+                    poll_interval: wr_common::lifecycle::PositiveDuration::from_secs(
+                        module_config.worker_poll_interval_secs,
+                        "worker poll interval",
+                    )?
+                    .get(),
+                    job_timeout: wr_common::lifecycle::PositiveDuration::from_secs(
+                        module_config.worker_job_timeout_secs,
+                        "worker job timeout",
+                    )?
+                    .get(),
                     database_url: db_url,
                 },
                 tx,

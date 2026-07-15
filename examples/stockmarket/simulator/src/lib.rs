@@ -33,10 +33,25 @@ fn symbol_name(idx: u32) -> String {
 
 impl proto::SimulatorService for Component {
     fn run(&self, req: proto::SimRunRequest) -> Result<proto::SimRunResponse, ServiceError> {
+        const MAX_TOTAL_ORDERS: u64 = 1_000_000;
+        const MAX_SYMBOLS: u32 = 10_000;
+
         let num_traders = req.num_traders.max(1);
         let orders_per_trader = req.orders_per_trader.max(1);
         let num_symbols = req.num_symbols.max(1);
-        let total_orders = (num_traders as i64) * (orders_per_trader as i64);
+        let total_orders_u64 = u64::from(num_traders) * u64::from(orders_per_trader);
+        if total_orders_u64 > MAX_TOTAL_ORDERS {
+            return Err(ServiceError::bad_request(format!(
+                "simulation exceeds {MAX_TOTAL_ORDERS} total orders"
+            )));
+        }
+        if num_symbols > MAX_SYMBOLS {
+            return Err(ServiceError::bad_request(format!(
+                "simulation exceeds {MAX_SYMBOLS} symbols"
+            )));
+        }
+        let total_orders = i64::try_from(total_orders_u64)
+            .map_err(|_| ServiceError::bad_request("total order count exceeds response range"))?;
 
         let run_span = wr_sdk::span!(
             "simulator.run",
@@ -54,14 +69,14 @@ impl proto::SimulatorService for Component {
             .reset(proto::ResetRequest {})
             .map_err(|e| ServiceError::internal(format!("ledger reset failed: {e}")))?;
 
-        let symbols: Vec<String> = (0..num_symbols as u32).map(symbol_name).collect();
+        let symbols: Vec<String> = (0..num_symbols).map(symbol_name).collect();
         exchange
             .setup(proto::SetupRequest {
                 symbols: symbols.clone(),
             })
             .map_err(|e| ServiceError::internal(format!("exchange setup failed: {e}")))?;
 
-        let mut errors: i32 = 0;
+        let mut errors: u32 = 0;
 
         // Place orders for each trader.
         for t in 0..num_traders {
@@ -72,7 +87,7 @@ impl proto::SimulatorService for Component {
                     .wrapping_mul(7)
                     .wrapping_add(o as u64)
                     .wrapping_mul(13)) as u32
-                    % (num_symbols as u32);
+                    % num_symbols;
 
                 let is_buy = (o % 3) != 0;
                 let price = 1000

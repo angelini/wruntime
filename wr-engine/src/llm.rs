@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use wasmtime::component::Resource;
 
-use crate::config::LlmConfig;
+use crate::config::{LlmConfig, LlmProvider};
 use crate::state::{CounterGuard, ModuleState, ResourceKind};
 
 // ── LlmRuntime — host-side HTTP client for the Claude Messages API ──────────
 
 pub struct LlmRuntime {
     client: Client,
+    provider: LlmProvider,
     api_key: String,
     base_url: String,
     max_tokens_limit: u32,
@@ -22,15 +23,22 @@ impl LlmRuntime {
             .with_context(|| format!("missing env var: {}", config.api_key_env))?;
         Ok(Self {
             client: Client::new(),
+            provider: config.provider,
             api_key,
             base_url: config.base_url.clone(),
             max_tokens_limit: config.max_tokens_limit,
         })
     }
 
+    fn messages_url(&self) -> String {
+        match self.provider {
+            LlmProvider::Anthropic => format!("{}/v1/messages", self.base_url),
+        }
+    }
+
     /// Non-streaming Messages API call.
     pub async fn complete(&self, req: ApiRequest) -> Result<ApiResponse, LlmErrorKind> {
-        let url = format!("{}/v1/messages", self.base_url);
+        let url = self.messages_url();
         let resp = self
             .client
             .post(&url)
@@ -58,7 +66,7 @@ impl LlmRuntime {
         mut req: ApiRequest,
     ) -> Result<mpsc::Receiver<HostStreamEvent>, LlmErrorKind> {
         req.stream = Some(true);
-        let url = format!("{}/v1/messages", self.base_url);
+        let url = self.messages_url();
         let resp = self
             .client
             .post(&url)
@@ -435,7 +443,7 @@ use wruntime::llm::inference::{
 impl Host for ModuleState {
     async fn complete(&mut self, req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let runtime = self.llm()?.runtime.clone();
-        let api_req = to_api_request(&runtime, &req);
+        let api_req = to_api_request(&runtime, &req)?;
         match runtime.complete(api_req).await {
             Ok(resp) => Ok(from_api_response(resp)),
             Err(e) => Err(e.into()),
@@ -457,7 +465,7 @@ impl Host for ModuleState {
             .try_track(ResourceKind::LlmStream)
             .ok_or_else(|| LlmError::Api("llm stream cap exceeded".into()))?;
         let runtime = cap.runtime.clone();
-        let api_req = to_api_request(&runtime, &req);
+        let api_req = to_api_request(&runtime, &req)?;
         match runtime.complete_stream(api_req).await {
             Ok(rx) => {
                 let handle = self
@@ -531,8 +539,46 @@ impl HostCompletionStream for ModuleState {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn to_api_request(runtime: &LlmRuntime, req: &CompletionRequest) -> ApiRequest {
-    ApiRequest {
+fn to_api_request(runtime: &LlmRuntime, req: &CompletionRequest) -> Result<ApiRequest, LlmError> {
+    if req.model.trim().is_empty() {
+        return Err(LlmError::InvalidRequest("model must not be empty".into()));
+    }
+    if req.max_tokens == 0 {
+        return Err(LlmError::InvalidRequest("max_tokens must be > 0".into()));
+    }
+    if let Some(temperature) = req.temperature {
+        if !temperature.is_finite() || !(0.0..=1.0).contains(&temperature) {
+            return Err(LlmError::InvalidRequest(
+                "temperature must be finite and between 0.0 and 1.0".into(),
+            ));
+        }
+    }
+    let tools = req
+        .tools
+        .iter()
+        .map(|tool| {
+            let input_schema = serde_json::from_str::<serde_json::Value>(&tool.input_schema)
+                .map_err(|error| {
+                    LlmError::InvalidRequest(format!(
+                        "tool '{}' input_schema is invalid JSON: {error}",
+                        tool.name
+                    ))
+                })?;
+            if !input_schema.is_object() {
+                return Err(LlmError::InvalidRequest(format!(
+                    "tool '{}' input_schema must be a JSON object",
+                    tool.name
+                )));
+            }
+            Ok(ApiToolDef {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema,
+            })
+        })
+        .collect::<Result<Vec<_>, LlmError>>()?;
+
+    Ok(ApiRequest {
         model: req.model.clone(),
         messages: req
             .messages
@@ -548,18 +594,9 @@ fn to_api_request(runtime: &LlmRuntime, req: &CompletionRequest) -> ApiRequest {
         max_tokens: runtime.clamp_max_tokens(req.max_tokens),
         system: req.system.clone(),
         temperature: req.temperature,
-        tools: req
-            .tools
-            .iter()
-            .map(|t| ApiToolDef {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                input_schema: serde_json::from_str(&t.input_schema)
-                    .unwrap_or(serde_json::json!({})),
-            })
-            .collect(),
+        tools,
         stream: None,
-    }
+    })
 }
 
 fn from_api_response(resp: ApiResponse) -> CompletionResponse {
@@ -685,16 +722,63 @@ mod tests {
         assert!(matches!(result, Err(LlmError::InvalidRequest(_))));
     }
 
+    fn runtime_with_limit(max_tokens_limit: u32) -> LlmRuntime {
+        LlmRuntime {
+            client: Client::new(),
+            provider: LlmProvider::Anthropic,
+            api_key: "test-key".into(),
+            base_url: "http://localhost".into(),
+            max_tokens_limit,
+        }
+    }
+
     #[test]
     fn test_clamp_max_tokens() {
         let config = LlmConfig {
-            provider: "anthropic".into(),
+            provider: LlmProvider::Anthropic,
             api_key_env: "TEST_KEY".into(),
             base_url: "http://localhost".into(),
             max_tokens_limit: 1000,
         };
         assert_eq!(500u32.min(config.max_tokens_limit), 500);
         assert_eq!(2000u32.min(config.max_tokens_limit), 1000);
+    }
+
+    #[test]
+    fn test_to_api_request_rejects_invalid_domains() {
+        let runtime = runtime_with_limit(1000);
+        let mut req = CompletionRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![],
+            system: None,
+            max_tokens: 100,
+            temperature: None,
+            tools: vec![],
+        };
+
+        req.max_tokens = 0;
+        assert!(matches!(
+            to_api_request(&runtime, &req),
+            Err(LlmError::InvalidRequest(_))
+        ));
+
+        req.max_tokens = 100;
+        req.temperature = Some(f32::NAN);
+        assert!(matches!(
+            to_api_request(&runtime, &req),
+            Err(LlmError::InvalidRequest(_))
+        ));
+
+        req.temperature = None;
+        req.tools = vec![wruntime::llm::inference::ToolDef {
+            name: "lookup".into(),
+            description: "Lookup".into(),
+            input_schema: "not-json".into(),
+        }];
+        assert!(matches!(
+            to_api_request(&runtime, &req),
+            Err(LlmError::InvalidRequest(_))
+        ));
     }
 
     #[test]
@@ -744,7 +828,7 @@ mod tests {
     #[test]
     fn test_to_api_request_maps_fields() {
         let config = LlmConfig {
-            provider: "anthropic".into(),
+            provider: LlmProvider::Anthropic,
             api_key_env: "TEST_KEY".into(),
             base_url: "http://localhost".into(),
             max_tokens_limit: 1000,
@@ -766,21 +850,12 @@ mod tests {
             temperature: Some(0.5),
             tools: vec![],
         };
-        let api_msgs: Vec<ApiMessage> = req
-            .messages
-            .iter()
-            .map(|m| ApiMessage {
-                role: match m.role {
-                    MessageRole::User => "user".into(),
-                    MessageRole::Assistant => "assistant".into(),
-                },
-                content: m.content.clone(),
-            })
-            .collect();
-        assert_eq!(api_msgs.len(), 2);
-        assert_eq!(api_msgs[0].role, "user");
-        assert_eq!(api_msgs[1].role, "assistant");
-        assert_eq!(2000u32.min(config.max_tokens_limit), 1000);
+        let runtime = runtime_with_limit(config.max_tokens_limit);
+        let api_request = to_api_request(&runtime, &req).expect("valid request");
+        assert_eq!(api_request.messages.len(), 2);
+        assert_eq!(api_request.messages[0].role, "user");
+        assert_eq!(api_request.messages[1].role, "assistant");
+        assert_eq!(api_request.max_tokens, 1000);
     }
 
     #[test]

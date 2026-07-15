@@ -93,7 +93,7 @@ async fn test_manager_rejects_module_without_namespace() -> Result<()> {
             registration: Some(EngineRegistration {
                 engine_id: "e1".into(),
                 address: "http://127.0.0.1:9100".into(),
-                proxy_address: String::new(),
+                proxy_address: TEST_SELF_PEER.into(),
                 peer_address: TEST_SELF_PEER.into(),
                 modules: vec![ModuleDescriptor {
                     name: "svc".into(),

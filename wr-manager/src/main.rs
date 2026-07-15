@@ -159,9 +159,7 @@ async fn main() -> Result<()> {
     let manager = service::Manager::new(db_pool.clone(), crypto, cluster_handle.clone());
 
     // Monitor for engines that miss their heartbeat deadline
-    let module_heartbeat_timeout_secs = config
-        .module_heartbeat_timeout_secs
-        .expect("module_heartbeat_timeout_secs is filled by ManagerConfig::load");
+    let module_heartbeat_timeout_secs = config.module_heartbeat_timeout_secs.get();
     let monitor_handle = tokio::spawn(state::monitor_heartbeats(
         db_pool.clone(),
         config.engine_heartbeat_timeout_secs,

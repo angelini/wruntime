@@ -1,6 +1,8 @@
 syntax = "proto3";
 package codegen;
 
+import "common.proto";
+
 service CoordinatorService {
   rpc CreateTask  (CreateTaskRequest)  returns (CreateTaskResponse);
   rpc GetTask     (GetTaskRequest)     returns (GetTaskResponse);
@@ -13,7 +15,7 @@ service CoordinatorService {
 }
 
 message DocSourceSpec {
-  string source_type = 1;
+  DocSourceType source_type = 1;
   string owner       = 2;
   string repo        = 3;
   string ref_or_ver  = 4;
@@ -24,12 +26,12 @@ message CreateTaskRequest {
   string                ref              = 2;
   repeated DocSourceSpec doc_sources     = 3;
   string                task_description = 4;
-  int32                 max_agent_turns  = 5;  // default 3
+  uint32                max_agent_turns  = 5;  // 0 means default 3
 }
 
 message CreateTaskResponse {
   string task_id = 1;
-  string status  = 2;
+  TaskStatus status = 2;
 }
 
 message GetTaskRequest {
@@ -38,19 +40,19 @@ message GetTaskRequest {
 
 message GetTaskResponse {
   string task_id              = 1;
-  string status               = 2;
+  TaskStatus status           = 2;
   string unified_diff         = 3;
   string message              = 4;
-  int32  agent_turns          = 5;
-  int32  total_input_tokens   = 6;
-  int32  total_output_tokens  = 7;
+  uint32 agent_turns          = 5;
+  uint32 total_input_tokens   = 6;
+  uint32 total_output_tokens  = 7;
   string created_at           = 8;
   string updated_at           = 9;
 }
 
 message ListTasksRequest {
-  int32 limit  = 1;
-  int32 offset = 2;
+  uint32 limit  = 1;
+  uint32 offset = 2;
 }
 
 message ListTasksResponse {
@@ -69,24 +71,24 @@ message ClaimTaskResponse {
   string                 ref              = 5;
   repeated DocSourceSpec doc_sources      = 6;
   string                 task_description = 7;
-  int32                  max_agent_turns  = 8;
+  uint32                 max_agent_turns  = 8;
 }
 
 message UpdateTaskStatusRequest {
   string task_id = 1;
-  string status  = 2;
+  TaskStatus status = 2;
 }
 
 message UpdateTaskStatusResponse {}
 
 message CompleteTaskRequest {
   string task_id              = 1;
-  string status               = 2;  // "complete" or "error"
+  TaskStatus status           = 2;
   string unified_diff         = 3;
   string message              = 4;
-  int32  agent_turns          = 5;
-  int32  total_input_tokens   = 6;
-  int32  total_output_tokens  = 7;
+  uint32 agent_turns          = 5;
+  uint32 total_input_tokens   = 6;
+  uint32 total_output_tokens  = 7;
 }
 
 message CompleteTaskResponse {}

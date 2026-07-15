@@ -240,8 +240,8 @@ fn bundle(args: BundleArgs) -> Result<()> {
     )?;
 
     // Docker artifacts
-    let listen_port = helpers::extract_port(&config.listen_address);
-    let gossip_port = helpers::extract_port(&config.cluster.gossip_listen_address);
+    let listen_port = helpers::extract_port(&config.listen_address)?.get();
+    let gossip_port = helpers::extract_port(&config.cluster.gossip_listen_address)?.get();
 
     let dockerfile = DockerfileSpec {
         workdir: &workdir,
@@ -389,7 +389,8 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         "secret_key",
     )?;
     let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key, "WR_SSH_KEY");
-    let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port);
+    let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port)?
+        .map(helpers::DeployPort::get);
     let cert_dir = deploy_config::resolve_cert_dir(&args.cert_dir, deploy_cfg.cert_dir);
 
     let manifest: ManagerManifest = bundle::read_manifest(&args.bundle)?;
@@ -397,7 +398,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
 
     // Auto-derive advertise_address from remote host + listen port if not provided
-    let listen_port = helpers::extract_port(&manifest.listen_address);
+    let listen_port = helpers::extract_port(&manifest.listen_address)?.get();
     let advertise_address =
         match deploy_config::resolve_string(args.advertise_address, None, "WR_ADVERTISE_ADDRESS") {
             Some(addr) => addr,

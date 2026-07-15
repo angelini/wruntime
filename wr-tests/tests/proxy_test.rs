@@ -116,7 +116,7 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
             registration: Some(EngineRegistration {
                 engine_id: "proxy-e1".into(),
                 address: "http://127.0.0.1:9700".into(),
-                proxy_address: String::new(),
+                proxy_address: "https://test-node:9443".into(),
                 peer_address: "https://127.0.0.1:9443".into(),
                 modules: vec![ModuleDescriptor {
                     name: "inventory".into(),

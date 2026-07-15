@@ -10,6 +10,8 @@ use std::time::Duration;
 /// Errors from outbound HTTP requests.
 #[derive(Debug)]
 pub enum HttpError {
+    /// Request construction failed before any network I/O.
+    InvalidRequest(String),
     /// The server returned a non-success HTTP status.
     Status { code: u16, body: Vec<u8> },
     /// A transport-level failure (DNS, connection refused, timeout, etc.).
@@ -21,6 +23,7 @@ pub enum HttpError {
 impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            HttpError::InvalidRequest(msg) => write!(f, "invalid request: {msg}"),
             HttpError::Status { code, body } => {
                 let msg = String::from_utf8_lossy(body);
                 write!(f, "rpc error: HTTP {code}: {msg}")
@@ -49,6 +52,7 @@ impl HttpError {
 // ── Request / Response types ────────────────────────────────────────────────
 
 /// HTTP method for outbound requests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Method {
     Get,
     Post,
@@ -60,7 +64,7 @@ pub enum Method {
 }
 
 impl Method {
-    fn to_wasi(&self) -> WasiMethod {
+    fn to_wasi(self) -> WasiMethod {
         match self {
             Method::Get => WasiMethod::Get,
             Method::Post => WasiMethod::Post,
@@ -73,7 +77,70 @@ impl Method {
     }
 }
 
-/// An outbound HTTP request descriptor.
+#[derive(Clone, Debug)]
+pub struct Authority(http::uri::Authority);
+impl Authority {
+    pub fn parse(value: &str) -> Result<Self, HttpError> {
+        value
+            .parse()
+            .map(Self)
+            .map_err(|e| HttpError::InvalidRequest(format!("invalid authority: {e}")))
+    }
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PathAndQuery(http::uri::PathAndQuery);
+impl PathAndQuery {
+    pub fn parse(value: &str) -> Result<Self, HttpError> {
+        value
+            .parse()
+            .map(Self)
+            .map_err(|e| HttpError::InvalidRequest(format!("invalid path/query: {e}")))
+    }
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HeaderName(http::HeaderName);
+impl HeaderName {
+    pub fn parse(value: &str) -> Result<Self, HttpError> {
+        value
+            .parse()
+            .map(Self)
+            .map_err(|e| HttpError::InvalidRequest(format!("invalid header name: {e}")))
+    }
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HeaderValue(http::HeaderValue);
+impl HeaderValue {
+    pub fn from_bytes(value: &[u8]) -> Result<Self, HttpError> {
+        http::HeaderValue::from_bytes(value)
+            .map(Self)
+            .map_err(|e| HttpError::InvalidRequest(format!("invalid header value: {e}")))
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+pub struct TypedHttpRequest<'a> {
+    pub authority: Authority,
+    pub path: PathAndQuery,
+    pub method: Method,
+    pub headers: &'a [(HeaderName, HeaderValue)],
+    pub body: &'a [u8],
+}
+
+/// Raw escape hatch retained for malformed request tests.
 pub struct HttpRequest<'a> {
     pub authority: &'a str,
     pub path: &'a str,
@@ -126,6 +193,19 @@ pub struct Timeouts {
     pub between_bytes: Option<Duration>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestTimeoutNanos(u64);
+impl RequestTimeoutNanos {
+    pub fn from_duration(duration: Duration) -> Result<Self, HttpError> {
+        u64::try_from(duration.as_nanos())
+            .map(Self)
+            .map_err(|_| HttpError::InvalidRequest("timeout exceeds u64 nanoseconds".into()))
+    }
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 impl Timeouts {
     /// Set all three timeouts to the same duration.
     pub fn uniform(d: Duration) -> Self {
@@ -144,6 +224,21 @@ pub fn http_request(req: &HttpRequest) -> Result<HttpResponse, HttpError> {
     do_request(req, None)
 }
 
+pub fn http_request_typed(req: &TypedHttpRequest) -> Result<HttpResponse, HttpError> {
+    let headers: Vec<(&str, &[u8])> = req
+        .headers
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_bytes()))
+        .collect();
+    http_request(&HttpRequest {
+        authority: req.authority.as_str(),
+        path: req.path.as_str(),
+        method: req.method,
+        headers: &headers,
+        body: req.body,
+    })
+}
+
 /// Execute an HTTP request with timeout configuration.
 pub fn http_request_with_timeouts(
     req: &HttpRequest,
@@ -151,15 +246,15 @@ pub fn http_request_with_timeouts(
 ) -> Result<HttpResponse, HttpError> {
     let opts = RequestOptions::new();
     if let Some(d) = timeouts.connect {
-        opts.set_connect_timeout(Some(d.as_nanos() as u64))
+        opts.set_connect_timeout(Some(RequestTimeoutNanos::from_duration(d)?.get()))
             .map_err(|_| HttpError::Transport("connect timeout not supported".into()))?;
     }
     if let Some(d) = timeouts.first_byte {
-        opts.set_first_byte_timeout(Some(d.as_nanos() as u64))
+        opts.set_first_byte_timeout(Some(RequestTimeoutNanos::from_duration(d)?.get()))
             .map_err(|_| HttpError::Transport("first-byte timeout not supported".into()))?;
     }
     if let Some(d) = timeouts.between_bytes {
-        opts.set_between_bytes_timeout(Some(d.as_nanos() as u64))
+        opts.set_between_bytes_timeout(Some(RequestTimeoutNanos::from_duration(d)?.get()))
             .map_err(|_| HttpError::Transport("between-bytes timeout not supported".into()))?;
     }
     do_request(req, Some(opts))
@@ -195,22 +290,22 @@ fn do_request(
     for (name, value) in req.headers {
         headers
             .set(name, &[value.to_vec()])
-            .map_err(|e| HttpError::Transport(format!("set header {name}: {e:?}")))?;
+            .map_err(|e| HttpError::InvalidRequest(format!("set header {name}: {e:?}")))?;
     }
 
     let out_req = OutgoingRequest::new(headers);
     out_req
         .set_method(&req.method.to_wasi())
-        .map_err(|_| HttpError::Transport("set method".into()))?;
+        .map_err(|_| HttpError::InvalidRequest("set method".into()))?;
     out_req
         .set_scheme(Some(&Scheme::Http))
-        .map_err(|_| HttpError::Transport("set scheme".into()))?;
+        .map_err(|_| HttpError::InvalidRequest("set scheme".into()))?;
     out_req
         .set_authority(Some(req.authority))
-        .map_err(|_| HttpError::Transport("set authority".into()))?;
+        .map_err(|_| HttpError::InvalidRequest("set authority".into()))?;
     out_req
         .set_path_with_query(Some(req.path))
-        .map_err(|_| HttpError::Transport("set path".into()))?;
+        .map_err(|_| HttpError::InvalidRequest("set path".into()))?;
 
     let outgoing_body = out_req
         .body()
@@ -265,5 +360,29 @@ fn do_request(
                 future_resp.subscribe().block();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_request_parts_reject_invalid_values() {
+        assert!(Authority::parse("not a host").is_err());
+        assert!(PathAndQuery::parse("not a path").is_err());
+        assert!(HeaderName::parse("bad header").is_err());
+        assert!(HeaderValue::from_bytes(b"bad\nvalue").is_err());
+    }
+
+    #[test]
+    fn timeout_nanoseconds_are_checked() {
+        assert_eq!(
+            RequestTimeoutNanos::from_duration(Duration::from_secs(1))
+                .unwrap()
+                .get(),
+            1_000_000_000
+        );
+        assert!(RequestTimeoutNanos::from_duration(Duration::MAX).is_err());
     }
 }

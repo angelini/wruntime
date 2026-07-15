@@ -1,25 +1,35 @@
-package wruntime:tracing@0.1.0;
+package wruntime:tracing@0.2.0;
 
 interface span {
+    /// Typed OpenTelemetry-compatible attribute value.
+    variant attribute-value {
+        text(string),
+        boolean(bool),
+        signed(s64),
+        float(f64),
+    }
+
+    type attribute = tuple<string, attribute-value>;
+
     /// An active span. Ends when the resource is dropped.
     resource active-span {
         /// Record a key/value attribute on the span.
-        set-attribute: func(key: string, value: string);
+        set-attribute: func(key: string, value: attribute-value);
 
         /// Record an event (point-in-time annotation).
-        record-event: func(name: string, attrs: list<tuple<string, string>>);
+        record-event: func(name: string, attrs: list<attribute>);
 
         /// Mark the span as failed with a message.
         set-error: func(message: string);
     }
 
     /// Start a new child span under the current request span with initial attributes.
-    start: func(name: string, attrs: list<tuple<string, string>>) -> active-span;
+    start: func(name: string, attrs: list<attribute>) -> active-span;
 
     /// Start a new root span (fresh trace). All subsequent outbound HTTP
     /// requests will be parented to this span until it is dropped.
     /// Use this to group a batch of related outbound calls under one trace.
-    start-root: func(name: string, attrs: list<tuple<string, string>>) -> active-span;
+    start-root: func(name: string, attrs: list<attribute>) -> active-span;
 }
 
 world tracing-access {

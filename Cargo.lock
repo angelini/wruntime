@@ -5216,6 +5216,7 @@ dependencies = [
  "libc",
  "prost",
  "prost-reflect",
+ "prost-types",
  "rcgen",
  "reqwest",
  "rustls",
@@ -5255,9 +5256,11 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prost",
+ "prost-types",
  "rand 0.10.2",
  "rustls",
  "rustls-pemfile",
+ "semver",
  "serde",
  "tempfile",
  "tokio",
@@ -5327,6 +5330,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "prost",
+ "prost-types",
  "refinery",
  "rustls",
  "serde",
@@ -5371,7 +5375,10 @@ dependencies = [
 name = "wr-sdk"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "http",
  "prost",
+ "rust_decimal",
  "serde",
  "serde_json",
  "wit-bindgen 0.51.0",

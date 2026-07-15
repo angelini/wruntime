@@ -3,12 +3,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tracing::warn;
+use wr_common::identity::{ModuleVersion, RouteKey};
 use wr_common::wruntime::{RoutingRule, RoutingTable};
 
 /// A routing rule with its semver version pre-parsed at sync time.
 pub struct ParsedRule {
     pub rule: RoutingRule,
-    pub parsed_version: Option<semver::Version>,
+    pub parsed_version: ModuleVersion,
 }
 
 /// Round-robin state for the set of candidates that share one exact version
@@ -36,7 +37,7 @@ pub struct RouteGroup {
 /// into a `RouteGroup`; per-route `AtomicUsize` counters live here (not in the
 /// middleware) and are carried over best-effort across syncs.
 pub struct IndexedRoutingTable {
-    by_module: HashMap<(Arc<str>, Arc<str>), RouteGroup>,
+    by_module: HashMap<RouteKey, RouteGroup>,
     pub version: u64,
 }
 
@@ -51,7 +52,7 @@ impl IndexedRoutingTable {
     /// Build the index from a protobuf `RoutingTable` received from the manager.
     /// Only healthy rules are indexed; unhealthy rules are dropped at sync time.
     pub fn from_proto(table: &RoutingTable, prev: Option<&IndexedRoutingTable>) -> Self {
-        let mut grouped: HashMap<(Arc<str>, Arc<str>), Vec<ParsedRule>> = HashMap::new();
+        let mut grouped: HashMap<RouteKey, Vec<ParsedRule>> = HashMap::new();
 
         for rule in &table.rules {
             if !rule.healthy {
@@ -64,28 +65,31 @@ impl IndexedRoutingTable {
                 );
                 continue;
             }
-            let key = (
-                Arc::from(rule.destination_namespace.as_str()),
-                Arc::from(rule.destination_module.as_str()),
-            );
-            let parsed_version = semver::Version::parse(&rule.destination_version).ok();
+            let key = match RouteKey::parse(&rule.destination_namespace, &rule.destination_module) {
+                Ok(key) => key,
+                Err(error) => {
+                    warn!(rule_id = %rule.rule_id, %error, "skipping routing rule with invalid identity");
+                    continue;
+                }
+            };
+            let parsed_version = match ModuleVersion::parse(&rule.destination_version) {
+                Ok(version) => version,
+                Err(error) => {
+                    warn!(rule_id = %rule.rule_id, %error, "skipping routing rule with invalid semver");
+                    continue;
+                }
+            };
             grouped.entry(key).or_default().push(ParsedRule {
                 rule: rule.clone(),
                 parsed_version,
             });
         }
 
-        let mut by_module: HashMap<(Arc<str>, Arc<str>), RouteGroup> =
-            HashMap::with_capacity(grouped.len());
+        let mut by_module: HashMap<RouteKey, RouteGroup> = HashMap::with_capacity(grouped.len());
 
         for (key, mut candidates) in grouped {
             // Sort each group by version descending so the best version is at the front.
-            candidates.sort_by(|a, b| match (&b.parsed_version, &a.parsed_version) {
-                (Some(bv), Some(av)) => bv.cmp(av),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => b.rule.destination_version.cmp(&a.rule.destination_version),
-            });
+            candidates.sort_by(|a, b| b.parsed_version.cmp(&a.parsed_version));
 
             // Group candidate indexes by exact version string.
             let mut by_version: HashMap<Arc<str>, VersionGroup> = HashMap::new();
@@ -152,8 +156,9 @@ impl IndexedRoutingTable {
     /// Look up the route group for a `(namespace, module)` pair. Returns `None`
     /// when no healthy routes exist for this destination.
     pub fn get(&self, namespace: &str, module: &str) -> Option<&RouteGroup> {
-        self.by_module
-            .get(&(Arc::from(namespace), Arc::from(module)))
+        RouteKey::parse(namespace, module)
+            .ok()
+            .and_then(|key| self.by_module.get(&key))
     }
 }
 

@@ -260,7 +260,7 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
         registration: Some(EngineRegistration {
             engine_id: "mh-e1".into(),
             address: "http://127.0.0.1:9800".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![
                 ModuleDescriptor {
@@ -372,7 +372,7 @@ async fn test_engine_stale_marks_all_module_routes_unhealthy() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "mh-stale-e1".into(),
             address: "http://127.0.0.1:9810".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![
                 ModuleDescriptor {
@@ -559,7 +559,7 @@ async fn test_malformed_module_entry_skipped_not_fatal() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "mh-bad-e1".into(),
             address: "http://127.0.0.1:9830".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![
                 ModuleDescriptor {

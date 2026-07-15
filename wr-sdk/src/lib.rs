@@ -11,7 +11,7 @@ pub mod bindings {
 
 // Re-export wit_bindgen_rt so macro-generated code can reference it via $crate.
 #[doc(hidden)]
-pub use ::wit_bindgen_rt as _rt;
+pub use wit_bindgen_rt as _rt;
 
 /// Handler export helpers. The `IncomingRequest` and `ResponseOutparam` types
 /// come from `wr_sdk::bindings::wasi::http::types`, ensuring type compatibility
@@ -118,6 +118,7 @@ impl std::fmt::Display for ServiceError {
 impl From<crate::http::HttpError> for ServiceError {
     fn from(e: crate::http::HttpError) -> Self {
         match e {
+            crate::http::HttpError::InvalidRequest(msg) => ServiceError::bad_request(msg),
             crate::http::HttpError::Status { code, body } => ServiceError {
                 status: code,
                 message: String::from_utf8_lossy(&body).into_owned(),

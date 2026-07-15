@@ -85,7 +85,7 @@ package {{NAMESPACE}}:{{MODULE_NAME}}@1.0.0;
 
 world {{MODULE_NAME}} {
   // Always include these base imports:
-  import wruntime:tracing/span@0.1.0;
+  import wruntime:tracing/span@0.2.0;
   import wasi:cli/stderr@0.2.6;
   import wasi:cli/environment@0.2.6;
   import wasi:cli/exit@0.2.6;

@@ -21,6 +21,70 @@ impl From<LlmError> for ServiceError {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ModelName(String);
+impl ModelName {
+    pub fn parse(value: impl Into<String>) -> Result<Self, LlmError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            Err(LlmError::InvalidRequest("model must not be empty".into()))
+        } else {
+            Ok(Self(value))
+        }
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MaxTokens(std::num::NonZeroU32);
+impl MaxTokens {
+    pub fn new(value: u32) -> Result<Self, LlmError> {
+        std::num::NonZeroU32::new(value)
+            .map(Self)
+            .ok_or_else(|| LlmError::InvalidRequest("max_tokens must be > 0".into()))
+    }
+    pub fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Temperature(f32);
+impl Temperature {
+    pub fn new(value: f32) -> Result<Self, LlmError> {
+        if value.is_finite() && (0.0..=1.0).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(LlmError::InvalidRequest(
+                "temperature must be finite and between 0.0 and 1.0".into(),
+            ))
+        }
+    }
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolSchema(String);
+impl ToolSchema {
+    pub fn parse(value: &str) -> Result<Self, LlmError> {
+        let parsed: serde_json::Value = serde_json::from_str(value)
+            .map_err(|e| LlmError::InvalidRequest(format!("invalid tool schema JSON: {e}")))?;
+        if !parsed.is_object() {
+            return Err(LlmError::InvalidRequest(
+                "tool schema must be a JSON object".into(),
+            ));
+        }
+        Ok(Self(value.to_string()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Builder for completion requests.
 pub struct CompletionBuilder {
     model: String,
@@ -74,21 +138,41 @@ impl CompletionBuilder {
         self
     }
 
+    /// Raw compatibility setter; the host still rejects zero.
     pub fn max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = n;
         self
     }
+    pub fn with_max_tokens(mut self, value: MaxTokens) -> Self {
+        self.max_tokens = value.get();
+        self
+    }
 
+    /// Raw compatibility setter; the host still validates range/finite values.
     pub fn temperature(mut self, t: f32) -> Self {
         self.temperature = Some(t);
         self
     }
+    pub fn with_temperature(mut self, value: Temperature) -> Self {
+        self.temperature = Some(value.get());
+        self
+    }
 
+    /// Raw compatibility setter; prefer `with_tool` for construction-time validation.
     pub fn tool(mut self, name: &str, description: &str, schema: &str) -> Self {
         self.tools.push(ToolDef {
             name: name.into(),
             description: description.into(),
             input_schema: schema.into(),
+        });
+        self
+    }
+
+    pub fn with_tool(mut self, name: &str, description: &str, schema: ToolSchema) -> Self {
+        self.tools.push(ToolDef {
+            name: name.into(),
+            description: description.into(),
+            input_schema: schema.0,
         });
         self
     }
@@ -135,5 +219,21 @@ pub fn collect_stream(stream: CompletionStream) -> Result<String, LlmError> {
             Some(StreamEvent::Usage(_)) | Some(StreamEvent::Stop(_)) => {}
             None => return Ok(buf),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_llm_values_reject_invalid_inputs() {
+        assert!(ModelName::parse(" ").is_err());
+        assert!(MaxTokens::new(0).is_err());
+        assert!(Temperature::new(f32::NAN).is_err());
+        assert!(Temperature::new(1.1).is_err());
+        assert!(ToolSchema::parse("not-json").is_err());
+        assert!(ToolSchema::parse("[]").is_err());
+        assert!(ToolSchema::parse(r#"{"type":"object"}"#).is_ok());
     }
 }

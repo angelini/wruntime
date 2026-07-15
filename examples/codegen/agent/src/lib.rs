@@ -122,10 +122,10 @@ impl proto::AgentService for Component {
         );
 
         // Multi-turn LLM loop.
-        let mut total_input: i32 = 0;
-        let mut total_output: i32 = 0;
+        let mut total_input: u32 = 0;
+        let mut total_output: u32 = 0;
         let mut latest_diff;
-        let mut turn = 0;
+        let mut turn: u32 = 0;
 
         // Turn 1: initial generation.
         let user_prompt = format!("## Task\n{}", req.task_description);
@@ -153,8 +153,8 @@ impl proto::AgentService for Component {
             }
         };
 
-        total_input += resp.usage.input_tokens as i32;
-        total_output += resp.usage.output_tokens as i32;
+        total_input = total_input.saturating_add(resp.usage.input_tokens);
+        total_output = total_output.saturating_add(resp.usage.output_tokens);
         latest_diff = text.clone();
         turn += 1;
 
@@ -210,8 +210,8 @@ impl proto::AgentService for Component {
                 }
             };
 
-            total_input += resp.usage.input_tokens as i32;
-            total_output += resp.usage.output_tokens as i32;
+            total_input = total_input.saturating_add(resp.usage.input_tokens);
+            total_output = total_output.saturating_add(resp.usage.output_tokens);
             turn += 1;
 
             wr_sdk::log::log(&format!(
@@ -256,7 +256,7 @@ impl proto::AgentService for Component {
             turns_used: turn,
             input_tokens: total_input,
             output_tokens: total_output,
-            status: "complete".into(),
+            status: proto::AgentRunStatus::Complete as i32,
             message: format!("completed in {turn} turn(s)"),
         })
     }
@@ -275,8 +275,10 @@ impl proto::AgentService for Component {
         }
 
         let status = match &rows[0].columns[0].value {
-            PgValue::Text(s) => s.clone(),
-            _ => String::new(),
+            PgValue::Text(value) if value == "active" => proto::SessionStatus::Active as i32,
+            PgValue::Text(value) if value == "complete" => proto::SessionStatus::Complete as i32,
+            PgValue::Text(value) if value == "error" => proto::SessionStatus::Error as i32,
+            _ => proto::SessionStatus::Unspecified as i32,
         };
         let latest_diff = match &rows[0].columns[1].value {
             PgValue::Text(s) => s.clone(),
@@ -293,7 +295,7 @@ impl proto::AgentService for Component {
             .into_iter()
             .map(|row| {
                 let turn_number = match &row.columns[0].value {
-                    PgValue::Int4(n) => *n,
+                    PgValue::Int4(n) => u32::try_from(*n).unwrap_or_default(),
                     _ => 0,
                 };
                 let user_prompt = match &row.columns[1].value {
@@ -305,11 +307,11 @@ impl proto::AgentService for Component {
                     _ => String::new(),
                 };
                 let input_tokens = match &row.columns[3].value {
-                    PgValue::Int4(n) => *n,
+                    PgValue::Int4(n) => u32::try_from(*n).unwrap_or_default(),
                     _ => 0,
                 };
                 let output_tokens = match &row.columns[4].value {
-                    PgValue::Int4(n) => *n,
+                    PgValue::Int4(n) => u32::try_from(*n).unwrap_or_default(),
                     _ => 0,
                 };
                 proto::ConversationTurn {
@@ -324,7 +326,7 @@ impl proto::AgentService for Component {
 
         Ok(proto::GetSessionResponse {
             session_id: req.session_id,
-            turn_count: turns.len() as i32,
+            turn_count: u32::try_from(turns.len()).unwrap_or(u32::MAX),
             latest_diff,
             status,
             turns,
@@ -388,7 +390,7 @@ fn build_context(doc_prefixes: &[String], task_description: &str) -> Result<Stri
             })
             .collect();
 
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|item| std::cmp::Reverse(item.0));
 
         for (_, entry) in scored {
             if total_size + entry.size as usize > MAX_CONTEXT_BYTES {
@@ -421,7 +423,7 @@ fn build_context(doc_prefixes: &[String], task_description: &str) -> Result<Stri
 
 fn store_turn(
     session_id: &str,
-    turn_number: i32,
+    turn_number: u32,
     user_prompt: &str,
     assistant_resp: &str,
     usage: &wr_sdk::bindings::wruntime::llm::inference::TokenUsage,
@@ -432,11 +434,18 @@ fn store_turn(
          VALUES ($1, $2, $3, $4, $5, $6)",
         &[
             PgValue::Text(session_id.into()),
-            PgValue::Int4(turn_number),
+            PgValue::Int4(
+                i32::try_from(turn_number)
+                    .map_err(|_| ServiceError::bad_request("turn number exceeds database range"))?,
+            ),
             PgValue::Text(user_prompt.into()),
             PgValue::Text(assistant_resp.into()),
-            PgValue::Int4(usage.input_tokens as i32),
-            PgValue::Int4(usage.output_tokens as i32),
+            PgValue::Int4(i32::try_from(usage.input_tokens).map_err(|_| {
+                ServiceError::bad_request("input token count exceeds database range")
+            })?),
+            PgValue::Int4(i32::try_from(usage.output_tokens).map_err(|_| {
+                ServiceError::bad_request("output token count exceeds database range")
+            })?),
         ],
     )?;
     Ok(())

@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::de::{value::MapAccessDeserializer, Error as _, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use wr_common::identity::ModuleId;
 use wr_common::node::{is_loopback_addr, NodeConfig};
 
 #[derive(Deserialize, Clone)]
@@ -181,10 +184,16 @@ impl Default for BlobstoreLimits {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmProvider {
+    Anthropic,
+}
+
 #[derive(Deserialize, Clone)]
 pub struct LlmConfig {
     /// LLM provider. Currently only "anthropic" is supported.
-    pub provider: String,
+    pub provider: LlmProvider,
     /// Environment variable name that holds the API key.
     /// Resolved at engine startup, never passed to guests.
     pub api_key_env: String,
@@ -223,14 +232,77 @@ pub enum ModuleMode {
     Worker,
 }
 
+/// A validated secret environment reference. The TOML marker must be
+/// `{ secret = true }`; `false` is not a meaningful runtime state.
+#[derive(Clone, Debug)]
+pub struct SecretEnvRef;
+
+#[derive(Deserialize)]
+struct RawSecretEnvRef {
+    secret: bool,
+}
+
+impl<'de> Deserialize<'de> for SecretEnvRef {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawSecretEnvRef::deserialize(deserializer)?;
+        if raw.secret {
+            Ok(Self)
+        } else {
+            Err(D::Error::custom("secret reference must use secret = true"))
+        }
+    }
+}
+
 /// An environment variable value: either a plain string or a secret reference.
-#[derive(Deserialize, Clone)]
-#[serde(untagged)]
+#[derive(Clone)]
 pub enum EnvValue {
     /// Inline plaintext value, e.g. `LOG_LEVEL = "debug"`
     Plain(String),
     /// Secret fetched from the manager, e.g. `API_KEY = { secret = true }`
-    Secret { secret: bool },
+    Secret(SecretEnvRef),
+}
+
+struct EnvValueVisitor;
+
+impl<'de> Visitor<'de> for EnvValueVisitor {
+    type Value = EnvValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a string or { secret = true }")
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(EnvValue::Plain(value.to_string()))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(EnvValue::Plain(value))
+    }
+
+    fn visit_map<A>(self, map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        SecretEnvRef::deserialize(MapAccessDeserializer::new(map)).map(EnvValue::Secret)
+    }
+}
+
+impl<'de> Deserialize<'de> for EnvValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(EnvValueVisitor)
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -302,7 +374,7 @@ pub struct ModuleConfig {
     pub worker_job_timeout_secs: u64,
     /// Maximum delivery attempts before a job is marked dead. Only used when `mode = "worker"`.
     #[serde(default = "default_worker_max_attempts")]
-    pub worker_max_attempts: i32,
+    pub worker_max_attempts: u32,
 }
 
 fn default_request_timeout_secs() -> u64 {
@@ -325,7 +397,7 @@ fn default_worker_job_timeout_secs() -> u64 {
     300
 }
 
-fn default_worker_max_attempts() -> i32 {
+fn default_worker_max_attempts() -> u32 {
     3
 }
 
@@ -376,9 +448,11 @@ impl EngineConfig {
         }
         if let Some(llm) = &self.llm {
             v.check(
-                llm.provider == "anthropic",
-                "llm.provider must be exactly \"anthropic\"",
+                !llm.api_key_env.trim().is_empty(),
+                "llm.api_key_env is required",
             );
+            v.check(!llm.base_url.trim().is_empty(), "llm.base_url is required");
+            v.check(llm.max_tokens_limit > 0, "llm.max_tokens_limit must be > 0");
         }
 
         let mut first_seen_modules = std::collections::HashSet::<(String, String, String)>::new();
@@ -387,6 +461,9 @@ impl EngineConfig {
             v.check(!module.name.is_empty(), "module.name is required");
             v.check(!module.namespace.is_empty(), "module.namespace is required");
             v.check(!module.version.is_empty(), "module.version is required");
+            if let Err(error) = ModuleId::parse(&module.namespace, &module.name, &module.version) {
+                v.check(false, format!("invalid module identity '{m}': {error}"));
+            }
             v.check(
                 std::path::Path::new(&module.wasm_path).exists(),
                 format!("wasm_path not found for module '{m}': {}", module.wasm_path),
@@ -438,6 +515,22 @@ impl EngineConfig {
                 v.check(
                     module.database,
                     format!("module '{m}' has mode = \"worker\" but database is not enabled (job queue requires database)"),
+                );
+                v.check(
+                    module.worker_concurrency > 0,
+                    format!("module '{m}' worker_concurrency must be > 0"),
+                );
+                v.check(
+                    module.worker_poll_interval_secs > 0,
+                    format!("module '{m}' worker_poll_interval_secs must be > 0"),
+                );
+                v.check(
+                    module.worker_job_timeout_secs > 0,
+                    format!("module '{m}' worker_job_timeout_secs must be > 0"),
+                );
+                v.check(
+                    module.worker_max_attempts > 0,
+                    format!("module '{m}' worker_max_attempts must be > 0"),
                 );
             }
             if let Some(mig_path) = &module.migrations_path {

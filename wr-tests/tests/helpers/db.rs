@@ -132,6 +132,7 @@ pub fn db_state(pool_size: usize) -> ModuleState {
         http_pool(),
         ModuleServices {
             db_pool: Some(pool),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )

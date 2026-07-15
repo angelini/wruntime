@@ -17,7 +17,7 @@ async fn test_register_and_list_engines() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9100".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "inventory-service".into(),
@@ -51,7 +51,7 @@ async fn test_deregister_engine() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9101".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![],
             secrets: vec![],
@@ -83,7 +83,7 @@ async fn test_heartbeat() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9102".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![],
             secrets: vec![],
@@ -136,6 +136,34 @@ async fn test_routing_table_upsert_and_get() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_routing_rule_rejects_invalid_identity_version_and_peer_scheme() -> Result<()> {
+    let (_pool, _addr, mut c) = manager_trio().await?;
+    for (namespace, version, peer) in [
+        ("bad_namespace", "1.0.0", "https://127.0.0.1:9443"),
+        ("ns", "latest", "https://127.0.0.1:9443"),
+        ("ns", "1.0.0", "http://127.0.0.1:9443"),
+    ] {
+        let error = c
+            .upsert_routing_rule(RoutingRule {
+                rule_id: "invalid-route".into(),
+                source_module: String::new(),
+                source_namespace: String::new(),
+                destination_module: "svc".into(),
+                destination_namespace: namespace.into(),
+                destination_version: version.into(),
+                engine_id: "e1".into(),
+                engine_address: "http://127.0.0.1:9103".into(),
+                peer_address: peer.into(),
+                healthy: false,
+            })
+            .await
+            .expect_err("invalid route boundary must be rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_routing_rule_rejects_empty_peer_address() -> Result<()> {
     let (_pool, _addr, mut c) = manager_trio().await?;
 
@@ -171,7 +199,7 @@ async fn test_get_schema_after_registration() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "schema-e1".into(),
             address: "http://127.0.0.1:9200".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "orders".into(),
@@ -273,7 +301,7 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "ver-e1".into(),
             address: "http://127.0.0.1:9210".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "catalog".into(),
@@ -292,7 +320,7 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "ver-e2".into(),
             address: "http://127.0.0.1:9211".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "catalog".into(),
@@ -341,7 +369,7 @@ async fn test_get_schema_cross_namespace_isolation() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "ns-e1".into(),
             address: "http://127.0.0.1:9220".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "gateway".into(),
@@ -391,7 +419,7 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "reup-e1".into(),
             address: "http://127.0.0.1:9230".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "payments".into(),
@@ -421,7 +449,7 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "reup-e1".into(),
             address: "http://127.0.0.1:9230".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "payments".into(),
@@ -464,7 +492,7 @@ async fn test_get_schema_multi_module_engine() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "multi-e1".into(),
             address: "http://127.0.0.1:9240".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![
                 ModuleDescriptor {
@@ -518,7 +546,7 @@ async fn test_register_engine_creates_default_routing_rule() -> Result<()> {
         registration: Some(EngineRegistration {
             engine_id: "route-e1".into(),
             address: "http://127.0.0.1:9600".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: "https://127.0.0.1:9443".into(),
             modules: vec![ModuleDescriptor {
                 name: "inventory".into(),
@@ -570,7 +598,7 @@ async fn test_register_engine_dedups_duplicate_module_instances() -> Result<()> 
         registration: Some(EngineRegistration {
             engine_id: "dup-e1".into(),
             address: "http://127.0.0.1:9610".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![
                 ModuleDescriptor {
@@ -616,7 +644,7 @@ async fn test_register_engine_missing_schema_rejected_no_writes() -> Result<()> 
             registration: Some(EngineRegistration {
                 engine_id: "badschema-e1".into(),
                 address: "http://127.0.0.1:9620".into(),
-                proxy_address: String::new(),
+                proxy_address: TEST_SELF_PEER.into(),
                 peer_address: TEST_SELF_PEER.into(),
                 modules: vec![ModuleDescriptor {
                     name: "inventory".into(),
@@ -667,7 +695,7 @@ async fn test_register_engine_missing_secret_leaves_no_routes() -> Result<()> {
             registration: Some(EngineRegistration {
                 engine_id: "secret-e1".into(),
                 address: "http://127.0.0.1:9630".into(),
-                proxy_address: String::new(),
+                proxy_address: TEST_SELF_PEER.into(),
                 peer_address: TEST_SELF_PEER.into(),
                 modules: vec![ModuleDescriptor {
                     name: "inventory".into(),
@@ -729,7 +757,7 @@ async fn test_reregister_removes_dropped_module_route_and_heartbeat() -> Result<
         registration: Some(EngineRegistration {
             engine_id: "recon-e1".into(),
             address: "http://127.0.0.1:9640".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: "https://127.0.0.1:9443".into(),
             modules: vec![module("alpha"), module("beta")],
             secrets: vec![],
@@ -749,7 +777,7 @@ async fn test_reregister_removes_dropped_module_route_and_heartbeat() -> Result<
         registration: Some(EngineRegistration {
             engine_id: "recon-e1".into(),
             address: "http://127.0.0.1:9640".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: "https://127.0.0.1:9443".into(),
             modules: vec![module("alpha")],
             secrets: vec![],
@@ -815,7 +843,7 @@ async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Re
         registration: Some(EngineRegistration {
             engine_id: "recon-e2".into(),
             address: "http://127.0.0.1:9650".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![ModuleDescriptor {
                 name: "inventory".into(),
@@ -840,7 +868,7 @@ async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Re
         registration: Some(EngineRegistration {
             engine_id: "recon-e2".into(),
             address: "http://127.0.0.1:9650".into(),
-            proxy_address: String::new(),
+            proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
             modules: vec![],
             secrets: vec![],

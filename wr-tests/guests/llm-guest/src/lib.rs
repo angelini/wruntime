@@ -45,7 +45,7 @@ impl proto::LlmTestService for Component {
 
         Ok(proto::CompleteResponse {
             text,
-            stop_reason: resp.stop_reason,
+            stop_reason: stop_reason(&resp.stop_reason),
             input_tokens: resp.usage.input_tokens,
             output_tokens: resp.usage.output_tokens,
         })
@@ -62,10 +62,7 @@ impl proto::LlmTestService for Component {
         Ok(proto::CompleteTextResponse { text })
     }
 
-    fn tool_use(
-        &self,
-        req: proto::ToolUseRequest,
-    ) -> Result<proto::ToolUseResponse, ServiceError> {
+    fn tool_use(&self, req: proto::ToolUseRequest) -> Result<proto::ToolUseResponse, ServiceError> {
         let resp = CompletionBuilder::sonnet()
             .user(&req.user_message)
             .tool(&req.tool_name, &req.tool_description, &req.tool_schema)
@@ -80,7 +77,7 @@ impl proto::LlmTestService for Component {
                     tool_name: call.name.clone(),
                     tool_id: call.id.clone(),
                     tool_input: call.input.clone(),
-                    stop_reason: resp.stop_reason,
+                    stop_reason: stop_reason(&resp.stop_reason),
                 })
             }
             inference::Completion::Text(_) => {
@@ -89,40 +86,27 @@ impl proto::LlmTestService for Component {
         }
     }
 
-    fn error(
-        &self,
-        req: proto::LlmErrorRequest,
-    ) -> Result<proto::LlmErrorResponse, ServiceError> {
+    fn error(&self, req: proto::LlmErrorRequest) -> Result<proto::LlmErrorResponse, ServiceError> {
         let result = CompletionBuilder::sonnet()
             .user(&req.user_message)
             .complete();
 
         match result {
             Ok(_) => Ok(proto::LlmErrorResponse {
-                error_kind: "none".into(),
+                error_kind: proto::LlmErrorKind::None as i32,
                 error_message: "no error".into(),
             }),
             Err(e) => {
-                let (kind, msg) = match e {
-                    inference::LlmError::InvalidRequest(m) => ("invalid-request", m),
-                    inference::LlmError::Auth(m) => ("auth", m),
-                    inference::LlmError::RateLimited(_) => {
-                        ("rate-limited", "rate limited".into())
-                    }
-                    inference::LlmError::Api(m) => ("api", m),
-                };
+                let (kind, msg) = llm_error_parts(e);
                 Ok(proto::LlmErrorResponse {
-                    error_kind: kind.into(),
+                    error_kind: kind,
                     error_message: msg,
                 })
             }
         }
     }
 
-    fn stream(
-        &self,
-        req: proto::StreamRequest,
-    ) -> Result<proto::StreamResponse, ServiceError> {
+    fn stream(&self, req: proto::StreamRequest) -> Result<proto::StreamResponse, ServiceError> {
         let mut builder = CompletionBuilder::sonnet().user(&req.user_message);
         if req.with_tools {
             builder = builder.tool("dummy", "dummy tool", r#"{"type":"object"}"#);
@@ -146,19 +130,19 @@ impl proto::LlmTestService for Component {
                 Ok(Some(inference::StreamEvent::TextDelta(chunk))) => {
                     resp.text.push_str(&chunk);
                     resp.chunk_count += 1;
-                    resp.events.push("text-delta".into());
+                    resp.events.push(proto::StreamEventKind::TextDelta as i32);
                     if resp.chunk_count == 1 {
                         resp.usage_mid_none = stream.usage().is_none();
                     }
                 }
                 Ok(Some(inference::StreamEvent::Usage(u))) => {
-                    resp.events.push("usage".into());
+                    resp.events.push(proto::StreamEventKind::Usage as i32);
                     resp.input_tokens = u.input_tokens;
                     resp.output_tokens = u.output_tokens;
                 }
                 Ok(Some(inference::StreamEvent::Stop(reason))) => {
-                    resp.events.push("stop".into());
-                    resp.stop_reason = reason;
+                    resp.events.push(proto::StreamEventKind::Stop as i32);
+                    resp.stop_reason = stop_reason(&reason);
                 }
                 Ok(None) => {
                     resp.usage_present_after = stream.usage().is_some();
@@ -187,12 +171,12 @@ impl proto::LlmTestService for Component {
                     Ok(s) => held.push(s),
                     Err(inference::LlmError::Api(m)) => {
                         resp.hit_cap = true;
-                        resp.error_kind = "api".into();
+                        resp.error_kind = proto::LlmErrorKind::Api as i32;
                         resp.error_message = m;
                         break;
                     }
                     Err(e) => {
-                        resp.error_kind = "other".into();
+                        resp.error_kind = proto::LlmErrorKind::Other as i32;
                         resp.error_message = format!("{e:?}");
                         break;
                     }
@@ -209,11 +193,24 @@ impl proto::LlmTestService for Component {
     }
 }
 
-fn llm_error_parts(e: inference::LlmError) -> (String, String) {
+fn stop_reason(value: &str) -> i32 {
+    match value {
+        "end_turn" => proto::StopReason::EndTurn as i32,
+        "tool_use" => proto::StopReason::ToolUse as i32,
+        "max_tokens" => proto::StopReason::MaxTokens as i32,
+        "" => proto::StopReason::Unspecified as i32,
+        _ => proto::StopReason::Other as i32,
+    }
+}
+
+fn llm_error_parts(e: inference::LlmError) -> (i32, String) {
     match e {
-        inference::LlmError::InvalidRequest(m) => ("invalid-request".into(), m),
-        inference::LlmError::Auth(m) => ("auth".into(), m),
-        inference::LlmError::RateLimited(_) => ("rate-limited".into(), "rate limited".into()),
-        inference::LlmError::Api(m) => ("api".into(), m),
+        inference::LlmError::InvalidRequest(m) => (proto::LlmErrorKind::InvalidRequest as i32, m),
+        inference::LlmError::Auth(m) => (proto::LlmErrorKind::Auth as i32, m),
+        inference::LlmError::RateLimited(_) => (
+            proto::LlmErrorKind::RateLimited as i32,
+            "rate limited".into(),
+        ),
+        inference::LlmError::Api(m) => (proto::LlmErrorKind::Api as i32, m),
     }
 }

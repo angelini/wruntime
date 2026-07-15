@@ -35,7 +35,7 @@ async fn wasm_llm_complete() -> Result<()> {
 
     let body = proto::CompleteResponse::decode(resp.into_body())?;
     assert_eq!(body.text, "Hello from mock Claude!");
-    assert_eq!(body.stop_reason, "end_turn");
+    assert_eq!(body.stop_reason, proto::StopReason::EndTurn as i32);
     assert_eq!(body.input_tokens, 10);
     assert_eq!(body.output_tokens, 7);
     Ok(())
@@ -93,7 +93,7 @@ async fn wasm_llm_tool_use() -> Result<()> {
     assert_eq!(body.tool_name, "get_weather");
     assert_eq!(body.tool_id, "toolu_mock_001");
     assert!(body.tool_input.contains("San Francisco"));
-    assert_eq!(body.stop_reason, "tool_use");
+    assert_eq!(body.stop_reason, proto::StopReason::ToolUse as i32);
     Ok(())
 }
 
@@ -117,7 +117,7 @@ async fn wasm_llm_error() -> Result<()> {
     assert_eq!(resp.status(), 200);
 
     let body = proto::LlmErrorResponse::decode(resp.into_body())?;
-    assert_eq!(body.error_kind, "auth");
+    assert_eq!(body.error_kind, proto::LlmErrorKind::Auth as i32);
     assert!(!body.error_message.is_empty());
     Ok(())
 }
@@ -146,14 +146,20 @@ async fn wasm_llm_stream() -> Result<()> {
     assert_eq!(body.chunk_count, 3);
     assert_eq!(
         body.events,
-        vec!["text-delta", "text-delta", "text-delta", "usage", "stop"]
+        vec![
+            proto::StreamEventKind::TextDelta as i32,
+            proto::StreamEventKind::TextDelta as i32,
+            proto::StreamEventKind::TextDelta as i32,
+            proto::StreamEventKind::Usage as i32,
+            proto::StreamEventKind::Stop as i32,
+        ]
     );
     assert_eq!(body.input_tokens, 25);
     assert_eq!(body.output_tokens, 21); // "Hello"(5) + " from"(5) + " streaming!"(11)
-    assert_eq!(body.stop_reason, "end_turn");
+    assert_eq!(body.stop_reason, proto::StopReason::EndTurn as i32);
     assert!(body.usage_mid_none, "usage() must be None mid-stream");
     assert!(body.usage_present_after, "usage() must be Some after drain");
-    assert!(body.error_kind.is_empty());
+    assert_eq!(body.error_kind, proto::LlmErrorKind::None as i32);
     Ok(())
 }
 
@@ -178,7 +184,7 @@ async fn wasm_llm_stream_error() -> Result<()> {
     assert_eq!(body.text, "partial");
     assert_eq!(body.chunk_count, 1);
     // The stream-level error surfaces as an llm-error, not a silent truncation.
-    assert_eq!(body.error_kind, "api");
+    assert_eq!(body.error_kind, proto::LlmErrorKind::Api as i32);
     assert!(body.error_message.contains("overloaded"));
     Ok(())
 }
@@ -204,7 +210,7 @@ async fn wasm_llm_stream_tool_use_rejected() -> Result<()> {
     assert_eq!(resp.status(), 200);
 
     let body = proto::StreamResponse::decode(resp.into_body())?;
-    assert_eq!(body.error_kind, "invalid-request");
+    assert_eq!(body.error_kind, proto::LlmErrorKind::InvalidRequest as i32);
     assert!(body.error_message.contains("streaming"));
     // No stream was produced.
     assert_eq!(body.chunk_count, 0);
@@ -241,7 +247,7 @@ async fn wasm_llm_stream_cap() -> Result<()> {
     let body = proto::AllocStreamsResponse::decode(resp.into_body())?;
     assert_eq!(body.held, 2);
     assert!(body.hit_cap);
-    assert_eq!(body.error_kind, "api");
+    assert_eq!(body.error_kind, proto::LlmErrorKind::Api as i32);
 
     // Dropping ALL held streams frees the count so a full re-allocation to cap
     // succeeds.

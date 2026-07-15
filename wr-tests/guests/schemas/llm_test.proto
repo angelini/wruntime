@@ -1,91 +1,53 @@
 syntax = "proto3";
 package test;
 
-// ── Complete ────────────────────────────────────────────────────────────────
-
-message CompleteRequest {
-  string model = 1;
-  string system = 2;
-  string user_message = 3;
-  uint32 max_tokens = 4;
+enum StopReason {
+  STOP_REASON_UNSPECIFIED = 0;
+  STOP_REASON_END_TURN = 1;
+  STOP_REASON_TOOL_USE = 2;
+  STOP_REASON_MAX_TOKENS = 3;
+  STOP_REASON_OTHER = 4;
 }
 
-message CompleteResponse {
-  string text = 1;
-  string stop_reason = 2;
-  uint32 input_tokens = 3;
-  uint32 output_tokens = 4;
+enum StreamEventKind {
+  STREAM_EVENT_KIND_UNSPECIFIED = 0;
+  STREAM_EVENT_KIND_TEXT_DELTA = 1;
+  STREAM_EVENT_KIND_USAGE = 2;
+  STREAM_EVENT_KIND_STOP = 3;
 }
 
-// ── CompleteText ────────────────────────────────────────────────────────────
-
-message CompleteTextRequest {
-  string user_message = 1;
+enum LlmErrorKind {
+  LLM_ERROR_KIND_NONE = 0;
+  LLM_ERROR_KIND_INVALID_REQUEST = 1;
+  LLM_ERROR_KIND_AUTH = 2;
+  LLM_ERROR_KIND_RATE_LIMITED = 3;
+  LLM_ERROR_KIND_API = 4;
+  LLM_ERROR_KIND_OTHER = 5;
 }
 
-message CompleteTextResponse {
-  string text = 1;
-}
-
-// ── ToolUse ─────────────────────────────────────────────────────────────────
-
-message ToolUseRequest {
-  string user_message = 1;
-  string tool_name = 2;
-  string tool_description = 3;
-  string tool_schema = 4;
-}
-
-message ToolUseResponse {
-  string tool_name = 1;
-  string tool_id = 2;
-  string tool_input = 3;
-  string stop_reason = 4;
-}
-
-// ── Error ───────────────────────────────────────────────────────────────────
-
-message LlmErrorRequest {
-  string user_message = 1;
-}
-
-message LlmErrorResponse {
-  string error_kind = 1;
-  string error_message = 2;
-}
-
-// ── Stream ──────────────────────────────────────────────────────────────────
-
-message StreamRequest {
-  string user_message = 1;
-  bool with_tools = 2;   // when true, attach a tool def -> host must pre-reject
-}
-
+message CompleteRequest { string model = 1; string system = 2; string user_message = 3; uint32 max_tokens = 4; }
+message CompleteResponse { string text = 1; StopReason stop_reason = 2; uint32 input_tokens = 3; uint32 output_tokens = 4; }
+message CompleteTextRequest { string user_message = 1; }
+message CompleteTextResponse { string text = 1; }
+message ToolUseRequest { string user_message = 1; string tool_name = 2; string tool_description = 3; string tool_schema = 4; }
+message ToolUseResponse { string tool_name = 1; string tool_id = 2; string tool_input = 3; StopReason stop_reason = 4; }
+message LlmErrorRequest { string user_message = 1; }
+message LlmErrorResponse { LlmErrorKind error_kind = 1; string error_message = 2; }
+message StreamRequest { string user_message = 1; bool with_tools = 2; }
 message StreamResponse {
   string text = 1;
-  uint32 chunk_count = 2;          // number of text-delta events observed
-  repeated string events = 3;      // ordered event-kind tags: "text-delta" | "usage" | "stop"
+  uint32 chunk_count = 2;
+  repeated StreamEventKind events = 3;
   uint32 input_tokens = 4;
   uint32 output_tokens = 5;
-  string stop_reason = 6;
-  bool usage_mid_none = 7;         // stream.usage() was None after the first text-delta
-  bool usage_present_after = 8;    // stream.usage() was Some after next() returned None
-  string error_kind = 9;           // set on error: "invalid-request"|"auth"|"rate-limited"|"api"; "" if ok
+  StopReason stop_reason = 6;
+  bool usage_mid_none = 7;
+  bool usage_present_after = 8;
+  LlmErrorKind error_kind = 9;
   string error_message = 10;
 }
-
-message AllocStreamsRequest {
-  uint32 initial    = 1;
-  uint32 drop_count = 2;
-  uint32 additional = 3;
-}
-message AllocStreamsResponse {
-  uint32 held          = 1;
-  bool   hit_cap       = 2;  // whether a cap error (LlmError::Api) was observed
-  string error_kind    = 3;  // "api" / "other" / ""
-  string error_message = 4;
-}
-
+message AllocStreamsRequest { uint32 initial = 1; uint32 drop_count = 2; uint32 additional = 3; }
+message AllocStreamsResponse { uint32 held = 1; bool hit_cap = 2; LlmErrorKind error_kind = 3; string error_message = 4; }
 service LlmTestService {
   rpc Complete(CompleteRequest) returns (CompleteResponse);
   rpc CompleteText(CompleteTextRequest) returns (CompleteTextResponse);

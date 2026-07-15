@@ -26,7 +26,7 @@ impl wr_sdk::ServiceGuest for Component {
 
 impl proto::ClientService for Component {
     fn run(&self, req: proto::RunRequest) -> Result<proto::RunResponse, ServiceError> {
-        let count = if req.count > 0 { req.count as u64 } else { 100 };
+        let count = if req.count == 0 { 100 } else { req.count };
 
         wr_sdk::log::log(&format!("client starting — {count} iterations"));
 
@@ -39,15 +39,15 @@ impl proto::ClientService for Component {
             Err(e) => wr_sdk::log::log(&format!("seed error: {e}")),
         }
 
-        let mut purchased: Vec<(String, i64)> = Vec::new();
-        let mut completed: i64 = 0;
+        let mut purchased: Vec<(String, u64)> = Vec::new();
+        let mut completed: u64 = 0;
         let mut errors: Vec<String> = Vec::new();
 
         for i in 0u64..count {
             // Spread load evenly across all 50 products via a cheap hash.
             let idx = ((i.wrapping_mul(7).wrapping_add(13)) % 50) as usize;
             let product_id = PRODUCTS[idx].to_string();
-            let quantity = (i % 5 + 1) as i64;
+            let quantity = i % 5 + 1;
 
             // Rotate through all 6 actions so every operation type gets exercised.
             match i % 6 {
@@ -144,7 +144,8 @@ impl proto::ClientService for Component {
                             Err(e) => {
                                 tracing::set_error(&sp, &format!("{e}"));
                                 wr_sdk::log::log(&format!("transfer error: {e}"));
-                                errors.push(format!("transfer {product_id} → {to_product_id}: {e}"));
+                                errors
+                                    .push(format!("transfer {product_id} → {to_product_id}: {e}"));
                             }
                         }
                     }
@@ -185,7 +186,7 @@ impl proto::ClientService for Component {
         if errors.is_empty() {
             Ok(proto::RunResponse { completed })
         } else {
-            Err(ServiceError::internal(&format!(
+            Err(ServiceError::internal(format!(
                 "{} operation(s) failed: {}",
                 errors.len(),
                 errors.join("; ")

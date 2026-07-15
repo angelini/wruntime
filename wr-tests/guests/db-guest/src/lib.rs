@@ -23,124 +23,62 @@ impl wr_sdk::ServiceGuest for Component {
     }
 }
 
-/// Parse a JSON params array into PgValue variants.
-/// Format: [{"type":"text","value":"hello"},{"type":"int4","value":"42"}]
-fn parse_params(json: &str) -> Vec<PgValue> {
-    if json.is_empty() {
-        return vec![];
-    }
-    // Minimal JSON parsing without serde — each param is {"type":"<t>","value":"<v>"}
-    // For test purposes we support: null, text, int4, int8, boolean, float8, numeric
-    let mut params = vec![];
-    // Strip outer brackets
-    let inner = json.trim().trim_start_matches('[').trim_end_matches(']');
-    if inner.trim().is_empty() {
-        return params;
-    }
-    // Split on "},{" to get individual objects
-    for obj in split_json_objects(inner) {
-        let typ = extract_json_field(&obj, "type");
-        let val = extract_json_field(&obj, "value");
-        let pg = match typ.as_str() {
-            "null" => PgValue::Null,
-            "text" => PgValue::Text(val),
-            "int4" => PgValue::Int4(val.parse().unwrap_or(0)),
-            "int8" => PgValue::Int8(val.parse().unwrap_or(0)),
-            "boolean" => PgValue::Boolean(val == "true"),
-            "float8" => PgValue::Float8(val.parse().unwrap_or(0.0)),
-            "numeric" => PgValue::Numeric(val),
-            _ => PgValue::Text(val),
-        };
-        params.push(pg);
-    }
+fn parse_params(params: &[proto::DbParam]) -> Result<Vec<PgValue>, ServiceError> {
     params
-}
-
-fn split_json_objects(s: &str) -> Vec<String> {
-    let mut results = vec![];
-    let mut depth = 0;
-    let mut start = 0;
-    for (i, c) in s.char_indices() {
-        match c {
-            '{' => {
-                if depth == 0 {
-                    start = i;
-                }
-                depth += 1;
+        .iter()
+        .map(|param| match param.value.as_ref() {
+            Some(proto::db_param::Value::NullMarker(true)) => Ok(PgValue::Null),
+            Some(proto::db_param::Value::NullMarker(false)) | None => {
+                Err(ServiceError::bad_request("DB parameter value is required"))
             }
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    results.push(s[start..=i].to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    results
+            Some(proto::db_param::Value::Text(value)) => Ok(PgValue::Text(value.clone())),
+            Some(proto::db_param::Value::Int4(value)) => Ok(PgValue::Int4(*value)),
+            Some(proto::db_param::Value::Int8(value)) => Ok(PgValue::Int8(*value)),
+            Some(proto::db_param::Value::Boolean(value)) => Ok(PgValue::Boolean(*value)),
+            Some(proto::db_param::Value::Float8(value)) => Ok(PgValue::Float8(*value)),
+            Some(proto::db_param::Value::Numeric(value)) => Ok(PgValue::Numeric(value.clone())),
+        })
+        .collect()
 }
 
-fn extract_json_field(obj: &str, field: &str) -> String {
-    let pattern = format!("\"{}\":\"", field);
-    if let Some(start) = obj.find(&pattern) {
-        let rest = &obj[start + pattern.len()..];
-        if let Some(end) = rest.find('"') {
-            return rest[..end].to_string();
-        }
-    }
-    String::new()
-}
+fn column_to_proto(name: &str, col: &database::Column) -> proto::DbColumn {
+    use proto::db_column::Value;
 
-fn column_to_json(name: &str, col: &database::Column) -> String {
-    let (typ, val) = match &col.value {
-        PgValue::Null => ("null", "null".to_string()),
-        PgValue::Boolean(b) => ("boolean", b.to_string()),
-        PgValue::Int2(v) => ("int2", v.to_string()),
-        PgValue::Int4(v) => ("int4", v.to_string()),
-        PgValue::Int8(v) => ("int8", v.to_string()),
-        PgValue::Float4(v) => ("float4", v.to_string()),
-        PgValue::Float8(v) => ("float8", v.to_string()),
-        PgValue::Text(v) => ("text", v.clone()),
-        PgValue::Bytea(v) => ("bytea", format!("{:?}", v)),
-        PgValue::Timestamptz(v) => ("timestamptz", v.to_string()),
-        PgValue::Timestamp(v) => ("timestamp", v.to_string()),
-        PgValue::Date(v) => ("date", v.to_string()),
-        PgValue::Time(v) => ("time", v.to_string()),
-        PgValue::Interval(iv) => (
-            "interval",
-            format!("{}m{}d{}us", iv.months, iv.days, iv.microseconds),
-        ),
-        PgValue::Numeric(v) => ("numeric", v.clone()),
-        PgValue::Uuid((hi, lo)) => ("uuid", format!("{hi:016x}{lo:016x}")),
-        PgValue::Jsonb(v) => ("jsonb", v.clone()),
-        PgValue::Oid(v) => ("oid", v.to_string()),
-        PgValue::BoolArray(a) => ("bool[]", format!("{:?}", a)),
-        PgValue::Int2Array(a) => ("int2[]", format!("{:?}", a)),
-        PgValue::Int4Array(a) => ("int4[]", format!("{:?}", a)),
-        PgValue::Int8Array(a) => ("int8[]", format!("{:?}", a)),
-        PgValue::Float4Array(a) => ("float4[]", format!("{:?}", a)),
-        PgValue::Float8Array(a) => ("float8[]", format!("{:?}", a)),
-        PgValue::TextArray(a) => ("text[]", format!("{:?}", a)),
-        PgValue::TimestamptzArray(a) => ("timestamptz[]", format!("{:?}", a)),
-        PgValue::TimestampArray(a) => ("timestamp[]", format!("{:?}", a)),
-        PgValue::UuidArray(a) => ("uuid[]", format!("{:?}", a)),
-        PgValue::JsonbArray(a) => ("jsonb[]", format!("{:?}", a)),
+    let (type_name, value) = match &col.value {
+        PgValue::Null => ("null", Value::NullMarker(true)),
+        PgValue::Boolean(value) => ("boolean", Value::Boolean(*value)),
+        PgValue::Int2(value) => ("int2", Value::Integer(i64::from(*value))),
+        PgValue::Int4(value) => ("int4", Value::Integer(i64::from(*value))),
+        PgValue::Int8(value) => ("int8", Value::Integer(*value)),
+        PgValue::Float4(value) => ("float4", Value::Float(f64::from(*value))),
+        PgValue::Float8(value) => ("float8", Value::Float(*value)),
+        PgValue::Text(value) => ("text", Value::Text(value.clone())),
+        PgValue::Bytea(value) => ("bytea", Value::Bytea(value.clone())),
+        PgValue::Numeric(value) => ("numeric", Value::Text(value.clone())),
+        PgValue::Jsonb(value) => ("jsonb", Value::Text(value.clone())),
+        PgValue::Timestamptz(value) => ("timestamptz", Value::Integer(*value)),
+        PgValue::Timestamp(value) => ("timestamp", Value::Integer(*value)),
+        PgValue::Date(value) => ("date", Value::Integer(i64::from(*value))),
+        PgValue::Time(value) => ("time", Value::Integer(*value)),
+        PgValue::Oid(value) => ("oid", Value::Integer(i64::from(*value))),
+        other => ("other", Value::Display(format!("{other:?}"))),
     };
-    format!(
-        "{{\"name\":\"{}\",\"type\":\"{}\",\"value\":\"{}\"}}",
-        name, typ, val
-    )
+    proto::DbColumn {
+        name: name.to_string(),
+        type_name: type_name.to_string(),
+        value: Some(value),
+    }
 }
 
 impl proto::DbTestService for Component {
     fn execute(&self, req: proto::ExecuteRequest) -> Result<proto::ExecuteResponse, ServiceError> {
-        let params = parse_params(&req.params_json);
+        let params = parse_params(&req.params)?;
         let affected = database::execute(&req.sql, &params)?;
         Ok(proto::ExecuteResponse { affected })
     }
 
     fn query(&self, req: proto::QueryRequest) -> Result<proto::QueryResponse, ServiceError> {
-        let params = parse_params(&req.params_json);
+        let params = parse_params(&req.params)?;
         match database::query(&req.sql, &params) {
             Ok(rows) => {
                 let proto_rows = rows
@@ -149,9 +87,9 @@ impl proto::DbTestService for Component {
                         let cols = row
                             .columns
                             .iter()
-                            .map(|c| column_to_json(&c.name, c))
+                            .map(|c| column_to_proto(&c.name, c))
                             .collect();
-                        proto::QueryRow { columns_json: cols }
+                        proto::QueryRow { columns: cols }
                     })
                     .collect();
                 Ok(proto::QueryResponse { rows: proto_rows })
@@ -190,18 +128,15 @@ impl proto::DbTestService for Component {
 
         let rows = database::query("SELECT * FROM type_test LIMIT 1", &[])?;
 
-        let row_json = if let Some(row) = rows.first() {
-            let parts: Vec<String> = row
+        let row = rows.first().map(|row| proto::QueryRow {
+            columns: row
                 .columns
                 .iter()
-                .map(|c| column_to_json(&c.name, c))
-                .collect();
-            format!("[{}]", parts.join(","))
-        } else {
-            "[]".to_string()
-        };
+                .map(|column| column_to_proto(&column.name, column))
+                .collect(),
+        });
 
-        Ok(proto::QueryTypesResponse { row_json })
+        Ok(proto::QueryTypesResponse { row })
     }
 
     fn transaction_commit(
@@ -303,8 +238,33 @@ impl proto::DbTestService for Component {
         Ok(proto::TransactionDropResponse { count })
     }
 
+    fn transaction_after_complete(
+        &self,
+        req: proto::TransactionAfterCompleteRequest,
+    ) -> Result<proto::TransactionAfterCompleteResponse, ServiceError> {
+        let tx = database::begin_transaction()?;
+        if req.rollback {
+            tx.rollback()?;
+        } else {
+            tx.commit()?;
+        }
+        let result = match req.operation.as_str() {
+            "query" => tx.query("SELECT 1", &[]).map(|_| ()),
+            "execute" => tx.execute("SELECT 1", &[]).map(|_| ()),
+            "query-stream" => tx.query_stream("SELECT 1", &[]).map(|_| ()),
+            "commit" => tx.commit(),
+            "rollback" => tx.rollback(),
+            other => return Err(ServiceError::bad_request(format!("unknown operation: {other}"))),
+        };
+        let error_message = match result {
+            Err(database::DbError::Query(message)) | Err(database::DbError::Connection(message)) => message,
+            Ok(()) => "unexpectedly succeeded".into(),
+        };
+        Ok(proto::TransactionAfterCompleteResponse { error_message })
+    }
+
     fn error(&self, req: proto::ErrorRequest) -> Result<proto::ErrorResponse, ServiceError> {
-        let params = parse_params(&req.params_json);
+        let params = parse_params(&req.params)?;
         match database::execute(&req.sql, &params) {
             Ok(_) => Ok(proto::ErrorResponse {
                 error_kind: "none".into(),
@@ -327,7 +287,7 @@ impl proto::DbTestService for Component {
         &self,
         req: proto::QueryStreamRequest,
     ) -> Result<proto::QueryStreamResponse, ServiceError> {
-        let params = parse_params(&req.params_json);
+        let params = parse_params(&req.params)?;
         let batch_size = if req.batch_size == 0 {
             10
         } else {
@@ -346,9 +306,9 @@ impl proto::DbTestService for Component {
                 let cols = row
                     .columns
                     .iter()
-                    .map(|c| column_to_json(&c.name, c))
+                    .map(|c| column_to_proto(&c.name, c))
                     .collect();
-                all_rows.push(proto::QueryRow { columns_json: cols });
+                all_rows.push(proto::QueryRow { columns: cols });
             }
         }
         Ok(proto::QueryStreamResponse {

@@ -14,6 +14,7 @@ use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::indexed_routing::{IndexedRoutingTable, RouteGroup};
 use crate::routing::CachedRoutingTable;
 use wr_common::http_headers::{WR_DESTINATION, WR_MODULE, WR_NAMESPACE, WR_VERSION};
+use wr_common::identity::{RouteKey, VersionSelector};
 
 /// A routing candidate with its resolved version attached so the caller can
 /// inject the correct `x-wr-version` header after round-robin selection.
@@ -168,9 +169,15 @@ fn classify_destination(
     }
 
     // Internal: exactly two dot-separated labels AND a route exists for them.
-    if labels.len() == 2 && !labels[0].is_empty() && !labels[1].is_empty() {
-        let namespace: Arc<str> = Arc::from(labels[0]);
-        let module: Arc<str> = Arc::from(labels[1]);
+    if labels.len() == 2 {
+        let key = RouteKey::parse(labels[0], labels[1]).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid internal destination '{host}': {error}"),
+            )
+        })?;
+        let namespace: Arc<str> = Arc::from(key.namespace.as_str());
+        let module: Arc<str> = Arc::from(key.module.as_str());
         if table.get(&namespace, &module).is_some() {
             return Ok(ParsedDestination::Internal {
                 namespace,
@@ -262,21 +269,12 @@ fn select_candidate(
             cb_registry,
         ),
         Some(version_str) => {
-            let req = semver::VersionReq::parse(version_str).ok();
-            let best_ver: Arc<str> = match req {
-                Some(req) => group
-                    .candidates
-                    .iter()
-                    .find(|r| r.parsed_version.as_ref().is_some_and(|v| req.matches(v)))
-                    .map(|r| Arc::from(r.rule.destination_version.as_str()))?,
-                None => {
-                    if group.by_version.contains_key(version_str.as_str()) {
-                        Arc::from(version_str.as_str())
-                    } else {
-                        return None;
-                    }
-                }
-            };
+            let req = VersionSelector::parse(version_str).ok()?;
+            let best_ver: Arc<str> = group
+                .candidates
+                .iter()
+                .find(|rule| req.matches(&rule.parsed_version))
+                .map(|rule| Arc::from(rule.rule.destination_version.as_str()))?;
             let vg = group.by_version.get(&best_ver)?;
             choose_candidate(
                 group,
@@ -344,6 +342,14 @@ where
                 .get(WR_VERSION)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
+            if let Some(version) = &requested_version {
+                if let Err(error) = VersionSelector::parse(version) {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("invalid x-wr-version requirement '{version}': {error}"),
+                    ));
+                }
+            }
 
             // Classify + (for internal) select under a single read guard so no
             // table state is borrowed once we start forwarding.

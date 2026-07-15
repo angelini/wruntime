@@ -8,12 +8,21 @@ use crate::state::ModuleState;
 
 // ── HostRowCursor implementation ─────────────────────────────────────────
 
+fn validate_batch_size(max: u32) -> Result<(), DbError> {
+    if max == 0 {
+        Err(DbError::Query("batch size must be > 0".into()))
+    } else {
+        Ok(())
+    }
+}
+
 impl HostRowCursor for ModuleState {
     async fn next_batch(
         &mut self,
         self_: Resource<CursorState>,
         max: u32,
     ) -> Result<Vec<Row>, DbError> {
+        validate_batch_size(max)?;
         let cursor = self
             .table()
             .get_mut(&self_)
@@ -38,5 +47,16 @@ impl HostRowCursor for ModuleState {
     async fn drop(&mut self, rep: Resource<CursorState>) -> wasmtime::Result<()> {
         self.table().delete(rep)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_batch_size_is_rejected() {
+        assert!(matches!(validate_batch_size(0), Err(DbError::Query(_))));
+        assert!(validate_batch_size(1).is_ok());
     }
 }

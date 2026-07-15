@@ -5,5 +5,5 @@ service ClientService {
   rpc Run (RunRequest) returns (RunResponse);
 }
 
-message RunRequest  { int64 count = 1; }
-message RunResponse { int64 completed = 1; }
+message RunRequest  { uint64 count = 1; } // 0 means default 100
+message RunResponse { uint64 completed = 1; }

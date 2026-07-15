@@ -5,6 +5,10 @@ use deadpool_postgres::Pool;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
+use wr_common::identity::{
+    EngineHttpUrl, EngineId, ModuleId, Namespace, NamespaceFilter, PeerHttpsUrl, ProxyHttpUrl,
+    RouteKey, RuleId,
+};
 use wr_common::naming::namespace_role;
 use wr_common::wruntime::{
     manager_service_server::ManagerService, DeleteRoutingRuleRequest, DeleteRoutingRuleResponse,
@@ -25,6 +29,13 @@ use crate::db;
 
 /// A genuine liveness discrepancy surfaced by reconciliation: a manager the DB
 /// still considers fresh that chitchat has affirmatively marked dead.
+fn proto_timestamp(value: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: value.timestamp(),
+        nanos: value.timestamp_subsec_nanos() as i32,
+    }
+}
+
 pub struct ReconcileWarning {
     pub manager_id: String,
 }
@@ -250,9 +261,11 @@ impl ManagerService for Manager {
             .registration
             .ok_or_else(|| Status::invalid_argument("registration field is required"))?;
 
-        if reg.engine_id.is_empty() {
-            return Err(Status::invalid_argument("engine_id is required"));
-        }
+        EngineId::parse(&reg.engine_id)
+            .and_then(|_| EngineHttpUrl::parse(&reg.address))
+            .and_then(|_| ProxyHttpUrl::parse(&reg.proxy_address))
+            .and_then(|_| PeerHttpsUrl::parse(&reg.peer_address))
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
         // Validate modules — proto_schema is only required on the first
         // descriptor for a given (namespace, name, version) tuple; additional
@@ -260,12 +273,8 @@ impl ManagerService for Manager {
         {
             let mut seen = std::collections::HashSet::new();
             for module in &reg.modules {
-                if module.namespace.is_empty() {
-                    return Err(Status::invalid_argument(format!(
-                        "module '{}' is missing a namespace",
-                        module.name
-                    )));
-                }
+                ModuleId::parse(&module.namespace, &module.name, &module.version)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
                 let first = seen.insert((&module.namespace, &module.name, &module.version));
                 if first && module.proto_schema.is_empty() {
                     return Err(Status::invalid_argument(format!(
@@ -274,6 +283,15 @@ impl ManagerService for Manager {
                     )));
                 }
             }
+        }
+
+        for namespace in reg
+            .db_namespaces
+            .iter()
+            .chain(reg.secrets.iter().map(|s| &s.namespace))
+        {
+            Namespace::parse(namespace)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
         }
 
         let engine_id = reg.engine_id.clone();
@@ -330,7 +348,7 @@ impl ManagerService for Manager {
         // entries rather than rejecting the whole heartbeat.
         let mut valid = Vec::with_capacity(healthy_modules.len());
         for m in healthy_modules {
-            if m.namespace.is_empty() || m.name.is_empty() || m.version.is_empty() {
+            if ModuleId::parse(&m.namespace, &m.name, &m.version).is_err() {
                 warn!(
                     engine_id = %engine_id,
                     namespace = %m.namespace,
@@ -410,8 +428,21 @@ impl ManagerService for Manager {
         let mut rule = request.into_inner();
         rule.healthy = true; // explicitly upserted rules are always healthy
 
-        if rule.rule_id.is_empty() {
-            return Err(Status::invalid_argument("rule_id is required"));
+        RuleId::parse(&rule.rule_id)
+            .and_then(|_| EngineId::parse(&rule.engine_id))
+            .and_then(|_| {
+                ModuleId::parse(
+                    &rule.destination_namespace,
+                    &rule.destination_module,
+                    &rule.destination_version,
+                )
+            })
+            .and_then(|_| EngineHttpUrl::parse(&rule.engine_address))
+            .and_then(|_| PeerHttpsUrl::parse(&rule.peer_address))
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if !rule.source_namespace.is_empty() || !rule.source_module.is_empty() {
+            RouteKey::parse(&rule.source_namespace, &rule.source_module)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
         }
 
         info!(
@@ -466,8 +497,10 @@ impl ManagerService for Manager {
         request: Request<SetSecretRequest>,
     ) -> Result<Response<SetSecretResponse>, Status> {
         let req = request.into_inner();
-        if req.namespace.is_empty() || req.key.is_empty() {
-            return Err(Status::invalid_argument("namespace and key are required"));
+        Namespace::parse(&req.namespace)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if req.key.is_empty() {
+            return Err(Status::invalid_argument("key is required"));
         }
         if req.key.starts_with("__") {
             return Err(Status::invalid_argument(
@@ -490,8 +523,10 @@ impl ManagerService for Manager {
         request: Request<DeleteSecretRequest>,
     ) -> Result<Response<DeleteSecretResponse>, Status> {
         let req = request.into_inner();
-        if req.namespace.is_empty() || req.key.is_empty() {
-            return Err(Status::invalid_argument("namespace and key are required"));
+        Namespace::parse(&req.namespace)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if req.key.is_empty() {
+            return Err(Status::invalid_argument("key is required"));
         }
 
         db::delete_secret(&self.pool, &req.namespace, &req.key).await?;
@@ -504,7 +539,9 @@ impl ManagerService for Manager {
         request: Request<ListSecretsRequest>,
     ) -> Result<Response<ListSecretsResponse>, Status> {
         let req = request.into_inner();
-        let entries = db::list_secrets(&self.pool, &req.namespace).await?;
+        let filter = NamespaceFilter::from_wire(&req.namespace)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let entries = db::list_secrets(&self.pool, &filter).await?;
         let secrets = entries
             .into_iter()
             .filter(|(_, key)| !key.starts_with("__"))
@@ -520,18 +557,15 @@ impl ManagerService for Manager {
         request: Request<UpsertScheduleRequest>,
     ) -> Result<Response<UpsertScheduleResponse>, Status> {
         let req = request.into_inner();
-        if req.worker_namespace.is_empty()
-            || req.worker_name.is_empty()
-            || req.worker_version.is_empty()
-            || req.job_type.is_empty()
-        {
-            return Err(Status::invalid_argument(
-                "worker_namespace, worker_name, worker_version, and job_type are required",
-            ));
+        ModuleId::parse(&req.worker_namespace, &req.worker_name, &req.worker_version)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if req.job_type.is_empty() {
+            return Err(Status::invalid_argument("job_type is required"));
         }
-        if req.interval_secs <= 0 {
-            return Err(Status::invalid_argument("interval_secs must be > 0"));
-        }
+        wr_common::lifecycle::ScheduleIntervalSecs::new(req.interval_secs)
+            .and_then(|_| wr_common::lifecycle::JobTimeoutSecs::new(req.timeout_secs))
+            .and_then(|_| wr_common::lifecycle::MaxAttempts::new(req.max_attempts))
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
 
         let schedule_id = db::upsert_schedule(
             &self.pool,
@@ -561,14 +595,10 @@ impl ManagerService for Manager {
         request: Request<DeleteScheduleRequest>,
     ) -> Result<Response<DeleteScheduleResponse>, Status> {
         let req = request.into_inner();
-        if req.worker_namespace.is_empty()
-            || req.worker_name.is_empty()
-            || req.worker_version.is_empty()
-            || req.job_type.is_empty()
-        {
-            return Err(Status::invalid_argument(
-                "worker_namespace, worker_name, worker_version, and job_type are required",
-            ));
+        ModuleId::parse(&req.worker_namespace, &req.worker_name, &req.worker_version)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if req.job_type.is_empty() {
+            return Err(Status::invalid_argument("job_type is required"));
         }
 
         db::delete_schedule(
@@ -593,7 +623,9 @@ impl ManagerService for Manager {
         request: Request<ListSchedulesRequest>,
     ) -> Result<Response<ListSchedulesResponse>, Status> {
         let req = request.into_inner();
-        let rows = db::list_schedules(&self.pool, &req.worker_namespace).await?;
+        let filter = NamespaceFilter::from_wire(&req.worker_namespace)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let rows = db::list_schedules(&self.pool, &filter).await?;
         let schedules = rows
             .into_iter()
             .map(|r| Schedule {
@@ -602,16 +634,23 @@ impl ManagerService for Manager {
                 worker_name: r.worker_name,
                 worker_version: r.worker_version,
                 job_type: r.job_type,
-                interval_secs: r.interval_secs,
+                interval_secs: u32::try_from(r.interval_secs)
+                    .expect("schedule interval DB constraint"),
                 immediate: r.immediate,
                 payload: r.payload,
-                timeout_secs: r.timeout_secs,
-                max_attempts: r.max_attempts,
+                timeout_secs: u32::try_from(r.timeout_secs)
+                    .expect("schedule timeout DB constraint"),
+                max_attempts: u32::try_from(r.max_attempts)
+                    .expect("schedule attempts DB constraint"),
                 enabled: r.enabled,
-                last_fired_at: r.last_fired_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
-                next_fire_at: r.next_fire_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                last_fired_at: r.last_fired_at.map(proto_timestamp),
+                next_fire_at: r.next_fire_at.map(proto_timestamp),
                 last_error: r.last_error.unwrap_or_default(),
-                consecutive_failures: r.consecutive_failures,
+                consecutive_failures: wr_common::lifecycle::FailureCount::new(
+                    u32::try_from(r.consecutive_failures)
+                        .expect("schedule failure count DB constraint"),
+                )
+                .get(),
             })
             .collect();
         Ok(Response::new(ListSchedulesResponse { schedules }))
@@ -638,6 +677,14 @@ mod reconcile_tests {
     }
     fn map<T>(items: Vec<(&str, T)>) -> HashMap<String, T> {
         items.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    #[test]
+    fn schedule_timestamp_preserves_seconds_and_nanos() {
+        let value = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        let timestamp = proto_timestamp(value);
+        assert_eq!(timestamp.seconds, 1_700_000_000);
+        assert_eq!(timestamp.nanos, 123_456_789);
     }
 
     // 2-manager: peer is chitchat-dead while still DB-fresh (the N1 case).

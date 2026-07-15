@@ -23,6 +23,7 @@ just manager
 ```toml
 listen_address                = "0.0.0.0:9000"
 engine_heartbeat_timeout_secs = 30
+# module_heartbeat_timeout_secs = 30  # optional; defaults to engine timeout; must be > 0
 local_proxy_address           = "http://127.0.0.1:9001"  # required — scheduler posts jobs here
 
 [tls]
@@ -53,7 +54,7 @@ refinery, serialized across active-active managers by a Postgres advisory lock.
 
 The `[cluster]` section is required. Multiple managers can run active-active against the same Postgres database. Each manager registers itself in the `wr_managers` table, heartbeats every 15 seconds, and participates in a chitchat gossip mesh for failure detection. Chitchat is now load-bearing for manager liveness — `gossip_listen_address` must be a reachable UDP address; a manager fails to start (fail-fast) if gossip cannot bind. Concurrent writes are serialized via Postgres row locks. Set `advertise_grpc_address` when the manager is behind a load balancer or NAT.
 
-The manager also runs a Postgres-backed claim/lease job scheduler that submits scheduled jobs through `local_proxy_address` (the local proxy loopback) using the same routing/mTLS path as normal traffic; delivery is **at-least-once** (jobs must be idempotent). `local_proxy_address` is **required** — startup fails if it is unset or empty. `scheduler_lease_secs` must exceed the worst-case per-tick submission time, or a schedule can be reclaimed by another manager while still legitimately in flight.
+The manager also runs a Postgres-backed claim/lease job scheduler that submits scheduled jobs through `local_proxy_address` (the local proxy loopback) using the same routing/mTLS path as normal traffic; delivery is **at-least-once** (jobs must be idempotent). `local_proxy_address` is **required** — startup fails if it is unset or empty. `scheduler_lease_secs` must exceed the worst-case per-tick submission time, or a schedule can be reclaimed by another manager while still legitimately in flight. Schedule `interval_secs`, `timeout_secs`, and `max_attempts` are required non-zero unsigned values; malformed negatives fail TOML/protobuf parsing and zero fails manager validation.
 
 ## wr-proxy
 
@@ -122,7 +123,7 @@ module    = "inventory"
 namespace = "ecommerce"
 ```
 
-Omit the `[external]` section to keep all routes internal-only.
+Omit the `[external]` section to keep all routes internal-only. Route patterns are parsed with `matchit` during config load, methods are normalized and validated once as HTTP method tokens, and conflicting patterns fail startup with a config error. An empty `methods` list still means all methods.
 
 ## wr-engine
 
@@ -166,12 +167,14 @@ schema_path = "schemas/inventory_service.binpb"
 
 > **`schema_path` is required on the first occurrence of each unique module tuple.** The first config occurrence of each unique `(namespace, name, version)` must declare a non-empty existing compiled `FileDescriptorSet`; later duplicate instances may omit `schema_path`. Schemas are uploaded to the manager on registration for discovery purposes.
 
+Module names and namespaces are canonical identifiers: 1–24 characters, lowercase ASCII letters/digits with interior hyphens only. Versions must be valid semantic versions. Because underscores and other punctuation are rejected, the legacy hyphen-to-underscore storage mapping is collision-free for accepted identities and existing schemas/roles/blob prefixes remain stable. Module tuples whose Postgres schema would exceed 63 bytes are rejected. Engine registration also validates engine/proxy URLs and requires an explicit-port `https` peer address.
+
 On startup the engine:
 
 1. Starts an inbound HTTP server on `listen_address`.
 2. Registers itself and its modules with the manager to obtain requested secrets and DB credentials.
 3. The manager creates schemas and default routes as unhealthy and resets module readiness for advertised tuples.
-4. Provisions schemas and the job schema, runs migrations, builds pools, resolves secrets, and loads modules.
+4. Provisions schemas and the job schema, runs migrations, builds pools, resolves secrets, validates component imports against each module's enabled DB/blobstore/LLM capabilities, and loads modules. Capability mismatches fail startup before the module becomes ready.
 5. Sends an immediate readiness heartbeat after module load, then every 3 seconds, reporting healthy loaded modules.
 6. Deregisters cleanly on `Ctrl+C`, which immediately marks its routing rules as unhealthy.
 
@@ -226,6 +229,24 @@ schema_path          = "schemas/batch_processor.binpb"
 request_timeout_secs = 120
 ```
 
+### Worker lifecycle settings
+
+Worker modules require non-zero `worker_concurrency`, `worker_poll_interval_secs`, `worker_job_timeout_secs`, and `worker_max_attempts`. Jobs expose the closed states `pending`, `running`, `complete`, and `dead`; the obsolete `claimed` spelling is rejected. Job submission uses zero only as the explicit wire sentinel for configured timeout/retry defaults.
+
+### Module environment values
+
+Module environment entries are either inline strings or explicit secret references:
+
+```toml
+[[module]]
+# ... identity and artifact fields ...
+[module.env]
+LOG_LEVEL = "debug"
+API_KEY = { secret = true }
+```
+
+The secret marker is intentionally one-way: `{ secret = false }` is invalid and fails config parsing rather than silently omitting the variable.
+
 ### LLM inference
 
 Modules can call the Anthropic Claude API through a host binding. The engine holds the API key — guests never see credentials. Engine validation rejects every provider value except `"anthropic"`.
@@ -249,6 +270,8 @@ llm         = true
 Key behaviors:
 
 - **Credential isolation:** The API key is resolved from an environment variable at engine startup and never enters the WASM sandbox.
+- **Provider validation:** `provider` is a closed setting; unsupported names fail TOML parsing instead of being routed through Anthropic semantics.
+- **Required settings:** `api_key_env` and `base_url` must be non-empty and `max_tokens_limit` must be greater than zero.
 - **Host-enforced token limit:** `max_tokens_limit` caps the `max_tokens` field on every request before forwarding to the API, preventing runaway generation.
 - **Provider mapping:** Currently only `"anthropic"` is supported. The WIT interface is provider-agnostic so future providers can be added without changing guest code.
 - **Streaming:** Guests can use `complete-stream` to get a cursor that yields typed stream events — zero or more text deltas, then one final usage event, then one stop event — following the same resource pattern as `row-cursor` for database queries. Tool-enabled requests cannot be streamed (they are rejected with `invalid-request`); use `complete` for tool calls.
@@ -365,7 +388,7 @@ Current worker modules use the same descriptor/default-route path as service mod
 
 To run **multiple instances** of the same module version across different engines (on the same or different nodes), create one rule per engine pointing at the same `(destination_module, destination_namespace, destination_version)`. The proxy round-robins across all healthy rules for that tuple.
 
-To deploy a **new version** alongside the old one, register a new engine with `version = "2.0.0"` and add a corresponding rule. Callers that omit `x-wr-version` are load-balanced across all healthy versions; the proxy injects the concrete selected version into `x-wr-version` before forwarding. Callers that pin a version with the `x-wr-version` request header continue to reach the older instance.
+To deploy a **new version** alongside the old one, register a new engine with `version = "2.0.0"` and add a corresponding rule. Callers that omit `x-wr-version` are load-balanced across all healthy versions; the proxy injects the concrete selected version into `x-wr-version` before forwarding. `x-wr-version` is always parsed as a semver requirement (exact versions are valid requirements); malformed selectors return `400` and never fall back to opaque string matching.
 
 ### Multi-node deployment
 

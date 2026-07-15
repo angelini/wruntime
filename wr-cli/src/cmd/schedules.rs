@@ -68,22 +68,31 @@ pub struct ScheduleEntry {
     pub worker_name: String,
     pub worker_version: String,
     pub job_type: String,
-    pub interval_secs: i32,
+    pub interval_secs: u32,
     #[serde(default)]
     pub immediate: bool,
     #[serde(default)]
     pub payload: String,
     #[serde(default = "default_timeout")]
-    pub timeout_secs: i32,
+    pub timeout_secs: u32,
     #[serde(default = "default_max_attempts")]
-    pub max_attempts: i32,
+    pub max_attempts: u32,
 }
 
-fn default_timeout() -> i32 {
+fn default_timeout() -> u32 {
     300
 }
-fn default_max_attempts() -> i32 {
+fn default_max_attempts() -> u32 {
     3
+}
+
+impl ScheduleEntry {
+    fn validate(&self) -> Result<()> {
+        wr_common::lifecycle::ScheduleIntervalSecs::new(self.interval_secs)?;
+        wr_common::lifecycle::JobTimeoutSecs::new(self.timeout_secs)?;
+        wr_common::lifecycle::MaxAttempts::new(self.max_attempts)?;
+        Ok(())
+    }
 }
 
 async fn apply(manager: &str, file_path: &str) -> Result<()> {
@@ -93,6 +102,7 @@ async fn apply(manager: &str, file_path: &str) -> Result<()> {
     let mut client = client::connect(manager).await?;
 
     for entry in &schedules_file.schedule {
+        entry.validate()?;
         let resp = client
             .upsert_schedule(UpsertScheduleRequest {
                 worker_namespace: entry.worker_namespace.clone(),
@@ -126,6 +136,7 @@ pub async fn apply_entries(manager: &str, entries: &[ScheduleEntry]) -> Result<(
     let mut client = client::connect(manager).await?;
 
     for entry in entries {
+        entry.validate()?;
         let resp = client
             .upsert_schedule(UpsertScheduleRequest {
                 worker_namespace: entry.worker_namespace.clone(),
@@ -154,6 +165,17 @@ pub async fn apply_entries(manager: &str, entries: &[ScheduleEntry]) -> Result<(
 
 // ── List ─────────────────────────────────────────────────────────────────────
 
+fn format_timestamp(timestamp: &prost_types::Timestamp) -> String {
+    let nanos = i128::from(timestamp.seconds) * 1_000_000_000 + i128::from(timestamp.nanos);
+    match time::OffsetDateTime::from_unix_timestamp_nanos(nanos) {
+        Ok(value) => match value.format(&time::format_description::well_known::Rfc3339) {
+            Ok(formatted) => formatted,
+            Err(_) => "invalid timestamp".to_string(),
+        },
+        Err(_) => "invalid timestamp".to_string(),
+    }
+}
+
 async fn list(manager: &str, namespace: Option<&str>) -> Result<()> {
     let mut client = client::connect(manager).await?;
     let resp = client
@@ -180,6 +202,11 @@ async fn list(manager: &str, namespace: Option<&str>) -> Result<()> {
         "Last Fired",
     ]);
     for s in &resp.schedules {
+        let last_fired = s
+            .last_fired_at
+            .as_ref()
+            .map(format_timestamp)
+            .unwrap_or_else(|| "never".to_string());
         builder.push_record([
             s.worker_namespace.as_str(),
             s.worker_name.as_str(),
@@ -188,11 +215,7 @@ async fn list(manager: &str, namespace: Option<&str>) -> Result<()> {
             &format!("{}s", s.interval_secs),
             &s.immediate.to_string(),
             &s.enabled.to_string(),
-            if s.last_fired_at.is_empty() {
-                "never"
-            } else {
-                &s.last_fired_at
-            },
+            &last_fired,
         ]);
     }
     display::print_table(builder);
@@ -222,4 +245,46 @@ async fn delete(
         namespace, name, version, job_type
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_timestamp_is_rendered_as_rfc3339() {
+        let timestamp = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 123_456_789,
+        };
+        assert_eq!(
+            format_timestamp(&timestamp),
+            "2023-11-14T22:13:20.123456789Z"
+        );
+    }
+
+    #[test]
+    fn schedule_file_rejects_negative_and_zero_lifecycle_values() {
+        let negative = r#"[[schedule]]
+worker_namespace = "ns"
+worker_name = "worker"
+worker_version = "1.0.0"
+job_type = "/Run"
+interval_secs = -1
+"#;
+        assert!(toml::from_str::<SchedulesFile>(negative).is_err());
+
+        let entry = ScheduleEntry {
+            worker_namespace: "ns".into(),
+            worker_name: "worker".into(),
+            worker_version: "1.0.0".into(),
+            job_type: "/Run".into(),
+            interval_secs: 0,
+            immediate: false,
+            payload: String::new(),
+            timeout_secs: 300,
+            max_attempts: 3,
+        };
+        assert!(entry.validate().is_err());
+    }
 }

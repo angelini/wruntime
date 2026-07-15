@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use wr_common::config::Validatable;
-use wr_engine::config::EngineConfig;
-use wr_manager::config::ManagerConfig;
+use wr_engine::config::{EngineConfig, EnvValue};
+use wr_manager::config::{ManagerConfig, RawManagerConfig};
 use wr_proxy::config::ProxyConfig;
 
 fn unique_temp_path(name: &str, ext: &str) -> PathBuf {
@@ -71,7 +71,7 @@ fn test_manager_config_valid() {
     let cfg = load_config_from_toml("manager-valid", toml, ManagerConfig::load);
     assert_eq!(cfg.listen_address, "0.0.0.0:9000");
     assert_eq!(cfg.engine_heartbeat_timeout_secs, 30);
-    assert_eq!(cfg.module_heartbeat_timeout_secs, Some(30));
+    assert_eq!(cfg.module_heartbeat_timeout_secs.get(), 30);
     assert_eq!(cfg.local_proxy_address, "http://127.0.0.1:9001");
     assert_eq!(cfg.database.url, "postgres://localhost/test");
     assert_eq!(cfg.database.max_connections, 10);
@@ -101,7 +101,7 @@ fn test_manager_config_default_heartbeat() {
     "#;
     let cfg = load_config_from_toml("manager-default-heartbeat", toml, ManagerConfig::load);
     assert_eq!(cfg.engine_heartbeat_timeout_secs, 10);
-    assert_eq!(cfg.module_heartbeat_timeout_secs, Some(10));
+    assert_eq!(cfg.module_heartbeat_timeout_secs.get(), 10);
 }
 
 #[test]
@@ -232,12 +232,65 @@ fn test_proxy_config_accepts_positive_ttl() {
 }
 
 #[test]
+fn test_proxy_config_rejects_invalid_external_route_pattern() {
+    let toml = format!(
+        "{}\n[external]\nlisten_address = \"0.0.0.0:8080\"\n[[external.route]]\npath = \"/items/{{id\"\nmodule = \"inventory\"\nnamespace = \"ecommerce\"\n",
+        proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")
+    );
+    let error = match toml::from_str::<ProxyConfig>(&toml) {
+        Ok(_) => panic!("invalid route pattern must fail parsing"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("invalid route pattern"));
+}
+
+#[test]
+fn test_proxy_config_rejects_invalid_external_route_method() {
+    let toml = format!(
+        "{}\n[external]\nlisten_address = \"0.0.0.0:8080\"\n[[external.route]]\npath = \"/items\"\nmethods = [\"G ET\"]\nmodule = \"inventory\"\nnamespace = \"ecommerce\"\n",
+        proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")
+    );
+    let error = match toml::from_str::<ProxyConfig>(&toml) {
+        Ok(_) => panic!("invalid method must fail parsing"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("invalid HTTP method"));
+}
+
+#[test]
+fn test_proxy_config_rejects_invalid_external_route_target() {
+    let toml = format!(
+        "{}\n[external]\nlisten_address = \"0.0.0.0:8080\"\n[[external.route]]\npath = \"/items\"\nmodule = \"inventory_service\"\nnamespace = \"ecommerce\"\n",
+        proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")
+    );
+    let error = match toml::from_str::<ProxyConfig>(&toml) {
+        Ok(_) => panic!("non-canonical route target must fail parsing"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("module name may contain only"));
+}
+
+#[test]
+fn test_proxy_config_rejects_conflicting_external_routes() {
+    let toml = format!(
+        "{}\n[external]\nlisten_address = \"0.0.0.0:8080\"\n[[external.route]]\npath = \"/items/{{id}}\"\nmodule = \"inventory\"\nnamespace = \"ecommerce\"\n[[external.route]]\npath = \"/items/{{name}}\"\nmodule = \"inventory\"\nnamespace = \"ecommerce\"\n",
+        proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")
+    );
+    let cfg: ProxyConfig = toml::from_str(&toml).unwrap();
+    let error = cfg
+        .validate()
+        .expect_err("conflicting routes must fail validation");
+    assert!(format!("{error:#}").contains("conflicting external route pattern"));
+}
+
+#[test]
 fn test_example_config_files_parse() {
     let (path, toml) = (
         "examples/config/manager.toml",
         include_str!("../../examples/config/manager.toml"),
     );
-    toml::from_str::<ManagerConfig>(toml).unwrap_or_else(|err| panic!("{path} must parse: {err}"));
+    toml::from_str::<RawManagerConfig>(toml)
+        .unwrap_or_else(|err| panic!("{path} must parse: {err}"));
 
     for (path, toml) in [
         (
@@ -831,14 +884,32 @@ fn test_engine_rejects_unsupported_llm_provider() {
         "{}\n[llm]\nprovider = \"openai\"\napi_key_env = \"OPENAI_API_KEY\"\n",
         engine_toml("127.0.0.1:9100", "")
     );
-    let cfg: EngineConfig = toml::from_str(&toml).unwrap();
-    let err = cfg
-        .validate()
-        .expect_err("unsupported LLM provider must fail validation");
-    assert!(
-        format!("{err:#}").contains("llm.provider must be exactly \"anthropic\""),
-        "unexpected validation error: {err:#}"
-    );
+    let error = match toml::from_str::<EngineConfig>(&toml) {
+        Ok(_) => panic!("unsupported LLM provider must fail parsing"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("unknown variant `openai`"));
+}
+
+#[test]
+fn test_engine_rejects_false_secret_reference() {
+    #[derive(serde::Deserialize)]
+    struct EnvBlock {
+        env: std::collections::HashMap<String, EnvValue>,
+    }
+
+    let error = match toml::from_str::<EnvBlock>("[env]\nAPI_KEY = { secret = false }") {
+        Ok(_) => panic!("secret = false must fail parsing"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("secret reference must use secret = true"));
+
+    let valid: EnvBlock =
+        toml::from_str("[env]\nAPI_KEY = { secret = true }\nLOG_LEVEL = \"debug\"").unwrap();
+    assert!(matches!(valid.env["API_KEY"], EnvValue::Secret(_)));
+    assert!(matches!(valid.env["LOG_LEVEL"], EnvValue::Plain(_)));
 }
 
 #[test]

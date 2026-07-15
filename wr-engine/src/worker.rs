@@ -7,6 +7,9 @@ use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use crate::{InboundRequest, ModuleTx};
+use wr_common::lifecycle::{
+    AttemptCount, JobState, JobTimeoutSecs, MaxAttempts, WorkerConcurrency,
+};
 
 /// Provision the `wr__jobs` schema, table, indexes, and NOTIFY trigger.
 /// Idempotent — safe to call on every startup.
@@ -45,9 +48,34 @@ CREATE INDEX IF NOT EXISTS idx_jobs_pending
     ON wr__jobs.jobs (worker_namespace, worker_name, worker_version, created_at)
     WHERE status = 'pending';
 
+UPDATE wr__jobs.jobs SET status = 'dead' WHERE status NOT IN ('pending', 'running', 'complete', 'dead');
+UPDATE wr__jobs.jobs SET timeout_secs = 300 WHERE timeout_secs <= 0;
+UPDATE wr__jobs.jobs SET max_attempts = 3 WHERE max_attempts <= 0;
+UPDATE wr__jobs.jobs SET attempt = 0 WHERE attempt < 0;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'jobs_status_valid' AND conrelid = 'wr__jobs.jobs'::regclass) THEN
+        ALTER TABLE wr__jobs.jobs ADD CONSTRAINT jobs_status_valid CHECK (status IN ('pending', 'running', 'complete', 'dead')) NOT VALID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'jobs_timeout_positive' AND conrelid = 'wr__jobs.jobs'::regclass) THEN
+        ALTER TABLE wr__jobs.jobs ADD CONSTRAINT jobs_timeout_positive CHECK (timeout_secs > 0) NOT VALID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'jobs_max_attempts_positive' AND conrelid = 'wr__jobs.jobs'::regclass) THEN
+        ALTER TABLE wr__jobs.jobs ADD CONSTRAINT jobs_max_attempts_positive CHECK (max_attempts > 0) NOT VALID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'jobs_attempt_valid' AND conrelid = 'wr__jobs.jobs'::regclass) THEN
+        ALTER TABLE wr__jobs.jobs ADD CONSTRAINT jobs_attempt_valid CHECK (attempt >= 0 AND attempt <= max_attempts) NOT VALID;
+    END IF;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+ALTER TABLE wr__jobs.jobs VALIDATE CONSTRAINT jobs_status_valid;
+ALTER TABLE wr__jobs.jobs VALIDATE CONSTRAINT jobs_timeout_positive;
+ALTER TABLE wr__jobs.jobs VALIDATE CONSTRAINT jobs_max_attempts_positive;
+ALTER TABLE wr__jobs.jobs VALIDATE CONSTRAINT jobs_attempt_valid;
+
+DROP INDEX IF EXISTS wr__jobs.idx_jobs_stale;
 CREATE INDEX IF NOT EXISTS idx_jobs_stale
     ON wr__jobs.jobs (claimed_at)
-    WHERE status IN ('claimed', 'running');
+    WHERE status = 'running';
 
 CREATE OR REPLACE FUNCTION wr__jobs.notify_new_job() RETURNS trigger AS $$
 DECLARE
@@ -85,15 +113,17 @@ pub async fn insert_job(
     version: &str,
     job_type: &str,
     payload: &[u8],
-    timeout_secs: i32,
-    max_attempts: i32,
+    timeout_secs: u32,
+    max_attempts: u32,
     source_namespace: &str,
     source_module: &str,
 ) -> anyhow::Result<String> {
     let client = pool.get().await?;
     let job_id = uuid::Uuid::new_v4().to_string();
-    let timeout = if timeout_secs > 0 { timeout_secs } else { 300 };
-    let attempts = if max_attempts > 0 { max_attempts } else { 3 };
+    let timeout = JobTimeoutSecs::new(if timeout_secs == 0 { 300 } else { timeout_secs })?;
+    let attempts = MaxAttempts::new(if max_attempts == 0 { 3 } else { max_attempts })?;
+    let timeout = i32::try_from(timeout.get())?;
+    let attempts = i32::try_from(attempts.get())?;
 
     client
         .execute(
@@ -130,23 +160,31 @@ pub async fn get_job_status(pool: &Pool, job_id: &str) -> anyhow::Result<Option<
         )
         .await?;
 
-    Ok(row.map(|r| JobStatus {
-        job_id: r.get(0),
-        status: r.get(1),
-        result: r.get::<_, Option<Vec<u8>>>(2).unwrap_or_default(),
-        error_message: r.get::<_, Option<String>>(3).unwrap_or_default(),
-        attempt: r.get(4),
-        max_attempts: r.get(5),
-    }))
+    row.map(|r| {
+        let state = JobState::try_from(r.get::<_, &str>(1))?;
+        let attempt_raw = r.get::<_, i32>(4);
+        let max_raw = r.get::<_, i32>(5);
+        let max_attempts = MaxAttempts::new(u32::try_from(max_raw)?)?;
+        let attempt = AttemptCount::new(u32::try_from(attempt_raw)?).validate(max_attempts)?;
+        Ok(JobStatus {
+            job_id: r.get(0),
+            status: state,
+            result: r.get::<_, Option<Vec<u8>>>(2).unwrap_or_default(),
+            error_message: r.get::<_, Option<String>>(3).unwrap_or_default(),
+            attempt,
+            max_attempts,
+        })
+    })
+    .transpose()
 }
 
 pub struct JobStatus {
     pub job_id: String,
-    pub status: String,
+    pub status: JobState,
     pub result: Vec<u8>,
     pub error_message: String,
-    pub attempt: i32,
-    pub max_attempts: i32,
+    pub attempt: AttemptCount,
+    pub max_attempts: MaxAttempts,
 }
 
 /// A claimed job ready for dispatch.
@@ -246,7 +284,7 @@ pub struct WorkerPoolConfig {
     pub name: String,
     pub version: String,
     pub engine_id: String,
-    pub concurrency: usize,
+    pub concurrency: WorkerConcurrency,
     pub poll_interval: Duration,
     pub job_timeout: Duration,
     /// Raw database URL for the LISTEN connection (outside of deadpool).
@@ -292,7 +330,7 @@ pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx
     }
 
     // Spawn worker loops.
-    for i in 0..config.concurrency {
+    for i in 0..config.concurrency.get() {
         let pool = pool.clone();
         let tx = tx.clone();
         let notify = notify.clone();
@@ -339,7 +377,7 @@ pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx
         namespace = %config.namespace,
         module = %config.name,
         version = %config.version,
-        concurrency = config.concurrency,
+        concurrency = config.concurrency.get(),
         "worker pool started",
     );
 }

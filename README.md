@@ -221,7 +221,6 @@ Manager deployment follows the same pattern (`wr managers bundle` / `wr managers
 | `protoc` | Compile `.proto` schemas to `FileDescriptorSet` binaries |
 | `wasm32-wasip2` target | `rustup target add wasm32-wasip2` — build WASM component modules |
 | [`wasm-tools`](https://github.com/bytecodealliance/wasm-tools) | Strip/inspect WASM components (install: `cargo install --locked wasm-tools`) |
-| [`sccache`](https://github.com/mozilla/sccache) | Compilation cache — speeds up rebuilds and fresh clones (install: `cargo install sccache`) |
 
 ```bash
 just build               # debug build

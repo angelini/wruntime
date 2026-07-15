@@ -7,7 +7,7 @@ use wr_engine::config::ResourceLimits;
 use helpers::{
     db::{db_state_for_module, db_state_for_module_with_limits, skip_without_db},
     proto,
-    wasm::{GuestHarness, TestGuest},
+    wasm::{GuestHarness, RpcPath, TestGuest},
 };
 
 #[tokio::test]
@@ -23,7 +23,7 @@ async fn wasm_db_execute() -> Result<()> {
     // Create a table via Execute
     let req = proto::ExecuteRequest {
         sql: "CREATE TEMP TABLE IF NOT EXISTS exec_test (id integer)".into(),
-        params_json: "".into(),
+        params: vec![],
     };
     let resp = harness.dispatch(state, "/Execute", req).await?;
     assert_eq!(resp.status(), 200);
@@ -46,16 +46,17 @@ async fn wasm_db_query() -> Result<()> {
 
     let req = proto::QueryRequest {
         sql: "SELECT 42 as num".into(),
-        params_json: "".into(),
+        params: vec![],
     };
-    let resp = harness.dispatch(state, "/Query", req).await?;
-    assert_eq!(resp.status(), 200);
-
-    let body = proto::QueryResponse::decode(resp.into_body())?;
+    let body: proto::QueryResponse = harness
+        .dispatch_typed(state, RpcPath::new("/Query")?, req)
+        .await?;
     assert_eq!(body.rows.len(), 1);
-    assert!(!body.rows[0].columns_json.is_empty());
-    // The column JSON should contain "42"
-    assert!(body.rows[0].columns_json[0].contains("42"));
+    assert_eq!(body.rows[0].columns.len(), 1);
+    assert_eq!(
+        body.rows[0].columns[0].value,
+        Some(proto::db_column::Value::Integer(42))
+    );
     Ok(())
 }
 
@@ -74,13 +75,20 @@ async fn wasm_db_query_types() -> Result<()> {
     assert_eq!(resp.status(), 200);
 
     let body = proto::QueryTypesResponse::decode(resp.into_body())?;
-    // row_json should contain entries for all the typed columns
-    assert!(body.row_json.contains("boolean"));
-    assert!(body.row_json.contains("int4"));
-    assert!(body.row_json.contains("int8"));
-    assert!(body.row_json.contains("float8"));
-    assert!(body.row_json.contains("text"));
-    assert!(body.row_json.contains("hello"));
+    let row = body.row.expect("typed row");
+    let types: Vec<_> = row
+        .columns
+        .iter()
+        .map(|column| column.type_name.as_str())
+        .collect();
+    assert!(types.contains(&"boolean"));
+    assert!(types.contains(&"int4"));
+    assert!(types.contains(&"int8"));
+    assert!(types.contains(&"float8"));
+    assert!(row
+        .columns
+        .iter()
+        .any(|column| { column.value == Some(proto::db_column::Value::Text("hello".into())) }));
     Ok(())
 }
 
@@ -151,6 +159,40 @@ async fn wasm_db_transaction_drop() -> Result<()> {
 }
 
 #[tokio::test]
+async fn wasm_db_transaction_rejects_use_after_completion() -> Result<()> {
+    if skip_without_db("wasm_db_transaction_rejects_use_after_completion") {
+        return Ok(());
+    }
+    let Some(harness) = GuestHarness::load(TestGuest::Db).await? else {
+        return Ok(());
+    };
+
+    for rollback in [false, true] {
+        for operation in ["query", "execute", "query-stream", "commit", "rollback"] {
+            let state = db_state_for_module(2, "test-ns", "db-txdone-test").await;
+            let response: proto::TransactionAfterCompleteResponse = harness
+                .dispatch_typed(
+                    state,
+                    RpcPath::new("/TransactionAfterComplete")?,
+                    proto::TransactionAfterCompleteRequest {
+                        rollback,
+                        operation: operation.into(),
+                    },
+                )
+                .await?;
+            assert!(
+                response
+                    .error_message
+                    .contains("transaction already completed"),
+                "{operation} after completion returned: {}",
+                response.error_message
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn wasm_db_error() -> Result<()> {
     if skip_without_db("wasm_db_error") {
         return Ok(());
@@ -162,7 +204,7 @@ async fn wasm_db_error() -> Result<()> {
 
     let req = proto::ErrorRequest {
         sql: "SELECT * FROM nonexistent_table_xyz".into(),
-        params_json: "".into(),
+        params: vec![],
     };
     let resp = harness.dispatch(state, "/Error", req).await?;
     assert_eq!(resp.status(), 200);
@@ -185,7 +227,9 @@ async fn wasm_db_invalid_param() -> Result<()> {
 
     let req = proto::ErrorRequest {
         sql: "SELECT $1::numeric AS n".into(),
-        params_json: r#"[{"type":"numeric","value":"not-a-number"}]"#.into(),
+        params: vec![proto::DbParam {
+            value: Some(proto::db_param::Value::Numeric("not-a-number".into())),
+        }],
     };
     let resp = harness.dispatch(state, "/Error", req).await?;
     assert_eq!(resp.status(), 200);
@@ -208,7 +252,7 @@ async fn wasm_db_query_stream() -> Result<()> {
 
     let req = proto::QueryStreamRequest {
         sql: "SELECT generate_series(1, 5) AS n".into(),
-        params_json: "".into(),
+        params: vec![],
         batch_size: 2,
     };
     let resp = harness.dispatch(state, "/QueryStream", req).await?;

@@ -201,9 +201,7 @@ async fn async_main() -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         for m in &config.modules {
             for (key, val) in &m.env {
-                if matches!(val, EnvValue::Secret { secret: true })
-                    && seen.insert((&m.namespace, key))
-                {
+                if matches!(val, EnvValue::Secret(_)) && seen.insert((&m.namespace, key)) {
                     secret_requests.push(SecretRequest {
                         namespace: m.namespace.clone(),
                         key: key.clone(),
@@ -294,7 +292,7 @@ async fn async_main() -> Result<()> {
                 EnvValue::Plain(v) => {
                     env.insert(key.clone(), v.clone());
                 }
-                EnvValue::Secret { secret: true } => {
+                EnvValue::Secret(_) => {
                     let plaintext = secrets_map
                         .get(&(module.namespace.as_str(), key.as_str()))
                         .ok_or_else(|| {
@@ -305,7 +303,6 @@ async fn async_main() -> Result<()> {
                         })?;
                     env.insert(key.clone(), plaintext.to_string());
                 }
-                EnvValue::Secret { secret: false } => {}
             }
         }
         resolved_envs.insert((module.namespace.clone(), module.name.clone()), env);

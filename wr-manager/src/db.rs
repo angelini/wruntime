@@ -4,6 +4,7 @@ use tokio_retry::strategy::ExponentialBackoff;
 use tokio_retry::RetryIf;
 use tonic::Status;
 
+use wr_common::identity::NamespaceFilter;
 use wr_common::wruntime::{EngineRegistration, ModuleDescriptor, RoutingRule, RoutingTable};
 
 /// Exponential backoff strategy for NOWAIT lock retries: 10ms, 20ms, 40ms, 80ms.
@@ -669,10 +670,12 @@ pub async fn delete_secret(pool: &Pool, namespace: &str, key: &str) -> Result<bo
 }
 
 /// List secret metadata (namespace + key only, no values).
-/// If namespace is empty, return all secrets across all namespaces.
-pub async fn list_secrets(pool: &Pool, namespace: &str) -> Result<Vec<(String, String)>, Status> {
+pub async fn list_secrets(
+    pool: &Pool,
+    filter: &NamespaceFilter,
+) -> Result<Vec<(String, String)>, Status> {
     let client = pool.get().await.internal()?;
-    let rows = if namespace.is_empty() {
+    let rows = if matches!(filter, NamespaceFilter::All) {
         client
             .query(
                 "SELECT namespace, key FROM wr_secrets ORDER BY namespace, key",
@@ -684,7 +687,7 @@ pub async fn list_secrets(pool: &Pool, namespace: &str) -> Result<Vec<(String, S
         client
             .query(
                 "SELECT namespace, key FROM wr_secrets WHERE namespace = $1 ORDER BY key",
-                &[&namespace],
+                &[&filter.as_db_value()],
             )
             .await
             .internal()?
@@ -887,12 +890,18 @@ pub async fn upsert_schedule(
     worker_name: &str,
     worker_version: &str,
     job_type: &str,
-    interval_secs: i32,
+    interval_secs: u32,
     immediate: bool,
     payload: &[u8],
-    timeout_secs: i32,
-    max_attempts: i32,
+    timeout_secs: u32,
+    max_attempts: u32,
 ) -> Result<String, Status> {
+    let interval_secs = i32::try_from(interval_secs)
+        .map_err(|_| Status::invalid_argument("interval_secs exceeds PostgreSQL INT"))?;
+    let timeout_secs = i32::try_from(timeout_secs)
+        .map_err(|_| Status::invalid_argument("timeout_secs exceeds PostgreSQL INT"))?;
+    let max_attempts = i32::try_from(max_attempts)
+        .map_err(|_| Status::invalid_argument("max_attempts exceeds PostgreSQL INT"))?;
     let client = pool.get().await.internal()?;
     let row = client
         .query_one(
@@ -962,10 +971,10 @@ pub async fn delete_schedule(
 /// List schedules, optionally filtered by namespace. Empty namespace returns all.
 pub async fn list_schedules(
     pool: &Pool,
-    worker_namespace: &str,
+    filter: &NamespaceFilter,
 ) -> Result<Vec<ScheduleRow>, Status> {
     let client = pool.get().await.internal()?;
-    let rows = if worker_namespace.is_empty() {
+    let rows = if matches!(filter, NamespaceFilter::All) {
         let sql = format!(
             "SELECT {SCHEDULE_COLUMNS} FROM wr_schedules
              ORDER BY worker_namespace, worker_name, job_type"
@@ -977,7 +986,10 @@ pub async fn list_schedules(
              WHERE worker_namespace = $1
              ORDER BY worker_name, job_type"
         );
-        client.query(&sql, &[&worker_namespace]).await.internal()?
+        client
+            .query(&sql, &[&filter.as_db_value()])
+            .await
+            .internal()?
     };
     Ok(rows.iter().map(row_to_schedule).collect())
 }

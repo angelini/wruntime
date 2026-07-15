@@ -7,7 +7,7 @@ use http::{Request, Response, StatusCode};
 use tower::{Layer, Service};
 
 use super::{error_response, ProxyBody, ResBody};
-use crate::config::ExternalRoute;
+use crate::config::{build_external_route_index, ExternalRoute};
 use wr_common::http_headers::{strip_external_spoofable_headers, WR_DESTINATION, WR_SOURCE};
 
 pub struct IngressLayer {
@@ -16,26 +16,12 @@ pub struct IngressLayer {
 }
 
 impl IngressLayer {
-    pub fn new(routes: Vec<ExternalRoute>) -> Self {
-        let mut router = matchit::Router::new();
-
-        // Group route indices by path pattern. Multiple routes can share
-        // the same path but differ on methods.
-        let mut path_map: std::collections::HashMap<String, Vec<usize>> =
-            std::collections::HashMap::new();
-        for (i, route) in routes.iter().enumerate() {
-            path_map.entry(route.path.clone()).or_default().push(i);
-        }
-        for (path, indices) in path_map {
-            // matchit returns Err if a duplicate pattern is inserted, but
-            // we've already deduplicated by path.
-            router.insert(path, indices).expect("duplicate route path");
-        }
-
-        Self {
+    pub fn new(routes: Vec<ExternalRoute>) -> anyhow::Result<Self> {
+        let router = build_external_route_index(&routes)?;
+        Ok(Self {
             routes: Arc::new(routes),
             router: Arc::new(router),
-        }
+        })
     }
 }
 
@@ -75,7 +61,7 @@ where
         let routes = self.routes.clone();
         let router = self.router.clone();
         let mut inner = self.inner.clone();
-        let method = req.method().as_str().to_uppercase();
+        let method = req.method().clone();
         let path = req.uri().path().to_string();
 
         Box::pin(async move {
@@ -96,10 +82,11 @@ where
                 }
             };
 
-            let route = match matched.value.iter().find(|&&idx| {
-                let r = &routes[idx];
-                r.methods.is_empty() || r.methods.iter().any(|m| m.to_uppercase() == method)
-            }) {
+            let route = match matched
+                .value
+                .iter()
+                .find(|&&idx| routes[idx].methods().allows(&method))
+            {
                 Some(&idx) => &routes[idx],
                 None => {
                     return Ok(error_response(
@@ -109,11 +96,10 @@ where
                 }
             };
 
-            let module = &route.module;
-            let namespace = &route.namespace;
+            let target = route.target();
 
             // Set routing headers and pass through to the inner stack.
-            let dest = format!("http://{namespace}.{module}/");
+            let dest = format!("http://{}.{}/", target.namespace(), target.module());
             if let Ok(v) = http::HeaderValue::from_str(&dest) {
                 parts.headers.insert(WR_DESTINATION, v);
             }

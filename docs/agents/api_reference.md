@@ -256,15 +256,17 @@ let (trade_id, buyer, seller, qty, price): (i64, String, String, i64, i64) =
 ### Transaction guard (auto-rollback on drop)
 
 ```rust
-/// Begin a transaction wrapped in TxGuard. Rolls back automatically on drop.
-pub fn transaction() -> Result<TxGuard, ServiceError>;
+/// Begin an active transaction. `TxGuard` remains a compatibility alias.
+pub fn transaction() -> Result<ActiveTransaction, ServiceError>;
 
-impl TxGuard {
+impl ActiveTransaction {
     fn query(&self, sql: &str, params: &[PgValue]) -> Result<Vec<Row>, ServiceError>;
     fn execute(&self, sql: &str, params: &[PgValue]) -> Result<u64, ServiceError>;
     fn commit(self) -> Result<(), ServiceError>;  // consumes guard, no rollback
 }
 ```
+
+The SDK implementation has no optional inner handle or normal-path unwrap. Raw WIT clients remain host-validated: query, execute, query-stream, commit, or rollback after completion returns `db-error.query("transaction already completed")`.
 
 ## Generated code (wr-build)
 
@@ -444,23 +446,30 @@ The engine requires a non-empty `[blobstore].allowed_buckets` list. Bucket argum
 an oversized download is aborted mid-stream, never fully buffered; `max_list_objects` (default 1000)
 caps `list_objects`. Exceeding either returns `BlobError::TooLarge`.
 
-## wruntime:tracing/span@0.1.0
+## wruntime:tracing/span@0.2.0
 
 Source: `wit/tracing.wit`. Import path: `wr_sdk::bindings::wruntime::tracing::span`.
 
 ```rust
 /// Start a new child span. Returns an ActiveSpan resource.
-span::start(name: &str, attrs: &[(String, String)]) -> ActiveSpan
+enum AttributeValue {
+    Text(String),
+    Boolean(bool),
+    Signed(i64),
+    Float(f64),
+}
+
+span::start(name: &str, attrs: &[(String, AttributeValue)]) -> ActiveSpan
 
 impl ActiveSpan {
-    fn set_attribute(&self, key: &str, value: &str)
-    fn record_event(&self, name: &str, attrs: &[(String, String)])
+    fn set_attribute(&self, key: &str, value: &AttributeValue)
+    fn record_event(&self, name: &str, attrs: &[(String, AttributeValue)])
     fn set_error(&self, message: &str)
 }
 // Span ends when ActiveSpan is dropped.
 ```
 
-Note: the `wr_sdk::tracing` helpers accept `&[(&str, &str)]` and convert to owned strings internally. Prefer using `wr_sdk::tracing::start()` over the raw WIT binding.
+The `wr_sdk::tracing::start()` compatibility helper accepts string pairs. Prefer `span!`, `root_span!`, and `set_attr` for typed string, boolean, integer, and floating-point attributes. Version 0.2.0 is intentionally ABI-breaking from the former string-only 0.1.0 interface.
 
 ## wruntime:llm/inference@0.1.0
 
@@ -603,8 +612,8 @@ pub fn submit_job(
     payload: &[u8],
 ) -> Result<String, HttpError>
 
-/// Submit a job with explicit timeout and retry settings.
-/// Pass 0 for timeout_secs or max_attempts to use engine-configured worker defaults.
+/// Compatibility API for explicit timeout and retry settings.
+/// Zero uses engine-configured defaults; negative values are rejected.
 pub fn submit_job_with_options(
     engine_authority: &str,
     worker_version: &str,
@@ -615,6 +624,14 @@ pub fn submit_job_with_options(
 ) -> Result<String, HttpError>
 
 /// Query the status of a previously submitted job.
+pub fn submit_job_with_typed_options(
+    engine_authority: &str,
+    worker_version: &str,
+    job_type: &str,
+    payload: &[u8],
+    options: JobOptions,
+) -> Result<String, HttpError>
+
 pub fn get_job_status(engine_authority: &str, job_id: &str) -> Result<JobStatus, HttpError>
 ```
 
@@ -623,13 +640,20 @@ The engine requires `SubmitJobRequest.worker_namespace` and `worker_name` to mat
 ### Types
 
 ```rust
+pub enum JobState { Pending, Running, Complete, Dead }
+pub struct MaxAttempts(NonZeroU32);
+pub struct JobTimeout(Duration);
+pub struct JobOptions {
+    pub timeout: Option<JobTimeout>,
+    pub max_attempts: Option<MaxAttempts>,
+}
 pub struct JobStatus {
     pub job_id: String,
-    pub status: String,         // "pending" | "running" | "complete" | "failed" | "dead"
+    pub status: JobState,
     pub result: Vec<u8>,
     pub error_message: String,
-    pub attempt: i32,
-    pub max_attempts: i32,
+    pub attempt: u32,
+    pub max_attempts: u32,
 }
 ```
 
@@ -681,4 +705,41 @@ impl WorkerServiceClient {
 }
 ```
 
-Result helpers map pending/running to `Ok(None)`, complete to a decoded non-empty result, completed empty/invalid result to `HttpError::Decode`, failed/dead to `HttpError::Status { code: 500, body }`, not-found propagates `404`, and unknown status to `HttpError::Decode`.
+Result helpers map pending/running to `Ok(None)`, complete to a decoded non-empty result, completed empty/invalid result to `HttpError::Decode`, and dead to `HttpError::Status { code: 500, body }`; not-found propagates `404`. Unknown wire status values are rejected while decoding into `JobState`.
+
+## Typed boundary helpers
+
+Prefer the validated SDK boundary types below; raw WIT values and `HttpRequest` remain available for negative tests. The host independently validates every raw guest call.
+
+```rust
+// HTTP
+Authority::parse(value) -> Result<Authority, HttpError>
+PathAndQuery::parse(value) -> Result<PathAndQuery, HttpError>
+HeaderName::parse(value) -> Result<HeaderName, HttpError>
+HeaderValue::from_bytes(value) -> Result<HeaderValue, HttpError>
+RequestTimeoutNanos::from_duration(value) -> Result<RequestTimeoutNanos, HttpError>
+http_request_typed(&TypedHttpRequest) -> Result<HttpResponse, HttpError>
+// construction failures use HttpError::InvalidRequest(String)
+
+// LLM
+ModelName::parse(value) -> Result<ModelName, LlmError>
+MaxTokens::new(value) -> Result<MaxTokens, LlmError>
+Temperature::new(value) -> Result<Temperature, LlmError>
+ToolSchema::parse(json) -> Result<ToolSchema, LlmError>
+CompletionBuilder::{with_max_tokens, with_temperature, with_tool}
+
+// Database
+Jsonb::parse(json) -> Result<Jsonb, ServiceError>
+PgNumeric::parse(value) -> Result<PgNumeric, ServiceError>
+PgTimeMicros::new(value) -> Result<PgTimeMicros, ServiceError>
+PgTimestampMicros::new(value) -> Result<PgTimestampMicros, ServiceError>
+PgDateDays::new(value) -> Result<PgDateDays, ServiceError>
+BatchSize::new(value) -> Result<BatchSize, ServiceError>
+
+// Blobstore
+BucketName::parse(value) -> Result<BucketName, ServiceError>
+ObjectKey::parse(value) -> Result<ObjectKey, ServiceError>
+ObjectPrefix::parse(value) -> Result<ObjectPrefix, ServiceError>
+```
+
+Tracing attributes are typed end-to-end. `AttributeValue` has `String`, `Bool`, `I64`, and `F64` variants; `span!`, `root_span!`, and `set_attr` preserve supported Rust value types instead of stringifying them.

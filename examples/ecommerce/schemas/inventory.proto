@@ -15,7 +15,7 @@ message SeedResponse { int32 seeded = 1; }
 
 message BuyRequest {
   string product_id = 1;
-  int64  quantity   = 2;
+  uint64 quantity   = 2;
 }
 message BuyResponse {
   int64 bought    = 1;
@@ -24,7 +24,7 @@ message BuyResponse {
 
 message ReturnRequest {
   string product_id = 1;
-  int64  quantity   = 2;
+  uint64 quantity   = 2;
 }
 message ReturnResponse {
   int64  returned   = 1;
@@ -40,7 +40,7 @@ message GetStockResponse {
 message TransferRequest {
   string from_product_id = 1;
   string to_product_id   = 2;
-  int64  quantity        = 3;
+  uint64 quantity        = 3;
 }
 message TransferResponse {
   int64 transferred = 1;
@@ -48,7 +48,7 @@ message TransferResponse {
 
 message RestockRequest {
   string product_id = 1;
-  int64  quantity   = 2;
+  uint64 quantity   = 2;
 }
 message RestockResponse {
   string product_id = 1;

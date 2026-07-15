@@ -20,7 +20,7 @@ pub use wr_proxy::config::{EgressConfig, ExternalRoute};
 use super::manager::sync_table;
 use super::pki::{shared_test_pki, test_mtls_pool};
 
-pub const TEST_SELF_PEER: &str = "http://test-node";
+pub const TEST_SELF_PEER: &str = "https://test-node:9443";
 
 /// Identifies an engine instance and the node it belongs to.
 pub struct EngineSpec<'a> {
@@ -128,7 +128,7 @@ pub async fn start_ingress_proxy(
         Default::default(),
     ));
     let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::IngressLayer::new(routes))
+        .layer(wr_proxy::layers::IngressLayer::new(routes)?)
         .layer(wr_proxy::layers::RoutingLayer::new(
             table,
             TEST_SELF_PEER,

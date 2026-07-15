@@ -81,8 +81,8 @@ impl WorkerPoolHarness {
         &self,
         job_type: &str,
         payload: impl AsRef<[u8]>,
-        timeout_secs: i32,
-        max_attempts: i32,
+        timeout_secs: u32,
+        max_attempts: u32,
     ) -> Result<String> {
         wr_engine::worker::insert_job(
             &self.pool,
@@ -103,8 +103,8 @@ impl WorkerPoolHarness {
         &self,
         job_type: &str,
         payload: impl AsRef<[u8]>,
-        timeout_secs: i32,
-        max_attempts: i32,
+        timeout_secs: u32,
+        max_attempts: u32,
         source_namespace: &str,
         source_module: &str,
     ) -> Result<String> {
@@ -131,7 +131,8 @@ impl WorkerPoolHarness {
                 name: self.name.clone(),
                 version: self.version.clone(),
                 engine_id: self.engine_id.clone(),
-                concurrency,
+                concurrency: wr_common::lifecycle::WorkerConcurrency::new(concurrency)
+                    .expect("test worker concurrency must be positive"),
                 poll_interval,
                 job_timeout,
                 database_url: self.db_url.clone(),

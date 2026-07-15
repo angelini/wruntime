@@ -22,11 +22,22 @@ wasmtime::component::bindgen!({
     },
 });
 
+use wruntime::tracing::span::AttributeValue;
+
+fn to_otel_value(value: AttributeValue) -> opentelemetry::Value {
+    match value {
+        AttributeValue::Text(value) => opentelemetry::Value::String(value.into()),
+        AttributeValue::Boolean(value) => opentelemetry::Value::Bool(value),
+        AttributeValue::Signed(value) => opentelemetry::Value::I64(value),
+        AttributeValue::Float(value) => opentelemetry::Value::F64(value),
+    }
+}
+
 impl wruntime::tracing::span::Host for ModuleState {
     async fn start(
         &mut self,
         name: String,
-        attrs: Vec<(String, String)>,
+        attrs: Vec<(String, AttributeValue)>,
     ) -> wasmtime::Result<Resource<SpanState>> {
         let (tc, table) = self.tracing_mut();
         // Parent the new span to the top of the guest span stack, falling back
@@ -42,10 +53,7 @@ impl wruntime::tracing::span::Host for ModuleState {
         {
             use tracing_opentelemetry::OpenTelemetrySpanExt as _;
             for (key, value) in attrs {
-                child.set_attribute(
-                    opentelemetry::Key::new(key),
-                    opentelemetry::Value::String(value.into()),
-                );
+                child.set_attribute(opentelemetry::Key::new(key), to_otel_value(value));
             }
         }
         let guard = tc
@@ -65,7 +73,7 @@ impl wruntime::tracing::span::Host for ModuleState {
     async fn start_root(
         &mut self,
         name: String,
-        attrs: Vec<(String, String)>,
+        attrs: Vec<(String, AttributeValue)>,
     ) -> wasmtime::Result<Resource<SpanState>> {
         let root = tracing::info_span!(
             parent: tracing::Span::none(),
@@ -76,10 +84,7 @@ impl wruntime::tracing::span::Host for ModuleState {
         {
             use tracing_opentelemetry::OpenTelemetrySpanExt as _;
             for (key, value) in attrs {
-                root.set_attribute(
-                    opentelemetry::Key::new(key),
-                    opentelemetry::Value::String(value.into()),
-                );
+                root.set_attribute(opentelemetry::Key::new(key), to_otel_value(value));
             }
         }
         let (tc, table) = self.tracing_mut();
@@ -105,14 +110,13 @@ impl wruntime::tracing::span::HostActiveSpan for ModuleState {
         &mut self,
         self_: Resource<SpanState>,
         key: String,
-        value: String,
+        value: AttributeValue,
     ) -> wasmtime::Result<()> {
         if let Ok(state) = self.table().get(&self_) {
             use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-            state.span.set_attribute(
-                opentelemetry::Key::new(key),
-                opentelemetry::Value::String(value.into()),
-            );
+            state
+                .span
+                .set_attribute(opentelemetry::Key::new(key), to_otel_value(value));
         }
         Ok(())
     }
@@ -121,12 +125,15 @@ impl wruntime::tracing::span::HostActiveSpan for ModuleState {
         &mut self,
         self_: Resource<SpanState>,
         name: String,
-        attrs: Vec<(String, String)>,
+        attrs: Vec<(String, AttributeValue)>,
     ) -> wasmtime::Result<()> {
         if let Ok(state) = self.table().get(&self_) {
-            state.span.in_scope(|| {
-                tracing::info!(event = name.as_str(), attrs = ?attrs);
-            });
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            let attrs = attrs
+                .into_iter()
+                .map(|(key, value)| opentelemetry::KeyValue::new(key, to_otel_value(value)))
+                .collect();
+            state.span.add_event(name, attrs);
         }
         Ok(())
     }
@@ -173,7 +180,7 @@ pub use wruntime::tracing::span::add_to_linker;
 
 #[cfg(test)]
 mod tests {
-    use super::wruntime::tracing::span::{Host, HostActiveSpan};
+    use super::wruntime::tracing::span::{AttributeValue, Host, HostActiveSpan};
     use crate::state::ModuleState;
 
     fn proxy_uri() -> hyper::Uri {
@@ -219,7 +226,7 @@ mod tests {
             &mut state,
             wasmtime::component::Resource::new_borrow(rep),
             "db.table".into(),
-            "users".into(),
+            AttributeValue::Text("users".into()),
         )
         .await
         .expect("set_attribute");
@@ -244,7 +251,7 @@ mod tests {
             &mut state,
             wasmtime::component::Resource::new_borrow(rep),
             "cache.miss".into(),
-            vec![("key".into(), "user:42".into())],
+            vec![("key".into(), AttributeValue::Text("user:42".into()))],
         )
         .await
         .expect("record_event");

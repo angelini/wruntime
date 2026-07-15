@@ -329,9 +329,9 @@ impl prost_build::ServiceGenerator for WrWorkerClientGenerator {
                         job_id: &str,
                     ) -> Result<Option<#output>, wr_sdk::http::HttpError> {
                         let status = self.get_status(job_id)?;
-                        match status.status.as_str() {
-                            "pending" | "running" => Ok(None),
-                            "complete" => {
+                        match status.status {
+                            wr_sdk::jobs::JobState::Pending | wr_sdk::jobs::JobState::Running => Ok(None),
+                            wr_sdk::jobs::JobState::Complete => {
                                 if status.result.is_empty() {
                                     return Err(wr_sdk::http::HttpError::Decode(
                                         "missing result for completed job".into(),
@@ -341,7 +341,7 @@ impl prost_build::ServiceGenerator for WrWorkerClientGenerator {
                                     .map(Some)
                                     .map_err(|e| wr_sdk::http::HttpError::Decode(e.to_string()))
                             }
-                            "failed" | "dead" => {
+                            wr_sdk::jobs::JobState::Dead => {
                                 let body = if status.error_message.is_empty() {
                                     format!("job {} {}", status.job_id, status.status).into_bytes()
                                 } else {
@@ -349,9 +349,6 @@ impl prost_build::ServiceGenerator for WrWorkerClientGenerator {
                                 };
                                 Err(wr_sdk::http::HttpError::Status { code: 500, body })
                             }
-                            other => Err(wr_sdk::http::HttpError::Decode(format!(
-                                "unknown job status: {other}"
-                            ))),
                         }
                     }
                 }
@@ -501,7 +498,7 @@ mod tests {
             "{buf}"
         );
         assert!(
-            buf.contains("\"pending\" | \"running\" => Ok(None)"),
+            buf.contains("JobState::Pending | wr_sdk::jobs::JobState::Running => Ok(None)"),
             "{buf}"
         );
         assert!(
@@ -514,10 +511,10 @@ mod tests {
             ),
             "{buf}"
         );
-        assert!(buf.contains("\"failed\" | \"dead\""), "{buf}");
+        assert!(buf.contains("wr_sdk::jobs::JobState::Dead"), "{buf}");
         assert!(buf.contains("wr_sdk::http::HttpError::Status"), "{buf}");
         assert!(buf.contains("code: 500"), "{buf}");
-        assert!(buf.contains("unknown job status"), "{buf}");
+        assert!(!buf.contains("unknown job status"), "{buf}");
         assert!(!buf.contains("\"/ProcessTask\""), "{buf}");
         assert!(
             !buf.contains("submit_job(&self.authority, \"/codegen.WorkerService/ProcessTask\""),

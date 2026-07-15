@@ -118,12 +118,12 @@ async fn wasm_http_ingress() -> Result<()> {
     let table = synced_routing_table(&mgr_addr).await?;
     let ingress_addr = start_ingress_proxy(
         table,
-        vec![ExternalRoute {
-            path: "/test.HttpTestService/Echo".into(),
-            methods: vec!["POST".into()],
-            module: "http-svc".into(),
-            namespace: "test-ns".into(),
-        }],
+        vec![ExternalRoute::new(
+            "/test.HttpTestService/Echo",
+            vec!["POST".into()],
+            "http-svc",
+            "test-ns",
+        )?],
     )
     .await?;
 

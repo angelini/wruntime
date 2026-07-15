@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde::Deserialize;
 
+use super::helpers::DeployPort;
+
 /// Shared deployment format used by both manager and node deploy commands.
 #[derive(Clone, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -129,24 +131,49 @@ pub fn resolve_format(cli: Option<DeployFormat>, config: Option<DeployFormat>) -
         .unwrap_or(DeployFormat::Systemd)
 }
 
+fn optional_deploy_port(port: Option<u16>, source: &str) -> Result<Option<DeployPort>> {
+    port.map(|value| DeployPort::new(value).with_context(|| format!("invalid {source}")))
+        .transpose()
+}
+
+fn parse_deploy_port(value: &str, source: &str) -> Result<DeployPort> {
+    let port = value
+        .parse::<u16>()
+        .with_context(|| format!("{source} must be a non-zero TCP port, got '{value}'"))?;
+    DeployPort::new(port)
+        .with_context(|| format!("{source} must be a non-zero TCP port, got '{value}'"))
+}
+
+fn env_deploy_port(key: &str) -> Result<Option<DeployPort>> {
+    match std::env::var(key) {
+        Ok(value) => parse_deploy_port(&value, key).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{key} must contain a valid UTF-8 TCP port")
+        }
+    }
+}
+
 /// Resolve SSH port from CLI > config > env. Returns None to use SSH default.
-pub fn resolve_ssh_port(cli: Option<u16>, config: Option<u16>) -> Option<u16> {
-    cli.or(config).or_else(|| {
-        std::env::var("WR_SSH_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-    })
+pub fn resolve_ssh_port(cli: Option<u16>, config: Option<u16>) -> Result<Option<DeployPort>> {
+    if let Some(port) = optional_deploy_port(cli, "--ssh-port")? {
+        return Ok(Some(port));
+    }
+    if let Some(port) = optional_deploy_port(config, "ssh_port in wr-deploy.toml")? {
+        return Ok(Some(port));
+    }
+    env_deploy_port("WR_SSH_PORT")
 }
 
 /// Resolve peer port from CLI > config > env > default (9443).
-pub fn resolve_peer_port(cli: Option<u16>, config: Option<u16>) -> u16 {
-    cli.or(config)
-        .or_else(|| {
-            std::env::var("WR_PEER_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(9443)
+pub fn resolve_peer_port(cli: Option<u16>, config: Option<u16>) -> Result<DeployPort> {
+    if let Some(port) = optional_deploy_port(cli, "--peer-port")? {
+        return Ok(port);
+    }
+    if let Some(port) = optional_deploy_port(config, "peer_port in wr-deploy.toml")? {
+        return Ok(port);
+    }
+    Ok(env_deploy_port("WR_PEER_PORT")?.unwrap_or(DeployPort::new(9443)?))
 }
 
 /// Resolve cert_dir from CLI > config > env > default ("./certs").
@@ -172,4 +199,31 @@ pub fn resolve_no_otel(cli: bool, config: Option<bool>) -> bool {
         .ok()
         .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deployment_ports_reject_malformed_and_zero_values() {
+        assert!(parse_deploy_port("not-a-port", "WR_PEER_PORT").is_err());
+        assert!(parse_deploy_port("0", "WR_SSH_PORT").is_err());
+        assert!(optional_deploy_port(Some(0), "--peer-port").is_err());
+    }
+
+    #[test]
+    fn deployment_ports_accept_nonzero_values() {
+        assert_eq!(
+            parse_deploy_port("9443", "WR_PEER_PORT").unwrap().get(),
+            9443
+        );
+        assert_eq!(
+            optional_deploy_port(Some(22), "--ssh-port")
+                .unwrap()
+                .unwrap()
+                .get(),
+            22
+        );
+    }
 }

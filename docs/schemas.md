@@ -53,3 +53,9 @@ When the proxy receives a request with `x-wr-destination: http://ecommerce.inven
 Generated routers match the canonical path `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`; public ingress routes must use that path unless a manual wrapper handles a different public route.
 
 The proxy only inspects headers — it never reads, decodes, or validates the request or response body.
+
+The manager control API uses present/absent `google.protobuf.Timestamp` values for schedule `last_fired_at` and `next_fire_at`; absence is no longer encoded as an empty RFC3339 string. Generated clients should test field presence before formatting these timestamps.
+
+Job and schedule counts/durations use `uint32`. `SubmitJobRequest.timeout_secs` and `max_attempts` reserve zero as an explicit configured-default sentinel; schedule interval/timeout/attempt fields must be non-zero. `GetJobStatusResponse.status` is the closed `JobState` enum (`PENDING`, `RUNNING`, `COMPLETE`, `DEAD`) rather than a free-form string.
+
+These field-type changes intentionally break wire compatibility with older control-plane clients while the API remains pre-release. Upgrade managers, proxies, engines, and CLI clients together; mixed-version rolling upgrades are not supported for this transition.

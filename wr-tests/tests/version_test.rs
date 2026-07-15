@@ -55,6 +55,27 @@ async fn test_proxy_routes_to_explicit_version() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_proxy_rejects_invalid_version_requirement() -> Result<()> {
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (engine_addr, _stub) = spawn_identified_stub("engine-v1").await?;
+    register_test_module_ready(
+        &pool,
+        &mut mgr,
+        "e1",
+        &engine_addr,
+        "ver-ns",
+        "versioned-service",
+        "1.0.0",
+    )
+    .await?;
+    let proxy = start_proxy(synced_routing_table(&mgr_addr).await?).await?;
+
+    let (status, _) = proxy_get(proxy, "ver-ns", "versioned-service", Some("latest")).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_proxy_load_balances_across_versions_without_header() -> Result<()> {
     let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 

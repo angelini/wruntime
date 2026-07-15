@@ -20,6 +20,9 @@ impl HostTransaction for ModuleState {
             .table()
             .get(&self_)
             .map_err(|e| DbError::Connection(e.to_string()))?;
+        if state.done {
+            return Err(DbError::Query("transaction already completed".into()));
+        }
         query_rows(&state.client, sql.as_str(), params).await
     }
 
@@ -33,6 +36,9 @@ impl HostTransaction for ModuleState {
             .table()
             .get(&self_)
             .map_err(|e| DbError::Connection(e.to_string()))?;
+        if state.done {
+            return Err(DbError::Query("transaction already completed".into()));
+        }
         execute_statement(&state.client, sql.as_str(), params).await
     }
 
@@ -42,6 +48,13 @@ impl HostTransaction for ModuleState {
         sql: String,
         params: Vec<PgValue>,
     ) -> Result<Resource<CursorState>, DbError> {
+        let state = self
+            .table()
+            .get(&self_)
+            .map_err(|e| DbError::Connection(e.to_string()))?;
+        if state.done {
+            return Err(DbError::Query("transaction already completed".into()));
+        }
         let guard = self
             .db()?
             .accounting
@@ -67,6 +80,9 @@ impl HostTransaction for ModuleState {
             .table()
             .get(&self_)
             .map_err(|e| DbError::Connection(e.to_string()))?;
+        if state.done {
+            return Err(DbError::Query("transaction already completed".into()));
+        }
         state
             .client
             .execute("COMMIT", &[])
@@ -84,6 +100,9 @@ impl HostTransaction for ModuleState {
             .table()
             .get(&self_)
             .map_err(|e| DbError::Connection(e.to_string()))?;
+        if state.done {
+            return Err(DbError::Query("transaction already completed".into()));
+        }
         state
             .client
             .execute("ROLLBACK", &[])

@@ -7,6 +7,15 @@ use http_body_util::{BodyExt, Full};
 use std::time::Duration;
 use wr_common::config::Validatable;
 
+fn proto_job_state(state: wr_common::lifecycle::JobState) -> i32 {
+    match state {
+        wr_common::lifecycle::JobState::Pending => wr_common::wruntime::JobState::Pending as i32,
+        wr_common::lifecycle::JobState::Running => wr_common::wruntime::JobState::Running as i32,
+        wr_common::lifecycle::JobState::Complete => wr_common::wruntime::JobState::Complete as i32,
+        wr_common::lifecycle::JobState::Dead => wr_common::wruntime::JobState::Dead as i32,
+    }
+}
+
 #[tokio::test]
 async fn test_worker_config_parsing() {
     let toml_str = r#"
@@ -73,6 +82,49 @@ async fn test_worker_config_defaults() {
     assert_eq!(m.worker_poll_interval_secs, 2);
     assert_eq!(m.worker_job_timeout_secs, 300);
     assert_eq!(m.worker_max_attempts, 3);
+}
+
+#[tokio::test]
+async fn test_worker_config_rejects_zero_lifecycle_values() {
+    let toml_str = r#"
+        listen_address = "127.0.0.1:9100"
+        [node]
+        proxy_address = "http://127.0.0.1:9001"
+        control_address = "http://127.0.0.1:9002"
+        [node.tls]
+        cert_path = "c.crt"
+        key_path = "c.key"
+        ca_cert_path = "ca.crt"
+        [database]
+        url = "postgres://localhost/test"
+        [[module]]
+        name = "my-worker"
+        namespace = "test"
+        version = "1.0.0"
+        wasm_path = "wr-tests/guests/tracing-guest/target/wasm32-wasip2/debug/tracing_guest.wasm"
+        mode = "worker"
+        database = true
+        worker_concurrency = 0
+        worker_poll_interval_secs = 0
+        worker_job_timeout_secs = 0
+        worker_max_attempts = 0
+    "#;
+    let config: wr_engine::config::EngineConfig = toml::from_str(toml_str).unwrap();
+    let error = config
+        .validate()
+        .expect_err("zero worker lifecycle values must fail");
+    let message = format!("{error:#}");
+    for field in [
+        "worker_concurrency",
+        "worker_poll_interval_secs",
+        "worker_job_timeout_secs",
+        "worker_max_attempts",
+    ] {
+        assert!(
+            message.contains(field),
+            "missing validation for {field}: {message}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -179,11 +231,11 @@ async fn test_worker_job_submission_and_status_via_grpc() {
                                     let resp = match status {
                                         Some(s) => wr_common::wruntime::GetJobStatusResponse {
                                             job_id: s.job_id,
-                                            status: s.status,
+                                            status: proto_job_state(s.status),
                                             result: s.result,
                                             error_message: s.error_message,
-                                            attempt: s.attempt,
-                                            max_attempts: s.max_attempts,
+                                            attempt: s.attempt.get(),
+                                            max_attempts: s.max_attempts.get(),
                                         },
                                         None => wr_common::wruntime::GetJobStatusResponse {
                                             ..Default::default()
@@ -261,7 +313,10 @@ async fn test_worker_job_submission_and_status_via_grpc() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let status_resp = wr_common::wruntime::GetJobStatusResponse::decode(&body[..]).unwrap();
     assert_eq!(status_resp.job_id, submit_resp.job_id);
-    assert_eq!(status_resp.status, "pending");
+    assert_eq!(
+        status_resp.status,
+        wr_common::wruntime::JobState::Pending as i32
+    );
     assert_eq!(status_resp.max_attempts, 5);
 }
 
@@ -928,11 +983,11 @@ async fn test_worker_grpc_get_status_not_found() {
                                     .body(http_body_util::Full::new(bytes::Bytes::from(
                                         wr_common::wruntime::GetJobStatusResponse {
                                             job_id: s.job_id,
-                                            status: s.status,
+                                            status: proto_job_state(s.status),
                                             result: s.result,
                                             error_message: s.error_message,
-                                            attempt: s.attempt,
-                                            max_attempts: s.max_attempts,
+                                            attempt: s.attempt.get(),
+                                            max_attempts: s.max_attempts.get(),
                                         }
                                         .encode_to_vec(),
                                     )))

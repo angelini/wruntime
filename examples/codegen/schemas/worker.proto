@@ -16,13 +16,13 @@ message ProcessTaskRequest {
   string                 ref              = 4;
   repeated DocSourceSpec doc_sources      = 5;
   string                 task_description = 6;
-  int32                  max_agent_turns  = 7;
+  uint32                 max_agent_turns  = 7;
 }
 
 message ProcessTaskResponse {
   string unified_diff         = 1;
   string message              = 2;
-  int32  agent_turns          = 3;
-  int32  total_input_tokens   = 4;
-  int32  total_output_tokens  = 5;
+  uint32 agent_turns          = 3;
+  uint32 total_input_tokens   = 4;
+  uint32 total_output_tokens  = 5;
 }

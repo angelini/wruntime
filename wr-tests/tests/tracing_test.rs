@@ -1,5 +1,6 @@
 mod helpers;
 use helpers::wasm::tracing_state;
+use wr_engine::tracing::wruntime::tracing::span::AttributeValue;
 
 #[tokio::test]
 async fn test_tracing_span_start_and_drop() {
@@ -29,7 +30,7 @@ async fn test_tracing_span_set_attribute() {
         &mut state,
         wasmtime::component::Resource::new_borrow(rep),
         "db.table".into(),
-        "users".into(),
+        AttributeValue::Text("users".into()),
     )
     .await
     .expect("set_attribute");
@@ -50,7 +51,7 @@ async fn test_tracing_span_record_event() {
         &mut state,
         wasmtime::component::Resource::new_borrow(rep),
         "cache.miss".into(),
-        vec![("key".into(), "user:42".into())],
+        vec![("key".into(), AttributeValue::Text("user:42".into()))],
     )
     .await
     .expect("record_event");

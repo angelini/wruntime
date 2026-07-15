@@ -23,7 +23,11 @@ when it is absent. S3-backed tests use `WRT_TEST_S3_ENDPOINT`,
 `WRT_TEST_S3_ACCESS_KEY`, and `WRT_TEST_S3_SECRET_KEY`; direct S3-backed cargo
 tests require those variables because the current blobstore helper expects
 them. Required WASM artifacts must be built before direct WASM host binding
-test runs.
+test runs. The LLM guest protocol uses protobuf enums for stop reasons, stream
+events, and error kinds, while the DB guest protocol uses `oneof` parameter and
+column values rather than JSON strings. Positive-path tests can use `RpcPath`
+and `GuestHarness::dispatch_typed`; raw request helpers remain available for
+malformed-input coverage.
 
 WASM host binding tests require:
 

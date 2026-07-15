@@ -136,8 +136,8 @@ pub async fn submit_job(
         worker_version: schedule.worker_version.clone(),
         job_type: schedule.job_type.clone(),
         payload: schedule.payload.clone(),
-        timeout_secs: schedule.timeout_secs,
-        max_attempts: schedule.max_attempts,
+        timeout_secs: u32::try_from(schedule.timeout_secs)?,
+        max_attempts: u32::try_from(schedule.max_attempts)?,
     };
     let body = req.encode_to_vec();
 

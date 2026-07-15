@@ -214,6 +214,19 @@ impl GuestHarness {
         .await
     }
 
+    pub async fn dispatch_typed<Req, Resp>(
+        &self,
+        state: ModuleState,
+        path: RpcPath,
+        request: Req,
+    ) -> Result<Resp>
+    where
+        Req: prost::Message,
+        Resp: prost::Message + Default,
+    {
+        self.dispatch_decode(state, path.as_str(), request).await
+    }
+
     pub async fn dispatch_decode<Req, Resp>(
         &self,
         state: ModuleState,
@@ -232,6 +245,23 @@ impl GuestHarness {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RpcPath(&'static str);
+
+impl RpcPath {
+    pub fn new(path: &'static str) -> Result<Self> {
+        if !path.starts_with('/') || path.chars().any(char::is_whitespace) {
+            bail!("invalid RPC path: {path}");
+        }
+        Ok(Self(path))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+/// Raw request escape hatch for malformed-request tests.
 pub fn rpc_request(path: &str, body: Vec<u8>) -> http::Request<Bytes> {
     http::Request::builder()
         .method("POST")

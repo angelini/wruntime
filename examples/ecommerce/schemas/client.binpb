@@ -3,8 +3,8 @@
 client.proto	ecommerce""
 
 RunRequest
-count (Rcount"+
+count (Rcount"+
 RunResponse
-	completed (R	completed2E
+	completed (R	completed2E
 ClientService4
 Run.ecommerce.RunRequest.ecommerce.RunResponsebproto3

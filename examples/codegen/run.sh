@@ -72,7 +72,7 @@ if [ "$INLINE" = true ]; then
 		--proxy http://127.0.0.1:9001 \
 		--destination http://codegen.coordinator/codegen.CoordinatorService/CreateTask \
 		--source test --source-ns codegen \
-		--body '{"repo_url":"https://github.com/dtolnay/anyhow","doc_sources":[{"source_type":"docs_rs","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}')
+		--body '{"repo_url":"https://github.com/dtolnay/anyhow","doc_sources":[{"source_type":"DOC_SOURCE_TYPE_DOCS_RS","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}')
 	echo "$CREATE_OUTPUT"
 
 	TASK_ID=$(printf '%s\n' "$CREATE_OUTPUT" | json_field taskId)
@@ -90,11 +90,11 @@ if [ "$INLINE" = true ]; then
 		fi
 		STATUS=$(printf '%s\n' "$TASK_OUTPUT" | json_field status)
 		case "$STATUS" in
-		complete)
+		complete | TASK_STATUS_COMPLETE)
 			echo "$TASK_OUTPUT"
 			exit 0
 			;;
-		error)
+		error | TASK_STATUS_ERROR)
 			echo "$TASK_OUTPUT"
 			exit 1
 			;;

@@ -6,9 +6,9 @@ service SimulatorService {
 }
 
 message SimRunRequest {
-  int32 num_traders       = 1;
-  int32 orders_per_trader = 2;
-  int32 num_symbols       = 3;
+  uint32 num_traders       = 1; // 0 means default 1
+  uint32 orders_per_trader = 2; // 0 means default 1
+  uint32 num_symbols       = 3; // 0 means default 1
 }
 
 message SimRunResponse {
@@ -17,5 +17,5 @@ message SimRunResponse {
   int64  total_volume          = 3;
   bool   ledger_valid          = 4;
   string verification_details  = 5;
-  int32  errors                = 6;
+  uint32 errors                = 6;
 }

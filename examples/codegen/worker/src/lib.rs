@@ -39,7 +39,7 @@ impl proto::WorkerService for Component {
         // Phase 1: Collect docs + source code.
         let _ = coordinator.update_task_status(proto::UpdateTaskStatusRequest {
             task_id: task_id.clone(),
-            status: "collecting".into(),
+            status: proto::TaskStatus::Collecting as i32,
         });
 
         let collect_span = tracing::start("worker.collect_docs", &[("task.id", task_id.as_str())]);
@@ -59,7 +59,7 @@ impl proto::WorkerService for Component {
         if !req.repo_url.is_empty() {
             if let Some((owner, repo)) = parse_github_url(&req.repo_url) {
                 sources.push(proto::DocSourceSpec {
-                    source_type: "github_tarball".into(),
+                    source_type: proto::DocSourceType::GithubTarball as i32,
                     owner,
                     repo,
                     ref_or_ver: req.r#ref.clone(),
@@ -71,7 +71,7 @@ impl proto::WorkerService for Component {
         let collector_sources = sources
             .iter()
             .map(|s| proto::DocSource {
-                source_type: s.source_type.clone(),
+                source_type: s.source_type,
                 owner: s.owner.clone(),
                 repo: s.repo.clone(),
                 ref_or_ver: s.ref_or_ver.clone(),
@@ -106,7 +106,7 @@ impl proto::WorkerService for Component {
         // Phase 2: Run agent.
         let _ = coordinator.update_task_status(proto::UpdateTaskStatusRequest {
             task_id: task_id.clone(),
-            status: "generating".into(),
+            status: proto::TaskStatus::Generating as i32,
         });
 
         let agent_span = wr_sdk::span!("worker.run_agent", "task.id" => task_id.as_str(), "agent.max_turns" => req.max_agent_turns);
@@ -133,7 +133,7 @@ impl proto::WorkerService for Component {
         // Store result via coordinator.
         let _ = coordinator.complete_task(proto::CompleteTaskRequest {
             task_id: task_id.clone(),
-            status: "complete".into(),
+            status: proto::TaskStatus::Complete as i32,
             unified_diff: agent_resp.unified_diff.clone(),
             message: agent_resp.message.clone(),
             agent_turns: agent_resp.turns_used,
@@ -159,7 +159,7 @@ fn fail_task(coordinator: &CoordinatorServiceClient, task_id: &str, message: &st
     wr_sdk::log::log(&format!("task {} failed: {}", task_id, message));
     let _ = coordinator.complete_task(proto::CompleteTaskRequest {
         task_id: task_id.into(),
-        status: "error".into(),
+        status: proto::TaskStatus::Error as i32,
         message: message.into(),
         ..Default::default()
     });

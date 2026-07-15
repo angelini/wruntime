@@ -187,11 +187,11 @@ async fn handle_mock_llm_request(
 /// Build an `LlmRuntime` pointing at the given mock base URL.
 pub fn mock_llm_runtime(base_url: &str) -> Arc<LlmRuntime> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    use wr_engine::config::LlmConfig;
+    use wr_engine::config::{LlmConfig, LlmProvider};
     // Set a temp env var for the API key
     std::env::set_var("WRT_TEST_LLM_KEY", "mock-key");
     let config = LlmConfig {
-        provider: "anthropic".into(),
+        provider: LlmProvider::Anthropic,
         api_key_env: "WRT_TEST_LLM_KEY".into(),
         base_url: base_url.into(),
         max_tokens_limit: 8192,

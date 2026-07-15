@@ -114,6 +114,8 @@ All fields are optional. Fields that only apply to specific commands (e.g. `secr
 | `--cert-dir` | `WR_CERT_DIR` | — |
 | `--peer-port` | `WR_PEER_PORT` | `9443` |
 
+Deployment ports must be valid non-zero TCP ports. Malformed or zero CLI/config/environment values fail immediately; defaults apply only when a value is absent. Likewise, malformed ports in source manager, proxy, or engine addresses fail bundle/deploy generation instead of becoming port `0`.
+
 ## Template variables
 
 Config files use placeholders that are resolved at deploy time:
@@ -285,7 +287,7 @@ echo "deploy ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/deploy
 Both `managers deploy` and `node deploy` accept:
 
 - `--ssh-key <PATH>` — private key for authentication (env: `WR_SSH_KEY`, config: `ssh_key`)
-- `--ssh-port <PORT>` — SSH port (env: `WR_SSH_PORT`, config: `ssh_port`)
+- `--ssh-port <PORT>` — non-zero SSH port (env: `WR_SSH_PORT`, config: `ssh_port`); malformed configured values are errors
 
 ## NAT / port-forwarding environments
 

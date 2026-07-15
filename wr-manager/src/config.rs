@@ -1,31 +1,36 @@
+use std::num::NonZeroU64;
+
 use anyhow::Result;
 use serde::Deserialize;
 use wr_common::node::TlsConfig;
 
-#[derive(Deserialize, Clone)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeartbeatTimeoutSecs(NonZeroU64);
+
+impl HeartbeatTimeoutSecs {
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone)]
 pub struct ManagerConfig {
     /// gRPC listen address, e.g. "0.0.0.0:9000"
     pub listen_address: String,
     /// How long (seconds) without a heartbeat before an engine is considered unhealthy
-    #[serde(default = "default_heartbeat_timeout")]
     pub engine_heartbeat_timeout_secs: u64,
     /// How long (seconds) without a per-module heartbeat before that module's
-    /// routes are marked unhealthy. Optional in config; when omitted it is
-    /// filled from `engine_heartbeat_timeout_secs` in `load()`.
-    #[serde(default)]
-    pub module_heartbeat_timeout_secs: Option<u64>,
+    /// routes are marked unhealthy.
+    pub module_heartbeat_timeout_secs: HeartbeatTimeoutSecs,
     /// Loopback proxy address the scheduler POSTs jobs to, e.g.
     /// "http://127.0.0.1:9001". REQUIRED — startup fails if unset or empty.
     pub local_proxy_address: String,
     /// How long (seconds) a claimed schedule lease is held before another manager
     /// may reclaim it. Must exceed worst-case per-tick submission time.
-    #[serde(default = "default_scheduler_lease_secs")]
     pub scheduler_lease_secs: u64,
     /// Base backoff (seconds) for a failed submission; doubles per consecutive failure.
-    #[serde(default = "default_scheduler_retry_base_secs")]
     pub scheduler_retry_base_secs: u64,
     /// Maximum backoff (seconds) cap for consecutive failures.
-    #[serde(default = "default_scheduler_retry_cap_secs")]
     pub scheduler_retry_cap_secs: u64,
     /// PostgreSQL connection pool configuration.
     pub database: DatabaseConfig,
@@ -81,28 +86,32 @@ fn default_max_connections() -> usize {
     10
 }
 
-impl wr_common::config::Validatable for ManagerConfig {
+#[derive(Deserialize, Clone)]
+pub struct RawManagerConfig {
+    pub listen_address: String,
+    #[serde(default = "default_heartbeat_timeout")]
+    pub engine_heartbeat_timeout_secs: u64,
+    #[serde(default)]
+    pub module_heartbeat_timeout_secs: Option<u64>,
+    pub local_proxy_address: String,
+    #[serde(default = "default_scheduler_lease_secs")]
+    pub scheduler_lease_secs: u64,
+    #[serde(default = "default_scheduler_retry_base_secs")]
+    pub scheduler_retry_base_secs: u64,
+    #[serde(default = "default_scheduler_retry_cap_secs")]
+    pub scheduler_retry_cap_secs: u64,
+    pub database: DatabaseConfig,
+    pub cluster: ClusterConfig,
+    pub tls: TlsConfig,
+}
+
+impl wr_common::config::Validatable for RawManagerConfig {
     fn validate(&self) -> Result<()> {
         self.validate_inner()
     }
 }
 
-impl ManagerConfig {
-    pub fn load(path: &str) -> Result<Self> {
-        let mut config: Self = wr_common::config::load(path)?;
-        config.normalize();
-        Ok(config)
-    }
-
-    /// Fill cross-field defaults that cannot be expressed as serde field
-    /// defaults. `module_heartbeat_timeout_secs` defaults to
-    /// `engine_heartbeat_timeout_secs` when omitted from config.
-    fn normalize(&mut self) {
-        if self.module_heartbeat_timeout_secs.is_none() {
-            self.module_heartbeat_timeout_secs = Some(self.engine_heartbeat_timeout_secs);
-        }
-    }
-
+impl RawManagerConfig {
     fn validate_inner(&self) -> Result<()> {
         use wr_common::config::Validator;
         let mut v = Validator::new();
@@ -155,5 +164,38 @@ impl ManagerConfig {
         );
 
         v.finish()
+    }
+}
+
+impl TryFrom<RawManagerConfig> for ManagerConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(raw: RawManagerConfig) -> Result<Self> {
+        let module_timeout = raw
+            .module_heartbeat_timeout_secs
+            .unwrap_or(raw.engine_heartbeat_timeout_secs);
+        let module_heartbeat_timeout_secs = NonZeroU64::new(module_timeout)
+            .map(HeartbeatTimeoutSecs)
+            .ok_or_else(|| anyhow::anyhow!("module_heartbeat_timeout_secs must be > 0"))?;
+
+        Ok(Self {
+            listen_address: raw.listen_address,
+            engine_heartbeat_timeout_secs: raw.engine_heartbeat_timeout_secs,
+            module_heartbeat_timeout_secs,
+            local_proxy_address: raw.local_proxy_address,
+            scheduler_lease_secs: raw.scheduler_lease_secs,
+            scheduler_retry_base_secs: raw.scheduler_retry_base_secs,
+            scheduler_retry_cap_secs: raw.scheduler_retry_cap_secs,
+            database: raw.database,
+            cluster: raw.cluster,
+            tls: raw.tls,
+        })
+    }
+}
+
+impl ManagerConfig {
+    pub fn load(path: &str) -> Result<Self> {
+        let raw: RawManagerConfig = wr_common::config::load(path)?;
+        raw.try_into()
     }
 }

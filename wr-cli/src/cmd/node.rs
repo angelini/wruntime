@@ -170,7 +170,7 @@ fn add_engine_artifacts(
         };
 
         // Write the template-ized config into the bundle
-        let bundle_config = config.to_bundle_config();
+        let bundle_config = config.to_bundle_config()?;
         bundle::tar_add_bytes(
             tar,
             &format!("wr-node/config/{config_name}"),
@@ -179,7 +179,7 @@ fn add_engine_artifacts(
         )?;
         config_names.push(config_name.clone());
 
-        engine_listen_ports.push(helpers::extract_port(&config.listen_address));
+        engine_listen_ports.push(helpers::extract_port(&config.listen_address)?.get());
 
         let engine_name = Path::new(path)
             .file_stem()
@@ -271,10 +271,10 @@ fn add_proxy_config(
             .node
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("--proxy-config requires node"))?;
-        let proxy_port = helpers::extract_port(&source.listen_address);
-        let control_port = helpers::extract_port(control_address);
+        let proxy_port = helpers::extract_port(&source.listen_address)?.get();
+        let control_port = helpers::extract_port(control_address)?.get();
         let artifact_peer_port = node.peer_port.unwrap_or(fallback_artifact_peer_port);
-        let proxy = source.to_bundle_config();
+        let proxy = source.to_bundle_config()?;
         bundle::tar_add_bytes(
             tar,
             "wr-node/config/proxy.toml",
@@ -289,8 +289,8 @@ fn add_proxy_config(
     let first = &all_engine_configs[0].1;
     let (proxy_port, control_port) = if let Some(ref node) = first.node {
         (
-            helpers::extract_port(&node.proxy_address),
-            helpers::extract_port(&node.control_address),
+            helpers::extract_port(&node.proxy_address)?.get(),
+            helpers::extract_port(&node.control_address)?.get(),
         )
     } else {
         (9001u16, 9002u16)
@@ -331,7 +331,7 @@ fn add_proxy_config(
     bundle::tar_add_bytes(
         tar,
         "wr-node/config/proxy.toml",
-        proxy.to_bundle_config().to_toml()?.as_bytes(),
+        proxy.to_bundle_config()?.to_toml()?.as_bytes(),
         0o644,
     )?;
     config_names.push("proxy.toml".to_string());
@@ -520,7 +520,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         "WR_IMAGE_PREFIX",
     );
     let no_otel = deploy_config::resolve_no_otel(args.no_otel, deploy_cfg.no_otel);
-    let peer_port = deploy_config::resolve_peer_port(args.peer_port, deploy_cfg.peer_port);
+    let peer_port = deploy_config::resolve_peer_port(args.peer_port, deploy_cfg.peer_port)?.get();
     let proxy_config_path = deploy_config::resolve_string(
         args.proxy_config,
         deploy_cfg.proxy_config,
@@ -737,9 +737,10 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
     let db_url =
         deploy_config::resolve_required(args.db_url, deploy_cfg.db_url, "WR_DB_URL", "db_url")?;
     let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key, "WR_SSH_KEY");
-    let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port);
+    let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port)?
+        .map(helpers::DeployPort::get);
     let cert_dir = deploy_config::resolve_cert_dir(&args.cert_dir, deploy_cfg.cert_dir);
-    let peer_port = deploy_config::resolve_peer_port(args.peer_port, deploy_cfg.peer_port);
+    let peer_port = deploy_config::resolve_peer_port(args.peer_port, deploy_cfg.peer_port)?.get();
 
     let manifest: Manifest = bundle::read_manifest(&args.bundle)?;
     let configs = bundle::read_configs_from_tarball(&args.bundle)?;

@@ -1,4 +1,66 @@
+use std::num::NonZeroU32;
+use std::time::Duration;
+
 use crate::http::{HttpError, HttpRequest, Method};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobState {
+    Pending,
+    Running,
+    Complete,
+    Dead,
+}
+impl JobState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Complete => "complete",
+            Self::Dead => "dead",
+        }
+    }
+}
+impl std::fmt::Display for JobState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxAttempts(NonZeroU32);
+impl MaxAttempts {
+    pub fn new(value: u32) -> Result<Self, HttpError> {
+        NonZeroU32::new(value)
+            .map(Self)
+            .ok_or_else(|| HttpError::InvalidRequest("max_attempts must be > 0".into()))
+    }
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobTimeout(Duration);
+impl JobTimeout {
+    pub fn new(value: Duration) -> Result<Self, HttpError> {
+        if value.as_secs() == 0 || value.as_secs() > u32::MAX as u64 || value.subsec_nanos() != 0 {
+            Err(HttpError::InvalidRequest(
+                "job timeout must be a whole number of seconds in 1..=u32::MAX".into(),
+            ))
+        } else {
+            Ok(Self(value))
+        }
+    }
+    pub fn seconds(self) -> u32 {
+        self.0.as_secs() as u32
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct JobOptions {
+    pub timeout: Option<JobTimeout>,
+    pub max_attempts: Option<MaxAttempts>,
+}
 
 const SUBMIT_JOB_PATH: &str = "/wruntime.WorkerService/SubmitJob";
 const GET_JOB_STATUS_PATH: &str = "/wruntime.WorkerService/GetJobStatus";
@@ -41,6 +103,29 @@ pub fn submit_job_with_options(
     timeout_secs: i32,
     max_attempts: i32,
 ) -> Result<String, HttpError> {
+    if timeout_secs < 0 || max_attempts < 0 {
+        return Err(HttpError::InvalidRequest(
+            "job timeout and max_attempts cannot be negative".into(),
+        ));
+    }
+    let options = JobOptions {
+        timeout: (timeout_secs > 0)
+            .then(|| JobTimeout::new(Duration::from_secs(timeout_secs as u64)))
+            .transpose()?,
+        max_attempts: (max_attempts > 0)
+            .then(|| MaxAttempts::new(max_attempts as u32))
+            .transpose()?,
+    };
+    submit_job_with_typed_options(engine_authority, worker_version, job_type, payload, options)
+}
+
+pub fn submit_job_with_typed_options(
+    engine_authority: &str,
+    worker_version: &str,
+    job_type: &str,
+    payload: &[u8],
+    options: JobOptions,
+) -> Result<String, HttpError> {
     // Parse namespace.name from the authority.
     let (namespace, name) = engine_authority.split_once('.').ok_or_else(|| {
         HttpError::Transport(format!(
@@ -54,8 +139,11 @@ pub fn submit_job_with_options(
         worker_version,
         job_type,
         payload,
-        timeout_secs,
-        max_attempts,
+        options.timeout.map(JobTimeout::seconds).unwrap_or_default(),
+        options
+            .max_attempts
+            .map(MaxAttempts::get)
+            .unwrap_or_default(),
     );
     let headers = submit_job_headers(worker_version);
     let resp = crate::http::http_request(&HttpRequest {
@@ -100,11 +188,11 @@ pub fn get_job_status(engine_authority: &str, job_id: &str) -> Result<JobStatus,
 /// Status of a worker job.
 pub struct JobStatus {
     pub job_id: String,
-    pub status: String,
+    pub status: JobState,
     pub result: Vec<u8>,
     pub error_message: String,
-    pub attempt: i32,
-    pub max_attempts: i32,
+    pub attempt: u32,
+    pub max_attempts: u32,
 }
 
 // ── Minimal protobuf encoding/decoding (no prost dependency) ────────────────
@@ -139,10 +227,10 @@ fn encode_bytes_field(field: u32, data: &[u8], buf: &mut Vec<u8>) {
     }
 }
 
-fn encode_int32_field(field: u32, val: i32, buf: &mut Vec<u8>) {
+fn encode_uint32_field(field: u32, val: u32, buf: &mut Vec<u8>) {
     if val != 0 {
         encode_varint((field as u64) << 3, buf); // wire type 0 = varint
-        encode_varint(val as u32 as u64, buf);
+        encode_varint(val as u64, buf);
     }
 }
 
@@ -152,8 +240,8 @@ fn encode_submit_job_request(
     worker_version: &str,
     job_type: &str,
     payload: &[u8],
-    timeout_secs: i32,
-    max_attempts: i32,
+    timeout_secs: u32,
+    max_attempts: u32,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     // field 1: worker_namespace
@@ -167,9 +255,9 @@ fn encode_submit_job_request(
     // field 5: payload
     encode_bytes_field(5, payload, &mut buf);
     // field 6: timeout_secs
-    encode_int32_field(6, timeout_secs, &mut buf);
+    encode_uint32_field(6, timeout_secs, &mut buf);
     // field 7: max_attempts
-    encode_int32_field(7, max_attempts, &mut buf);
+    encode_uint32_field(7, max_attempts, &mut buf);
     buf
 }
 
@@ -285,7 +373,16 @@ fn decode_bytes_field(data: &[u8], target_field: u32) -> Result<Vec<u8>, HttpErr
     Ok(Vec::new())
 }
 
-fn decode_int32_field(data: &[u8], target_field: u32) -> Result<i32, HttpError> {
+#[cfg(test)]
+fn encode_int32_field(field: u32, value: i32, buffer: &mut Vec<u8>) {
+    encode_uint32_field(
+        field,
+        u32::try_from(value).expect("test value must be nonnegative"),
+        buffer,
+    );
+}
+
+fn decode_uint32_field(data: &[u8], target_field: u32) -> Result<u32, HttpError> {
     let mut pos = 0;
     while pos < data.len() {
         let tag = decode_varint(data, &mut pos)?;
@@ -301,12 +398,19 @@ fn decode_int32_field(data: &[u8], target_field: u32) -> Result<i32, HttpError> 
                     "field {target_field} has wire type {wire_type}, expected 0"
                 )));
             }
-            return Ok(decode_varint(data, &mut pos)? as i32);
+            return u32::try_from(decode_varint(data, &mut pos)?)
+                .map_err(|_| HttpError::Decode(format!("field {target_field} exceeds u32")));
         }
 
         skip_field(data, &mut pos, wire_type)?;
     }
     Ok(0)
+}
+
+#[cfg(test)]
+fn decode_int32_field(data: &[u8], target_field: u32) -> Result<i32, HttpError> {
+    i32::try_from(decode_uint32_field(data, target_field)?)
+        .map_err(|_| HttpError::Decode(format!("field {target_field} exceeds i32")))
 }
 
 fn decode_submit_job_response(data: &[u8]) -> Result<String, HttpError> {
@@ -319,23 +423,39 @@ fn decode_job_status_response(data: &[u8]) -> Result<JobStatus, HttpError> {
     let job_id = decode_string_field(data, 1)?
         .filter(|job_id| !job_id.is_empty())
         .ok_or_else(|| HttpError::Decode("missing job_id in response".into()))?;
-    let status = decode_string_field(data, 2)?
-        .filter(|status| !status.is_empty())
-        .ok_or_else(|| HttpError::Decode("missing status in response".into()))?;
+    let status = match decode_uint32_field(data, 2)? {
+        1 => JobState::Pending,
+        2 => JobState::Running,
+        3 => JobState::Complete,
+        4 => JobState::Dead,
+        value => return Err(HttpError::Decode(format!("unknown job state {value}"))),
+    };
 
     Ok(JobStatus {
         job_id,
         status,
         result: decode_bytes_field(data, 3)?,
         error_message: decode_string_field(data, 4)?.unwrap_or_default(),
-        attempt: decode_int32_field(data, 5)?,
-        max_attempts: decode_int32_field(data, 6)?,
+        attempt: decode_uint32_field(data, 5)?,
+        max_attempts: decode_uint32_field(data, 6)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_job_options_reject_invalid_values() {
+        assert!(MaxAttempts::new(0).is_err());
+        assert!(JobTimeout::new(Duration::ZERO).is_err());
+        assert!(JobTimeout::new(Duration::from_millis(1)).is_err());
+        assert!(JobTimeout::new(Duration::from_millis(1_500)).is_err());
+        assert!(matches!(
+            submit_job_with_options("ns.worker", "1.0.0", "/Run", &[], -1, 3),
+            Err(HttpError::InvalidRequest(_))
+        ));
+    }
 
     #[test]
     fn test_worker_management_paths_are_canonical() {
@@ -502,7 +622,7 @@ mod tests {
         // Manually build a protobuf with all 6 fields.
         let mut buf = Vec::new();
         buf.extend_from_slice(&encode_string_field(1, "job-123"));
-        buf.extend_from_slice(&encode_string_field(2, "complete"));
+        encode_uint32_field(2, 3, &mut buf);
         encode_bytes_field(3, b"result-bytes", &mut buf);
         buf.extend_from_slice(&encode_string_field(4, ""));
         encode_int32_field(5, 2, &mut buf);
@@ -510,7 +630,7 @@ mod tests {
 
         let status = decode_job_status_response(&buf).unwrap();
         assert_eq!(status.job_id, "job-123");
-        assert_eq!(status.status, "complete");
+        assert_eq!(status.status, JobState::Complete);
         assert_eq!(status.result, b"result-bytes");
         assert_eq!(status.error_message, "");
         assert_eq!(status.attempt, 2);
@@ -537,11 +657,11 @@ mod tests {
     fn test_decode_job_status_defaults_absent_detail_fields() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&encode_string_field(1, "job-123"));
-        buf.extend_from_slice(&encode_string_field(2, "pending"));
+        encode_uint32_field(2, 1, &mut buf);
 
         let status = decode_job_status_response(&buf).unwrap();
         assert_eq!(status.job_id, "job-123");
-        assert_eq!(status.status, "pending");
+        assert_eq!(status.status, JobState::Pending);
         assert!(status.result.is_empty());
         assert_eq!(status.error_message, "");
         assert_eq!(status.attempt, 0);

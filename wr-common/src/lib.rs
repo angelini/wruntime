@@ -11,6 +11,8 @@ pub mod discovery;
 pub mod http_headers;
 #[cfg(feature = "http-pool")]
 pub mod http_pool;
+pub mod identity;
+pub mod lifecycle;
 pub mod naming;
 pub mod node;
 #[cfg(feature = "pool")]
