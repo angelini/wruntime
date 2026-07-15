@@ -1,7 +1,10 @@
 mod helpers;
 use helpers::{
-    manager::{manager_trio, register_test_module, synced_routing_table},
-    proxy::{http_client, proxy_get, register_module, start_proxy_with_cb, EngineSpec, ModuleSpec},
+    manager::{
+        manager_trio, register_test_module_ready, register_test_module_ready_with_peer,
+        synced_routing_table,
+    },
+    proxy::{http_client, proxy_get, start_proxy_with_cb, EngineSpec, ModuleSpec},
     stubs::{spawn_status_stub, spawn_stub_engine, spawn_switchable_stub},
     wasm::minimal_file_descriptor_set,
 };
@@ -17,13 +20,14 @@ use wr_proxy::config::CircuitBreakerConfig;
 /// requests are rejected with 503 + `Retry-After` without reaching the engine.
 #[tokio::test]
 async fn test_circuit_breaker_opens_after_consecutive_failures() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     // Stub engine that always returns 500.
     let (engine_addr, engine_shutdown) =
         spawn_status_stub(StatusCode::INTERNAL_SERVER_ERROR).await?;
 
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "cb-e1",
         &engine_addr,
@@ -68,12 +72,13 @@ async fn test_circuit_breaker_opens_after_consecutive_failures() -> Result<()> {
 /// proxy, the circuit opens and rejects with 503 without attempting a forward.
 #[tokio::test]
 async fn test_circuit_breaker_opens_for_remote_peer() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     // peer_address ("https://127.0.0.1:1") differs from the proxy's self peer
     // address (TEST_SELF_PEER) → make_destination yields RemoteProxy; the peer
     // is unreachable so every forward fails.
-    register_module(
+    register_test_module_ready_with_peer(
+        &pool,
         &mut mgr,
         EngineSpec {
             id: "cb-remote-e1",
@@ -121,12 +126,13 @@ async fn test_circuit_breaker_opens_for_remote_peer() -> Result<()> {
 /// configured `open_duration_secs`.
 #[tokio::test]
 async fn test_circuit_breaker_retry_after_header() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (engine_addr, engine_shutdown) =
         spawn_status_stub(StatusCode::INTERNAL_SERVER_ERROR).await?;
 
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "cb-retry-e1",
         &engine_addr,
@@ -178,11 +184,12 @@ async fn test_circuit_breaker_retry_after_header() -> Result<()> {
 /// 429 Too Many Requests counts as a failure and can trip the circuit.
 #[tokio::test]
 async fn test_circuit_breaker_429_counts_as_failure() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (engine_addr, engine_shutdown) = spawn_status_stub(StatusCode::TOO_MANY_REQUESTS).await?;
 
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "cb-429-e1",
         &engine_addr,
@@ -223,11 +230,12 @@ async fn test_circuit_breaker_429_counts_as_failure() -> Result<()> {
 /// Successful responses keep the circuit closed — no spurious opens.
 #[tokio::test]
 async fn test_circuit_breaker_stays_closed_on_success() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
 
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "cb-ok-e1",
         &engine_addr,
@@ -262,12 +270,13 @@ async fn test_circuit_breaker_stays_closed_on_success() -> Result<()> {
 /// probe closes the circuit and restores normal traffic.
 #[tokio::test]
 async fn test_circuit_breaker_half_open_recovery() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     // Start with a switchable stub returning 500.
     let (engine_addr, engine_shutdown, status_ctl) = spawn_switchable_stub(500).await?;
 
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "cb-ho-e1",
         &engine_addr,
@@ -318,7 +327,7 @@ async fn test_circuit_breaker_half_open_recovery() -> Result<()> {
 /// Circuit breakers are per-engine: one failing engine doesn't affect another.
 #[tokio::test]
 async fn test_circuit_breaker_per_engine_isolation() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     // Engine A: always fails.
     let (engine_a_addr, engine_a_shutdown) =
@@ -326,7 +335,8 @@ async fn test_circuit_breaker_per_engine_isolation() -> Result<()> {
     // Engine B: always succeeds (different module in same namespace).
     let (engine_b_addr, engine_b_shutdown) = spawn_stub_engine().await?;
 
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "cb-iso-ea",
         &engine_a_addr,
@@ -335,7 +345,8 @@ async fn test_circuit_breaker_per_engine_isolation() -> Result<()> {
         "1.0.0",
     )
     .await?;
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "cb-iso-eb",
         &engine_b_addr,

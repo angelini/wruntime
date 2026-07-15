@@ -191,7 +191,7 @@ impl proto::{{ServiceName}} for Component {
 
 If your module uses `database = true`, create a `migrations/` directory with SQL files following the [refinery](https://github.com/rust-db/refinery) naming convention: `V{version}__{description}.sql` (double underscore).
 
-Migrations run on the **engine (host side)** at startup, before the WASM module loads and before any traffic is routed. You do **not** need `CREATE TABLE IF NOT EXISTS` in your guest code.
+Migrations run on the **engine (host side)** at startup, before the WASM module loads and before the module becomes routable. Default routes remain unhealthy until readiness heartbeat and manager recompute. You do **not** need `CREATE TABLE IF NOT EXISTS` in your guest code.
 
 ```
 migrations/
@@ -216,7 +216,7 @@ Key rules:
 - Migrations can only modify your module's own schema — `search_path` is restricted to the module's schema at migration time.
 - An advisory lock prevents concurrent migration execution across engine replicas.
 - Already-applied migrations are skipped automatically (tracked in `refinery_schema_history` table).
-- If a migration fails, the engine exits before registering routing rules — no traffic reaches the module.
+- If a migration fails, the engine exits before the module becomes routable; default routes remain unhealthy, so no traffic reaches the module.
 
 ## engine.toml entry
 

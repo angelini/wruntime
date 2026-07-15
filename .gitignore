@@ -3,6 +3,7 @@
 .pi-subagents
 .wr-dev.pid
 bindings.rs
+!wr-engine/src/db/bindings.rs
 observability
 target
 wr-deploy.toml

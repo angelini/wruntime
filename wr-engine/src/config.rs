@@ -243,7 +243,9 @@ pub struct ModuleConfig {
     #[serde(default)]
     pub cwasm_path: Option<String>,
     /// Path to a compiled `FileDescriptorSet` binary for this module's API.
-    /// Optional — modules may omit this if they don't expose a schema.
+    /// The first config occurrence of each unique (namespace, name, version)
+    /// tuple must provide a non-empty existing schema path. Later duplicate
+    /// instances may omit it; if present, it is still validated.
     #[serde(default)]
     pub schema_path: Option<String>,
     /// Whether this module has access to the shared database pool.
@@ -358,6 +360,7 @@ impl EngineConfig {
             "node.control_address is required",
         );
 
+        let mut first_seen_modules = std::collections::HashSet::<(String, String, String)>::new();
         for module in &self.modules {
             let m = &module.name;
             v.check(!module.name.is_empty(), "module.name is required");
@@ -367,11 +370,34 @@ impl EngineConfig {
                 std::path::Path::new(&module.wasm_path).exists(),
                 format!("wasm_path not found for module '{m}': {}", module.wasm_path),
             );
-            if let Some(ref schema_path) = module.schema_path {
-                v.check(
-                    std::path::Path::new(schema_path).exists(),
-                    format!("schema_path not found for module '{m}': {schema_path}"),
-                );
+            let first_occurrence = first_seen_modules.insert((
+                module.namespace.clone(),
+                module.name.clone(),
+                module.version.clone(),
+            ));
+            match module.schema_path.as_deref() {
+                Some(schema_path) if schema_path.trim().is_empty() => {
+                    v.check(
+                        false,
+                        format!("schema_path for module '{m}' must not be empty"),
+                    );
+                }
+                Some(schema_path) => {
+                    v.check(
+                        std::path::Path::new(schema_path).exists(),
+                        format!("schema_path not found for module '{m}': {schema_path}"),
+                    );
+                }
+                None if first_occurrence => {
+                    v.check(
+                        false,
+                        format!(
+                            "schema_path is required for first occurrence of module '{m}' in namespace '{}' version '{}'",
+                            module.namespace, module.version
+                        ),
+                    );
+                }
+                None => {}
             }
             v.check(
                 !module.database || self.database.is_some(),

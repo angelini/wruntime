@@ -1,7 +1,7 @@
 mod helpers;
 use helpers::{
     db::{db_state_for_module, DbHost, PgValue},
-    manager::{manager_trio, register_test_module, synced_routing_table},
+    manager::{manager_trio, register_test_module_ready, synced_routing_table},
     proxy::{http_client, proxy_get, start_proxy, TEST_SELF_PEER},
     stubs::spawn_identified_stub,
     wasm::invalid_protobuf,
@@ -16,12 +16,13 @@ use wr_common::wruntime::{EngineRegistration, ModuleDescriptor, RegisterEngineRe
 #[tokio::test]
 async fn test_proxy_namespaces_are_isolated() -> Result<()> {
     // Two engines host the same module name in different namespaces.
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e_alpha_addr, e_alpha_shutdown) = spawn_identified_stub("engine-alpha").await?;
     let (e_beta_addr, e_beta_shutdown) = spawn_identified_stub("engine-beta").await?;
 
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "ea",
         &e_alpha_addr,
@@ -30,7 +31,8 @@ async fn test_proxy_namespaces_are_isolated() -> Result<()> {
         "1.0.0",
     )
     .await?;
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "eb",
         &e_beta_addr,

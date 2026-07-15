@@ -1,17 +1,18 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use tokio::net::TcpListener;
 use tonic::transport::Server;
 
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, manager_service_server::ManagerServiceServer,
-    GetRoutingTableRequest,
+    EngineRegistration, GetRoutingTableRequest, HeartbeatRequest, ModuleDescriptor,
+    RegisterEngineRequest,
 };
 use wr_manager::service::Manager;
 
 use super::db::manager_pool;
-use super::proxy::{register_module, EngineSpec, ModuleSpec, TEST_SELF_PEER};
+use super::proxy::{register_module_raw, EngineSpec, ModuleSpec, TEST_SELF_PEER};
 use super::wasm::minimal_file_descriptor_set;
 
 async fn test_cluster_handle() -> Result<std::sync::Arc<wr_manager::cluster::ClusterHandle>> {
@@ -86,8 +87,8 @@ pub async fn manager_trio_with_monitor(
     Ok((pool, addr, client))
 }
 
-/// Register a module with sensible test defaults (empty proxy_address, minimal schema).
-pub async fn register_test_module(
+/// Raw register a module with sensible test defaults; does not create an admin route or mark the route healthy.
+pub async fn register_test_module_raw(
     c: &mut ManagerServiceClient<tonic::transport::Channel>,
     engine_id: &str,
     engine_addr: &str,
@@ -95,7 +96,7 @@ pub async fn register_test_module(
     name: &str,
     version: &str,
 ) -> Result<()> {
-    register_module(
+    register_module_raw(
         c,
         EngineSpec {
             id: engine_id,
@@ -110,6 +111,75 @@ pub async fn register_test_module(
         },
     )
     .await
+}
+
+pub async fn register_test_module_ready(
+    pool: &deadpool_postgres::Pool,
+    c: &mut ManagerServiceClient<tonic::transport::Channel>,
+    engine_id: &str,
+    engine_addr: &str,
+    namespace: &str,
+    name: &str,
+    version: &str,
+) -> Result<()> {
+    register_test_module_ready_with_peer(
+        pool,
+        c,
+        EngineSpec {
+            id: engine_id,
+            addr: engine_addr,
+            peer_address: TEST_SELF_PEER,
+        },
+        ModuleSpec {
+            namespace,
+            name,
+            version,
+            schema: minimal_file_descriptor_set(),
+        },
+    )
+    .await
+}
+
+pub async fn register_test_module_ready_with_peer(
+    pool: &deadpool_postgres::Pool,
+    c: &mut ManagerServiceClient<tonic::transport::Channel>,
+    engine: EngineSpec<'_>,
+    module: ModuleSpec<'_>,
+) -> Result<()> {
+    let engine_id = engine.id.to_string();
+    let namespace = module.namespace.to_string();
+    let name = module.name.to_string();
+    let version = module.version.to_string();
+
+    register_module_raw(c, engine, module).await?;
+    c.heartbeat(HeartbeatRequest {
+        engine_id: engine_id.clone(),
+        healthy_modules: vec![ModuleDescriptor {
+            name: name.clone(),
+            namespace: namespace.clone(),
+            version: version.clone(),
+            proto_schema: vec![],
+        }],
+    })
+    .await?;
+    wr_manager::db::update_route_health(pool, 30.0, 30.0)
+        .await
+        .map_err(|status| anyhow::anyhow!("update_route_health failed: {status}"))?;
+
+    let started = std::time::Instant::now();
+    loop {
+        let (healthy, table_version) =
+            get_default_rule_health(c, &engine_id, &namespace, &name, &version).await?;
+        if healthy {
+            return Ok(());
+        }
+        if started.elapsed() >= super::wait::DEFAULT_WAIT_TIMEOUT {
+            bail!(
+                "default route {engine_id}/{namespace}/{name}/{version} remained unhealthy after heartbeat/recompute; last table version={table_version}"
+            );
+        }
+        tokio::time::sleep(super::wait::DEFAULT_POLL_INTERVAL).await;
+    }
 }
 
 /// Create a routing table and sync it from the manager in one step.
@@ -136,6 +206,34 @@ pub async fn get_rule_health(
         .iter()
         .find(|r| r.destination_module == destination_module)
         .unwrap_or_else(|| panic!("no rule for destination_module={destination_module}"));
+    Ok((rule.healthy, table.version))
+}
+
+pub async fn get_default_rule_health(
+    mgr: &mut ManagerServiceClient<tonic::transport::Channel>,
+    engine_id: &str,
+    namespace: &str,
+    destination_module: &str,
+    version: &str,
+) -> Result<(bool, u64)> {
+    let table = mgr
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
+        .await?
+        .into_inner()
+        .table
+        .expect("routing table present");
+    let rule_id = format!("{engine_id}/{namespace}/{destination_module}/{version}");
+    let rule = table
+        .rules
+        .iter()
+        .find(|r| {
+            r.rule_id == rule_id
+                && r.engine_id == engine_id
+                && r.destination_namespace == namespace
+                && r.destination_module == destination_module
+                && r.destination_version == version
+        })
+        .unwrap_or_else(|| panic!("no default rule {rule_id}"));
     Ok((rule.healthy, table.version))
 }
 

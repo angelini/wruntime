@@ -31,6 +31,59 @@ fn main() -> Result<()> {
     rt.block_on(async_main())
 }
 
+async fn collect_healthy_module_descriptors(
+    registry: &registry::ModuleRegistry,
+    module_configs: &[config::ModuleConfig],
+) -> Vec<ModuleDescriptor> {
+    let mut healthy = Vec::new();
+    let mut checked = std::collections::HashSet::new();
+    for m in module_configs {
+        if !checked.insert((&m.namespace, &m.name, &m.version)) {
+            continue;
+        }
+        if let Some(tx) = registry
+            .next_sender(&m.namespace, &m.name, &m.version)
+            .await
+        {
+            if engine::check_module_health(&tx).await {
+                healthy.push(ModuleDescriptor {
+                    name: m.name.clone(),
+                    namespace: m.namespace.clone(),
+                    version: m.version.clone(),
+                    proto_schema: vec![],
+                });
+            } else {
+                warn!(
+                    namespace = %m.namespace,
+                    module    = %m.name,
+                    version   = %m.version,
+                    "module failed health check",
+                );
+            }
+        }
+    }
+    healthy
+}
+
+async fn send_heartbeat_with_retry(
+    client: &mut NodeServiceClient<tonic::transport::Channel>,
+    engine_id: &str,
+    healthy_modules: Vec<ModuleDescriptor>,
+) -> std::result::Result<(), tonic::Status> {
+    let hb_req = HeartbeatRequest {
+        engine_id: engine_id.to_string(),
+        healthy_modules,
+    };
+    let strategy = FixedInterval::from_millis(50).take(2);
+    Retry::start(strategy, || {
+        let mut c = client.clone();
+        let r = hb_req.clone();
+        async move { c.heartbeat(r).await }
+    })
+    .await
+    .map(|_| ())
+}
+
 async fn async_main() -> Result<()> {
     let config_path = std::env::args()
         .nth(1)
@@ -111,12 +164,24 @@ async fn async_main() -> Result<()> {
         for m in &config.modules {
             let first = schema_sent.insert((&m.namespace, &m.name, &m.version));
             let proto_schema = if first {
-                m.schema_path
-                    .as_ref()
-                    .map(std::fs::read)
-                    .transpose()
-                    .with_context(|| format!("failed to read schema for module '{}'", m.name))?
-                    .unwrap_or_default()
+                let schema_path = m
+                    .schema_path
+                    .as_deref()
+                    .filter(|path| !path.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "schema_path is required for first occurrence of module '{}.{}@{}'",
+                            m.namespace,
+                            m.name,
+                            m.version
+                        )
+                    })?;
+                std::fs::read(schema_path).with_context(|| {
+                    format!(
+                        "failed to read schema for module '{}.{}@{}' from {schema_path}",
+                        m.namespace, m.name, m.version
+                    )
+                })?
             } else {
                 vec![]
             };
@@ -251,6 +316,17 @@ async fn async_main() -> Result<()> {
         .await?;
     info!("all modules loaded");
 
+    let initial_healthy = collect_healthy_module_descriptors(&registry, &config.modules).await;
+    let initial_sent = send_heartbeat_with_retry(&mut client, &engine_id, initial_healthy).await;
+    if let Err(e) = &initial_sent {
+        warn!(error = %e, "initial readiness heartbeat failed after retries; periodic heartbeat will retry");
+    }
+    if initial_sent.is_err() {
+        if let Ok(c) = NodeServiceClient::connect(config.node.control_address.clone()).await {
+            client = c;
+        }
+    }
+
     // ── Heartbeat background task ─────────────────────────────────────────
     {
         let mut hb_client = client.clone();
@@ -264,51 +340,13 @@ async fn async_main() -> Result<()> {
             loop {
                 interval.tick().await;
 
-                // Health-check each unique module; only include passing ones.
-                let mut healthy = Vec::new();
-                let mut checked = std::collections::HashSet::new();
-                for m in &hb_module_configs {
-                    if !checked.insert((&m.namespace, &m.name, &m.version)) {
-                        continue;
-                    }
-                    if let Some(tx) = hb_registry
-                        .next_sender(&m.namespace, &m.name, &m.version)
-                        .await
-                    {
-                        if engine::check_module_health(&tx).await {
-                            healthy.push(ModuleDescriptor {
-                                name: m.name.clone(),
-                                namespace: m.namespace.clone(),
-                                version: m.version.clone(),
-                                proto_schema: vec![],
-                            });
-                        } else {
-                            warn!(
-                                namespace = %m.namespace,
-                                module    = %m.name,
-                                version   = %m.version,
-                                "module failed health check",
-                            );
-                        }
-                    }
-                }
-
-                let hb_req = HeartbeatRequest {
-                    engine_id: hb_id.clone(),
-                    healthy_modules: healthy,
-                };
-                let strategy = FixedInterval::from_millis(50).take(2);
-                let sent = Retry::start(strategy, || {
-                    let mut c = hb_client.clone();
-                    let r = hb_req.clone();
-                    async move { c.heartbeat(r).await }
-                })
-                .await;
+                let healthy =
+                    collect_healthy_module_descriptors(&hb_registry, &hb_module_configs).await;
+                let sent = send_heartbeat_with_retry(&mut hb_client, &hb_id, healthy).await;
                 if let Err(e) = &sent {
                     warn!(error = %e, "heartbeat failed after retries");
                 }
                 if sent.is_err() {
-                    // Connection may be stale — reconnect for next cycle.
                     if let Ok(c) = NodeServiceClient::connect(hb_control_address.clone()).await {
                         hb_client = c;
                     }

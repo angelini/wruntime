@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use wr_common::wruntime::ListEnginesRequest;
+use wr_common::wruntime::{GetRoutingTableRequest, ListEnginesRequest};
 
 use crate::client;
 
@@ -218,47 +218,88 @@ impl Drop for PrefixedTail {
     }
 }
 
-/// Poll the manager until an engine at the given address registers or timeout.
-/// Returns `true` if the engine was detected.
-pub async fn wait_for_engine_at_address(
-    manager: &str,
-    listen_addr: &str,
-    timeout: Duration,
-) -> bool {
+/// Poll the manager until an engine registers and every advertised module has
+/// a healthy default route. Engines without modules are ready after registration.
+pub async fn wait_for_engine_ready(manager: &str, listen_addr: &str, timeout: Duration) -> bool {
     use tokio_retry::strategy::FixedInterval;
     use tokio_retry::Retry;
 
     let normalized = normalize_address(listen_addr);
-    debug!("polling manager {manager} for engine at {listen_addr} (normalized: {normalized}, timeout {}s)", timeout.as_secs());
+    debug!("polling manager {manager} for ready engine at {listen_addr} (normalized: {normalized}, timeout {}s)", timeout.as_secs());
     let attempt = std::sync::atomic::AtomicU32::new(0);
     let normalized = &normalized;
     let strategy = FixedInterval::from_millis(1000).take(timeout.as_secs() as usize);
     Retry::start(strategy, || {
         let n = attempt.fetch_add(1, Ordering::Relaxed) + 1;
         async move {
-            match client::connect(manager).await {
-                Ok(mut client) => match client.list_engines(ListEnginesRequest {}).await {
-                    Ok(resp) => {
-                        let engines = resp.into_inner().engines;
-                        let addrs: Vec<_> = engines.iter().map(|e| e.address.as_str()).collect();
-                        debug!("attempt {n}: ListEngines OK, engines: {addrs:?}");
-                        if engines
-                            .iter()
-                            .any(|e| normalize_address(&e.address) == *normalized)
-                        {
-                            return Ok(());
-                        }
-                        Err(())
-                    }
-                    Err(e) => {
-                        debug!("attempt {n}: ListEngines RPC failed: {e}");
-                        Err(())
-                    }
-                },
+            let mut client = match client::connect(manager).await {
+                Ok(client) => client,
                 Err(e) => {
                     debug!("attempt {n}: connection to {manager} failed: {e}");
-                    Err(())
+                    return Err(());
                 }
+            };
+            let engines = match client.list_engines(ListEnginesRequest {}).await {
+                Ok(resp) => resp.into_inner().engines,
+                Err(e) => {
+                    debug!("attempt {n}: ListEngines RPC failed: {e}");
+                    return Err(());
+                }
+            };
+            let Some(engine) = engines
+                .iter()
+                .find(|engine| normalize_address(&engine.address) == *normalized)
+            else {
+                debug!("attempt {n}: engine has not registered");
+                return Err(());
+            };
+            if engine.modules.is_empty() {
+                return Ok(());
+            }
+
+            let rules = match client
+                .get_routing_table(GetRoutingTableRequest { known_version: 0 })
+                .await
+            {
+                Ok(resp) => resp
+                    .into_inner()
+                    .table
+                    .map(|table| table.rules)
+                    .unwrap_or_default(),
+                Err(e) => {
+                    debug!("attempt {n}: GetRoutingTable RPC failed: {e}");
+                    return Err(());
+                }
+            };
+            let all_ready = engine.modules.iter().all(|module| {
+                rules.iter().any(|rule| {
+                    rule.engine_id == engine.engine_id
+                        && rule.destination_namespace == module.namespace
+                        && rule.destination_module == module.name
+                        && rule.destination_version == module.version
+                        && rule.healthy
+                })
+            });
+            debug!(
+                "attempt {n}: engine {} has {}/{} ready module route(s)",
+                engine.engine_id,
+                engine
+                    .modules
+                    .iter()
+                    .filter(|module| rules.iter().any(|rule| {
+                        rule.engine_id == engine.engine_id
+                            && rule.destination_namespace == module.namespace
+                            && rule.destination_module == module.name
+                            && rule.destination_version == module.version
+                            && rule.healthy
+                    }))
+                    .count(),
+                engine.modules.len()
+            );
+            if all_ready {
+                Ok(())
+            } else {
+                Err(())
             }
         }
     })

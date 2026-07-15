@@ -554,7 +554,10 @@ async fn test_register_engine_creates_default_routing_rule() -> Result<()> {
     assert_eq!(r.peer_address, "https://127.0.0.1:9443");
     assert_eq!(r.source_namespace, "");
     assert_eq!(r.source_module, "");
-    assert!(r.healthy, "default rule starts healthy");
+    assert!(
+        !r.healthy,
+        "default rule starts unhealthy until module heartbeat readiness"
+    );
     Ok(())
 }
 
@@ -597,6 +600,10 @@ async fn test_register_engine_dedups_duplicate_module_instances() -> Result<()> 
         .unwrap();
     assert_eq!(table.rules.len(), 1, "duplicate instances produce one rule");
     assert_eq!(table.rules[0].rule_id, "dup-e1/store/inventory/1.0.0");
+    assert!(
+        !table.rules[0].healthy,
+        "deduped default rule starts unhealthy"
+    );
     Ok(())
 }
 
@@ -781,10 +788,9 @@ async fn test_reregister_removes_dropped_module_route_and_heartbeat() -> Result<
         .iter()
         .map(|row| row.get::<_, String>(0))
         .collect();
-    assert_eq!(
-        hb_modules,
-        vec!["alpha".to_string()],
-        "dropped module's heartbeat row must be removed; retained module's remains",
+    assert!(
+        hb_modules.is_empty(),
+        "re-registration clears module heartbeat rows for both retained and dropped tuples",
     );
 
     let v_after: i64 = pool

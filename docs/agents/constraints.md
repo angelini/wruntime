@@ -18,7 +18,7 @@ Hard rules and common mistakes when building wruntime guest modules. Read this b
 4. **Generated clients use authority `namespace.module` plus canonical path `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`.**
    - Full URI example: `http://ecommerce.inventory/ecommerce.InventoryService/GetStock`
 
-5. **`schema_path` in engine.toml is required.** The engine refuses to start without it.
+5. **`schema_path` in engine.toml is required on the first occurrence of each unique `(namespace, name, version)` tuple.** Later duplicate instances may omit it, but any provided path must be non-empty and existing.
 
 6. **All host binding calls are synchronous from the guest's perspective.** The engine handles async internally. Do not attempt `async`/`await` in guest code.
 
@@ -56,7 +56,7 @@ Hard rules and common mistakes when building wruntime guest modules. Read this b
 
 12. **Dropping a Transaction without calling commit() triggers automatic rollback.** This is intentional — use it for error handling.
 
-13. **Do not use `CREATE TABLE IF NOT EXISTS` in guest code.** Database schema setup is handled by engine-side migrations. Add SQL migration files to a `migrations/` directory and set `migrations_path` in engine.toml. Migrations run at engine startup before the module receives traffic.
+13. **Do not use `CREATE TABLE IF NOT EXISTS` in guest code.** Database schema setup is handled by engine-side migrations. Add SQL migration files to a `migrations/` directory and set `migrations_path` in engine.toml. Migrations run at engine startup before the module receives traffic; route rows may already exist but remain unhealthy and unroutable.
 
 ## Common mistakes
 

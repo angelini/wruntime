@@ -216,7 +216,7 @@ match module_config.mode {
 }
 ```
 
-Key difference from Service: worker modules register in `ModuleRegistry` (so the worker loop can dispatch to them) but do **not** register routing rules with the manager (they don't receive external HTTP traffic). The worker pool task holds a clone of the `ModuleTx` sender and pushes `InboundRequest`s into it.
+Current implementation note: worker modules register in `ModuleRegistry` and are still advertised through `ModuleDescriptor`, so they currently retain direct default routes gated by the same unhealthy-until-ready lifecycle as service modules. Queue-only/no-default-route workers require a future explicit proto/control-plane module mode or route-publication signal. The worker pool task holds a clone of the `ModuleTx` sender and pushes `InboundRequest`s into it.
 
 Workers get the same host bindings (DB, blobstore, LLM, tracing) via `ModuleState`.
 
@@ -263,8 +263,8 @@ The engine needs the DB pool passed to the server for these endpoints.
 ### 9. Engine Startup — `wr-engine/src/main.rs`
 
 1. Provision `wr__jobs` schema/tables (between DB provisioning and module migrations)
-2. Skip routing-rule upsert for `mode = "worker"` modules (they don't receive external HTTP traffic)
-3. Workers ARE registered with manager (including their proto schema via `schema_path`) for visibility, heartbeat, and schema discovery — just no routing rules
+2. Current implementation still registers worker modules through `ModuleDescriptor`, so workers retain direct default routes gated by readiness.
+3. Queue-only routing with no default worker routes is a future design requiring an explicit mode/route-publication signal while still registering workers with manager for visibility, heartbeat, and schema discovery.
 
 ### 10. Codegen Worker Migration — `examples/codegen/worker/`
 
@@ -294,7 +294,7 @@ Convert to service guest with worker mode:
 | `wr-engine/src/worker.rs` | **Create** — Worker pool, job claiming, HTTP dispatch |
 | `wr-engine/src/engine.rs` | Modify — Three-way dispatch in `spawn_module()` |
 | `wr-engine/src/server.rs` | Modify — Add SubmitJob/GetJobStatus gRPC endpoints |
-| `wr-engine/src/main.rs` | Modify — Job schema provisioning, skip routing for workers |
+| `wr-engine/src/main.rs` | Modify — Job schema provisioning; current workers retain readiness-gated direct default routes |
 | `wr-engine/src/lib.rs` | Modify — Add `pub mod worker;` |
 | `proto/wruntime.proto` | Modify — Add SubmitJob/GetJobStatus messages |
 | `examples/codegen/worker/src/lib.rs` | Modify — Convert to `ServiceGuest` + `WrServiceGenerator` |

@@ -164,19 +164,20 @@ schema_path = "schemas/inventory_service.binpb"
 
 `listen_address` **must** bind to loopback (`127.0.0.1`, `::1`, or `localhost`); the engine rejects a non-loopback value at config load. To bind a routable interface anyway, set `allow_non_loopback_internal = true` at the top level of `engine.toml` (defaults to `false`; omitting it keeps existing configs valid). When enabled with a `0.0.0.0` bind, the engine still advertises `127.0.0.1` to peers, so the address is only reachable same-host — operators enabling this flag own end-to-end reachability.
 
-> **`schema_path` is required.** Every module must declare a compiled `FileDescriptorSet`. The engine will refuse to start if the file is absent. Schemas are uploaded to the manager on registration for discovery purposes.
+> **`schema_path` is required on the first occurrence of each unique module tuple.** The first config occurrence of each unique `(namespace, name, version)` must declare a non-empty existing compiled `FileDescriptorSet`; later duplicate instances may omit `schema_path`. Schemas are uploaded to the manager on registration for discovery purposes.
 
 On startup the engine:
 
-1. Loads every listed WASM component from disk.
-2. Registers itself and its modules with the manager (including schema bytes).
-3. Starts an inbound HTTP server on `listen_address`.
-4. Sends a heartbeat to the manager every 10 seconds, reporting all loaded modules as healthy.
-5. Deregisters cleanly on `Ctrl+C`, which immediately marks its routing rules as unhealthy.
+1. Starts an inbound HTTP server on `listen_address`.
+2. Registers itself and its modules with the manager to obtain requested secrets and DB credentials.
+3. The manager creates schemas and default routes as unhealthy and resets module readiness for advertised tuples.
+4. Provisions schemas and the job schema, runs migrations, builds pools, resolves secrets, and loads modules.
+5. Sends an immediate readiness heartbeat after module load, then every 3 seconds, reporting healthy loaded modules.
+6. Deregisters cleanly on `Ctrl+C`, which immediately marks its routing rules as unhealthy.
 
 ### Database migrations
 
-Modules that use a database can declare a `migrations_path` pointing to a directory of SQL migration files. Migrations run on the engine (host side) at startup — after the Postgres schema is provisioned but before the WASM module loads and before routing rules are registered. This means no traffic reaches a module until its database is fully migrated.
+Modules that use a database can declare a `migrations_path` pointing to a directory of SQL migration files. Migrations run on the engine (host side) at startup — after the Postgres schema is provisioned and before the WASM module loads. Default route rows may already be registered, but they remain unhealthy and unroutable until migrations, secret resolution, module load, readiness heartbeat, and manager health recomputation succeed.
 
 ```toml
 [database]
@@ -207,7 +208,7 @@ Key behaviors:
 - **Schema isolation:** `search_path` is set to the module's own schema before migrations run. A migration cannot modify tables belonging to another module.
 - **Advisory locking:** An engine acquires a Postgres advisory lock before running migrations, preventing concurrent execution across engine replicas for the same module.
 - **Idempotent:** Refinery tracks applied migrations in a `refinery_schema_history` table inside the module's schema. Already-applied migrations are skipped on subsequent startups.
-- **Fail-fast:** If any migration fails, the engine exits before registering routing rules — the module never receives traffic.
+- **Fail-fast:** If any migration fails, the engine exits before the module becomes routable. Registered route rows remain unhealthy, so the module never receives traffic.
 
 ### Per-module request timeout
 
@@ -311,7 +312,7 @@ max_outbound_body_bytes = 16777216   # optional; default 16 MiB
 
 ### Module health checks
 
-Every 10 seconds the engine sends `GET /__health` to each loaded module instance. If the module responds with a `2xx` status within 5 seconds it is reported as healthy in the next heartbeat; otherwise it is omitted, and the manager marks its routing rule unhealthy so the proxy stops sending traffic to it.
+After module load immediately, then every 3 seconds, the engine sends `GET /__health` to each loaded module instance. If the module responds with a `2xx` status within 5 seconds it is reported as healthy in the next heartbeat; otherwise it is omitted, and the manager marks its routing rule unhealthy so the proxy stops sending traffic to it.
 
 By default a module does not need to handle `/__health` at all — the `wasi:http/incoming-handler` export just needs to exist. The engine treats any `2xx` as healthy and anything else (including a timeout or a dropped connection) as unhealthy.
 
@@ -338,7 +339,7 @@ If the health handler returns a non-`2xx` status or does not respond within 5 se
 
 ### Routing rules
 
-When an engine registers, the manager automatically creates one default routing rule per module that carries a schema, in the same transaction as the registration (and only after the engine's requested secrets and per-namespace DB credentials resolve successfully). You do not need to create these rules manually. The `UpsertRoutingRule` RPC remains available as an admin override — for example to add an extra rule or force a rule healthy:
+When an engine registers, the manager automatically creates one default routing rule per module that carries a schema, in the same transaction as the registration (and only after the engine's requested secrets and per-namespace DB credentials resolve successfully). Default rules start with `healthy = false`; the proxy indexes only healthy rules, so they are not routable until module readiness is reported and recomputed. You do not need to create these rules manually. The `UpsertRoutingRule` RPC remains available as an admin override — for example to add an extra rule or force a rule healthy:
 
 ```
 # example using grpcurl
@@ -356,6 +357,8 @@ grpcurl -plaintext -d '{
 ```
 
 `peer_address` tells every proxy which node owns this rule. A proxy whose own derived `[node]` peer address matches will route directly to `engine_address`; all other proxies relay to `peer_address` and let that node route locally. The old `proxy_address` routing-rule field is reserved in `proto/wruntime.proto` and must not be used in new rules.
+
+Current worker modules use the same descriptor/default-route path as service modules, so direct worker routes remain available but are gated by the same unhealthy-until-ready lifecycle. Queue-only workers with no default route require a future proto/control-plane route-publication flag or module mode.
 
 To run **multiple instances** of the same module version across different engines (on the same or different nodes), create one rule per engine pointing at the same `(destination_module, destination_namespace, destination_version)`. The proxy round-robins across all healthy rules for that tuple.
 

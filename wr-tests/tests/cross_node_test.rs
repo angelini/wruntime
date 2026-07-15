@@ -1,7 +1,7 @@
 mod helpers;
 use helpers::{
-    manager::{manager_trio, sync_table},
-    proxy::{proxy_get, register_module, start_node, EngineSpec, ModuleSpec},
+    manager::{manager_trio, register_test_module_ready_with_peer, sync_table},
+    proxy::{proxy_get, start_node, EngineSpec, ModuleSpec},
     stubs::spawn_identified_stub,
     wasm::minimal_file_descriptor_set,
 };
@@ -14,14 +14,15 @@ use http::StatusCode;
 /// dispatches it to the engine registered on node B.
 #[tokio::test]
 async fn test_cross_node_routing() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (engine_b_addr, engine_b_shutdown) = spawn_identified_stub("engine-b").await?;
 
     // Start node B first to obtain its proxy address, then register the engine
     // under that address and re-sync so node B's routing table sees the rule.
     let node_b = start_node(&mgr_addr).await?;
-    register_module(
+    register_test_module_ready_with_peer(
+        &pool,
         &mut mgr,
         EngineSpec {
             id: "engine-b-id",

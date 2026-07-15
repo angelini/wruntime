@@ -285,9 +285,9 @@ impl ManagerService for Manager {
         // (fails before any write).
         let db_credentials = self.resolve_db_credentials(&reg.db_namespaces).await?;
 
-        // Persist engine, schemas, and default routing rules atomically. Routes are
-        // published last, so a failure in either resolver above leaves no engine,
-        // schema, or routing-rule rows.
+        // Persist engine, schemas, and initially-unhealthy default routing rules
+        // atomically. Routes are published last, so a failure in either resolver
+        // above leaves no engine, schema, or routing-rule rows.
         db::register_engine_and_routes(&self.pool, &reg).await?;
 
         info!(engine_id, "engine registered");

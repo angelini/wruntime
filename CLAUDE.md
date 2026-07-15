@@ -101,7 +101,7 @@ Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `
 
 **mTLS** — all inter-service network traffic uses mutual TLS. Proxy loopback listener (`:9001`) is plain HTTP; cross-node traffic uses the mTLS peer listener (`:9443`). `just certs` generates localhost certificates for local dev.
 
-**`wr-engine`** — on startup: registers with manager → receives per-namespace DB credentials → provisions schemas/roles → runs migrations → builds connection pools → loads WASM components → starts heartbeat loop. DB-enabled modules connect through per-namespace roles (`wr_ns_{namespace}`). Guest roles are never granted access to the `wr_system` schema, so WASM modules cannot read manager system tables.
+**`wr-engine`** — on startup: registers with manager → receives per-namespace DB credentials while default routes start unhealthy → provisions schemas/roles → runs migrations → builds connection pools → loads WASM components → sends an immediate post-load readiness heartbeat → starts a 3-second heartbeat loop. DB-enabled modules connect through per-namespace roles (`wr_ns_{namespace}`). Guest roles are never granted access to the `wr_system` schema, so WASM modules cannot read manager system tables.
 
 **Database migrations** — Manager migrations are embedded SQL migrations run via
 refinery under an advisory lock. Module migrations use `migrations_path` in

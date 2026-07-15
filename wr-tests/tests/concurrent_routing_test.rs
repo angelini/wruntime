@@ -3,7 +3,7 @@ use helpers::{
     db::manager_pool,
     manager::{
         backdate_engine_heartbeat, get_routing_table_version, manager_client, manager_trio,
-        manager_trio_with_monitor, register_test_module,
+        manager_trio_with_monitor, register_test_module_ready,
     },
     proxy::TEST_SELF_PEER,
     stubs::spawn_stub_engine,
@@ -397,7 +397,16 @@ async fn test_health_monitor_and_upsert_coexist() -> Result<()> {
     let (pool, _mgr_addr, mut c) = manager_trio_with_monitor(1).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_test_module(&mut c, "hm-e1", &engine_addr, "hm-ns", "hm-svc", "1.0.0").await?;
+    register_test_module_ready(
+        &pool,
+        &mut c,
+        "hm-e1",
+        &engine_addr,
+        "hm-ns",
+        "hm-svc",
+        "1.0.0",
+    )
+    .await?;
 
     // Backdate heartbeat so the monitor will flip health and acquire the lock.
     backdate_engine_heartbeat(&pool, "hm-e1", 60).await;

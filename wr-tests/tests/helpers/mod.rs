@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code, unused_assignments, unused_imports)]
 
 pub mod blobstore;
 pub mod db;

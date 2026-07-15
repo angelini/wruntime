@@ -434,18 +434,18 @@ async fn deploy(args: DeployArgs, manager: &str, pid_file: &Path) -> Result<()> 
         .with_context(|| format!("failed to start {bin}"))?;
     let engine_pid = child.id();
 
-    // Wait for engine to register
-    println!("[engine]  waiting for registration...");
-    let registered = helpers::wait_for_engine_at_address(
-        manager,
-        &config.listen_address,
-        Duration::from_secs(60),
-    )
-    .await;
+    // Wait for registration, the post-load heartbeat, and manager health recomputation.
+    println!("[engine]  waiting for route readiness...");
+    let ready =
+        helpers::wait_for_engine_ready(manager, &config.listen_address, Duration::from_secs(60))
+            .await;
 
-    if !registered {
-        bail!("Engine did not register within 60 seconds");
+    if !ready {
+        bail!("Engine did not become route-ready within 60 seconds");
     }
+
+    // The proxy routing cache refreshes asynchronously after the manager table changes.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Update PID file
     entries.retain(|e| !(e.role == "engine" && e.config.as_deref() == Some(config_path)));

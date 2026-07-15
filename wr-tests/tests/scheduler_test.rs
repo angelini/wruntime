@@ -1,6 +1,6 @@
 mod helpers;
 use helpers::{
-    manager::{manager_trio, register_test_module, synced_routing_table},
+    manager::{manager_trio, register_test_module_ready, synced_routing_table},
     proxy::start_proxy,
     worker::spawn_worker_stub_engine,
 };
@@ -512,7 +512,16 @@ async fn test_routed_firing_reaches_worker_via_proxy() -> Result<()> {
     let (pool, mgr_addr, mut c) = manager_trio().await?;
     let (engine_addr, _stub_tx) = spawn_worker_stub_engine().await?;
 
-    register_test_module(&mut c, "eng1", &engine_addr, "sched", "worker", "1.0.0").await?;
+    register_test_module_ready(
+        &pool,
+        &mut c,
+        "eng1",
+        &engine_addr,
+        "sched",
+        "worker",
+        "1.0.0",
+    )
+    .await?;
 
     let table = synced_routing_table(&mgr_addr).await?;
     let proxy_addr = start_proxy(table).await?;

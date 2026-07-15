@@ -8,7 +8,7 @@
 /// Or:   cargo test -p wr-tests --test bench_test --release -- --nocapture
 mod helpers;
 use helpers::{
-    manager::{manager_trio, register_test_module, sync_table, synced_routing_table},
+    manager::{manager_trio, register_test_module_ready, sync_table, synced_routing_table},
     proxy::{proxy_get, start_proxy},
     stubs::spawn_stub_engine,
     wasm::{spawn_wasm_stub_engine, wasm_module_pre},
@@ -143,7 +143,7 @@ async fn bench_hot_path() -> Result<()> {
         .unwrap_or(10);
 
     // ── Infrastructure ───────────────────────────────────────────────────────
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let table = wr_proxy::routing::new_routing_table();
     let proxy_addr = start_proxy(table.clone()).await?;
@@ -154,7 +154,8 @@ async fn bench_hot_path() -> Result<()> {
     let (echo_addr, _echo_shutdown) =
         spawn_wasm_stub_engine(echo_engine, echo_pre, &proxy_uri, "echo-svc", "bench-ns").await?;
 
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "echo-engine",
         &echo_addr,
@@ -278,11 +279,12 @@ async fn bench_proxy_only() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(500);
 
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (engine_addr, _shutdown) = spawn_stub_engine().await?;
 
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "stub-engine",
         &engine_addr,

@@ -92,8 +92,10 @@ impl<T, E: std::fmt::Display> IntoInternalStatus<T> for Result<T, E> {
 
 /// Register an engine, its module schemas, and one default routing rule per
 /// unique schema-bearing module tuple — all in a single transaction under the
-/// global routing lock. Routes are the last statements before commit, so any
-/// earlier failure rolls back the whole registration (no partial routes).
+/// global routing lock. Default rules are created as initially unhealthy and
+/// become routable only after heartbeat-driven health recomputation. Routes are
+/// the last statements before commit, so any earlier failure rolls back the whole
+/// registration (no partial routes).
 pub async fn register_engine_and_routes(
     pool: &Pool,
     reg: &EngineRegistration,
@@ -149,9 +151,9 @@ pub async fn register_engine_and_routes(
 
     // Publish one default routing rule per unique schema-bearing module tuple.
     // source_* = "", destination_* = module tuple, engine_address = reg.address,
-    // peer_address = reg.peer_address, healthy = true.
+    // peer_address = reg.peer_address, healthy = false.
     let empty = String::new();
-    let healthy = true;
+    let healthy = false;
     let mut seen = std::collections::HashSet::new();
     let mut seen_advertised = std::collections::HashSet::new();
     let mut desired_rule_ids: Vec<String> = Vec::new();
@@ -208,23 +210,28 @@ pub async fn register_engine_and_routes(
         )
         .await
         .internal()?;
-        txn.execute(
-            "INSERT INTO wr_module_heartbeats (engine_id, namespace, module_name, version)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (engine_id, namespace, module_name, version)
-             DO UPDATE SET last_healthy = NOW()",
-            &[
-                &reg.engine_id,
-                &module.namespace,
-                &module.name,
-                &module.version,
-            ],
-        )
-        .await
-        .internal()?;
         desired_rule_ids.push(rule_id);
     }
     let rules_written = desired_rule_ids.len() as u64;
+
+    // Clear readiness for every tuple advertised by this registration. A
+    // re-registering engine must not inherit module readiness from a previous
+    // process before the new process has loaded and health-checked modules.
+    txn.execute(
+        "DELETE FROM wr_module_heartbeats
+         WHERE engine_id = $1
+           AND (namespace, module_name, version) IN (
+             SELECT n, m, v FROM unnest($2::text[], $3::text[], $4::text[]) AS t(n, m, v)
+           )",
+        &[
+            &reg.engine_id,
+            &advertised_ns,
+            &advertised_name,
+            &advertised_ver,
+        ],
+    )
+    .await
+    .internal()?;
 
     // Reconcile: remove engine-owned DEFAULT rules this registration no longer
     // advertises. Only rows with this engine's canonical default prefix
@@ -244,10 +251,10 @@ pub async fn register_engine_and_routes(
         .await
         .internal()?;
 
-    // Drop per-module heartbeats for modules this engine no longer advertises,
-    // so a removed module cannot be resurrected as healthy by the health sweep.
-    // Keep-set is every advertised tuple; NOT IN over an empty unnest deletes all
-    // of this engine's heartbeat rows (zero-module re-registration).
+    // Drop per-module heartbeats for modules this engine no longer advertises;
+    // retained/incoming tuples were already cleared above. Keep-set is every
+    // advertised tuple; NOT IN over an empty unnest deletes all of this engine's
+    // heartbeat rows (zero-module re-registration).
     txn.execute(
         "DELETE FROM wr_module_heartbeats
          WHERE engine_id = $1

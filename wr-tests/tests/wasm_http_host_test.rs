@@ -7,7 +7,7 @@ use prost::Message;
 
 use helpers::{
     db::{ModuleServices, ModuleState},
-    manager::{manager_trio, register_test_module, synced_routing_table},
+    manager::{manager_trio, register_test_module_ready, synced_routing_table},
     proto,
     proxy::{
         http_client, http_pool, start_egress_proxy, start_ingress_proxy, EgressConfig,
@@ -102,8 +102,9 @@ async fn wasm_http_ingress() -> Result<()> {
         spawn_wasm_stub_engine(engine, pre, "http://127.0.0.1:9001", "http-svc", "test-ns").await?;
 
     // Manager + registration.
-    let (_pool, mgr_addr, mut client) = manager_trio().await?;
-    register_test_module(
+    let (pool, mgr_addr, mut client) = manager_trio().await?;
+    register_test_module_ready(
+        &pool,
         &mut client,
         "wasm-engine-1",
         &engine_addr,

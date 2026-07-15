@@ -1,6 +1,6 @@
 mod helpers;
 use helpers::{
-    manager::{manager_trio, register_test_module, sync_table, synced_routing_table},
+    manager::{manager_trio, register_test_module_ready, sync_table, synced_routing_table},
     proxy::{proxy_get, start_proxy},
     stubs::spawn_identified_stub,
 };
@@ -12,12 +12,13 @@ use wr_common::wruntime::DeregisterEngineRequest;
 
 #[tokio::test]
 async fn test_proxy_routes_to_explicit_version() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-v1").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-v2").await?;
 
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "e1",
         &e1_addr,
@@ -26,7 +27,8 @@ async fn test_proxy_routes_to_explicit_version() -> Result<()> {
         "1.0.0",
     )
     .await?;
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "e2",
         &e2_addr,
@@ -54,12 +56,13 @@ async fn test_proxy_routes_to_explicit_version() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_load_balances_across_versions_without_header() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-v1").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-v2").await?;
 
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "e1",
         &e1_addr,
@@ -68,7 +71,8 @@ async fn test_proxy_load_balances_across_versions_without_header() -> Result<()>
         "1.0.0",
     )
     .await?;
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "e2",
         &e2_addr,
@@ -106,10 +110,11 @@ async fn test_proxy_load_balances_across_versions_without_header() -> Result<()>
 
 #[tokio::test]
 async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, _stub) = spawn_identified_stub("engine-v1").await?;
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "e1",
         &e1_addr,
@@ -130,7 +135,7 @@ async fn test_proxy_returns_503_for_missing_version() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_routes_semver_range_to_highest_satisfying() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-v1").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-v2").await?;
@@ -141,7 +146,16 @@ async fn test_proxy_routes_semver_range_to_highest_satisfying() -> Result<()> {
         ("e2", e2_addr.as_str(), "1.5.0"),
         ("e3", e3_addr.as_str(), "2.0.0"),
     ] {
-        register_test_module(&mut mgr, id, addr, "range-ns", "range-service", version).await?;
+        register_test_module_ready(
+            &pool,
+            &mut mgr,
+            id,
+            addr,
+            "range-ns",
+            "range-service",
+            version,
+        )
+        .await?;
     }
 
     let table = synced_routing_table(&mgr_addr).await?;
@@ -168,10 +182,11 @@ async fn test_proxy_routes_semver_range_to_highest_satisfying() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_returns_503_for_unsatisfiable_range() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, _stub) = spawn_identified_stub("engine-v1").await?;
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "e1",
         &e1_addr,
@@ -196,14 +211,32 @@ async fn test_proxy_returns_503_for_unsatisfiable_range() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_load_balances_across_instances() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     // Two engines both hosting the same (module, version).
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-a").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-b").await?;
 
-    register_test_module(&mut mgr, "ea", &e1_addr, "lb-ns", "lb-service", "1.0.0").await?;
-    register_test_module(&mut mgr, "eb", &e2_addr, "lb-ns", "lb-service", "1.0.0").await?;
+    register_test_module_ready(
+        &pool,
+        &mut mgr,
+        "ea",
+        &e1_addr,
+        "lb-ns",
+        "lb-service",
+        "1.0.0",
+    )
+    .await?;
+    register_test_module_ready(
+        &pool,
+        &mut mgr,
+        "eb",
+        &e2_addr,
+        "lb-ns",
+        "lb-service",
+        "1.0.0",
+    )
+    .await?;
 
     let table = synced_routing_table(&mgr_addr).await?;
     let proxy = start_proxy(table).await?;
@@ -227,12 +260,13 @@ async fn test_proxy_load_balances_across_instances() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_failover_after_deregister() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, e1_shutdown) = spawn_identified_stub("engine-a").await?;
     let (e2_addr, e2_shutdown) = spawn_identified_stub("engine-b").await?;
 
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "ea",
         &e1_addr,
@@ -241,7 +275,8 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
         "1.0.0",
     )
     .await?;
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "eb",
         &e2_addr,
@@ -289,10 +324,19 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_503_when_all_instances_unhealthy() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
     let (e1_addr, _stub) = spawn_identified_stub("engine-a").await?;
-    register_test_module(&mut mgr, "ea", &e1_addr, "gone-ns", "gone-service", "1.0.0").await?;
+    register_test_module_ready(
+        &pool,
+        &mut mgr,
+        "ea",
+        &e1_addr,
+        "gone-ns",
+        "gone-service",
+        "1.0.0",
+    )
+    .await?;
 
     let table = synced_routing_table(&mgr_addr).await?;
     let proxy = start_proxy(table.clone()).await?;

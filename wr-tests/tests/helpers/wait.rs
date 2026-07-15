@@ -83,6 +83,56 @@ pub async fn wait_for_rule_health(
     }
 }
 
+pub async fn wait_for_default_rule_health(
+    mgr: &mut ManagerServiceClient<Channel>,
+    engine_id: &str,
+    namespace: &str,
+    destination_module: &str,
+    version: &str,
+    expected_healthy: bool,
+    timeout: Duration,
+) -> Result<(bool, u64)> {
+    let context = format!(
+        "default routing rule {engine_id}/{namespace}/{destination_module}/{version} healthy={expected_healthy}"
+    );
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut last_seen: Option<(bool, u64)> = None;
+
+    loop {
+        match super::manager::get_default_rule_health(
+            mgr,
+            engine_id,
+            namespace,
+            destination_module,
+            version,
+        )
+        .await
+        {
+            Ok((healthy, version_seen)) if healthy == expected_healthy => {
+                return Ok((healthy, version_seen));
+            }
+            Ok((healthy, version_seen)) => last_seen = Some((healthy, version_seen)),
+            Err(err) if Instant::now() >= deadline => {
+                bail!(
+                    "timed out after {:?} waiting for {context}; last error: {err:#}",
+                    started.elapsed()
+                );
+            }
+            Err(_) => {}
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out after {:?} waiting for {context}; last seen: {:?}",
+                started.elapsed(),
+                last_seen
+            );
+        }
+        sleep(DEFAULT_POLL_INTERVAL).await;
+    }
+}
+
 pub async fn wait_for_routing_table_version_gt(
     mgr: &mut ManagerServiceClient<Channel>,
     baseline: u64,

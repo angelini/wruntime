@@ -25,6 +25,19 @@ fn write_temp_config(name: &str, content: &str) -> PathBuf {
     path
 }
 
+fn write_temp_file(name: &str, ext: &str, content: &[u8]) -> PathBuf {
+    let path = unique_temp_path(name, ext);
+    fs::write(&path, content).unwrap();
+    path
+}
+
+fn workspace_path(path: impl AsRef<Path>) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("wr-tests crate has a workspace parent")
+        .join(path)
+}
+
 fn load_config_from_toml<T>(
     name: &str,
     content: &str,
@@ -330,7 +343,7 @@ fn test_test_guest_build_manifest_is_explicit_and_valid() {
     );
     for module in &manifest.modules {
         assert!(
-            Path::new(&module.proto_path).exists(),
+            workspace_path(&module.proto_path).exists(),
             "{} proto_path",
             module.name
         );
@@ -340,7 +353,9 @@ fn test_test_guest_build_manifest_is_explicit_and_valid() {
             module.name
         );
         assert!(
-            Path::new(&module.cargo_dir).join("Cargo.toml").exists(),
+            workspace_path(&module.cargo_dir)
+                .join("Cargo.toml")
+                .exists(),
             "{} cargo_dir",
             module.name
         );
@@ -401,7 +416,7 @@ fn test_example_build_metadata_matches_engine_configs() {
         for module in modules.values() {
             if let Some(schema_path) = &module.schema_path {
                 let proto_path = schema_path.replace(".binpb", ".proto");
-                assert!(Path::new(&proto_path).exists(), "{group} {proto_path}");
+                assert!(workspace_path(&proto_path).exists(), "{group} {proto_path}");
             }
             let cargo_dir = module
                 .wasm_path
@@ -409,11 +424,155 @@ fn test_example_build_metadata_matches_engine_configs() {
                 .next()
                 .expect("wasm_path must contain target directory");
             assert!(
-                Path::new(cargo_dir).join("Cargo.toml").exists(),
+                workspace_path(cargo_dir).join("Cargo.toml").exists(),
                 "{group} {cargo_dir}/Cargo.toml"
             );
         }
     }
+}
+
+#[test]
+fn test_engine_schema_path_first_occurrence_required() {
+    let wasm_a = write_temp_file("schema-first-required-a", "wasm", b"wasm");
+    let wasm_b = write_temp_file("schema-first-required-b", "wasm", b"wasm");
+    let schema = write_temp_file("schema-first-required", "binpb", b"schema");
+    let cfg: EngineConfig = toml::from_str(&engine_toml_with_modules(&format!(
+        r#"
+          [[module]]
+          name = "inventory"
+          namespace = "store"
+          version = "1.0.0"
+          wasm_path = "{}"
+
+          [[module]]
+          name = "inventory"
+          namespace = "store"
+          version = "1.0.0"
+          wasm_path = "{}"
+          schema_path = "{}"
+        "#,
+        wasm_a.display(),
+        wasm_b.display(),
+        schema.display()
+    )))
+    .unwrap();
+    let err = cfg
+        .validate()
+        .expect_err("first duplicate occurrence without schema must fail");
+    assert!(
+        format!("{err:#}").contains("schema_path is required for first occurrence"),
+        "unexpected validation error: {err:#}"
+    );
+    let _ = fs::remove_file(wasm_a);
+    let _ = fs::remove_file(wasm_b);
+    let _ = fs::remove_file(schema);
+}
+
+#[test]
+fn test_engine_schema_path_duplicate_may_omit_after_first() {
+    let wasm_a = write_temp_file("schema-dup-omit-a", "wasm", b"wasm");
+    let wasm_b = write_temp_file("schema-dup-omit-b", "wasm", b"wasm");
+    let schema = write_temp_file("schema-dup-omit", "binpb", b"schema");
+    let cfg: EngineConfig = toml::from_str(&engine_toml_with_modules(&format!(
+        r#"
+          [[module]]
+          name = "inventory"
+          namespace = "store"
+          version = "1.0.0"
+          wasm_path = "{}"
+          schema_path = "{}"
+
+          [[module]]
+          name = "inventory"
+          namespace = "store"
+          version = "1.0.0"
+          wasm_path = "{}"
+        "#,
+        wasm_a.display(),
+        schema.display(),
+        wasm_b.display()
+    )))
+    .unwrap();
+    cfg.validate()
+        .expect("duplicate module may omit schema_path after first occurrence");
+    let _ = fs::remove_file(wasm_a);
+    let _ = fs::remove_file(wasm_b);
+    let _ = fs::remove_file(schema);
+}
+
+#[test]
+fn test_engine_schema_path_empty_fails() {
+    let wasm = write_temp_file("schema-empty", "wasm", b"wasm");
+    let cfg: EngineConfig = toml::from_str(&engine_toml_with_modules(&format!(
+        r#"
+          [[module]]
+          name = "inventory"
+          namespace = "store"
+          version = "1.0.0"
+          wasm_path = "{}"
+          schema_path = ""
+        "#,
+        wasm.display()
+    )))
+    .unwrap();
+    let err = cfg
+        .validate()
+        .expect_err("empty schema_path must fail validation");
+    assert!(
+        format!("{err:#}").contains("must not be empty"),
+        "unexpected validation error: {err:#}"
+    );
+    let _ = fs::remove_file(wasm);
+}
+
+#[test]
+fn test_engine_schema_path_existing_first_occurrence_passes() {
+    let wasm = write_temp_file("schema-existing", "wasm", b"wasm");
+    let schema = write_temp_file("schema-existing", "binpb", b"schema");
+    let cfg: EngineConfig = toml::from_str(&engine_toml_with_modules(&format!(
+        r#"
+          [[module]]
+          name = "inventory"
+          namespace = "store"
+          version = "1.0.0"
+          wasm_path = "{}"
+          schema_path = "{}"
+        "#,
+        wasm.display(),
+        schema.display()
+    )))
+    .unwrap();
+    cfg.validate()
+        .expect("existing first-occurrence schema_path must validate");
+    let _ = fs::remove_file(wasm);
+    let _ = fs::remove_file(schema);
+}
+
+#[test]
+fn test_engine_schema_path_present_missing_file_fails() {
+    let wasm = write_temp_file("schema-missing", "wasm", b"wasm");
+    let missing_schema = unique_temp_path("schema-missing", "binpb");
+    let cfg: EngineConfig = toml::from_str(&engine_toml_with_modules(&format!(
+        r#"
+          [[module]]
+          name = "inventory"
+          namespace = "store"
+          version = "1.0.0"
+          wasm_path = "{}"
+          schema_path = "{}"
+        "#,
+        wasm.display(),
+        missing_schema.display()
+    )))
+    .unwrap();
+    let err = cfg
+        .validate()
+        .expect_err("missing schema_path file must fail validation");
+    assert!(
+        format!("{err:#}").contains("schema_path not found"),
+        "unexpected validation error: {err:#}"
+    );
+    let _ = fs::remove_file(wasm);
 }
 
 #[test]
@@ -525,6 +684,26 @@ fn engine_toml(listen: &str, allow_line: &str) -> String {
         key_path     = "certs/node.key"
         ca_cert_path = "certs/ca.crt"
     "#
+    )
+}
+
+fn engine_toml_with_modules(module_blocks: &str) -> String {
+    format!(
+        r#"
+          listen_address = "127.0.0.1:9100"
+
+          [node]
+          proxy_address   = "http://127.0.0.1:9001"
+          control_address = "http://127.0.0.1:9002"
+          peer_port       = 9443
+
+          [node.tls]
+          cert_path    = "certs/node.crt"
+          key_path     = "certs/node.key"
+          ca_cert_path = "certs/ca.crt"
+
+          {module_blocks}
+      "#
     )
 }
 

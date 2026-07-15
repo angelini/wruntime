@@ -1,12 +1,16 @@
 mod helpers;
 use helpers::{
     manager::{
-        backdate_engine_heartbeat, get_routing_table_version, get_rule_health,
-        manager_trio_with_monitor, register_test_module, sync_table, synced_routing_table,
+        backdate_engine_heartbeat, get_default_rule_health, get_routing_table_version,
+        manager_trio_with_monitor, register_test_module_raw, register_test_module_ready,
+        sync_table, synced_routing_table,
     },
     proxy::{proxy_get, start_proxy, TEST_SELF_PEER},
     stubs::spawn_stub_engine,
-    wait::{wait_for_routing_table_version_gt, wait_for_rule_health, DEFAULT_WAIT_TIMEOUT},
+    wait::{
+        wait_for_default_rule_health, wait_for_routing_table_version_gt, wait_for_rule_health,
+        DEFAULT_WAIT_TIMEOUT,
+    },
     wasm::minimal_file_descriptor_set,
 };
 
@@ -22,7 +26,8 @@ async fn test_heartbeat_timeout_marks_module_unhealthy() -> Result<()> {
     let (pool, _mgr_addr, mut mgr) = manager_trio_with_monitor(1).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "hc-e1",
         &engine_addr,
@@ -32,15 +37,26 @@ async fn test_heartbeat_timeout_marks_module_unhealthy() -> Result<()> {
     )
     .await?;
 
-    // The module is initially healthy (registration sets last_heartbeat).
-    let (healthy, _) = get_rule_health(&mut mgr, "heartbeat-svc").await?;
-    assert!(healthy, "module should be healthy after registration");
+    let (healthy, _) =
+        get_default_rule_health(&mut mgr, "hc-e1", "hc-ns", "heartbeat-svc", "1.0.0").await?;
+    assert!(
+        healthy,
+        "module should be healthy after readiness heartbeat"
+    );
 
     // Backdate the engine heartbeat so the monitor considers it stale.
     backdate_engine_heartbeat(&pool, "hc-e1", 60).await;
 
-    let (healthy, _) =
-        wait_for_rule_health(&mut mgr, "heartbeat-svc", false, DEFAULT_WAIT_TIMEOUT).await?;
+    let (healthy, _) = wait_for_default_rule_health(
+        &mut mgr,
+        "hc-e1",
+        "hc-ns",
+        "heartbeat-svc",
+        "1.0.0",
+        false,
+        DEFAULT_WAIT_TIMEOUT,
+    )
+    .await?;
     assert!(
         !healthy,
         "module should be unhealthy after heartbeat timeout"
@@ -54,10 +70,11 @@ async fn test_heartbeat_timeout_marks_module_unhealthy() -> Result<()> {
 /// the monitor from marking its routing rules unhealthy.
 #[tokio::test]
 async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
-    let (_pool, _mgr_addr, mut mgr) = manager_trio_with_monitor(2).await?;
+    let (pool, _mgr_addr, mut mgr) = manager_trio_with_monitor(2).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "hc-keep-e1",
         &engine_addr,
@@ -83,8 +100,8 @@ async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
         interval.tick().await;
     }
 
-    // Module should still be healthy.
-    let (healthy, _) = get_rule_health(&mut mgr, "kept-svc").await?;
+    let (healthy, _) =
+        get_default_rule_health(&mut mgr, "hc-keep-e1", "hc-keep-ns", "kept-svc", "1.0.0").await?;
     assert!(healthy, "module should remain healthy with heartbeats");
 
     let _ = engine_shutdown.send(());
@@ -98,7 +115,8 @@ async fn test_engine_health_recovery_after_heartbeat() -> Result<()> {
     let (pool, _mgr_addr, mut mgr) = manager_trio_with_monitor(1).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "hc-rec-e1",
         &engine_addr,
@@ -111,8 +129,16 @@ async fn test_engine_health_recovery_after_heartbeat() -> Result<()> {
     // Backdate engine heartbeat so the monitor marks it unhealthy.
     backdate_engine_heartbeat(&pool, "hc-rec-e1", 60).await;
 
-    let (healthy, _) =
-        wait_for_rule_health(&mut mgr, "recovering-svc", false, DEFAULT_WAIT_TIMEOUT).await?;
+    let (healthy, _) = wait_for_default_rule_health(
+        &mut mgr,
+        "hc-rec-e1",
+        "hc-rec-ns",
+        "recovering-svc",
+        "1.0.0",
+        false,
+        DEFAULT_WAIT_TIMEOUT,
+    )
+    .await?;
     assert!(!healthy, "module should be unhealthy before recovery");
 
     // Send a heartbeat — refreshes last_heartbeat in the DB.
@@ -127,8 +153,16 @@ async fn test_engine_health_recovery_after_heartbeat() -> Result<()> {
     })
     .await?;
 
-    let (healthy, _) =
-        wait_for_rule_health(&mut mgr, "recovering-svc", true, DEFAULT_WAIT_TIMEOUT).await?;
+    let (healthy, _) = wait_for_default_rule_health(
+        &mut mgr,
+        "hc-rec-e1",
+        "hc-rec-ns",
+        "recovering-svc",
+        "1.0.0",
+        true,
+        DEFAULT_WAIT_TIMEOUT,
+    )
+    .await?;
     assert!(healthy, "module should recover after heartbeat");
 
     let _ = engine_shutdown.send(());
@@ -141,7 +175,8 @@ async fn test_unhealthy_module_excluded_from_routing() -> Result<()> {
     let (pool, mgr_addr, mut mgr) = manager_trio_with_monitor(1).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "hc-route-e1",
         &engine_addr,
@@ -160,7 +195,16 @@ async fn test_unhealthy_module_excluded_from_routing() -> Result<()> {
 
     // Backdate engine heartbeat and wait for monitor to mark unhealthy.
     backdate_engine_heartbeat(&pool, "hc-route-e1", 60).await;
-    wait_for_rule_health(&mut mgr, "routed-svc", false, DEFAULT_WAIT_TIMEOUT).await?;
+    wait_for_default_rule_health(
+        &mut mgr,
+        "hc-route-e1",
+        "hc-route-ns",
+        "routed-svc",
+        "1.0.0",
+        false,
+        DEFAULT_WAIT_TIMEOUT,
+    )
+    .await?;
 
     // Re-sync the routing table — the rule should now be unhealthy.
     sync_table(&mgr_addr, &table).await?;
@@ -179,7 +223,8 @@ async fn test_health_change_bumps_routing_table_version() -> Result<()> {
     let (pool, _mgr_addr, mut mgr) = manager_trio_with_monitor(1).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "hc-ver-e1",
         &engine_addr,
@@ -237,7 +282,7 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
     })
     .await?;
 
-    // Intentional elapsed-time interval: keep the engine and mod-a fresh while mod-b's seeded heartbeat ages out.
+    // Intentional elapsed-time interval: keep the engine and mod-a fresh while mod-b remains omitted.
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
     for _ in 0..8 {
         mgr.heartbeat(HeartbeatRequest {
@@ -252,10 +297,31 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
         .await?;
         interval.tick().await;
     }
-    wait_for_rule_health(&mut mgr, "mod-b", false, DEFAULT_WAIT_TIMEOUT).await?;
+    wait_for_default_rule_health(
+        &mut mgr,
+        "mh-e1",
+        "mh-ns",
+        "mod-a",
+        "1.0.0",
+        true,
+        DEFAULT_WAIT_TIMEOUT,
+    )
+    .await?;
+    wait_for_default_rule_health(
+        &mut mgr,
+        "mh-e1",
+        "mh-ns",
+        "mod-b",
+        "1.0.0",
+        false,
+        DEFAULT_WAIT_TIMEOUT,
+    )
+    .await?;
 
-    let (a_healthy, _) = get_rule_health(&mut mgr, "mod-a").await?;
-    let (b_healthy, _) = get_rule_health(&mut mgr, "mod-b").await?;
+    let (a_healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-e1", "mh-ns", "mod-a", "1.0.0").await?;
+    let (b_healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-e1", "mh-ns", "mod-b", "1.0.0").await?;
     assert!(a_healthy, "reported module stays healthy");
     assert!(!b_healthy, "omitted module's route becomes unhealthy");
 
@@ -278,10 +344,21 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
         ],
     })
     .await?;
-    wait_for_rule_health(&mut mgr, "mod-b", true, DEFAULT_WAIT_TIMEOUT).await?;
+    wait_for_default_rule_health(
+        &mut mgr,
+        "mh-e1",
+        "mh-ns",
+        "mod-b",
+        "1.0.0",
+        true,
+        DEFAULT_WAIT_TIMEOUT,
+    )
+    .await?;
 
-    let (a_healthy, _) = get_rule_health(&mut mgr, "mod-a").await?;
-    let (b_healthy, _) = get_rule_health(&mut mgr, "mod-b").await?;
+    let (a_healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-e1", "mh-ns", "mod-a", "1.0.0").await?;
+    let (b_healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-e1", "mh-ns", "mod-b", "1.0.0").await?;
     assert!(a_healthy, "mod-a still healthy");
     assert!(b_healthy, "mod-b recovers once reported again");
     Ok(())
@@ -317,21 +394,66 @@ async fn test_engine_stale_marks_all_module_routes_unhealthy() -> Result<()> {
     })
     .await?;
 
-    backdate_engine_heartbeat(&pool, "mh-stale-e1", 60).await;
+    mgr.heartbeat(HeartbeatRequest {
+        engine_id: "mh-stale-e1".into(),
+        healthy_modules: vec![
+            ModuleDescriptor {
+                name: "stale-a".into(),
+                namespace: "mh-ns".into(),
+                version: "1.0.0".into(),
+                proto_schema: vec![],
+            },
+            ModuleDescriptor {
+                name: "stale-b".into(),
+                namespace: "mh-ns".into(),
+                version: "1.0.0".into(),
+                proto_schema: vec![],
+            },
+        ],
+    })
+    .await?;
+    wr_manager::db::update_route_health(&pool, 30.0, 30.0)
+        .await
+        .map_err(|status| anyhow::anyhow!("update_route_health failed: {status}"))?;
+
     let (a_healthy, _) =
-        wait_for_rule_health(&mut mgr, "stale-a", false, DEFAULT_WAIT_TIMEOUT).await?;
+        get_default_rule_health(&mut mgr, "mh-stale-e1", "mh-ns", "stale-a", "1.0.0").await?;
     let (b_healthy, _) =
-        wait_for_rule_health(&mut mgr, "stale-b", false, DEFAULT_WAIT_TIMEOUT).await?;
+        get_default_rule_health(&mut mgr, "mh-stale-e1", "mh-ns", "stale-b", "1.0.0").await?;
+    assert!(a_healthy, "stale-a starts healthy after heartbeat");
+    assert!(b_healthy, "stale-b starts healthy after heartbeat");
+
+    backdate_engine_heartbeat(&pool, "mh-stale-e1", 60).await;
+    let (a_healthy, _) = wait_for_default_rule_health(
+        &mut mgr,
+        "mh-stale-e1",
+        "mh-ns",
+        "stale-a",
+        "1.0.0",
+        false,
+        DEFAULT_WAIT_TIMEOUT,
+    )
+    .await?;
+    let (b_healthy, _) = wait_for_default_rule_health(
+        &mut mgr,
+        "mh-stale-e1",
+        "mh-ns",
+        "stale-b",
+        "1.0.0",
+        false,
+        DEFAULT_WAIT_TIMEOUT,
+    )
+    .await?;
     assert!(!a_healthy, "stale engine marks all its routes unhealthy");
     assert!(!b_healthy, "stale engine marks all its routes unhealthy");
     Ok(())
 }
 
 #[tokio::test]
-async fn test_registration_seed_survives_first_sweep() -> Result<()> {
-    let (_pool, _addr, mut mgr) = manager_trio_with_monitor(30).await?;
+async fn test_registration_alone_remains_unhealthy_after_sweep() -> Result<()> {
+    let (pool, _addr, mut mgr) = manager_trio_with_monitor(30).await?;
 
-    register_test_module(
+    register_test_module_raw(
         &mut mgr,
         "mh-seed-e1",
         "http://127.0.0.1:9820",
@@ -341,22 +463,97 @@ async fn test_registration_seed_survives_first_sweep() -> Result<()> {
     )
     .await?;
 
-    // Intentional elapsed-time coverage: no observable state changes on a successful sweep.
-    // Without the registration seed, the module-heartbeat join would fail and the route would flip
-    // unhealthy on the first sweep.
+    let (healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-seed-e1", "mh-ns", "seeded-svc", "1.0.0").await?;
+    assert!(!healthy, "raw registration starts default route unhealthy");
+
+    wr_manager::db::update_route_health(&pool, 30.0, 30.0)
+        .await
+        .map_err(|status| anyhow::anyhow!("update_route_health failed: {status}"))?;
+    let (healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-seed-e1", "mh-ns", "seeded-svc", "1.0.0").await?;
+    assert!(
+        !healthy,
+        "health recompute without heartbeat keeps route unhealthy"
+    );
+
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
 
-    let (healthy, _) = get_rule_health(&mut mgr, "seeded-svc").await?;
+    let (healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-seed-e1", "mh-ns", "seeded-svc", "1.0.0").await?;
+    assert!(
+        !healthy,
+        "monitor sweep without heartbeat keeps route unhealthy"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_reregister_resets_stale_module_readiness() -> Result<()> {
+    let (pool, _addr, mut mgr) = manager_trio_with_monitor(30).await?;
+
+    register_test_module_ready(
+        &pool,
+        &mut mgr,
+        "mh-rereg-e1",
+        "http://127.0.0.1:9825",
+        "mh-ns",
+        "rereg-svc",
+        "1.0.0",
+    )
+    .await?;
+    let (healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-rereg-e1", "mh-ns", "rereg-svc", "1.0.0").await?;
+    assert!(healthy, "route starts healthy after ready registration");
+
+    register_test_module_raw(
+        &mut mgr,
+        "mh-rereg-e1",
+        "http://127.0.0.1:9825",
+        "mh-ns",
+        "rereg-svc",
+        "1.0.0",
+    )
+    .await?;
+    let (healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-rereg-e1", "mh-ns", "rereg-svc", "1.0.0").await?;
+    assert!(!healthy, "re-registration resets the route to unhealthy");
+
+    wr_manager::db::update_route_health(&pool, 30.0, 30.0)
+        .await
+        .map_err(|status| anyhow::anyhow!("update_route_health failed: {status}"))?;
+    let (healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-rereg-e1", "mh-ns", "rereg-svc", "1.0.0").await?;
+    assert!(
+        !healthy,
+        "stale pre-registration readiness cannot recover route"
+    );
+
+    mgr.heartbeat(HeartbeatRequest {
+        engine_id: "mh-rereg-e1".into(),
+        healthy_modules: vec![ModuleDescriptor {
+            name: "rereg-svc".into(),
+            namespace: "mh-ns".into(),
+            version: "1.0.0".into(),
+            proto_schema: vec![],
+        }],
+    })
+    .await?;
+    wr_manager::db::update_route_health(&pool, 30.0, 30.0)
+        .await
+        .map_err(|status| anyhow::anyhow!("update_route_health failed: {status}"))?;
+    let (healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-rereg-e1", "mh-ns", "rereg-svc", "1.0.0").await?;
     assert!(
         healthy,
-        "seeded route stays healthy through the first sweep"
+        "fresh heartbeat recovers route after re-registration"
     );
     Ok(())
 }
 
 #[tokio::test]
 async fn test_malformed_module_entry_skipped_not_fatal() -> Result<()> {
-    let (_pool, _addr, mut mgr) = manager_trio_with_monitor(30).await?;
+    let (pool, _addr, mut mgr) = manager_trio_with_monitor(30).await?;
 
     mgr.register_engine(RegisterEngineRequest {
         registration: Some(EngineRegistration {
@@ -406,26 +603,29 @@ async fn test_malformed_module_entry_skipped_not_fatal() -> Result<()> {
         .await;
     assert!(resp.is_ok(), "malformed entry must not fail the heartbeat");
 
-    // Intentional elapsed-time coverage of a monitor sweep that should not change health.
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    wr_manager::db::update_route_health(&pool, 30.0, 30.0)
+        .await
+        .map_err(|status| anyhow::anyhow!("update_route_health failed: {status}"))?;
 
-    // Engine liveness was bumped and neither route was starved.
-    let (good_healthy, _) = get_rule_health(&mut mgr, "good-svc").await?;
-    let (other_healthy, _) = get_rule_health(&mut mgr, "other-svc").await?;
-    assert!(good_healthy, "valid module stays healthy");
+    let (good_healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-bad-e1", "mh-ns", "good-svc", "1.0.0").await?;
+    let (other_healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-bad-e1", "mh-ns", "other-svc", "1.0.0").await?;
+    assert!(good_healthy, "valid module becomes healthy");
     assert!(
-        other_healthy,
-        "other route not starved by the malformed entry"
+        !other_healthy,
+        "malformed/omitted module route remains unhealthy"
     );
     Ok(())
 }
 
 #[tokio::test]
 async fn test_admin_route_without_module_heartbeat_flips_unhealthy() -> Result<()> {
-    let (_pool, _addr, mut mgr) = manager_trio_with_monitor(30).await?;
+    let (pool, _addr, mut mgr) = manager_trio_with_monitor(30).await?;
 
     // A registered, fresh engine with a real module (whose route stays healthy).
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr,
         "mh-admin-e1",
         "http://127.0.0.1:9840",
@@ -453,7 +653,8 @@ async fn test_admin_route_without_module_heartbeat_flips_unhealthy() -> Result<(
 
     let (ghost_healthy, _) =
         wait_for_rule_health(&mut mgr, "ghost-svc", false, DEFAULT_WAIT_TIMEOUT).await?;
-    let (real_healthy, _) = get_rule_health(&mut mgr, "real-svc").await?;
+    let (real_healthy, _) =
+        get_default_rule_health(&mut mgr, "mh-admin-e1", "mh-ns", "real-svc", "1.0.0").await?;
     assert!(
         !ghost_healthy,
         "admin route with no module heartbeat flips unhealthy on the sweep"

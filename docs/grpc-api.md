@@ -6,7 +6,7 @@ All inter-service communication uses the `wruntime.ManagerService` gRPC service.
 
 | RPC | Request | Response | Description |
 |-----|---------|----------|-------------|
-| `RegisterEngine` | `EngineRegistration` | `{ accepted }` | Engine announces itself and its modules; the manager resolves requested secrets and DB credentials, then persists the engine, its schemas, and one default routing rule per schema-bearing module in a single transaction |
+| `RegisterEngine` | `EngineRegistration` | `{ accepted }` | Engine announces itself and its modules; the manager resolves requested secrets and DB credentials, then persists the engine, its schemas, and one initially-unhealthy default routing rule per schema-bearing module in a single transaction; module readiness rows are reset for advertised tuples |
 | `DeregisterEngine` | `{ engine_id }` | — | Engine removes itself on shutdown |
 | `Heartbeat` | `{ engine_id, healthy_modules }` | — | Bumps the engine's liveness unconditionally, then upserts a per-module heartbeat for each valid `healthy_modules` entry. Entries missing `namespace`/`name`/`version` are skipped and logged, never fatal. The background monitor marks a routing rule unhealthy when either its engine heartbeat or its specific module's heartbeat goes stale |
 | `ListEngines` | — | `[EngineRegistration]` | Returns all currently registered engines |
@@ -38,7 +38,7 @@ message RoutingRule {
 
 `proxy_address` is set automatically from the engine's `[node] proxy_address` when the engine registers. The routing layer on each proxy compares this field against its own `[node] proxy_address` to decide whether to forward the request directly to the local `engine_address` (`LocalEngine`) or to relay it to the peer proxy at `proxy_address` (`RemoteProxy`).
 
-The `healthy` field is managed entirely by the manager — it is always set to `true` on `UpsertRoutingRule` and is flipped to `false` automatically when the engine's heartbeat stops reporting the module as healthy, or immediately on `DeregisterEngine`. The routing table version is incremented whenever health status changes, so proxies pick up failover events within one TTL cycle. Default routing rules created at registration start healthy = true.
+The `healthy` field is managed entirely by the manager — it is always set to `true` on `UpsertRoutingRule`; default routing rules created at registration start `healthy = false`. Matching module heartbeats plus the background monitor's health recomputation make default routes healthy, and routes flip to `false` automatically when the engine or module heartbeat goes stale, or immediately on `DeregisterEngine`. The routing table version is incremented whenever health status changes, so proxies pick up failover events within one TTL cycle.
 
 ## Manager discovery
 
@@ -63,7 +63,7 @@ The `wruntime.NodeService` gRPC service is exposed by `wr-proxy` on its `control
 |-----|---------|----------|-------------|
 | `RegisterEngine` | `RegisterEngineRequest` | `RegisterEngineResponse` | Engine announces itself and its modules to the local proxy |
 | `DeregisterEngine` | `DeregisterEngineRequest` | `DeregisterEngineResponse` | Engine removes itself on shutdown |
-| `Heartbeat` | `HeartbeatRequest` | `HeartbeatResponse` | Sent every 10 s; the proxy forwards to the manager |
+| `Heartbeat` | `HeartbeatRequest` | `HeartbeatResponse` | Sent after module load immediately, then every 3 s; the proxy forwards to the manager |
 
 This decouples engines from the manager address — engines only need to know their local proxy's control address.
 
@@ -116,7 +116,7 @@ message GetJobStatusResponse {
 |-----|-------------|
 | `GetSchema` | Retrieve the stored schema bytes |
 
-Schemas are automatically uploaded when engines register (if `schema_path` is set in `engine.toml`).
+Schemas are automatically uploaded when engines register; the first occurrence of each unique `(namespace, name, version)` tuple in `engine.toml` supplies `schema_path`.
 
 ## Secrets
 

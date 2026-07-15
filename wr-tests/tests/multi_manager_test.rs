@@ -2,12 +2,13 @@ mod helpers;
 use helpers::{
     db::manager_pool,
     manager::{
-        get_rule_health, manager_client, register_test_module, start_manager_cluster,
+        get_default_rule_health, manager_client, register_test_module_ready, start_manager_cluster,
         start_manager_cluster_fast_death,
     },
     proxy::TEST_SELF_PEER,
     wait::{
-        wait_for_manager_absent, wait_for_manager_count, wait_for_rule_health, DEFAULT_WAIT_TIMEOUT,
+        wait_for_default_rule_health, wait_for_manager_absent, wait_for_manager_count,
+        DEFAULT_WAIT_TIMEOUT,
     },
     wasm::minimal_file_descriptor_set,
 };
@@ -33,7 +34,8 @@ async fn test_heartbeat_visible_across_managers() {
 
     // Register engine + routing rule via manager-1
     let mut c1 = manager_client(&managers[0].addr).await.unwrap();
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut c1,
         "engine-1",
         "http://127.0.0.1:19100",
@@ -44,19 +46,13 @@ async fn test_heartbeat_visible_across_managers() {
     .await
     .unwrap();
 
-    // Send heartbeat to manager-1
-    c1.heartbeat(wr_common::wruntime::HeartbeatRequest {
-        engine_id: "engine-1".into(),
-        healthy_modules: vec![],
-    })
-    .await
-    .unwrap();
-
     // No gossip wait needed — DB writes are immediately visible.
 
     // Manager-2 can see the healthy rule via the shared DB.
     let mut c2 = manager_client(&managers[1].addr).await.unwrap();
-    let (healthy, _) = get_rule_health(&mut c2, "svc").await.unwrap();
+    let (healthy, _) = get_default_rule_health(&mut c2, "engine-1", "ns", "svc", "1.0.0")
+        .await
+        .unwrap();
     assert!(
         healthy,
         "rule should be healthy (heartbeat written to shared Postgres)"
@@ -71,7 +67,8 @@ async fn test_health_preserved_across_managers() {
     let managers = start_manager_cluster(pool.clone(), 2, 2).await.unwrap();
 
     let mut c1 = manager_client(&managers[0].addr).await.unwrap();
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut c1,
         "engine-2",
         "http://127.0.0.1:19200",
@@ -82,17 +79,11 @@ async fn test_health_preserved_across_managers() {
     .await
     .unwrap();
 
-    // Heartbeat to manager-1
-    c1.heartbeat(wr_common::wruntime::HeartbeatRequest {
-        engine_id: "engine-2".into(),
-        healthy_modules: vec![],
-    })
-    .await
-    .unwrap();
-
     // Check via manager-2 that the rule is still healthy
     let mut c2 = manager_client(&managers[1].addr).await.unwrap();
-    let (healthy, _) = get_rule_health(&mut c2, "svc2").await.unwrap();
+    let (healthy, _) = get_default_rule_health(&mut c2, "engine-2", "ns", "svc2", "1.0.0")
+        .await
+        .unwrap();
     assert!(
         healthy,
         "rule should be healthy (heartbeat in shared Postgres)"
@@ -107,7 +98,8 @@ async fn test_health_convergence_on_missed_heartbeat() {
     let managers = start_manager_cluster(pool.clone(), 2, 1).await.unwrap();
 
     let mut c1 = manager_client(&managers[0].addr).await.unwrap();
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut c1,
         "engine-3",
         "http://127.0.0.1:19300",
@@ -118,25 +110,33 @@ async fn test_health_convergence_on_missed_heartbeat() {
     .await
     .unwrap();
 
-    // One heartbeat to establish the engine
-    c1.heartbeat(wr_common::wruntime::HeartbeatRequest {
-        engine_id: "engine-3".into(),
-        healthy_modules: vec![],
-    })
-    .await
-    .unwrap();
-
     // Verify healthy via manager-2
     let mut c2 = manager_client(&managers[1].addr).await.unwrap();
-    let (healthy, _) = wait_for_rule_health(&mut c2, "svc3", true, DEFAULT_WAIT_TIMEOUT)
-        .await
-        .unwrap();
+    let (healthy, _) = wait_for_default_rule_health(
+        &mut c2,
+        "engine-3",
+        "ns",
+        "svc3",
+        "1.0.0",
+        true,
+        DEFAULT_WAIT_TIMEOUT,
+    )
+    .await
+    .unwrap();
     assert!(healthy, "should be healthy after heartbeat");
 
     // Stop heartbeating — wait for timeout + monitor cycle
-    let (healthy, _) = wait_for_rule_health(&mut c2, "svc3", false, Duration::from_secs(5))
-        .await
-        .unwrap();
+    let (healthy, _) = wait_for_default_rule_health(
+        &mut c2,
+        "engine-3",
+        "ns",
+        "svc3",
+        "1.0.0",
+        false,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     assert!(!healthy, "should be unhealthy after missed heartbeat");
 }
 
@@ -147,7 +147,8 @@ async fn test_single_manager_cluster() {
     let managers = start_manager_cluster(pool.clone(), 1, 30).await.unwrap();
 
     let mut c = manager_client(&managers[0].addr).await.unwrap();
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut c,
         "engine-solo",
         "http://127.0.0.1:19400",
@@ -158,14 +159,9 @@ async fn test_single_manager_cluster() {
     .await
     .unwrap();
 
-    c.heartbeat(wr_common::wruntime::HeartbeatRequest {
-        engine_id: "engine-solo".into(),
-        healthy_modules: vec![],
-    })
-    .await
-    .unwrap();
-
-    let (healthy, _) = get_rule_health(&mut c, "solo").await.unwrap();
+    let (healthy, _) = get_default_rule_health(&mut c, "engine-solo", "ns", "solo", "1.0.0")
+        .await
+        .unwrap();
     assert!(healthy, "single-manager cluster should work normally");
 }
 
@@ -250,11 +246,34 @@ async fn test_module_health_convergence_across_managers() {
 
     // Manager-2 sees the shared outcome.
     let mut c2 = manager_client(&managers[1].addr).await.unwrap();
-    wait_for_rule_health(&mut c2, "mm-b", false, DEFAULT_WAIT_TIMEOUT)
+    wait_for_default_rule_health(
+        &mut c2,
+        "mm-e1",
+        "mm-ns",
+        "mm-a",
+        "1.0.0",
+        true,
+        DEFAULT_WAIT_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    wait_for_default_rule_health(
+        &mut c2,
+        "mm-e1",
+        "mm-ns",
+        "mm-b",
+        "1.0.0",
+        false,
+        DEFAULT_WAIT_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    let (a_healthy, _) = get_default_rule_health(&mut c2, "mm-e1", "mm-ns", "mm-a", "1.0.0")
         .await
         .unwrap();
-    let (a_healthy, _) = get_rule_health(&mut c2, "mm-a").await.unwrap();
-    let (b_healthy, _) = get_rule_health(&mut c2, "mm-b").await.unwrap();
+    let (b_healthy, _) = get_default_rule_health(&mut c2, "mm-e1", "mm-ns", "mm-b", "1.0.0")
+        .await
+        .unwrap();
     assert!(a_healthy, "reported module healthy via shared Postgres");
     assert!(!b_healthy, "omitted module unhealthy via shared Postgres");
 }

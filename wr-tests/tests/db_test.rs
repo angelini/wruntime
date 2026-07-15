@@ -1,6 +1,6 @@
 mod helpers;
 use helpers::{
-    db::{db_state, DbError, DbHost, ModuleState, PgValue},
+    db::{db_state, DbError, DbHost as _, ModuleState, PgValue},
     proxy::http_pool,
 };
 

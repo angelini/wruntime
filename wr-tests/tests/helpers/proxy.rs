@@ -41,8 +41,8 @@ pub struct ModuleSpec<'a> {
     pub schema: Vec<u8>,
 }
 
-/// Register one engine and one routing rule in a single call.
-pub async fn register_module(
+/// Register one engine and one module without creating an admin route.
+pub async fn register_module_raw(
     c: &mut ManagerServiceClient<tonic::transport::Channel>,
     engine: EngineSpec<'_>,
     module: ModuleSpec<'_>,
@@ -64,6 +64,14 @@ pub async fn register_module(
         }),
     })
     .await?;
+    Ok(())
+}
+
+pub async fn upsert_admin_route(
+    c: &mut ManagerServiceClient<tonic::transport::Channel>,
+    engine: EngineSpec<'_>,
+    module: ModuleSpec<'_>,
+) -> Result<()> {
     c.upsert_routing_rule(RoutingRule {
         rule_id: format!(
             "{}-{}-{}-{}",
@@ -77,7 +85,7 @@ pub async fn register_module(
         engine_id: engine.id.into(),
         engine_address: engine.addr.into(),
         peer_address: engine.peer_address.into(),
-        healthy: false, // manager overrides to true on upsert
+        healthy: false,
     })
     .await?;
     Ok(())

@@ -1,6 +1,6 @@
 mod helpers;
 use helpers::{
-    manager::{manager_trio, register_test_module, synced_routing_table},
+    manager::{manager_trio, register_test_module_ready, synced_routing_table},
     proxy::{http_client, proxy_get, start_egress_proxy, EgressConfig},
     stubs::{spawn_http1_stub, spawn_stub_engine},
 };
@@ -77,10 +77,11 @@ async fn test_egress_blocked_domain() -> Result<()> {
 /// Internal module calls must still route correctly when egress is configured.
 #[tokio::test]
 async fn test_egress_internal_module_passthrough() -> Result<()> {
-    let (_pool, mgr_addr, mut mgr_c) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr_c) = manager_trio().await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_test_module(
+    register_test_module_ready(
+        &pool,
         &mut mgr_c,
         "stub-engine",
         &engine_addr,

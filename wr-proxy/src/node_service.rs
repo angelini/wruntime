@@ -130,14 +130,15 @@ impl NodeService for NodeAgent {
         let mut client = self.discovery.get_client().await?;
         let response = client.register_engine(req.clone()).await?.into_inner();
 
-        // Cache engine for heartbeat aggregation
+        // Registration advertises configured modules, not loaded modules. Keep
+        // readiness empty until the engine reports a post-load heartbeat.
         {
             let mut engines = self.engines.write().await;
             engines.insert(
                 engine_id.clone(),
                 EngineState {
                     engine_id: engine_id.clone(),
-                    healthy_modules: reg.modules.clone(),
+                    healthy_modules: Vec::new(),
                 },
             );
         }

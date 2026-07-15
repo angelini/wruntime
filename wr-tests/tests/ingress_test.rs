@@ -1,6 +1,6 @@
 mod helpers;
 use helpers::{
-    manager::{manager_trio, register_test_module, synced_routing_table},
+    manager::{manager_trio, register_test_module_ready, synced_routing_table},
     proxy::{http_client, start_ingress_proxy, ExternalRoute},
     stubs::spawn_stub_engine,
 };
@@ -16,10 +16,19 @@ async fn ingress_fixture(
     namespace: &str,
     routes: Vec<ExternalRoute>,
 ) -> Result<(std::net::SocketAddr, tokio::sync::oneshot::Sender<()>)> {
-    let (_pool, mgr_addr, mut mgr_c) = manager_trio().await?;
+    let (pool, mgr_addr, mut mgr_c) = manager_trio().await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_test_module(&mut mgr_c, "e1", &engine_addr, namespace, module, "1.0.0").await?;
+    register_test_module_ready(
+        &pool,
+        &mut mgr_c,
+        "e1",
+        &engine_addr,
+        namespace,
+        module,
+        "1.0.0",
+    )
+    .await?;
 
     let table = synced_routing_table(&mgr_addr).await?;
 
