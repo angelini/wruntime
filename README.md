@@ -9,7 +9,8 @@ interception. Modules make ordinary HTTP calls to each other — Wruntime
 intercepts, routes, and delivers them automatically.
 
 ```
-┌────────────┐  ①  http://example.echo/echo.EchoService/Echo  ┌────────────┐
+                                 ①  http://example.echo/echo.EchoService/Echo  
+┌────────────┐                                ┌────────────┐
 │   caller   │ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─►   │    echo    │
 │   (WASM)   │        (appears direct)        │   (WASM)   │
 └──────┬─────┘                                └──────▲─────┘
