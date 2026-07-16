@@ -103,6 +103,7 @@ async fn test_query_with_postgres() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -136,6 +137,7 @@ async fn test_execute_with_postgres() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -171,6 +173,7 @@ async fn test_query_parameterised_with_postgres() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -206,6 +209,7 @@ async fn test_query_typed_columns_with_postgres() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -255,6 +259,7 @@ async fn test_transaction_commit() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -319,6 +324,7 @@ async fn test_transaction_rollback() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -380,6 +386,7 @@ async fn test_transaction_implicit_rollback_on_drop() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -433,6 +440,7 @@ async fn test_query_stream_with_postgres() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -500,6 +508,7 @@ async fn test_query_stream_drop_mid_iteration() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -548,6 +557,7 @@ async fn test_query_stream_in_transaction() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -615,6 +625,7 @@ async fn test_naive_timestamp_with_postgres() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -655,6 +666,7 @@ async fn test_naive_timestamp_param_roundtrip() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -688,6 +700,7 @@ async fn test_interval_with_postgres() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -728,6 +741,7 @@ async fn test_interval_param_roundtrip() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -765,6 +779,7 @@ async fn test_int4_array_with_postgres() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -797,6 +812,7 @@ async fn test_text_array_with_postgres() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -832,6 +848,7 @@ async fn test_array_param_roundtrip() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
@@ -865,6 +882,7 @@ async fn test_array_any_query() {
         test_http_pool(),
         ModuleServices {
             db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
             ..Default::default()
         },
     )
