@@ -82,6 +82,10 @@ url = "postgres://postgres@localhost:5433/wruntime_example"
 
 [cache]
 routing_table_ttl_secs = 5   # how often to poll the manager for routing updates
+
+# Optional; omit to block external HTTP from guests.
+[egress]
+allowed_domains = ["api.github.com", "*.openai.com"]
 ```
 
 `listen_address` and `control_address` **must** bind to loopback (`127.0.0.1`, `::1`, or `localhost`) — only engines on the same host reach them, and the proxy rejects a non-loopback value at config load. `node.proxy_address` must be an absolute `http` or `https` URI with a host. Cross-node traffic uses the mTLS peer listener on `peer_port` (default 9443, binds `0.0.0.0`). The peer address is derived automatically from `proxy_address` host + `peer_port`, including bracketed IPv6 authorities. The routing layer uses the derived peer address to distinguish local vs. remote rules.
@@ -89,6 +93,10 @@ routing_table_ttl_secs = 5   # how often to poll the manager for routing updates
 `control_address` exposes a gRPC `NodeService` that engines on the same node use for registration and heartbeats instead of connecting directly to the manager. This decouples engines from the manager address and enables local-first orchestration.
 
 The proxy is a streaming header-based router — it inspects only HTTP headers for routing decisions and streams request and response bodies through without buffering. It connects to the manager at startup, then polls for routing table updates in the background.
+
+### External egress
+
+The optional proxy `[egress]` section allows guests to call listed external domains. If the section is absent or `allowed_domains` is empty, non-module destinations are blocked. Exact domains match directly; a leading `*.` matches exactly one DNS label (`*.openai.com` matches `api.openai.com`, not `openai.com` or `a.b.openai.com`). Module authorities such as `ecommerce.inventory` continue through internal routing rather than this allowlist.
 
 ### Circuit breaker
 

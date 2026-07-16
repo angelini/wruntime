@@ -1,8 +1,10 @@
 # Host Bindings
 
-> **Building a new guest module?** See [`docs/agents/api_reference.md`](agents/api_reference.md) for exact function signatures of all host bindings.
+> **Building a new guest module?** Use the guest [API guide](agents/guest-module-author/api_guide.md) for preferred usage and semantic contracts. Exact APIs are owned by root [`wit/*.wit`](../wit/) and [`wr-sdk/src/*.rs`](../wr-sdk/src/).
 
-WASM modules running in `wr-engine` can access host-provided capabilities through WIT interfaces defined under `wit/`. When using `wr-sdk`, these types are available via `wr_sdk::bindings` — no separate `wit_bindgen::generate!` call is required.
+WASM modules running in `wr-engine` access host capabilities through WIT interfaces defined under `wit/`. `wr_sdk::bindings` supplies compatible SDK convenience types. Every guest still needs a local `wit_bindgen::generate!` block for its own world so the component records that world's imports, exports, and metadata; see the [module template](agents/guest-module-author/module_template.md).
+
+DB, blobstore, and LLM imports require matching per-module opt-ins and valid engine provider configuration. The engine validates these imports before loading the module; mismatches fail startup before readiness. Host implementations continue to enforce authorization, scope, input, and resource limits on every call.
 
 > **Compatibility policy.** The `wruntime:*` WIT packages (`wruntime:db`, `wruntime:llm`, `wruntime:blobstore`, `wruntime:tracing`) are **pre-1.0 and may change incompatibly** at any time until the project declares a stable API. Pin the runtime and SDK versions you build against, and expect to update guest code when these interfaces change.
 
@@ -160,7 +162,7 @@ Defined in `wit/tracing.wit`. Allows modules to create and annotate OpenTelemetr
 use wr_sdk::tracing;
 
 let span = tracing::start("process-order", &[("order.id", "123")]);
-tracing::set_attribute(&span, "order.total", "45.99");
+tracing::set_attr(&span, "order.total", 45.99);
 tracing::record_event(&span, "validation-passed", &[]);
 // span ends when dropped
 ```
@@ -173,7 +175,7 @@ Each request has a ceiling on the number of concurrently live guest-created span
 
 Defined in `wit/llm.wit`. Allows modules to call LLM APIs (currently Anthropic Claude) through a host binding. The engine holds the API key — guests never see credentials.
 
-### Engine configuration
+### LLM provider configuration
 
 Add an `[llm]` section to `engine.toml` and set `llm = true` on each module that should have access:
 
@@ -224,7 +226,17 @@ Access via `wr_sdk::bindings::wruntime::llm::inference` (raw WIT binding) or `wr
 
 `complete-stream` returns a `CompletionStream` cursor whose `next()` yields typed `StreamEvent` values in a guaranteed order: zero or more `TextDelta`, then exactly one `Usage`, then exactly one `Stop`, then `None` (idempotent thereafter). `usage()` returns `None` until the terminal `Usage` event has been observed via `next()`. Stream-level errors, transport failures, and truncated streams surface as an `LlmError` from `next()`.
 
-Tool-use is **not** supported while streaming: `complete-stream` pre-rejects tool-enabled requests with `LlmError::InvalidRequest` before any upstream call — use `complete()` for tool calls. Extended-thinking, signature, and citation deltas from the upstream API are dropped (they have no WIT representation). The `wr_sdk::llm::collect_stream` helper (used above) drains the cursor and accumulates the text deltas into a `String`. See [`api_reference.md`](agents/api_reference.md#wruntimellminference010) for the full type/ordering contract.
+Tool-use is **not** supported while streaming: `complete-stream` pre-rejects tool-enabled requests with `LlmError::InvalidRequest` before any upstream call — use `complete()` for tool calls. Extended-thinking, signature, and citation deltas from the upstream API are dropped (they have no WIT representation). The `wr_sdk::llm::collect_stream` helper (used above) drains the cursor and accumulates the text deltas into a `String`. See the guest API guide's [LLM semantics](agents/guest-module-author/api_guide.md#llm); exact stream types remain owned by [`wit/llm.wit`](../wit/llm.wit).
+
+The LLM API key is host configuration and never enters the guest sandbox. General guest secrets use a separate module environment mechanism:
+
+```toml
+[module.env]
+PUBLIC_MODE = "production"
+API_TOKEN = { secret = true }
+```
+
+The manager resolves `API_TOKEN` in the module namespace during registration. The engine passes only the resolved value as an environment variable; the guest receives no secret-store API, identifier, or provider credential. Missing secrets fail registration/startup. See [module environment values](configuration.md#module-environment-values).
 
 ## Filesystem
 

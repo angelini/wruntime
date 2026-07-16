@@ -1,154 +1,78 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for repository maintenance and guest-module work.
 
 ## Commands
 
-`just` is the task runner. Run `just` with no arguments to list all recipes.
+`just` is the task runner. Run `just` with no arguments to list recipes.
 
 ```bash
-# Build
-just build           # debug build
-just build-release   # release build
-just check           # compile check only
+# Workspace
+just build
+just check
+just test
+just test-integration
+just test-one <name>
+just tidy                    # format + clippy -D warnings
 
-# Test
-just test            # all tests
-just test-integration # wr-tests only
-just test-one <name> # single test by name
-just test-wasm       # build WASM test guests + run host binding tests
+# WASM and examples
+just test-wasm
+just build-ecommerce
+just build-stockmarket
+just build-codegen
+just validate-ecommerce     # ecommerce E2E; fails on WARN/WARNING
+just validate-all
 
-# Lint & format
-just fmt             # cargo fmt --all
-just lint            # cargo clippy -D warnings
-just tidy            # fmt + lint
-
-# Dev workflow (continuous compilation via bacon)
-just watch                  # cargo build + all example WASM guests (re-runs on file save)
-just watch check            # cargo check only
-just watch clippy           # clippy -D warnings
-just watch test             # cargo test
-just watch build-ecommerce  # WASM ecommerce guests only
-just watch build-codegen    # WASM codegen guests only
-just watch build-stockmarket # WASM stockmarket guests only
-
-# Certificates (required before running services)
-just certs             # generate local CA + localhost certs
-
-# Run services (debug)
+# Development infrastructure and services
+just certs
+just dev-up
+just dev-down
 just manager
 just proxy
 just engine
-
-# Dev infrastructure (Docker Compose — Postgres, Grafana/LGTM, RustFS S3)
-just dev-up
-just dev-down
-just dev-logs [service]
-
-# Ecommerce example
-just build-ecommerce   # compile WASM components + protobuf schemas
-just ecommerce         # build + run
-just ecommerce-inline  # build + run with single invocation, exits on failure
-
-# Codegen example (LLM agent sandbox)
-just build-codegen   # compile WASM components + protobuf schemas
-just codegen         # build + run
-just codegen-inline  # build + run with single invocation, exits on failure
-
-# Stockmarket example
-just build-stockmarket       # compile WASM components + protobuf schemas
-just stockmarket             # build + run (1 exchange engine)
-just stockmarket exchanges=3 # build + run with N exchange engines
-just stockmarket-inline      # build + run single invocation, exits on failure
 ```
+
+Continuous compilation is available through `just watch [check|clippy|test|build-ecommerce|build-codegen|build-stockmarket]`.
+
+## Agent modes
+
+[`docs/agents/README.md`](docs/agents/README.md) is a neutral dispatcher with exactly two modes:
+
+- [Guest module author](docs/agents/guest-module-author/README.md) — consumes existing SDK/WIT contracts to build WASM guests.
+- [Wruntime maintainer](docs/agents/wruntime-maintainer/README.md) — changes runtime, SDK, WIT, protobuf, CLI, tests, deployment, or repository contracts.
+
+A task requiring changes to root `wit/`, `wr-sdk`, or `wr-build` is maintainer work even when a guest example is the downstream consumer. Follow the [maintainer workflow](docs/agents/wruntime-maintainer/README.md), [invariants](docs/agents/wruntime-maintainer/invariants.md), and [validation matrix](docs/agents/wruntime-maintainer/validation.md).
+
+Exact guest APIs are owned by `wr-sdk/src/*.rs`, `wr-build/src/lib.rs`, and `wit/*.wit`. The [guest API guide](docs/agents/guest-module-author/api_guide.md) owns preferred usage and semantic guidance.
 
 ## Verification
 
-After refactoring, always run `just tidy` and `just ecommerce-inline` to verify formatting, lints, and end-to-end correctness. Treat any `WARN` log lines in `just ecommerce-inline` output as bugs that need to be fixed — a clean run should produce zero warnings. When changing host bindings (`wr-engine/src/db.rs`, `wr-engine/src/blobstore.rs`, `wr-engine/src/tracing.rs`), WIT interfaces (`wit/`), the SDK (`wr-sdk/`), or the WASM guest test harness (`wr-tests/guests/`, `wr-tests/tests/wasm_host_test.rs`), also run `just test-wasm`.
+After runtime refactoring, run `just tidy` and `just validate-ecommerce`. Treat any ecommerce warning as a bug. Use the change-sensitive requirements in the [validation matrix](docs/agents/wruntime-maintainer/validation.md).
 
-**Keep docs in sync with code changes.** When modifying architecture (adding/removing layers, changing request flow, changing config), update `CLAUDE.md`, `README.md`, and the relevant files in `docs/` (`architecture.md`, `configuration.md`, `schemas.md`, etc.) in the same change. **When modifying `wr-sdk/`, `wr-build/`, or `wit/` interfaces, also update `docs/agents/api_reference.md`.**
+Changes to host bindings (`wr-engine/src/db/`, `wr-engine/src/blobstore.rs`, `wr-engine/src/llm.rs`, `wr-engine/src/tracing.rs`), root WIT, `wr-sdk`, `wr-build`, test guests, or split `wr-tests/tests/wasm_*_host_test.rs` targets also require `just test-wasm`.
 
-### Agent Documentation (`docs/agents/`)
+Keep documentation synchronized according to [documentation ownership](docs/agents/wruntime-maintainer/documentation_ownership.md). Guest-visible SDK/WIT/build semantics require review of the guest API guide; exact signatures remain in source.
 
-`docs/agents/` contains structured documentation for AI agents building WASM guest modules. Key files: `module_template.md`, `api_reference.md` (must stay in sync with code), `constraints.md`, `decision_matrix.md`, `codegen.md`, `examples.md`.
+**Prerequisites:** `rustc`, `cargo`, `just`, `protoc`, and `taplo`. WASM work also requires `wasm32-wasip2` and `wasm-tools`. Cross-compilation requires `zig` and `cargo-zigbuild`.
 
-**Prerequisites:** `rustc`, `cargo`, `just`, `protoc`, `taplo`. WASM modules additionally require the `wasm32-wasip2` target (`rustup target add wasm32-wasip2`) and `wasm-tools`. Cross-compilation requires `zig` and `cargo-zigbuild`.
+Integration helpers live in `wr-tests/tests/helpers/mod.rs`. Direct DB-backed tests use `WRT_TEST_DB_URL=postgres://postgres@localhost:5433/wruntime_test` and skip under the shared policy when it is absent. Just test recipes set required DB/S3 variables; run `just dev-up` first.
 
-**Integration tests with a real DB:** set `WRT_TEST_DB_URL=postgres://postgres@localhost:5433/wruntime_test` (matches `just dev-up`); omitting it skips DB-backed tests. `just test-wasm` sets all required env vars automatically.
+## Architecture summary
 
-## Architecture
+Wruntime is a Cargo workspace implementing a distributed WASI Preview 2 runtime:
 
-Cargo workspace (`wr-common`, `wr-engine`, `wr-proxy`, `wr-manager`, `wr-cli`, `wr-tests`) implementing a distributed runtime that networks WASM modules via transparent HTTP interception.
-
-### Three-Service System
-
-| Service | Default Port | Role |
+| Service | Default listeners | Role |
 |---|---|---|
-| `wr-manager` | 9000 (mTLS gRPC) + 9010 (gossip) | Registry — routing table, schemas, heartbeats. Active-active with chitchat gossip. State persisted to Postgres (`wr_system` schema) |
-| `wr-proxy` | 9001 (HTTP, loopback) + 9002 (gRPC control, loopback) + 9443 (mTLS peer) | Streaming header-based router — inspects headers only, bodies flow through untouched |
-| `wr-engine` | 9100 (HTTP, loopback) | Runs WASM modules via wasmtime WASI component model |
+| `wr-manager` | 9000 mTLS gRPC, 9010 gossip | Registry, routing, schemas, schedules, secrets, heartbeats |
+| `wr-proxy` | 9001 loopback HTTP, 9002 loopback control, 9443 mTLS peer | Streaming header-based routing and circuit breaking |
+| `wr-engine` | 9100 loopback HTTP | WASM component execution and host capabilities |
 
-### Request Flow
+Modules use `(namespace, name, version)` identity and call `http://namespace.module/{package}.{Service}/{Method}`. The engine intercepts outbound HTTP and supplies internal routing metadata; the proxy resolves a healthy local/peer destination and streams the body; the destination engine dispatches to a module instance.
 
-1. WASM module makes HTTP call (e.g., `http://ecommerce.inventory/items`)
-2. `WasiHttpView` intercepts, attaches `x-wr-source` / `x-wr-destination` headers, rewrites URI to proxy
-3. Proxy resolves destination engine from cached routing table, streams request through
-4. Destination engine dispatches to correct WASM instance via `ModuleRegistry` (round-robin)
+Engine startup registers unhealthy routes, provisions namespace resources, runs module migrations, resolves secrets, validates capabilities, loads components, sends an immediate readiness heartbeat, then starts periodic heartbeats. Manager migrations and module migrations follow separate policies.
 
-### Key Design Details
+Manager gRPC and peer-proxy cross-node traffic use mTLS; manager liveness uses chitchat UDP gossip on its separately configured listener. Loopback engine/proxy traffic is plain HTTP only on documented listeners. Source routing metadata is not authorization. Guest DB pools use namespace roles without access to `wr_system`.
 
-**Module identity** — `(namespace, name, version)` triple used for routing, schema storage, and dispatch.
+Host interfaces are canonical under `wit/` and implemented asynchronously in `wr-engine`; guest calls remain synchronous from the guest perspective. Do not use `block_in_place` or `block_on` in host implementations.
 
-**mTLS** — all inter-service network traffic uses mutual TLS. Proxy loopback listener (`:9001`) is plain HTTP; cross-node traffic uses the mTLS peer listener (`:9443`). `just certs` generates localhost certificates for local dev.
-
-**`wr-engine`** — on startup: registers with manager → receives per-namespace DB credentials while default routes start unhealthy → provisions schemas/roles → runs migrations → builds connection pools → loads WASM components → sends an immediate post-load readiness heartbeat → starts a 3-second heartbeat loop. DB-enabled modules connect through per-namespace roles (`wr_ns_{namespace}`). Guest roles are never granted access to the `wr_system` schema, so WASM modules cannot read manager system tables.
-
-**Database migrations** — Manager migrations are embedded SQL migrations run via
-refinery under an advisory lock. Module migrations use `migrations_path` in
-`engine.toml`, `V{n}__description.sql` files, run via refinery at startup.
-Schema-isolated and serialized across replicas via advisory locks. See
-`docs/configuration.md`.
-
-**`wr-cli`** — all communication via gRPC to manager (`--manager` or `WR_MANAGER`). No direct DB access. TLS cert args default to `certs/` for local dev.
-
-**Schemas** — compiled protobuf `FileDescriptorSet` (`.binpb`) uploaded on registration. Used for codegen/discovery, **not** validated by proxy at runtime.
-
-**Capability scoping** — `[blobstore].allowed_buckets` is a required, non-empty host allowlist; namespace prefixes still isolate keys within an allowed bucket. `[llm].provider` currently accepts only `anthropic`.
-
-**Worker job routing** — `/wruntime.WorkerService/...` paths are canonical, with short compatibility aliases. Non-empty job versions are claimed exactly; an empty ad-hoc job version is name-only and can be claimed by any matching namespace/name worker. Manager schedules remain version-pinned.
-
-This project targets WASI Preview 2.
-
-### WIT Host Bindings (async)
-
-Host interfaces defined under `wit/` and implemented in `wr-engine`. All host bindings use async — `bindgen!` with `imports: { default: async }`. Do not use `block_in_place` or `block_on` in host implementations.
-
-```rust
-wasmtime::component::bindgen!({
-    path:  "../wit/db.wit",
-    world: "db-access",
-    imports: { default: async },
-});
-
-impl Host for ModuleState {
-    async fn query(&mut self, sql: String, params: Vec<PgValue>) -> Result<Vec<Row>, DbError> {
-        // ...
-    }
-}
-```
-
-### Configuration
-
-Each service reads a TOML config file. Examples in `examples/config/`. Modules declared under `[[module]]` in `engine.toml`. All services require TLS config (`[node.tls]` or `[tls]`) with `cert_path`, `key_path`, `ca_cert_path`.
-
-### Integration Tests
-
-`wr-tests/tests/` — spins up all services in-process on ephemeral ports. Helpers in `tests/helpers.rs` provide `start_manager()`, `start_proxy()`, `stub_engine()`, and schema/payload builders. DB host method calls must be `.await`ed (async trait methods).
-
-### Examples
-
-- `examples/ecommerce/` — inventory + client modules, multiple engine instances with load-balanced routing
-- `examples/stockmarket/` — exchange + ledger + simulator, supports N parallel exchange engines
-- `examples/codegen/` — LLM agent sandbox using the LLM host binding
-- `examples/multi-node/` — multi-node deployment configs
-- `examples/config/` — base service configs
+For maintenance details, use [architecture](docs/architecture.md), [configuration](docs/configuration.md), and the [maintainer guide](docs/agents/wruntime-maintainer/README.md).

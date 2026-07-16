@@ -1,20 +1,15 @@
-# Agent Guide for Building Guest Modules
+# Agent Guide
 
-This directory contains documentation optimized for AI agents building wruntime WASM guest modules. These docs are structured for minimal ambiguity and maximum copy-paste correctness.
+Choose exactly one mode before changing the repository.
 
-| Document | Purpose |
-|----------|---------|
-| [module_template.md](module_template.md) | Fill-in-the-blank skeleton for new modules |
-| [api_reference.md](api_reference.md) | Exact function signatures for all guest-callable APIs |
-| [constraints.md](constraints.md) | Hard rules, gotchas, and common mistakes |
-| [decision_matrix.md](decision_matrix.md) | Choose the right pattern for the task |
-| [examples.md](examples.md) | Index of real code in the repo |
-| [codegen.md](codegen.md) | Proto-to-Rust code generation mapping |
+- [Guest module author](guest-module-author/README.md)
+- [Wruntime maintainer](wruntime-maintainer/README.md)
 
-## Quick start
+| Task | Mode |
+|---|---|
+| Build a WASM guest against existing SDK and WIT APIs | Guest module author |
+| Change a guest's source, schema, migrations, or `[[module]]` entry | Guest module author |
+| Change the runtime, SDK, WIT, control-plane proto, CLI, tests, deployment, or repository contracts | Wruntime maintainer |
+| Change a guest-visible contract and update examples or guest docs downstream | Wruntime maintainer |
 
-1. Read [decision_matrix.md](decision_matrix.md) to pick handler vs. runner vs. combined
-2. Copy the skeleton from [module_template.md](module_template.md)
-3. Use [api_reference.md](api_reference.md) as the source of truth for function signatures
-4. Check [constraints.md](constraints.md) before building to avoid known pitfalls
-5. Refer to [codegen.md](codegen.md) to understand what `wr-build` generates from your proto
+A task that requires changes to root `wit/`, `wr-sdk`, or `wr-build` crosses the boundary and is maintainer work. There is no third or hybrid mode.

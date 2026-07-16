@@ -1,5 +1,7 @@
 # Testing
 
+Maintainers should select checks by change class in the [validation matrix](agents/wruntime-maintainer/validation.md). This page documents command behavior and prerequisites.
+
 Common recipes:
 
 ```bash

@@ -74,6 +74,12 @@ fn main() {
 ```rust
 mod proto { include!(concat!(env!("OUT_DIR"), "/echo.rs")); }
 
+// The complete local world is shown in docs/agents/guest-module-author/module_template.md.
+#[allow(dead_code, unused_imports)]
+mod bindings {
+    wit_bindgen::generate!({ path: "wit", world: "echo", generate_all });
+}
+
 use wr_sdk::prelude::*;
 
 struct Component;
@@ -111,6 +117,12 @@ fn main() {
 
 ```rust
 mod proto { include!(concat!(env!("OUT_DIR"), "/echo.rs")); }
+
+// The complete local world is shown in docs/agents/guest-module-author/module_template.md.
+#[allow(dead_code, unused_imports)]
+mod bindings {
+    wit_bindgen::generate!({ path: "wit", world: "caller", generate_all });
+}
 
 use prost::Message;
 use proto::EchoServiceClient;
@@ -256,6 +268,7 @@ wruntime/
 
 ## Documentation
 
+- [Agent guide](docs/agents/README.md) — choose guest module author or wruntime maintainer mode
 - [Architecture](docs/architecture.md) — detailed system diagram, request flow, internal headers
 - [Configuration](docs/configuration.md) — manager, proxy, and engine TOML configs; health checks; routing rules; multi-node setup
 - [gRPC API](docs/grpc-api.md) — `ManagerService` and `NodeService` RPC reference, worker job queue API

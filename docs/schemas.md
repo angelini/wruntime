@@ -1,6 +1,6 @@
 # Protobuf Schemas
 
-> **Building a new guest module?** See [`docs/agents/codegen.md`](agents/codegen.md) for the exact mapping from proto definitions to generated Rust code.
+> **Building a new guest module?** See the guest [codegen guide](agents/guest-module-author/codegen.md) for generator selection, output concepts, and authoritative source links.
 
 Every module **must** declare a protobuf schema. Schemas serve two purposes:
 
