@@ -32,6 +32,7 @@ impl ModelName {
             Ok(Self(value))
         }
     }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -96,9 +97,9 @@ pub struct CompletionBuilder {
 }
 
 impl CompletionBuilder {
-    pub fn new(model: &str) -> Self {
+    pub fn new(model: ModelName) -> Self {
         Self {
-            model: model.into(),
+            model: model.0,
             messages: vec![],
             system: None,
             max_tokens: 4096,
@@ -109,12 +110,12 @@ impl CompletionBuilder {
 
     /// Shorthand for claude-sonnet-4-6.
     pub fn sonnet() -> Self {
-        Self::new("claude-sonnet-4-6")
+        Self::new(ModelName("claude-sonnet-4-6".into()))
     }
 
     /// Shorthand for claude-haiku-4-5-20251001.
     pub fn haiku() -> Self {
-        Self::new("claude-haiku-4-5-20251001")
+        Self::new(ModelName("claude-haiku-4-5-20251001".into()))
     }
 
     pub fn system(mut self, s: impl Into<String>) -> Self {
@@ -138,37 +139,17 @@ impl CompletionBuilder {
         self
     }
 
-    /// Raw compatibility setter; the host still rejects zero.
-    pub fn max_tokens(mut self, n: u32) -> Self {
-        self.max_tokens = n;
-        self
-    }
-    pub fn with_max_tokens(mut self, value: MaxTokens) -> Self {
+    pub fn max_tokens(mut self, value: MaxTokens) -> Self {
         self.max_tokens = value.get();
         self
     }
 
-    /// Raw compatibility setter; the host still validates range/finite values.
-    pub fn temperature(mut self, t: f32) -> Self {
-        self.temperature = Some(t);
-        self
-    }
-    pub fn with_temperature(mut self, value: Temperature) -> Self {
+    pub fn temperature(mut self, value: Temperature) -> Self {
         self.temperature = Some(value.get());
         self
     }
 
-    /// Raw compatibility setter; prefer `with_tool` for construction-time validation.
-    pub fn tool(mut self, name: &str, description: &str, schema: &str) -> Self {
-        self.tools.push(ToolDef {
-            name: name.into(),
-            description: description.into(),
-            input_schema: schema.into(),
-        });
-        self
-    }
-
-    pub fn with_tool(mut self, name: &str, description: &str, schema: ToolSchema) -> Self {
+    pub fn tool(mut self, name: &str, description: &str, schema: ToolSchema) -> Self {
         self.tools.push(ToolDef {
             name: name.into(),
             description: description.into(),
@@ -227,13 +208,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn typed_llm_values_reject_invalid_inputs() {
+    fn typed_llm_values_validate_boundaries_before_builder_use() {
         assert!(ModelName::parse(" ").is_err());
         assert!(MaxTokens::new(0).is_err());
+        assert_eq!(MaxTokens::new(1).expect("lower boundary").get(), 1);
+        assert_eq!(
+            MaxTokens::new(u32::MAX).expect("upper boundary").get(),
+            u32::MAX
+        );
+        assert!(Temperature::new(f32::NEG_INFINITY).is_err());
         assert!(Temperature::new(f32::NAN).is_err());
-        assert!(Temperature::new(1.1).is_err());
+        assert!(Temperature::new(-f32::EPSILON).is_err());
+        assert!(Temperature::new(1.0 + f32::EPSILON).is_err());
+        assert_eq!(Temperature::new(0.0).expect("lower boundary").get(), 0.0);
+        assert_eq!(Temperature::new(1.0).expect("upper boundary").get(), 1.0);
         assert!(ToolSchema::parse("not-json").is_err());
         assert!(ToolSchema::parse("[]").is_err());
         assert!(ToolSchema::parse(r#"{"type":"object"}"#).is_ok());
+    }
+
+    #[test]
+    fn typed_setters_store_validated_values_in_one_signature_family() {
+        let request = CompletionBuilder::new(ModelName::parse("model").expect("valid model"))
+            .max_tokens(MaxTokens::new(1).expect("valid tokens"))
+            .temperature(Temperature::new(1.0).expect("valid temperature"))
+            .tool(
+                "lookup",
+                "Lookup a value",
+                ToolSchema::parse(r#"{"type":"object"}"#).expect("valid schema"),
+            )
+            .into_request();
+
+        assert_eq!(request.model, "model");
+        assert_eq!(request.max_tokens, 1);
+        assert_eq!(request.temperature, Some(1.0));
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.tools[0].name, "lookup");
+        assert_eq!(request.tools[0].input_schema, r#"{"type":"object"}"#);
     }
 }

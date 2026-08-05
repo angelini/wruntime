@@ -48,11 +48,14 @@ message StreamResponse {
 }
 message AllocStreamsRequest { uint32 initial = 1; uint32 drop_count = 2; uint32 additional = 3; }
 message AllocStreamsResponse { uint32 held = 1; bool hit_cap = 2; LlmErrorKind error_kind = 3; string error_message = 4; }
+message RawInvalidRequest {}
+
 service LlmTestService {
   rpc Complete(CompleteRequest) returns (CompleteResponse);
   rpc CompleteText(CompleteTextRequest) returns (CompleteTextResponse);
   rpc ToolUse(ToolUseRequest) returns (ToolUseResponse);
   rpc Error(LlmErrorRequest) returns (LlmErrorResponse);
+  rpc RawInvalid(RawInvalidRequest) returns (LlmErrorResponse);
   rpc Stream(StreamRequest) returns (StreamResponse);
   rpc AllocStreams(AllocStreamsRequest) returns (AllocStreamsResponse);
 }

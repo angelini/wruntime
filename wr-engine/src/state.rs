@@ -294,6 +294,8 @@ pub struct ModuleServices {
     pub db_schema: Option<Arc<str>>,
     /// Timeout configuration for guest DB connections.
     pub db_timeouts: DbTimeouts,
+    /// Whether host DB spans may include whitespace-normalized statement text.
+    pub db_telemetry_include_query_text: bool,
     /// Shared S3-compatible blobstore client, present when the module has blobstore access enabled.
     pub blobstore: Option<Arc<BlobstoreRuntime>>,
     /// S3 key prefix for namespace isolation (e.g. `wr/ecommerce/`).
@@ -325,6 +327,7 @@ impl Default for ModuleServices {
             db_pool: None,
             db_schema: None,
             db_timeouts: DbTimeouts::default(),
+            db_telemetry_include_query_text: false,
             blobstore: None,
             blob_prefix: None,
             blob_limits: BlobstoreLimits::default(),
@@ -378,6 +381,7 @@ struct ModuleCapabilities {
     blobstore: Option<BlobstoreCapability>,
     llm: Option<LlmCapability>,
     tracing: TracingCapability,
+    db_telemetry_include_query_text: bool,
     _fs: FsCapability,
 }
 
@@ -453,6 +457,7 @@ impl ModuleState {
                     outbound_parent,
                     accounting,
                 },
+                db_telemetry_include_query_text: services.db_telemetry_include_query_text,
                 _fs: FsCapability { _root: fs_root },
             },
         })
@@ -477,6 +482,16 @@ impl ModuleState {
             .llm
             .as_mut()
             .ok_or_else(|| LlmError::InvalidRequest("no LLM configured for this module".into()))
+    }
+
+    pub(crate) fn db_telemetry_config(&self) -> (Option<Arc<str>>, bool) {
+        (
+            self.capabilities
+                .db
+                .as_ref()
+                .and_then(|database| database.schema.clone()),
+            self.capabilities.db_telemetry_include_query_text,
+        )
     }
 
     pub(crate) fn tracing_context(&mut self) -> &mut TracingCapability {

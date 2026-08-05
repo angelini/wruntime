@@ -1,6 +1,6 @@
 mod helpers;
 use helpers::{
-    db::{db_state, DbError, DbHost as _, ModuleState, PgValue},
+    db::{db_state, DbError, DbHost as _, ModuleState, PgType, PgValue},
     proxy::http_pool,
 };
 
@@ -259,11 +259,33 @@ async fn test_db_jsonb_roundtrip() {
 async fn test_db_null_param_passes_through_as_null_column() {
     let mut state = db_state(2);
     let rows = state
-        .query("SELECT $1::text AS v".into(), vec![PgValue::Null])
+        .query(
+            "SELECT $1::text AS v".into(),
+            vec![PgValue::Null(PgType::Text)],
+        )
         .await
         .expect("query");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].columns[0].value, PgValue::Null);
+    assert_eq!(rows[0].columns[0].value, PgValue::Null(PgType::Text));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_db_unsupported_result_type_is_contextual() {
+    let mut state = db_state(2);
+    let error = state
+        .query("SELECT '127.0.0.1'::inet AS network".into(), vec![])
+        .await
+        .expect_err("inet has no pg-value representation");
+
+    match error {
+        DbError::UnsupportedResultType(details) => {
+            assert_eq!(details.column_name.as_deref(), Some("network"));
+            assert_eq!(details.column_index, 0);
+            assert_eq!(details.postgres_type_name, "inet");
+            assert_eq!(details.postgres_type_oid, 869);
+        }
+        other => panic!("expected unsupported result type, got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -34,7 +34,7 @@ async fn wasm_blobstore_put_get() -> Result<()> {
     let state = blobstore_state(bs.clone());
     let req = proto::PutRequest {
         bucket: "test-bucket".into(),
-        key: key.clone(),
+        key: format!("{key}//./object"),
         data: b"hello wasm blobstore".to_vec(),
     };
     let resp = harness.dispatch(state, "/Put", req).await?;
@@ -44,7 +44,7 @@ async fn wasm_blobstore_put_get() -> Result<()> {
     let state = blobstore_state(bs.clone());
     let req = proto::GetRequest {
         bucket: "test-bucket".into(),
-        key: key.clone(),
+        key: format!("{key}/object"),
     };
     let resp = harness.dispatch(state, "/Get", req).await?;
     assert_eq!(resp.status(), 200);
@@ -92,6 +92,51 @@ async fn wasm_blobstore_delete() -> Result<()> {
 
     let body = proto::NotFoundResponse::decode(resp.into_body())?;
     assert_eq!(body.error_kind, "not-found");
+    Ok(())
+}
+
+#[tokio::test]
+async fn wasm_blobstore_facade_rejects_invalid_names_before_host_calls() -> Result<()> {
+    let Some(harness) = GuestHarness::load(TestGuest::Blobstore).await? else {
+        return Ok(());
+    };
+    for (bucket, key) in [
+        ("Bad_Bucket", "valid/key"),
+        ("test-bucket", "../secret"),
+        ("test-bucket", ""),
+    ] {
+        let response = harness
+            .dispatch(
+                blobstore_state(blobstore_client()),
+                "/Put",
+                proto::PutRequest {
+                    bucket: bucket.into(),
+                    key: key.into(),
+                    data: b"must not be written".to_vec(),
+                },
+            )
+            .await?;
+        assert_eq!(response.status(), 400, "bucket={bucket}, key={key}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn wasm_blobstore_facade_missing_object_maps_to_not_found() -> Result<()> {
+    let Some(harness) = GuestHarness::load(TestGuest::Blobstore).await? else {
+        return Ok(());
+    };
+    let response = harness
+        .dispatch(
+            blobstore_state(blobstore_client()),
+            "/Get",
+            proto::GetRequest {
+                bucket: "test-bucket".into(),
+                key: unique_prefix("facade-missing"),
+            },
+        )
+        .await?;
+    assert_eq!(response.status(), 404);
     Ok(())
 }
 
@@ -156,7 +201,7 @@ async fn wasm_blobstore_list() -> Result<()> {
     let state = blobstore_state(bs.clone());
     let req = proto::ListRequest {
         bucket: "test-bucket".into(),
-        prefix: format!("{prefix}/"),
+        prefix: format!("{prefix}//./"),
     };
     let resp = harness.dispatch(state, "/List", req).await?;
     assert_eq!(resp.status(), 200);

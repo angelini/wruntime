@@ -1,0 +1,11 @@
+error: duplicate `rename` attribute
+ --> tests/ui/from_row/fail-duplicates.rs:5:31
+  |
+5 |     #[wr_db(rename = "first", rename = "second")]
+  |                               ^^^^^^
+
+error: duplicate `flatten` attribute
+  --> tests/ui/from_row/fail-duplicates.rs:11:22
+   |
+11 |     #[wr_db(flatten, flatten)]
+   |                      ^^^^^^^

@@ -1,0 +1,25 @@
+error: `FromRow` does not support generic structs
+ --> tests/ui/from_row/fail-generics.rs:4:19
+  |
+4 | struct TypeGeneric<T> {
+  |                   ^^^
+
+error: `FromRow` does not support generic structs
+ --> tests/ui/from_row/fail-generics.rs:9:23
+  |
+9 | struct LifetimeGeneric<'a> {
+  |                       ^^^^
+
+error: `FromRow` does not support generic structs
+  --> tests/ui/from_row/fail-generics.rs:14:20
+   |
+14 | struct ConstGeneric<const N: usize> {
+   |                    ^^^^^^^^^^^^^^^^
+
+error: `FromRow` does not support generic structs
+  --> tests/ui/from_row/fail-generics.rs:18:10
+   |
+18 | #[derive(FromRow)]
+   |          ^^^^^^^
+   |
+   = note: this error originates in the derive macro `FromRow` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -6,6 +6,7 @@ use super::bindings::{CursorState, TxState};
 use super::connection::get_prepared_connection;
 use super::params::prepare_params;
 use super::rows::pg_row_to_wit;
+use super::telemetry::DbOperation;
 use super::wruntime::db::database::{DbError, Host, PgValue, Row};
 use crate::state::{ModuleState, ResourceKind};
 
@@ -21,7 +22,7 @@ pub(crate) async fn query_rows(
         .query(sql, &params_ref)
         .await
         .map_err(|e| DbError::Query(pg_error_string(&e)))?;
-    Ok(rows.iter().map(pg_row_to_wit).collect())
+    rows.iter().map(pg_row_to_wit).collect()
 }
 
 pub(crate) async fn execute_statement(
@@ -58,13 +59,19 @@ impl Host for ModuleState {
         sql: String,
         params: Vec<PgValue>,
     ) -> impl std::future::Future<Output = Result<Vec<Row>, DbError>> + Send {
+        let mut telemetry = self.start_db_span(DbOperation::Query, &sql);
         let prepared = self
             .db()
             .map(|db| (db.pool.clone(), db.schema.clone(), db.timeouts.clone()));
         async move {
-            let (pool, schema, timeouts) = prepared?;
-            let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
-            query_rows(&client, sql.as_str(), params).await
+            let result = async {
+                let (pool, schema, timeouts) = prepared?;
+                let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
+                query_rows(&client, sql.as_str(), params).await
+            }
+            .await;
+            telemetry.finish_result(&result, |rows| rows.len() as u64);
+            result
         }
     }
 
@@ -73,13 +80,19 @@ impl Host for ModuleState {
         sql: String,
         params: Vec<PgValue>,
     ) -> impl std::future::Future<Output = Result<u64, DbError>> + Send {
+        let mut telemetry = self.start_db_span(DbOperation::Execute, &sql);
         let prepared = self
             .db()
             .map(|db| (db.pool.clone(), db.schema.clone(), db.timeouts.clone()));
         async move {
-            let (pool, schema, timeouts) = prepared?;
-            let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
-            execute_statement(&client, sql.as_str(), params).await
+            let result = async {
+                let (pool, schema, timeouts) = prepared?;
+                let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
+                execute_statement(&client, sql.as_str(), params).await
+            }
+            .await;
+            telemetry.finish_result(&result, |affected| *affected);
+            result
         }
     }
 
@@ -88,29 +101,50 @@ impl Host for ModuleState {
         sql: String,
         params: Vec<PgValue>,
     ) -> Result<Resource<CursorState>, DbError> {
-        let (pool, schema, timeouts, guard) = {
+        let mut telemetry = self.start_db_span(DbOperation::Stream, &sql);
+        let prepared = (|| {
             let db = self.db()?;
             let guard = db
                 .accounting
                 .try_track(ResourceKind::DbCursor)
                 .ok_or_else(|| DbError::Connection("db cursor cap exceeded".into()))?;
-            (
+            Ok((
                 db.pool.clone(),
                 db.schema.clone(),
                 db.timeouts.clone(),
                 guard,
-            )
+            ))
+        })();
+        let (pool, schema, timeouts, guard) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                telemetry.finish_error(&error);
+                return Err(error);
+            }
         };
-        let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
-        let stream = open_row_stream(&client, sql.as_str(), params).await?;
+        let client = match get_prepared_connection(&pool, &schema, &timeouts).await {
+            Ok(client) => client,
+            Err(error) => {
+                telemetry.finish_error(&error);
+                return Err(error);
+            }
+        };
+        let stream = match open_row_stream(&client, sql.as_str(), params).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                telemetry.finish_error(&error);
+                return Err(error);
+            }
+        };
         self.table()
             .push(CursorState {
                 stream: Box::pin(stream),
                 _conn: Some(client),
                 done: false,
+                telemetry,
                 _count: guard,
             })
-            .map_err(|e| DbError::Connection(e.to_string()))
+            .map_err(|error| DbError::Connection(error.to_string()))
     }
 
     async fn begin_transaction(&mut self) -> Result<Resource<TxState>, DbError> {
@@ -131,13 +165,13 @@ impl Host for ModuleState {
         client
             .execute("BEGIN", &[])
             .await
-            .map_err(|e| DbError::Query(pg_error_string(&e)))?;
+            .map_err(|error| DbError::Query(pg_error_string(&error)))?;
         self.table()
             .push(TxState {
                 client,
                 done: false,
                 _count: guard,
             })
-            .map_err(|e| DbError::Connection(e.to_string()))
+            .map_err(|error| DbError::Connection(error.to_string()))
     }
 }

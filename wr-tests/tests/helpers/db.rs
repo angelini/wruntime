@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 #[allow(unused_imports)]
-pub use wr_engine::db::wruntime::db::database::{DbError, Host as DbHost, PgValue};
+pub use wr_engine::db::wruntime::db::database::{DbError, Host as DbHost, PgType, PgValue};
 pub use wr_engine::state::{ModuleServices, ModuleState};
 
 use super::proxy::http_pool;
@@ -144,6 +144,15 @@ pub fn db_state(pool_size: usize) -> ModuleState {
 /// if it does not
 /// already exist. Panics if `WRT_TEST_DB_URL` is not set.
 pub async fn db_state_for_module(pool_size: usize, namespace: &str, name: &str) -> ModuleState {
+    db_state_for_module_with_active_span(pool_size, namespace, name, tracing::Span::none()).await
+}
+
+pub async fn db_state_for_module_with_active_span(
+    pool_size: usize,
+    namespace: &str,
+    name: &str,
+    active_span: tracing::Span,
+) -> ModuleState {
     let url = require_db_url();
     let schema = wr_engine::pool::module_schema(namespace, name);
     let pool = Arc::new(wr_engine::pool::build_pool(&url, pool_size).expect("build_pool"));
@@ -151,17 +160,15 @@ pub async fn db_state_for_module(pool_size: usize, namespace: &str, name: &str) 
         .get()
         .await
         .expect("get connection for schema provisioning");
-    if let Err(e) = client
+    if let Err(error) = client
         .simple_query(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
         .await
     {
-        // Ignore unique_violation (23505) — a concurrent test may have created
-        // the schema between our IF NOT EXISTS check and the actual CREATE.
-        let is_duplicate = e
+        let is_duplicate = error
             .as_db_error()
-            .is_some_and(|db| db.code().code() == "23505");
+            .is_some_and(|database| database.code().code() == "23505");
         if !is_duplicate {
-            panic!("provision schema: {e}");
+            panic!("provision schema: {error}");
         }
     }
     drop(client);
@@ -173,6 +180,7 @@ pub async fn db_state_for_module(pool_size: usize, namespace: &str, name: &str) 
         ModuleServices {
             db_pool: Some(pool),
             db_schema: Some(Arc::from(schema)),
+            active_span,
             ..Default::default()
         },
     )

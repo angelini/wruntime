@@ -13,7 +13,6 @@ mod bindings {
 }
 
 use serde::{Deserialize, Serialize};
-use wr_sdk::bindings::wruntime::blobstore::store;
 use wr_sdk::prelude::*;
 
 struct Component;
@@ -52,7 +51,9 @@ impl proto::CollectorService for Component {
         &self,
         req: proto::FetchDocsRequest,
     ) -> Result<proto::FetchDocsResponse, ServiceError> {
-        let span = wr_sdk::span!("collector.fetch_docs", "sources.count" => req.sources.len());
+        let source_count = i64::try_from(req.sources.len()).expect("source count fits in i64");
+        let span = wr_sdk::span!("collector.fetch_docs", "sources.count" => source_count);
+        let docs = bucket(BUCKET)?;
 
         let mut sources_fetched: u32 = 0;
         let mut total_bytes: u64 = 0;
@@ -75,32 +76,39 @@ impl proto::CollectorService for Component {
             let manifest_key = format!("{prefix}/manifest.json");
 
             // Check if already fetched (idempotent).
-            if store::head_object(BUCKET, &manifest_key).is_ok() {
-                wr_sdk::log::log(&format!("skipping already-fetched: {prefix}"));
-                tracing::record_event(&span, "cache_hit", &[("prefix", prefix.as_str())]);
-                doc_prefixes.push(prefix);
-                continue;
+            match docs.head(&manifest_key) {
+                Ok(_) => {
+                    wr_sdk::log!("skipping already-fetched: {prefix}");
+                    wr_sdk::event!(span, "cache_hit", "prefix" => prefix.as_str());
+                    doc_prefixes.push(prefix);
+                    continue;
+                }
+                Err(error) if error.status == 404 => {}
+                Err(error) => return Err(error),
             }
 
-            let fetch_span = tracing::start(
+            let fetch_span = wr_sdk::span!(
                 "collector.fetch_source",
-                &[
-                    ("source.type", doc_source_type_name(source_type)),
-                    ("source.owner", source.owner.as_str()),
-                    ("source.repo", source.repo.as_str()),
-                ],
+                "source.type" => doc_source_type_name(source_type),
+                "source.owner" => source.owner.as_str(),
+                "source.repo" => source.repo.as_str()
             );
             let bytes = match source_type {
-                proto::DocSourceType::GithubTarball => fetch_github_tarball(&source, &prefix),
-                proto::DocSourceType::DocsRs => fetch_docs_rs(&source, &prefix),
-                proto::DocSourceType::CratesIo => fetch_crates_io(&source, &prefix),
+                proto::DocSourceType::GithubTarball => {
+                    fetch_github_tarball(&docs, &source, &prefix)
+                }
+                proto::DocSourceType::DocsRs => fetch_docs_rs(&docs, &source, &prefix),
+                proto::DocSourceType::CratesIo => fetch_crates_io(&docs, &source, &prefix),
                 proto::DocSourceType::Unspecified => unreachable!(),
             }
             .inspect_err(|e| {
                 tracing::set_error(&fetch_span, &e.message);
             })?;
 
-            tracing::set_attr(&fetch_span, "source.bytes", bytes);
+            wr_sdk::set_attrs!(
+                fetch_span,
+                "source.bytes" => i64::try_from(bytes).expect("source bytes fit in i64")
+            );
             drop(fetch_span);
 
             total_bytes = total_bytes.saturating_add(bytes as u64);
@@ -108,8 +116,11 @@ impl proto::CollectorService for Component {
             doc_prefixes.push(prefix);
         }
 
-        tracing::set_attr(&span, "sources.fetched", sources_fetched);
-        tracing::set_attr(&span, "total_bytes", total_bytes);
+        wr_sdk::set_attrs!(
+            span,
+            "sources.fetched" => sources_fetched,
+            "total_bytes" => i64::try_from(total_bytes).expect("total bytes fit in i64")
+        );
         drop(span);
 
         Ok(proto::FetchDocsResponse {
@@ -123,7 +134,7 @@ impl proto::CollectorService for Component {
         &self,
         req: proto::ListDocsRequest,
     ) -> Result<proto::ListDocsResponse, ServiceError> {
-        let objects = store::list_objects(BUCKET, Some(&req.doc_prefix))?;
+        let objects = bucket(BUCKET)?.list(&req.doc_prefix)?;
 
         let chunks = objects
             .into_iter()
@@ -172,7 +183,7 @@ fn http_get(url: &str) -> Result<(u16, Vec<u8>), String> {
                     };
                     format!("{scheme_str}{authority}{location}")
                 };
-                wr_sdk::log::log(&format!("following {status} redirect to: {current_url}"));
+                wr_sdk::log!("following {status} redirect to: {current_url}");
             }
             _ => return Ok((status, body)),
         }
@@ -283,16 +294,16 @@ fn doc_prefix(source: &proto::DocSource) -> String {
     format!("docs/{st}/{owner}/{repo}/{ver}")
 }
 
-fn write_manifest(prefix: &str, manifest: &Manifest) -> Result<(), ServiceError> {
+fn write_manifest(docs: &Bucket, prefix: &str, manifest: &Manifest) -> Result<(), ServiceError> {
     let json = serde_json::to_vec(manifest)
         .map_err(|e| ServiceError::internal(format!("serialize manifest: {e}")))?;
     let key = format!("{prefix}/manifest.json");
-    store::put_object(BUCKET, &key, &json)?;
+    docs.put(&key, &json)?;
     Ok(())
 }
 
-fn store_file(key: &str, data: &[u8]) -> Result<(), ServiceError> {
-    store::put_object(BUCKET, key, data)?;
+fn store_file(docs: &Bucket, key: &str, data: &[u8]) -> Result<(), ServiceError> {
+    docs.put(key, data)?;
     Ok(())
 }
 
@@ -301,7 +312,7 @@ fn store_file(key: &str, data: &[u8]) -> Result<(), ServiceError> {
 /// Query the GitHub API to discover a repository's default branch.
 fn resolve_github_ref(owner: &str, repo: &str) -> Result<String, ServiceError> {
     let url = format!("https://api.github.com/repos/{owner}/{repo}");
-    wr_sdk::log::log(&format!("resolving default branch: {url}"));
+    wr_sdk::log!("resolving default branch: {url}");
 
     let (status, body) =
         http_get(&url).map_err(|e| ServiceError::internal(format!("GitHub API: {e}")))?;
@@ -320,11 +331,15 @@ fn resolve_github_ref(owner: &str, repo: &str) -> Result<String, ServiceError> {
     let info: RepoInfo = serde_json::from_slice(&body)
         .map_err(|e| ServiceError::internal(format!("parse repo info: {e}")))?;
 
-    wr_sdk::log::log(&format!("resolved default branch: {}", info.default_branch));
+    wr_sdk::log!("resolved default branch: {}", info.default_branch);
     Ok(info.default_branch)
 }
 
-fn fetch_github_tarball(source: &proto::DocSource, prefix: &str) -> Result<u64, ServiceError> {
+fn fetch_github_tarball(
+    docs: &Bucket,
+    source: &proto::DocSource,
+    prefix: &str,
+) -> Result<u64, ServiceError> {
     use flate2::read::GzDecoder;
     use std::io::Read;
     use tar::Archive;
@@ -333,7 +348,7 @@ fn fetch_github_tarball(source: &proto::DocSource, prefix: &str) -> Result<u64, 
         "https://codeload.github.com/{}/{}/tar.gz/{}",
         source.owner, source.repo, source.ref_or_ver
     );
-    wr_sdk::log::log(&format!("fetching tarball: {url}"));
+    wr_sdk::log!("fetching tarball: {url}");
 
     let (status, body) =
         http_get(&url).map_err(|e| ServiceError::internal(format!("http_get: {e}")))?;
@@ -399,7 +414,7 @@ fn fetch_github_tarball(source: &proto::DocSource, prefix: &str) -> Result<u64, 
         }
 
         let key = format!("{prefix}/files/{relative}");
-        store_file(&key, &contents)?;
+        store_file(docs, &key, &contents)?;
 
         let size = contents.len() as u64;
         total_bytes += size;
@@ -410,6 +425,7 @@ fn fetch_github_tarball(source: &proto::DocSource, prefix: &str) -> Result<u64, 
     }
 
     write_manifest(
+        docs,
         prefix,
         &Manifest {
             source_type: "github_tarball".into(),
@@ -421,18 +437,22 @@ fn fetch_github_tarball(source: &proto::DocSource, prefix: &str) -> Result<u64, 
         },
     )?;
 
-    wr_sdk::log::log(&format!("stored tarball: {prefix} ({total_bytes} bytes)"));
+    wr_sdk::log!("stored tarball: {prefix} ({total_bytes} bytes)");
     Ok(total_bytes)
 }
 
 // ── docs.rs fetcher ──────────────────────────────────────────────────────────
 
-fn fetch_docs_rs(source: &proto::DocSource, prefix: &str) -> Result<u64, ServiceError> {
+fn fetch_docs_rs(
+    docs: &Bucket,
+    source: &proto::DocSource,
+    prefix: &str,
+) -> Result<u64, ServiceError> {
     // Fetch the main crate doc page.
     let crate_name = &source.owner;
     let version = &source.ref_or_ver;
     let url = format!("https://docs.rs/{crate_name}/{version}/{crate_name}/index.html");
-    wr_sdk::log::log(&format!("fetching docs.rs: {url}"));
+    wr_sdk::log!("fetching docs.rs: {url}");
 
     let (status, body) =
         http_get(&url).map_err(|e| ServiceError::internal(format!("http_get: {e}")))?;
@@ -445,9 +465,10 @@ fn fetch_docs_rs(source: &proto::DocSource, prefix: &str) -> Result<u64, Service
 
     let key = format!("{prefix}/files/index.html");
     let size = body.len() as u64;
-    store_file(&key, &body)?;
+    store_file(docs, &key, &body)?;
 
     write_manifest(
+        docs,
         prefix,
         &Manifest {
             source_type: "docs_rs".into(),
@@ -462,17 +483,21 @@ fn fetch_docs_rs(source: &proto::DocSource, prefix: &str) -> Result<u64, Service
         },
     )?;
 
-    wr_sdk::log::log(&format!("stored docs.rs: {prefix} ({size} bytes)"));
+    wr_sdk::log!("stored docs.rs: {prefix} ({size} bytes)");
     Ok(size)
 }
 
 // ── crates.io fetcher ────────────────────────────────────────────────────────
 
-fn fetch_crates_io(source: &proto::DocSource, prefix: &str) -> Result<u64, ServiceError> {
+fn fetch_crates_io(
+    docs: &Bucket,
+    source: &proto::DocSource,
+    prefix: &str,
+) -> Result<u64, ServiceError> {
     let crate_name = &source.owner;
     let version = &source.ref_or_ver;
     let url = format!("https://crates.io/api/v1/crates/{crate_name}/{version}");
-    wr_sdk::log::log(&format!("fetching crates.io: {url}"));
+    wr_sdk::log!("fetching crates.io: {url}");
 
     let (status, body) =
         http_get(&url).map_err(|e| ServiceError::internal(format!("http_get: {e}")))?;
@@ -485,9 +510,10 @@ fn fetch_crates_io(source: &proto::DocSource, prefix: &str) -> Result<u64, Servi
 
     let key = format!("{prefix}/files/metadata.json");
     let size = body.len() as u64;
-    store_file(&key, &body)?;
+    store_file(docs, &key, &body)?;
 
     write_manifest(
+        docs,
         prefix,
         &Manifest {
             source_type: "crates_io".into(),
@@ -502,6 +528,6 @@ fn fetch_crates_io(source: &proto::DocSource, prefix: &str) -> Result<u64, Servi
         },
     )?;
 
-    wr_sdk::log::log(&format!("stored crates.io: {prefix} ({size} bytes)"));
+    wr_sdk::log!("stored crates.io: {prefix} ({size} bytes)");
     Ok(size)
 }

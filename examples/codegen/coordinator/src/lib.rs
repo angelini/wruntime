@@ -182,6 +182,30 @@ fn handle_get_task_json(task_id: &str) -> (u16, Vec<u8>) {
 
 // ── Proto service implementation ─────────────────────────────────────────────
 
+#[derive(FromRow)]
+struct TaskRow {
+    task_id: String,
+    status: String,
+    unified_diff: String,
+    message: String,
+    agent_turns: i32,
+    total_input_tokens: i32,
+    total_output_tokens: i32,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(FromRow)]
+struct ClaimedTaskRow {
+    task_id: String,
+    session_id: String,
+    repo_url: String,
+    git_ref: String,
+    doc_sources: Json<Vec<DocSourceJson>>,
+    task_description: String,
+    max_agent_turns: i32,
+}
+
 impl proto::CoordinatorService for Component {
     fn create_task(
         &self,
@@ -195,18 +219,16 @@ impl proto::CoordinatorService for Component {
                 .map_err(ServiceError::bad_request)?;
         }
 
-        let doc_sources_json = serde_json::to_string(
-            &req.doc_sources
-                .iter()
-                .map(|s| DocSourceJson {
-                    source_type: doc_source_type_name(s.source_type).to_string(),
-                    owner: s.owner.clone(),
-                    repo: s.repo.clone(),
-                    ref_or_ver: s.ref_or_ver.clone(),
-                })
-                .collect::<Vec<_>>(),
-        )
-        .unwrap_or_else(|_| "[]".into());
+        let doc_sources = req
+            .doc_sources
+            .iter()
+            .map(|source| DocSourceJson {
+                source_type: doc_source_type_name(source.source_type).to_string(),
+                owner: source.owner.clone(),
+                repo: source.repo.clone(),
+                ref_or_ver: source.ref_or_ver.clone(),
+            })
+            .collect::<Vec<_>>();
 
         let max_turns = if req.max_agent_turns > 0 {
             req.max_agent_turns
@@ -214,20 +236,19 @@ impl proto::CoordinatorService for Component {
             3
         };
 
-        database::execute(
+        query(
             "INSERT INTO tasks (task_id, repo_url, \"ref\", doc_sources, task_description, \
              max_agent_turns, status, session_id) \
              VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)",
-            &[
-                PgValue::Text(task_id.clone()),
-                PgValue::Text(req.repo_url.clone()),
-                PgValue::Text(req.r#ref.clone()),
-                PgValue::Jsonb(doc_sources_json),
-                PgValue::Text(req.task_description.clone()),
-                PgValue::Int4(to_db_i32(max_turns, "max_agent_turns")?),
-                PgValue::Text(session_id.clone()),
-            ],
-        )?;
+        )
+        .bind(task_id.clone())
+        .bind(req.repo_url.clone())
+        .bind(req.r#ref.clone())
+        .bind(Json(doc_sources))
+        .bind(req.task_description.clone())
+        .bind(to_db_i32(max_turns, "max_agent_turns")?)
+        .bind(session_id.clone())
+        .execute()?;
 
         // Submit a job to the engine's worker queue.
         let worker = proto::WorkerServiceClient::new("codegen.worker", "1.0.0");
@@ -249,7 +270,7 @@ impl proto::CoordinatorService for Component {
             task_description: req.task_description,
             max_agent_turns: max_turns,
         }) {
-            wr_sdk::log::log(&format!("failed to submit worker job: {e}"));
+            wr_sdk::log!("failed to submit worker job: {e}");
         }
 
         Ok(proto::CreateTaskResponse {
@@ -269,18 +290,18 @@ impl proto::CoordinatorService for Component {
         let limit = if req.limit > 0 { req.limit } else { 50 };
         let offset = if req.offset > 0 { req.offset } else { 0 };
 
-        let rows = database::query(
+        let tasks = query_as::<TaskRow>(
             "SELECT task_id, status, unified_diff, message, agent_turns, \
              total_input_tokens, total_output_tokens, \
-             created_at::text, updated_at::text \
+             created_at::text AS created_at, updated_at::text AS updated_at \
              FROM tasks ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-            &[
-                PgValue::Int4(to_db_i32(limit, "limit")?),
-                PgValue::Int4(to_db_i32(offset, "offset")?),
-            ],
-        )?;
-
-        let tasks = rows.into_iter().map(row_to_task_response).collect();
+        )
+        .bind(to_db_i32(limit, "limit")?)
+        .bind(to_db_i32(offset, "offset")?)
+        .fetch_all()?
+        .into_iter()
+        .map(task_row_to_response)
+        .collect::<Result<Vec<_>, ServiceError>>()?;
         Ok(proto::ListTasksResponse { tasks })
     }
 
@@ -289,41 +310,23 @@ impl proto::CoordinatorService for Component {
         _req: proto::ClaimTaskRequest,
     ) -> Result<proto::ClaimTaskResponse, ServiceError> {
         // Atomically claim one pending task.
-        let rows = database::query(
+        let Some(row) = query_as::<ClaimedTaskRow>(
             "UPDATE tasks SET status = 'claimed', updated_at = now() \
              WHERE task_id = ( \
                SELECT task_id FROM tasks WHERE status = 'pending' \
                ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED \
-             ) RETURNING task_id, session_id, repo_url, \"ref\", \
+             ) RETURNING task_id, session_id, repo_url, \"ref\" AS git_ref, \
                doc_sources, task_description, max_agent_turns",
-            &[],
-        )?;
-
-        if rows.is_empty() {
+        )
+        .fetch_optional()?
+        else {
             return Ok(proto::ClaimTaskResponse {
                 found: false,
                 ..Default::default()
             });
-        }
-
-        let row = &rows[0];
-        let text = |i: usize| -> String {
-            match &row.columns[i].value {
-                PgValue::Text(s) => s.clone(),
-                PgValue::Jsonb(s) => s.clone(),
-                _ => String::new(),
-            }
-        };
-        let count = |i: usize| -> u32 {
-            match &row.columns[i].value {
-                PgValue::Int4(n) => u32::try_from(*n).unwrap_or_default(),
-                _ => 0,
-            }
         };
 
-        let doc_sources_json = text(4);
-        let doc_source_specs: Vec<DocSourceJson> =
-            serde_json::from_str(&doc_sources_json).unwrap_or_default();
+        let doc_source_specs = row.doc_sources.0;
         let doc_sources = doc_source_specs
             .into_iter()
             .map(|source| {
@@ -340,13 +343,14 @@ impl proto::CoordinatorService for Component {
 
         Ok(proto::ClaimTaskResponse {
             found: true,
-            task_id: text(0),
-            session_id: text(1),
-            repo_url: text(2),
-            r#ref: text(3),
+            task_id: row.task_id,
+            session_id: row.session_id,
+            repo_url: row.repo_url,
+            r#ref: row.git_ref,
             doc_sources,
-            task_description: text(5),
-            max_agent_turns: count(6),
+            task_description: row.task_description,
+            max_agent_turns: u32::try_from(row.max_agent_turns)
+                .map_err(|_| ServiceError::internal("negative max_agent_turns in database"))?,
         })
     }
 
@@ -355,13 +359,10 @@ impl proto::CoordinatorService for Component {
         req: proto::UpdateTaskStatusRequest,
     ) -> Result<proto::UpdateTaskStatusResponse, ServiceError> {
         let status = validated_task_status(req.status)?;
-        database::execute(
-            "UPDATE tasks SET status = $2, updated_at = now() WHERE task_id = $1",
-            &[
-                PgValue::Text(req.task_id),
-                PgValue::Text(task_status_name(status as i32).to_string()),
-            ],
-        )?;
+        query("UPDATE tasks SET status = $2, updated_at = now() WHERE task_id = $1")
+            .bind(req.task_id)
+            .bind(task_status_name(status as i32).to_string())
+            .execute()?;
         Ok(proto::UpdateTaskStatusResponse {})
     }
 
@@ -378,42 +379,42 @@ impl proto::CoordinatorService for Component {
                 "complete_task status must be complete or error",
             ));
         }
-        database::execute(
+        query(
             "UPDATE tasks SET status = $2, unified_diff = $3, message = $4, \
              agent_turns = $5, total_input_tokens = $6, total_output_tokens = $7, \
              updated_at = now() WHERE task_id = $1",
-            &[
-                PgValue::Text(req.task_id),
-                PgValue::Text(task_status_name(status as i32).to_string()),
-                PgValue::Text(req.unified_diff),
-                PgValue::Text(req.message),
-                PgValue::Int4(to_db_i32(req.agent_turns, "agent_turns")?),
-                PgValue::Int4(to_db_i32(req.total_input_tokens, "total_input_tokens")?),
-                PgValue::Int4(to_db_i32(req.total_output_tokens, "total_output_tokens")?),
-            ],
-        )?;
+        )
+        .bind(req.task_id)
+        .bind(task_status_name(status as i32).to_string())
+        .bind(req.unified_diff)
+        .bind(req.message)
+        .bind(to_db_i32(req.agent_turns, "agent_turns")?)
+        .bind(to_db_i32(req.total_input_tokens, "total_input_tokens")?)
+        .bind(to_db_i32(req.total_output_tokens, "total_output_tokens")?)
+        .execute()?;
         Ok(proto::CompleteTaskResponse {})
     }
 }
 
 impl Component {
     fn get_task_inner(&self, task_id: &str) -> Result<proto::GetTaskResponse, ServiceError> {
-        let span = tracing::start("coordinator.get_task", &[("task.id", task_id)]);
-        let rows = database::query(
+        let span = wr_sdk::span!("coordinator.get_task", "task.id" => task_id);
+        let row = query_as::<TaskRow>(
             "SELECT task_id, status, unified_diff, message, agent_turns, \
              total_input_tokens, total_output_tokens, \
-             created_at::text, updated_at::text \
+             created_at::text AS created_at, updated_at::text AS updated_at \
              FROM tasks WHERE task_id = $1",
-            &[PgValue::Text(task_id.into())],
-        )?;
+        )
+        .bind(task_id.to_owned())
+        .fetch_optional()?;
 
-        if rows.is_empty() {
+        let Some(row) = row else {
             tracing::set_error(&span, "task not found");
             return Err(ServiceError::not_found("task not found"));
-        }
+        };
 
         drop(span);
-        Ok(row_to_task_response(rows.into_iter().next().unwrap()))
+        task_row_to_response(row)
     }
 }
 
@@ -437,15 +438,17 @@ fn doc_source_type_name(value: i32) -> &'static str {
     }
 }
 
-fn task_status_from_name(value: &str) -> proto::TaskStatus {
+fn task_status_from_name(value: &str) -> Result<proto::TaskStatus, ServiceError> {
     match value {
-        "pending" => proto::TaskStatus::Pending,
-        "claimed" => proto::TaskStatus::Claimed,
-        "collecting" => proto::TaskStatus::Collecting,
-        "generating" => proto::TaskStatus::Generating,
-        "complete" => proto::TaskStatus::Complete,
-        "error" => proto::TaskStatus::Error,
-        _ => proto::TaskStatus::Unspecified,
+        "pending" => Ok(proto::TaskStatus::Pending),
+        "claimed" => Ok(proto::TaskStatus::Claimed),
+        "collecting" => Ok(proto::TaskStatus::Collecting),
+        "generating" => Ok(proto::TaskStatus::Generating),
+        "complete" => Ok(proto::TaskStatus::Complete),
+        "error" => Ok(proto::TaskStatus::Error),
+        value => Err(ServiceError::internal(format!(
+            "invalid task status in database: {value}"
+        ))),
     }
 }
 
@@ -475,31 +478,21 @@ fn to_db_i32(value: u32, field: &str) -> Result<i32, ServiceError> {
         .map_err(|_| ServiceError::bad_request(format!("{field} exceeds database range")))
 }
 
-fn row_to_task_response(row: database::Row) -> proto::GetTaskResponse {
-    let text = |i: usize| -> String {
-        match &row.columns[i].value {
-            PgValue::Text(s) => s.clone(),
-            _ => String::new(),
-        }
-    };
-    let count = |i: usize| -> u32 {
-        match &row.columns[i].value {
-            PgValue::Int4(n) => u32::try_from(*n).unwrap_or_default(),
-            _ => 0,
-        }
-    };
-
-    proto::GetTaskResponse {
-        task_id: text(0),
-        status: task_status_from_name(&text(1)) as i32,
-        unified_diff: text(2),
-        message: text(3),
-        agent_turns: count(4),
-        total_input_tokens: count(5),
-        total_output_tokens: count(6),
-        created_at: text(7),
-        updated_at: text(8),
-    }
+fn task_row_to_response(row: TaskRow) -> Result<proto::GetTaskResponse, ServiceError> {
+    Ok(proto::GetTaskResponse {
+        task_id: row.task_id,
+        status: task_status_from_name(&row.status)? as i32,
+        unified_diff: row.unified_diff,
+        message: row.message,
+        agent_turns: u32::try_from(row.agent_turns)
+            .map_err(|_| ServiceError::internal("negative agent_turns in database"))?,
+        total_input_tokens: u32::try_from(row.total_input_tokens)
+            .map_err(|_| ServiceError::internal("negative total_input_tokens in database"))?,
+        total_output_tokens: u32::try_from(row.total_output_tokens)
+            .map_err(|_| ServiceError::internal("negative total_output_tokens in database"))?,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
 }
 
 fn generate_id(prefix: &str) -> String {

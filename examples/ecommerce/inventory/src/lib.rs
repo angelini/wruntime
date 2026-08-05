@@ -18,10 +18,6 @@ struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
 impl wr_sdk::ServiceGuest for Component {
-    fn init() {
-        wr_sdk::db::enable_tracing();
-    }
-
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         proto::inventory_service_handle(&Component, request, response_out);
     }
@@ -37,19 +33,21 @@ fn positive_quantity(quantity: u64) -> Result<i64, ServiceError> {
 
 impl proto::InventoryService for Component {
     fn seed(&self, _req: proto::SeedRequest) -> Result<proto::SeedResponse, ServiceError> {
-        let sp = tracing::start("inventory.seed", &[]);
+        let sp = wr_sdk::span!("inventory.seed");
 
         // Table is created by engine-side migrations; seed data only.
         for i in 1u32..=50 {
             let id = format!("prod-{:03}", i);
             let name = format!("Product {}", i);
-            let _ = database::execute(
+            query(
                 "INSERT INTO inventory (product_id, name, stock) \
                  VALUES ($1, $2, 10000) ON CONFLICT DO NOTHING",
-                &[PgValue::Text(id), PgValue::Text(name)],
-            );
+            )
+            .bind(id)
+            .bind(name)
+            .execute()?;
         }
-        tracing::set_attr(&sp, "inventory.seeded", "50");
+        wr_sdk::set_attrs!(sp, "inventory.seeded" => 50_i64);
         Ok(proto::SeedResponse { seeded: 50 })
     }
 
@@ -57,25 +55,18 @@ impl proto::InventoryService for Component {
         &self,
         req: proto::GetStockRequest,
     ) -> Result<proto::GetStockResponse, ServiceError> {
-        let sp = tracing::start(
+        let sp = wr_sdk::span!(
             "inventory.get_stock",
-            &[("product.id", req.product_id.as_str())],
+            "product.id" => req.product_id.as_str()
         );
 
-        let rows = database::query(
-            "SELECT stock FROM inventory WHERE product_id = $1",
-            &[PgValue::Text(req.product_id.clone())],
-        )?;
-
-        if rows.is_empty() {
-            return Err(ServiceError::not_found(format!(
-                "product {} not found",
-                req.product_id
-            )));
-        }
-
-        let stock = rows[0].get_i64(0)?;
-        tracing::set_attr(&sp, "product.stock", stock);
+        let stock = query_scalar::<i64>("SELECT stock FROM inventory WHERE product_id = $1")
+            .bind(req.product_id.clone())
+            .fetch_optional()?
+            .ok_or_else(|| {
+                ServiceError::not_found(format!("product {} not found", req.product_id))
+            })?;
+        wr_sdk::set_attrs!(sp, "product.stock" => stock);
         Ok(proto::GetStockResponse {
             product_id: req.product_id,
             stock,
@@ -92,19 +83,13 @@ impl proto::InventoryService for Component {
 
         let tx = wr_sdk::db::transaction()?;
 
-        let rows = tx.query(
-            "SELECT stock FROM inventory WHERE product_id = $1 FOR UPDATE",
-            &[PgValue::Text(req.product_id.clone())],
-        )?;
-
-        if rows.is_empty() {
-            return Err(ServiceError::not_found(format!(
-                "product {} not found",
-                req.product_id
-            )));
-        }
-
-        let stock = rows[0].get_i64(0)?;
+        let stock = tx
+            .query_scalar::<i64>("SELECT stock FROM inventory WHERE product_id = $1 FOR UPDATE")
+            .bind(req.product_id.clone())
+            .fetch_optional()?
+            .ok_or_else(|| {
+                ServiceError::not_found(format!("product {} not found", req.product_id))
+            })?;
 
         if stock < quantity {
             tracing::set_error(&sp, &format!("insufficient stock — available: {stock}"));
@@ -113,25 +98,20 @@ impl proto::InventoryService for Component {
             )));
         }
 
-        tx.execute(
-            "UPDATE inventory SET stock = stock - $2 WHERE product_id = $1",
-            &[
-                PgValue::Text(req.product_id.clone()),
-                PgValue::Int8(quantity),
-            ],
-        )?;
+        tx.query("UPDATE inventory SET stock = stock - $2 WHERE product_id = $1")
+            .bind(req.product_id.clone())
+            .bind(quantity)
+            .execute()?;
 
         tx.commit()?;
 
         let remaining = stock - quantity;
-        tracing::set_attr(&sp, "product.remaining", remaining);
-        tracing::record_event(
-            &sp,
+        wr_sdk::set_attrs!(sp, "product.remaining" => remaining);
+        wr_sdk::event!(
+            sp,
             "buy.committed",
-            &[
-                ("product_id", req.product_id.as_str()),
-                ("quantity", &quantity.to_string()),
-            ],
+            "product_id" => req.product_id.as_str(),
+            "quantity" => quantity
         );
         Ok(proto::BuyResponse {
             bought: quantity,
@@ -147,13 +127,10 @@ impl proto::InventoryService for Component {
             "product.quantity" => quantity,
         );
 
-        let affected = database::execute(
-            "UPDATE inventory SET stock = stock + $2 WHERE product_id = $1",
-            &[
-                PgValue::Text(req.product_id.clone()),
-                PgValue::Int8(quantity),
-            ],
-        )?;
+        let affected = query("UPDATE inventory SET stock = stock + $2 WHERE product_id = $1")
+            .bind(req.product_id.clone())
+            .bind(quantity)
+            .execute()?;
 
         if affected == 0 {
             return Err(ServiceError::not_found(format!(
@@ -200,24 +177,21 @@ impl proto::InventoryService for Component {
         };
 
         for id in [&lock_first, &lock_second] {
-            let rows = tx.query(
-                "SELECT 1 FROM inventory WHERE product_id = $1 FOR UPDATE",
-                &[PgValue::Text(id.clone())],
-            )?;
-            if rows.is_empty() {
+            let exists = tx
+                .query_scalar::<i32>("SELECT 1 FROM inventory WHERE product_id = $1 FOR UPDATE")
+                .bind(id.clone())
+                .fetch_optional()?
+                .is_some();
+            if !exists {
                 return Err(ServiceError::not_found(format!("product {id} not found")));
             }
         }
 
         // Read source stock after both locks are held.
-        let rows = tx.query(
-            "SELECT stock FROM inventory WHERE product_id = $1",
-            &[PgValue::Text(req.from_product_id.clone())],
-        )?;
-        let stock_from = rows
-            .first()
-            .ok_or_else(|| ServiceError::internal("missing row"))?
-            .get_i64(0)?;
+        let stock_from = tx
+            .query_scalar::<i64>("SELECT stock FROM inventory WHERE product_id = $1")
+            .bind(req.from_product_id.clone())
+            .fetch_exactly_one()?;
 
         if stock_from < quantity {
             tracing::set_error(
@@ -229,32 +203,24 @@ impl proto::InventoryService for Component {
             )));
         }
 
-        tx.execute(
-            "UPDATE inventory SET stock = stock - $2 WHERE product_id = $1",
-            &[
-                PgValue::Text(req.from_product_id.clone()),
-                PgValue::Int8(quantity),
-            ],
-        )?;
+        tx.query("UPDATE inventory SET stock = stock - $2 WHERE product_id = $1")
+            .bind(req.from_product_id.clone())
+            .bind(quantity)
+            .execute()?;
 
-        tx.execute(
-            "UPDATE inventory SET stock = stock + $2 WHERE product_id = $1",
-            &[
-                PgValue::Text(req.to_product_id.clone()),
-                PgValue::Int8(quantity),
-            ],
-        )?;
+        tx.query("UPDATE inventory SET stock = stock + $2 WHERE product_id = $1")
+            .bind(req.to_product_id.clone())
+            .bind(quantity)
+            .execute()?;
 
         tx.commit()?;
 
-        tracing::record_event(
-            &sp,
+        wr_sdk::event!(
+            sp,
             "transfer.committed",
-            &[
-                ("from", req.from_product_id.as_str()),
-                ("to", req.to_product_id.as_str()),
-                ("quantity", &quantity.to_string()),
-            ],
+            "from" => req.from_product_id.as_str(),
+            "to" => req.to_product_id.as_str(),
+            "quantity" => quantity
         );
         Ok(proto::TransferResponse {
             transferred: quantity,
@@ -269,23 +235,14 @@ impl proto::InventoryService for Component {
             "product.quantity" => quantity,
         );
 
-        let rows = database::query(
+        let new_stock = query_scalar::<i64>(
             "UPDATE inventory SET stock = stock + $2 WHERE product_id = $1 RETURNING stock",
-            &[
-                PgValue::Text(req.product_id.clone()),
-                PgValue::Int8(quantity),
-            ],
-        )?;
-
-        if rows.is_empty() {
-            return Err(ServiceError::not_found(format!(
-                "product {} not found",
-                req.product_id
-            )));
-        }
-
-        let new_stock = rows[0].get_i64(0)?;
-        tracing::set_attr(&sp, "product.new_stock", new_stock);
+        )
+        .bind(req.product_id.clone())
+        .bind(quantity)
+        .fetch_optional()?
+        .ok_or_else(|| ServiceError::not_found(format!("product {} not found", req.product_id)))?;
+        wr_sdk::set_attrs!(sp, "product.new_stock" => new_stock);
         Ok(proto::RestockResponse {
             product_id: req.product_id,
             new_stock,

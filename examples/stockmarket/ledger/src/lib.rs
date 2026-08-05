@@ -13,42 +13,57 @@ mod bindings {
 }
 
 use prost::Message;
-use wr_sdk::bindings::wruntime::blobstore::store;
 use wr_sdk::prelude::*;
 
 struct Component;
 wr_sdk::export!(Component with_types_in wr_sdk::bindings);
 
 impl wr_sdk::ServiceGuest for Component {
-    fn init() {
-        wr_sdk::db::enable_tracing();
-    }
-
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         proto::ledger_service_handle(&Component, request, response_out);
     }
 }
 
+#[derive(FromRow)]
+struct TradeRow {
+    trade_id: i64,
+    buyer_id: String,
+    seller_id: String,
+    symbol: String,
+    quantity: i64,
+    price: i64,
+    order_id: i64,
+}
+
+#[derive(FromRow)]
+struct VerificationRow {
+    total_trades: i64,
+    total_volume: i64,
+    symbols_traded: i64,
+}
+
 impl proto::LedgerService for Component {
     fn reset(&self, _req: proto::ResetRequest) -> Result<proto::ResetResponse, ServiceError> {
-        let sp = tracing::start("ledger.reset", &[]);
+        let sp = wr_sdk::span!("ledger.reset");
 
-        let trades_deleted: i64 = query_scalar("SELECT COUNT(*) FROM trades", &[])?;
+        let trades_deleted =
+            query_scalar::<i64>("SELECT COUNT(*) FROM trades").fetch_exactly_one()?;
 
-        database::execute("TRUNCATE trades", &[])?;
+        query("TRUNCATE trades").execute()?;
 
-        // Delete old snapshot objects from blobstore.
-        let mut snapshots_deleted: i64 = 0;
-        if let Ok(objects) = store::list_objects("stockmarket", Some("ledger-snapshots/")) {
-            for obj in &objects {
-                if store::delete_object("stockmarket", &obj.key).is_ok() {
-                    snapshots_deleted += 1;
-                }
-            }
+        let snapshots = bucket("stockmarket")?;
+        let objects = snapshots.list("ledger-snapshots/")?;
+        for object in &objects {
+            snapshots.delete(&object.key)?;
         }
+        let snapshots_deleted = i64::try_from(objects.len())
+            .map_err(|_| ServiceError::internal("snapshot count exceeds response range"))?;
 
-        tracing::set_attr(&sp, "reset.trades_deleted", trades_deleted);
-        tracing::set_attr(&sp, "reset.snapshots_deleted", snapshots_deleted);
+        wr_sdk::set_attrs!(
+            sp,
+            "reset.trades_deleted" => trades_deleted,
+            "reset.snapshots_deleted" => snapshots_deleted
+        );
 
         Ok(proto::ResetResponse {
             trades_deleted,
@@ -69,19 +84,18 @@ impl proto::LedgerService for Component {
             "trade.price" => req.price
         );
 
-        let trade_id: i64 = query_scalar(
+        let trade_id = query_scalar::<i64>(
             "INSERT INTO trades (buyer_id, seller_id, symbol, quantity, price, order_id) \
              VALUES ($1, $2, $3, $4, $5, $6) RETURNING trade_id",
-            &[
-                PgValue::Text(req.buyer_id),
-                PgValue::Text(req.seller_id),
-                PgValue::Text(req.symbol),
-                PgValue::Int8(req.quantity),
-                PgValue::Int8(req.price),
-                PgValue::Int8(req.order_id),
-            ],
-        )?;
-        tracing::set_attr(&sp, "trade.id", trade_id);
+        )
+        .bind(req.buyer_id)
+        .bind(req.seller_id)
+        .bind(req.symbol)
+        .bind(req.quantity)
+        .bind(req.price)
+        .bind(req.order_id)
+        .fetch_exactly_one()?;
+        wr_sdk::set_attrs!(sp, "trade.id" => trade_id);
         Ok(proto::RecordTradeResponse { trade_id })
     }
 
@@ -89,39 +103,27 @@ impl proto::LedgerService for Component {
         &self,
         req: proto::SnapshotRequest,
     ) -> Result<proto::SnapshotResponse, ServiceError> {
-        let sp = tracing::start("ledger.snapshot", &[("snapshot.label", req.label.as_str())]);
+        let sp = wr_sdk::span!("ledger.snapshot", "snapshot.label" => req.label.as_str());
 
-        let rows = database::query(
+        let trades = query_as::<TradeRow>(
             "SELECT trade_id, buyer_id, seller_id, symbol, quantity, price, order_id \
              FROM trades ORDER BY trade_id",
-            &[],
-        )?;
+        )
+        .fetch_all()?
+        .into_iter()
+        .map(|row| proto::TradeRecord {
+            trade_id: row.trade_id,
+            buyer_id: row.buyer_id,
+            seller_id: row.seller_id,
+            symbol: row.symbol,
+            quantity: row.quantity,
+            price: row.price,
+            order_id: row.order_id,
+        })
+        .collect::<Vec<_>>();
 
-        let trades: Vec<proto::TradeRecord> = rows
-            .iter()
-            .map(|r| {
-                let (trade_id, buyer_id, seller_id, symbol, quantity, price, order_id): (
-                    i64,
-                    String,
-                    String,
-                    String,
-                    i64,
-                    i64,
-                    i64,
-                ) = r.unpack()?;
-                Ok(proto::TradeRecord {
-                    trade_id,
-                    buyer_id,
-                    seller_id,
-                    symbol,
-                    quantity,
-                    price,
-                    order_id,
-                })
-            })
-            .collect::<Result<Vec<_>, ServiceError>>()?;
-
-        let trade_count = trades.len() as i64;
+        let trade_count = i64::try_from(trades.len())
+            .map_err(|_| ServiceError::internal("trade count exceeds response range"))?;
         let snapshot = proto::LedgerSnapshot {
             label: req.label.clone(),
             trade_count,
@@ -132,11 +134,14 @@ impl proto::LedgerService for Component {
         let snapshot_bytes = data.len() as i64;
         let key = format!("ledger-snapshots/{}-{}.bin", req.label, trade_count);
 
-        store::put_object("stockmarket", &key, &data)?;
+        bucket("stockmarket")?.put(&key, &data)?;
 
-        tracing::set_attr(&sp, "snapshot.trade_count", trade_count);
-        tracing::set_attr(&sp, "snapshot.bytes", snapshot_bytes);
-        tracing::set_attr(&sp, "snapshot.key", &key);
+        wr_sdk::set_attrs!(
+            sp,
+            "snapshot.trade_count" => trade_count,
+            "snapshot.bytes" => snapshot_bytes,
+            "snapshot.key" => &key
+        );
 
         Ok(proto::SnapshotResponse {
             snapshot_key: key,
@@ -146,57 +151,60 @@ impl proto::LedgerService for Component {
     }
 
     fn verify(&self, _req: proto::VerifyRequest) -> Result<proto::VerifyResponse, ServiceError> {
-        let sp = tracing::start("ledger.verify", &[]);
+        let sp = wr_sdk::span!("ledger.verify");
 
-        let (total_trades, total_volume, symbols_traded): (i64, i64, i64) = query_one(
-            "SELECT COUNT(*), COALESCE(SUM(quantity * price), 0)::BIGINT, \
-             COUNT(DISTINCT symbol) FROM trades",
-            &[],
-        )?;
+        let VerificationRow {
+            total_trades,
+            total_volume,
+            symbols_traded,
+        } = query_as::<VerificationRow>(
+            "SELECT COUNT(*) AS total_trades, \
+             COALESCE(SUM(quantity * price), 0)::BIGINT AS total_volume, \
+             COUNT(DISTINCT symbol) AS symbols_traded FROM trades",
+        )
+        .fetch_exactly_one()?;
 
         let mut details = vec![format!(
             "total_trades={total_trades}, total_volume={total_volume} cents"
         )];
 
         // Cross-check snapshot from blobstore against DB.
-        let snapshot_ok = match store::list_objects("stockmarket", Some("ledger-snapshots/")) {
-            Ok(objects) if !objects.is_empty() => {
-                let latest_key = objects
-                    .iter()
-                    .max_by_key(|o| &o.key)
-                    .map(|o| o.key.clone())
-                    .unwrap_or_default();
-                match store::get_object("stockmarket", &latest_key)
-                    .map_err(|e| format!("{e:?}"))
+        let snapshots = bucket("stockmarket")?;
+        let snapshot_ok = match snapshots.list("ledger-snapshots/") {
+            Ok(objects) => match objects.iter().max_by_key(|object| &object.key) {
+                Some(latest) => match snapshots
+                    .get(&latest.key)
+                    .map_err(|error| error.to_string())
                     .and_then(|data| {
-                        proto::LedgerSnapshot::decode(data.as_slice()).map_err(|e| format!("{e}"))
+                        proto::LedgerSnapshot::decode(data.as_slice())
+                            .map_err(|error| error.to_string())
                     }) {
-                    Ok(snap) if snap.trade_count == total_trades => {
+                    Ok(snapshot) if snapshot.trade_count == total_trades => {
                         details.push(format!(
                             "snapshot cross-check OK: {} trades match DB",
-                            snap.trade_count
+                            snapshot.trade_count
                         ));
                         true
                     }
-                    Ok(snap) => {
+                    Ok(snapshot) => {
                         details.push(format!(
                             "snapshot MISMATCH: snapshot has {} trades, DB has {}",
-                            snap.trade_count, total_trades
+                            snapshot.trade_count, total_trades
                         ));
                         false
                     }
-                    Err(e) => {
-                        details.push(format!("snapshot error: {e}"));
+                    Err(error) => {
+                        details.push(format!("snapshot error: {error}"));
                         false
                     }
+                },
+                None => {
+                    details.push("no snapshots found in blobstore".to_string());
+                    false
                 }
-            }
-            Ok(_) => {
-                details.push("no snapshots found in blobstore".to_string());
-                false
-            }
-            Err(e) => {
-                details.push(format!("blobstore list error: {e:?}"));
+            },
+            Err(error) => {
+                details.push(format!("blobstore list error: {error}"));
                 false
             }
         };
@@ -206,9 +214,12 @@ impl proto::LedgerService for Component {
         details
             .push("cash conservation: OK (each trade transfers equal cash buyer->seller)".into());
 
-        tracing::set_attr(&sp, "verify.valid", snapshot_ok);
-        tracing::set_attr(&sp, "verify.total_trades", total_trades);
-        tracing::set_attr(&sp, "verify.total_volume", total_volume);
+        wr_sdk::set_attrs!(
+            sp,
+            "verify.valid" => snapshot_ok,
+            "verify.total_trades" => total_trades,
+            "verify.total_volume" => total_volume
+        );
 
         Ok(proto::VerifyResponse {
             valid: snapshot_ok,
@@ -222,7 +233,7 @@ impl proto::LedgerService for Component {
         &self,
         _req: proto::GetTradeCountRequest,
     ) -> Result<proto::GetTradeCountResponse, ServiceError> {
-        let count: i64 = query_scalar("SELECT COUNT(*) FROM trades", &[])?;
+        let count = query_scalar::<i64>("SELECT COUNT(*) FROM trades").fetch_exactly_one()?;
         Ok(proto::GetTradeCountResponse { count })
     }
 }

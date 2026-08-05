@@ -13,7 +13,7 @@ mod bindings {
 }
 
 use wr_sdk::bindings::wruntime::llm::inference;
-use wr_sdk::llm::CompletionBuilder;
+use wr_sdk::llm::{CompletionBuilder, MaxTokens, ModelName, ToolSchema};
 use wr_sdk::prelude::*;
 
 struct Component;
@@ -30,17 +30,21 @@ impl proto::LlmTestService for Component {
         &self,
         req: proto::CompleteRequest,
     ) -> Result<proto::CompleteResponse, ServiceError> {
-        let mut builder = CompletionBuilder::new(&req.model);
+        let mut builder = CompletionBuilder::new(ModelName::parse(req.model)?);
         if !req.system.is_empty() {
             builder = builder.system(&req.system);
         }
-        builder = builder.user(&req.user_message).max_tokens(req.max_tokens);
+        builder = builder
+            .user(&req.user_message)
+            .max_tokens(MaxTokens::new(req.max_tokens)?);
 
         let resp = builder.complete()?;
 
         let text = match resp.completion {
             inference::Completion::Text(t) => t,
-            inference::Completion::ToolCalls(_) => String::new(),
+            inference::Completion::ToolCalls(_) => {
+                return Err(ServiceError::internal("expected text but got tool_use"));
+            }
         };
 
         Ok(proto::CompleteResponse {
@@ -65,7 +69,11 @@ impl proto::LlmTestService for Component {
     fn tool_use(&self, req: proto::ToolUseRequest) -> Result<proto::ToolUseResponse, ServiceError> {
         let resp = CompletionBuilder::sonnet()
             .user(&req.user_message)
-            .tool(&req.tool_name, &req.tool_description, &req.tool_schema)
+            .tool(
+                &req.tool_name,
+                &req.tool_description,
+                ToolSchema::parse(&req.tool_schema)?,
+            )
             .complete()?;
 
         match resp.completion {
@@ -106,10 +114,30 @@ impl proto::LlmTestService for Component {
         }
     }
 
+    fn raw_invalid(
+        &self,
+        _req: proto::RawInvalidRequest,
+    ) -> Result<proto::LlmErrorResponse, ServiceError> {
+        let result = inference::complete(&inference::CompletionRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![inference::Message { role: inference::MessageRole::User, content: "raw invalid request".into() }],
+            system: None, max_tokens: 0, temperature: None, tools: vec![],
+        });
+        match result {
+            Ok(_) => Ok(proto::LlmErrorResponse { error_kind: proto::LlmErrorKind::None as i32, error_message: "unexpectedly succeeded".into() }),
+            Err(error) => { let (error_kind, error_message) = llm_error_parts(error); Ok(proto::LlmErrorResponse { error_kind, error_message }) }
+        }
+    }
+
     fn stream(&self, req: proto::StreamRequest) -> Result<proto::StreamResponse, ServiceError> {
         let mut builder = CompletionBuilder::sonnet().user(&req.user_message);
         if req.with_tools {
-            builder = builder.tool("dummy", "dummy tool", r#"{"type":"object"}"#);
+            builder = builder.tool(
+                "dummy",
+                "dummy tool",
+                ToolSchema::parse(r#"{"type":"object"}"#)
+                    .expect("static tool schema is valid"),
+            );
         }
 
         let stream = match builder.stream() {
@@ -188,7 +216,8 @@ impl proto::LlmTestService for Component {
             held.pop(); // CompletionStream dropped -> host drop -> live-count decrement
         }
         open(&mut resp, &mut held, req.additional);
-        resp.held = held.len() as u32;
+        resp.held = u32::try_from(held.len())
+            .map_err(|_| ServiceError::internal("held stream count exceeds response range"))?;
         Ok(resp)
     }
 }

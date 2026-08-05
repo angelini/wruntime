@@ -1,0 +1,11 @@
+error: `rename` requires a string literal value
+ --> tests/ui/from_row/fail-rename.rs:5:13
+  |
+5 |     #[wr_db(rename = 42)]
+  |             ^^^^^^^^^^^
+
+error: `rename` and `flatten` cannot be combined
+  --> tests/ui/from_row/fail-rename.rs:11:22
+   |
+11 |     #[wr_db(rename = "id", flatten)]
+   |                      ^^^^

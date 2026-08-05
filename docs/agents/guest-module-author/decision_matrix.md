@@ -27,8 +27,8 @@ A runner is still an HTTP handler when something invokes it. There is no separat
 | Need | Module/config opt-in | Guest import or interface | Preferred API |
 |---|---|---|---|
 | PostgreSQL | `database = true`; usually `migrations_path` | `wruntime:db/database@0.4.0` | `wr_sdk::db` and prelude types |
-| Blobstore | `blobstore = true`; engine `[blobstore]` with non-empty allowlist | `wruntime:blobstore/store@0.1.0` | typed `wr_sdk::blobstore` values plus store binding |
-| Tracing | available to loaded guests | `wruntime:tracing/span@0.2.0` | `span!`, `root_span!`, `tracing::*` |
+| Blobstore | `blobstore = true`; engine `[blobstore]` with non-empty allowlist | `wruntime:blobstore/store@0.1.0` | scoped `wr_sdk::blobstore::bucket` handle |
+| Tracing | available to loaded guests | `wruntime:tracing/span@0.2.0` | `span!`, `root_span!`, `set_attrs!`, `event!` |
 | LLM | `llm = true`; engine `[llm]` | `wruntime:llm/inference@0.1.0` | `CompletionBuilder` |
 | Ephemeral filesystem | `fs = "tempdir"` | standard WASI filesystem imports | `std::fs` inside the mounted sandbox |
 | Outbound HTTP | proxy `[egress].allowed_domains` permits external hosts | standard WASI HTTP imports | generated client or `wr_sdk::http` |

@@ -186,6 +186,20 @@ On startup the engine:
 5. Sends an immediate readiness heartbeat after module load, then every 3 seconds, reporting healthy loaded modules.
 6. Deregisters cleanly on `Ctrl+C`, which immediately marks its routing rules as unhealthy.
 
+### Database telemetry
+
+Engine-owned database spans cover raw WIT calls and SDK builders without guest setup. Query text is omitted by default. Operators may opt in globally for DB-enabled modules:
+
+```toml
+[database]
+url = "postgres://user:pass@localhost:5432/mydb"
+
+[database.telemetry]
+include_query_text = true # default: false
+```
+
+When enabled, `db.query.text` contains the statement exactly as supplied by the guest except that runs of whitespace are collapsed to one space and leading/trailing whitespace is removed. Bind values are never interpolated or recorded. Treat enabled statement text as sensitive because SQL literals and comments remain present; do not enable it where guests may place credentials or secrets directly in SQL.
+
 ### Database migrations
 
 Modules that use a database can declare a `migrations_path` pointing to a directory of SQL migration files. Migrations run on the engine (host side) at startup — after the Postgres schema is provisioned and before the WASM module loads. Default route rows may already be registered, but they remain unhealthy and unroutable until migrations, secret resolution, module load, readiness heartbeat, and manager health recomputation succeed.
@@ -359,7 +373,9 @@ impl wr_sdk::ServiceGuest for Component {
 
         if path == "/__health" {
             // Run any checks that make sense for this module.
-            let ok = database::query("SELECT 1", &[]).is_ok();
+            let ok = wr_sdk::db::query_scalar::<i32>("SELECT 1")
+                .fetch_exactly_one()
+                .is_ok();
             let status = if ok { 200 } else { 503 };
             return send_response(response_out, status, vec![]);
         }

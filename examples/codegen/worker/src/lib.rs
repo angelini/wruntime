@@ -30,7 +30,7 @@ impl proto::WorkerService for Component {
         req: proto::ProcessTaskRequest,
     ) -> Result<proto::ProcessTaskResponse, ServiceError> {
         let task_id = &req.task_id;
-        let span = tracing::start("worker.process_task", &[("task.id", task_id.as_str())]);
+        let span = wr_sdk::span!("worker.process_task", "task.id" => task_id.as_str());
 
         let coordinator = CoordinatorServiceClient::new("codegen.coordinator");
         let collector = CollectorServiceClient::new("codegen.collector");
@@ -42,7 +42,7 @@ impl proto::WorkerService for Component {
             status: proto::TaskStatus::Collecting as i32,
         });
 
-        let collect_span = tracing::start("worker.collect_docs", &[("task.id", task_id.as_str())]);
+        let collect_span = wr_sdk::span!("worker.collect_docs", "task.id" => task_id.as_str());
 
         let mut sources: Vec<proto::DocSourceSpec> = req
             .doc_sources
@@ -91,17 +91,16 @@ impl proto::WorkerService for Component {
             }
         };
 
-        tracing::set_attr(
-            &collect_span,
-            "collector.sources_fetched",
-            fetch_resp.sources_fetched,
+        wr_sdk::set_attrs!(
+            collect_span,
+            "collector.sources_fetched" => fetch_resp.sources_fetched
         );
         drop(collect_span);
 
-        wr_sdk::log::log(&format!(
+        wr_sdk::log!(
             "collected {} source(s), {} bytes",
             fetch_resp.sources_fetched, fetch_resp.total_bytes
-        ));
+        );
 
         // Phase 2: Run agent.
         let _ = coordinator.update_task_status(proto::UpdateTaskStatusRequest {
@@ -127,7 +126,7 @@ impl proto::WorkerService for Component {
             }
         };
 
-        tracing::set_attr(&agent_span, "agent.turns_used", agent_resp.turns_used);
+        wr_sdk::set_attrs!(agent_span, "agent.turns_used" => agent_resp.turns_used);
         drop(agent_span);
 
         // Store result via coordinator.
@@ -141,9 +140,9 @@ impl proto::WorkerService for Component {
             total_output_tokens: agent_resp.output_tokens,
         });
 
-        tracing::set_attr(&span, "task.status", "complete");
+        wr_sdk::set_attrs!(span, "task.status" => "complete");
         drop(span);
-        wr_sdk::log::log(&format!("task {} complete", task_id));
+        wr_sdk::log!("task {} complete", task_id);
 
         Ok(proto::ProcessTaskResponse {
             unified_diff: agent_resp.unified_diff,
@@ -156,7 +155,7 @@ impl proto::WorkerService for Component {
 }
 
 fn fail_task(coordinator: &CoordinatorServiceClient, task_id: &str, message: &str) {
-    wr_sdk::log::log(&format!("task {} failed: {}", task_id, message));
+    wr_sdk::log!("task {} failed: {}", task_id, message);
     let _ = coordinator.complete_task(proto::CompleteTaskRequest {
         task_id: task_id.into(),
         status: proto::TaskStatus::Error as i32,

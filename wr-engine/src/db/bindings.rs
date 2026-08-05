@@ -2,6 +2,8 @@ use std::pin::Pin;
 
 use crate::state::CounterGuard;
 
+use super::telemetry::DbSpan;
+
 /// Host-side state for an active WIT `transaction` resource.
 ///
 /// Holds the dedicated pooled connection for the duration of the transaction.
@@ -24,6 +26,7 @@ pub struct CursorState {
     /// Keeps the connection alive for non-transactional cursors.
     pub(crate) _conn: Option<deadpool_postgres::Object>,
     pub(crate) done: bool,
+    pub(crate) telemetry: DbSpan,
     pub(crate) _count: CounterGuard,
 }
 

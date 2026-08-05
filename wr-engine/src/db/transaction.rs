@@ -4,6 +4,7 @@ use wr_common::pool::pg_error_string;
 
 use super::bindings::{CursorState, TxState};
 use super::host::{execute_statement, open_row_stream, query_rows};
+use super::telemetry::DbOperation;
 use super::wruntime::db::database::{DbError, HostTransaction, PgValue, Row};
 use crate::state::{ModuleState, ResourceKind};
 
@@ -16,14 +17,20 @@ impl HostTransaction for ModuleState {
         sql: String,
         params: Vec<PgValue>,
     ) -> Result<Vec<Row>, DbError> {
-        let state = self
-            .table()
-            .get(&self_)
-            .map_err(|e| DbError::Connection(e.to_string()))?;
-        if state.done {
-            return Err(DbError::Query("transaction already completed".into()));
+        let mut telemetry = self.start_db_span(DbOperation::TransactionQuery, &sql);
+        let result = async {
+            let state = self
+                .table()
+                .get(&self_)
+                .map_err(|error| DbError::Connection(error.to_string()))?;
+            if state.done {
+                return Err(DbError::Query("transaction already completed".into()));
+            }
+            query_rows(&state.client, sql.as_str(), params).await
         }
-        query_rows(&state.client, sql.as_str(), params).await
+        .await;
+        telemetry.finish_result(&result, |rows| rows.len() as u64);
+        result
     }
 
     async fn execute(
@@ -32,14 +39,20 @@ impl HostTransaction for ModuleState {
         sql: String,
         params: Vec<PgValue>,
     ) -> Result<u64, DbError> {
-        let state = self
-            .table()
-            .get(&self_)
-            .map_err(|e| DbError::Connection(e.to_string()))?;
-        if state.done {
-            return Err(DbError::Query("transaction already completed".into()));
+        let mut telemetry = self.start_db_span(DbOperation::TransactionExecute, &sql);
+        let result = async {
+            let state = self
+                .table()
+                .get(&self_)
+                .map_err(|error| DbError::Connection(error.to_string()))?;
+            if state.done {
+                return Err(DbError::Query("transaction already completed".into()));
+            }
+            execute_statement(&state.client, sql.as_str(), params).await
         }
-        execute_statement(&state.client, sql.as_str(), params).await
+        .await;
+        telemetry.finish_result(&result, |affected| *affected);
+        result
     }
 
     async fn query_stream(
@@ -48,31 +61,56 @@ impl HostTransaction for ModuleState {
         sql: String,
         params: Vec<PgValue>,
     ) -> Result<Resource<CursorState>, DbError> {
-        let state = self
-            .table()
-            .get(&self_)
-            .map_err(|e| DbError::Connection(e.to_string()))?;
+        let mut telemetry = self.start_db_span(DbOperation::TransactionStream, &sql);
+        let state = match self.table().get(&self_) {
+            Ok(state) => state,
+            Err(error) => {
+                let error = DbError::Connection(error.to_string());
+                telemetry.finish_error(&error);
+                return Err(error);
+            }
+        };
         if state.done {
-            return Err(DbError::Query("transaction already completed".into()));
+            let error = DbError::Query("transaction already completed".into());
+            telemetry.finish_error(&error);
+            return Err(error);
         }
-        let guard = self
-            .db()?
-            .accounting
-            .try_track(ResourceKind::DbCursor)
-            .ok_or_else(|| DbError::Connection("db cursor cap exceeded".into()))?;
-        let state = self
-            .table()
-            .get(&self_)
-            .map_err(|e| DbError::Connection(e.to_string()))?;
-        let stream = open_row_stream(&state.client, sql.as_str(), params).await?;
+        let guard = match self.db().and_then(|database| {
+            database
+                .accounting
+                .try_track(ResourceKind::DbCursor)
+                .ok_or_else(|| DbError::Connection("db cursor cap exceeded".into()))
+        }) {
+            Ok(guard) => guard,
+            Err(error) => {
+                telemetry.finish_error(&error);
+                return Err(error);
+            }
+        };
+        let state = match self.table().get(&self_) {
+            Ok(state) => state,
+            Err(error) => {
+                let error = DbError::Connection(error.to_string());
+                telemetry.finish_error(&error);
+                return Err(error);
+            }
+        };
+        let stream = match open_row_stream(&state.client, sql.as_str(), params).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                telemetry.finish_error(&error);
+                return Err(error);
+            }
+        };
         self.table()
             .push(CursorState {
                 stream: Box::pin(stream),
-                _conn: None, // connection owned by TxState
+                _conn: None,
                 done: false,
+                telemetry,
                 _count: guard,
             })
-            .map_err(|e| DbError::Connection(e.to_string()))
+            .map_err(|error| DbError::Connection(error.to_string()))
     }
 
     async fn commit(&mut self, self_: Resource<TxState>) -> Result<(), DbError> {

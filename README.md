@@ -138,7 +138,7 @@ impl ServiceGuest for Component {
 
         match client.echo(proto::EchoRequest { message: "hello".into() }) {
             Ok(resp) => send_response(response_out, 200, resp.encode_to_vec()),
-            Err(e)   => wr_sdk::log::log(&format!("error: {e}")),
+            Err(e)   => wr_sdk::log!("error: {e}"),
         }
     }
 }
@@ -196,12 +196,14 @@ wr-cli --manager http://127.0.0.1:9000 invoke --destination http://example.calle
 
 WASM modules can access host-provided capabilities through WIT interfaces:
 
-| Binding | WIT | Access via | Description |
-|---------|-----|-----------|-------------|
-| **Database** | `wit/db.wit` | `wr_sdk::bindings::wruntime::db::database` | Parameterized SQL queries and transactions against a shared Postgres pool |
-| **Blobstore** | `wit/blobstore.wit` | `wr_sdk::bindings::wruntime::blobstore::store` | S3-compatible object storage constrained to a host-configured bucket allowlist |
-| **Tracing** | `wit/tracing.wit` | `wr_sdk::bindings::wruntime::tracing::span` | Create and annotate OpenTelemetry spans from within modules |
-| **LLM** | `wit/llm.wit` | `wr_sdk::bindings::wruntime::llm::inference` | Anthropic Claude completions, streaming, and tool use |
+| Binding | WIT | Preferred SDK surface | Description |
+|---------|-----|-----------------------|-------------|
+| **Database** | `wit/db.wit` | `wr_sdk::db` builders and owned rows | Parameterized SQL queries, transactions, and streaming against a shared Postgres pool |
+| **Blobstore** | `wit/blobstore.wit` | `wr_sdk::blobstore::bucket` scoped handle | S3-compatible object storage constrained to a host-configured bucket allowlist |
+| **Tracing** | `wit/tracing.wit` | `span!`, `set_attrs!`, and `event!` | Typed OpenTelemetry spans and batched attributes from within modules |
+| **LLM** | `wit/llm.wit` | `wr_sdk::llm::CompletionBuilder` | Validated Anthropic Claude completions, streaming, and tool use |
+
+Prefer these facades for application code. `wr_sdk::bindings::wruntime::*` exposes the raw WIT bindings as an intentional escape hatch for unsupported operations and protocol/negative tests.
 
 See [docs/host-bindings.md](docs/host-bindings.md) for configuration and usage examples.
 

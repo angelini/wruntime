@@ -7,14 +7,18 @@ interface span {
         boolean(bool),
         signed(s64),
         float(f64),
+        text-array(list<string>),
+        boolean-array(list<bool>),
+        signed-array(list<s64>),
+        float-array(list<f64>),
     }
 
     type attribute = tuple<string, attribute-value>;
 
     /// An active span. Ends when the resource is dropped.
     resource active-span {
-        /// Record a key/value attribute on the span.
-        set-attribute: func(key: string, value: attribute-value);
+        /// Record key/value attributes on the span in one host call.
+        set-attributes: func(attrs: list<attribute>);
 
         /// Record an event (point-in-time annotation).
         record-event: func(name: string, attrs: list<attribute>);

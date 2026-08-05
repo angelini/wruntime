@@ -17,3 +17,8 @@ chrono         = { version = "0.4", default-features = false }
 rust_decimal   = "1"
 wit-bindgen    = "0.51.0"
 wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+wr-sdk-macros  = { path = "../wr-sdk-macros" }
+
+[dev-dependencies]
+serde    = { version = "1", features = ["derive"] }
+trybuild = "=1.0.120"

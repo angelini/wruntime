@@ -26,26 +26,42 @@ impl HostRowCursor for ModuleState {
         let cursor = self
             .table()
             .get_mut(&self_)
-            .map_err(|e| DbError::Connection(e.to_string()))?;
+            .map_err(|error| DbError::Connection(error.to_string()))?;
         if cursor.done {
             return Ok(vec![]);
         }
         let mut rows = Vec::with_capacity(max.min(256) as usize);
         for _ in 0..max {
             match cursor.stream.next().await {
-                Some(Ok(pg_row)) => rows.push(pg_row_to_wit(&pg_row)),
-                Some(Err(e)) => return Err(DbError::Query(e.to_string())),
+                Some(Ok(pg_row)) => match pg_row_to_wit(&pg_row) {
+                    Ok(row) => rows.push(row),
+                    Err(error) => {
+                        cursor.done = true;
+                        cursor.telemetry.finish_error(&error);
+                        return Err(error);
+                    }
+                },
+                Some(Err(error)) => {
+                    let error = DbError::Query(error.to_string());
+                    cursor.done = true;
+                    cursor.telemetry.finish_error(&error);
+                    return Err(error);
+                }
                 None => {
                     cursor.done = true;
-                    break;
+                    cursor.telemetry.add_rows(rows.len());
+                    cursor.telemetry.finish_success();
+                    return Ok(rows);
                 }
             }
         }
+        cursor.telemetry.add_rows(rows.len());
         Ok(rows)
     }
 
     async fn drop(&mut self, rep: Resource<CursorState>) -> wasmtime::Result<()> {
-        self.table().delete(rep)?;
+        let mut cursor = self.table().delete(rep)?;
+        cursor.telemetry.finish_cancelled();
         Ok(())
     }
 }

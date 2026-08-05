@@ -12,7 +12,7 @@ mod bindings {
     });
 }
 
-use wr_sdk::bindings::wruntime::blobstore::store::{self, BlobError};
+use wr_sdk::blobstore::raw::{self, BlobError};
 use wr_sdk::prelude::*;
 
 struct Component;
@@ -26,17 +26,17 @@ impl wr_sdk::ServiceGuest for Component {
 
 impl proto::BlobstoreTestService for Component {
     fn put(&self, req: proto::PutRequest) -> Result<proto::PutResponse, ServiceError> {
-        store::put_object(&req.bucket, &req.key, &req.data)?;
+        bucket(&req.bucket)?.put(&req.key, &req.data)?;
         Ok(proto::PutResponse {})
     }
 
     fn get(&self, req: proto::GetRequest) -> Result<proto::GetResponse, ServiceError> {
-        let data = store::get_object(&req.bucket, &req.key)?;
+        let data = bucket(&req.bucket)?.get(&req.key)?;
         Ok(proto::GetResponse { data })
     }
 
     fn delete(&self, req: proto::DeleteRequest) -> Result<proto::DeleteResponse, ServiceError> {
-        store::delete_object(&req.bucket, &req.key)?;
+        bucket(&req.bucket)?.delete(&req.key)?;
         Ok(proto::DeleteResponse {})
     }
 
@@ -44,7 +44,7 @@ impl proto::BlobstoreTestService for Component {
         &self,
         req: proto::DeleteRequest,
     ) -> Result<proto::NotFoundResponse, ServiceError> {
-        match store::delete_object(&req.bucket, &req.key) {
+        match raw::delete_object(&req.bucket, &req.key) {
             Ok(()) => Ok(proto::NotFoundResponse {
                 error_kind: "none".into(),
                 error_message: "unexpectedly succeeded".into(),
@@ -54,12 +54,7 @@ impl proto::BlobstoreTestService for Component {
     }
 
     fn list(&self, req: proto::ListRequest) -> Result<proto::ListResponse, ServiceError> {
-        let prefix = if req.prefix.is_empty() {
-            None
-        } else {
-            Some(req.prefix.as_str())
-        };
-        let objects = store::list_objects(&req.bucket, prefix)?;
+        let objects = bucket(&req.bucket)?.list(&req.prefix)?;
         let proto_objects = objects
             .into_iter()
             .map(|o| proto::ObjectMeta {
@@ -75,7 +70,7 @@ impl proto::BlobstoreTestService for Component {
     }
 
     fn head(&self, req: proto::HeadRequest) -> Result<proto::HeadResponse, ServiceError> {
-        let meta = store::head_object(&req.bucket, &req.key)?;
+        let meta = bucket(&req.bucket)?.head(&req.key)?;
         Ok(proto::HeadResponse {
             key: meta.key,
             size: meta.size,
@@ -88,8 +83,9 @@ impl proto::BlobstoreTestService for Component {
         &self,
         req: proto::RoundTripRequest,
     ) -> Result<proto::RoundTripResponse, ServiceError> {
-        store::put_object(&req.bucket, &req.key, &req.data)?;
-        let fetched = store::get_object(&req.bucket, &req.key)?;
+        let objects = bucket(&req.bucket)?;
+        objects.put(&req.key, &req.data)?;
+        let fetched = objects.get(&req.key)?;
         let matches = fetched == req.data;
         Ok(proto::RoundTripResponse {
             data: fetched,
@@ -101,7 +97,7 @@ impl proto::BlobstoreTestService for Component {
         &self,
         req: proto::NotFoundRequest,
     ) -> Result<proto::NotFoundResponse, ServiceError> {
-        match store::get_object(&req.bucket, &req.key) {
+        match raw::get_object(&req.bucket, &req.key) {
             Ok(_) => Ok(proto::NotFoundResponse {
                 error_kind: "none".into(),
                 error_message: "unexpectedly succeeded".into(),

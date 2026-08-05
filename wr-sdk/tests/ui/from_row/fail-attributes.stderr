@@ -1,0 +1,29 @@
+error: #[wr_db(...)] is only supported on fields
+ --> tests/ui/from_row/fail-attributes.rs:4:1
+  |
+4 | #[wr_db(rename = "container")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: unsupported #[wr_db] attribute; expected `rename` or `flatten`
+  --> tests/ui/from_row/fail-attributes.rs:11:13
+   |
+11 |     #[wr_db(unknown)]
+   |             ^^^^^^^
+
+error: unsupported #[wr_db] attribute; expected `rename` or `flatten`
+  --> tests/ui/from_row/fail-attributes.rs:17:13
+   |
+17 |     #[wr_db(default)]
+   |             ^^^^^^^
+
+error: expected `rename = "..."` or `flatten`
+  --> tests/ui/from_row/fail-attributes.rs:23:5
+   |
+23 |     #[wr_db]
+   |     ^^^^^^^^
+
+error: expected `rename = "..."` or `flatten`
+  --> tests/ui/from_row/fail-attributes.rs:29:5
+   |
+29 |     #[wr_db()]
+   |     ^^^^^^^^^^

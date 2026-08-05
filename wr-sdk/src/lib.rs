@@ -25,8 +25,7 @@ pub mod exports {
         pub trait ServiceGuest {
             fn handle(request: IncomingRequest, response_out: ResponseOutparam);
 
-            /// Called once before the first request is handled. Use this for
-            /// one-time setup such as `db::enable_tracing()`.
+            /// Called once before the first request is handled for module-specific setup.
             fn init() {}
 
             /// Called by the engine on each heartbeat to determine if this module
@@ -67,6 +66,8 @@ pub mod exports {
 pub use exports::incoming_handler::ServiceGuest;
 
 pub mod blobstore;
+extern crate self as wr_sdk;
+
 pub mod db;
 pub mod http;
 pub mod io;
@@ -75,6 +76,9 @@ pub mod llm;
 pub mod log;
 pub mod prelude;
 pub mod tracing;
+
+pub use blobstore::{bucket, Bucket, BucketName, ObjectKey, ObjectPrefix};
+pub use tracing::{Attribute, AttributeValue, IntoAttributeValue};
 
 /// Error type returned by generated service handler traits.
 pub struct ServiceError {
@@ -129,6 +133,14 @@ impl From<crate::http::HttpError> for ServiceError {
             crate::http::HttpError::Decode(msg) => ServiceError::internal(format!("decode: {msg}")),
         }
     }
+}
+
+/// Write one formatted diagnostic line to WASI stderr.
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        $crate::log::log_format(::std::format_args!($($arg)*))
+    }};
 }
 
 /// Export macro for HTTP handler modules (those that export `wasi:http/incoming-handler`).

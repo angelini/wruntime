@@ -205,9 +205,7 @@ impl wr_sdk::ServiceGuest for Component {
 
 impl proto::AgentService for Component {
     fn run_task(req: proto::RunTaskRequest) -> Result<proto::RunTaskResponse, ServiceError> {
-        let span = tracing::start("agent.run_task", &[
-            ("session.id", req.session_id.as_str()),
-        ]);
+        let span = wr_sdk::span!("agent.run_task", "session.id" => req.session_id.as_str());
         // ... your logic here ...
         Ok(proto::RunTaskResponse { result })
     }
@@ -266,9 +264,10 @@ Collector can't touch the task DB. Agent can't enqueue new jobs. Worker can't ca
 # LLM as a Host Capability
 
 ```rust
+let max_tokens = MaxTokens::new(8192)?;
 let resp = CompletionBuilder::sonnet()
     .system(&system_prompt)
-    .max_tokens(8192)
+    .max_tokens(max_tokens)
     .user(&user_prompt)
     .complete()?;
 ```
@@ -282,22 +281,29 @@ let resp = CompletionBuilder::sonnet()
 # Tracing Is a Capability Too
 
 ```rust
-let span = tracing::start("agent.run_task", &[
-    ("session.id",       session_id.as_str()),
-    ("agent.max_turns",  &max_turns.to_string()),
-    ("agent.doc_prefixes", &req.doc_prefixes.len().to_string()),
-]);
+let prefix_count = i64::try_from(req.doc_prefixes.len())
+    .expect("doc prefix count fits in i64");
+let span = wr_sdk::span!(
+    "agent.run_task",
+    "session.id" => session_id.as_str(),
+    "agent.max_turns" => max_turns,
+    "agent.doc_prefixes" => prefix_count,
+);
 
 // ... do work ...
 
-tracing::set_attribute(&span, "agent.turns_used", &turn.to_string());
-tracing::set_attribute(&turn_span, "tokens.input", &resp.usage.input_tokens.to_string());
-tracing::set_attribute(&turn_span, "tokens.output", &resp.usage.output_tokens.to_string());
+wr_sdk::set_attrs!(
+    span,
+    "agent.turns_used" => turn,
+    "tokens.input" => resp.usage.input_tokens,
+    "tokens.output" => resp.usage.output_tokens
+);
 drop(span); // span ends on drop
 ```
 
-- OTel spans from inside WASM via host binding
-- Structured attributes, error recording with `tracing::set_error()`
+- OTel spans from inside WASM via one-crossing typed attribute batches
+- Arbitrary late keys, typed events, and error recording with `tracing::set_error()`
+- `u64`, `usize`, and unsigned arrays require checked signed conversion or explicit text
 
 ```bash
 wr metrics summary --since 1h             # view request metrics from OTel traces

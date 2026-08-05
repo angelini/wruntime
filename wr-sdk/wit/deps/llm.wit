@@ -57,7 +57,7 @@ interface inference {
     record completion-response {
         completion: completion,
         usage: token-usage,
-        /// "end_turn" | "tool_use" | "max_tokens"
+        /// Upstream provider stop reason, e.g. "end_turn", "tool_use", or "max_tokens".
         stop-reason: string,
     }
 

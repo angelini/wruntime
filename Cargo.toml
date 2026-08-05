@@ -7,6 +7,7 @@ members = [
   "wr-tests",
   "wr-cli",
   "wr-sdk",
+  "wr-sdk-macros",
   "wr-build",
 ]
 exclude = [

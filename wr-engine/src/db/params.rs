@@ -1,4 +1,4 @@
-use super::wruntime::db::database::{DbError, PgValue};
+use super::wruntime::db::database::{DbError, PgType, PgValue};
 
 // ── PgParam ──────────────────────────────────────────────────────────────────
 
@@ -8,7 +8,7 @@ use super::wruntime::db::database::{DbError, PgValue};
 /// `tokio_postgres` without boxing each concrete Rust type individually.
 #[derive(Debug)]
 pub(crate) enum PgParam {
-    Null,
+    Null(PgType),
     Boolean(bool),
     Int2(i16),
     Int4(i32),
@@ -37,6 +37,45 @@ pub(crate) enum PgParam {
     TimestampArray(Vec<Option<chrono::NaiveDateTime>>),
     UuidArray(Vec<Option<uuid::Uuid>>),
     JsonbArray(Vec<Option<serde_json::Value>>),
+}
+
+pub(crate) fn postgres_type_to_pg_type(ty: &tokio_postgres::types::Type) -> Option<PgType> {
+    use tokio_postgres::types::{Kind, Type};
+
+    match *ty {
+        Type::BOOL => Some(PgType::Boolean),
+        Type::INT2 => Some(PgType::Int2),
+        Type::INT4 => Some(PgType::Int4),
+        Type::INT8 => Some(PgType::Int8),
+        Type::FLOAT4 => Some(PgType::Float4),
+        Type::FLOAT8 => Some(PgType::Float8),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => Some(PgType::Text),
+        Type::BYTEA => Some(PgType::Bytea),
+        Type::TIMESTAMPTZ => Some(PgType::Timestamptz),
+        Type::TIMESTAMP => Some(PgType::Timestamp),
+        Type::DATE => Some(PgType::Date),
+        Type::TIME => Some(PgType::Time),
+        Type::INTERVAL => Some(PgType::Interval),
+        Type::NUMERIC => Some(PgType::Numeric),
+        Type::UUID => Some(PgType::Uuid),
+        Type::JSON | Type::JSONB => Some(PgType::Jsonb),
+        Type::OID => Some(PgType::Oid),
+        Type::BOOL_ARRAY => Some(PgType::BoolArray),
+        Type::INT2_ARRAY => Some(PgType::Int2Array),
+        Type::INT4_ARRAY => Some(PgType::Int4Array),
+        Type::INT8_ARRAY => Some(PgType::Int8Array),
+        Type::FLOAT4_ARRAY => Some(PgType::Float4Array),
+        Type::FLOAT8_ARRAY => Some(PgType::Float8Array),
+        Type::TEXT_ARRAY | Type::VARCHAR_ARRAY => Some(PgType::TextArray),
+        Type::TIMESTAMPTZ_ARRAY => Some(PgType::TimestamptzArray),
+        Type::TIMESTAMP_ARRAY => Some(PgType::TimestampArray),
+        Type::UUID_ARRAY => Some(PgType::UuidArray),
+        Type::JSON_ARRAY | Type::JSONB_ARRAY => Some(PgType::JsonbArray),
+        ref other => match other.kind() {
+            Kind::Domain(inner) => postgres_type_to_pg_type(inner),
+            _ => None,
+        },
+    }
 }
 
 /// Raw Postgres INTERVAL: 8-byte microseconds + 4-byte days + 4-byte months
@@ -145,7 +184,7 @@ fn parse_jsonb(s: String) -> Result<serde_json::Value, DbError> {
 macro_rules! passthrough_variants {
     ($v:expr, [ $($variant:ident),+ $(,)? ]) => {
         match $v {
-            PgValue::Null => Ok(PgParam::Null),
+            PgValue::Null(pg_type) => Ok(PgParam::Null(pg_type)),
             $(PgValue::$variant(inner) => Ok(PgParam::$variant(inner)),)+
             other => convert_complex(other),
         }
@@ -229,7 +268,18 @@ pub(crate) fn prepare_params(params: Vec<PgValue>) -> Result<Vec<PgParam>, DbErr
 macro_rules! delegate_to_sql {
     ($self:expr, $ty:expr, $buf:expr, [ $($variant:ident),+ $(,)? ]) => {
         match $self {
-            PgParam::Null => Ok(tokio_postgres::types::IsNull::Yes),
+            PgParam::Null(pg_type) => {
+                if postgres_type_to_pg_type($ty) == Some(*pg_type) {
+                    Ok(tokio_postgres::types::IsNull::Yes)
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "typed null declared as {pg_type:?} cannot bind to PostgreSQL type {} (OID {})",
+                        $ty.name(),
+                        $ty.oid(),
+                    ))
+                    .into())
+                }
+            },
             $(PgParam::$variant(v) => v.to_sql($ty, $buf),)+
         }
     };
@@ -296,7 +346,7 @@ impl tokio_postgres::types::ToSql for PgParam {
 #[cfg(test)]
 mod tests {
     use super::prepare_param;
-    use crate::db::wruntime::db::database::{DbError, PgValue};
+    use crate::db::wruntime::db::database::{DbError, PgType, PgValue};
 
     fn assert_rejected(v: PgValue) {
         match prepare_param(v.clone()) {
@@ -339,5 +389,26 @@ mod tests {
         ] {
             assert!(prepare_param(v.clone()).is_ok(), "should accept {v:?}");
         }
+    }
+
+    #[test]
+    fn typed_null_rejects_a_mismatched_postgres_context() {
+        let param = prepare_param(PgValue::Null(PgType::Text)).expect("prepare typed null");
+        let error = tokio_postgres::types::ToSql::to_sql(
+            &param,
+            &tokio_postgres::types::Type::INT4,
+            &mut bytes::BytesMut::new(),
+        )
+        .err()
+        .expect("text null must not bind as int4");
+        let message = error.to_string();
+        assert!(
+            message.contains("declared as PgType::Text"),
+            "actual typed-null mismatch error: {message}"
+        );
+        assert!(
+            message.contains("int4"),
+            "actual typed-null mismatch error: {message}"
+        );
     }
 }

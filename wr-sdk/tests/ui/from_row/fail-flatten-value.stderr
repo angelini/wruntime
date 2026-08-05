@@ -1,0 +1,5 @@
+error: `flatten` does not take a value
+ --> tests/ui/from_row/fail-flatten-value.rs:5:13
+  |
+5 |     #[wr_db(flatten = true)]
+  |             ^^^^^^^

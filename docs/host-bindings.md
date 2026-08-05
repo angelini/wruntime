@@ -34,76 +34,23 @@ wasm_path = "modules/inventory_service.wasm"
 # database omitted — no DB access for this module
 ```
 
-### Example: querying Postgres from a WASM module
+### Transport and resources
 
-```rust
-use wr_sdk::bindings::wruntime::db::database::{self, PgValue};
+The raw WIT interface supports query, execute, streaming query, transactions, and transaction-scoped equivalents. Exact signatures and transport records are owned by [`wit/db.wit`](../wit/db.wit); preferred guest builders and row decoding are documented in the [guest API guide](agents/guest-module-author/api_guide.md#database).
 
-/// Look up an order by its integer ID and return the status string.
-fn get_order_status(order_id: i32) -> Option<String> {
-    let rows = database::query(
-        "SELECT status FROM orders WHERE id = $1",
-        &[PgValue::Int4(order_id)],
-    ).ok()?;
+The engine acquires a pool connection inside the module's provisioned namespace role and schema. Transactions retain one connection until commit, rollback, or drop; dropping an active transaction rolls it back. Streaming retains its connection while the row cursor is live. An empty batch is end-of-stream, and dropping a cursor early cancels/releases it. Completed transaction resources reject later use. `[limits].max_db_transactions` and `max_db_cursors` cap live resources; over-cap creation returns `db-error::connection` without weakening capability or namespace enforcement.
 
-    match rows.first()?.columns.first().map(|c| &c.value) {
-        Some(PgValue::Text(s)) => Some(s.clone()),
-        _ => None,
-    }
-}
+### Typed values and strict errors
 
-/// Insert a new order and return the number of rows affected.
-fn create_order(id: i32, status: &str, total: &str) -> u64 {
-    database::execute(
-        "INSERT INTO orders (id, status, total) VALUES ($1, $2, $3::numeric)",
-        &[
-            PgValue::Int4(id),
-            PgValue::Text(status.to_string()),
-            PgValue::Numeric(total.to_string()),
-        ],
-    ).unwrap_or(0)
-}
-```
+`pg-value` carries an explicit `pg-type` for SQL `NULL`, so null parameters and null results retain their intended PostgreSQL type. Parameters are bound positionally as `$1`, `$2`, …; a typed null used in an incompatible SQL context, malformed JSONB/numeric/temporal data, or an invalid array element returns an error rather than being coerced.
 
-### `pg-value` type mapping
+Result conversion is equally strict. A supported SQL null remains a typed null for SDK `Option<T>` decoding. A PostgreSQL result type with no `pg-value` representation returns `db-error::unsupported-result-type` through query and streaming paths; its payload identifies the optional column name, zero-based column index, PostgreSQL type name, and OID. It is never converted to null and does not rely on a warning. SDK row errors additionally preserve missing/duplicate column, expected/actual type, non-optional-null, cardinality, and JSONB decode context.
 
-| Variant | Postgres type | Rust encoding |
-|---|---|---|
-| `PgValue::Null` | SQL NULL | — |
-| `PgValue::Boolean(bool)` | `BOOL` | `bool` |
-| `PgValue::Int2(i16)` | `SMALLINT` | `i16` |
-| `PgValue::Int4(i32)` | `INTEGER` | `i32` |
-| `PgValue::Int8(i64)` | `BIGINT` | `i64` |
-| `PgValue::Float4(f32)` | `REAL` | `f32` |
-| `PgValue::Float8(f64)` | `DOUBLE PRECISION` | `f64` |
-| `PgValue::Text(String)` | `TEXT` / `VARCHAR` / `CHAR` | `String` |
-| `PgValue::Bytea(Vec<u8>)` | `BYTEA` | `Vec<u8>` |
-| `PgValue::Timestamptz(i64)` | `TIMESTAMPTZ` | µs since Unix epoch (UTC) |
-| `PgValue::Timestamp(i64)` | `TIMESTAMP` | µs since Unix epoch (naive) |
-| `PgValue::Date(i32)` | `DATE` | days since Unix epoch |
-| `PgValue::Time(i64)` | `TIME` | µs since midnight |
-| `PgValue::Interval(PgInterval)` | `INTERVAL` | `{ months, days, microseconds }` |
-| `PgValue::Numeric(String)` | `NUMERIC` / `DECIMAL` | decimal string (lossless) |
-| `PgValue::Uuid((u64, u64))` | `UUID` | 128-bit value as `(high, low)` |
-| `PgValue::Jsonb(String)` | `JSON` / `JSONB` | serialised JSON string |
-| `PgValue::Oid(u32)` | `OID` | `u32` |
-| `PgValue::BoolArray(Vec<Option<bool>>)` | `BOOL[]` | `Vec<Option<bool>>` |
-| `PgValue::Int2Array(Vec<Option<i16>>)` | `INT2[]` | `Vec<Option<i16>>` |
-| `PgValue::Int4Array(Vec<Option<i32>>)` | `INT4[]` | `Vec<Option<i32>>` |
-| `PgValue::Int8Array(Vec<Option<i64>>)` | `INT8[]` | `Vec<Option<i64>>` |
-| `PgValue::Float4Array(Vec<Option<f32>>)` | `FLOAT4[]` | `Vec<Option<f32>>` |
-| `PgValue::Float8Array(Vec<Option<f64>>)` | `FLOAT8[]` | `Vec<Option<f64>>` |
-| `PgValue::TextArray(Vec<Option<String>>)` | `TEXT[]` | `Vec<Option<String>>` |
-| `PgValue::TimestamptzArray(Vec<Option<i64>>)` | `TIMESTAMPTZ[]` | `Vec<Option<i64>>` |
-| `PgValue::TimestampArray(Vec<Option<i64>>)` | `TIMESTAMP[]` | `Vec<Option<i64>>` |
-| `PgValue::UuidArray(Vec<Option<(u64, u64)>>)` | `UUID[]` | `Vec<Option<(u64, u64)>>` |
-| `PgValue::JsonbArray(Vec<Option<String>>)` | `JSONB[]` | `Vec<Option<String>>` |
+### Engine-owned telemetry
 
-Parameters are bound positionally as `$1`, `$2`, … in the SQL string. Use explicit casts (e.g. `$1::numeric`, `$1::jsonb`) when Postgres cannot infer the type from context.
+Every raw WIT or SDK-builder DB operation creates an engine-owned client span; guest opt-in is neither required nor available. The stable attributes are `db.system.name=postgresql`, `db.operation.name`, `db.namespace` when known, `db.response.returned_rows`, and `error.type` on failure. Query, execute, transaction operations, and a stream's complete lifetime use the guest span as parent when one is active. A stream records one span and accumulates returned rows; exhaustion finishes it successfully, while a host/decode error or early cursor drop finishes it once as an error/cancellation.
 
-### Input validation
-
-Parameter values are converted strictly. A value that cannot be represented in its target Postgres type is **rejected** with `DbError::Query(...)` (a descriptive message) rather than silently coerced. This applies to: malformed `Jsonb`/`JsonbArray` JSON, a non-numeric `Numeric` string, an out-of-range `Timestamp`/`Timestamptz`/`Time` value, and invalid elements inside array variants. There is a deliberate **read-path asymmetry**: on the way *out*, a result column of a Postgres type the engine does not explicitly map is logged as a warning and returned as `PgValue::Null` (lenient), whereas input conversion is strict.
+`db.query.text` is omitted by default. [`[database.telemetry] include_query_text`](configuration.md#database-telemetry) opts in to whitespace-normalized statement text; bind values are never interpolated or recorded, while SQL literals/comments remain potentially sensitive.
 
 ## Blobstore (S3-compatible)
 
@@ -119,26 +66,32 @@ Available functions:
 | `list-objects(bucket, prefix)` | List objects matching a prefix |
 | `head-object(bucket, key)` | Get object metadata (size, etag, last-modified) |
 
-Access via `wr_sdk::bindings::wruntime::blobstore::store`.
+Prefer the scoped `wr_sdk::blobstore::bucket` facade. Raw access remains available via `wr_sdk::bindings::wruntime::blobstore::store` as an escape hatch.
 
 ### Example: storing and retrieving objects
 
 ```rust
-use wr_sdk::bindings::wruntime::blobstore::store;
+use wr_sdk::blobstore::bucket;
 
 fn save_report(report_id: &str, data: &[u8]) {
-    store::put_object("reports", &format!("daily/{report_id}.bin"), data)
-        .expect("put_object failed");
+    bucket("reports")
+        .expect("valid bucket")
+        .put(&format!("daily/{report_id}.bin"), data)
+        .expect("put failed");
 }
 
 fn load_report(report_id: &str) -> Vec<u8> {
-    store::get_object("reports", &format!("daily/{report_id}.bin"))
-        .expect("get_object failed")
+    bucket("reports")
+        .expect("valid bucket")
+        .get(&format!("daily/{report_id}.bin"))
+        .expect("get failed")
 }
 
 fn list_reports() -> Vec<String> {
-    store::list_objects("reports", Some("daily/"))
-        .expect("list_objects failed")
+    bucket("reports")
+        .expect("valid bucket")
+        .list("daily/")
+        .expect("list failed")
         .into_iter()
         .map(|meta| meta.key)
         .collect()
@@ -159,15 +112,19 @@ See [configuration.md](configuration.md#blobstore) for the config keys.
 Defined in `wit/tracing.wit`. Allows modules to create and annotate OpenTelemetry spans that appear alongside the proxy's own request traces.
 
 ```rust
-use wr_sdk::tracing;
-
-let span = tracing::start("process-order", &[("order.id", "123")]);
-tracing::set_attr(&span, "order.total", 45.99);
-tracing::record_event(&span, "validation-passed", &[]);
+let span = wr_sdk::span!("process-order", "order.id" => "123");
+wr_sdk::set_attrs!(
+    span,
+    "order.total" => 45.99,
+    "order.flags" => vec![true, false]
+);
+wr_sdk::event!(span, "validation-passed", "attempt" => 1_i64);
 // span ends when dropped
 ```
 
-Access via `wr_sdk::bindings::wruntime::tracing::span`.
+Initial span fields, late attributes, and event fields use typed scalar or homogeneous-array values. A `set_attrs!` invocation may add arbitrary late keys and batches them into one WIT call. Convert `u64`, `usize`, and unsigned arrays explicitly to signed values with checked conversion, or record them intentionally as text; implicit lossy conversion is not provided.
+
+Raw access is available via `wr_sdk::bindings::wruntime::tracing::span`.
 
 Each request has a ceiling on the number of concurrently live guest-created spans (`[limits] max_spans`, default **1024**). A span resource is created by `start`/`start-root` and freed when dropped. If a guest tries to open a span beyond the cap, the guest instance is **trapped** (the request fails) — this protects the engine's resource table; it does not crash the engine. Drop spans you no longer need to stay under the cap.
 
@@ -198,13 +155,13 @@ llm         = true
 ### Example: calling Claude from a WASM module
 
 ```rust
-use wr_sdk::llm::CompletionBuilder;
+use wr_sdk::llm::{CompletionBuilder, MaxTokens};
 
 fn summarize(text: &str) -> String {
     CompletionBuilder::sonnet()
         .system("You are a concise summarizer.")
         .user(text)
-        .max_tokens(256)
+        .max_tokens(MaxTokens::new(256).expect("non-zero token limit"))
         .complete_text()
         .expect("completion failed")
 }
@@ -213,7 +170,7 @@ fn summarize(text: &str) -> String {
 fn stream_response(prompt: &str) -> String {
     let stream = CompletionBuilder::sonnet()
         .user(prompt)
-        .max_tokens(1024)
+        .max_tokens(MaxTokens::new(1024).expect("non-zero token limit"))
         .stream()
         .expect("stream failed");
     wr_sdk::llm::collect_stream(stream).expect("collect failed")

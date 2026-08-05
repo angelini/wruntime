@@ -30,6 +30,29 @@ fn to_otel_value(value: AttributeValue) -> opentelemetry::Value {
         AttributeValue::Boolean(value) => opentelemetry::Value::Bool(value),
         AttributeValue::Signed(value) => opentelemetry::Value::I64(value),
         AttributeValue::Float(value) => opentelemetry::Value::F64(value),
+        AttributeValue::TextArray(values) => opentelemetry::Value::Array(
+            opentelemetry::Array::String(values.into_iter().map(Into::into).collect()),
+        ),
+        AttributeValue::BooleanArray(values) => {
+            opentelemetry::Value::Array(opentelemetry::Array::Bool(values))
+        }
+        AttributeValue::SignedArray(values) => {
+            opentelemetry::Value::Array(opentelemetry::Array::I64(values))
+        }
+        AttributeValue::FloatArray(values) => {
+            opentelemetry::Value::Array(opentelemetry::Array::F64(values))
+        }
+    }
+}
+
+impl ModuleState {
+    pub(crate) fn guest_span_parent(&mut self) -> tracing::Span {
+        let tracing = self.tracing_context();
+        tracing
+            .span_stack
+            .last()
+            .unwrap_or(&tracing.active_span)
+            .clone()
     }
 }
 
@@ -39,13 +62,10 @@ impl wruntime::tracing::span::Host for ModuleState {
         name: String,
         attrs: Vec<(String, AttributeValue)>,
     ) -> wasmtime::Result<Resource<SpanState>> {
+        let parent = self.guest_span_parent();
         let (tc, table) = self.tracing_mut();
-        // Parent the new span to the top of the guest span stack, falling back
-        // to the request-level `active_span`. This gives automatic nesting:
-        // e.g. db.query becomes a child of db.transaction.
-        let parent = tc.span_stack.last().unwrap_or(&tc.active_span);
         let child = tracing::info_span!(
-            parent: parent,
+            parent: &parent,
             "module",
             "otel.name" = name.as_str(),
             "wasm.span.name" = name.as_str()
@@ -106,17 +126,18 @@ impl wruntime::tracing::span::Host for ModuleState {
 }
 
 impl wruntime::tracing::span::HostActiveSpan for ModuleState {
-    async fn set_attribute(
+    async fn set_attributes(
         &mut self,
         self_: Resource<SpanState>,
-        key: String,
-        value: AttributeValue,
+        attrs: Vec<(String, AttributeValue)>,
     ) -> wasmtime::Result<()> {
         if let Ok(state) = self.table().get(&self_) {
             use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-            state
-                .span
-                .set_attribute(opentelemetry::Key::new(key), to_otel_value(value));
+            for (key, value) in attrs {
+                state
+                    .span
+                    .set_attribute(opentelemetry::Key::new(key), to_otel_value(value));
+            }
         }
         Ok(())
     }
@@ -192,6 +213,41 @@ mod tests {
         wr_common::http_pool::HttpClientPool::new(1)
     }
 
+    #[test]
+    fn test_to_otel_value_preserves_scalars_and_arrays() {
+        use opentelemetry::{Array, Value};
+
+        let cases = [
+            (
+                AttributeValue::Text("value".into()),
+                Value::String("value".into()),
+            ),
+            (AttributeValue::Boolean(true), Value::Bool(true)),
+            (AttributeValue::Signed(-42), Value::I64(-42)),
+            (AttributeValue::Float(1.5), Value::F64(1.5)),
+            (
+                AttributeValue::TextArray(vec!["a".into(), "b".into()]),
+                Value::Array(Array::String(vec!["a".into(), "b".into()])),
+            ),
+            (
+                AttributeValue::BooleanArray(vec![true, false]),
+                Value::Array(Array::Bool(vec![true, false])),
+            ),
+            (
+                AttributeValue::SignedArray(vec![-1, 2]),
+                Value::Array(Array::I64(vec![-1, 2])),
+            ),
+            (
+                AttributeValue::FloatArray(vec![1.25, 2.5]),
+                Value::Array(Array::F64(vec![1.25, 2.5])),
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(super::to_otel_value(input), expected);
+        }
+    }
+
     #[tokio::test]
     async fn test_start_returns_valid_handle() {
         let mut state = ModuleState::new(
@@ -209,7 +265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_set_attribute_on_span() {
+    async fn test_set_attributes_accepts_all_values_empty_and_missing_span() {
         let mut state = ModuleState::new(
             "test".into(),
             "test".into(),
@@ -222,14 +278,49 @@ mod tests {
             .await
             .expect("start");
         let rep = span.rep();
-        HostActiveSpan::set_attribute(
+        let attrs = vec![
+            ("text".into(), AttributeValue::Text("users".into())),
+            ("boolean".into(), AttributeValue::Boolean(true)),
+            ("signed".into(), AttributeValue::Signed(-42)),
+            ("float".into(), AttributeValue::Float(1.5)),
+            (
+                "text-array".into(),
+                AttributeValue::TextArray(vec!["a".into(), "b".into()]),
+            ),
+            (
+                "boolean-array".into(),
+                AttributeValue::BooleanArray(vec![true, false]),
+            ),
+            (
+                "signed-array".into(),
+                AttributeValue::SignedArray(vec![-1, 2]),
+            ),
+            (
+                "float-array".into(),
+                AttributeValue::FloatArray(vec![1.25, 2.5]),
+            ),
+        ];
+        HostActiveSpan::set_attributes(
             &mut state,
             wasmtime::component::Resource::new_borrow(rep),
-            "db.table".into(),
-            AttributeValue::Text("users".into()),
+            attrs,
         )
         .await
-        .expect("set_attribute");
+        .expect("set_attributes");
+        HostActiveSpan::set_attributes(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(rep),
+            vec![],
+        )
+        .await
+        .expect("empty set_attributes");
+        HostActiveSpan::set_attributes(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(u32::MAX),
+            vec![("ignored".into(), AttributeValue::Boolean(true))],
+        )
+        .await
+        .expect("missing span is ignored");
         HostActiveSpan::drop(&mut state, span).await.expect("drop");
     }
 

@@ -1,0 +1,11 @@
+error: `FromRow` cannot be derived for enums
+ --> tests/ui/from_row/fail-item-kinds.rs:4:6
+  |
+4 | enum Choice {
+  |      ^^^^^^
+
+error: `FromRow` cannot be derived for unions
+ --> tests/ui/from_row/fail-item-kinds.rs:9:7
+  |
+9 | union Either {
+  |       ^^^^^^

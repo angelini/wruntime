@@ -9,6 +9,19 @@ use helpers::{
     wasm::{tracing_state, tracing_state_with_limits, GuestHarness, TestGuest},
 };
 
+#[test]
+fn tracing_fixture_uses_one_bulk_late_attribute_call() {
+    let source = include_str!("../guests/tracing-guest/src/lib.rs");
+    let method = source
+        .split_once("fn span_attributes(")
+        .and_then(|(_, rest)| rest.split_once("fn span_event("))
+        .map(|(method, _)| method)
+        .expect("span_attributes method source");
+
+    assert_eq!(method.matches("sdk_tracing::set_attrs(").count(), 1);
+    assert_eq!(method.matches("sdk_tracing::set_attr(").count(), 0);
+}
+
 #[tokio::test]
 async fn wasm_tracing_start_span() -> Result<()> {
     let Some(harness) = GuestHarness::load(TestGuest::Tracing).await? else {

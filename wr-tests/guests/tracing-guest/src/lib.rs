@@ -29,10 +29,10 @@ impl proto::TracingTestService for Component {
         &self,
         req: proto::StartSpanRequest,
     ) -> Result<proto::StartSpanResponse, ServiceError> {
-        let attrs: Vec<(&str, &str)> = req
+        let attrs: Vec<sdk_tracing::Attribute> = req
             .attrs
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .into_iter()
+            .map(|(key, value)| (key, sdk_tracing::AttributeValue::Text(value)))
             .collect();
         let _span = sdk_tracing::start(&req.name, &attrs);
         Ok(proto::StartSpanResponse { ok: true })
@@ -43,9 +43,12 @@ impl proto::TracingTestService for Component {
         req: proto::SpanAttributesRequest,
     ) -> Result<proto::SpanAttributesResponse, ServiceError> {
         let span = sdk_tracing::start(&req.span_name, &[]);
-        for (k, v) in &req.attrs {
-            sdk_tracing::set_attr(&span, k, v);
-        }
+        let attrs: Vec<sdk_tracing::Attribute> = req
+            .attrs
+            .into_iter()
+            .map(|(key, value)| (key, sdk_tracing::AttributeValue::Text(value)))
+            .collect();
+        sdk_tracing::set_attrs(&span, &attrs);
         Ok(proto::SpanAttributesResponse { ok: true })
     }
 
@@ -54,10 +57,10 @@ impl proto::TracingTestService for Component {
         req: proto::SpanEventRequest,
     ) -> Result<proto::SpanEventResponse, ServiceError> {
         let span = sdk_tracing::start(&req.span_name, &[]);
-        let attrs: Vec<(&str, &str)> = req
+        let attrs: Vec<sdk_tracing::Attribute> = req
             .event_attrs
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .into_iter()
+            .map(|(key, value)| (key, sdk_tracing::AttributeValue::Text(value)))
             .collect();
         sdk_tracing::record_event(&span, &req.event_name, &attrs);
         Ok(proto::SpanEventResponse { ok: true })
@@ -76,10 +79,21 @@ impl proto::TracingTestService for Component {
         &self,
         req: proto::NestedSpansRequest,
     ) -> Result<proto::NestedSpansResponse, ServiceError> {
-        let outer = sdk_tracing::start(&req.outer_name, &[("level", "outer")]);
-        let inner = sdk_tracing::start(&req.inner_name, &[("level", "inner")]);
-        sdk_tracing::set_attr(&inner, "nested", "true");
-        sdk_tracing::record_event(&outer, "checkpoint", &[("stage", "mid")]);
+        let outer = wr_sdk::span!(&req.outer_name, "level" => "outer", "root" => false);
+        let inner = wr_sdk::span!(&req.inner_name, "level" => "inner");
+        wr_sdk::set_attrs!(
+            inner,
+            "nested" => true,
+            "depth" => 2_i64,
+            "labels" => vec!["inner", "child"]
+        );
+        wr_sdk::event!(
+            outer,
+            "checkpoint",
+            "stage" => "mid",
+            "attempt" => 1_i64,
+            "flags" => vec![true, false]
+        );
         drop(inner);
         drop(outer);
         Ok(proto::NestedSpansResponse { ok: true })

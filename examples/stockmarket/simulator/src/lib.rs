@@ -111,7 +111,7 @@ impl proto::SimulatorService for Component {
                     quantity,
                     price,
                 }) {
-                    wr_sdk::log::log(&format!("place_order error: {e}"));
+                    wr_sdk::log!("place_order error: {e}");
                     errors += 1;
                 }
             }
@@ -121,7 +121,7 @@ impl proto::SimulatorService for Component {
         if let Err(e) = ledger.snapshot(proto::SnapshotRequest {
             label: "final".into(),
         }) {
-            wr_sdk::log::log(&format!("snapshot error: {e}"));
+            wr_sdk::log!("snapshot error: {e}");
             errors += 1;
         }
 
@@ -135,10 +135,13 @@ impl proto::SimulatorService for Component {
                 }
             };
 
-        tracing::set_attr(&run_span, "sim.total_trades", total_trades);
-        tracing::set_attr(&run_span, "sim.total_volume", total_volume);
-        tracing::set_attr(&run_span, "sim.errors", errors);
-        tracing::set_attr(&run_span, "sim.ledger_valid", ledger_valid);
+        wr_sdk::set_attrs!(
+            run_span,
+            "sim.total_trades" => total_trades,
+            "sim.total_volume" => total_volume,
+            "sim.errors" => errors,
+            "sim.ledger_valid" => ledger_valid
+        );
 
         Ok(proto::SimRunResponse {
             total_orders,

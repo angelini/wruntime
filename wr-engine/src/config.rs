@@ -114,6 +114,15 @@ pub struct DatabaseConfig {
     /// Defaults to 60.
     #[serde(default = "default_db_idle_in_transaction_timeout_secs")]
     pub idle_in_transaction_timeout_secs: u32,
+    /// Database span disclosure controls. Query text is omitted by default.
+    #[serde(default)]
+    pub telemetry: DatabaseTelemetryConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct DatabaseTelemetryConfig {
+    pub include_query_text: bool,
 }
 
 fn default_max_connections() -> usize {
@@ -546,5 +555,41 @@ impl EngineConfig {
         }
 
         v.finish()
+    }
+}
+
+#[cfg(test)]
+mod database_telemetry_tests {
+    use serde::Deserialize;
+
+    use super::DatabaseConfig;
+
+    #[derive(Deserialize)]
+    struct TestConfig {
+        database: DatabaseConfig,
+    }
+
+    #[test]
+    fn database_query_text_disclosure_defaults_off_and_can_be_enabled() {
+        let default: TestConfig = toml::from_str(
+            r#"
+            [database]
+            url = "postgres://localhost/test"
+            "#,
+        )
+        .expect("default database telemetry config");
+        assert!(!default.database.telemetry.include_query_text);
+
+        let enabled: TestConfig = toml::from_str(
+            r#"
+            [database]
+            url = "postgres://localhost/test"
+
+            [database.telemetry]
+            include_query_text = true
+            "#,
+        )
+        .expect("enabled database telemetry config");
+        assert!(enabled.database.telemetry.include_query_text);
     }
 }

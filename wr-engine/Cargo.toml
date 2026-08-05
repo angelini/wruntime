@@ -62,3 +62,7 @@ object_store = { version = "0.14.0", default-features = false, features = [
   "reqwest",
   "ring",
 ] }
+
+[dev-dependencies]
+opentelemetry_sdk = { version = "0.32", features = ["testing", "trace"] }
+toml              = "1"

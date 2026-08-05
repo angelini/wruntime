@@ -14,9 +14,8 @@ mod bindings {
 
 use serde::Deserialize;
 use wr_sdk::bindings::wasi::clocks::monotonic_clock;
-use wr_sdk::bindings::wruntime::blobstore::store;
 use wr_sdk::bindings::wruntime::llm::inference::{CompletionResponse, LlmError};
-use wr_sdk::llm::CompletionBuilder;
+use wr_sdk::llm::{CompletionBuilder, MaxTokens};
 use wr_sdk::prelude::*;
 
 struct Component;
@@ -36,11 +35,11 @@ fn complete_with_retry(
             Ok(resp) => return Ok(resp),
             Err(LlmError::RateLimited(retry_after)) if attempt < MAX_RETRIES => {
                 let secs = retry_after.unwrap_or(30);
-                wr_sdk::log::log(&format!(
+                wr_sdk::log!(
                     "rate limited, retrying in {secs}s (attempt {}/{})",
                     attempt + 1,
                     MAX_RETRIES
-                ));
+                );
                 let nanos = secs as u64 * 1_000_000_000;
                 monotonic_clock::subscribe_duration(nanos).block();
             }
@@ -69,43 +68,63 @@ struct ManifestEntry {
     size: u64,
 }
 
+#[derive(FromRow)]
+struct SessionRow {
+    status: String,
+    latest_diff: String,
+}
+
+#[derive(FromRow)]
+struct TurnRow {
+    turn_number: i32,
+    user_prompt: String,
+    assistant_response: String,
+    input_tokens: i32,
+    output_tokens: i32,
+}
+
 // ── Service implementation ───────────────────────────────────────────────────
 
 impl proto::AgentService for Component {
     fn run_task(&self, req: proto::RunTaskRequest) -> Result<proto::RunTaskResponse, ServiceError> {
         let session_id = &req.session_id;
         let max_turns = if req.max_turns > 0 { req.max_turns } else { 3 };
+        let doc_prefix_count =
+            i64::try_from(req.doc_prefixes.len()).expect("doc prefix count fits in i64");
 
         let span = wr_sdk::span!(
             "agent.run_task",
             "session.id" => session_id.as_str(),
             "agent.max_turns" => max_turns,
-            "agent.doc_prefixes" => req.doc_prefixes.len()
+            "agent.doc_prefixes" => doc_prefix_count
         );
 
         // Create session in DB.
-        database::execute(
+        query(
             "INSERT INTO sessions (session_id, status) VALUES ($1, 'active') \
              ON CONFLICT (session_id) DO UPDATE SET status = 'active', updated_at = now()",
-            &[PgValue::Text(session_id.clone())],
-        )?;
+        )
+        .bind(session_id.clone())
+        .execute()?;
 
         // Store doc prefix associations.
         for prefix in &req.doc_prefixes {
-            database::execute(
+            query(
                 "INSERT INTO session_doc_prefixes (session_id, doc_prefix) VALUES ($1, $2) \
                  ON CONFLICT DO NOTHING",
-                &[
-                    PgValue::Text(session_id.clone()),
-                    PgValue::Text(prefix.clone()),
-                ],
-            )?;
+            )
+            .bind(session_id.clone())
+            .bind(prefix.clone())
+            .execute()?;
         }
 
         // Load relevant documentation from blobstore.
-        let ctx_span = tracing::start("agent.build_context", &[]);
+        let ctx_span = wr_sdk::span!("agent.build_context");
         let context = build_context(&req.doc_prefixes, &req.task_description)?;
-        tracing::set_attr(&ctx_span, "context.length", context.len());
+        wr_sdk::set_attrs!(
+            ctx_span,
+            "context.length" => i64::try_from(context.len()).expect("context length fits in i64")
+        );
         drop(ctx_span);
 
         let system_prompt = format!(
@@ -130,15 +149,15 @@ impl proto::AgentService for Component {
         // Turn 1: initial generation.
         let user_prompt = format!("## Task\n{}", req.task_description);
 
-        let turn_span = tracing::start("agent.llm_turn", &[("turn", "1")]);
-        wr_sdk::log::log(&format!(
+        let turn_span = wr_sdk::span!("agent.llm_turn", "turn" => 1_i64);
+        wr_sdk::log!(
             "llm call: turn=1 model=claude-sonnet-4-6 messages=1 max_tokens=8192 system_len={}",
             system_prompt.len()
-        ));
+        );
         let resp = complete_with_retry(|| {
             CompletionBuilder::sonnet()
                 .system(&system_prompt)
-                .max_tokens(8192)
+                .max_tokens(MaxTokens::new(8192).expect("8192 is a valid token limit"))
                 .user(&user_prompt)
         })
         .map_err(|e| {
@@ -158,14 +177,17 @@ impl proto::AgentService for Component {
         latest_diff = text.clone();
         turn += 1;
 
-        wr_sdk::log::log(&format!(
+        wr_sdk::log!(
             "llm response: turn=1 input_tokens={} output_tokens={} response_len={}",
             resp.usage.input_tokens,
             resp.usage.output_tokens,
             text.len()
-        ));
-        tracing::set_attr(&turn_span, "tokens.input", resp.usage.input_tokens);
-        tracing::set_attr(&turn_span, "tokens.output", resp.usage.output_tokens);
+        );
+        wr_sdk::set_attrs!(
+            turn_span,
+            "tokens.input" => resp.usage.input_tokens,
+            "tokens.output" => resp.usage.output_tokens
+        );
         drop(turn_span);
 
         store_turn(session_id, turn, &user_prompt, &text, &resp.usage)?;
@@ -179,15 +201,15 @@ impl proto::AgentService for Component {
                 If the diff is already correct, respond with exactly: LGTM";
 
             let turn_span = wr_sdk::span!("agent.llm_turn", "turn" => turn + 1, "type" => "refine");
-            wr_sdk::log::log(&format!(
+            wr_sdk::log!(
                 "llm call: turn={} type=refine model=claude-sonnet-4-6 messages=2 max_tokens=8192",
                 turn + 1,
-            ));
+            );
             // Refinement turns don't resend the full context — the model's
             // own diff output contains everything needed for self-review.
             let resp = complete_with_retry(|| {
                 CompletionBuilder::sonnet()
-                    .max_tokens(8192)
+                    .max_tokens(MaxTokens::new(8192).expect("8192 is a valid token limit"))
                     .user(format!(
                         "Here is a unified diff I produced:\n\n{prev_assistant}"
                     ))
@@ -201,10 +223,10 @@ impl proto::AgentService for Component {
             let text = match resp.completion {
                 wr_sdk::bindings::wruntime::llm::inference::Completion::Text(s) => s,
                 wr_sdk::bindings::wruntime::llm::inference::Completion::ToolCalls(_) => {
-                    wr_sdk::log::log(&format!(
+                    wr_sdk::log!(
                         "llm response: turn={} unexpected tool_use, stopping",
                         turn + 1
-                    ));
+                    );
                     drop(turn_span);
                     break;
                 }
@@ -214,17 +236,20 @@ impl proto::AgentService for Component {
             total_output = total_output.saturating_add(resp.usage.output_tokens);
             turn += 1;
 
-            wr_sdk::log::log(&format!(
+            wr_sdk::log!(
                 "llm response: turn={turn} type=refine input_tokens={} output_tokens={} response_len={} lgtm={}",
                 resp.usage.input_tokens, resp.usage.output_tokens, text.len(), text.trim() == "LGTM"
-            ));
-            tracing::set_attr(&turn_span, "tokens.input", resp.usage.input_tokens);
-            tracing::set_attr(&turn_span, "tokens.output", resp.usage.output_tokens);
+            );
+            wr_sdk::set_attrs!(
+                turn_span,
+                "tokens.input" => resp.usage.input_tokens,
+                "tokens.output" => resp.usage.output_tokens
+            );
 
             store_turn(session_id, turn, refine_prompt, &text, &resp.usage)?;
 
             if text.trim() == "LGTM" {
-                tracing::record_event(&turn_span, "lgtm", &[]);
+                wr_sdk::event!(turn_span, "lgtm");
                 drop(turn_span);
                 break;
             }
@@ -235,19 +260,22 @@ impl proto::AgentService for Component {
         }
 
         // Update session with final result.
-        database::execute(
+        query(
             "UPDATE sessions SET status = 'complete', latest_diff = $2, updated_at = now() \
              WHERE session_id = $1",
-            &[
-                PgValue::Text(session_id.clone()),
-                PgValue::Text(latest_diff.clone()),
-            ],
-        )?;
+        )
+        .bind(session_id.clone())
+        .bind(latest_diff.clone())
+        .execute()?;
 
-        tracing::set_attr(&span, "agent.turns_used", turn);
-        tracing::set_attr(&span, "agent.total_input_tokens", total_input);
-        tracing::set_attr(&span, "agent.total_output_tokens", total_output);
-        tracing::set_attr(&span, "agent.diff_bytes", latest_diff.len());
+        wr_sdk::set_attrs!(
+            span,
+            "agent.turns_used" => turn,
+            "agent.total_input_tokens" => total_input,
+            "agent.total_output_tokens" => total_output,
+            "agent.diff_bytes" => i64::try_from(latest_diff.len())
+                .expect("diff length fits in i64")
+        );
         drop(span);
 
         Ok(proto::RunTaskResponse {
@@ -265,69 +293,54 @@ impl proto::AgentService for Component {
         &self,
         req: proto::GetSessionRequest,
     ) -> Result<proto::GetSessionResponse, ServiceError> {
-        let rows = database::query(
+        let session = query_as::<SessionRow>(
             "SELECT status, latest_diff FROM sessions WHERE session_id = $1",
-            &[PgValue::Text(req.session_id.clone())],
-        )?;
+        )
+        .bind(req.session_id.clone())
+        .fetch_optional()?
+        .ok_or_else(|| ServiceError::not_found("session not found"))?;
 
-        if rows.is_empty() {
-            return Err(ServiceError::not_found("session not found"));
-        }
+        let status = match session.status.as_str() {
+            "active" => proto::SessionStatus::Active,
+            "complete" => proto::SessionStatus::Complete,
+            "error" => proto::SessionStatus::Error,
+            value => {
+                return Err(ServiceError::internal(format!(
+                    "invalid session status in database: {value}"
+                )))
+            }
+        } as i32;
 
-        let status = match &rows[0].columns[0].value {
-            PgValue::Text(value) if value == "active" => proto::SessionStatus::Active as i32,
-            PgValue::Text(value) if value == "complete" => proto::SessionStatus::Complete as i32,
-            PgValue::Text(value) if value == "error" => proto::SessionStatus::Error as i32,
-            _ => proto::SessionStatus::Unspecified as i32,
-        };
-        let latest_diff = match &rows[0].columns[1].value {
-            PgValue::Text(s) => s.clone(),
-            _ => String::new(),
-        };
-
-        let turn_rows = database::query(
-            "SELECT turn_number, user_prompt, assistant_resp, input_tokens, output_tokens \
+        let turns = query_as::<TurnRow>(
+            "SELECT turn_number, user_prompt, assistant_resp AS assistant_response, \
+             input_tokens, output_tokens \
              FROM conversation_turns WHERE session_id = $1 ORDER BY turn_number",
-            &[PgValue::Text(req.session_id.clone())],
-        )?;
-
-        let turns = turn_rows
-            .into_iter()
-            .map(|row| {
-                let turn_number = match &row.columns[0].value {
-                    PgValue::Int4(n) => u32::try_from(*n).unwrap_or_default(),
-                    _ => 0,
-                };
-                let user_prompt = match &row.columns[1].value {
-                    PgValue::Text(s) => s.clone(),
-                    _ => String::new(),
-                };
-                let assistant_response = match &row.columns[2].value {
-                    PgValue::Text(s) => s.clone(),
-                    _ => String::new(),
-                };
-                let input_tokens = match &row.columns[3].value {
-                    PgValue::Int4(n) => u32::try_from(*n).unwrap_or_default(),
-                    _ => 0,
-                };
-                let output_tokens = match &row.columns[4].value {
-                    PgValue::Int4(n) => u32::try_from(*n).unwrap_or_default(),
-                    _ => 0,
-                };
-                proto::ConversationTurn {
-                    turn_number,
-                    user_prompt,
-                    assistant_response,
-                    input_tokens,
-                    output_tokens,
-                }
+        )
+        .bind(req.session_id.clone())
+        .fetch_all()?
+        .into_iter()
+        .map(|row| {
+            Ok(proto::ConversationTurn {
+                turn_number: u32::try_from(row.turn_number)
+                    .map_err(|_| ServiceError::internal("negative turn number in database"))?,
+                user_prompt: row.user_prompt,
+                assistant_response: row.assistant_response,
+                input_tokens: u32::try_from(row.input_tokens).map_err(|_| {
+                    ServiceError::internal("negative input token count in database")
+                })?,
+                output_tokens: u32::try_from(row.output_tokens).map_err(|_| {
+                    ServiceError::internal("negative output token count in database")
+                })?,
             })
-            .collect::<Vec<_>>();
+        })
+        .collect::<Result<Vec<_>, ServiceError>>()?;
+        let turn_count = u32::try_from(turns.len())
+            .map_err(|_| ServiceError::internal("turn count exceeds response range"))?;
 
         Ok(proto::GetSessionResponse {
             session_id: req.session_id,
-            turn_count: u32::try_from(turns.len()).unwrap_or(u32::MAX),
-            latest_diff,
+            turn_count,
+            latest_diff: session.latest_diff,
             status,
             turns,
         })
@@ -340,10 +353,11 @@ fn build_context(doc_prefixes: &[String], task_description: &str) -> Result<Stri
     let task_lower = task_description.to_lowercase();
     let mut context = String::new();
     let mut total_size: usize = 0;
+    let docs = bucket(BUCKET)?;
 
     for prefix in doc_prefixes {
         let manifest_key = format!("{prefix}/manifest.json");
-        let manifest_data = store::get_object(BUCKET, &manifest_key)?;
+        let manifest_data = docs.get(&manifest_key)?;
 
         let manifest: Manifest = serde_json::from_slice(&manifest_data)
             .map_err(|e| ServiceError::internal(format!("parse manifest: {e}")))?;
@@ -397,22 +411,19 @@ fn build_context(doc_prefixes: &[String], task_description: &str) -> Result<Stri
                 continue;
             }
 
-            match store::get_object(BUCKET, &entry.key) {
-                Ok(data) => {
-                    if let Ok(text) = String::from_utf8(data.clone()) {
-                        // Extract the path after "files/" for a meaningful label.
-                        let label = entry
-                            .key
-                            .find("/files/")
-                            .map(|i| &entry.key[i + 7..])
-                            .unwrap_or(&entry.key);
+            let data = docs.get(&entry.key)?;
+            let text = String::from_utf8(data).map_err(|error| {
+                ServiceError::internal(format!("{} is not UTF-8: {error}", entry.key))
+            })?;
+            let label = match entry.key.find("/files/") {
+                Some(index) => &entry.key[index + 7..],
+                None => &entry.key,
+            };
 
-                        context.push_str(&format!("<file: {label}>\n{text}\n</file>\n\n"));
-                        total_size += data.len();
-                    }
-                }
-                Err(_) => continue,
-            }
+            context.push_str(&format!("<file: {label}>\n{text}\n</file>\n\n"));
+            total_size = total_size
+                .checked_add(text.len())
+                .ok_or_else(|| ServiceError::internal("context byte count overflow"))?;
         }
     }
 
@@ -428,25 +439,26 @@ fn store_turn(
     assistant_resp: &str,
     usage: &wr_sdk::bindings::wruntime::llm::inference::TokenUsage,
 ) -> Result<(), ServiceError> {
-    database::execute(
+    query(
         "INSERT INTO conversation_turns \
          (session_id, turn_number, user_prompt, assistant_resp, input_tokens, output_tokens) \
          VALUES ($1, $2, $3, $4, $5, $6)",
-        &[
-            PgValue::Text(session_id.into()),
-            PgValue::Int4(
-                i32::try_from(turn_number)
-                    .map_err(|_| ServiceError::bad_request("turn number exceeds database range"))?,
-            ),
-            PgValue::Text(user_prompt.into()),
-            PgValue::Text(assistant_resp.into()),
-            PgValue::Int4(i32::try_from(usage.input_tokens).map_err(|_| {
-                ServiceError::bad_request("input token count exceeds database range")
-            })?),
-            PgValue::Int4(i32::try_from(usage.output_tokens).map_err(|_| {
-                ServiceError::bad_request("output token count exceeds database range")
-            })?),
-        ],
-    )?;
+    )
+    .bind(session_id.to_owned())
+    .bind(
+        i32::try_from(turn_number)
+            .map_err(|_| ServiceError::bad_request("turn number exceeds database range"))?,
+    )
+    .bind(user_prompt.to_owned())
+    .bind(assistant_resp.to_owned())
+    .bind(
+        i32::try_from(usage.input_tokens)
+            .map_err(|_| ServiceError::bad_request("input token count exceeds database range"))?,
+    )
+    .bind(
+        i32::try_from(usage.output_tokens)
+            .map_err(|_| ServiceError::bad_request("output token count exceeds database range"))?,
+    )
+    .execute()?;
     Ok(())
 }

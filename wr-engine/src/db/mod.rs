@@ -4,6 +4,7 @@ mod cursor;
 mod host;
 mod params;
 mod rows;
+mod telemetry;
 mod transaction;
 
 #[cfg(test)]

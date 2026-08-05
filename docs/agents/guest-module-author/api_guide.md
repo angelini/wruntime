@@ -18,14 +18,15 @@ This is a discovery and semantic guide, not an exhaustive signature reference. U
 | Serve protobuf RPCs | generated service trait and `_handle` | generated `_router` plus `wr_sdk::io` |
 | Call a module RPC | generated `{Service}Client` | typed `wr_sdk::http` request |
 | Submit/query worker jobs | generated `*WorkerServiceClient` | `wr_sdk::jobs` |
-| Query PostgreSQL | `wr_sdk::db` typed helpers and prelude | `wr_sdk::bindings::wruntime::db::database` |
-| Use S3-compatible storage | validated `wr_sdk::blobstore` names plus store binding | raw blobstore WIT binding |
-| Create spans | `span!`, `root_span!`, `wr_sdk::tracing` | tracing WIT binding |
-| Call an LLM | `wr_sdk::llm::CompletionBuilder` | LLM inference WIT binding |
+| Query PostgreSQL | `wr_sdk::db` builders, owned rows, and `FromRow` | `wr_sdk::bindings::wruntime::db::database` |
+| Use S3-compatible storage | `wr_sdk::blobstore::bucket` scoped handle | raw blobstore WIT binding |
+| Create spans and events | `span!`, `root_span!`, `set_attrs!`, and `event!` | tracing WIT binding |
+| Call an LLM | `wr_sdk::llm::CompletionBuilder` with validated value types | LLM inference WIT binding |
+| Write a diagnostic | `wr_sdk::log!` | — |
 | Read configuration/secret values | `std::env::var` | WASI CLI environment binding |
 | Use scratch files | `std::fs` with `fs = "tempdir"` | WASI filesystem bindings |
 
-Typed SDK values are preferred because they reject malformed authority, path, header, timeout, JSON, numeric, timestamp, bucket/key, model, token, temperature, and tool-schema inputs before crossing the host boundary. Raw bindings remain useful for unsupported operations and negative tests; the host validates them independently.
+Prefer the SDK facade: it owns validation, strict decoding, and ergonomic resource handling before and after a host call. Raw bindings are an intentional escape hatch for unsupported operations and protocol/negative tests, not the default application API; host validation still applies to raw calls.
 
 ## Lifecycle and synchronous calls
 
@@ -53,51 +54,73 @@ A guest's local `world.wit` declares imports and emits component metadata. Enabl
 
 ## Database
 
-Prefer typed row extraction, validated parameter wrappers, and `wr_sdk::db::transaction()`:
+Bind owned typed values and choose cardinality explicitly:
 
 ```rust
-let rows = database::query(
-    "SELECT name FROM items WHERE id = $1",
-    &[PgValue::Int8(item_id)],
-)?;
-let name: String = rows.first().ok_or_else(|| ServiceError::not_found("item"))?.get(0)?;
+use wr_sdk::db::{query_as, FromRow};
+
+#[derive(FromRow)]
+struct Item {
+    id: i64,
+    name: String,
+}
+
+let item = query_as::<Item>("SELECT id, name FROM items WHERE id = $1")
+    .bind(item_id)
+    .fetch_exactly_one()?;
 ```
 
-A transaction rolls back when its resource/guard is dropped without commit. A row cursor cancels and releases its connection on drop. Completed transaction resources reject further operations. Input conversion is strict; unknown result-column types are read leniently as null with a host warning. Put schema DDL in module migrations, not request handlers.
+`query`, `query_as`, and `query_scalar` provide `execute`, `fetch_first`, `fetch_optional`, `fetch_exactly_one`, `fetch_all`, and `stream` terminals; transactions expose the same builders. `fetch_optional` rejects more than one row, `fetch_exactly_one` rejects zero or multiple rows, and `fetch_first` rejects zero rows. A `Row` owns its data: `get("name")` rejects missing or duplicate names and `get_at(0)` rejects a missing index. Type mismatches and a SQL `NULL` decoded into a non-`Option<T>` are errors with column, expected-type, and actual/null-type context. Use `Option<T>` for nullable values, `Json<T>` (with the `wr-sdk` `serde` feature) for JSONB serde conversion, and `#[derive(FromRow)]` with `#[wr_db(rename = "...")]` or `#[wr_db(flatten)]` for named rows; decoding never supplies `Default` fallbacks.
+
+Parameters implement `EncodePg`; ambiguous integers and heterogeneous arrays are rejected, and raw SQL nulls carry a `PgType`. `BatchSize::new` rejects zero. A stream is a synchronous iterator of `Result<T, DbError>`; reaching an empty batch ends it, a decode/host error terminates it, and dropping it early releases the host cursor. Transactions roll back on drop unless consumed by `commit` or `rollback`. Put schema DDL in module migrations, not request handlers. Exact types and signatures remain in [`wr-sdk/src/db.rs`](../../../wr-sdk/src/db.rs) and [`wit/db.wit`](../../../wit/db.wit).
 
 ## Blobstore
 
-Validate bucket/key values before calling the store binding:
+Scope repeated operations to one validated bucket handle:
 
 ```rust
-let bucket = wr_sdk::blobstore::BucketName::parse("reports")?;
-let key = wr_sdk::blobstore::ObjectKey::parse("daily/result.json")?;
-store::put_object(bucket.as_str(), key.as_str(), payload)?;
+let reports = wr_sdk::blobstore::bucket("reports")?;
+reports.put("daily/result.json", payload)?;
+let saved = reports.get("daily/result.json")?;
+let daily = reports.list("daily/")?;
 ```
 
-The engine enforces a non-empty bucket allowlist, namespace key isolation, object-size limits, and list-count limits. Object operations are fully buffered from the guest perspective.
+`Bucket::put`, `get`, `delete`, `head`, and `list` validate and normalize each key or prefix. The engine independently enforces the non-empty bucket allowlist, namespace key isolation, object-size limits, and list-count limits. Object operations are fully buffered from the guest perspective. Use the raw store binding only when the facade does not expose the needed operation or for intentional protocol tests.
 
 ## Tracing
 
 ```rust
 let span = wr_sdk::span!("orders.create", "order.id" => order_id, "retry" => false);
-wr_sdk::tracing::record_event(&span, "validated", &[]);
+wr_sdk::set_attrs!(span, "order.total" => 45.99, "order.items" => 3_i64);
+wr_sdk::event!(span, "validated", "checks" => vec!["stock", "payment"]);
 wr_sdk::tracing::set_error(&span, "failed");
 ```
 
+`set_attrs!` accepts arbitrary late keys and sends all fields in one guest/host crossing. Attribute values are strings, booleans, signed 64-bit integers, 64-bit floats, or homogeneous arrays of those types. Convert `u64`, `usize`, and unsigned arrays explicitly with a checked conversion such as `i64::try_from(value)?`, or intentionally record text; the SDK never converts them lossily.
+
 Spans end on drop. Keep stable, low-cardinality attributes and never attach secrets.
+
+## Logging
+
+```rust
+wr_sdk::log!("processed item {item_id}: {status}");
+```
+
+`log!` accepts normal formatting syntax without allocating an intermediate `format!` string.
 
 ## LLM
 
 ```rust
-let text = wr_sdk::llm::CompletionBuilder::sonnet()
+use wr_sdk::llm::{CompletionBuilder, MaxTokens};
+
+let text = CompletionBuilder::sonnet()
     .system("Answer concisely.")
     .user(prompt)
-    .max_tokens(512)
+    .max_tokens(MaxTokens::new(512)?)
     .complete_text()?;
 ```
 
-Streaming yields zero or more text deltas, exactly one usage event, one stop event, then `None`; errors may surface while advancing the stream. Streaming rejects tool-enabled requests before an upstream call. Use non-streaming `complete()` for tool use. Dropping a stream cancels it. The host retains provider credentials, enforces limits, and exposes no API key to the guest.
+Dynamic models use `ModelName::parse`; optional temperature and tool setters require `Temperature::new` and `ToolSchema::parse`. Invalid model names, zero token limits, non-finite/out-of-range temperatures, and non-object/invalid JSON tool schemas fail before the host call. Streaming yields zero or more text deltas, exactly one usage event, one stop event, then `None`; errors may surface while advancing the stream. Streaming rejects tool-enabled requests before an upstream call. Use non-streaming `complete()` for tool use. Dropping a stream cancels it. The host retains provider credentials, enforces limits, and exposes no API key to the guest.
 
 ## Workers
 

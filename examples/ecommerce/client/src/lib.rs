@@ -27,16 +27,18 @@ impl wr_sdk::ServiceGuest for Component {
 impl proto::ClientService for Component {
     fn run(&self, req: proto::RunRequest) -> Result<proto::RunResponse, ServiceError> {
         let count = if req.count == 0 { 100 } else { req.count };
+        let count_attr = i64::try_from(count)
+            .map_err(|_| ServiceError::bad_request("count exceeds tracing range"))?;
 
-        wr_sdk::log::log(&format!("client starting — {count} iterations"));
+        wr_sdk::log!("client starting — {count} iterations");
 
-        let run_span = wr_sdk::span!("client.run", "client.count" => count);
+        let run_span = wr_sdk::span!("client.run", "client.count" => count_attr);
 
         let inv = InventoryServiceClient::new("ecommerce.inventory");
 
         match inv.seed(proto::SeedRequest {}) {
-            Ok(_) => wr_sdk::log::log("inventory seeded"),
-            Err(e) => wr_sdk::log::log(&format!("seed error: {e}")),
+            Ok(_) => wr_sdk::log!("inventory seeded"),
+            Err(e) => wr_sdk::log!("seed error: {e}"),
         }
 
         let mut purchased: Vec<(String, u64)> = Vec::new();
@@ -48,31 +50,34 @@ impl proto::ClientService for Component {
             let idx = ((i.wrapping_mul(7).wrapping_add(13)) % 50) as usize;
             let product_id = PRODUCTS[idx].to_string();
             let quantity = i % 5 + 1;
+            let quantity_attr = i64::try_from(quantity).expect("quantity is in 1..=5");
 
             // Rotate through all 6 actions so every operation type gets exercised.
             match i % 6 {
                 // 0, 3 — Buy
                 0 | 3 => {
-                    let sp = wr_sdk::span!("client.buy", "product.id" => &product_id, "product.quantity" => quantity);
+                    let sp = wr_sdk::span!("client.buy", "product.id" => &product_id, "product.quantity" => quantity_attr);
                     match inv.buy(proto::BuyRequest {
                         product_id: product_id.clone(),
                         quantity,
                     }) {
                         Ok(r) => {
-                            tracing::set_attr(&sp, "product.remaining", r.remaining);
-                            wr_sdk::log::log(&format!(
+                            wr_sdk::set_attrs!(sp, "product.remaining" => r.remaining);
+                            wr_sdk::log!(
                                 "bought {} x{} — remaining={}",
-                                product_id, quantity, r.remaining
-                            ));
+                                product_id,
+                                quantity,
+                                r.remaining
+                            );
                             purchased.push((product_id, quantity));
                         }
                         Err(ref e) if e.is_status(409) => {
                             tracing::set_error(&sp, "out of stock");
-                            wr_sdk::log::log(&format!("out of stock {} x{}", product_id, quantity));
+                            wr_sdk::log!("out of stock {} x{}", product_id, quantity);
                         }
                         Err(e) => {
                             tracing::set_error(&sp, &format!("{e}"));
-                            wr_sdk::log::log(&format!("buy error: {e}"));
+                            wr_sdk::log!("buy error: {e}");
                             errors.push(format!("buy {product_id}: {e}"));
                         }
                     }
@@ -80,20 +85,22 @@ impl proto::ClientService for Component {
                 // 1 — Return a previously purchased item
                 1 => {
                     if let Some((ret_id, ret_qty)) = purchased.pop() {
-                        let sp = wr_sdk::span!("client.return", "product.id" => ret_id.as_str(), "product.quantity" => ret_qty);
+                        let sp = wr_sdk::span!("client.return", "product.id" => ret_id.as_str(), "product.quantity" => i64::try_from(ret_qty).expect("returned quantity is in 1..=5"));
                         match inv.r#return(proto::ReturnRequest {
                             product_id: ret_id.clone(),
                             quantity: ret_qty,
                         }) {
                             Ok(r) => {
-                                wr_sdk::log::log(&format!(
+                                wr_sdk::log!(
                                     "returned {} x{} — product={}",
-                                    ret_id, ret_qty, r.product_id
-                                ));
+                                    ret_id,
+                                    ret_qty,
+                                    r.product_id
+                                );
                             }
                             Err(e) => {
                                 tracing::set_error(&sp, &format!("{e}"));
-                                wr_sdk::log::log(&format!("return error: {e}"));
+                                wr_sdk::log!("return error: {e}");
                                 errors.push(format!("return {ret_id}: {e}"));
                             }
                         }
@@ -101,17 +108,17 @@ impl proto::ClientService for Component {
                 }
                 // 2 — GetStock (read-only, high-frequency)
                 2 => {
-                    let sp = tracing::start("client.get_stock", &[("product.id", &product_id)]);
+                    let sp = wr_sdk::span!("client.get_stock", "product.id" => &product_id);
                     match inv.get_stock(proto::GetStockRequest {
                         product_id: product_id.clone(),
                     }) {
                         Ok(r) => {
-                            tracing::set_attr(&sp, "product.stock", r.stock);
-                            wr_sdk::log::log(&format!("stock {} = {}", product_id, r.stock));
+                            wr_sdk::set_attrs!(sp, "product.stock" => r.stock);
+                            wr_sdk::log!("stock {} = {}", product_id, r.stock);
                         }
                         Err(e) => {
                             tracing::set_error(&sp, &format!("{e}"));
-                            wr_sdk::log::log(&format!("get_stock error: {e}"));
+                            wr_sdk::log!("get_stock error: {e}");
                             errors.push(format!("get_stock {product_id}: {e}"));
                         }
                     }
@@ -121,29 +128,32 @@ impl proto::ClientService for Component {
                     let to_idx = ((i.wrapping_mul(11).wrapping_add(3)) % 50) as usize;
                     let to_product_id = PRODUCTS[to_idx].to_string();
                     if product_id != to_product_id {
-                        let sp = wr_sdk::span!("client.transfer", "product.from" => &product_id, "product.to" => &to_product_id, "product.quantity" => quantity);
+                        let sp = wr_sdk::span!("client.transfer", "product.from" => &product_id, "product.to" => &to_product_id, "product.quantity" => quantity_attr);
                         match inv.transfer(proto::TransferRequest {
                             from_product_id: product_id.clone(),
                             to_product_id: to_product_id.clone(),
                             quantity,
                         }) {
                             Ok(r) => {
-                                tracing::set_attr(&sp, "product.transferred", r.transferred);
-                                wr_sdk::log::log(&format!(
+                                wr_sdk::set_attrs!(sp, "product.transferred" => r.transferred);
+                                wr_sdk::log!(
                                     "transferred {} → {} x{}",
-                                    product_id, to_product_id, r.transferred
-                                ));
+                                    product_id,
+                                    to_product_id,
+                                    r.transferred
+                                );
                             }
                             Err(ref e) if e.is_status(409) => {
                                 tracing::set_error(&sp, "insufficient stock");
-                                wr_sdk::log::log(&format!(
+                                wr_sdk::log!(
                                     "transfer insufficient stock {} → {}",
-                                    product_id, to_product_id
-                                ));
+                                    product_id,
+                                    to_product_id
+                                );
                             }
                             Err(e) => {
                                 tracing::set_error(&sp, &format!("{e}"));
-                                wr_sdk::log::log(&format!("transfer error: {e}"));
+                                wr_sdk::log!("transfer error: {e}");
                                 errors
                                     .push(format!("transfer {product_id} → {to_product_id}: {e}"));
                             }
@@ -152,21 +162,18 @@ impl proto::ClientService for Component {
                 }
                 // 5 — Restock
                 _ => {
-                    let sp = wr_sdk::span!("client.restock", "product.id" => &product_id, "product.quantity" => quantity * 10);
+                    let sp = wr_sdk::span!("client.restock", "product.id" => &product_id, "product.quantity" => quantity_attr * 10);
                     match inv.restock(proto::RestockRequest {
                         product_id: product_id.clone(),
                         quantity: quantity * 10,
                     }) {
                         Ok(r) => {
-                            tracing::set_attr(&sp, "product.new_stock", r.new_stock);
-                            wr_sdk::log::log(&format!(
-                                "restocked {} — new_stock={}",
-                                product_id, r.new_stock
-                            ));
+                            wr_sdk::set_attrs!(sp, "product.new_stock" => r.new_stock);
+                            wr_sdk::log!("restocked {} — new_stock={}", product_id, r.new_stock);
                         }
                         Err(e) => {
                             tracing::set_error(&sp, &format!("{e}"));
-                            wr_sdk::log::log(&format!("restock error: {e}"));
+                            wr_sdk::log!("restock error: {e}");
                             errors.push(format!("restock {product_id}: {e}"));
                         }
                     }
@@ -176,12 +183,17 @@ impl proto::ClientService for Component {
             completed += 1;
         }
 
-        tracing::set_attr(&run_span, "client.completed", completed);
-        tracing::set_attr(&run_span, "client.errors", errors.len());
-        wr_sdk::log::log(&format!(
+        wr_sdk::set_attrs!(
+            run_span,
+            "client.completed" => i64::try_from(completed)
+                .expect("completed is bounded by validated count"),
+            "client.errors" => i64::try_from(errors.len())
+                .expect("error count is bounded by validated count")
+        );
+        wr_sdk::log!(
             "client done — {completed} operations, {} errors",
             errors.len()
-        ));
+        );
 
         if errors.is_empty() {
             Ok(proto::RunResponse { completed })

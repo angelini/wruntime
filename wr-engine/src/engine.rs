@@ -434,6 +434,11 @@ impl EngineRunner {
                 idle_in_transaction_timeout_secs: db.idle_in_transaction_timeout_secs,
             })
             .unwrap_or_default();
+        let db_telemetry_include_query_text = self
+            .config
+            .database
+            .as_ref()
+            .is_some_and(|database| database.telemetry.include_query_text);
         let module = ModuleContext {
             name: module_name.clone(),
             namespace: module_namespace.clone(),
@@ -442,6 +447,7 @@ impl EngineRunner {
             db_pool: svc.db_pool.clone(),
             db_schema: svc.db_schema.clone(),
             db_timeouts,
+            db_telemetry_include_query_text,
             blobstore: svc.blobstore,
             blob_prefix: svc.blob_prefix,
             blob_limits: svc.blob_limits,
@@ -522,6 +528,7 @@ struct ModuleContext {
     db_pool: Option<Arc<Pool>>,
     db_schema: Option<Arc<str>>,
     db_timeouts: DbTimeouts,
+    db_telemetry_include_query_text: bool,
     blobstore: Option<Arc<BlobstoreRuntime>>,
     blob_prefix: Option<Arc<str>>,
     blob_limits: BlobstoreLimits,
@@ -631,6 +638,7 @@ async fn dispatch_request(
             db_pool: module.db_pool.clone(),
             db_schema: module.db_schema.clone(),
             db_timeouts: module.db_timeouts.clone(),
+            db_telemetry_include_query_text: module.db_telemetry_include_query_text,
             blobstore: module.blobstore.clone(),
             blob_prefix: module.blob_prefix.clone(),
             blob_limits: module.blob_limits,

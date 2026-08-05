@@ -1,6 +1,12 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use super::wruntime::db::database::{DbError, Host, HostRowCursor, PgInterval, PgValue};
+use opentelemetry::{trace::TracerProvider as _, Value};
+use opentelemetry_sdk::trace::{
+    in_memory_exporter::InMemorySpanExporter, SdkTracerProvider, SpanData,
+};
+use tracing_subscriber::layer::SubscriberExt as _;
+
+use super::wruntime::db::database::{DbError, Host, HostRowCursor, PgInterval, PgType, PgValue};
 use crate::state::{ModuleServices, ModuleState};
 
 fn proxy_uri() -> hyper::Uri {
@@ -9,6 +15,49 @@ fn proxy_uri() -> hyper::Uri {
 
 fn test_http_pool() -> wr_common::http_pool::HttpClientPool<http_body_util::Full<bytes::Bytes>> {
     wr_common::http_pool::HttpClientPool::new(1)
+}
+
+struct CapturedTelemetry {
+    exporter: InMemorySpanExporter,
+    provider: SdkTracerProvider,
+    dispatch: tracing::Dispatch,
+}
+
+static CAPTURED_TELEMETRY: OnceLock<CapturedTelemetry> = OnceLock::new();
+static CAPTURED_TELEMETRY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn captured_telemetry() -> &'static CapturedTelemetry {
+    CAPTURED_TELEMETRY.get_or_init(|| {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("wr-engine-db-tests");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let dispatch = tracing::Dispatch::new(subscriber);
+        tracing::dispatcher::set_global_default(dispatch.clone())
+            .expect("wr-engine lib tests install the global tracing dispatcher once");
+        CapturedTelemetry {
+            exporter,
+            provider,
+            dispatch,
+        }
+    })
+}
+
+fn attribute<'a>(span: &'a SpanData, key: &str) -> Option<&'a Value> {
+    span.attributes
+        .iter()
+        .find(|attribute| attribute.key.as_str() == key)
+        .map(|attribute| &attribute.value)
+}
+
+fn string_attribute<'a>(span: &'a SpanData, key: &str) -> Option<&'a str> {
+    match attribute(span, key) {
+        Some(Value::String(value)) => Some(value.as_str()),
+        _ => None,
+    }
 }
 
 // ── no-pool tests ────────────────────────────────────────────────────────
@@ -79,6 +128,81 @@ async fn test_query_stream_returns_error_when_no_pool() {
         matches!(result, Err(DbError::Connection(_))),
         "expected Connection error, got {result:?}",
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn database_capability_error_is_parented_and_query_text_defaults_off() {
+    let _capture_guard = CAPTURED_TELEMETRY_LOCK.lock().await;
+    let telemetry = captured_telemetry();
+    let request = tracing::dispatcher::with_default(&telemetry.dispatch, || {
+        tracing::info_span!(
+            "db-capability-request",
+            "otel.name" = "db-capability-request"
+        )
+    });
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test".into(),
+        proxy_uri(),
+        test_http_pool(),
+        ModuleServices {
+            active_span: request.clone(),
+            ..Default::default()
+        },
+    )
+    .expect("state");
+
+    let result = state.query("SELECT secret_literal".into(), vec![]).await;
+    assert!(matches!(result, Err(DbError::Connection(_))));
+    drop(state);
+    drop(request);
+    telemetry.provider.force_flush().expect("flush spans");
+
+    let spans = telemetry
+        .exporter
+        .get_finished_spans()
+        .expect("captured spans");
+    let request = spans
+        .iter()
+        .find(|span| span.name == "db-capability-request")
+        .expect("capability request span");
+    let query = spans
+        .iter()
+        .find(|span| {
+            span.parent_span_id == request.span_context.span_id()
+                && string_attribute(span, "db.operation.name") == Some("query")
+        })
+        .unwrap_or_else(|| {
+            let captured = spans
+                .iter()
+                .map(|span| {
+                    format!(
+                        "name={:?} attributes={:?} status={:?}",
+                        span.name, span.attributes, span.status
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "query operation span missing; captured spans (name, attributes, status):\n{captured}"
+            );
+        });
+    assert_eq!(query.parent_span_id, request.span_context.span_id());
+    assert_eq!(
+        string_attribute(query, "db.system.name"),
+        Some("postgresql")
+    );
+    assert_eq!(string_attribute(query, "db.operation.name"), Some("query"));
+    assert_eq!(string_attribute(query, "error.type"), Some("connection"));
+    assert_eq!(
+        attribute(query, "db.response.returned_rows"),
+        Some(&Value::I64(0))
+    );
+    assert!(attribute(query, "db.query.text").is_none());
+    assert!(matches!(
+        &query.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
 }
 
 // ── real-Postgres tests ───────────────────────────────────────────────────
@@ -239,7 +363,280 @@ async fn test_query_typed_columns_with_postgres() {
     assert_eq!(cols[3].value, PgValue::Int8(9_999_999_999));
     assert_eq!(cols[4].value, PgValue::Float4(1.5));
     assert_eq!(cols[5].value, PgValue::Float8(2.5));
-    assert_eq!(cols[6].value, PgValue::Null);
+    assert_eq!(cols[6].value, PgValue::Null(PgType::Text));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_every_supported_typed_null_roundtrips_with_its_postgres_type() {
+    let url = match db_url() {
+        Some(url) => url,
+        None => return,
+    };
+    let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test".into(),
+        proxy_uri(),
+        test_http_pool(),
+        ModuleServices {
+            db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
+            ..Default::default()
+        },
+    )
+    .expect("state");
+
+    let cases = [
+        (PgType::Boolean, "bool"),
+        (PgType::Int2, "int2"),
+        (PgType::Int4, "int4"),
+        (PgType::Int8, "int8"),
+        (PgType::Float4, "float4"),
+        (PgType::Float8, "float8"),
+        (PgType::Text, "text"),
+        (PgType::Bytea, "bytea"),
+        (PgType::Timestamptz, "timestamptz"),
+        (PgType::Timestamp, "timestamp"),
+        (PgType::Date, "date"),
+        (PgType::Time, "time"),
+        (PgType::Interval, "interval"),
+        (PgType::Numeric, "numeric"),
+        (PgType::Uuid, "uuid"),
+        (PgType::Jsonb, "jsonb"),
+        (PgType::Oid, "oid"),
+        (PgType::BoolArray, "bool[]"),
+        (PgType::Int2Array, "int2[]"),
+        (PgType::Int4Array, "int4[]"),
+        (PgType::Int8Array, "int8[]"),
+        (PgType::Float4Array, "float4[]"),
+        (PgType::Float8Array, "float8[]"),
+        (PgType::TextArray, "text[]"),
+        (PgType::TimestamptzArray, "timestamptz[]"),
+        (PgType::TimestampArray, "timestamp[]"),
+        (PgType::UuidArray, "uuid[]"),
+        (PgType::JsonbArray, "jsonb[]"),
+    ];
+
+    for (pg_type, postgres_type) in cases {
+        let rows = state
+            .query(
+                format!("SELECT $1::{postgres_type} AS value"),
+                vec![PgValue::Null(pg_type)],
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{postgres_type} typed null failed: {error:?}"));
+        assert_eq!(rows[0].columns[0].value, PgValue::Null(pg_type));
+    }
+
+    let error = state
+        .query(
+            "SELECT $1::int4 AS value".into(),
+            vec![PgValue::Null(PgType::Text)],
+        )
+        .await
+        .expect_err("text null must not bind in an int4 context");
+    assert!(matches!(error, DbError::Query(_)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unsupported_result_context_propagates_and_cursors_remain_droppable() {
+    let url = match db_url() {
+        Some(url) => url,
+        None => return,
+    };
+    let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test".into(),
+        proxy_uri(),
+        test_http_pool(),
+        ModuleServices {
+            db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
+            ..Default::default()
+        },
+    )
+    .expect("state");
+
+    let domain_rows = state
+        .query(
+            "SELECT 'safe-domain'::information_schema.sql_identifier AS value".into(),
+            vec![],
+        )
+        .await
+        .expect("supported domain query");
+    assert_eq!(
+        domain_rows[0].columns[0].value,
+        PgValue::Text("safe-domain".into())
+    );
+
+    let assert_context = |error: DbError| match error {
+        DbError::UnsupportedResultType(details) => {
+            assert_eq!(details.column_name.as_deref(), Some("network"));
+            assert_eq!(details.column_index, 0);
+            assert_eq!(details.postgres_type_name, "inet");
+            assert_eq!(details.postgres_type_oid, 869);
+        }
+        other => panic!("expected unsupported result type, got {other:?}"),
+    };
+
+    let error = state
+        .query("SELECT '127.0.0.1'::inet AS network".into(), vec![])
+        .await
+        .expect_err("ordinary query must reject inet");
+    assert_context(error);
+
+    let cursor = state
+        .query_stream("SELECT '127.0.0.1'::inet AS network".into(), vec![])
+        .await
+        .expect("open ordinary cursor");
+    let cursor_rep = cursor.rep();
+    let error = HostRowCursor::next_batch(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(cursor_rep),
+        1,
+    )
+    .await
+    .expect_err("ordinary stream must reject inet");
+    assert_context(error);
+    HostRowCursor::drop(&mut state, cursor)
+        .await
+        .expect("drop failed ordinary cursor");
+
+    let tx = state.begin_transaction().await.expect("begin transaction");
+    let tx_rep = tx.rep();
+    let error = super::wruntime::db::database::HostTransaction::query(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(tx_rep),
+        "SELECT '127.0.0.1'::inet AS network".into(),
+        vec![],
+    )
+    .await
+    .expect_err("transaction query must reject inet");
+    assert_context(error);
+
+    let cursor = super::wruntime::db::database::HostTransaction::query_stream(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(tx_rep),
+        "SELECT '127.0.0.1'::inet AS network".into(),
+        vec![],
+    )
+    .await
+    .expect("open transaction cursor");
+    let cursor_rep = cursor.rep();
+    let error = HostRowCursor::next_batch(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(cursor_rep),
+        1,
+    )
+    .await
+    .expect_err("transaction stream must reject inet");
+    assert_context(error);
+    HostRowCursor::drop(&mut state, cursor)
+        .await
+        .expect("drop failed transaction cursor");
+    super::wruntime::db::database::HostTransaction::rollback(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(tx_rep),
+    )
+    .await
+    .expect("rollback transaction");
+    super::wruntime::db::database::HostTransaction::drop(&mut state, tx)
+        .await
+        .expect("drop transaction");
+
+    let rows = state
+        .query("SELECT 1::int4 AS value".into(), vec![])
+        .await
+        .expect("connection remains usable after conversion failures");
+    assert_eq!(rows[0].columns[0].value, PgValue::Int4(1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unsupported_domain_reports_domain_metadata() {
+    let url = match db_url() {
+        Some(url) => url,
+        None => return,
+    };
+    let pool = crate::pool::build_pool(&url, 1).expect("build_pool");
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test".into(),
+        proxy_uri(),
+        test_http_pool(),
+        ModuleServices {
+            db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
+            ..Default::default()
+        },
+    )
+    .expect("state");
+
+    let suffix = std::process::id();
+    let domain_name = format!("_wr_unsupported_inet_domain_{suffix}");
+    let table_name = format!("_wr_unsupported_domain_table_{suffix}");
+    state
+        .execute(format!("DROP TABLE IF EXISTS public.{table_name}"), vec![])
+        .await
+        .expect("remove stale unsupported-domain table");
+    state
+        .execute(
+            format!("DROP DOMAIN IF EXISTS public.{domain_name}"),
+            vec![],
+        )
+        .await
+        .expect("remove stale unsupported domain");
+    state
+        .execute(
+            format!("CREATE DOMAIN public.{domain_name} AS inet"),
+            vec![],
+        )
+        .await
+        .expect("create unsupported domain");
+    state
+        .execute(
+            format!("CREATE TABLE public.{table_name} (value public.{domain_name} NOT NULL)"),
+            vec![],
+        )
+        .await
+        .expect("create unsupported-domain table");
+    state
+        .execute(
+            format!("INSERT INTO public.{table_name} (value) VALUES ('127.0.0.1')"),
+            vec![],
+        )
+        .await
+        .expect("insert unsupported-domain value");
+
+    let domain_result = state
+        .query(
+            format!("SELECT value AS domain_network FROM public.{table_name}"),
+            vec![],
+        )
+        .await;
+
+    state
+        .execute(format!("DROP TABLE IF EXISTS public.{table_name}"), vec![])
+        .await
+        .expect("clean up unsupported-domain table");
+    state
+        .execute(
+            format!("DROP DOMAIN IF EXISTS public.{domain_name}"),
+            vec![],
+        )
+        .await
+        .expect("clean up unsupported domain");
+
+    let error = domain_result.expect_err("unsupported domain must not produce a row");
+    match error {
+        DbError::UnsupportedResultType(details) => {
+            assert_eq!(details.column_name.as_deref(), Some("domain_network"));
+            assert_eq!(details.column_index, 0);
+            assert_eq!(details.postgres_type_name, "inet");
+            assert_eq!(details.postgres_type_oid, 869);
+        }
+        other => panic!("expected unsupported domain result type, got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -901,4 +1298,391 @@ async fn test_array_any_query() {
     assert_eq!(rows[0].columns[0].value, PgValue::Int4(1));
     assert_eq!(rows[1].columns[0].value, PgValue::Int4(2));
     assert_eq!(rows[2].columns[0].value, PgValue::Int4(3));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn database_spans_cover_guest_parent_operations_errors_and_cursor_lifetimes() {
+    use crate::tracing::wruntime::tracing::span::{Host as TracingHost, HostActiveSpan};
+
+    let _capture_guard = CAPTURED_TELEMETRY_LOCK.lock().await;
+    let url = match db_url() {
+        Some(url) => url,
+        None => return,
+    };
+    let telemetry = captured_telemetry();
+    let request = tracing::dispatcher::with_default(&telemetry.dispatch, || {
+        tracing::info_span!("db-lifecycle-request", "otel.name" = "db-lifecycle-request")
+    });
+    let pool = Arc::new(crate::pool::build_pool(&url, 3).expect("build_pool"));
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test".into(),
+        proxy_uri(),
+        test_http_pool(),
+        ModuleServices {
+            db_pool: Some(pool.clone()),
+            db_schema: Some(Arc::from("public")),
+            db_telemetry_include_query_text: true,
+            active_span: request.clone(),
+            ..Default::default()
+        },
+    )
+    .expect("state");
+    let guest = TracingHost::start(&mut state, "guest-db".into(), vec![])
+        .await
+        .expect("guest span");
+    let rows = state
+        .query(
+            "/* telemetry-query */\n SELECT $1::text AS value".into(),
+            vec![PgValue::Text("bind-secret".into())],
+        )
+        .await
+        .expect("query");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        state
+            .query("/* telemetry-zero */ SELECT 1 WHERE false".into(), vec![])
+            .await
+            .expect("zero-row query")
+            .len(),
+        0
+    );
+    assert_eq!(
+        state
+            .execute("/* telemetry-execute */ SELECT 1".into(), vec![])
+            .await
+            .expect("execute"),
+        1
+    );
+
+    let exhausted = state
+        .query_stream(
+            "/* telemetry-stream-exhausted */ SELECT generate_series(1, 3)".into(),
+            vec![],
+        )
+        .await
+        .expect("exhausted cursor");
+    let exhausted_rep = exhausted.rep();
+    assert_eq!(
+        HostRowCursor::next_batch(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(exhausted_rep),
+            2,
+        )
+        .await
+        .expect("first exhausted-stream batch")
+        .len(),
+        2
+    );
+    assert_eq!(
+        HostRowCursor::next_batch(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(exhausted_rep),
+            2,
+        )
+        .await
+        .expect("final exhausted-stream batch")
+        .len(),
+        1
+    );
+    HostRowCursor::drop(&mut state, exhausted)
+        .await
+        .expect("drop exhausted cursor");
+
+    let empty = state
+        .query_stream(
+            "/* telemetry-stream-empty */ SELECT 1 WHERE false".into(),
+            vec![],
+        )
+        .await
+        .expect("empty cursor");
+    let empty_rep = empty.rep();
+    assert!(HostRowCursor::next_batch(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(empty_rep),
+        2,
+    )
+    .await
+    .expect("empty stream")
+    .is_empty());
+    HostRowCursor::drop(&mut state, empty)
+        .await
+        .expect("drop empty cursor");
+
+    let partial = state
+        .query_stream(
+            "/* telemetry-stream-partial */ SELECT generate_series(1, 100)".into(),
+            vec![],
+        )
+        .await
+        .expect("partial cursor");
+    let partial_rep = partial.rep();
+    assert_eq!(
+        HostRowCursor::next_batch(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(partial_rep),
+            2,
+        )
+        .await
+        .expect("partial stream")
+        .len(),
+        2
+    );
+    HostRowCursor::drop(&mut state, partial)
+        .await
+        .expect("drop partial cursor");
+
+    let discarded = state
+        .query_stream(
+            "/* telemetry-stream-discarded */ \
+             SELECT 1 / (n - 3) FROM generate_series(1, 3) AS n"
+                .into(),
+            vec![],
+        )
+        .await
+        .expect("discarded-batch cursor");
+    let discarded_rep = discarded.rep();
+    assert!(matches!(
+        HostRowCursor::next_batch(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(discarded_rep),
+            10,
+        )
+        .await,
+        Err(DbError::Query(_))
+    ));
+    HostRowCursor::drop(&mut state, discarded)
+        .await
+        .expect("drop discarded-batch cursor");
+
+    let decode = state
+        .query_stream(
+            "/* telemetry-stream-decode */ SELECT '127.0.0.1'::inet AS network".into(),
+            vec![],
+        )
+        .await
+        .expect("decode cursor");
+    let decode_rep = decode.rep();
+    assert!(matches!(
+        HostRowCursor::next_batch(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(decode_rep),
+            1,
+        )
+        .await,
+        Err(DbError::UnsupportedResultType(_))
+    ));
+    HostRowCursor::drop(&mut state, decode)
+        .await
+        .expect("drop decode cursor");
+
+    let transaction = state.begin_transaction().await.expect("transaction");
+    let transaction_rep = transaction.rep();
+    let transaction_rows = super::wruntime::db::database::HostTransaction::query(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(transaction_rep),
+        "/* telemetry-transaction-query */ SELECT 1".into(),
+        vec![],
+    )
+    .await
+    .expect("transaction query");
+    assert_eq!(transaction_rows.len(), 1);
+    assert_eq!(
+        super::wruntime::db::database::HostTransaction::execute(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(transaction_rep),
+            "/* telemetry-transaction-execute */ SELECT 1".into(),
+            vec![],
+        )
+        .await
+        .expect("transaction execute"),
+        1
+    );
+    let transaction_cursor = super::wruntime::db::database::HostTransaction::query_stream(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(transaction_rep),
+        "/* telemetry-transaction-stream */ SELECT generate_series(1, 2)".into(),
+        vec![],
+    )
+    .await
+    .expect("transaction stream");
+    let transaction_cursor_rep = transaction_cursor.rep();
+    assert_eq!(
+        HostRowCursor::next_batch(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(transaction_cursor_rep),
+            10,
+        )
+        .await
+        .expect("transaction stream rows")
+        .len(),
+        2
+    );
+    HostRowCursor::drop(&mut state, transaction_cursor)
+        .await
+        .expect("drop transaction cursor");
+    super::wruntime::db::database::HostTransaction::commit(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(transaction_rep),
+    )
+    .await
+    .expect("commit");
+    assert!(super::wruntime::db::database::HostTransaction::query(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(transaction_rep),
+        "/* telemetry-completed */ SELECT 1".into(),
+        vec![],
+    )
+    .await
+    .is_err());
+    super::wruntime::db::database::HostTransaction::drop(&mut state, transaction)
+        .await
+        .expect("drop transaction");
+
+    HostActiveSpan::drop(&mut state, guest)
+        .await
+        .expect("drop guest span");
+
+    let mut capped = ModuleState::new(
+        "test".into(),
+        "test".into(),
+        proxy_uri(),
+        test_http_pool(),
+        ModuleServices {
+            db_pool: Some(pool),
+            db_schema: Some(Arc::from("public")),
+            active_span: request.clone(),
+            limits: crate::config::ResourceLimits {
+                max_db_cursors: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("capped state");
+    assert!(capped
+        .query_stream("/* telemetry-cap */ SELECT 1".into(), vec![])
+        .await
+        .is_err());
+
+    drop(capped);
+    drop(state);
+    drop(request);
+    telemetry.provider.force_flush().expect("flush spans");
+    let spans = telemetry
+        .exporter
+        .get_finished_spans()
+        .expect("captured spans");
+    let request = spans
+        .iter()
+        .find(|span| span.name == "db-lifecycle-request")
+        .expect("lifecycle request span");
+    let guest = spans
+        .iter()
+        .find(|span| {
+            span.name == "guest-db" && span.parent_span_id == request.span_context.span_id()
+        })
+        .expect("guest DB span");
+    let db_spans: Vec<_> = spans
+        .iter()
+        .filter(|span| {
+            string_attribute(span, "db.system.name") == Some("postgresql")
+                && (span.parent_span_id == guest.span_context.span_id()
+                    || span.parent_span_id == request.span_context.span_id())
+        })
+        .collect();
+    assert!(db_spans.len() >= 13);
+    for span in db_spans.iter().filter(|span| {
+        string_attribute(span, "db.query.text").is_some_and(|text| !text.contains("telemetry-cap"))
+    }) {
+        assert_eq!(span.parent_span_id, guest.span_context.span_id());
+    }
+    assert!(db_spans.iter().all(|span| {
+        span.attributes
+            .iter()
+            .all(|attribute| !attribute.value.to_string().contains("bind-secret"))
+    }));
+
+    let find = |marker: &str| {
+        db_spans
+            .iter()
+            .copied()
+            .find(|span| {
+                string_attribute(span, "db.query.text").is_some_and(|text| text.contains(marker))
+            })
+            .unwrap()
+    };
+    let query = find("telemetry-query");
+    assert_eq!(
+        string_attribute(query, "db.query.text"),
+        Some("/* telemetry-query */ SELECT $1::text AS value")
+    );
+    assert_eq!(string_attribute(query, "db.namespace"), Some("public"));
+    assert_eq!(
+        attribute(query, "db.response.returned_rows"),
+        Some(&Value::I64(1))
+    );
+    assert_eq!(
+        attribute(find("telemetry-zero"), "db.response.returned_rows"),
+        Some(&Value::I64(0))
+    );
+    let exhausted = find("telemetry-stream-exhausted");
+    assert_eq!(
+        attribute(exhausted, "db.response.returned_rows"),
+        Some(&Value::I64(3))
+    );
+    assert!(string_attribute(exhausted, "error.type").is_none());
+    let empty = find("telemetry-stream-empty");
+    assert_eq!(
+        attribute(empty, "db.response.returned_rows"),
+        Some(&Value::I64(0))
+    );
+    assert!(string_attribute(empty, "error.type").is_none());
+    let partial = find("telemetry-stream-partial");
+    assert_eq!(
+        attribute(partial, "db.response.returned_rows"),
+        Some(&Value::I64(2))
+    );
+    assert_eq!(string_attribute(partial, "error.type"), Some("cancelled"));
+    let discarded = find("telemetry-stream-discarded");
+    assert_eq!(
+        attribute(discarded, "db.response.returned_rows"),
+        Some(&Value::I64(0))
+    );
+    assert_eq!(string_attribute(discarded, "error.type"), Some("query"));
+    let decode = find("telemetry-stream-decode");
+    assert_eq!(
+        string_attribute(decode, "error.type"),
+        Some("unsupported_result_type")
+    );
+    assert_eq!(
+        string_attribute(find("telemetry-transaction-query"), "db.operation.name"),
+        Some("transaction.query")
+    );
+    assert_eq!(
+        string_attribute(find("telemetry-transaction-execute"), "db.operation.name"),
+        Some("transaction.execute")
+    );
+    assert_eq!(
+        string_attribute(find("telemetry-transaction-stream"), "db.operation.name"),
+        Some("transaction.stream")
+    );
+    assert_eq!(
+        string_attribute(find("telemetry-completed"), "error.type"),
+        Some("query")
+    );
+    let cap = db_spans
+        .iter()
+        .copied()
+        .find(|span| {
+            string_attribute(span, "db.operation.name") == Some("stream")
+                && string_attribute(span, "error.type") == Some("connection")
+                && attribute(span, "db.query.text").is_none()
+        })
+        .expect("resource-cap span");
+    assert_eq!(cap.parent_span_id, request.span_context.span_id());
+    assert!(matches!(
+        &cap.status,
+        opentelemetry::trace::Status::Error { .. }
+    ));
 }

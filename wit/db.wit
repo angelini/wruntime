@@ -43,8 +43,39 @@ interface database {
     ///   timestamp-array  → TIMESTAMP[]
     ///   uuid-array       → UUID[]
     ///   jsonb-array      → JSONB[]
+    enum pg-type {
+        boolean,
+        int2,
+        int4,
+        int8,
+        float4,
+        float8,
+        text,
+        bytea,
+        timestamptz,
+        timestamp,
+        date,
+        time,
+        interval,
+        numeric,
+        uuid,
+        jsonb,
+        oid,
+        bool-array,
+        int2-array,
+        int4-array,
+        int8-array,
+        float4-array,
+        float8-array,
+        text-array,
+        timestamptz-array,
+        timestamp-array,
+        uuid-array,
+        jsonb-array,
+    }
+
     variant pg-value {
-        null,
+        null(pg-type),
         boolean(bool),
         int2(s16),
         int4(s32),
@@ -86,11 +117,22 @@ interface database {
         columns: list<column>,
     }
 
+    /// Details for a PostgreSQL result type that cannot be represented by
+    /// `pg-value`.
+    record unsupported-result-type {
+        column-name: option<string>,
+        column-index: u32,
+        postgres-type-name: string,
+        postgres-type-oid: u32,
+    }
+
     variant db-error {
         /// Could not acquire or use a connection.
         connection(string),
-        /// The database rejected the query.
+        /// The database rejected the query or a supported value could not be decoded.
         query(string),
+        /// A result column has no safe `pg-value` representation.
+        unsupported-result-type(unsupported-result-type),
     }
 
     /// Execute a parameterised SELECT and return all matching rows.

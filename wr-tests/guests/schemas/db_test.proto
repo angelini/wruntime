@@ -4,6 +4,7 @@ package test;
 service DbTestService {
   rpc Execute (ExecuteRequest) returns (ExecuteResponse);
   rpc Query (QueryRequest) returns (QueryResponse);
+  rpc BuilderApi (BuilderApiRequest) returns (BuilderApiResponse);
   rpc QueryTypes (QueryTypesRequest) returns (QueryTypesResponse);
   rpc TransactionCommit (TransactionCommitRequest) returns (TransactionCommitResponse);
   rpc TransactionRollback (TransactionRollbackRequest) returns (TransactionRollbackResponse);
@@ -18,7 +19,7 @@ service DbTestService {
 
 message DbParam {
   oneof value {
-    bool null_marker = 1;
+    string null_type = 1;
     string text = 2;
     sint32 int4 = 3;
     sint64 int8 = 4;
@@ -32,7 +33,7 @@ message DbColumn {
   string name = 1;
   string type_name = 2;
   oneof value {
-    bool null_marker = 3;
+    string null_type = 3;
     bool boolean = 4;
     sint64 integer = 5;
     double float = 6;
@@ -45,6 +46,21 @@ message DbColumn {
 message ExecuteRequest { string sql = 1; repeated DbParam params = 2; }
 message ExecuteResponse { uint64 affected = 1; }
 message QueryRequest { string sql = 1; repeated DbParam params = 2; }
+message BuilderApiRequest { string table_name = 1; }
+message BuilderApiResponse {
+  int32 raw_value = 1;
+  string typed_label = 2;
+  int64 scalar_value = 3;
+  bool optional_missing = 4;
+  int64 first_value = 5;
+  uint32 all_count = 6;
+  uint32 exactly_one_actual = 7;
+  bool execution_failed = 8;
+  uint64 bind_error_parameter = 9;
+  int64 side_effect_count = 10;
+  int64 transaction_count = 11;
+  uint32 streamed_before_drop = 12;
+}
 message QueryRow { repeated DbColumn columns = 1; }
 message QueryResponse { repeated QueryRow rows = 1; }
 message QueryTypesRequest {}
@@ -57,8 +73,19 @@ message TransactionDropRequest { string table_name = 1; }
 message TransactionDropResponse { int64 count = 1; }
 message TransactionAfterCompleteRequest { bool rollback = 1; string operation = 2; }
 message TransactionAfterCompleteResponse { string error_message = 1; }
-message ErrorRequest { string sql = 1; repeated DbParam params = 2; }
-message ErrorResponse { string error_kind = 1; string error_message = 2; }
+message ErrorRequest {
+  string sql = 1;
+  repeated DbParam params = 2;
+  string operation = 3;
+}
+message ErrorResponse {
+  string error_kind = 1;
+  string error_message = 2;
+  string column_name = 3;
+  uint32 column_index = 4;
+  string postgres_type_name = 5;
+  uint32 postgres_type_oid = 6;
+}
 message QueryStreamRequest { string sql = 1; repeated DbParam params = 2; uint32 batch_size = 3; }
 message QueryStreamResponse { repeated QueryRow rows = 1; uint32 batch_count = 2; }
 message QueryStreamDropRequest { string sql = 1; uint32 fetch_count = 2; }

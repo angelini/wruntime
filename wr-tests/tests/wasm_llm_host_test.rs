@@ -42,6 +42,77 @@ async fn wasm_llm_complete() -> Result<()> {
 }
 
 #[tokio::test]
+async fn wasm_llm_typed_wrappers_reject_invalid_inputs() -> Result<()> {
+    let Some(harness) = GuestHarness::load(TestGuest::Llm).await? else {
+        return Ok(());
+    };
+    let (base_url, _shutdown) = spawn_mock_llm_server(MockLlmMode::Text {
+        text: "must not be returned".into(),
+        input_tokens: 0,
+        output_tokens: 0,
+    })
+    .await?;
+    for request in [
+        proto::CompleteRequest {
+            model: "".into(),
+            system: String::new(),
+            user_message: "invalid model".into(),
+            max_tokens: 1,
+        },
+        proto::CompleteRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: String::new(),
+            user_message: "invalid tokens".into(),
+            max_tokens: 0,
+        },
+    ] {
+        let response = harness
+            .dispatch(llm_state(mock_llm_runtime(&base_url)), "/Complete", request)
+            .await?;
+        assert_eq!(response.status(), 400);
+    }
+    let response = harness
+        .dispatch(
+            llm_state(mock_llm_runtime(&base_url)),
+            "/ToolUse",
+            proto::ToolUseRequest {
+                user_message: "invalid tool".into(),
+                tool_name: "tool".into(),
+                tool_description: "tool".into(),
+                tool_schema: "[]".into(),
+            },
+        )
+        .await?;
+    assert_eq!(response.status(), 400);
+    Ok(())
+}
+
+#[tokio::test]
+async fn wasm_llm_raw_invalid_request_still_reaches_host_validation() -> Result<()> {
+    let Some(harness) = GuestHarness::load(TestGuest::Llm).await? else {
+        return Ok(());
+    };
+    let (base_url, _shutdown) = spawn_mock_llm_server(MockLlmMode::Text {
+        text: "must not be returned".into(),
+        input_tokens: 0,
+        output_tokens: 0,
+    })
+    .await?;
+    let response = harness
+        .dispatch(
+            llm_state(mock_llm_runtime(&base_url)),
+            "/RawInvalid",
+            proto::RawInvalidRequest {},
+        )
+        .await?;
+    assert_eq!(response.status(), 200);
+    let body = proto::LlmErrorResponse::decode(response.into_body())?;
+    assert_eq!(body.error_kind, proto::LlmErrorKind::InvalidRequest as i32);
+    assert!(body.error_message.contains("max_tokens"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn wasm_llm_complete_text() -> Result<()> {
     let Some(harness) = GuestHarness::load(TestGuest::Llm).await? else {
         return Ok(());
