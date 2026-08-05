@@ -239,6 +239,7 @@ Manager deployment follows the same pattern (`wr managers bundle` / `wr managers
 just build               # debug build
 just build-release       # release build
 just dev-up              # start Postgres/RustFS for integration tests and examples
+just multi-node          # run two local proxy nodes and three engines
 just test                # all tests with test DB/S3 env vars set
 just test-wasm           # WASM host binding tests
 just validate-ecommerce  # ecommerce inline run with zero-warning enforcement
@@ -264,7 +265,7 @@ wruntime/
 │   ├── ecommerce/          # example: inventory (handler) + client (runner)
 │   ├── codegen/            # example: LLM agent sandbox (code generation)
 │   ├── stockmarket/        # example: multi-module trading system
-│   └── multi-node/         # example multi-node deployment
+│   └── multi-node/         # local and deployment multi-node topology
 ```
 
 ## Documentation

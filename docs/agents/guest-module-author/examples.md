@@ -12,7 +12,7 @@ Use executable examples to study integrated patterns, then apply the documented 
 | Client/simulator orchestration | [stockmarket simulator](../../../examples/stockmarket/simulator/src/lib.rs) | [build.rs](../../../examples/stockmarket/simulator/build.rs), [engine config](../../../examples/stockmarket/engine-simulator.toml) |
 | Service router plus manual JSON ingress | [codegen coordinator](../../../examples/codegen/coordinator/src/lib.rs) | [nested generator](../../../examples/codegen/coordinator/build.rs), [migration](../../../examples/codegen/coordinator/migrations/V1__create_tables.sql) |
 
-Run scripts: [ecommerce](../../../examples/ecommerce/run.sh), [stockmarket](../../../examples/stockmarket/run.sh), and [codegen](../../../examples/codegen/run.sh).
+Run scripts: [ecommerce](../../../examples/ecommerce/run.sh), [stockmarket](../../../examples/stockmarket/run.sh), [codegen](../../../examples/codegen/run.sh), and the cross-node [Echo topology](../../../examples/multi-node/run.sh).
 
 ## Workers and capabilities
 
@@ -22,7 +22,7 @@ Run scripts: [ecommerce](../../../examples/ecommerce/run.sh), [stockmarket](../.
 | Generated worker client and nested generator composition | [codegen coordinator](../../../examples/codegen/coordinator/src/lib.rs) | [coordinator build.rs](../../../examples/codegen/coordinator/build.rs) |
 | LLM, DB, blobstore, filesystem, typed tracing | [codegen agent](../../../examples/codegen/agent/src/lib.rs) | [world](../../../examples/codegen/agent/wit/world.wit), [migrations](../../../examples/codegen/agent/migrations/), [engine config](../../../examples/codegen/engine.toml) |
 | Outbound HTTP, blobstore, filesystem | [codegen collector](../../../examples/codegen/collector/src/lib.rs) | [world](../../../examples/codegen/collector/wit/world.wit), [engine config](../../../examples/codegen/engine.toml) |
-| Multi-node placement/config only | [multi-node configs](../../../examples/multi-node/) | [public deployment guide](../../deployment.md) |
+| Multi-node placement and peer configuration | [multi-node topology](../../../examples/multi-node/) | [local run guide](../../../examples/multi-node/README.md), [public deployment guide](../../deployment.md) |
 
 ## Protocol fixtures, not scaffolds
 

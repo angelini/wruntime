@@ -6,6 +6,8 @@ Common recipes:
 
 ```bash
 just dev-up                  # start Postgres, Grafana/LGTM, and RustFS S3
+just multi-node              # run the local two-node topology until Ctrl-C
+just multi-node-inline       # start, verify, and stop the local topology
 just test                    # all tests with test DB/S3 env vars set
 just test-integration        # wr-tests crate only
 just test-one <test_name>    # single test by name
@@ -39,7 +41,8 @@ WASM host binding tests require:
 - Postgres and RustFS from `just dev-up`
 
 Example inline scripts require the built workspace binaries, the same dev
-infrastructure, and Python 3 for small JSON/config rendering helpers. They
+infrastructure, and Python 3 for small JSON/config rendering and readiness
+helpers. The multi-node smoke test requires Postgres but not RustFS. They
 create per-run temporary config directories and call
 `wr-cli dev --state-dir <run-dir>/dev-state`, so cleanup only observes that
 run's PID state. The codegen example uses `wr-cli invoke --json` and Python

@@ -30,7 +30,7 @@ certs:
 
 # ── Lint & Format ─────────────────────────────────────────────────────────────
 
-guest_crates := "examples/ecommerce/client examples/ecommerce/inventory examples/codegen/agent examples/codegen/collector examples/codegen/coordinator examples/codegen/worker examples/stockmarket/exchange examples/stockmarket/ledger examples/stockmarket/simulator"
+guest_crates := "examples/ecommerce/client examples/ecommerce/inventory examples/codegen/agent examples/codegen/collector examples/codegen/coordinator examples/codegen/worker examples/stockmarket/exchange examples/stockmarket/ledger examples/stockmarket/simulator examples/multi-node/echo"
 
 # Format workspace source code
 fmt:
@@ -94,49 +94,63 @@ test-one name:
 
 # Run wr-manager
 manager config="examples/config/manager.toml":
-    cargo run -p wr-manager -- --config {{config}}
+    cargo run -p wr-manager -- {{config}}
 
 # Run wr-proxy
 proxy config="examples/config/proxy.toml":
-    cargo run -p wr-proxy -- --config {{config}}
+    cargo run -p wr-proxy -- {{config}}
 
 # Run wr-engine
 engine config="examples/config/engine.toml":
-    cargo run -p wr-engine -- --config {{config}}
+    cargo run -p wr-engine -- {{config}}
 
 # Run wr-manager (release build)
 manager-release config="examples/config/manager.toml":
-    cargo run --release -p wr-manager -- --config {{config}}
+    cargo run --release -p wr-manager -- {{config}}
 
 # Run wr-proxy (release build)
 proxy-release config="examples/config/proxy.toml":
-    cargo run --release -p wr-proxy -- --config {{config}}
+    cargo run --release -p wr-proxy -- {{config}}
 
 # Run wr-engine (release build)
 engine-release config="examples/config/engine.toml":
-    cargo run --release -p wr-engine -- --config {{config}}
+    cargo run --release -p wr-engine -- {{config}}
 
 # ── Multi-node local development ──────────────────────────────────────────────
 
-# Start node A proxy (listens :9001, proxy_address = "http://127.0.0.1:9001")
+# Build the echo component and schema for the multi-node example
+build-multi-node:
+    cargo run --bin wr-cli -- dev build --config examples/multi-node/node-b/engine-1.toml
+
+# Run the full local multi-node topology (requires Postgres — see `just dev-up`)
+multi-node: build-multi-node build
+    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    DB_URL={{db_url_example}} bash examples/multi-node/run.sh
+
+# Verify a cross-node echo request, then stop the local topology
+multi-node-inline: build-multi-node build
+    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    DB_URL={{db_url_example}} bash examples/multi-node/run.sh --inline
+
+# Start only node A proxy (listens :9001, peer TLS :9443)
 node-a-proxy:
-    cargo run -p wr-proxy -- --config examples/multi-node/node-a/proxy.toml
+    cargo run -p wr-proxy -- examples/multi-node/node-a/proxy.toml
 
 # Start node A engine 1 (listens :9100)
 node-a-engine-1:
-    cargo run -p wr-engine -- --config examples/multi-node/node-a/engine-1.toml
+    cargo run -p wr-engine -- examples/multi-node/node-a/engine-1.toml
 
 # Start node A engine 2 (listens :9101)
 node-a-engine-2:
-    cargo run -p wr-engine -- --config examples/multi-node/node-a/engine-2.toml
+    cargo run -p wr-engine -- examples/multi-node/node-a/engine-2.toml
 
-# Start node B proxy (listens :9003, control :9004, proxy_address = "http://127.0.0.1:9003")
+# Start only node B proxy (listens :9003, control :9004, peer TLS :9444)
 node-b-proxy:
-    cargo run -p wr-proxy -- --config examples/multi-node/node-b/proxy.toml
+    cargo run -p wr-proxy -- examples/multi-node/node-b/proxy.toml
 
-# Start node B engine 1 (listens :9200)
-node-b-engine-1:
-    cargo run -p wr-engine -- --config examples/multi-node/node-b/engine-1.toml
+# Start node B engine 1 with the echo module (listens :9200)
+node-b-engine-1: build-multi-node
+    cargo run -p wr-engine -- examples/multi-node/node-b/engine-1.toml
 
 # ── Dev infrastructure (Docker Compose) ──────────────────────────────────────
 

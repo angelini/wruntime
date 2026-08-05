@@ -292,22 +292,28 @@ fn test_example_config_files_parse() {
     toml::from_str::<RawManagerConfig>(toml)
         .unwrap_or_else(|err| panic!("{path} must parse: {err}"));
 
-    for (path, toml) in [
+    for (path, toml, expected_peer_address) in [
         (
             "examples/config/proxy.toml",
             include_str!("../../examples/config/proxy.toml"),
+            None,
         ),
         (
             "examples/multi-node/node-a/proxy.toml",
             include_str!("../../examples/multi-node/node-a/proxy.toml"),
+            Some("https://127.0.0.1:9443"),
         ),
         (
             "examples/multi-node/node-b/proxy.toml",
             include_str!("../../examples/multi-node/node-b/proxy.toml"),
+            Some("https://127.0.0.1:9444"),
         ),
     ] {
-        toml::from_str::<ProxyConfig>(toml)
+        let config = toml::from_str::<ProxyConfig>(toml)
             .unwrap_or_else(|err| panic!("{path} must parse: {err}"));
+        if let Some(expected) = expected_peer_address {
+            assert_eq!(config.node.peer_address().unwrap(), expected, "{path}");
+        }
     }
 
     // Engine configs reference wasm/schema artifacts that may not exist before build recipes run,
@@ -396,6 +402,37 @@ fn test_example_config_files_parse() {
         );
         if !path.starts_with("examples/multi-node/") {
             assert!(!raw.modules.is_empty(), "{path} modules");
+        }
+    }
+
+    for (path, toml, expected_peer_port) in [
+        (
+            "examples/multi-node/node-a/engine-1.toml",
+            include_str!("../../examples/multi-node/node-a/engine-1.toml"),
+            9443,
+        ),
+        (
+            "examples/multi-node/node-a/engine-2.toml",
+            include_str!("../../examples/multi-node/node-a/engine-2.toml"),
+            9443,
+        ),
+        (
+            "examples/multi-node/node-b/engine-1.toml",
+            include_str!("../../examples/multi-node/node-b/engine-1.toml"),
+            9444,
+        ),
+    ] {
+        let raw: EngineRaw =
+            toml::from_str(toml).unwrap_or_else(|err| panic!("{path} must parse: {err}"));
+        assert_eq!(raw.node.peer_port, expected_peer_port, "{path}");
+        if path.ends_with("node-b/engine-1.toml") {
+            assert_eq!(raw.modules.len(), 1, "{path} modules");
+            assert_eq!(raw.modules[0]["name"].as_str(), Some("echo"), "{path}");
+            assert_eq!(
+                raw.modules[0]["namespace"].as_str(),
+                Some("multinode"),
+                "{path}"
+            );
         }
     }
 }

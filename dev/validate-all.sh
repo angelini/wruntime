@@ -287,7 +287,8 @@ if [ "$E2E_ONLY" != true ]; then
 		"wasm test guests" "just build-test-guests" \
 		"ecommerce wasm" "just build-ecommerce" \
 		"stockmarket wasm" "just build-stockmarket" \
-		"codegen wasm" "just build-codegen"
+		"codegen wasm" "just build-codegen" \
+		"multi-node echo wasm" "just build-multi-node"
 
 	section "rust tests"
 	run_cmd "workspace tests including wasm host tests" "just test"
@@ -295,6 +296,9 @@ fi
 
 if [ "$RUN_E2E" = true ]; then
 	section "fixed-port E2E examples"
+	run_cmd "reset example db for multi-node" "just dev-reset-db"
+	run_cmd "multi-node cross-node echo" "just multi-node-inline"
+
 	run_cmd "reset example db for ecommerce" "just dev-reset-db"
 	run_cmd "ecommerce validation" "just validate-ecommerce"
 

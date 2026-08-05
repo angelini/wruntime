@@ -169,8 +169,7 @@ impl proto::LedgerService for Component {
                 match store::get_object("stockmarket", &latest_key)
                     .map_err(|e| format!("{e:?}"))
                     .and_then(|data| {
-                        proto::LedgerSnapshot::decode(data.as_slice())
-                            .map_err(|e| format!("{e}"))
+                        proto::LedgerSnapshot::decode(data.as_slice()).map_err(|e| format!("{e}"))
                     }) {
                     Ok(snap) if snap.trade_count == total_trades => {
                         details.push(format!(
@@ -204,7 +203,8 @@ impl proto::LedgerService for Component {
 
         details.push(format!("symbols traded: {symbols_traded}"));
         details.push("share conservation: OK (each trade is a matched buyer+seller pair)".into());
-        details.push("cash conservation: OK (each trade transfers equal cash buyer->seller)".into());
+        details
+            .push("cash conservation: OK (each trade transfers equal cash buyer->seller)".into());
 
         tracing::set_attr(&sp, "verify.valid", snapshot_ok);
         tracing::set_attr(&sp, "verify.total_trades", total_trades);

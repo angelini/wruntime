@@ -440,7 +440,7 @@ control_address = "127.0.0.1:9004"
 
 [node]
 proxy_address = "http://node-b-host:9003"
-peer_port     = 9443
+peer_port     = 9444 # distinct from Node A so both proxies can run locally
 
 [node.tls]
 cert_path    = "certs/127.0.0.1.crt"
@@ -456,15 +456,22 @@ listen_address = "127.0.0.1:9200"
 [node]
 proxy_address   = "http://node-b-host:9003"
 control_address = "http://127.0.0.1:9004"
-peer_port       = 9443
+peer_port       = 9444
 
 [node.tls]
 cert_path    = "certs/127.0.0.1.crt"
 key_path     = "certs/127.0.0.1.key"
 ca_cert_path = "certs/ca.crt"
+
+[[module]]
+name        = "echo"
+namespace   = "multinode"
+version     = "1.0.0"
+wasm_path   = "examples/multi-node/echo/target/wasm32-wasip2/debug/echo.wasm"
+schema_path = "examples/multi-node/echo/schemas/echo.binpb"
 ```
 
-When a module on Node A calls a module whose routing rule has `peer_address = "https://node-b-host:9443"`, Node A's proxy adds `x-wr-via-proxy: 1` and forwards the request to Node B's mTLS peer listener. Node B's `RoutingLayer` resolves the destination as a local engine and forwards to it.
+When a module on Node A calls a module whose routing rule has `peer_address = "https://node-b-host:9444"`, Node A's proxy adds `x-wr-via-proxy: 1` and forwards the request to Node B's mTLS peer listener. Node B's `RoutingLayer` resolves the destination as a local engine and forwards to it. The nodes may use the same peer port when deployed on separate hosts; these examples use distinct ports so `just multi-node` can run both proxies on one machine.
 
 ### Manager high availability
 

@@ -30,12 +30,28 @@ CONFIG_DIR="${RUN_DIR}/config"
 WR_DEV_STATE_DIR="${RUN_DIR}/dev-state"
 mkdir -p "${CONFIG_DIR}" "${WR_DEV_STATE_DIR}"
 DEV_STATE_ARGS=(--state-dir "${WR_DEV_STATE_DIR}")
+EXAMPLE_CHILD_PIDS=()
+
+register_example_child() {
+	EXAMPLE_CHILD_PIDS+=("$1")
+}
+
+stop_example_children() {
+	local pid
+	for pid in "${EXAMPLE_CHILD_PIDS[@]}"; do
+		kill "$pid" 2>/dev/null || true
+	done
+	for pid in "${EXAMPLE_CHILD_PIDS[@]}"; do
+		wait "$pid" 2>/dev/null || true
+	done
+}
 
 cleanup_example_run() {
 	local status=$?
 	trap - EXIT INT TERM
 	echo "==> Shutting down..."
 	./target/debug/wr-cli dev "${DEV_STATE_ARGS[@]}" down 2>/dev/null || true
+	stop_example_children
 	rm -rf "${RUN_DIR}"
 	exit "$status"
 }
