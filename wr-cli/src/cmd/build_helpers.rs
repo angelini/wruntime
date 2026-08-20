@@ -166,9 +166,13 @@ pub fn build_wasm_modules(modules: &[BuildModule], release: bool) -> Result<()> 
         if release {
             args.push("--release");
         }
-        let output = Command::new("cargo")
-            .args(&args)
-            .current_dir(&cargo_dir)
+        let mut command = Command::new("cargo");
+        command.args(&args).current_dir(&cargo_dir);
+        if !release {
+            // The artifact is stripped below, so generating full DWARF only adds build cost.
+            command.env("CARGO_PROFILE_DEV_DEBUG", "0");
+        }
+        let output = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
