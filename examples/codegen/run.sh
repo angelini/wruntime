@@ -109,7 +109,7 @@ fi
 cat <<'USAGE'
 
 All services running. Press Ctrl-C to stop.
-  Manager     : http://127.0.0.1:9000 (gRPC)
+  Manager     : https://127.0.0.1:9000 (mTLS gRPC)
   Proxy       : http://127.0.0.1:9001
   External API: http://127.0.0.1:8080
   Engine      : http://127.0.0.1:9100 (collector + agent + coordinator)

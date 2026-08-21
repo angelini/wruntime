@@ -22,7 +22,7 @@ pub struct EngineConfig {
     pub node: NodeConfig,
     #[serde(rename = "module", default)]
     pub modules: Vec<ModuleConfig>,
-    /// Optional PostgreSQL connection pool shared across DB-enabled modules.
+    /// Optional PostgreSQL settings for per-namespace guest connection pools.
     pub database: Option<DatabaseConfig>,
     /// Optional S3-compatible blobstore shared across blobstore-enabled modules.
     pub blobstore: Option<BlobstoreConfig>,
@@ -55,7 +55,7 @@ pub struct PoolConfig {
     pub max_memory_size: usize,
     /// Epoch tick interval in milliseconds. A background task increments the
     /// wasmtime epoch at this rate, enabling preemption of CPU-bound WASM
-    /// modules that never yield to the host. Defaults to 100.
+    /// modules that never yield to the host. Defaults to 10.
     pub epoch_tick_interval_ms: u64,
 }
 
@@ -331,12 +331,13 @@ pub struct ModuleConfig {
     /// instances may omit it; if present, it is still validated.
     #[serde(default)]
     pub schema_path: Option<String>,
-    /// Whether this module has access to the shared database pool.
+    /// Whether this module has access to its namespace's database pool.
     /// Requires a `[database]` section in the engine config.
     #[serde(default)]
     pub database: bool,
-    /// Overrides `[database].max_connections` for this module's pool.
-    /// Falls back to the global value when absent.
+    /// This module's contribution to its namespace pool's maximum size.
+    /// Falls back to `[database].max_connections` when absent; contributions
+    /// from all DB-enabled modules in the namespace are summed.
     #[serde(default)]
     pub db_max_connections: Option<usize>,
     /// Whether this module has access to the shared blobstore client.

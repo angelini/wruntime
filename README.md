@@ -32,9 +32,9 @@ intercepts, routes, and delivers them automatically.
 
 Modules address each other using `http://{namespace}.{module}/{proto_package}.{ProtoServiceName}/{ProtoMethodName}` URLs. The runtime handles service discovery, version routing, circuit-breaker-aware load balancing across instances, and OpenTelemetry tracing — all transparent to the module code. Request and response bodies are streamed through the proxy with zero buffering.
 
-## Quick start: Echo service
+## Echo service API sketch
 
-Two WASM modules — **echo** returns whatever it receives, **caller** sends a message to echo and prints the result.
+The snippets below illustrate the guest API; they are not standalone workspace crates. The runnable Echo component lives in [`examples/multi-node/echo`](examples/multi-node/echo) and is exercised by the multi-node Just recipes.
 
 ### 1. Define the schema
 
@@ -54,7 +54,7 @@ message EchoResponse { string message = 1; }
 Compile it:
 
 ```bash
-protoc --descriptor_set_out=schemas/echo.binpb --include_imports echo.proto
+protoc --descriptor_set_out=schemas/echo.binpb --include_imports schemas/echo.proto
 ```
 
 ### 2. Echo module (handler)
@@ -146,59 +146,25 @@ impl ServiceGuest for Component {
 
 `WrClientGenerator` generates a typed `EchoServiceClient` struct with one method per RPC. The client calls `http://example.echo/echo.EchoService/Echo` under the hood via `wr_sdk::http::http_request`.
 
-### 4. Configure and run
+### 4. Run the executable example
 
-`engine.toml`:
-
-```toml
-listen_address = "127.0.0.1:9100"
-
-[node]
-proxy_address   = "http://127.0.0.1:9001"
-control_address = "http://127.0.0.1:9002"
-peer_port       = 9443
-
-[node.tls]
-cert_path    = "certs/127.0.0.1.crt"
-key_path     = "certs/127.0.0.1.key"
-ca_cert_path = "certs/ca.crt"
-
-[[module]]
-name        = "echo"
-namespace   = "example"
-version     = "1.0.0"
-wasm_path   = "target/wasm32-wasip2/debug/echo.wasm"
-schema_path = "schemas/echo.binpb"
-
-[[module]]
-name        = "caller"
-namespace   = "example"
-version     = "1.0.0"
-wasm_path   = "target/wasm32-wasip2/debug/caller.wasm"
-schema_path = "schemas/echo.binpb"
-```
+The repository's multi-node example supplies the component crate, schema, engine/proxy configs, and invocation. Prepare Postgres and local certificates before running it:
 
 ```bash
-# Build the WASM components
-cargo build --target wasm32-wasip2 -p echo
-cargo build --target wasm32-wasip2 -p caller
-
-# Start the services (in separate terminals, or background them)
-just manager
-just proxy
-just engine ./engine.toml
-
-# Invoke the caller through the proxy
-wr-cli --manager http://127.0.0.1:9000 invoke --destination http://example.caller/run
+just dev-up
+just certs
+just multi-node-inline
 ```
+
+For an interactive topology that stays running, use `just multi-node`. Its Echo service is invoked through Node A and routed over mTLS to Node B. Manager-facing CLI commands use `https://127.0.0.1:9000` and, by default, the CA/client certificates under `certs/`.
 
 ## Host bindings
 
 WASM modules can access host-provided capabilities through WIT interfaces:
 
 | Binding | WIT | Preferred SDK surface | Description |
-|---------|-----|-----------------------|-------------|
-| **Database** | `wit/db.wit` | `wr_sdk::db` builders and owned rows | Parameterized SQL queries, transactions, and streaming against a shared Postgres pool |
+| --------- | ----- | ----------------------- | ------------- |
+| **Database** | `wit/db.wit` | `wr_sdk::db` builders and owned rows | Parameterized SQL queries, transactions, and streaming through a per-namespace Postgres pool |
 | **Blobstore** | `wit/blobstore.wit` | `wr_sdk::blobstore::bucket` scoped handle | S3-compatible object storage constrained to a host-configured bucket allowlist |
 | **Tracing** | `wit/tracing.wit` | `span!`, `set_attrs!`, and `event!` | Typed OpenTelemetry spans and batched attributes from within modules |
 | **LLM** | `wit/llm.wit` | `wr_sdk::llm::CompletionBuilder` | Validated Anthropic Claude completions, streaming, and tool use |
@@ -218,19 +184,19 @@ wr-cli node bundle --engine-config engine.toml
 # Deploy to a remote host via SSH (format defaults to systemd)
 wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.50 \
     --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
-    --manager http://10.0.1.1:9000
+    --manager https://10.0.1.1:9000
 
 # Or with a wr-deploy.toml providing db_url, just the positional args:
 wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.50 \
-    --manager http://10.0.1.1:9000
+    --manager https://10.0.1.1:9000
 ```
 
-Manager deployment follows the same pattern (`wr managers bundle` / `wr managers deploy`). See [docs/deployment.md](docs/deployment.md) for the deploy config reference, multi-node cluster setup, bundle structure, and template variables.
+Manager deployment follows the same pattern (`wr-cli managers bundle` / `wr-cli managers deploy`). See [docs/deployment.md](docs/deployment.md) for the deploy config reference, multi-node cluster setup, bundle structure, and template variables.
 
 ## Prerequisites
 
 | Tool | Purpose |
-|------|---------|
+| ------ | --------- |
 | Rust + Cargo (stable) | Build all binaries |
 | [`just`](https://github.com/casey/just) | Run project recipes (see `Justfile`) |
 | `protoc` | Compile `.proto` schemas to `FileDescriptorSet` binaries |
@@ -259,7 +225,7 @@ wruntime/
 ├── wr-engine/              # WASM runtime (wasmtime) + inbound HTTP server
 ├── wr-sdk/                 # WASM module SDK: http, io, db, tracing, llm, export macros
 ├── wr-build/               # build.rs helper: service/client generators from proto
-├── wr-cli/                 # CLI: invoke modules, list engines/services, query metrics (requires --manager or WR_MANAGER)
+├── wr-cli/                 # CLI: invoke modules, list engines/services, query metrics
 ├── wr-tests/               # integration tests
 ├── wit/                    # WIT interfaces (db, blobstore, tracing, llm)
 ├── examples/

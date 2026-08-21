@@ -14,7 +14,7 @@ Schemas are compiled `FileDescriptorSet` binaries produced by `protoc`.
 ## Writing a schema
 
 ```protobuf
-// inventory_service.proto
+// schemas/inventory_service.proto
 syntax = "proto3";
 package inventory;
 
@@ -37,7 +37,7 @@ service InventoryService {
 protoc \
   --descriptor_set_out=schemas/inventory_service.binpb \
   --include_imports \
-  inventory_service.proto
+  schemas/inventory_service.proto
 ```
 
 The resulting `.binpb` file is the value of `schema_path` in `engine.toml`.

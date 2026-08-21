@@ -736,7 +736,7 @@ proxy_address = "http://127.0.0.1:9443"
             [cluster]
             cluster_id = "prod"
             gossip_listen_address = "0.0.0.0:9010"
-            advertise_grpc_address = "http://127.0.0.1:9000"
+            advertise_grpc_address = "https://127.0.0.1:9000"
             gossip_interval_ms = 750
             seed_nodes = ["10.0.0.2:9010"]
         "#;

@@ -90,7 +90,7 @@ pub struct DeployArgs {
     /// Secret encryption key (hex-encoded, 32 bytes / 64 hex chars)
     #[arg(long)]
     secret_key: Option<String>,
-    /// Local directory containing CA + manager certificates (from `wr cert`)
+    /// Local directory containing CA + manager certificates (from `wr-cli cert`)
     #[arg(long, default_value = "./certs")]
     cert_dir: String,
     /// Manager's externally-reachable gRPC address (derived from remote host if omitted)
@@ -478,7 +478,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
                     (&host_key, "manager.key"),
                 ] {
                     if !Path::new(local).exists() {
-                        bail!("Certificate file not found: {local}. Run `wr cert generate {host}` first.");
+                        bail!("Certificate file not found: {local}. Run `wr-cli cert generate {host}` first.");
                     }
                     let tmp_path = format!("/tmp/{remote_name}");
                     helpers::scp_file(local, &args.remote, &tmp_path, ssh_key.as_deref(), ssh_port)
@@ -513,7 +513,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
 
     // Configure mTLS so the readiness check can connect to the TLS-enabled manager.
     // Cert files are named by the SSH host alias; the cert must include the resolved
-    // IP as a SAN (via `wr cert generate <host> --ip <addr>`).
+    // IP as a SAN (via `wr-cli cert generate <host> --ip <addr>`).
     let remote_host = helpers::extract_remote_host(&args.remote);
     let remote_ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
     crate::client::set_tls_config(wr_common::node::TlsConfig {

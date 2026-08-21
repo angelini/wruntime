@@ -11,9 +11,9 @@ INV2_CFG="${CONFIG_DIR}/ecommerce-inventory-2.toml"
 CLIENT_CFG="${CONFIG_DIR}/ecommerce-client.toml"
 
 render_config examples/ecommerce/engine-inventory-1.toml "$INV1_CFG" \
-	"postgres://postgres@localhost:5433/wruntime_example" "${DB_URL}"
+  "postgres://postgres@localhost:5433/wruntime_example" "${DB_URL}"
 render_config examples/ecommerce/engine-inventory-2.toml "$INV2_CFG" \
-	"postgres://postgres@localhost:5433/wruntime_example" "${DB_URL}"
+  "postgres://postgres@localhost:5433/wruntime_example" "${DB_URL}"
 copy_config examples/ecommerce/engine-client.toml "$CLIENT_CFG"
 
 # ── Prepare manager + proxy configs ──────────────────────────────────────
@@ -35,11 +35,11 @@ dev_status
 # ── Seed inventory via the proxy ─────────────────────────────────────────
 echo "==> Seeding inventory..."
 just cli invoke \
-	--proxy http://127.0.0.1:9001 \
-	--destination http://ecommerce.inventory/ecommerce.InventoryService/Seed \
-	--source bootstrap \
-	--source-ns ecommerce \
-	--body '' || echo " (seed may already exist)"
+  --proxy http://127.0.0.1:9001 \
+  --destination http://ecommerce.inventory/ecommerce.InventoryService/Seed \
+  --source bootstrap \
+  --source-ns ecommerce \
+  --body '' || echo " (seed may already exist)"
 
 # ── Deploy client engine ─────────────────────────────────────────────────
 deploy_engine "$CLIENT_CFG" "client engine" 9200
@@ -47,20 +47,20 @@ list_services
 dev_status
 
 if [ "$INLINE" = true ]; then
-	echo "==> Running client inline with {\"count\": 1}..."
-	just cli invoke \
-		--proxy http://127.0.0.1:9001 \
-		--destination http://ecommerce.client/ecommerce.ClientService/Run \
-		--source loadtest --source-ns ecommerce \
-		--body '{"count": 1}'
-	# cleanup runs via EXIT trap; exit with invoke's exit code
-	exit $?
+  echo "==> Running client inline with {\"count\": 1}..."
+  just cli invoke \
+    --proxy http://127.0.0.1:9001 \
+    --destination http://ecommerce.client/ecommerce.ClientService/Run \
+    --source loadtest --source-ns ecommerce \
+    --body '{"count": 1}'
+  # cleanup runs via EXIT trap; exit with invoke's exit code
+  exit $?
 fi
 
 cat <<'USAGE'
 
 All services running. Press Ctrl-C to stop.
-  Manager  : http://127.0.0.1:9000 (gRPC)
+  Manager  : https://127.0.0.1:9000 (mTLS gRPC)
   Proxy    : http://127.0.0.1:9001
   Inventory: http://127.0.0.1:9100 + :9101 (2 engines, shared Postgres)
   Client   : http://127.0.0.1:9200 (3 instances, ServiceGuest)

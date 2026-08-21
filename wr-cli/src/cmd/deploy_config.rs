@@ -44,7 +44,7 @@ pub struct DeployConfig {
     pub no_otel: Option<bool>,
     /// Path to schedules TOML file for post-deploy apply
     pub schedules_path: Option<String>,
-    /// Local directory containing CA + node certificates (from `wr cert`)
+    /// Local directory containing CA + node certificates (from `wr-cli cert`)
     pub cert_dir: Option<String>,
     /// mTLS peer listener port (default: 9443)
     pub peer_port: Option<u16>,

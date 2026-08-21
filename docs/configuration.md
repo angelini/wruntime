@@ -38,7 +38,7 @@ max_connections = 10
 [cluster]
 cluster_id            = "default"           # all managers in the same cluster must match
 gossip_listen_address = "0.0.0.0:9010"      # UDP address for chitchat gossip
-# advertise_grpc_address = "http://manager-1:9000"  # optional; defaults to listen_address
+# advertise_grpc_address = "https://manager-1:9000" # optional; defaults to listen_address
 # gossip_interval_ms = 500                           # optional; default 500
 
 # scheduler_lease_secs       = 30    # optional; lease before another manager may reclaim
@@ -100,7 +100,7 @@ The optional proxy `[egress]` section allows guests to call listed external doma
 
 ### Circuit breaker
 
-The proxy can protect downstream engines from cascading failures with per-engine circuit breakers. Each engine address gets its own independent breaker — one open circuit does not affect routing to other engines.
+The proxy protects forwarding targets from cascading failures with independent circuit breakers. Each concrete target—either a local engine address or a remote peer-proxy address—gets its own breaker. Remote engines reached through the same peer proxy therefore share that peer target's breaker.
 
 ```toml
 [circuit_breaker]
@@ -186,6 +186,55 @@ On startup the engine:
 5. Sends an immediate readiness heartbeat after module load, then every 3 seconds, reporting healthy loaded modules.
 6. Deregisters cleanly on `Ctrl+C`, which immediately marks its routing rules as unhealthy.
 
+### Pool and module loading settings
+
+The pooling allocator is enabled by default. Omit `[pool]` to use these values:
+
+```toml
+[pool]
+total_component_instances = 1000     # concurrent instances across all modules
+max_memory_size           = 10485760 # 10 MiB linear memory per instance
+epoch_tick_interval_ms    = 10       # CPU-bound guest preemption tick
+```
+
+Each module also supports optional loading and admission settings:
+
+```toml
+[[module]]
+name             = "inventory"
+namespace        = "ecommerce"
+version          = "1.0.0"
+wasm_path        = "modules/inventory.wasm"
+cwasm_path       = "modules/inventory.cwasm" # optional precompiled artifact
+schema_path      = "schemas/inventory.binpb"
+channel_capacity = 128 # queued inbound dispatches before the engine returns 429
+```
+
+When `cwasm_path` exists and is compatible with the engine, startup deserializes it instead of JIT-compiling `wasm_path`; a missing or incompatible artifact falls back to the WASM file. `channel_capacity` defaults to **128** per configured module instance.
+
+### Database pool and timeout settings
+
+The engine creates one guest pool per DB-enabled namespace. Every DB-enabled module contributes `db_max_connections`, or `[database].max_connections` when the module override is absent, and the contributions are summed for that namespace.
+
+```toml
+[database]
+url                              = "postgres://user:pass@localhost:5432/mydb"
+max_connections                  = 20 # default per-module contribution
+statement_timeout_secs           = 30 # applied to every guest statement
+idle_in_transaction_timeout_secs = 60 # terminates idle transactions
+
+[[module]]
+name               = "inventory"
+namespace          = "ecommerce"
+version            = "1.0.0"
+wasm_path          = "modules/inventory.wasm"
+schema_path        = "schemas/inventory.binpb"
+database           = true
+db_max_connections = 10 # this module contributes 10 instead of 20
+```
+
+`max_connections` defaults to **20**, `statement_timeout_secs` to **30**, and `idle_in_transaction_timeout_secs` to **60**. Pools authenticate with the manager-provisioned namespace role; module schemas remain isolated through their connection `search_path`.
+
 ### Database telemetry
 
 Engine-owned database spans cover raw WIT calls and SDK builders without guest setup. Query text is omitted by default. Operators may opt in globally for DB-enabled modules:
@@ -221,7 +270,7 @@ migrations_path = "modules/inventory/migrations"
 
 Migration files follow the [refinery](https://github.com/rust-db/refinery) naming convention:
 
-```
+```text
 modules/inventory/migrations/
     V1__create_tables.sql
     V2__add_indexes.sql
@@ -341,7 +390,7 @@ max_llm_streams     = 32     # concurrent open LLM completion streams
 ```
 
 | Key | Default | Resource | Over-cap behavior |
-|-----|---------|----------|-------------------|
+| ----- | --------- | ---------- | ------------------- |
 | `max_spans` | 1024 | tracing spans (`start`/`start-root`) | guest instance is **trapped** (request fails); engine survives |
 | `max_db_transactions` | 64 | DB transactions (`begin-transaction`) | returns `db-error::connection` |
 | `max_db_cursors` | 256 | DB row cursors (`query-stream`) | returns `db-error::connection` |
@@ -364,36 +413,35 @@ After module load immediately, then every 3 seconds, the engine sends `GET /__he
 
 By default a module does not need to handle `/__health` at all — the `wasi:http/incoming-handler` export just needs to exist. The engine treats any `2xx` as healthy and anything else (including a timeout or a dropped connection) as unhealthy.
 
-To run custom checks — verifying database connectivity, warming caches, or validating internal state — handle the path explicitly in your module:
+To run custom checks—verifying database connectivity, warming caches, or validating internal state—override `ServiceGuest::health_check()`. The SDK intercepts `GET /__health` before `handle`, calls this method, and returns `200` for `true` or `503` for `false`:
 
 ```rust
 impl wr_sdk::ServiceGuest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        let path = request.path_with_query().unwrap_or_default();
-
-        if path == "/__health" {
-            // Run any checks that make sense for this module.
-            let ok = wr_sdk::db::query_scalar::<i32>("SELECT 1")
-                .fetch_exactly_one()
-                .is_ok();
-            let status = if ok { 200 } else { 503 };
-            return send_response(response_out, status, vec![]);
-        }
-
         // ... normal request handling
+    }
+
+    fn health_check() -> bool {
+        wr_sdk::db::query_scalar::<i32>("SELECT 1")
+            .fetch_exactly_one()
+            .is_ok()
     }
 }
 ```
 
-If the health handler returns a non-`2xx` status or does not respond within 5 seconds, the module is excluded from that heartbeat. The routing rule is marked unhealthy by the manager and will not receive traffic until a subsequent heartbeat reports the module healthy again.
+If `health_check` returns `false`, traps, or does not respond within 5 seconds, the module is excluded from that heartbeat. The routing rule is marked unhealthy by the manager and will not receive traffic until a subsequent heartbeat reports the module healthy again.
 
 ### Routing rules
 
 When an engine registers, the manager automatically creates one default routing rule per module that carries a schema, in the same transaction as the registration (and only after the engine's requested secrets and per-namespace DB credentials resolve successfully). Default rules start with `healthy = false`; the proxy indexes only healthy rules, so they are not routable until module readiness is reported and recomputed. You do not need to create these rules manually. The `UpsertRoutingRule` RPC remains available as an admin override — for example to add an extra rule or force a rule healthy:
 
-```
+```bash
 # example using grpcurl
-grpcurl -plaintext -d '{
+grpcurl \
+  -cacert certs/ca.crt \
+  -cert certs/127.0.0.1.crt \
+  -key certs/127.0.0.1.key \
+  -d '{
   "rule_id": "r1",
   "source_module": "order-service",
   "source_namespace": "ecommerce",
@@ -504,7 +552,7 @@ url = "postgres://postgres@db-host:5432/wruntime"
 [cluster]
 cluster_id             = "prod"
 gossip_listen_address  = "0.0.0.0:9010"
-advertise_grpc_address = "http://manager-1:9000"
+advertise_grpc_address = "https://manager-1:9000"
 
 # manager-2.toml
 listen_address       = "0.0.0.0:9000"
@@ -516,25 +564,25 @@ url = "postgres://postgres@db-host:5432/wruntime"
 [cluster]
 cluster_id             = "prod"
 gossip_listen_address  = "0.0.0.0:9010"
-advertise_grpc_address = "http://manager-2:9000"
+advertise_grpc_address = "https://manager-2:9000"
 ```
 
 Proxies and engines can point at any single manager — they all share the same Postgres state. For production, use a load balancer or DNS round-robin in front of the managers.
 
 ### CLI access
 
-The CLI requires a manager address and does **not** require database access:
+The CLI requires a manager address and does **not** require database access. Manager connections use mTLS; the certificate flags default to `--ca-cert certs/ca.crt`, `--client-cert certs/127.0.0.1.crt`, and `--client-key certs/127.0.0.1.key` (or the corresponding `WR_CA_CERT`, `WR_CLIENT_CERT`, and `WR_CLIENT_KEY` variables):
 
 ```bash
 # Via flag
-wr-cli --manager http://manager-1:9000 engines list
+wr-cli --manager https://manager-1:9000 engines list
 
 # Via environment variable
-export WR_MANAGER=http://manager-1:9000
+export WR_MANAGER=https://manager-1:9000
 wr-cli engines list
 
 # Discover all managers in the cluster from any seed
-wr-cli --manager http://manager-1:9000 engines list
+wr-cli --manager https://manager-1:9000 engines list
 # Proxies and clients discover managers via ListManagers, which reconciles the
 # DB-fresh set against chitchat; direct wr_managers reads are a documented
 # bootstrap-only fallback when no manager RPC is reachable.
@@ -542,7 +590,7 @@ wr-cli --manager http://manager-1:9000 engines list
 
 ### Remote deployment via CLI
 
-The CLI provides `wr managers` and `wr node` command groups for deploying to remote hosts via SSH. Both support systemd and Docker deployment formats. Bundles are **host-agnostic** — they contain template placeholders like `{host}` and `{db_url}` that are resolved at deploy time.
+The CLI provides `wr-cli managers` and `wr-cli node` command groups for deploying to remote hosts via SSH. Both support systemd and Docker deployment formats. Bundles are **host-agnostic** — they contain template placeholders like `{host}` and `{db_url}` that are resolved at deploy time.
 
 Both bundle and deploy commands auto-discover a `wr-deploy.toml` file in the current directory (or accept `--config <path>`). This file provides defaults for flags like `target`, `db_url`, `format`, etc. — see [deployment.md](deployment.md) for the full config reference.
 
@@ -574,7 +622,7 @@ wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10
 wr-cli node bundle --engine-config examples/codegen/engine.toml
 
 # 2. Deploy to each node (resolves {host}, {db_url})
-export WR_MANAGER=http://10.0.1.10:9000
+export WR_MANAGER=https://10.0.1.10:9000
 
 wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.20 \
   --db-url "postgres://postgres@10.0.1.10:5432/wruntime"

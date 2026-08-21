@@ -14,15 +14,15 @@ cargo install cargo-zigbuild
 ## Overview
 
 | Command | Purpose |
-|---------|---------|
-| `wr managers bundle` | Package the manager binary + config into a tarball |
-| `wr managers deploy` | Push bundle to a remote host and start the service |
-| `wr managers status` | Inspect a bundle without deploying |
-| `wr managers list` | List active managers in the cluster |
-| `wr node bundle` | Package proxy + engine binaries, WASM modules, and schemas |
-| `wr node deploy` | Push node bundle to a remote host and start services |
-| `wr node status` | Inspect a node bundle without deploying |
-| `wr logs node` | View logs from services on a remote node (systemd or Docker) |
+| --------- | --------- |
+| `wr-cli managers bundle` | Package the manager binary + config into a tarball |
+| `wr-cli managers deploy` | Push bundle to a remote host and start the service |
+| `wr-cli managers status` | Inspect a bundle without deploying |
+| `wr-cli managers list` | List active managers in the cluster |
+| `wr-cli node bundle` | Package proxy + engine binaries, WASM modules, and schemas |
+| `wr-cli node deploy` | Push node bundle to a remote host and start services |
+| `wr-cli node status` | Inspect a node bundle without deploying |
+| `wr-cli logs node` | View logs from services on a remote node (systemd or Docker) |
 
 ## Bundle structure
 
@@ -86,7 +86,7 @@ db_url     = "postgres://postgres@10.0.1.1:5432/wruntime"
 secret_key = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 ssh_key    = "~/.ssh/deploy_key"
 seed_nodes = ["10.0.1.11:9010", "10.0.1.12:9010"] # metadata/reserved; not emitted into manager runtime TOML
-cert_dir   = "./certs"    # CA + node certs from `wr cert`
+cert_dir   = "./certs"    # CA + node certs from `wr-cli cert`
 peer_port  = 9443         # mTLS peer listener port
 # ssh_port     = 22
 # image_prefix = "wr"
@@ -94,14 +94,14 @@ peer_port  = 9443         # mTLS peer listener port
 
 All fields are optional. Fields that only apply to specific commands (e.g. `secret_key` for managers) are silently ignored when unused. CLI flags always override the config file.
 
-`proxy_config` applies to `wr node bundle`: when set (or passed as `--proxy-config` / `WR_PROXY_CONFIG`), the node bundle uses that source proxy TOML, templates deploy-varying database/node/TLS values, and preserves proxy runtime sections such as `[circuit_breaker]`, `[egress]`, and `[external]`. When omitted, the CLI keeps generating a minimal proxy config from the engine node settings.
+`proxy_config` applies to `wr-cli node bundle`: when set (or passed as `--proxy-config` / `WR_PROXY_CONFIG`), the node bundle uses that source proxy TOML, templates deploy-varying database/node/TLS values, and preserves proxy runtime sections such as `[circuit_breaker]`, `[egress]`, and `[external]`. When omitted, the CLI keeps generating a minimal proxy config from the engine node settings.
 
 `seed_nodes` is deployment metadata/reserved for future gossip bootstrapping UX. It is accepted from `wr-deploy.toml` / `--seed-node` for compatibility, but the deploy flow does not write `cluster.seed_nodes` into runtime `manager.toml` by default because the runtime manager config has no such field.
 
 **Environment variables** are also supported for all deploy-related fields:
 
 | Flag | Env var | Default |
-|------|---------|---------|
+| ------ | --------- | --------- |
 | `--format` | `WR_FORMAT` | `systemd` |
 | `--db-url` | `WR_DB_URL` | — |
 | `--secret-key` | `WR_SECRET_KEY` | — |
@@ -121,7 +121,7 @@ Deployment ports must be valid non-zero TCP ports. Malformed or zero CLI/config/
 Config files use placeholders that are resolved at deploy time:
 
 | Variable | Resolved from | Used in |
-|----------|---------------|---------|
+| ---------- | --------------- | --------- |
 | `{db_url}` | `--db-url` / `WR_DB_URL` / config | manager, proxy, engine configs |
 | `{host}` | deploy target (`user@host`) | proxy/engine `[node]` addresses |
 | `{secret_key}` | `--secret-key` / `WR_SECRET_KEY` / config | manager systemd unit / Dockerfile |
@@ -156,10 +156,10 @@ Add `--proxy-config examples/config/proxy.toml` (or set `proxy_config` in `wr-de
 
 ```bash
 # 4. Deploy node
-wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.1 --manager http://10.0.1.1:9000
+wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.1 --manager https://10.0.1.1:9000
 
 # 5. Verify
-wr-cli engines list --manager http://10.0.1.1:9000
+wr-cli engines list --manager https://10.0.1.1:9000
 ```
 
 Without the config file, pass all values as flags:
@@ -181,7 +181,7 @@ wr-cli node bundle \
 
 wr-cli node deploy myapp.tar.gz deploy@10.0.1.1 \
     --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
-    --manager http://10.0.1.1:9000
+    --manager https://10.0.1.1:9000
 ```
 
 Deploy steps (systemd): SCP tarball, unpack to `--workdir` (default `/opt/wruntime`), install static units, resolve and upload config templates, provision TLS certificates, start services once with the final runtime files in place, then poll manager until the engine registers (60s timeout).
@@ -198,7 +198,7 @@ secret_key = "<64-char-hex-key>"
 ```
 
 ```bash
-export WR_MANAGER=http://10.0.1.1:9000
+export WR_MANAGER=https://10.0.1.1:9000
 
 # --- Manager (once per cluster) ---
 
@@ -237,7 +237,7 @@ wr-cli node bundle \
 
 wr-cli node deploy node-a.tar.gz deploy@10.0.1.50 \
     --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
-    --manager http://10.0.1.1:9000
+    --manager https://10.0.1.1:9000
 ```
 
 ## Docker deployment
@@ -258,7 +258,7 @@ cd wr-node && docker compose -f docker/docker-compose.yml up -d
 
 ## TLS certificates
 
-All inter-service communication uses mTLS. Generate certificates before deployment:
+Manager gRPC and cross-node peer-proxy traffic use mTLS. Local engine-to-proxy data-plane and engine-to-proxy control-plane traffic use plain HTTP on loopback listeners; manager liveness gossip uses its separate UDP listener. Generate certificates for the mTLS boundaries before deployment:
 
 ```bash
 # 1. Create a CA (once per cluster)
@@ -301,12 +301,12 @@ wr-cli managers deploy manager.tar.gz example@localhost \
     --ssh-port 2201 \
     --db-url "postgres://postgres@localhost:5432/wruntime" \
     --secret-key "<64-char-hex-key>" \
-    --advertise-address "http://10.0.2.2:9000"
+    --advertise-address "https://10.0.2.2:9000"
 
 wr-cli node deploy node.tar.gz example@localhost \
     --ssh-port 2202 \
     --db-url "postgres://postgres@10.0.2.2:5432/wruntime" \
-    --manager http://10.0.2.2:9000
+    --manager https://10.0.2.2:9000
 ```
 
 In QEMU user-mode networking, `10.0.2.2` is the host gateway address reachable from all VMs.
@@ -316,7 +316,7 @@ In QEMU user-mode networking, `10.0.2.2` is the host gateway address reachable f
 Services use automatic retries to tolerate startup ordering and transient failures during deployment. This means services can be started in any order — the engine will wait for the proxy and manager to become available rather than crashing immediately.
 
 | Operation | Retry strategy | Total window |
-|-----------|---------------|--------------|
+| ----------- | --------------- | -------------- |
 | Engine → proxy connection | Exponential backoff (200ms → 5s cap), 10 attempts | ~30s |
 | Engine → manager registration (via proxy) | Exponential backoff (500ms → 5s cap), 10 attempts | ~30s |
 | Engine heartbeat (per cycle) | 3 attempts, 50ms apart; reconnects on total failure | 100ms per cycle |
@@ -358,7 +358,7 @@ wr-cli logs node deploy@10.0.1.50 --format docker --tail 50 --since 1h
 ```
 
 | Flag | Default | Description |
-|------|---------|-------------|
+| ------ | --------- | ------------- |
 | `--format` | — | `systemd` or `docker` (required) |
 | `--service` | all wr-* units | Filter to a specific service (e.g. `wr-proxy`, `wr-engine-inventory`) |
 | `--tail` | `100` | Number of recent log lines to show |

@@ -121,7 +121,7 @@ done
 cat <<USAGE
 
 All services running. Press Ctrl-C to stop.
-  Manager   : http://127.0.0.1:9000 (gRPC)
+  Manager   : https://127.0.0.1:9000 (mTLS gRPC)
   Proxy     : http://127.0.0.1:9001
   Exchange  : ${EXCHANGE_PORTS} (${NUM_EXCHANGES} engine(s), DB-backed order book)
   Ledger    : http://127.0.0.1:${LEDGER_PORT} (DB + S3 blobstore)

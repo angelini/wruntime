@@ -78,9 +78,9 @@ fn init_ca(args: InitCaArgs) -> Result<()> {
 
 fn generate(args: GenerateArgs) -> Result<()> {
     let ca_cert_pem = std::fs::read_to_string(args.ca_dir.join("ca.crt"))
-        .context("reading ca.crt — run `wr cert init-ca` first")?;
+        .context("reading ca.crt — run `wr-cli cert init-ca` first")?;
     let ca_key_pem = std::fs::read_to_string(args.ca_dir.join("ca.key"))
-        .context("reading ca.key — run `wr cert init-ca` first")?;
+        .context("reading ca.key — run `wr-cli cert init-ca` first")?;
 
     let ca_key_pair = KeyPair::from_pem(&ca_key_pem).context("parsing CA private key")?;
     let issuer = rcgen::Issuer::from_ca_cert_pem(&ca_cert_pem, ca_key_pair)

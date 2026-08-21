@@ -1,11 +1,11 @@
 # gRPC API (`proto/wruntime.proto`)
 
-All inter-service communication uses the `wruntime.ManagerService` gRPC service.
+The mTLS `wruntime.ManagerService` is the cluster control plane. Engines use the local proxy's `wruntime.NodeService` for lifecycle calls, and worker job submission/status use HTTP RPC through the proxy rather than gRPC.
 
 ## Engine lifecycle
 
 | RPC | Request | Response | Description |
-|-----|---------|----------|-------------|
+| ----- | --------- | ---------- | ------------- |
 | `RegisterEngine` | `EngineRegistration` | `{ accepted }` | Engine announces itself and its modules; the manager resolves requested secrets and DB credentials, then persists the engine, its schemas, and one initially-unhealthy default routing rule per schema-bearing module in a single transaction; module readiness rows are reset for advertised tuples |
 | `DeregisterEngine` | `{ engine_id }` | — | Engine removes itself on shutdown |
 | `Heartbeat` | `{ engine_id, healthy_modules }` | — | Bumps the engine's liveness unconditionally, then upserts a per-module heartbeat for each valid `healthy_modules` entry. Entries missing `namespace`/`name`/`version` are skipped and logged, never fatal. The background monitor marks a routing rule unhealthy when either its engine heartbeat or its specific module's heartbeat goes stale |
@@ -14,7 +14,7 @@ All inter-service communication uses the `wruntime.ManagerService` gRPC service.
 ## Routing table
 
 | RPC | Request | Response | Description |
-|-----|---------|----------|-------------|
+| ----- | --------- | ---------- | ------------- |
 | `GetRoutingTable` | — | `RoutingTable` | Returns the full versioned table |
 | `UpsertRoutingRule` | `RoutingRule` | — | Insert or update a rule by `rule_id`; always marks the rule healthy |
 | `DeleteRoutingRule` | `{ rule_id }` | — | Remove a rule; increments table version |
@@ -48,14 +48,15 @@ The `healthy` field is managed entirely by the manager — it is always set to `
 
 | RPC | Request | Response | Description |
 |-----|---------|----------|-------------|
-| `ListManagers` | — | `[ManagerInfo]` | Returns all active managers (heartbeat within 60 s). Each entry has `manager_id` and `grpc_address`. Use for peer discovery from any seed manager — no database access required. |
+| `ListManagers` | — | `[ManagerInfo]` | Reconciles DB-fresh registrations with chitchat liveness. Gossip-live managers are included, gossip-dead managers are excluded immediately, and DB-fresh managers not yet observed by gossip are included only during the startup convergence window. Use for peer discovery from any seed manager—no client database access required. |
 
 A `ManagerInfo` has the fields:
 
 ```protobuf
 message ManagerInfo {
-  string manager_id   = 1;   // UUID assigned at startup
-  string grpc_address = 2;   // externally-reachable gRPC endpoint
+  string manager_id     = 1; // UUID assigned at startup
+  string grpc_address   = 2; // externally reachable mTLS gRPC endpoint
+  string gossip_address = 3; // chitchat UDP address
 }
 ```
 
@@ -64,7 +65,7 @@ message ManagerInfo {
 The `wruntime.NodeService` gRPC service is exposed by `wr-proxy` on its `control_address` (default port 9002). Engines on the same node use this for registration and heartbeats instead of connecting directly to the manager.
 
 | RPC | Request | Response | Description |
-|-----|---------|----------|-------------|
+| ----- | --------- | ---------- | ------------- |
 | `RegisterEngine` | `RegisterEngineRequest` | `RegisterEngineResponse` | Engine announces itself and its modules to the local proxy |
 | `DeregisterEngine` | `DeregisterEngineRequest` | `DeregisterEngineResponse` | Engine removes itself on shutdown |
 | `Heartbeat` | `HeartbeatRequest` | `HeartbeatResponse` | Sent after module load immediately, then every 3 s; the proxy forwards to the manager |
@@ -82,17 +83,37 @@ The fully qualified endpoints are canonical. `/SubmitJob` and `/GetJobStatus` re
 | `POST /wruntime.WorkerService/SubmitJob` | `SubmitJobRequest` | `SubmitJobResponse` | Submit a job to a worker module's queue |
 | `POST /wruntime.WorkerService/GetJobStatus` | `GetJobStatusRequest` | `GetJobStatusResponse` | Query the status of a previously submitted job |
 
-A `SubmitJobRequest` has the fields:
+The current worker messages are:
 
 ```protobuf
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_PENDING     = 1;
+  JOB_STATE_RUNNING     = 2;
+  JOB_STATE_COMPLETE    = 3;
+  JOB_STATE_DEAD        = 4;
+}
+
 message SubmitJobRequest {
   string worker_namespace = 1;
   string worker_name      = 2;
-  string worker_version   = 3;
+  string worker_version   = 3; // empty means name-only dispatch
   string job_type         = 4;
   bytes  payload          = 5;
-  int32  timeout_secs     = 6;
-  int32  max_attempts     = 7;
+  uint32 timeout_secs     = 6; // 0 uses the configured default
+  uint32 max_attempts     = 7; // 0 uses the configured default
+}
+
+message SubmitJobResponse { string job_id = 1; }
+message GetJobStatusRequest { string job_id = 1; }
+
+message GetJobStatusResponse {
+  string job_id        = 1;
+  JobState status      = 2;
+  bytes  result        = 3;
+  string error_message = 4;
+  uint32 attempt       = 5;
+  uint32 max_attempts  = 6;
 }
 ```
 
@@ -102,18 +123,17 @@ message SubmitJobRequest {
 - `max_attempts` precedence is explicit request value > configured `worker_max_attempts` for the exact body version (or proxy-routed version when the body version is empty) > hard default 3.
 - Manager schedules remain version-pinned and continue to require a non-empty worker version.
 
-A `GetJobStatusResponse` has the fields:
+## Schedules
 
-```protobuf
-message GetJobStatusResponse {
-  string job_id        = 1;
-  string status        = 2;   // "pending" | "running" | "complete" | "failed" | "dead"
-  bytes  result        = 3;
-  string error_message = 4;
-  int32  attempt       = 5;
-  int32  max_attempts  = 6;
-}
-```
+Schedules are version-pinned control-plane resources. Their interval, timeout, and attempt fields are non-zero `uint32` values; `last_fired_at` and `next_fire_at` are optional `google.protobuf.Timestamp` fields.
+
+| RPC | Request | Response | Description |
+| --- | --- | --- | --- |
+| `UpsertSchedule` | `UpsertScheduleRequest` | `{ schedule_id }` | Create or update the schedule identified by worker namespace/name/version and canonical job type |
+| `DeleteSchedule` | `DeleteScheduleRequest` | — | Delete the matching version-pinned schedule |
+| `ListSchedules` | `{ worker_namespace }` | `[Schedule]` | List schedules, optionally filtered by worker namespace |
+
+Schedule delivery is at least once. Handlers must be idempotent, and `job_type` uses the canonical `/{package}.{Service}/{Method}` path.
 
 ## Schemas
 
@@ -126,7 +146,7 @@ Schemas are automatically uploaded when engines register; the first occurrence o
 ## Secrets
 
 | RPC | Request | Response | Description |
-|-----|---------|----------|-------------|
+| ----- | --------- | ---------- | ------------- |
 | `SetSecret` | `{ namespace, key, value }` | — | Encrypt and store a secret (AES-GCM). |
 | `DeleteSecret` | `{ namespace, key }` | — | Remove a secret. |
 | `ListSecrets` | `{ namespace }` | `[SecretEntry]` | List secret keys (not values) for a namespace. Empty namespace returns all. |
@@ -140,14 +160,14 @@ Request metrics are collected via OpenTelemetry traces rather than a custom gRPC
 Query metrics via the CLI:
 
 ```bash
-wr-cli --manager http://127.0.0.1:9000 metrics summary                          # default: Tempo at localhost:3200, last 1h
-wr-cli --manager http://127.0.0.1:9000 metrics summary --tempo http://tempo:3200 --since 6h
+wr-cli metrics summary                          # default: Tempo at localhost:3200, last 1h
+wr-cli metrics summary --tempo http://tempo:3200 --since 6h
 ```
 
-> **Note:** `--manager` (or the `WR_MANAGER` env var) is required for all CLI commands. The CLI does not require database access — it communicates exclusively via gRPC.
+> **Note:** Manager-facing CLI commands require `--manager https://…` (or `WR_MANAGER`) plus the CA/client certificate options described in [configuration](configuration.md#cli-access). Metrics commands query Tempo directly and do not require a manager.
 
 Or query Tempo directly with [TraceQL](https://grafana.com/docs/tempo/latest/traceql/):
 
-```
+```traceql
 {name = "proxy.request" && span.wr.source = "order-service"}
 ```

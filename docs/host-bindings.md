@@ -10,7 +10,7 @@ DB, blobstore, and LLM imports require matching per-module opt-ins and valid eng
 
 ## Database (Postgres)
 
-Defined in `wit/db.wit`. Provides parameterized SQL queries and transactions against a shared Postgres connection pool managed by the engine.
+Defined in `wit/db.wit`. Provides parameterized SQL queries and transactions through a Postgres connection pool created per namespace by the engine.
 
 ### Engine configuration
 
@@ -19,20 +19,27 @@ Add a `[database]` section to `engine.toml` and set `database = true` on each mo
 ```toml
 [database]
 url             = "postgres://user:pass@localhost:5432/mydb"
-max_connections = 10   # default: 8
+max_connections = 20   # default contribution from each DB-enabled module
 
 [[module]]
-name      = "order-service"
-version   = "1.0.0"
-wasm_path = "modules/order_service.wasm"
-database  = true       # opt in to DB access
+name               = "order-service"
+namespace          = "ecommerce"
+version            = "1.0.0"
+wasm_path          = "modules/order_service.wasm"
+schema_path        = "schemas/order_service.binpb"
+database           = true # opt in to DB access
+db_max_connections = 10   # override this module's contribution
 
 [[module]]
-name      = "inventory-service"
-version   = "1.0.0"
-wasm_path = "modules/inventory_service.wasm"
+name        = "inventory-service"
+namespace   = "ecommerce"
+version     = "1.0.0"
+wasm_path   = "modules/inventory_service.wasm"
+schema_path = "schemas/inventory_service.binpb"
 # database omitted — no DB access for this module
 ```
+
+Each namespace gets one guest pool. Its maximum size is the sum of `db_max_connections` (or the `[database].max_connections` default) contributed by every DB-enabled module in that namespace. The manager provisions a namespace role, and the pool uses that role while each module retains its own schema-specific `search_path`.
 
 ### Transport and resources
 
@@ -59,7 +66,7 @@ Defined in `wit/blobstore.wit`. Provides object storage operations against an S3
 Available functions:
 
 | Function | Description |
-|----------|-------------|
+| ---------- | ------------- |
 | `put-object(bucket, key, data)` | Upload an object |
 | `get-object(bucket, key)` | Download an object's bytes |
 | `delete-object(bucket, key)` | Remove an object; returns `NotFound` when it is missing |
@@ -209,12 +216,7 @@ schema_path = "schemas/order_service.binpb"
 fs          = "tempdir"
 ```
 
-The directory is created fresh on the host for each store and deleted when the store is dropped:
-
-- For **HTTP handler modules** a new directory is created per request (each request gets its own store).
-- For **runner modules** the directory lives for the lifetime of the module.
-
-The directory is empty on creation. It is not shared between module instances or across requests. Use it for scratch space, caching, or temporary files — do not rely on it for durable state.
+The directory is created fresh on the host for every dispatch and deleted when that dispatch's store is dropped. This applies to both service requests and worker jobs: each gets a new store and therefore a new empty temp directory. It is not shared between module instances or dispatches. Use it only for scratch space or temporary files — do not rely on it for cross-request caching or durable state.
 
 | Value | Effect |
 |-------|--------|

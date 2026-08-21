@@ -87,7 +87,7 @@ pub struct DeployArgs {
     /// SSH port
     #[arg(long)]
     ssh_port: Option<u16>,
-    /// Local directory containing CA + node certificates (from `wr cert`)
+    /// Local directory containing CA + node certificates (from `wr-cli cert`)
     #[arg(long, default_value = "./certs")]
     cert_dir: String,
     /// mTLS peer listener port (default: 9443)
@@ -821,7 +821,7 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
                     (&host_key, "node.key"),
                 ] {
                     if !Path::new(local).exists() {
-                        bail!("Certificate file not found: {local}. Run `wr cert generate {host_name}` first.");
+                        bail!("Certificate file not found: {local}. Run `wr-cli cert generate {host_name}` first.");
                     }
                     let tmp_path = format!("/tmp/{remote_name}");
                     helpers::scp_file(local, &args.remote, &tmp_path, ssh_key.as_deref(), ssh_port)
