@@ -221,6 +221,10 @@ dev-reset-blobstore bucket="codegen":
 
 # ── WASM Guest Test Harness ───────────────────────────────────────────────────
 
+# Build every repository WASM guest sequentially through the shared Cargo cache
+build-wasm-guests:
+    cargo run --bin wr-cli -- dev build all
+
 # Build WASM test guest components and protobuf schemas
 build-test-guests:
     cargo run --bin wr-cli -- dev build tests
@@ -347,6 +351,10 @@ watch job="build":
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 
-# Remove build artifacts
+# Remove only Cargo's shared WASM guest cache (staged runtime artifacts remain)
+clean-wasm-cache:
+    rm -rf target/wasm-guests
+
+# Remove build artifacts, including the shared WASM guest cache
 clean:
     cargo clean

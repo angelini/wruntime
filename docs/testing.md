@@ -11,7 +11,9 @@ just multi-node-inline       # start, verify, and stop the local topology
 just test                    # all tests with test DB/S3 env vars set
 just test-integration        # wr-tests crate only
 just test-one <test_name>    # single test by name
+just build-wasm-guests       # build every WASM guest sequentially
 just test-wasm               # build WASM guests, then run host binding tests
+just clean-wasm-cache        # remove only the shared Cargo guest cache
 just validate-ecommerce      # ecommerce inline run, failing on WARN/WARNING output
 just validate-all            # full format/lint/WASM/test/E2E suite
 just dev-down                # stop dev infrastructure
@@ -33,6 +35,21 @@ column values rather than JSON strings. Positive-path tests can use `RpcPath`
 and `GuestHarness::dispatch_typed`; raw request helpers remain available for
 malformed-input coverage.
 
+Rust guest builds launched by `wr-cli` use the mandatory shared Cargo target
+at `target/wasm-guests`. Each configured guest-local `wasm_path` is a staged,
+stripped runtime artifact; Cargo's unmodified build output remains in the
+shared target. `just build-wasm-guests` resolves every repository guest and
+builds them sequentially in one CLI invocation.
+
+`just clean-wasm-cache` removes only `target/wasm-guests`, not staged guest
+artifacts. Root `cargo clean` removes the whole root `target/` tree, including
+the shared cache. Running `cargo clean` inside an individual guest does not
+clear the shared cache unless Cargo is explicitly given that target directory.
+Deleting a staged guest artifact does not require a cache reset: the next CLI
+guest build recreates it from the shared artifact. Existing guest-local target
+directories containing old Cargo intermediates may be deleted once; subsequent
+CLI builds recreate only the configured staged output directories there.
+
 WASM host binding tests require:
 
 - `rustup target add wasm32-wasip2`
@@ -50,9 +67,11 @@ stdlib JSON parsing; no `jq` dependency is required.
 
 `just validate-all` is a thin alias for `dev/validate-all.sh`. The script
 orchestrates existing Just recipes for formatting, compile checks, lints, WASM
-guest builds, Rust tests, and fixed-port E2E examples. E2E examples run
-sequentially because they share ports and example resources. Logs and
-`summary.txt` are written under `target/validate-all/<timestamp>/`; terminal
+guest builds, Rust tests, and fixed-port E2E examples. All guests are built
+through one sequential `just build-wasm-guests` invocation so independent
+Cargo processes never contend on the shared target during that stage. E2E
+examples run sequentially because they share ports and example resources. Logs
+and `summary.txt` are written under `target/validate-all/<timestamp>/`; terminal
 failure output is capped for agent-friendly context use. Codegen E2E runs only
 when `ANTHROPIC_API_KEY` is set by default; use `--codegen-e2e` to require it
 or `--no-codegen-e2e` to always skip it.

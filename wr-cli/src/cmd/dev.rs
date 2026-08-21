@@ -25,6 +25,7 @@ const STOCKMARKET_ENGINE_CONFIGS: &[&str] = &[
     "examples/stockmarket/engine-simulator.toml",
 ];
 const CODEGEN_ENGINE_CONFIGS: &[&str] = &["examples/codegen/engine.toml"];
+const MULTI_NODE_ENGINE_CONFIGS: &[&str] = &["examples/multi-node/node-b/engine-1.toml"];
 
 /// Resolve the path to a prebuilt binary. Checks ./target/debug/ first,
 /// then falls back to $PATH lookup.
@@ -84,7 +85,7 @@ pub struct DeployArgs {
 
 #[derive(Args, Clone, Debug)]
 pub struct BuildArgs {
-    /// Build group: tests, ecommerce, stockmarket, codegen, or all
+    /// Build group: tests, ecommerce, stockmarket, codegen, multi-node, or all
     #[arg(value_name = "GROUP")]
     group: Option<String>,
     /// Explicit engine TOML to use as build metadata (repeatable)
@@ -490,7 +491,7 @@ fn resolve_build_modules(args: &BuildArgs) -> Result<Vec<BuildModule>> {
         append_manifest_modules(manifest, &mut modules)?;
     }
     if modules.is_empty() {
-        bail!("no build modules requested; pass a group (tests, ecommerce, stockmarket, codegen, all), --config, or --manifest");
+        bail!("no build modules requested; pass a group (tests, ecommerce, stockmarket, codegen, multi-node, all), --config, or --manifest");
     }
     let modules = dedupe_build_modules(modules)?;
     filter_build_modules(modules, &args.modules)
@@ -502,13 +503,15 @@ fn append_group_modules(group: &str, modules: &mut Vec<BuildModule>) -> Result<(
         "ecommerce" => append_config_group(ECOMMERCE_ENGINE_CONFIGS, modules),
         "stockmarket" => append_config_group(STOCKMARKET_ENGINE_CONFIGS, modules),
         "codegen" => append_config_group(CODEGEN_ENGINE_CONFIGS, modules),
+        "multi-node" => append_config_group(MULTI_NODE_ENGINE_CONFIGS, modules),
         "all" => {
             append_group_modules("tests", modules)?;
             append_group_modules("ecommerce", modules)?;
             append_group_modules("stockmarket", modules)?;
-            append_group_modules("codegen", modules)
+            append_group_modules("codegen", modules)?;
+            append_group_modules("multi-node", modules)
         }
-        other => bail!("unknown build group '{other}'; expected tests, ecommerce, stockmarket, codegen, all, or use --config/--manifest"),
+        other => bail!("unknown build group '{other}'; expected tests, ecommerce, stockmarket, codegen, multi-node, all, or use --config/--manifest"),
     }
 }
 
@@ -766,10 +769,12 @@ mod tests {
             modules: vec![],
         };
         let err = resolve_build_modules(&args).expect_err("unknown group must be rejected");
+        let message = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("unknown build group 'bogus'"),
+            message.contains("unknown build group 'bogus'"),
             "unexpected error: {err:#}"
         );
+        assert!(message.contains("multi-node"));
     }
 
     #[test]
@@ -792,6 +797,17 @@ mod tests {
     }
 
     #[test]
+    fn multi_node_group_resolves_echo_config() {
+        let modules = resolve_build_modules(&build_args(Some("multi-node"))).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].name, "echo");
+        assert_eq!(
+            modules[0].wasm_path,
+            "examples/multi-node/echo/target/wasm32-wasip2/debug/echo.wasm"
+        );
+    }
+
+    #[test]
     fn stockmarket_group_does_not_select_duplicate_schema_ledger_crate() {
         let modules = resolve_build_modules(&build_args(Some("stockmarket"))).unwrap();
         let names: BTreeSet<String> = modules.iter().map(|m| m.name.clone()).collect();
@@ -811,6 +827,45 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("examples/stockmarket/schemas/ledger")));
+    }
+
+    #[test]
+    fn all_group_resolves_every_guest_once_with_unique_artifact_names() {
+        let modules = resolve_build_modules(&build_args(Some("all"))).unwrap();
+        let cargo_dirs: BTreeSet<PathBuf> = modules
+            .iter()
+            .map(|module| build_helpers::module_cargo_dir(module).unwrap())
+            .collect();
+        let expected = BTreeSet::from([
+            PathBuf::from("wr-tests/guests/db-guest"),
+            PathBuf::from("wr-tests/guests/tracing-guest"),
+            PathBuf::from("wr-tests/guests/blobstore-guest"),
+            PathBuf::from("wr-tests/guests/http-guest"),
+            PathBuf::from("wr-tests/guests/llm-guest"),
+            PathBuf::from("examples/ecommerce/client"),
+            PathBuf::from("examples/ecommerce/inventory"),
+            PathBuf::from("examples/stockmarket/exchange"),
+            PathBuf::from("examples/stockmarket/ledger"),
+            PathBuf::from("examples/stockmarket/simulator"),
+            PathBuf::from("examples/codegen/collector"),
+            PathBuf::from("examples/codegen/agent"),
+            PathBuf::from("examples/codegen/coordinator"),
+            PathBuf::from("examples/codegen/worker"),
+            PathBuf::from("examples/multi-node/echo"),
+        ]);
+        assert_eq!(cargo_dirs, expected);
+        assert_eq!(modules.len(), cargo_dirs.len());
+
+        let filenames: BTreeSet<_> = modules
+            .iter()
+            .map(|module| {
+                Path::new(&module.wasm_path)
+                    .file_name()
+                    .unwrap()
+                    .to_os_string()
+            })
+            .collect();
+        assert_eq!(filenames.len(), modules.len());
     }
 
     #[test]

@@ -283,12 +283,8 @@ if [ "$E2E_ONLY" != true ]; then
 		"workspace lint" "just lint" \
 		"guest lint" "just lint-examples"
 
-	run_parallel "wasm and example builds" \
-		"wasm test guests" "just build-test-guests" \
-		"ecommerce wasm" "just build-ecommerce" \
-		"stockmarket wasm" "just build-stockmarket" \
-		"codegen wasm" "just build-codegen" \
-		"multi-node echo wasm" "just build-multi-node"
+	section "wasm and example builds"
+	run_cmd "all wasm guests" "just build-wasm-guests"
 
 	section "rust tests"
 	run_cmd "workspace tests including wasm host tests" "just test"

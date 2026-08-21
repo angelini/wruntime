@@ -16,6 +16,8 @@ just test-one <name>
 just tidy                    # format + clippy -D warnings
 
 # WASM and examples
+just build-wasm-guests
+just clean-wasm-cache
 just test-wasm
 just build-ecommerce
 just build-stockmarket
@@ -62,7 +64,7 @@ Integration helpers live in `wr-tests/tests/helpers/mod.rs`. Direct DB-backed te
 Wruntime is a Cargo workspace implementing a distributed WASI Preview 2 runtime:
 
 | Service | Default listeners | Role |
-|---|---|---|
+| --- | --- | --- |
 | `wr-manager` | 9000 mTLS gRPC, 9010 gossip | Registry, routing, schemas, schedules, secrets, heartbeats |
 | `wr-proxy` | 9001 loopback HTTP, 9002 loopback control, 9443 mTLS peer | Streaming header-based routing and circuit breaking |
 | `wr-engine` | 9100 loopback HTTP | WASM component execution and host capabilities |
