@@ -215,6 +215,8 @@ dev-reset-db:
 
 # Clear all objects from the codegen S3 bucket
 dev-reset-blobstore bucket="codegen":
+    -AWS_ACCESS_KEY_ID={{s3_access_key}} AWS_SECRET_ACCESS_KEY={{s3_secret_key}} \
+        aws --endpoint-url {{s3_endpoint}} s3 mb s3://{{bucket}} 2>/dev/null
     AWS_ACCESS_KEY_ID={{s3_access_key}} AWS_SECRET_ACCESS_KEY={{s3_secret_key}} \
         aws --endpoint-url {{s3_endpoint}} s3 rm s3://{{bucket}} --recursive
     @echo "Cleared s3://{{bucket}}"
