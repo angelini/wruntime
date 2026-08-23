@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ pub type EngineBreaker = StateMachine<failure_policy::ConsecutiveFailures<backof
 pub struct CircuitBreakerRegistry {
     inner: Arc<Mutex<HashMap<Arc<str>, EngineBreaker>>>,
     config: CircuitBreakerConfig,
+    resolver_calls: Arc<AtomicUsize>,
 }
 
 impl CircuitBreakerRegistry {
@@ -19,35 +21,44 @@ impl CircuitBreakerRegistry {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             config,
+            resolver_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Returns the breaker for `addr`, creating one in the Closed state on first access.
-    pub fn get_or_create(&self, addr: &str) -> EngineBreaker {
+    /// Resolve the breaker for `addr` while preparing a routing snapshot.
+    pub(crate) fn resolve(&self, addr: &str) -> EngineBreaker {
+        self.resolver_calls.fetch_add(1, Ordering::Relaxed);
         let mut map = self.inner.lock().unwrap();
-        map.entry(Arc::from(addr))
-            .or_insert_with(|| self.build_breaker())
-            .clone()
-    }
+        if let Some(breaker) = map.get(addr) {
+            return breaker.clone();
+        }
 
-    /// Returns whether a call to `addr` is currently permitted.
-    ///
-    /// This uses failsafe's state transition API, so an expired open breaker
-    /// becomes half-open and can be selected for its recovery probe.
-    pub fn is_call_permitted(&self, addr: &str) -> bool {
-        self.get_or_create(addr).is_call_permitted()
+        let key: Arc<str> = Arc::from(addr);
+        let breaker = self.build_breaker();
+        map.insert(key, breaker.clone());
+        breaker
     }
 
     pub fn open_duration_secs(&self) -> u64 {
         self.config.open_duration_secs
     }
 
-    /// Removes breakers for addresses no longer present in the routing table.
-    pub fn evict_missing(&self, active: &HashSet<&str>) {
+    /// Remove registry membership for addresses absent from the published table.
+    pub(crate) fn evict_missing(&self, active: &HashSet<Arc<str>>) {
         self.inner
             .lock()
             .unwrap()
-            .retain(|k, _| active.contains(&**k));
+            .retain(|key, _| active.contains(key));
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn resolver_calls(&self) -> usize {
+        self.resolver_calls.load(Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn reset_resolver_calls(&self) {
+        self.resolver_calls.store(0, Ordering::Relaxed);
     }
 
     fn build_breaker(&self) -> EngineBreaker {
@@ -57,5 +68,26 @@ impl CircuitBreakerRegistry {
                 backoff::constant(Duration::from_secs(self.config.open_duration_secs)),
             ))
             .build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_reuses_borrowed_key_and_eviction_resets_membership() {
+        let registry = CircuitBreakerRegistry::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration_secs: 30,
+        });
+        let old = registry.resolve("http://engine");
+        old.on_error();
+        assert!(!registry.resolve("http://engine").is_call_permitted());
+
+        registry.evict_missing(&HashSet::new());
+        let fresh = registry.resolve("http://engine");
+        assert!(fresh.is_call_permitted());
+        assert!(!old.is_call_permitted());
     }
 }

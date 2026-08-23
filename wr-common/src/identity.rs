@@ -111,10 +111,17 @@ pub struct RouteKey {
     pub module: ModuleName,
 }
 impl RouteKey {
+    /// Validate a borrowed route identity without constructing owned name types.
+    pub fn validate(namespace: &str, module: &str) -> Result<()> {
+        validate_name(namespace, "namespace")?;
+        validate_name(module, "module name")
+    }
+
     pub fn parse(namespace: &str, module: &str) -> Result<Self> {
+        Self::validate(namespace, module)?;
         Ok(Self {
-            namespace: Namespace::parse(namespace)?,
-            module: ModuleName::parse(module)?,
+            namespace: Namespace(namespace.to_owned()),
+            module: ModuleName(module.to_owned()),
         })
     }
 }
@@ -222,6 +229,36 @@ mod tests {
         assert!(Namespace::parse("Foo").is_err());
         assert!(Namespace::parse("a".repeat(25)).is_err());
     }
+    #[test]
+    fn borrowed_and_owned_route_validation_match() {
+        let valid_24 = "a".repeat(24);
+        let invalid_25 = "a".repeat(25);
+        for (namespace, module) in [
+            ("store", "inventory"),
+            (valid_24.as_str(), "module"),
+            ("", "module"),
+            ("Store", "module"),
+            ("store_name", "module"),
+            ("store.name", "module"),
+            ("-store", "module"),
+            ("store-", "module"),
+            (invalid_25.as_str(), "module"),
+            ("store", ""),
+            ("store", "Module"),
+            ("store", "module_name"),
+            ("store", "module.name"),
+            ("store", "-module"),
+            ("store", "module-"),
+            ("store", invalid_25.as_str()),
+        ] {
+            assert_eq!(
+                RouteKey::validate(namespace, module).is_ok(),
+                RouteKey::parse(namespace, module).is_ok(),
+                "borrowed and owned validation differ for {namespace:?}.{module:?}"
+            );
+        }
+    }
+
     #[test]
     fn versions_and_endpoints_are_typed() {
         assert!(ModuleVersion::parse("1.2.3").is_ok());

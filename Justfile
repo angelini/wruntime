@@ -266,13 +266,21 @@ test-wasm-one target: build-test-guests
 validate-all *args:
     bash dev/validate-all.sh "$@"
 
-# Run hot-path benchmarks (WASM→proxy→WASM). Override iterations/concurrency via env vars.
-bench: build-test-guests
+# Run hot-path benchmarks (WASM→proxy→WASM).
+bench iterations="5000" warmup="30" concurrency="20": build-test-guests
     WRT_TEST_DB_URL={{db_url_test}} \
-    BENCH_ITERATIONS=5000 \
-    BENCH_WARMUP=30 \
-    BENCH_CONCURRENCY=20 \
+    BENCH_ITERATIONS={{iterations}} \
+    BENCH_WARMUP={{warmup}} \
+    BENCH_CONCURRENCY={{concurrency}} \
     cargo test -p wr-tests --test bench_test --release -- --nocapture
+
+# Run the warmed-client proxy routing/forwarding benchmark only.
+bench-proxy-routing iterations="500" warmup="10" concurrency="20":
+    WRT_TEST_DB_URL={{db_url_test}} \
+    BENCH_ITERATIONS={{iterations}} \
+    BENCH_WARMUP={{warmup}} \
+    BENCH_CONCURRENCY={{concurrency}} \
+    cargo test -p wr-tests --test bench_test --release bench_proxy_only -- --nocapture
 
 # ── Ecommerce Example ─────────────────────────────────────────────────────────
 

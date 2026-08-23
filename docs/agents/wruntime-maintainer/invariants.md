@@ -10,9 +10,9 @@ For each change, **preserve** the contract, **inspect** the listed implementatio
 
 ## Routing and circuit breaking
 
-- **Preserve:** routing-table versions increase with durable state updates; persisted state and proxy indexes converge; exact versions, semver ranges, and unpinned requests retain distinct selection semantics; unhealthy routes are excluded.
+- **Preserve:** routing-table versions increase with durable state updates; persisted state and proxy indexes converge; exact versions, semver ranges, and unpinned requests retain distinct selection semantics; unhealthy routes are excluded. Continuously active forwarding addresses retain their prepared breaker across refreshes; completed publication-plus-eviction is the reset boundary, and in-flight old handles remain isolated from later re-adds.
 - **Inspect:** manager routing persistence, proxy `routing.rs`, `indexed_routing.rs`, routing/forward layers, and circuit-breaker membership eviction.
-- **Prove:** version, proxy, concurrent-routing, circuit-breaker, and cross-node tests.
+- **Prove:** version, proxy, concurrent-routing, circuit-breaker refresh/lifetime, and cross-node tests.
 
 - **Preserve:** local-engine, peer-proxy, public-ingress, and external-egress branches remain explicit. Egress cannot be mistaken for internal module routing, and circuit state applies to the correct destination.
 - **Inspect:** ingress, routing, forward, and egress layers plus node service.

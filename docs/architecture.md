@@ -2,7 +2,7 @@
 
 A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. Nodes are independent — each proxy handles its own inbound traffic and forwards cross-node requests directly to the peer proxy, which then routes locally to its engines.
 
-```
+```text
               ┌────────────────────────┐    gossip    ┌────────────────────────┐
               │    wr-manager (1)     │◄───(UDP)───►│    wr-manager (2)     │
               │  Engine registry      │             │  Engine registry      │
@@ -74,7 +74,7 @@ Delivery is **at-least-once** — a manager crash between submit and finalize le
 
 ## Request flow
 
-```
+```text
 WASM module makes HTTP call to "http://ecommerce.inventory/inventory.InventoryService/GetItems"
   │
   ▼  [WasiHttpView::send_request intercepts — transparent to the module]
@@ -87,23 +87,27 @@ WASM module makes HTTP call to "http://ecommerce.inventory/inventory.InventorySe
 wr-proxy A  (Node A)
   │  1. TracingLayer       — opens an OTel span (captures source, destination,
   │                          status, duration); injects W3C traceparent header
-  │  2. RoutingLayer       — single routing table read per request;
-  │                          reads optional x-wr-version header; when omitted,
-  │                          load-balances across all healthy versions;
+  │  2. RoutingLayer       — single routing snapshot read and one borrowed
+  │                          namespace/module lookup per internal request;
+  │                          parses an optional x-wr-version selector once and
+  │                          scans sync-time prepared, descending version groups;
+  │                          when omitted, load-balances across all healthy versions;
   │                          returns 503 if no healthy instance matches;
-  │                          injects x-wr-module, x-wr-namespace, x-wr-version;
-  │                          round-robins across healthy instances at the same
-  │                          version and skips known-open circuit-breaker targets
-  │                          when another eligible replica exists; resolves the
-  │                          destination as LocalEngine or RemoteProxy; when egress
-  │                          is enabled and no internal
-  │                          route matches, sets ExternalEgress extension
+  │                          inserts sync-time prepared x-wr-module,
+  │                          x-wr-namespace, and resolved x-wr-version values;
+  │                          skips known-open prepared circuit-breaker handles
+  │                          when another eligible replica exists, then carries
+  │                          the selected destination and breaker forward; when
+  │                          egress is enabled and no internal route matches,
+  │                          sets ExternalEgress extension
   │  3. EgressLayer        — handles ExternalEgress requests: enforces the domain
   │                          allowlist and forwards to external hosts;
   │                          passes internal requests through to ForwardService
-  │  4. ForwardService     — strips x-wr-destination / x-wr-source, injects
-  │                          traceparent; streams request body to engine and
-  │                          streams engine response back — no buffering; then:
+  │  4. ForwardService     — assembles normal local/peer URIs from prepared
+  │                          scheme/authority plus the borrowed request path/query;
+  │                          strips x-wr-destination / x-wr-source, injects
+  │                          traceparent, performs the final carried-breaker check,
+  │                          and streams both bodies without buffering; then:
   │
   ├── destination is on Node A (LocalEngine) ──────────────────────────────────┐
   │     strips x-wr-destination / x-wr-source / x-wr-via-proxy                 │
@@ -147,7 +151,7 @@ All internal routing uses a set of reserved `x-wr-*` HTTP headers. The proxy str
 
 ### Header lifecycle per request
 
-```
+```text
 WASM module calls http://ecommerce.inventory/inventory.InventoryService/GetItems
   │
   │  WasiHttpView (wr-engine) sets:

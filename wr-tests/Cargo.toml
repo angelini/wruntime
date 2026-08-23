@@ -27,7 +27,7 @@ wr-common = { path = "../wr-common", features = [
 ] }
 wr-engine = { path = "../wr-engine" }
 wr-manager = { path = "../wr-manager" }
-wr-proxy = { path = "../wr-proxy" }
+wr-proxy = { path = "../wr-proxy", features = ["test-util"] }
 rustls = { version = "0.23", default-features = false, features = [
   "ring",
   "std",

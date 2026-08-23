@@ -2,7 +2,7 @@ mod helpers;
 use helpers::{
     manager::{
         manager_trio, register_test_module_ready, register_test_module_ready_with_peer,
-        synced_routing_table,
+        synced_routing_table_with_config,
     },
     proxy::{http_client, proxy_get, start_proxy_with_cb, EngineSpec, ModuleSpec},
     stubs::{spawn_status_stub, spawn_stub_engine, spawn_switchable_stub},
@@ -37,17 +37,16 @@ async fn test_circuit_breaker_opens_after_consecutive_failures() -> Result<()> {
     )
     .await?;
 
-    let table = synced_routing_table(&mgr_addr).await?;
-
-    // threshold=3 so we can test quickly; open_duration_secs=2 for recovery test.
-    let proxy = start_proxy_with_cb(
-        table,
+    // threshold=3 so the breaker can be exercised quickly.
+    let table = synced_routing_table_with_config(
+        &mgr_addr,
         CircuitBreakerConfig {
             failure_threshold: 3,
             open_duration_secs: 2,
         },
     )
     .await?;
+    let proxy = start_proxy_with_cb(table).await?;
 
     // First 3 requests hit the engine and get 500 passed through (counted as failure).
     for _ in 0..3 {
@@ -94,16 +93,15 @@ async fn test_circuit_breaker_opens_for_remote_peer() -> Result<()> {
     )
     .await?;
 
-    let table = synced_routing_table(&mgr_addr).await?;
-
-    let proxy = start_proxy_with_cb(
-        table,
+    let table = synced_routing_table_with_config(
+        &mgr_addr,
         CircuitBreakerConfig {
             failure_threshold: 3,
             open_duration_secs: 2,
         },
     )
     .await?;
+    let proxy = start_proxy_with_cb(table).await?;
 
     // First 3 requests attempt the remote forward and fail (counted as failures).
     for _ in 0..3 {
@@ -142,16 +140,15 @@ async fn test_circuit_breaker_retry_after_header() -> Result<()> {
     )
     .await?;
 
-    let table = synced_routing_table(&mgr_addr).await?;
-
-    let proxy = start_proxy_with_cb(
-        table,
+    let table = synced_routing_table_with_config(
+        &mgr_addr,
         CircuitBreakerConfig {
             failure_threshold: 2,
             open_duration_secs: 7,
         },
     )
     .await?;
+    let proxy = start_proxy_with_cb(table).await?;
 
     // Trip the circuit.
     for _ in 0..2 {
@@ -199,16 +196,15 @@ async fn test_circuit_breaker_429_counts_as_failure() -> Result<()> {
     )
     .await?;
 
-    let table = synced_routing_table(&mgr_addr).await?;
-
-    let proxy = start_proxy_with_cb(
-        table,
+    let table = synced_routing_table_with_config(
+        &mgr_addr,
         CircuitBreakerConfig {
             failure_threshold: 2,
             open_duration_secs: 2,
         },
     )
     .await?;
+    let proxy = start_proxy_with_cb(table).await?;
 
     // Trip the circuit with 429s.
     for _ in 0..2 {
@@ -245,16 +241,15 @@ async fn test_circuit_breaker_stays_closed_on_success() -> Result<()> {
     )
     .await?;
 
-    let table = synced_routing_table(&mgr_addr).await?;
-
-    let proxy = start_proxy_with_cb(
-        table,
+    let table = synced_routing_table_with_config(
+        &mgr_addr,
         CircuitBreakerConfig {
             failure_threshold: 2,
             open_duration_secs: 2,
         },
     )
     .await?;
+    let proxy = start_proxy_with_cb(table).await?;
 
     // 10 successful requests — all should return 200.
     for _ in 0..10 {
@@ -286,16 +281,15 @@ async fn test_circuit_breaker_half_open_recovery() -> Result<()> {
     )
     .await?;
 
-    let table = synced_routing_table(&mgr_addr).await?;
-
-    let proxy = start_proxy_with_cb(
-        table,
+    let table = synced_routing_table_with_config(
+        &mgr_addr,
         CircuitBreakerConfig {
             failure_threshold: 2,
             open_duration_secs: 1,
         },
     )
     .await?;
+    let proxy = start_proxy_with_cb(table).await?;
 
     // Trip the circuit.
     for _ in 0..2 {
@@ -353,15 +347,15 @@ async fn test_circuit_breaker_skips_open_replica_for_same_route() -> Result<()> 
     )
     .await?;
 
-    let table = synced_routing_table(&mgr_addr).await?;
-    let proxy = start_proxy_with_cb(
-        table,
+    let table = synced_routing_table_with_config(
+        &mgr_addr,
         CircuitBreakerConfig {
             failure_threshold: 1,
             open_duration_secs: 30,
         },
     )
     .await?;
+    let proxy = start_proxy_with_cb(table).await?;
 
     let mut tripped_failing_replica = false;
     for _ in 0..4 {
@@ -422,16 +416,15 @@ async fn test_circuit_breaker_per_engine_isolation() -> Result<()> {
     )
     .await?;
 
-    let table = synced_routing_table(&mgr_addr).await?;
-
-    let proxy = start_proxy_with_cb(
-        table,
+    let table = synced_routing_table_with_config(
+        &mgr_addr,
         CircuitBreakerConfig {
             failure_threshold: 2,
             open_duration_secs: 30,
         },
     )
     .await?;
+    let proxy = start_proxy_with_cb(table).await?;
 
     // Trip engine A's circuit.
     for _ in 0..3 {

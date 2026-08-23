@@ -65,7 +65,11 @@ async fn test_proxy_namespaces_are_isolated() -> Result<()> {
 
 #[tokio::test]
 async fn test_proxy_returns_400_when_namespace_missing() -> Result<()> {
-    let proxy_addr = start_proxy(wr_proxy::routing::new_routing_table()).await?;
+    let proxy_addr = start_proxy(wr_proxy::routing::new_routing_table(
+        Default::default(),
+        TEST_SELF_PEER,
+    ))
+    .await?;
 
     // Host has no dot — no namespace.
     let req = Request::builder()

@@ -1,58 +1,77 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use http::HeaderValue;
 use tracing::warn;
 use wr_common::identity::{ModuleVersion, RouteKey};
 use wr_common::wruntime::{RoutingRule, RoutingTable};
 
-/// A routing rule with its semver version pre-parsed at sync time.
-pub struct ParsedRule {
-    pub rule: RoutingRule,
-    pub parsed_version: ModuleVersion,
+use crate::circuit_breaker::{CircuitBreakerRegistry, EngineBreaker};
+use crate::layers::Destination;
+
+type ModulesByName = HashMap<Arc<str>, RouteGroup>;
+
+pub struct IndexedCandidate {
+    pub destination: Destination,
+    pub breaker: EngineBreaker,
+    pub version_group_index: usize,
 }
 
-/// Round-robin state for the set of candidates that share one exact version
-/// string within a route group.
 pub struct VersionGroup {
-    /// Indexes into the owning `RouteGroup::candidates`.
+    pub parsed_version: ModuleVersion,
+    pub version: Arc<str>,
+    pub version_header: HeaderValue,
     pub candidate_indexes: Vec<usize>,
-    /// Per-version round-robin counter (used when `x-wr-version` pins a version).
     pub counter: AtomicUsize,
 }
 
-/// All healthy rules for one `(namespace, module)`, pre-sorted by parsed semver
-/// version descending (best version first), with per-route round-robin counters.
 pub struct RouteGroup {
-    pub candidates: Vec<ParsedRule>,
-    /// Round-robin counter used when no `x-wr-version` is pinned (spreads across
-    /// all versions).
+    pub namespace: Arc<str>,
+    pub module: Arc<str>,
+    pub namespace_header: HeaderValue,
+    pub module_header: HeaderValue,
+    pub candidates: Vec<IndexedCandidate>,
+    /// Unique exact versions in descending semantic-version order.
+    pub version_groups: Vec<VersionGroup>,
     pub all_versions_counter: AtomicUsize,
-    /// Candidates grouped by exact `destination_version` string.
-    pub by_version: HashMap<Arc<str>, VersionGroup>,
 }
 
-/// Pre-indexed routing table built once at sync time (every ~2s) rather than
-/// scanned linearly on every request. Rules are grouped by `(namespace, module)`
-/// into a `RouteGroup`; per-route `AtomicUsize` counters live here (not in the
-/// middleware) and are carried over best-effort across syncs.
 pub struct IndexedRoutingTable {
-    by_module: HashMap<RouteKey, RouteGroup>,
+    by_namespace: HashMap<Arc<str>, ModulesByName>,
+    active_forward_addrs: HashSet<Arc<str>>,
+    #[cfg(any(test, feature = "test-util"))]
+    lookup_calls: AtomicUsize,
     pub version: u64,
+}
+
+struct PreparedCandidate {
+    parsed_version: ModuleVersion,
+    version: String,
+    destination: Destination,
+    breaker: EngineBreaker,
 }
 
 impl IndexedRoutingTable {
     pub fn empty() -> Self {
         Self {
-            by_module: HashMap::new(),
+            by_namespace: HashMap::new(),
+            active_forward_addrs: HashSet::new(),
+            #[cfg(any(test, feature = "test-util"))]
+            lookup_calls: AtomicUsize::new(0),
             version: 0,
         }
     }
 
-    /// Build the index from a protobuf `RoutingTable` received from the manager.
-    /// Only healthy rules are indexed; unhealthy rules are dropped at sync time.
-    pub fn from_proto(table: &RoutingTable, prev: Option<&IndexedRoutingTable>) -> Self {
-        let mut grouped: HashMap<RouteKey, Vec<ParsedRule>> = HashMap::new();
+    /// Build an immutable request index from a manager routing table.
+    pub fn from_proto(
+        table: &RoutingTable,
+        prev: Option<&IndexedRoutingTable>,
+        registry: &CircuitBreakerRegistry,
+        self_peer_address: &str,
+    ) -> Self {
+        let mut grouped: HashMap<RouteKey, Vec<PreparedCandidate>> = HashMap::new();
+        let mut active_forward_addrs = HashSet::new();
 
         for rule in &table.rules {
             if !rule.healthy {
@@ -79,93 +98,187 @@ impl IndexedRoutingTable {
                     continue;
                 }
             };
-            grouped.entry(key).or_default().push(ParsedRule {
-                rule: rule.clone(),
+            if let Err(error) = HeaderValue::from_str(&rule.destination_version) {
+                warn!(rule_id = %rule.rule_id, %error, "skipping routing rule with invalid version header");
+                continue;
+            }
+
+            let destination = make_destination(rule, self_peer_address);
+            let address: Arc<str> = Arc::from(destination.address());
+            let breaker = registry.resolve(&address);
+            if !address.is_empty() {
+                active_forward_addrs.insert(address);
+            }
+            grouped.entry(key).or_default().push(PreparedCandidate {
                 parsed_version,
+                version: rule.destination_version.clone(),
+                destination,
+                breaker,
             });
         }
 
-        let mut by_module: HashMap<RouteKey, RouteGroup> = HashMap::with_capacity(grouped.len());
+        let mut by_namespace: HashMap<Arc<str>, ModulesByName> = HashMap::new();
+        for (key, mut prepared) in grouped {
+            prepared.sort_by(|a, b| b.parsed_version.cmp(&a.parsed_version));
 
-        for (key, mut candidates) in grouped {
-            // Sort each group by version descending so the best version is at the front.
-            candidates.sort_by(|a, b| b.parsed_version.cmp(&a.parsed_version));
+            let namespace: Arc<str> = Arc::from(key.namespace.as_str());
+            let module: Arc<str> = Arc::from(key.module.as_str());
+            let namespace_header = match HeaderValue::from_str(&namespace) {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(namespace = %namespace, %error, "skipping route group with invalid namespace header");
+                    continue;
+                }
+            };
+            let module_header = match HeaderValue::from_str(&module) {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(module = %module, %error, "skipping route group with invalid module header");
+                    continue;
+                }
+            };
 
-            // Group candidate indexes by exact version string.
-            let mut by_version: HashMap<Arc<str>, VersionGroup> = HashMap::new();
-            for (idx, c) in candidates.iter().enumerate() {
-                let ver: Arc<str> = Arc::from(c.rule.destination_version.as_str());
-                by_version
-                    .entry(ver)
-                    .or_insert_with(|| VersionGroup {
+            let mut version_indexes: HashMap<Arc<str>, usize> = HashMap::new();
+            let mut version_groups: Vec<VersionGroup> = Vec::new();
+            let mut candidates = Vec::with_capacity(prepared.len());
+            for candidate in prepared {
+                let version_group_index = if let Some(&index) =
+                    version_indexes.get(candidate.version.as_str())
+                {
+                    index
+                } else {
+                    let version: Arc<str> = Arc::from(candidate.version.as_str());
+                    let version_header = match HeaderValue::from_str(&version) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            warn!(version = %version, %error, "skipping routing candidate with invalid version header");
+                            continue;
+                        }
+                    };
+                    let index = version_groups.len();
+                    version_indexes.insert(version.clone(), index);
+                    version_groups.push(VersionGroup {
+                        parsed_version: candidate.parsed_version.clone(),
+                        version,
+                        version_header,
                         candidate_indexes: Vec::new(),
                         counter: AtomicUsize::new(0),
-                    })
+                    });
+                    index
+                };
+
+                let candidate_index = candidates.len();
+                version_groups[version_group_index]
                     .candidate_indexes
-                    .push(idx);
+                    .push(candidate_index);
+                candidates.push(IndexedCandidate {
+                    destination: candidate.destination,
+                    breaker: candidate.breaker,
+                    version_group_index,
+                });
             }
 
-            // Best-effort counter carry-over from the previous table: same
-            // (ns, module) seeds all_versions_counter; same (ns, module, version)
-            // seeds the per-version counter. Missing keys start at 0.
-            let prev_group = prev.and_then(|p| p.by_module.get(&key));
-            for (ver, vg) in by_version.iter_mut() {
-                if let Some(pvg) = prev_group.and_then(|g| g.by_version.get(ver)) {
-                    vg.counter = AtomicUsize::new(pvg.counter.load(Ordering::Relaxed));
-                }
+            if candidates.is_empty() {
+                continue;
             }
-            let all_versions_counter = AtomicUsize::new(
-                prev_group.map_or(0, |g| g.all_versions_counter.load(Ordering::Relaxed)),
-            );
 
-            by_module.insert(
-                key,
-                RouteGroup {
-                    candidates,
-                    all_versions_counter,
-                    by_version,
-                },
-            );
+            let mut group = RouteGroup {
+                namespace: namespace.clone(),
+                module: module.clone(),
+                namespace_header,
+                module_header,
+                candidates,
+                version_groups,
+                all_versions_counter: AtomicUsize::new(0),
+            };
+            if let Some(previous) = prev.and_then(|table| table.get(&namespace, &module)) {
+                seed_group_counters(&mut group, previous);
+            }
+
+            let canonical_namespace = by_namespace
+                .get_key_value(namespace.as_ref())
+                .map_or(namespace, |(existing, _)| existing.clone());
+            group.namespace = canonical_namespace.clone();
+            by_namespace
+                .entry(canonical_namespace)
+                .or_default()
+                .insert(module, group);
         }
 
         Self {
-            by_module,
+            by_namespace,
+            active_forward_addrs,
+            #[cfg(any(test, feature = "test-util"))]
+            lookup_calls: AtomicUsize::new(0),
             version: table.version,
         }
     }
 
-    /// Collect the forwarding addresses the circuit breaker keys on, matching
-    /// `make_destination`: the engine address for locally-dispatched rules
-    /// (`peer_address == self_peer_address`), the peer address for remote rules.
-    /// Empty addresses are skipped.
-    pub fn active_forward_addrs(&self, self_peer_address: &str) -> std::collections::HashSet<&str> {
-        self.by_module
-            .values()
-            .flat_map(|group| group.candidates.iter())
-            .filter_map(|r| {
-                let addr = if r.rule.peer_address == self_peer_address {
-                    r.rule.engine_address.as_str()
-                } else {
-                    r.rule.peer_address.as_str()
-                };
-                (!addr.is_empty()).then_some(addr)
-            })
-            .collect()
+    pub(crate) fn seed_counters_from(&mut self, previous: &IndexedRoutingTable) {
+        for (namespace, modules) in &mut self.by_namespace {
+            for (module, group) in modules {
+                if let Some(previous_group) = previous.get(namespace, module) {
+                    seed_group_counters(group, previous_group);
+                }
+            }
+        }
     }
 
-    /// Look up the route group for a `(namespace, module)` pair. Returns `None`
-    /// when no healthy routes exist for this destination.
+    pub(crate) fn active_forward_addrs(&self) -> &HashSet<Arc<str>> {
+        &self.active_forward_addrs
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn reset_lookup_calls(&self) {
+        self.lookup_calls.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn lookup_calls(&self) -> usize {
+        self.lookup_calls.load(Ordering::Relaxed)
+    }
+
+    /// Borrowed two-level lookup with no request-owned route key.
     pub fn get(&self, namespace: &str, module: &str) -> Option<&RouteGroup> {
-        RouteKey::parse(namespace, module)
-            .ok()
-            .and_then(|key| self.by_module.get(&key))
+        #[cfg(any(test, feature = "test-util"))]
+        self.lookup_calls.fetch_add(1, Ordering::Relaxed);
+        self.by_namespace.get(namespace)?.get(module)
+    }
+}
+
+fn make_destination(rule: &RoutingRule, self_peer_address: &str) -> Destination {
+    if rule.peer_address == self_peer_address {
+        Destination::local(Arc::from(rule.engine_address.as_str()))
+    } else {
+        Destination::remote(Arc::from(rule.peer_address.as_str()))
+    }
+}
+
+fn seed_group_counters(group: &mut RouteGroup, previous: &RouteGroup) {
+    group.all_versions_counter =
+        AtomicUsize::new(previous.all_versions_counter.load(Ordering::Relaxed));
+    for version_group in &mut group.version_groups {
+        if let Some(previous_version) = previous
+            .version_groups
+            .iter()
+            .find(|candidate| candidate.version == version_group.version)
+        {
+            version_group.counter =
+                AtomicUsize::new(previous_version.counter.load(Ordering::Relaxed));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wr_common::wruntime::RoutingRule;
+    use crate::config::CircuitBreakerConfig;
+
+    const SELF: &str = "http://self-peer";
+
+    fn registry() -> CircuitBreakerRegistry {
+        CircuitBreakerRegistry::new(CircuitBreakerConfig::default())
+    }
 
     fn rule(ns: &str, module: &str, version: &str, healthy: bool) -> RoutingRule {
         RoutingRule {
@@ -178,12 +291,16 @@ mod tests {
             healthy,
             source_namespace: String::new(),
             destination_namespace: ns.to_string(),
-            peer_address: "http://self-peer".to_string(),
+            peer_address: SELF.to_string(),
         }
     }
 
+    fn index(table: &RoutingTable, prev: Option<&IndexedRoutingTable>) -> IndexedRoutingTable {
+        IndexedRoutingTable::from_proto(table, prev, &registry(), SELF)
+    }
+
     #[test]
-    fn indexes_by_namespace_module() {
+    fn nested_borrowed_lookup_and_canonical_identity() {
         let table = RoutingTable {
             rules: vec![
                 rule("ns", "svc-a", "1.0.0", true),
@@ -192,85 +309,114 @@ mod tests {
             ],
             version: 1,
         };
-        let idx = IndexedRoutingTable::from_proto(&table, None);
-        assert_eq!(idx.get("ns", "svc-a").unwrap().candidates.len(), 2);
-        assert_eq!(idx.get("ns", "svc-b").unwrap().candidates.len(), 1);
-        assert!(idx.get("ns", "svc-c").is_none());
+        let indexed = index(&table, None);
+        let group = indexed.get("ns", "svc-a").unwrap();
+        let namespace_key = indexed
+            .by_namespace
+            .keys()
+            .find(|key| &***key == "ns")
+            .unwrap();
+        let module_key = indexed
+            .by_namespace
+            .get("ns")
+            .unwrap()
+            .keys()
+            .find(|key| &***key == "svc-a")
+            .unwrap();
+        assert!(Arc::ptr_eq(namespace_key, &group.namespace));
+        assert!(Arc::ptr_eq(module_key, &group.module));
+        assert_eq!(group.namespace_header, "ns");
+        assert_eq!(group.module_header, "svc-a");
+        assert_eq!(group.candidates.len(), 2);
+        assert!(indexed.get("ns", "missing").is_none());
     }
 
     #[test]
-    fn sorted_descending_by_version() {
+    fn version_groups_are_unique_descending_and_candidates_reference_them() {
         let table = RoutingTable {
             rules: vec![
                 rule("ns", "svc", "1.0.0", true),
                 rule("ns", "svc", "3.0.0", true),
                 rule("ns", "svc", "2.0.0", true),
+                rule("ns", "svc", "3.0.0", true),
             ],
             version: 1,
         };
-        let idx = IndexedRoutingTable::from_proto(&table, None);
-        let rules = &idx.get("ns", "svc").unwrap().candidates;
-        let versions: Vec<&str> = rules
+        let indexed = index(&table, None);
+        let group = indexed.get("ns", "svc").unwrap();
+        let versions: Vec<&str> = group
+            .version_groups
             .iter()
-            .map(|r| r.rule.destination_version.as_str())
+            .map(|version| &*version.version)
             .collect();
-        assert_eq!(versions, vec!["3.0.0", "2.0.0", "1.0.0"]);
+        assert_eq!(versions, ["3.0.0", "2.0.0", "1.0.0"]);
+        assert_eq!(group.version_groups[0].candidate_indexes.len(), 2);
+        for (version_index, version) in group.version_groups.iter().enumerate() {
+            for &candidate_index in &version.candidate_indexes {
+                assert_eq!(
+                    group.candidates[candidate_index].version_group_index,
+                    version_index
+                );
+            }
+        }
     }
 
     #[test]
-    fn excludes_unhealthy_rules() {
+    fn excludes_invalid_and_unhealthy_rules_before_breaker_resolution() {
+        let registry = registry();
+        let mut invalid_identity = rule("bad_name", "svc", "1.0.0", true);
+        invalid_identity.rule_id = "invalid-identity".into();
+        let mut invalid_version = rule("ns", "svc", "latest", true);
+        invalid_version.rule_id = "invalid-version".into();
+        let mut empty_peer = rule("ns", "svc", "1.0.0", true);
+        empty_peer.peer_address.clear();
         let table = RoutingTable {
             rules: vec![
                 rule("ns", "svc", "1.0.0", true),
                 rule("ns", "svc", "2.0.0", false),
+                invalid_identity,
+                invalid_version,
+                empty_peer,
             ],
             version: 1,
         };
-        let idx = IndexedRoutingTable::from_proto(&table, None);
-        let group = idx.get("ns", "svc").unwrap();
-        assert_eq!(group.candidates.len(), 1);
-        assert_eq!(group.candidates[0].rule.destination_version, "1.0.0");
+        let indexed = IndexedRoutingTable::from_proto(&table, None, &registry, SELF);
+        assert_eq!(indexed.get("ns", "svc").unwrap().candidates.len(), 1);
+        assert_eq!(registry.resolver_calls(), 1);
     }
 
     #[test]
-    fn empty_table() {
+    fn prepares_local_remote_and_uri_bases() {
+        let mut local = rule("ns", "local", "1.0.0", true);
+        local.engine_address = "http://127.0.0.1:9100/".into();
+        let mut remote = rule("ns", "remote", "1.0.0", true);
+        remote.peer_address = "https://[::1]:9443".into();
+        let mut fallback = rule("ns", "fallback", "1.0.0", true);
+        fallback.engine_address = "http://engine/base".into();
         let table = RoutingTable {
-            rules: vec![],
-            version: 0,
-        };
-        let idx = IndexedRoutingTable::from_proto(&table, None);
-        assert!(idx.get("ns", "svc").is_none());
-        assert_eq!(idx.version, 0);
-    }
-
-    #[test]
-    fn active_forward_addrs_local_and_remote() {
-        const SELF: &str = "http://self-peer";
-        // Local rule: peer_address == self → contributes engine_address.
-        let mut local = rule("ns", "svc-a", "1.0.0", true);
-        local.peer_address = SELF.to_string();
-        local.engine_address = "http://engine-local".to_string();
-        // Remote rule: peer_address != self → contributes peer_address, not engine_address.
-        let mut remote = rule("ns", "svc-b", "1.0.0", true);
-        remote.peer_address = "http://remote-peer".to_string();
-        remote.engine_address = "http://engine-remote".to_string();
-
-        let table = RoutingTable {
-            rules: vec![local, remote],
+            rules: vec![local, remote, fallback],
             version: 1,
         };
-        let idx = IndexedRoutingTable::from_proto(&table, None);
-        let addrs = idx.active_forward_addrs(SELF);
-
-        assert!(addrs.contains("http://engine-local"));
-        assert!(addrs.contains("http://remote-peer"));
-        assert!(!addrs.contains("http://engine-remote"));
-        assert!(!addrs.contains(SELF));
-        assert_eq!(addrs.len(), 2);
+        let indexed = index(&table, None);
+        assert!(indexed.get("ns", "local").unwrap().candidates[0]
+            .destination
+            .target()
+            .base_uri()
+            .is_some());
+        assert!(indexed.get("ns", "remote").unwrap().candidates[0]
+            .destination
+            .target()
+            .base_uri()
+            .is_some());
+        assert!(indexed.get("ns", "fallback").unwrap().candidates[0]
+            .destination
+            .target()
+            .base_uri()
+            .is_none());
     }
 
     #[test]
-    fn counter_carry_over_seeds_from_previous_table() {
+    fn counters_carry_over_by_route_and_exact_version() {
         let table = RoutingTable {
             rules: vec![
                 rule("ns", "svc", "1.0.0", true),
@@ -278,18 +424,27 @@ mod tests {
             ],
             version: 1,
         };
-        let prev = IndexedRoutingTable::from_proto(&table, None);
-        // Advance the all-versions counter on the previous table.
-        let g = prev.get("ns", "svc").unwrap();
-        g.all_versions_counter.fetch_add(5, Ordering::Relaxed);
+        let previous = index(&table, None);
+        let previous_group = previous.get("ns", "svc").unwrap();
+        previous_group
+            .all_versions_counter
+            .store(5, Ordering::Relaxed);
+        previous_group.version_groups[0]
+            .counter
+            .store(7, Ordering::Relaxed);
 
-        let next = IndexedRoutingTable::from_proto(&table, Some(&prev));
+        let next = index(
+            &RoutingTable {
+                version: 2,
+                ..table
+            },
+            Some(&previous),
+        );
+        let next_group = next.get("ns", "svc").unwrap();
+        assert_eq!(next_group.all_versions_counter.load(Ordering::Relaxed), 5);
         assert_eq!(
-            next.get("ns", "svc")
-                .unwrap()
-                .all_versions_counter
-                .load(Ordering::Relaxed),
-            5
+            next_group.version_groups[0].counter.load(Ordering::Relaxed),
+            7
         );
     }
 }

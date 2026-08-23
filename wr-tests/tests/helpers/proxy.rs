@@ -93,25 +93,10 @@ pub async fn upsert_admin_route(
 }
 
 pub async fn start_proxy(table: wr_proxy::routing::CachedRoutingTable) -> Result<SocketAddr> {
-    start_proxy_on(table, TEST_SELF_PEER).await
-}
-
-/// Build and start a proxy with a custom `self_peer_address`; returns the bound address.
-pub async fn start_proxy_on(
-    table: wr_proxy::routing::CachedRoutingTable,
-    self_peer_address: &str,
-) -> Result<SocketAddr> {
-    let cb_registry = Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
-        Default::default(),
-    ));
     let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::RoutingLayer::new(
-            table,
-            self_peer_address,
-            cb_registry.clone(),
-        ))
+        .layer(wr_proxy::layers::RoutingLayer::new(table.clone()))
         .service(wr_proxy::layers::ForwardService::new(
-            cb_registry,
+            table.open_duration_secs(),
             test_mtls_pool(),
         ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -125,18 +110,11 @@ pub async fn start_ingress_proxy(
     table: wr_proxy::routing::CachedRoutingTable,
     routes: Vec<ExternalRoute>,
 ) -> Result<SocketAddr> {
-    let cb_registry = Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
-        Default::default(),
-    ));
     let svc = tower::ServiceBuilder::new()
         .layer(wr_proxy::layers::IngressLayer::new(routes)?)
-        .layer(wr_proxy::layers::RoutingLayer::new(
-            table,
-            TEST_SELF_PEER,
-            cb_registry.clone(),
-        ))
+        .layer(wr_proxy::layers::RoutingLayer::new(table.clone()))
         .service(wr_proxy::layers::ForwardService::new(
-            cb_registry,
+            table.open_duration_secs(),
             test_mtls_pool(),
         ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -155,17 +133,11 @@ pub async fn start_egress_proxy(
         .as_ref()
         .map(|e| e.allowed_domains.clone())
         .unwrap_or_default();
-    let cb_registry = Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
-        Default::default(),
-    ));
     let svc = tower::ServiceBuilder::new()
-        .layer(
-            wr_proxy::layers::RoutingLayer::new(table, TEST_SELF_PEER, cb_registry.clone())
-                .with_egress(egress_domains),
-        )
+        .layer(wr_proxy::layers::RoutingLayer::new(table.clone()).with_egress(egress_domains))
         .layer(wr_proxy::layers::EgressLayer::new(egress_cfg))
         .service(wr_proxy::layers::ForwardService::new(
-            cb_registry,
+            table.open_duration_secs(),
             test_mtls_pool(),
         ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -207,20 +179,16 @@ pub async fn start_node(mgr_addr: &str) -> Result<Node> {
     )?;
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(server_config);
 
-    let table = wr_proxy::routing::new_routing_table();
+    let table = wr_proxy::routing::new_routing_table(
+        Default::default(),
+        Arc::<str>::from(proxy_address.as_str()),
+    );
     sync_table(mgr_addr, &table).await?;
 
-    let cb_registry = Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
-        Default::default(),
-    ));
     let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::RoutingLayer::new(
-            table.clone(),
-            &proxy_address,
-            cb_registry.clone(),
-        ))
+        .layer(wr_proxy::layers::RoutingLayer::new(table.clone()))
         .service(wr_proxy::layers::ForwardService::new(
-            cb_registry,
+            table.open_duration_secs(),
             test_mtls_pool(),
         ));
 
@@ -255,6 +223,24 @@ pub async fn proxy_get(
     destination_module: &str,
     version: Option<&str>,
 ) -> Result<(StatusCode, String)> {
+    proxy_get_with_client(
+        &http_client(),
+        proxy_addr,
+        namespace,
+        destination_module,
+        version,
+    )
+    .await
+}
+
+/// Send a proxy GET through a caller-owned HTTP/2 client.
+pub async fn proxy_get_with_client(
+    client: &ProxyHttpClient,
+    proxy_addr: SocketAddr,
+    namespace: &str,
+    destination_module: &str,
+    version: Option<&str>,
+) -> Result<(StatusCode, String)> {
     let path = "/Ping";
     let mut builder = Request::builder()
         .uri(format!("http://{proxy_addr}{path}"))
@@ -263,14 +249,14 @@ pub async fn proxy_get(
             format!("http://{namespace}.{destination_module}{path}"),
         )
         .header("x-wr-source", "test-caller");
-    if let Some(v) = version {
-        builder = builder.header("x-wr-version", v);
+    if let Some(version) = version {
+        builder = builder.header("x-wr-version", version);
     }
-    let resp = http_client()
+    let response = client
         .request(builder.body(Full::new(Bytes::new()))?)
         .await?;
-    let status = resp.status();
-    let body = resp.into_body().collect().await?.to_bytes();
+    let status = response.status();
+    let body = response.into_body().collect().await?.to_bytes();
     Ok((status, String::from_utf8_lossy(&body).into_owned()))
 }
 
@@ -359,11 +345,13 @@ where
     }
 }
 
-/// Build an HTTP/2 client for sending test requests through the proxy.
-pub fn http_client() -> hyper_util::client::legacy::Client<
+pub type ProxyHttpClient = hyper_util::client::legacy::Client<
     hyper_util::client::legacy::connect::HttpConnector,
     Full<Bytes>,
-> {
+>;
+
+/// Build an HTTP/2 client for sending test requests through the proxy.
+pub fn http_client() -> ProxyHttpClient {
     hyper_util::client::legacy::Client::builder(TokioExecutor::new())
         .http2_only(true)
         .build_http::<Full<Bytes>>()
@@ -376,19 +364,11 @@ pub fn http_pool() -> wr_common::http_pool::HttpClientPool<Full<Bytes>> {
 
 pub async fn start_proxy_with_cb(
     table: wr_proxy::routing::CachedRoutingTable,
-    cb_config: wr_proxy::config::CircuitBreakerConfig,
 ) -> Result<SocketAddr> {
-    let cb_registry = Arc::new(wr_proxy::circuit_breaker::CircuitBreakerRegistry::new(
-        cb_config,
-    ));
     let svc = tower::ServiceBuilder::new()
-        .layer(wr_proxy::layers::RoutingLayer::new(
-            table,
-            TEST_SELF_PEER,
-            cb_registry.clone(),
-        ))
+        .layer(wr_proxy::layers::RoutingLayer::new(table.clone()))
         .service(wr_proxy::layers::ForwardService::new(
-            cb_registry,
+            table.open_duration_secs(),
             test_mtls_pool(),
         ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;

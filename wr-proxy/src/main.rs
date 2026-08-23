@@ -29,19 +29,20 @@ use wr_common::wruntime::node_service_server::NodeServiceServer;
 async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("failed to install rustls crypto provider");
+        .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
 
     let _telemetry = wr_common::telemetry::init("wr-proxy")?;
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "proxy.toml".to_string());
     let config = config::ProxyConfig::load(&config_path)?;
+    let self_address = config.node.peer_address()?;
 
     // ── Shared state ──────────────────────────────────────────────────────
-    let routing_table = routing::new_routing_table();
-    let cb_registry = Arc::new(circuit_breaker::CircuitBreakerRegistry::new(
+    let routing_table = routing::new_routing_table(
         config.circuit_breaker.clone(),
-    ));
+        Arc::<str>::from(self_address.as_str()),
+    );
 
     // ── Manager discovery via Postgres ────────────────────────────────────
     let db_pool = wr_common::pool::build_pool_with_search_path(
@@ -57,15 +58,13 @@ async fn main() -> Result<()> {
     discovery.spawn_refresh_task();
     info!("manager discovery initialized");
 
-    let self_address = config.node.peer_address()?;
-
     // ── Initial routing table sync (blocks until first fetch succeeds) ──
     {
         let mut client = discovery
             .get_client()
             .await
             .map_err(|e| anyhow::anyhow!("initial manager connect failed: {e}"))?;
-        routing::sync_once(&mut client, &routing_table, &cb_registry, &self_address)
+        routing::sync_once(&mut client, &routing_table)
             .await
             .context("initial routing table sync failed")?;
         info!("initial routing table sync complete");
@@ -76,8 +75,6 @@ async fn main() -> Result<()> {
         discovery.clone(),
         routing_table.clone(),
         config.cache.routing_table_ttl_secs,
-        cb_registry.clone(),
-        self_address.clone(),
     ));
 
     // ── NodeService gRPC control plane ───────────────────────────────────
@@ -117,16 +114,12 @@ async fn main() -> Result<()> {
         .unwrap_or_default();
     let internal_svc = ServiceBuilder::new()
         .layer(TracingLayer)
-        .layer(
-            RoutingLayer::new(
-                routing_table.clone(),
-                self_address.clone(),
-                cb_registry.clone(),
-            )
-            .with_egress(egress_domains),
-        )
+        .layer(RoutingLayer::new(routing_table.clone()).with_egress(egress_domains))
         .layer(EgressLayer::new(config.egress.clone()))
-        .service(ForwardService::new(cb_registry.clone(), mtls_pool.clone()));
+        .service(ForwardService::new(
+            routing_table.open_duration_secs(),
+            mtls_pool.clone(),
+        ));
 
     // Internal listener — loopback only
     let internal_listener = TcpListener::bind(&config.listen_address).await?;
@@ -151,12 +144,11 @@ async fn main() -> Result<()> {
         let external_svc = ServiceBuilder::new()
             .layer(IngressLayer::new(ext.routes.clone())?)
             .layer(TracingLayer)
-            .layer(RoutingLayer::new(
-                routing_table,
-                self_address,
-                cb_registry.clone(),
-            ))
-            .service(ForwardService::new(cb_registry.clone(), mtls_pool));
+            .layer(RoutingLayer::new(routing_table.clone()))
+            .service(ForwardService::new(
+                routing_table.open_duration_secs(),
+                mtls_pool,
+            ));
 
         let external_listener = TcpListener::bind(&ext.listen_address).await?;
         info!(address = %ext.listen_address, "proxy listening (external)");

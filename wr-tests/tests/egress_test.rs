@@ -1,7 +1,7 @@
 mod helpers;
 use helpers::{
     manager::{manager_trio, register_test_module_ready, synced_routing_table},
-    proxy::{http_client, proxy_get, start_egress_proxy, EgressConfig},
+    proxy::{http_client, proxy_get, start_egress_proxy, EgressConfig, TEST_SELF_PEER},
     stubs::{spawn_http1_stub, spawn_stub_engine},
 };
 
@@ -16,7 +16,7 @@ use http_body_util::{BodyExt, Full};
 async fn test_egress_allowed_domain() -> Result<()> {
     let (ext_base, ext_shutdown) = spawn_http1_stub().await?;
 
-    let table = wr_proxy::routing::new_routing_table();
+    let table = wr_proxy::routing::new_routing_table(Default::default(), TEST_SELF_PEER);
     let proxy_addr = start_egress_proxy(
         Some(EgressConfig {
             allowed_domains: vec!["127.0.0.1".into()],
@@ -49,7 +49,7 @@ async fn test_egress_allowed_domain() -> Result<()> {
 /// in the egress allowlist and has no internal route.
 #[tokio::test]
 async fn test_egress_blocked_domain() -> Result<()> {
-    let table = wr_proxy::routing::new_routing_table();
+    let table = wr_proxy::routing::new_routing_table(Default::default(), TEST_SELF_PEER);
     let proxy_addr = start_egress_proxy(
         Some(EgressConfig {
             allowed_domains: vec!["127.0.0.1".into()],

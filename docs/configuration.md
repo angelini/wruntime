@@ -109,7 +109,7 @@ failure_threshold  = 5    # consecutive failures (5xx / 429 / network error) bef
 open_duration_secs = 30   # seconds the breaker stays open before probing again
 ```
 
-Omitting the entire `[circuit_breaker]` section keeps circuit breaking enabled with the defaults shown above; there is currently no config flag to disable it. When the section is present, both fields are required and must be greater than zero. Breakers are keyed by the concrete forwarding address. Routing skips a known-open destination when another eligible replica exists; if every eligible destination is open, the proxy returns `503 circuit open` with `Retry-After`.
+Omitting the entire `[circuit_breaker]` section keeps circuit breaking enabled with the defaults shown above; there is currently no config flag to disable it. When the section is present, both fields are required and must be greater than zero. Breakers are keyed by the concrete forwarding address and resolved while routing snapshots are prepared. Continuously active addresses retain the same breaker across routing refreshes. A completed refresh that publishes an address as absent and evicts it is the reset boundary; a later re-add receives a fresh closed breaker. In-flight requests keep their old handle, which cannot reinsert registry membership or affect a later fresh handle. Routing skips a known-open destination when another eligible replica exists; if every eligible destination is open, the proxy returns `503 circuit open` with `Retry-After`. Multiple remote routes through one peer address intentionally share that peer breaker's state.
 
 ### External routes (public API)
 

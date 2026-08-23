@@ -9,7 +9,7 @@
 mod helpers;
 use helpers::{
     manager::{manager_trio, register_test_module_ready, sync_table, synced_routing_table},
-    proxy::{proxy_get, start_proxy},
+    proxy::{http_client, proxy_get_with_client, start_proxy, TEST_SELF_PEER},
     stubs::spawn_stub_engine,
     wasm::{spawn_wasm_stub_engine, wasm_module_pre},
 };
@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
+use http::StatusCode;
 use http_body_util::Full;
 use prost::Message;
 
@@ -145,7 +146,7 @@ async fn bench_hot_path() -> Result<()> {
     // ── Infrastructure ───────────────────────────────────────────────────────
     let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
-    let table = wr_proxy::routing::new_routing_table();
+    let table = wr_proxy::routing::new_routing_table(Default::default(), TEST_SELF_PEER);
     let proxy_addr = start_proxy(table.clone()).await?;
     let proxy_uri = format!("http://{proxy_addr}");
 
@@ -278,6 +279,10 @@ async fn bench_proxy_only() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(500);
+    let warmup: usize = std::env::var("BENCH_WARMUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
 
     let (pool, mgr_addr, mut mgr) = manager_trio().await?;
 
@@ -296,10 +301,13 @@ async fn bench_proxy_only() -> Result<()> {
 
     let table = synced_routing_table(&mgr_addr).await?;
     let proxy_addr = start_proxy(table).await?;
+    let client = http_client();
 
-    // Warmup
-    for _ in 0..10 {
-        let (status, _) = proxy_get(proxy_addr, "bench-ns", "target-svc", Some("1.0.0")).await?;
+    // Warm the reusable HTTP/2 connection before measurement.
+    for _ in 0..warmup {
+        let (status, _) =
+            proxy_get_with_client(&client, proxy_addr, "bench-ns", "target-svc", Some("1.0.0"))
+                .await?;
         assert_eq!(status, 200);
     }
 
@@ -307,13 +315,50 @@ async fn bench_proxy_only() -> Result<()> {
     let mut latencies = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let start = Instant::now();
-        let (status, _) = proxy_get(proxy_addr, "bench-ns", "target-svc", Some("1.0.0")).await?;
+        let (status, _) =
+            proxy_get_with_client(&client, proxy_addr, "bench-ns", "target-svc", Some("1.0.0"))
+                .await?;
         let elapsed = start.elapsed();
         assert_eq!(status, 200);
         latencies.push(elapsed);
     }
 
     print_latency_stats("proxy→stub (sequential)", &mut latencies);
+    let sequential_rps = latencies.len() as f64 / latencies.iter().sum::<Duration>().as_secs_f64();
+
+    let concurrency: usize = std::env::var("BENCH_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let wall_start = Instant::now();
+    let mut handles = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let client = client.clone();
+        handles.push(tokio::spawn(async move {
+            let start = Instant::now();
+            let response =
+                proxy_get_with_client(&client, proxy_addr, "bench-ns", "target-svc", Some("1.0.0"))
+                    .await;
+            let elapsed = start.elapsed();
+            drop(permit);
+            (response, elapsed)
+        }));
+    }
+
+    let mut concurrent_latencies = Vec::with_capacity(iterations);
+    for handle in handles {
+        let (response, elapsed) = handle.await?;
+        assert_eq!(response?.0, StatusCode::OK);
+        concurrent_latencies.push(elapsed);
+    }
+    print_concurrent_stats(
+        &format!("proxy→stub (concurrent, {concurrency} in-flight)"),
+        &mut concurrent_latencies,
+        wall_start.elapsed(),
+        sequential_rps,
+    );
 
     Ok(())
 }

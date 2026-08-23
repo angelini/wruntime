@@ -11,7 +11,7 @@ use helpers::{
     proto,
     proxy::{
         http_client, http_pool, start_egress_proxy, start_ingress_proxy, EgressConfig,
-        ExternalRoute,
+        ExternalRoute, TEST_SELF_PEER,
     },
     stubs::spawn_http1_stub,
     wasm::{spawn_wasm_stub_engine, GuestHarness, TestGuest},
@@ -29,7 +29,7 @@ async fn wasm_http_egress() -> Result<()> {
     let ext_authority = ext_uri.authority().unwrap().to_string();
 
     // Egress proxy with 127.0.0.1 in the allowlist.
-    let table = wr_proxy::routing::new_routing_table();
+    let table = wr_proxy::routing::new_routing_table(Default::default(), TEST_SELF_PEER);
     let egress_cfg = EgressConfig {
         allowed_domains: vec!["127.0.0.1".into()],
     };

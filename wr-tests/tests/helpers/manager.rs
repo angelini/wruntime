@@ -182,9 +182,16 @@ pub async fn register_test_module_ready_with_peer(
     }
 }
 
-/// Create a routing table and sync it from the manager in one step.
+/// Create a routing cache and sync it from the manager in one step.
 pub async fn synced_routing_table(mgr_addr: &str) -> Result<wr_proxy::routing::CachedRoutingTable> {
-    let table = wr_proxy::routing::new_routing_table();
+    synced_routing_table_with_config(mgr_addr, Default::default()).await
+}
+
+pub async fn synced_routing_table_with_config(
+    mgr_addr: &str,
+    config: wr_proxy::config::CircuitBreakerConfig,
+) -> Result<wr_proxy::routing::CachedRoutingTable> {
+    let table = wr_proxy::routing::new_routing_table(config, Arc::<str>::from(TEST_SELF_PEER));
     sync_table(mgr_addr, &table).await?;
     Ok(table)
 }
@@ -261,8 +268,7 @@ pub async fn sync_table(
         .into_inner()
         .table
     {
-        *table.write().await =
-            wr_proxy::indexed_routing::IndexedRoutingTable::from_proto(&incoming, None);
+        table.replace(&incoming).await;
     }
     Ok(())
 }

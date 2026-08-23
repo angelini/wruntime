@@ -15,6 +15,7 @@ just build-wasm-guests       # build every WASM guest sequentially
 just test-wasm               # build WASM guests, then run host binding tests
 just clean-wasm-cache        # remove only the shared Cargo guest cache
 just validate-ecommerce      # ecommerce inline run, failing on WARN/WARNING output
+just bench-proxy-routing     # warmed HTTP/2 proxy routing/forwarding benchmark
 just validate-all            # full format/lint/WASM/test/E2E suite
 just dev-down                # stop dev infrastructure
 ```
@@ -22,6 +23,8 @@ just dev-down                # stop dev infrastructure
 `just test`, `just test-integration`, `just test-one`, and `just test-wasm`
 set the `WRT_TEST_DB_URL` and `WRT_TEST_S3_*` variables expected by
 integration tests. Run `just dev-up` first when using those full recipes.
+
+`just bench-proxy-routing [iterations] [warmup] [concurrency]` runs only the proxy-to-stub benchmark. It creates one HTTP/2 client, warms its connection before measurement, and reuses it for sequential and concurrent requests. The default dimensions are `500 10 20`; explicit positional values are preserved. `just bench [iterations] [warmup] [concurrency]` applies the same dimension contract to the full benchmark test target. `cargo test -p wr-proxy --features count-allocations direct_selection_core_is_allocation_free_for_eight_candidates` runs the vetted `allocation-counter` gate after a warm routing-core call; selector parsing is checked separately because `semver::VersionReq` parsing is not part of that zero-allocation selection boundary.
 
 Direct `cargo test -p wr-tests` runs are allowed for quick local checks.
 DB-backed tests use `WRT_TEST_DB_URL` and skip through the shared helper policy

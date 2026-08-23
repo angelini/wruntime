@@ -78,27 +78,65 @@ pub fn error_response(status: http::StatusCode, msg: &str) -> Response<ResBody> 
         .unwrap()
 }
 
+/// Prepared forwarding target shared by all snapshots and selected requests.
+#[derive(Clone)]
+pub struct ForwardTarget {
+    address: Arc<str>,
+    base_uri: Option<http::Uri>,
+}
+
+impl ForwardTarget {
+    pub(crate) fn new(address: Arc<str>) -> Self {
+        let base_uri = address.parse::<http::Uri>().ok().filter(|uri| {
+            uri.scheme().is_some()
+                && uri.authority().is_some()
+                && uri.query().is_none()
+                && matches!(uri.path(), "" | "/")
+        });
+        Self { address, base_uri }
+    }
+
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub(crate) fn base_uri(&self) -> Option<&http::Uri> {
+        self.base_uri.as_ref()
+    }
+}
+
 /// Routing decision made by [`RoutingLayer`]; consumed by [`ForwardService`].
-///
-/// Addresses are stored as `Arc<str>` so cloning a `Destination` is a
-/// cheap reference-count bump instead of a heap allocation.
 #[derive(Clone)]
 pub enum Destination {
-    /// Forward directly to the local engine at this address.
-    LocalEngine(Arc<str>),
-    /// Forward to a peer proxy at this address (cross-node hop).
-    RemoteProxy(Arc<str>),
+    /// Forward directly to the local engine at this target.
+    LocalEngine(ForwardTarget),
+    /// Forward to a peer proxy at this target (cross-node hop).
+    RemoteProxy(ForwardTarget),
 }
 
 impl Destination {
-    pub fn address(&self) -> &str {
+    pub(crate) fn local(address: Arc<str>) -> Self {
+        Self::LocalEngine(ForwardTarget::new(address))
+    }
+
+    pub(crate) fn remote(address: Arc<str>) -> Self {
+        Self::RemoteProxy(ForwardTarget::new(address))
+    }
+
+    pub fn target(&self) -> &ForwardTarget {
         match self {
-            Destination::LocalEngine(a) | Destination::RemoteProxy(a) => a,
+            Self::LocalEngine(target) | Self::RemoteProxy(target) => target,
         }
+    }
+
+    pub fn address(&self) -> &str {
+        self.target().address()
     }
 }
 
 /// Set by [`RoutingLayer`] on the request extensions; read by [`ForwardService`].
-/// Contains the single round-robin-selected candidate to forward to.
 #[derive(Clone)]
-pub struct ResolvedDestination(pub Destination);
+pub struct ResolvedRoute {
+    pub destination: Destination,
+    pub breaker: crate::circuit_breaker::EngineBreaker,
+}
