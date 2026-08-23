@@ -52,8 +52,12 @@ enum DeploymentState {
 }
 
 message DeploymentCondition {
-  string code = 1;
-  string detail = 2;
+  string code = 1; // stable machine-readable reason code
+  string detail = 2; // human-readable evidence; automation must use code/severity
+  StatusSeverity severity = 3;
+  string affected_identity = 4;
+  string desired = 5;
+  string actual = 6;
 }
 
 message DeploymentRecord {
@@ -182,6 +186,97 @@ message ListManagersRequest  {}
 message ManagerInfo          { string manager_id = 1; string grpc_address = 2; string gossip_address = 3; }
 message ListManagersResponse { repeated ManagerInfo managers = 1; }
 
+// ── Explainable cluster status ────────────────────────────────────────────
+
+// Numeric ordering is deliberate for deterministic reduction. UNKNOWN is a
+// separate evidence state and is ignored when reducing supported signals.
+enum StatusSeverity {
+  STATUS_SEVERITY_UNKNOWN = 0;
+  STATUS_SEVERITY_HEALTHY = 1;
+  STATUS_SEVERITY_DEGRADED = 2;
+  STATUS_SEVERITY_UNHEALTHY = 3;
+}
+
+enum ManagerMembershipState {
+  MANAGER_MEMBERSHIP_STATE_UNKNOWN = 0;
+  MANAGER_MEMBERSHIP_STATE_LIVE = 1;
+  MANAGER_MEMBERSHIP_STATE_DEAD = 2;
+}
+
+message ManagerStatus {
+  string manager_id = 1;
+  string grpc_address = 2;
+  string gossip_address = 3;
+  StatusSeverity severity = 4;
+  ManagerMembershipState membership = 5;
+  optional google.protobuf.Timestamp registered_at = 6;
+  optional google.protobuf.Timestamp last_heartbeat = 7;
+  uint64 heartbeat_age_seconds = 8;
+  repeated DeploymentCondition conditions = 9;
+}
+
+message ModuleStatus {
+  ModuleIdentity module = 1;
+  StatusSeverity severity = 2;
+  optional google.protobuf.Timestamp last_healthy = 3;
+  uint64 heartbeat_age_seconds = 4;
+  repeated DeploymentCondition conditions = 5;
+}
+
+message EngineStatus {
+  string engine_id = 1;
+  string address = 2;
+  DeploymentMetadata deployment = 3;
+  StatusSeverity severity = 4;
+  bool authoritative_for_desired_revision = 5;
+  optional google.protobuf.Timestamp registered_at = 6;
+  optional google.protobuf.Timestamp last_heartbeat = 7;
+  uint64 heartbeat_age_seconds = 8;
+  repeated ModuleStatus modules = 9;
+  repeated DeploymentCondition conditions = 10;
+}
+
+message RouteStatus {
+  RoutingRule rule = 1;
+  StatusSeverity severity = 2;
+  bool desired = 3;
+  optional google.protobuf.Timestamp updated_at = 4;
+  repeated DeploymentCondition conditions = 5;
+}
+
+message ServiceStatus {
+  ModuleIdentity service = 1;
+  StatusSeverity severity = 2;
+  uint32 desired_routes = 3;
+  uint32 healthy_routes = 4;
+  uint32 unhealthy_routes = 5;
+  repeated RouteStatus routes = 6;
+  repeated DeploymentCondition conditions = 7;
+}
+
+message NodeStatus {
+  string node_id = 1;
+  StatusSeverity severity = 2;
+  DeploymentRecord desired_deployment = 3;
+  repeated DeploymentRecord deployment_history = 4;
+  repeated EngineStatus engines = 5;
+  repeated DeploymentCondition conditions = 6;
+}
+
+message GetClusterStatusRequest {}
+message GetClusterStatusResponse {
+  optional google.protobuf.Timestamp response_at = 1;
+  optional google.protobuf.Timestamp database_observed_at = 2;
+  optional google.protobuf.Timestamp gossip_observed_at = 3;
+  uint64 routing_table_version = 4;
+  StatusSeverity severity = 5;
+  repeated ManagerStatus managers = 6;
+  repeated NodeStatus nodes = 7;
+  repeated EngineStatus engines = 8; // includes managed and unmanaged registrations
+  repeated ServiceStatus services = 9;
+  repeated DeploymentCondition conditions = 10; // cluster-wide/unsupported signals
+}
+
 // ── Schemas ───────────────────────────────────────────────────────────────
 
 message GetSchemaRequest    { string module = 1; string version = 2; string namespace = 3; }
@@ -296,8 +391,9 @@ service ManagerService {
   rpc UpsertRoutingRule (RoutingRule)              returns (UpsertRoutingRuleResponse);
   rpc DeleteRoutingRule (DeleteRoutingRuleRequest) returns (DeleteRoutingRuleResponse);
 
-  // Manager discovery
+  // Manager discovery and coherent read-only cluster status
   rpc ListManagers      (ListManagersRequest)      returns (ListManagersResponse);
+  rpc GetClusterStatus  (GetClusterStatusRequest)  returns (GetClusterStatusResponse);
 
   // Schemas
   rpc GetSchema         (GetSchemaRequest)         returns (GetSchemaResponse);

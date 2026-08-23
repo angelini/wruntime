@@ -1,6 +1,7 @@
 pub mod build_helpers;
 pub mod bundle;
 pub mod cert;
+pub mod cluster;
 pub mod config;
 pub mod db;
 pub mod deploy_config;

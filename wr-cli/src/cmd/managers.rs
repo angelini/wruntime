@@ -32,7 +32,7 @@ pub enum ManagersCommand {
     /// Deploy a manager bundle to a remote host
     Deploy(DeployArgs),
     /// Inspect a manager bundle without deploying
-    Status(StatusArgs),
+    InspectBundle(StatusArgs),
 }
 
 #[derive(Args)]
@@ -128,7 +128,7 @@ pub async fn run(args: ManagersArgs, manager: Option<&str>) -> Result<()> {
         }
         ManagersCommand::Bundle(bundle_args) => bundle(bundle_args),
         ManagersCommand::Deploy(deploy_args) => deploy(deploy_args).await,
-        ManagersCommand::Status(status_args) => status(status_args),
+        ManagersCommand::InspectBundle(status_args) => status(status_args),
     }
 }
 

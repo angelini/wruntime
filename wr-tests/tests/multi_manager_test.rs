@@ -16,8 +16,9 @@ use helpers::{
 use std::time::Duration;
 
 use wr_common::wruntime::{
-    BeginDeploymentRequest, EngineRegistration, ExpectedEngine, HeartbeatRequest,
-    ListManagersRequest, ModuleDescriptor, RegisterEngineRequest, VerifyDeploymentRequest,
+    BeginDeploymentRequest, EngineRegistration, ExpectedEngine, GetClusterStatusRequest,
+    HeartbeatRequest, ListManagersRequest, ModuleDescriptor, RegisterEngineRequest,
+    VerifyDeploymentRequest,
 };
 
 // ── Multi-manager integration tests ──────────────────────────────────────────
@@ -91,6 +92,26 @@ async fn test_deployment_desired_state_is_visible_across_managers() {
         .into_inner();
     assert_eq!(verification.deployment.unwrap().revision, 1);
     assert_eq!(verification.conditions[0].code, "MISSING_ENGINE");
+
+    let first_status = first
+        .get_cluster_status(GetClusterStatusRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let second_status = second
+        .get_cluster_status(GetClusterStatusRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        first_status.routing_table_version,
+        second_status.routing_table_version
+    );
+    assert_eq!(first_status.nodes, second_status.nodes);
+    assert_eq!(first_status.engines, second_status.engines);
+    assert_eq!(first_status.services, second_status.services);
+    assert!(first_status.response_at.is_some());
+    assert!(second_status.response_at.is_some());
 }
 
 /// Engine heartbeats to manager-1; manager-2 can also verify health via

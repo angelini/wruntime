@@ -584,12 +584,19 @@ wr-cli --manager https://manager-1:9000 engines list
 export WR_MANAGER=https://manager-1:9000
 wr-cli engines list
 
-# Discover all managers in the cluster from any seed
-wr-cli --manager https://manager-1:9000 engines list
-# Proxies and clients discover managers via ListManagers, which reconciles the
-# DB-fresh set against chitchat; direct wr_managers reads are a documented
-# bootstrap-only fallback when no manager RPC is reachable.
+# One coherent operator snapshot from any seed manager
+wr-cli --manager https://manager-1:9000 cluster status
+wr-cli --manager https://manager-1:9000 cluster status --output json
+
+# Focus and automation policies
+wr-cli cluster status --node node-a --detail
+wr-cli cluster status --service ecommerce.inventory@1.0.0 --fail-on unhealthy
+wr-cli cluster status --fail-on unknown  # strict: unknown/not-reported is non-zero
 ```
+
+`cluster status` uses one `GetClusterStatus` RPC and never requires direct PostgreSQL access. The default is display-only; only an explicit `--fail-on` turns reported state into an exit gate. Query and mTLS failures are always non-zero. Engine/module freshness uses the manager's configured `engine_heartbeat_timeout_secs` and `module_heartbeat_timeout_secs`. Manager DB heartbeat evidence uses the existing 60-second manager liveness backstop, while chitchat remains authoritative after its startup convergence window. Proxy routing-sync age, circuit state, and host resource usage are not configured status inputs and render as unknown/not reported.
+
+Proxies and narrow discovery clients continue to use `ListManagers`, which reconciles the DB-fresh set against chitchat; direct `wr_managers` reads are a bootstrap-only fallback when no manager RPC is reachable.
 
 ### Remote deployment via CLI
 
@@ -609,7 +616,7 @@ wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10 \
   --secret-key "<64-char-hex-key>"
 
 # 3. Inspect a bundle to see template variables and checksums
-wr-cli managers status wr-manager-bundle.tar.gz
+wr-cli managers inspect-bundle wr-manager-bundle.tar.gz
 ```
 
 The same bundle can be deployed to multiple managers with different `--db-url` and `--seed-node` values. With a `wr-deploy.toml`, deploy reduces to just the positional args:

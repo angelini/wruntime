@@ -5,9 +5,10 @@ use anyhow::Result;
 
 use wr_common::wruntime::{
     BeginDeploymentRequest, BeginRollbackRequest, CompleteDeploymentRequest, DeploymentMetadata,
-    DeregisterEngineRequest, EngineRegistration, ExpectedEngine, GetRoutingTableRequest,
-    GetSchemaRequest, HeartbeatRequest, ListEnginesRequest, ModuleDescriptor, ModuleIdentity,
-    RegisterEngineRequest, RoutingRule, SecretRequest, VerifyDeploymentRequest,
+    DeregisterEngineRequest, EngineRegistration, ExpectedEngine, GetClusterStatusRequest,
+    GetRoutingTableRequest, GetSchemaRequest, HeartbeatRequest, ListEnginesRequest,
+    ModuleDescriptor, ModuleIdentity, RegisterEngineRequest, RoutingRule, SecretRequest,
+    StatusSeverity, VerifyDeploymentRequest,
 };
 
 #[tokio::test]
@@ -1058,6 +1059,28 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
             .is_some(),
         "registration should stamp activation time"
     );
+    let healthy_status = client
+        .get_cluster_status(GetClusterStatusRequest {})
+        .await?
+        .into_inner();
+    assert!(healthy_status.database_observed_at.is_some());
+    assert!(healthy_status.gossip_observed_at.is_some());
+    assert!(healthy_status.response_at.is_some());
+    assert!(healthy_status.routing_table_version > 0);
+    let node = healthy_status
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "node-a")
+        .expect("status should include desired node");
+    assert_eq!(node.severity, StatusSeverity::Healthy as i32);
+    assert_eq!(node.deployment_history.len(), 1);
+    assert_eq!(node.engines[0].heartbeat_age_seconds, 0);
+    assert!(node.engines[0].modules[0].last_healthy.is_some());
+    assert_eq!(healthy_status.services[0].healthy_routes, 1);
+    assert!(healthy_status
+        .conditions
+        .iter()
+        .all(|condition| condition.code == "SIGNAL_NOT_REPORTED"));
     pool.get()
         .await?
         .execute(
@@ -1073,6 +1096,20 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
         .await?
         .into_inner();
     assert_eq!(stale.conditions[0].code, "STALE_ENGINE_HEARTBEAT");
+    let stale_status = client
+        .get_cluster_status(GetClusterStatusRequest {})
+        .await?
+        .into_inner();
+    let stale_node = stale_status
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "node-a")
+        .expect("status should retain stale desired node");
+    assert_eq!(stale_node.severity, StatusSeverity::Unhealthy as i32);
+    assert!(stale_node
+        .conditions
+        .iter()
+        .any(|condition| condition.code == "STALE_ENGINE_HEARTBEAT"));
     client
         .heartbeat(HeartbeatRequest {
             engine_id: "deploy-e1".into(),

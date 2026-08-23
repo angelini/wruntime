@@ -7,6 +7,7 @@ pub mod pool;
 pub mod scheduler;
 pub mod service;
 pub mod state;
+pub mod status;
 
 use std::sync::Arc;
 

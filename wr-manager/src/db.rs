@@ -482,6 +482,54 @@ pub async fn list_engines(pool: &Pool) -> Result<Vec<EngineRegistration>, Status
 
 // ── Desired node deployment operations ──────────────────────────────────────
 
+#[derive(Clone, Debug)]
+pub struct StatusDeploymentRecord {
+    pub record: DeploymentRecord,
+    pub current_revision: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct StatusEngineRecord {
+    pub registration: EngineRegistration,
+    pub registered_at: chrono::DateTime<chrono::Utc>,
+    pub last_heartbeat: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StatusModuleHeartbeat {
+    pub engine_id: String,
+    pub namespace: String,
+    pub module_name: String,
+    pub version: String,
+    pub last_healthy: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StatusRouteRecord {
+    pub rule: RoutingRule,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StatusManagerRecord {
+    pub manager_id: String,
+    pub grpc_address: String,
+    pub gossip_address: String,
+    pub registered_at: chrono::DateTime<chrono::Utc>,
+    pub last_heartbeat: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClusterStatusSnapshot {
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+    pub routing_version: u64,
+    pub deployments: Vec<StatusDeploymentRecord>,
+    pub engines: Vec<StatusEngineRecord>,
+    pub module_heartbeats: Vec<StatusModuleHeartbeat>,
+    pub routes: Vec<StatusRouteRecord>,
+    pub managers: Vec<StatusManagerRecord>,
+}
+
 fn deployment_revision(value: u64) -> Result<i64, Status> {
     i64::try_from(value).map_err(|_| Status::invalid_argument("deployment revision is too large"))
 }
@@ -692,31 +740,170 @@ pub async fn complete_deployment(
     get_deployment(pool, node_id, revision).await
 }
 
-/// Evaluate desired slots against the current registration, heartbeat, and
-/// routing rows. The returned codes are deliberately stable machine-readable
-/// deployment conditions, not CLI interpretations of ListEngines.
-pub async fn deployment_conditions(
-    pool: &Pool,
-    deployment: &DeploymentRecord,
-    engine_timeout_secs: f64,
-    module_timeout_secs: f64,
-) -> Result<Vec<(String, String)>, Status> {
+/// Capture all DB-backed cluster status evidence under one repeatable-read,
+/// read-only transaction. Presentation severity is intentionally not persisted.
+pub async fn get_cluster_status_snapshot(pool: &Pool) -> Result<ClusterStatusSnapshot, Status> {
     let mut client = pool.get().await.internal()?;
     let txn = client.transaction().await.internal()?;
     txn.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .internal()?;
-    let current_revision: i64 = txn
-        .query_opt(
-            "SELECT current_revision FROM wr_nodes WHERE node_id = $1",
-            &[&deployment.node_id],
+
+    let observed_at: chrono::DateTime<chrono::Utc> =
+        txn.query_one("SELECT NOW()", &[]).await.internal()?.get(0);
+    let routing_version = txn
+        .query_one("SELECT version FROM wr_manager_lock WHERE id = 1", &[])
+        .await
+        .internal()?
+        .get::<_, i64>(0) as u64;
+
+    let deployment_rows = txn
+        .query(
+            "SELECT d.node_id, d.revision, d.attempt_token, d.bundle_digest,
+                    d.expected_inventory, d.state, d.failure_detail, d.source_revision,
+                    d.created_at, d.activated_at, d.completed_at, n.current_revision
+             FROM wr_node_deployments d
+             JOIN wr_nodes n ON n.node_id = d.node_id
+             ORDER BY d.node_id, d.revision DESC",
+            &[],
+        )
+        .await
+        .internal()?;
+    let deployments = deployment_rows
+        .iter()
+        .map(|row| {
+            Ok(StatusDeploymentRecord {
+                record: deployment_row(row)?.record,
+                current_revision: row.get::<_, i64>("current_revision") as u64,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+
+    let engine_rows = txn
+        .query(
+            "SELECT registration, registered_at, last_heartbeat
+             FROM wr_engines ORDER BY engine_id",
+            &[],
+        )
+        .await
+        .internal()?;
+    let engines = engine_rows
+        .iter()
+        .map(|row| {
+            let bytes: Vec<u8> = row.get("registration");
+            Ok(StatusEngineRecord {
+                registration: EngineRegistration::decode(bytes.as_slice()).map_err(|error| {
+                    Status::internal(format!("failed to decode engine registration: {error}"))
+                })?,
+                registered_at: row.get("registered_at"),
+                last_heartbeat: row.get("last_heartbeat"),
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+
+    let module_heartbeats = txn
+        .query(
+            "SELECT engine_id, namespace, module_name, version, last_healthy
+             FROM wr_module_heartbeats
+             ORDER BY engine_id, namespace, module_name, version",
+            &[],
         )
         .await
         .internal()?
-        .ok_or_else(|| Status::not_found(format!("node '{}' not found", deployment.node_id)))?
-        .get(0);
-    if current_revision as u64 != deployment.revision {
-        txn.commit().await.internal()?;
+        .iter()
+        .map(|row| StatusModuleHeartbeat {
+            engine_id: row.get("engine_id"),
+            namespace: row.get("namespace"),
+            module_name: row.get("module_name"),
+            version: row.get("version"),
+            last_healthy: row.get("last_healthy"),
+        })
+        .collect();
+
+    let routes = txn
+        .query(
+            "SELECT rule_id, source_namespace, source_module, destination_namespace,
+                    destination_module, destination_version, engine_id, engine_address,
+                    healthy, peer_address, updated_at
+             FROM wr_routing_rules ORDER BY rule_id",
+            &[],
+        )
+        .await
+        .internal()?
+        .iter()
+        .map(|row| StatusRouteRecord {
+            rule: RoutingRule {
+                rule_id: row.get("rule_id"),
+                source_module: row.get("source_module"),
+                destination_module: row.get("destination_module"),
+                engine_id: row.get("engine_id"),
+                engine_address: row.get("engine_address"),
+                destination_version: row.get("destination_version"),
+                healthy: row.get("healthy"),
+                source_namespace: row.get("source_namespace"),
+                destination_namespace: row.get("destination_namespace"),
+                peer_address: row.get("peer_address"),
+            },
+            updated_at: row.get("updated_at"),
+        })
+        .collect();
+
+    let managers = txn
+        .query(
+            "SELECT manager_id, grpc_address, gossip_address, registered_at, last_heartbeat
+             FROM wr_managers ORDER BY manager_id",
+            &[],
+        )
+        .await
+        .internal()?
+        .iter()
+        .map(|row| StatusManagerRecord {
+            manager_id: row.get("manager_id"),
+            grpc_address: row.get("grpc_address"),
+            gossip_address: row.get("gossip_address"),
+            registered_at: row.get("registered_at"),
+            last_heartbeat: row.get("last_heartbeat"),
+        })
+        .collect();
+
+    txn.commit().await.internal()?;
+    Ok(ClusterStatusSnapshot {
+        observed_at,
+        routing_version,
+        deployments,
+        engines,
+        module_heartbeats,
+        routes,
+        managers,
+    })
+}
+
+fn fresh(
+    observed_at: chrono::DateTime<chrono::Utc>,
+    timestamp: chrono::DateTime<chrono::Utc>,
+    timeout_secs: f64,
+) -> bool {
+    observed_at
+        .signed_duration_since(timestamp)
+        .num_milliseconds() as f64
+        <= timeout_secs * 1000.0
+}
+
+/// Pure Plan 1 verifier over an already captured snapshot. Cluster status and
+/// VerifyDeployment therefore use identical desired-revision semantics.
+pub fn deployment_conditions_from_snapshot(
+    snapshot: &ClusterStatusSnapshot,
+    deployment: &DeploymentRecord,
+    engine_timeout_secs: f64,
+    module_timeout_secs: f64,
+) -> Result<Vec<(String, String)>, Status> {
+    let current_revision = snapshot
+        .deployments
+        .iter()
+        .find(|candidate| candidate.record.node_id == deployment.node_id)
+        .map(|candidate| candidate.current_revision)
+        .ok_or_else(|| Status::not_found(format!("node '{}' not found", deployment.node_id)))?;
+    if current_revision != deployment.revision {
         return Ok(vec![(
             "SUPERSEDED_REVISION".into(),
             format!(
@@ -725,54 +912,46 @@ pub async fn deployment_conditions(
             ),
         )]);
     }
-    let rows = txn
-        .query(
-            "SELECT registration, last_heartbeat >= NOW() - make_interval(secs => $1::double precision) AS fresh
-             FROM wr_engines",
-            &[&engine_timeout_secs],
-        )
-        .await
-        .internal()?;
-    let engines: Vec<(EngineRegistration, bool)> = rows
-        .iter()
-        .map(|row| {
-            let bytes: Vec<u8> = row.get("registration");
-            Ok((
-                EngineRegistration::decode(bytes.as_slice()).map_err(|e| {
-                    Status::internal(format!("failed to decode engine registration: {e}"))
-                })?,
-                row.get("fresh"),
-            ))
-        })
-        .collect::<Result<_, Status>>()?;
 
     let mut conditions = Vec::new();
     for expected in &deployment.expected_engines {
-        let same_slot: Vec<_> = engines
+        let same_slot: Vec<_> = snapshot
+            .engines
             .iter()
-            .filter(|(reg, _)| {
-                reg.deployment.as_ref().is_some_and(|meta| {
-                    meta.node_id == deployment.node_id && meta.engine_slot == expected.engine_slot
-                })
+            .filter(|engine| {
+                engine
+                    .registration
+                    .deployment
+                    .as_ref()
+                    .is_some_and(|metadata| {
+                        metadata.node_id == deployment.node_id
+                            && metadata.engine_slot == expected.engine_slot
+                    })
             })
             .collect();
         let exact: Vec<_> = same_slot
             .iter()
-            .filter(|(reg, _)| {
-                reg.deployment.as_ref().is_some_and(|meta| {
-                    meta.revision == deployment.revision
-                        && meta.bundle_digest == deployment.bundle_digest
-                })
+            .filter(|engine| {
+                engine
+                    .registration
+                    .deployment
+                    .as_ref()
+                    .is_some_and(|metadata| {
+                        metadata.revision == deployment.revision
+                            && metadata.bundle_digest == deployment.bundle_digest
+                    })
             })
             .copied()
             .collect();
         if exact.is_empty() {
             let code = if same_slot.is_empty() {
                 "MISSING_ENGINE"
-            } else if same_slot.iter().any(|(reg, _)| {
-                reg.deployment
+            } else if same_slot.iter().any(|engine| {
+                engine
+                    .registration
+                    .deployment
                     .as_ref()
-                    .is_some_and(|m| m.revision != deployment.revision)
+                    .is_some_and(|metadata| metadata.revision != deployment.revision)
             }) {
                 "REVISION_MISMATCH"
             } else {
@@ -787,12 +966,17 @@ pub async fn deployment_conditions(
             ));
             continue;
         }
-        let fresh: Vec<_> = exact
-            .iter()
-            .filter(|(_, engine_fresh)| *engine_fresh)
-            .copied()
+        let fresh_engines: Vec<_> = exact
+            .into_iter()
+            .filter(|engine| {
+                fresh(
+                    snapshot.observed_at,
+                    engine.last_heartbeat,
+                    engine_timeout_secs,
+                )
+            })
             .collect();
-        if fresh.is_empty() {
+        if fresh_engines.is_empty() {
             conditions.push((
                 "STALE_ENGINE_HEARTBEAT".into(),
                 format!(
@@ -802,18 +986,18 @@ pub async fn deployment_conditions(
             ));
             continue;
         }
-        if fresh.len() != 1 {
+        if fresh_engines.len() != 1 {
             conditions.push((
                 "DUPLICATE_ENGINE_SLOT".into(),
                 format!(
                     "engine slot '{}' has {} fresh matching registrations",
                     expected.engine_slot,
-                    fresh.len()
+                    fresh_engines.len()
                 ),
             ));
             continue;
         }
-        let (engine, _) = fresh[0];
+        let engine = &fresh_engines[0].registration;
         for module in &expected.modules {
             if !engine.modules.iter().any(|advertised| {
                 advertised.namespace == module.namespace
@@ -829,22 +1013,13 @@ pub async fn deployment_conditions(
                 ));
                 continue;
             }
-            let module_heartbeat = txn
-                .query_opt(
-                    "SELECT last_healthy >= NOW() - make_interval(secs => $5::double precision) AS fresh
-                     FROM wr_module_heartbeats
-                     WHERE engine_id = $1 AND namespace = $2 AND module_name = $3 AND version = $4",
-                    &[
-                        &engine.engine_id,
-                        &module.namespace,
-                        &module.name,
-                        &module.version,
-                        &module_timeout_secs,
-                    ],
-                )
-                .await
-                .internal()?;
-            let Some(module_heartbeat) = module_heartbeat else {
+            let heartbeat = snapshot.module_heartbeats.iter().find(|heartbeat| {
+                heartbeat.engine_id == engine.engine_id
+                    && heartbeat.namespace == module.namespace
+                    && heartbeat.module_name == module.name
+                    && heartbeat.version == module.version
+            });
+            let Some(heartbeat) = heartbeat else {
                 conditions.push((
                     "MISSING_MODULE_HEARTBEAT".into(),
                     format!(
@@ -854,7 +1029,11 @@ pub async fn deployment_conditions(
                 ));
                 continue;
             };
-            if !module_heartbeat.get::<_, bool>("fresh") {
+            if !fresh(
+                snapshot.observed_at,
+                heartbeat.last_healthy,
+                module_timeout_secs,
+            ) {
                 conditions.push((
                     "STALE_MODULE_HEARTBEAT".into(),
                     format!(
@@ -868,22 +1047,13 @@ pub async fn deployment_conditions(
                 "{}/{}/{}/{}",
                 engine.engine_id, module.namespace, module.name, module.version
             );
-            let route = txn
-                .query_opt(
-                    "SELECT healthy FROM wr_routing_rules
-                     WHERE rule_id = $1 AND engine_id = $2 AND destination_namespace = $3
-                       AND destination_module = $4 AND destination_version = $5",
-                    &[
-                        &rule_id,
-                        &engine.engine_id,
-                        &module.namespace,
-                        &module.name,
-                        &module.version,
-                    ],
-                )
-                .await
-                .internal()?;
-            match route {
+            match snapshot.routes.iter().find(|route| {
+                route.rule.rule_id == rule_id
+                    && route.rule.engine_id == engine.engine_id
+                    && route.rule.destination_namespace == module.namespace
+                    && route.rule.destination_module == module.name
+                    && route.rule.destination_version == module.version
+            }) {
                 None => conditions.push((
                     "MISSING_ROUTE".into(),
                     format!(
@@ -891,7 +1061,7 @@ pub async fn deployment_conditions(
                         expected.engine_slot, module.namespace, module.name, module.version
                     ),
                 )),
-                Some(route) if !route.get::<_, bool>("healthy") => conditions.push((
+                Some(route) if !route.rule.healthy => conditions.push((
                     "UNHEALTHY_ROUTE".into(),
                     format!(
                         "engine slot '{}' module {}.{}@{} default route is unhealthy",
@@ -902,8 +1072,24 @@ pub async fn deployment_conditions(
             }
         }
     }
-    txn.commit().await.internal()?;
+    conditions.sort();
     Ok(conditions)
+}
+
+/// Evaluate desired slots against one coherent database snapshot.
+pub async fn deployment_conditions(
+    pool: &Pool,
+    deployment: &DeploymentRecord,
+    engine_timeout_secs: f64,
+    module_timeout_secs: f64,
+) -> Result<Vec<(String, String)>, Status> {
+    let snapshot = get_cluster_status_snapshot(pool).await?;
+    deployment_conditions_from_snapshot(
+        &snapshot,
+        deployment,
+        engine_timeout_secs,
+        module_timeout_secs,
+    )
 }
 
 pub async fn begin_rollback(

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use tonic::transport::{Channel, Endpoint};
 use wr_common::node::TlsConfig;
 use wr_common::wruntime::manager_service_client::ManagerServiceClient;
-use wr_common::wruntime::ListManagersRequest;
+use wr_common::wruntime::{GetClusterStatusRequest, GetClusterStatusResponse, ListManagersRequest};
 
 /// Global TLS config for CLI → manager connections.
 /// Set once at startup via [`set_tls_config`].
@@ -33,6 +33,15 @@ pub async fn connect(addr: &str) -> Result<ManagerServiceClient<Channel>> {
         .await
         .context("failed to connect to manager")?;
     Ok(ManagerServiceClient::new(channel))
+}
+
+/// Fetch one coherent cluster status snapshot from a seed manager.
+pub async fn get_cluster_status(addr: &str) -> Result<GetClusterStatusResponse> {
+    let mut client = connect(addr).await?;
+    Ok(client
+        .get_cluster_status(GetClusterStatusRequest {})
+        .await?
+        .into_inner())
 }
 
 /// List all active managers in the cluster via a seed manager.

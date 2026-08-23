@@ -22,7 +22,39 @@ The mTLS `wruntime.ManagerService` is the cluster control plane. Engines use the
 | `CompleteDeployment` | node ID, revision, outcome | `DeploymentRecord` | Records terminal failure, or records success only after the manager re-verifies exact readiness. |
 | `BeginRollback` | node ID, historical successful revision (or zero for previous), token | `DeploymentRecord` | Copies the selected immutable desired snapshot into a new monotonic revision and reports `source_revision`. |
 
-Verification uses one repeatable-read manager snapshot and only the current desired revision. Stable codes include `SUPERSEDED_REVISION`, `MISSING_ENGINE`, `REVISION_MISMATCH`, `DIGEST_MISMATCH`, `DUPLICATE_ENGINE_SLOT`, `MISSING_MODULE`, `STALE_ENGINE_HEARTBEAT`, `MISSING_MODULE_HEARTBEAT`, `STALE_MODULE_HEARTBEAT`, `MISSING_ROUTE`, and `UNHEALTHY_ROUTE`. CLI deployment success is defined by an empty condition set, not by `ListEngines` visibility.
+Verification uses one repeatable-read manager snapshot and only the current desired revision. Stable codes include `SUPERSEDED_REVISION`, `MISSING_ENGINE`, `REVISION_MISMATCH`, `DIGEST_MISMATCH`, `DUPLICATE_ENGINE_SLOT`, `MISSING_MODULE`, `STALE_ENGINE_HEARTBEAT`, `MISSING_MODULE_HEARTBEAT`, `STALE_MODULE_HEARTBEAT`, `MISSING_ROUTE`, and `UNHEALTHY_ROUTE`. `DeploymentCondition.code`, `severity`, and evidence fields are the machine-readable contract; `detail` is explanatory text and may improve without a wire-contract change. CLI deployment success is defined by an empty condition set, not by `ListEngines` visibility.
+
+## Cluster status snapshot
+
+| RPC | Request | Response | Description |
+| --- | --- | --- | --- |
+| `GetClusterStatus` | empty | `GetClusterStatusResponse` | Returns one manager-composed snapshot of manager membership, desired node revisions and history, engine/module heartbeat evidence, persisted routes/services, aggregate severity, and stable conditions. |
+
+The manager reads deployment history, registrations, engine/module heartbeats, routes, manager records, and the routing-table version in one read-only `REPEATABLE READ` PostgreSQL transaction. Gossip cannot join that transaction, so the response reports separate `database_observed_at`, `gossip_observed_at`, and `response_at` timestamps. Records and conditions are sorted deterministically. The response never stores or returns resolved secret values or deployment configuration payloads.
+
+`StatusSeverity` has the ordered known states `healthy < degraded < unhealthy`, plus `unknown`. Unknown evidence is not interpreted as healthy, but unsupported signals do not silently worsen supported deployment/routing status: aggregate reduction ignores `unknown` when at least one known signal exists. An all-unknown view remains `unknown`.
+
+Aggregation rules are:
+
+- a node is healthy only when the current desired `DeploymentRecord` passes the same verifier used by `VerifyDeployment`; a previous healthy revision and unmanaged registration never satisfy current readiness;
+- an engine is authoritative only when its node/revision/digest/slot matches the current desired inventory; fresh non-authoritative engines are `degraded` with `UNMANAGED_ENGINE`;
+- a service is healthy when all desired routes are healthy, degraded when at least one but not all desired routes are healthy, and unhealthy when no desired route is healthy;
+- gossip-dead managers are unhealthy; DB/gossip disagreement is explicit, while DB-only membership during the startup convergence window is degraded with `BOOTSTRAP_CONVERGING`;
+- proxy routing-sync age, circuit-breaker state, and host CPU/memory are currently `SIGNAL_NOT_REPORTED`. Manually inserted routes have persisted health but may use `MANUAL_ROUTE_REASON_UNAVAILABLE` because heartbeat causality is not stored.
+
+Additional stable cluster codes include `GOSSIP_DEAD`, `MANAGER_DB_GOSSIP_DISAGREEMENT`, `BOOTSTRAP_CONVERGING`, `UNMANAGED_ENGINE`, `NO_HEALTHY_ROUTE`, `PARTIAL_ROUTE_AVAILABILITY`, `MANUAL_ROUTE_REASON_UNAVAILABLE`, and `SIGNAL_NOT_REPORTED`. Consumers must branch on code/severity and use raw timestamps, ages, desired/actual revisions, and affected identities as evidence rather than parsing `detail`.
+
+`wr-cli cluster status` performs exactly this RPC; it does not join `ListManagers`, `ListEngines`, and `GetRoutingTable` client-side. `--output json` emits the versioned CLI DTO (`schema_version: 1`) with complete typed records; field meanings and condition codes are stable automation surfaces. Table output defaults to the summary and problem rows, while `--detail` includes healthy and unknown records. `--node` and `--service namespace.module[@version]` filter presentation. The default command is display-only; `--fail-on degraded` and `--fail-on unhealthy` make known severity a gate, and `--fail-on unknown` is strict unknown handling. Transport/query failures are always non-zero.
+
+Typical condition evidence:
+
+| Scenario | Status evidence |
+| --- | --- |
+| Healthy rollout | desired revision matches the sole fresh slot; module heartbeat and default route are healthy; node/service are `healthy` |
+| Revision mismatch | node is `unhealthy` with `REVISION_MISMATCH`, including desired revision plus stale actual registration metadata |
+| Stale heartbeat | node/engine are `unhealthy` with `STALE_ENGINE_HEARTBEAT` and raw heartbeat time/age |
+| Partial service availability | service is `degraded` with `PARTIAL_ROUTE_AVAILABILITY` and healthy/desired route counts |
+| Manager disagreement | `BOOTSTRAP_CONVERGING`, `GOSSIP_DEAD`, or `MANAGER_DB_GOSSIP_DISAGREEMENT` records both DB and gossip observations |
 
 ## Routing table
 

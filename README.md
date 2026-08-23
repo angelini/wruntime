@@ -191,7 +191,17 @@ wr-cli node deploy --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.50 \
     --manager https://10.0.1.1:9000
 ```
 
-Every node deployment receives a manager-owned monotonic revision and exits successfully only after that exact bundle digest and engine-slot inventory is healthy and routable. Use `wr-cli node rollback --node-id <id> <remote>` for an explicit retained-release rollback and `wr-cli node inspect-bundle` for bundle inspection. Manager deployment follows the same packaging pattern. See [docs/deployment.md](docs/deployment.md) for lifecycle, release layout, and configuration details.
+Every node deployment receives a manager-owned monotonic revision and exits successfully only after that exact bundle digest and engine-slot inventory is healthy and routable. Use `wr-cli node rollback --node-id <id> <remote>` for an explicit retained-release rollback and `wr-cli node inspect-bundle` / `wr-cli managers inspect-bundle` for bundle inspection. Manager deployment follows the same packaging pattern.
+
+Query any seed manager for the authoritative composed runtime view:
+
+```bash
+wr-cli --manager https://10.0.1.1:9000 cluster status
+wr-cli cluster status --output json
+wr-cli cluster status --fail-on unhealthy
+```
+
+The snapshot correlates desired revisions with manager membership, engine/module heartbeats, and persisted routes. Table output emphasizes problems; JSON is the stable complete automation view. Unknown proxy/resource/circuit signals are reported honestly, and only explicit `--fail-on` policy turns status into an exit gate. See [docs/deployment.md](docs/deployment.md) for lifecycle, status semantics, release layout, and configuration details.
 
 ## Prerequisites
 
@@ -225,7 +235,7 @@ wruntime/
 ├── wr-engine/              # WASM runtime (wasmtime) + inbound HTTP server
 ├── wr-sdk/                 # WASM module SDK: http, io, db, tracing, llm, export macros
 ├── wr-build/               # build.rs helper: service/client generators from proto
-├── wr-cli/                 # CLI: invoke modules, list engines/services, query metrics
+├── wr-cli/                 # CLI: cluster status, deployment, invoke, narrow views, metrics
 ├── wr-tests/               # integration tests
 ├── wit/                    # WIT interfaces (db, blobstore, tracing, llm)
 ├── examples/

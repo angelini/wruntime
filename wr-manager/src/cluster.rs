@@ -23,6 +23,15 @@ pub struct ManagerLiveness {
     pub gossip_address: String,
 }
 
+/// One gossip observation used by the composed status response. PostgreSQL and
+/// gossip cannot be globally atomic, so the observation carries its own time.
+#[derive(Clone, Debug)]
+pub struct MembershipSnapshot {
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+    pub live: Vec<ManagerLiveness>,
+    pub dead: HashSet<String>,
+}
+
 /// Wraps a chitchat instance for manager-to-manager liveness detection.
 ///
 /// Engine heartbeats are stored in Postgres — chitchat carries the manager's own
@@ -94,6 +103,39 @@ impl ClusterHandle {
                 state.set("gossip_address", &gossip);
             })
             .await;
+    }
+
+    /// Capture live and dead membership in one chitchat callback so status does
+    /// not race two gossip reads.
+    pub async fn membership_snapshot(&self) -> MembershipSnapshot {
+        let (live, dead) = self
+            .handle
+            .with_chitchat(|c| {
+                let live = c
+                    .live_nodes()
+                    .filter_map(|id| {
+                        let state = c.node_state(id)?;
+                        Some(ManagerLiveness {
+                            manager_id: id.node_id.to_string(),
+                            grpc_address: state.get("grpc_address").unwrap_or("").to_string(),
+                            gossip_address: state.get("gossip_address").unwrap_or("").to_string(),
+                        })
+                    })
+                    .collect();
+                let mut dead = HashSet::new();
+                dead.extend(c.dead_nodes().map(|id| id.node_id.to_string()));
+                dead.extend(
+                    c.scheduled_for_deletion_nodes()
+                        .map(|id| id.node_id.to_string()),
+                );
+                (live, dead)
+            })
+            .await;
+        MembershipSnapshot {
+            observed_at: chrono::Utc::now(),
+            live,
+            dead,
+        }
     }
 
     /// Managers chitchat considers live, keyed on `node_id`. Includes self.

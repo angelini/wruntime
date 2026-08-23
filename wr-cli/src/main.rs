@@ -9,7 +9,7 @@ mod display;
 #[derive(Parser)]
 #[command(name = "wr-cli", about = "wruntime deployment management CLI")]
 struct Cli {
-    /// Manager gRPC address (required for most commands; not needed for node bundle/status)
+    /// Manager gRPC address (not needed for local bundle/inspect-bundle commands)
     #[arg(long, env = "WR_MANAGER", global = true)]
     manager: Option<String>,
 
@@ -60,6 +60,8 @@ fn build_tls_config(cli: &Cli) -> TlsConfig {
 enum Commands {
     /// Database management (reset schemas, migrations)
     Db(cmd::db::DbArgs),
+    /// View coherent cluster-wide status
+    Cluster(cmd::cluster::ClusterArgs),
     /// Local development workflow (start infra, build, deploy)
     Dev(cmd::dev::DevArgs),
     /// Manage wruntime engines
@@ -105,6 +107,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Db(args) => cmd::db::run(args).await,
+        Commands::Cluster(args) => cmd::cluster::run(args, require_manager(&cli.manager)?).await,
         Commands::Dev(args) => cmd::dev::run(args, cli.manager.as_deref()).await,
         Commands::Engines(args) => cmd::engines::run(args, require_manager(&cli.manager)?).await,
         Commands::Managers(args) => cmd::managers::run(args, cli.manager.as_deref()).await,

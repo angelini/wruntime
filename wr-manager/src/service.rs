@@ -15,7 +15,8 @@ use wr_common::wruntime::{
     BeginRollbackRequest, BeginRollbackResponse, CompleteDeploymentRequest,
     CompleteDeploymentResponse, DeleteRoutingRuleRequest, DeleteRoutingRuleResponse,
     DeleteScheduleRequest, DeleteScheduleResponse, DeleteSecretRequest, DeleteSecretResponse,
-    DeploymentCondition, DeregisterEngineRequest, DeregisterEngineResponse, GetRoutingTableRequest,
+    DeploymentCondition, DeregisterEngineRequest, DeregisterEngineResponse,
+    GetClusterStatusRequest, GetClusterStatusResponse, GetRoutingTableRequest,
     GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse, HeartbeatRequest,
     HeartbeatResponse, ListEnginesRequest, ListEnginesResponse, ListManagersRequest,
     ListManagersResponse, ListSchedulesRequest, ListSchedulesResponse, ListSecretsRequest,
@@ -35,6 +36,17 @@ fn proto_timestamp(value: chrono::DateTime<chrono::Utc>) -> prost_types::Timesta
     prost_types::Timestamp {
         seconds: value.timestamp(),
         nanos: value.timestamp_subsec_nanos() as i32,
+    }
+}
+
+fn deployment_condition(code: String, detail: String) -> DeploymentCondition {
+    DeploymentCondition {
+        code,
+        detail,
+        severity: wr_common::wruntime::StatusSeverity::Unhealthy as i32,
+        affected_identity: String::new(),
+        desired: String::new(),
+        actual: String::new(),
     }
 }
 
@@ -512,7 +524,7 @@ impl ManagerService for Manager {
         )
         .await?
         .into_iter()
-        .map(|(code, detail)| DeploymentCondition { code, detail })
+        .map(|(code, detail)| deployment_condition(code, detail))
         .collect::<Vec<_>>();
         Ok(Response::new(VerifyDeploymentResponse {
             deployment: Some(deployment),
@@ -639,6 +651,22 @@ impl ManagerService for Manager {
         }
 
         Ok(Response::new(ListManagersResponse { managers }))
+    }
+
+    async fn get_cluster_status(
+        &self,
+        _request: Request<GetClusterStatusRequest>,
+    ) -> Result<Response<GetClusterStatusResponse>, Status> {
+        let membership = self.cluster.membership_snapshot().await;
+        let snapshot = db::get_cluster_status_snapshot(&self.pool).await?;
+        let response = crate::status::compose(
+            snapshot,
+            membership,
+            self.cluster.within_convergence_window(),
+            self.engine_heartbeat_timeout_secs,
+            self.module_heartbeat_timeout_secs,
+        )?;
+        Ok(Response::new(response))
     }
 
     // ── Routing table ─────────────────────────────────────────────────────

@@ -17,12 +17,13 @@ cargo install cargo-zigbuild
 | --------- | --------- |
 | `wr-cli managers bundle` | Package the manager binary + config into a tarball |
 | `wr-cli managers deploy` | Push bundle to a remote host and start the service |
-| `wr-cli managers status` | Inspect a bundle without deploying |
+| `wr-cli managers inspect-bundle` | Inspect a manager bundle without deploying |
 | `wr-cli managers list` | List active managers in the cluster |
 | `wr-cli node bundle` | Package proxy + engine binaries, WASM modules, and schemas |
 | `wr-cli node deploy` | Push node bundle to a remote host and start services |
 | `wr-cli node rollback` | Activate a retained prior successful bundle as a new revision |
 | `wr-cli node inspect-bundle` | Verify and inspect a node bundle without deploying |
+| `wr-cli cluster status` | Show the authoritative cluster-wide runtime snapshot |
 | `wr-cli logs node` | View logs from services on a remote node (systemd or Docker) |
 
 ## Bundle structure
@@ -345,11 +346,29 @@ During `node bundle`, WASM modules are pre-compiled to native `.cwasm` artifacts
 Inspect bundles without querying runtime status:
 
 ```bash
-wr-cli managers status manager.tar.gz
+wr-cli managers inspect-bundle manager.tar.gz
 wr-cli node inspect-bundle myapp.tar.gz
 ```
 
-Node inspection recomputes every payload checksum and the canonical digest before printing the target, digest, stable engine slots, exact module versions, template variables, config files, and checksums. Cluster-wide runtime presentation belongs to the follow-up `cluster status` work.
+Node inspection recomputes every payload checksum and the canonical digest before printing the target, digest, stable engine slots, exact module versions, template variables, config files, and checksums. Bundle inspection is deliberately separate from runtime status.
+
+## Cluster runtime status
+
+Query any seed manager for one coherent manager-known snapshot:
+
+```bash
+wr-cli --manager https://manager-1:9000 cluster status
+wr-cli cluster status --output json
+wr-cli cluster status --node node-a --detail
+wr-cli cluster status --service ecommerce.inventory@1.0.0
+wr-cli cluster status --fail-on unhealthy
+```
+
+The default table prints aggregate counts and problem rows; `--detail` expands healthy and unknown records. JSON always emits the complete typed snapshot DTO with `schema_version: 1`, raw observation/heartbeat/deployment timestamps, server-computed ages, desired and actual identities, routing version, route evidence, and stable condition codes. Human `detail` text is explanatory; automation must use severity and code.
+
+A healthy rollout reports the exact current node revision and digest with one authoritative fresh registration per desired slot, fresh module heartbeats, and healthy routes. Common failures are `REVISION_MISMATCH` for an old activated revision and `STALE_ENGINE_HEARTBEAT`/`STALE_MODULE_HEARTBEAT` for expired observations. A service remains available but becomes degraded with `PARTIAL_ROUTE_AVAILABILITY` when only some desired routes are healthy; zero healthy desired routes is unhealthy. Manager DB/gossip convergence and disagreement use `BOOTSTRAP_CONVERGING`, `GOSSIP_DEAD`, and `MANAGER_DB_GOSSIP_DISAGREEMENT` with separately stamped DB and gossip observation times.
+
+No direct proxy or host scrape occurs. Routing-sync age, circuit-breaker state, CPU, and memory therefore remain `SIGNAL_NOT_REPORTED`; stale/unmanaged registrations remain visible but cannot satisfy a desired revision. The default command never acts as a monitoring gate. `--fail-on degraded` and `--fail-on unhealthy` gate known aggregate severity; `--fail-on unknown` is strict and fails for any unknown/not-reported signal. RPC/mTLS failures are always non-zero.
 
 ## Viewing logs
 
