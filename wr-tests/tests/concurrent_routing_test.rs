@@ -139,6 +139,7 @@ async fn test_deregister_waits_for_lock() -> Result<()> {
             }],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -328,6 +329,7 @@ async fn test_deregister_no_rules_no_version_bump() -> Result<()> {
             modules: vec![],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -368,6 +370,7 @@ async fn test_deregister_with_rules_bumps_version() -> Result<()> {
             }],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;

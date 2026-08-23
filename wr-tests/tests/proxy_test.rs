@@ -126,6 +126,7 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
                 }],
                 secrets: vec![],
                 db_namespaces: vec![],
+                deployment: None,
             }),
         }))
         .await?

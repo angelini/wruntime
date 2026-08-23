@@ -16,8 +16,8 @@ use helpers::{
 use std::time::Duration;
 
 use wr_common::wruntime::{
-    EngineRegistration, HeartbeatRequest, ListManagersRequest, ModuleDescriptor,
-    RegisterEngineRequest,
+    BeginDeploymentRequest, EngineRegistration, ExpectedEngine, HeartbeatRequest,
+    ListManagersRequest, ModuleDescriptor, RegisterEngineRequest, VerifyDeploymentRequest,
 };
 
 // ── Multi-manager integration tests ──────────────────────────────────────────
@@ -57,6 +57,40 @@ async fn test_heartbeat_visible_across_managers() {
         healthy,
         "rule should be healthy (heartbeat written to shared Postgres)"
     );
+}
+
+#[tokio::test]
+async fn test_deployment_desired_state_is_visible_across_managers() {
+    let pool = manager_pool().await;
+    let managers = start_manager_cluster(pool, 2, 30).await.unwrap();
+    let mut first = manager_client(&managers[0].addr).await.unwrap();
+    let deployment = first
+        .begin_deployment(BeginDeploymentRequest {
+            node_id: "shared-node".into(),
+            attempt_token: "shared-attempt".into(),
+            bundle_digest: format!("sha256:{}", "3".repeat(64)),
+            expected_engines: vec![ExpectedEngine {
+                engine_slot: "primary".into(),
+                modules: vec![],
+            }],
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .deployment
+        .unwrap();
+
+    let mut second = manager_client(&managers[1].addr).await.unwrap();
+    let verification = second
+        .verify_deployment(VerifyDeploymentRequest {
+            node_id: "shared-node".into(),
+            revision: deployment.revision,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(verification.deployment.unwrap().revision, 1);
+    assert_eq!(verification.conditions[0].code, "MISSING_ENGINE");
 }
 
 /// Engine heartbeats to manager-1; manager-2 can also verify health via
@@ -222,6 +256,7 @@ async fn test_module_health_convergence_across_managers() {
             ],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await

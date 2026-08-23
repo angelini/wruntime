@@ -20,6 +20,10 @@ pub struct EngineConfig {
     pub allow_non_loopback_internal: bool,
     /// Node configuration — identifies the local proxy for this engine.
     pub node: NodeConfig,
+    /// Immutable deployment identity injected into a staged release by wr-cli.
+    /// Local development configurations may omit this until they are bundled.
+    #[serde(default)]
+    pub deployment: Option<DeploymentMetadata>,
     #[serde(rename = "module", default)]
     pub modules: Vec<ModuleConfig>,
     /// Optional PostgreSQL settings for per-namespace guest connection pools.
@@ -94,6 +98,14 @@ impl Default for ResourceLimits {
             max_llm_streams: 32,
         }
     }
+}
+
+#[derive(Deserialize, Clone)]
+pub struct DeploymentMetadata {
+    pub node_id: String,
+    pub revision: u64,
+    pub bundle_digest: String,
+    pub engine_slot: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -435,13 +447,38 @@ impl EngineConfig {
             "listen_address must bind to loopback (127.0.0.1, ::1, or localhost); \
              set allow_non_loopback_internal = true to override",
         );
+        v.check(
+            self.node.proxy_address.starts_with("http://")
+                && is_loopback_addr(&self.node.proxy_address),
+            "node.proxy_address must be an absolute loopback HTTP URL",
+        );
+        v.check(
+            self.node.control_address.starts_with("http://")
+                && is_loopback_addr(&self.node.control_address),
+            "node.control_address must be an absolute loopback HTTP URL",
+        );
         if let Err(error) = self.node.peer_address() {
             v.check(false, format!("invalid node configuration: {error}"));
         }
-        v.check(
-            !self.node.control_address.is_empty(),
-            "node.control_address is required",
-        );
+        if let Some(deployment) = &self.deployment {
+            v.check(
+                !deployment.node_id.is_empty(),
+                "deployment.node_id is required",
+            );
+            v.check(deployment.revision > 0, "deployment.revision must be > 0");
+            v.check(
+                deployment.bundle_digest.starts_with("sha256:")
+                    && deployment.bundle_digest.len() == 71
+                    && deployment.bundle_digest[7..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "deployment.bundle_digest must be sha256:<lowercase hex>",
+            );
+            v.check(
+                !deployment.engine_slot.is_empty(),
+                "deployment.engine_slot is required",
+            );
+        }
 
         if let Some(blobstore) = &self.blobstore {
             v.check(

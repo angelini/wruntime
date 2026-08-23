@@ -182,16 +182,16 @@ Bundle once, deploy anywhere — the CLI packages cross-compiled binaries, WASM 
 wr-cli node bundle --engine-config engine.toml
 
 # Deploy to a remote host via SSH (format defaults to systemd)
-wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.50 \
+wr-cli node deploy --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.50 \
     --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
     --manager https://10.0.1.1:9000
 
 # Or with a wr-deploy.toml providing db_url, just the positional args:
-wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.50 \
+wr-cli node deploy --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.50 \
     --manager https://10.0.1.1:9000
 ```
 
-Manager deployment follows the same pattern (`wr-cli managers bundle` / `wr-cli managers deploy`). See [docs/deployment.md](docs/deployment.md) for the deploy config reference, multi-node cluster setup, bundle structure, and template variables.
+Every node deployment receives a manager-owned monotonic revision and exits successfully only after that exact bundle digest and engine-slot inventory is healthy and routable. Use `wr-cli node rollback --node-id <id> <remote>` for an explicit retained-release rollback and `wr-cli node inspect-bundle` for bundle inspection. Manager deployment follows the same packaging pattern. See [docs/deployment.md](docs/deployment.md) for lifecycle, release layout, and configuration details.
 
 ## Prerequisites
 

@@ -129,6 +129,26 @@ pub fn run_ssh(ssh_base: &[String], command: &str) -> Result<()> {
     run_command(&args)
 }
 
+/// Run a command over SSH and return trimmed UTF-8 stdout.
+pub fn run_ssh_output(ssh_base: &[String], command: &str) -> Result<String> {
+    let mut args = ssh_base.to_vec();
+    args.push(command.to_string());
+    debug!("exec: {}", args.join(" "));
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to run {}", args[0]))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("remote command failed: {}", stderr.trim());
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_string())
+        .context("remote command returned non-UTF-8 output")
+}
+
 /// Run a command over SSH with output streamed directly to the terminal.
 /// Blocks until the remote command exits or the process receives SIGINT.
 pub fn run_ssh_streaming(ssh_base: &[String], command: &str) -> Result<()> {
@@ -497,63 +517,6 @@ pub fn scp_bytes(
     result?;
     let ssh_base = build_ssh_args(remote, ssh_key, ssh_port);
     run_ssh(&ssh_base, &format!("sudo mv {remote_tmp} {remote_path}"))
-}
-
-/// Poll the manager until an engine serving all the given (namespace, name) modules
-/// is registered, or timeout. Works for both fresh deploys and re-deploys.
-pub async fn wait_for_modules(
-    manager: &str,
-    modules: &[(String, String)],
-    timeout: Duration,
-) -> bool {
-    use tokio_retry::strategy::FixedInterval;
-    use tokio_retry::Retry;
-
-    let expected: Vec<_> = modules.iter().map(|(ns, n)| format!("{ns}.{n}")).collect();
-    debug!(
-        "polling manager {manager} for modules: {expected:?} (timeout {}s)",
-        timeout.as_secs()
-    );
-    let attempt = std::sync::atomic::AtomicU32::new(0);
-    let strategy = FixedInterval::from_millis(2000).take(timeout.as_secs() as usize / 2);
-    Retry::start(strategy, || {
-        let n = attempt.fetch_add(1, Ordering::Relaxed) + 1;
-        async move {
-            match client::connect(manager).await {
-                Ok(mut client) => match client.list_engines(ListEnginesRequest {}).await {
-                    Ok(resp) => {
-                        let engines = resp.into_inner().engines;
-                        let registered: Vec<_> = engines
-                            .iter()
-                            .flat_map(|e| e.modules.iter().map(|m| format!("{}.{}", m.namespace, m.name)))
-                            .collect();
-                        let all_found = modules.iter().all(|(ns, name)| {
-                            engines.iter().any(|e| {
-                                e.modules
-                                    .iter()
-                                    .any(|m| m.namespace == *ns && m.name == *name)
-                            })
-                        });
-                        debug!("attempt {n}: registered modules: {registered:?}, all_found: {all_found}");
-                        if all_found {
-                            return Ok(());
-                        }
-                        Err(())
-                    }
-                    Err(e) => {
-                        debug!("attempt {n}: ListEngines RPC failed: {e}");
-                        Err(())
-                    }
-                },
-                Err(e) => {
-                    debug!("attempt {n}: connection to {manager} failed: {e}");
-                    Err(())
-                }
-            }
-        }
-    })
-    .await
-    .is_ok()
 }
 
 #[cfg(test)]

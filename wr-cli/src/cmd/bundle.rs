@@ -30,6 +30,22 @@ pub fn tar_add_file(
     Ok(())
 }
 
+/// Add raw bytes to the tarball and record their SHA-256 checksum.
+pub fn tar_add_bytes_checked(
+    tar: &mut tar::Builder<GzEncoder<fs::File>>,
+    checksums: &mut HashMap<String, String>,
+    archive_path: &str,
+    data: &[u8],
+    mode: u32,
+) -> Result<()> {
+    tar_add_bytes(tar, archive_path, data, mode)?;
+    checksums.insert(
+        archive_path.to_string(),
+        format!("{:x}", Sha256::digest(data)),
+    );
+    Ok(())
+}
+
 /// Add raw bytes to the tarball.
 pub fn tar_add_bytes(
     tar: &mut tar::Builder<GzEncoder<fs::File>>,
@@ -43,6 +59,29 @@ pub fn tar_add_bytes(
     header.set_cksum();
     tar.append_data(&mut header, archive_path, data)?;
     Ok(())
+}
+
+/// Compute SHA-256 checksums for every non-manifest regular file in a bundle.
+pub fn read_payload_checksums(path: &str) -> Result<HashMap<String, String>> {
+    let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut checksums = HashMap::new();
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let entry_path = entry.path()?.to_string_lossy().to_string();
+        if entry_path.ends_with("/manifest.json") || entry_path == "manifest.json" {
+            continue;
+        }
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut data)?;
+        checksums.insert(entry_path, format!("{:x}", Sha256::digest(&data)));
+    }
+    Ok(checksums)
 }
 
 /// Read and deserialize `manifest.json` from a gzipped tarball.

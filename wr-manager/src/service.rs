@@ -11,16 +11,18 @@ use wr_common::identity::{
 };
 use wr_common::naming::namespace_role;
 use wr_common::wruntime::{
-    manager_service_server::ManagerService, DeleteRoutingRuleRequest, DeleteRoutingRuleResponse,
+    manager_service_server::ManagerService, BeginDeploymentRequest, BeginDeploymentResponse,
+    BeginRollbackRequest, BeginRollbackResponse, CompleteDeploymentRequest,
+    CompleteDeploymentResponse, DeleteRoutingRuleRequest, DeleteRoutingRuleResponse,
     DeleteScheduleRequest, DeleteScheduleResponse, DeleteSecretRequest, DeleteSecretResponse,
-    DeregisterEngineRequest, DeregisterEngineResponse, GetRoutingTableRequest,
+    DeploymentCondition, DeregisterEngineRequest, DeregisterEngineResponse, GetRoutingTableRequest,
     GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse, HeartbeatRequest,
     HeartbeatResponse, ListEnginesRequest, ListEnginesResponse, ListManagersRequest,
     ListManagersResponse, ListSchedulesRequest, ListSchedulesResponse, ListSecretsRequest,
     ListSecretsResponse, ManagerInfo, NamespaceDbCredential, NamespaceSecrets,
     RegisterEngineRequest, RegisterEngineResponse, RoutingRule, Schedule, SecretEntry,
     SetSecretRequest, SetSecretResponse, UpsertRoutingRuleResponse, UpsertScheduleRequest,
-    UpsertScheduleResponse,
+    UpsertScheduleResponse, VerifyDeploymentRequest, VerifyDeploymentResponse,
 };
 
 use crate::cluster::{ClusterHandle, ManagerLiveness};
@@ -116,15 +118,101 @@ pub struct Manager {
     pool: Pool,
     crypto: Arc<SecretCrypto>,
     cluster: Arc<ClusterHandle>,
+    engine_heartbeat_timeout_secs: f64,
+    module_heartbeat_timeout_secs: f64,
 }
 
 impl Manager {
     pub fn new(pool: Pool, crypto: Arc<SecretCrypto>, cluster: Arc<ClusterHandle>) -> Self {
+        Self::with_heartbeat_timeouts(pool, crypto, cluster, 10.0, 10.0)
+    }
+
+    pub fn with_heartbeat_timeouts(
+        pool: Pool,
+        crypto: Arc<SecretCrypto>,
+        cluster: Arc<ClusterHandle>,
+        engine_heartbeat_timeout_secs: f64,
+        module_heartbeat_timeout_secs: f64,
+    ) -> Self {
         Self {
             pool,
             crypto,
             cluster,
+            engine_heartbeat_timeout_secs,
+            module_heartbeat_timeout_secs,
         }
+    }
+
+    fn valid_deployment_token(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    }
+
+    fn valid_bundle_digest(value: &str) -> bool {
+        value.len() == 71
+            && value.starts_with("sha256:")
+            && value[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
+
+    fn canonicalize_deployment_request(request: &mut BeginDeploymentRequest) {
+        request
+            .expected_engines
+            .sort_by(|left, right| left.engine_slot.cmp(&right.engine_slot));
+        for engine in &mut request.expected_engines {
+            engine.modules.sort_by(|left, right| {
+                (&left.namespace, &left.name, &left.version).cmp(&(
+                    &right.namespace,
+                    &right.name,
+                    &right.version,
+                ))
+            });
+        }
+    }
+
+    fn validate_deployment_request(request: &BeginDeploymentRequest) -> Result<(), Status> {
+        Namespace::parse(&request.node_id)
+            .map_err(|_| Status::invalid_argument("node_id must be a valid stable identity"))?;
+        if !Self::valid_deployment_token(&request.attempt_token) {
+            return Err(Status::invalid_argument(
+                "attempt_token must be 1..=128 URL-safe characters",
+            ));
+        }
+        if !Self::valid_bundle_digest(&request.bundle_digest) {
+            return Err(Status::invalid_argument(
+                "bundle_digest must be sha256:<lowercase hex>",
+            ));
+        }
+        if request.expected_engines.is_empty() {
+            return Err(Status::invalid_argument(
+                "expected_engines must not be empty",
+            ));
+        }
+        let mut slots = HashSet::new();
+        for engine in &request.expected_engines {
+            if !Self::valid_deployment_token(&engine.engine_slot)
+                || !slots.insert(&engine.engine_slot)
+            {
+                return Err(Status::invalid_argument(
+                    "engine slots must be unique URL-safe identities",
+                ));
+            }
+            let mut modules = HashSet::new();
+            for module in &engine.modules {
+                ModuleId::parse(&module.namespace, &module.name, &module.version)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                if !modules.insert((&module.namespace, &module.name, &module.version)) {
+                    return Err(Status::invalid_argument(
+                        "expected engine inventory contains a duplicate module",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Ensure a DB password exists for the given namespace, creating one if not.
@@ -294,6 +382,20 @@ impl ManagerService for Manager {
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
         }
 
+        if let Some(metadata) = &reg.deployment {
+            Namespace::parse(&metadata.node_id)
+                .map_err(|_| Status::invalid_argument("deployment.node_id is invalid"))?;
+            if metadata.revision == 0
+                || metadata.revision > i64::MAX as u64
+                || !Self::valid_bundle_digest(&metadata.bundle_digest)
+                || !Self::valid_deployment_token(&metadata.engine_slot)
+            {
+                return Err(Status::invalid_argument(
+                    "deployment metadata requires a non-zero revision, sha256 digest, and valid engine slot",
+                ));
+            }
+        }
+
         let engine_id = reg.engine_id.clone();
 
         // Resolve requested secrets (fails before any write).
@@ -372,6 +474,135 @@ impl ManagerService for Manager {
     ) -> Result<Response<ListEnginesResponse>, Status> {
         let engines = db::list_engines(&self.pool).await?;
         Ok(Response::new(ListEnginesResponse { engines }))
+    }
+
+    // ── Desired node deployments ──────────────────────────────────────────
+
+    async fn begin_deployment(
+        &self,
+        request: Request<BeginDeploymentRequest>,
+    ) -> Result<Response<BeginDeploymentResponse>, Status> {
+        let mut request = request.into_inner();
+        Self::validate_deployment_request(&request)?;
+        Self::canonicalize_deployment_request(&mut request);
+        let deployment = db::begin_deployment(&self.pool, &request).await?.record;
+        Ok(Response::new(BeginDeploymentResponse {
+            deployment: Some(deployment),
+        }))
+    }
+
+    async fn verify_deployment(
+        &self,
+        request: Request<VerifyDeploymentRequest>,
+    ) -> Result<Response<VerifyDeploymentResponse>, Status> {
+        let request = request.into_inner();
+        if request.node_id.is_empty() || request.revision == 0 {
+            return Err(Status::invalid_argument(
+                "node_id and non-zero revision are required",
+            ));
+        }
+        let deployment = db::get_deployment(&self.pool, &request.node_id, request.revision)
+            .await?
+            .record;
+        let conditions = db::deployment_conditions(
+            &self.pool,
+            &deployment,
+            self.engine_heartbeat_timeout_secs,
+            self.module_heartbeat_timeout_secs,
+        )
+        .await?
+        .into_iter()
+        .map(|(code, detail)| DeploymentCondition { code, detail })
+        .collect::<Vec<_>>();
+        Ok(Response::new(VerifyDeploymentResponse {
+            deployment: Some(deployment),
+            ready: conditions.is_empty(),
+            conditions,
+        }))
+    }
+
+    async fn complete_deployment(
+        &self,
+        request: Request<CompleteDeploymentRequest>,
+    ) -> Result<Response<CompleteDeploymentResponse>, Status> {
+        let request = request.into_inner();
+        if request.node_id.is_empty() || request.revision == 0 {
+            return Err(Status::invalid_argument(
+                "node_id and non-zero revision are required",
+            ));
+        }
+        if request.succeeded && !request.failure_detail.is_empty() {
+            return Err(Status::invalid_argument(
+                "successful deployment cannot include failure_detail",
+            ));
+        }
+        if request.failure_detail.len() > 4096
+            || request.failure_detail.contains("postgres://")
+            || request.failure_detail.contains("postgresql://")
+        {
+            return Err(Status::invalid_argument(
+                "failure_detail must be at most 4096 characters and must not contain database URLs",
+            ));
+        }
+        if request.succeeded {
+            let candidate = db::get_deployment(&self.pool, &request.node_id, request.revision)
+                .await?
+                .record;
+            let conditions = db::deployment_conditions(
+                &self.pool,
+                &candidate,
+                self.engine_heartbeat_timeout_secs,
+                self.module_heartbeat_timeout_secs,
+            )
+            .await?;
+            if !conditions.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "deployment is not ready: {}",
+                    conditions
+                        .into_iter()
+                        .map(|(code, _)| code)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )));
+            }
+        }
+        let deployment = db::complete_deployment(
+            &self.pool,
+            &request.node_id,
+            request.revision,
+            request.succeeded,
+            &request.failure_detail,
+        )
+        .await?
+        .record;
+        Ok(Response::new(CompleteDeploymentResponse {
+            deployment: Some(deployment),
+        }))
+    }
+
+    async fn begin_rollback(
+        &self,
+        request: Request<BeginRollbackRequest>,
+    ) -> Result<Response<BeginRollbackResponse>, Status> {
+        let request = request.into_inner();
+        Namespace::parse(&request.node_id)
+            .map_err(|_| Status::invalid_argument("node_id must be a valid stable identity"))?;
+        if !Self::valid_deployment_token(&request.attempt_token) {
+            return Err(Status::invalid_argument(
+                "attempt_token must be 1..=128 URL-safe characters",
+            ));
+        }
+        let deployment = db::begin_rollback(
+            &self.pool,
+            &request.node_id,
+            request.to_revision,
+            &request.attempt_token,
+        )
+        .await?
+        .record;
+        Ok(Response::new(BeginRollbackResponse {
+            deployment: Some(deployment),
+        }))
     }
 
     // ── Manager discovery ─────────────────────────────────────────────────

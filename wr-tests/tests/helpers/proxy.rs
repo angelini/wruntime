@@ -61,6 +61,7 @@ pub async fn register_module_raw(
             }],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;

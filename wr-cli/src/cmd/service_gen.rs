@@ -106,6 +106,7 @@ pub struct ComposeService {
     pub dockerfile: String,
     pub context: String,
     pub image: Option<String>,
+    pub network_mode: Option<String>,
     pub ports: Vec<String>,
     pub depends_on: Vec<String>,
 }
@@ -126,6 +127,9 @@ pub fn generate_compose(header: &str, services: &[ComposeService]) -> String {
         ));
         if let Some(ref image) = svc.image {
             out.push_str(&format!("    image: {image}\n"));
+        }
+        if let Some(ref network_mode) = svc.network_mode {
+            out.push_str(&format!("    network_mode: {network_mode}\n"));
         }
         if !svc.ports.is_empty() {
             out.push_str("    ports:\n");

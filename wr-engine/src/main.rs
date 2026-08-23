@@ -93,6 +93,16 @@ async fn async_main() -> Result<()> {
 
     let config = config::EngineConfig::load(&config_path)?;
     let peer_address = config.node.peer_address()?;
+    let deployment =
+        config
+            .deployment
+            .clone()
+            .map(|metadata| wr_common::wruntime::DeploymentMetadata {
+                node_id: metadata.node_id,
+                revision: metadata.revision,
+                bundle_digest: metadata.bundle_digest,
+                engine_slot: metadata.engine_slot,
+            });
     let engine_id = Uuid::new_v4().to_string();
     // Convert listen_address (may bind on 0.0.0.0) to a routable HTTP URL.
     let advertise_address = {
@@ -238,6 +248,7 @@ async fn async_main() -> Result<()> {
                 modules: module_descriptors,
                 secrets: secret_requests,
                 db_namespaces: db_namespaces.clone(),
+                deployment: deployment.clone(),
             }),
         };
         let cl = client.clone();

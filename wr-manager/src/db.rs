@@ -5,7 +5,10 @@ use tokio_retry::RetryIf;
 use tonic::Status;
 
 use wr_common::identity::NamespaceFilter;
-use wr_common::wruntime::{EngineRegistration, ModuleDescriptor, RoutingRule, RoutingTable};
+use wr_common::wruntime::{
+    BeginDeploymentRequest, DeploymentRecord, DeploymentState, EngineRegistration,
+    ModuleDescriptor, RoutingRule, RoutingTable,
+};
 
 /// Exponential backoff strategy for NOWAIT lock retries: 10ms, 20ms, 40ms, 80ms.
 fn lock_retry_strategy() -> impl Iterator<Item = std::time::Duration> {
@@ -276,6 +279,25 @@ pub async fn register_engine_and_routes(
         increment_version(&txn).await?;
     }
 
+    if let Some(metadata) = &reg.deployment {
+        txn.execute(
+            "UPDATE wr_node_deployments d
+             SET state = 'active', activated_at = COALESCE(d.activated_at, NOW())
+             FROM wr_nodes n
+             WHERE d.node_id = $1 AND d.revision = $2 AND d.bundle_digest = $3
+               AND d.state = 'pending' AND n.node_id = d.node_id
+               AND n.current_revision = d.revision",
+            &[
+                &metadata.node_id,
+                &i64::try_from(metadata.revision)
+                    .map_err(|_| Status::invalid_argument("deployment revision is too large"))?,
+                &metadata.bundle_digest,
+            ],
+        )
+        .await
+        .internal()?;
+    }
+
     txn.commit().await.internal()?;
     Ok(())
 }
@@ -456,6 +478,540 @@ pub async fn list_engines(pool: &Pool) -> Result<Vec<EngineRegistration>, Status
                 .map_err(|e| Status::internal(format!("failed to decode registration: {e}")))
         })
         .collect()
+}
+
+// ── Desired node deployment operations ──────────────────────────────────────
+
+fn deployment_revision(value: u64) -> Result<i64, Status> {
+    i64::try_from(value).map_err(|_| Status::invalid_argument("deployment revision is too large"))
+}
+
+#[derive(Clone, Debug)]
+pub struct DeploymentRow {
+    pub record: DeploymentRecord,
+}
+
+fn deployment_state(value: &str) -> Result<i32, Status> {
+    match value {
+        "pending" => Ok(DeploymentState::Pending as i32),
+        "active" => Ok(DeploymentState::Active as i32),
+        "succeeded" => Ok(DeploymentState::Succeeded as i32),
+        "failed" => Ok(DeploymentState::Failed as i32),
+        _ => Err(Status::internal(format!(
+            "unknown deployment state '{value}'"
+        ))),
+    }
+}
+
+fn deployment_row(row: &tokio_postgres::Row) -> Result<DeploymentRow, Status> {
+    let inventory: Vec<u8> = row.get("expected_inventory");
+    let snapshot = DeploymentRecord::decode(inventory.as_slice())
+        .map_err(|e| Status::internal(format!("failed to decode deployment inventory: {e}")))?;
+    let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+    let activated_at: Option<chrono::DateTime<chrono::Utc>> = row.get("activated_at");
+    let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
+    Ok(DeploymentRow {
+        record: DeploymentRecord {
+            node_id: row.get("node_id"),
+            revision: row.get::<_, i64>("revision") as u64,
+            attempt_token: row.get("attempt_token"),
+            bundle_digest: row.get("bundle_digest"),
+            expected_engines: snapshot.expected_engines,
+            state: deployment_state(row.get::<_, String>("state").as_str())?,
+            created_at: Some(prost_types::Timestamp {
+                seconds: created_at.timestamp(),
+                nanos: created_at.timestamp_subsec_nanos() as i32,
+            }),
+            completed_at: completed_at.map(|time| prost_types::Timestamp {
+                seconds: time.timestamp(),
+                nanos: time.timestamp_subsec_nanos() as i32,
+            }),
+            failure_detail: row.get("failure_detail"),
+            source_revision: row.get::<_, i64>("source_revision") as u64,
+            activated_at: activated_at.map(|time| prost_types::Timestamp {
+                seconds: time.timestamp(),
+                nanos: time.timestamp_subsec_nanos() as i32,
+            }),
+        },
+    })
+}
+
+async fn get_deployment_in_transaction(
+    txn: &deadpool_postgres::Transaction<'_>,
+    node_id: &str,
+    revision: i64,
+) -> Result<Option<DeploymentRow>, Status> {
+    txn.query_opt(
+        "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, created_at, activated_at, completed_at
+         FROM wr_node_deployments WHERE node_id = $1 AND revision = $2",
+        &[&node_id, &revision],
+    )
+    .await
+    .internal()?
+    .as_ref()
+    .map(deployment_row)
+    .transpose()
+}
+
+/// Allocate a per-node revision. The node row lock makes independently running
+/// managers serialize only attempts for the same stable node identity.
+pub async fn begin_deployment(
+    pool: &Pool,
+    request: &BeginDeploymentRequest,
+) -> Result<DeploymentRow, Status> {
+    let mut client = pool.get().await.internal()?;
+    let txn = client.transaction().await.internal()?;
+
+    txn.execute(
+        "INSERT INTO wr_nodes (node_id) VALUES ($1) ON CONFLICT (node_id) DO NOTHING",
+        &[&request.node_id],
+    )
+    .await
+    .internal()?;
+
+    // An attempt token is idempotent. Check again after acquiring the node lock
+    // so a concurrent retry cannot allocate a second revision.
+    txn.query_one(
+        "SELECT current_revision FROM wr_nodes WHERE node_id = $1 FOR UPDATE",
+        &[&request.node_id],
+    )
+    .await
+    .internal()?;
+    if let Some(row) = txn
+        .query_opt(
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, created_at, activated_at, completed_at
+             FROM wr_node_deployments WHERE node_id = $1 AND attempt_token = $2",
+            &[&request.node_id, &request.attempt_token],
+        )
+        .await
+        .internal()?
+    {
+        let existing = deployment_row(&row)?;
+        if existing.record.bundle_digest != request.bundle_digest
+            || existing.record.expected_engines != request.expected_engines
+            || existing.record.source_revision != 0
+        {
+            return Err(Status::already_exists(
+                "attempt_token was already used with different deployment content",
+            ));
+        }
+        txn.commit().await.internal()?;
+        return Ok(existing);
+    }
+
+    let revision: i64 = txn
+        .query_one(
+            "UPDATE wr_nodes SET current_revision = current_revision + 1, updated_at = NOW()
+             WHERE node_id = $1 RETURNING current_revision",
+            &[&request.node_id],
+        )
+        .await
+        .internal()?
+        .get(0);
+    let snapshot = DeploymentRecord {
+        node_id: String::new(),
+        revision: 0,
+        attempt_token: String::new(),
+        bundle_digest: String::new(),
+        expected_engines: request.expected_engines.clone(),
+        state: DeploymentState::Unspecified as i32,
+        created_at: None,
+        completed_at: None,
+        failure_detail: String::new(),
+        source_revision: 0,
+        activated_at: None,
+    }
+    .encode_to_vec();
+    txn.execute(
+        "INSERT INTO wr_node_deployments
+           (node_id, revision, attempt_token, bundle_digest, expected_inventory, state)
+         VALUES ($1, $2, $3, $4, $5, 'pending')",
+        &[
+            &request.node_id,
+            &revision,
+            &request.attempt_token,
+            &request.bundle_digest,
+            &snapshot,
+        ],
+    )
+    .await
+    .internal()?;
+    let deployment = get_deployment_in_transaction(&txn, &request.node_id, revision)
+        .await?
+        .expect("deployment inserted in this transaction");
+    txn.commit().await.internal()?;
+    Ok(deployment)
+}
+
+pub async fn get_deployment(
+    pool: &Pool,
+    node_id: &str,
+    revision: u64,
+) -> Result<DeploymentRow, Status> {
+    let client = pool.get().await.internal()?;
+    let row = client
+        .query_opt(
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, created_at, activated_at, completed_at
+             FROM wr_node_deployments WHERE node_id = $1 AND revision = $2",
+            &[&node_id, &deployment_revision(revision)?],
+        )
+        .await
+        .internal()?
+        .ok_or_else(|| Status::not_found(format!("deployment {node_id}/{revision} not found")))?;
+    deployment_row(&row)
+}
+
+pub async fn complete_deployment(
+    pool: &Pool,
+    node_id: &str,
+    revision: u64,
+    succeeded: bool,
+    failure_detail: &str,
+) -> Result<DeploymentRow, Status> {
+    let client = pool.get().await.internal()?;
+    let state = if succeeded { "succeeded" } else { "failed" };
+    let updated = client
+        .execute(
+            "UPDATE wr_node_deployments
+             SET state = $3, failure_detail = $4, completed_at = NOW()
+             WHERE node_id = $1 AND revision = $2 AND state IN ('pending', 'active')",
+            &[
+                &node_id,
+                &deployment_revision(revision)?,
+                &state,
+                &failure_detail,
+            ],
+        )
+        .await
+        .internal()?;
+    if updated == 0 {
+        return Err(Status::failed_precondition(format!(
+            "deployment {node_id}/{revision} is not pending or active"
+        )));
+    }
+    get_deployment(pool, node_id, revision).await
+}
+
+/// Evaluate desired slots against the current registration, heartbeat, and
+/// routing rows. The returned codes are deliberately stable machine-readable
+/// deployment conditions, not CLI interpretations of ListEngines.
+pub async fn deployment_conditions(
+    pool: &Pool,
+    deployment: &DeploymentRecord,
+    engine_timeout_secs: f64,
+    module_timeout_secs: f64,
+) -> Result<Vec<(String, String)>, Status> {
+    let mut client = pool.get().await.internal()?;
+    let txn = client.transaction().await.internal()?;
+    txn.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await
+        .internal()?;
+    let current_revision: i64 = txn
+        .query_opt(
+            "SELECT current_revision FROM wr_nodes WHERE node_id = $1",
+            &[&deployment.node_id],
+        )
+        .await
+        .internal()?
+        .ok_or_else(|| Status::not_found(format!("node '{}' not found", deployment.node_id)))?
+        .get(0);
+    if current_revision as u64 != deployment.revision {
+        txn.commit().await.internal()?;
+        return Ok(vec![(
+            "SUPERSEDED_REVISION".into(),
+            format!(
+                "revision {} is not the current desired revision {}",
+                deployment.revision, current_revision
+            ),
+        )]);
+    }
+    let rows = txn
+        .query(
+            "SELECT registration, last_heartbeat >= NOW() - make_interval(secs => $1::double precision) AS fresh
+             FROM wr_engines",
+            &[&engine_timeout_secs],
+        )
+        .await
+        .internal()?;
+    let engines: Vec<(EngineRegistration, bool)> = rows
+        .iter()
+        .map(|row| {
+            let bytes: Vec<u8> = row.get("registration");
+            Ok((
+                EngineRegistration::decode(bytes.as_slice()).map_err(|e| {
+                    Status::internal(format!("failed to decode engine registration: {e}"))
+                })?,
+                row.get("fresh"),
+            ))
+        })
+        .collect::<Result<_, Status>>()?;
+
+    let mut conditions = Vec::new();
+    for expected in &deployment.expected_engines {
+        let same_slot: Vec<_> = engines
+            .iter()
+            .filter(|(reg, _)| {
+                reg.deployment.as_ref().is_some_and(|meta| {
+                    meta.node_id == deployment.node_id && meta.engine_slot == expected.engine_slot
+                })
+            })
+            .collect();
+        let exact: Vec<_> = same_slot
+            .iter()
+            .filter(|(reg, _)| {
+                reg.deployment.as_ref().is_some_and(|meta| {
+                    meta.revision == deployment.revision
+                        && meta.bundle_digest == deployment.bundle_digest
+                })
+            })
+            .copied()
+            .collect();
+        if exact.is_empty() {
+            let code = if same_slot.is_empty() {
+                "MISSING_ENGINE"
+            } else if same_slot.iter().any(|(reg, _)| {
+                reg.deployment
+                    .as_ref()
+                    .is_some_and(|m| m.revision != deployment.revision)
+            }) {
+                "REVISION_MISMATCH"
+            } else {
+                "DIGEST_MISMATCH"
+            };
+            conditions.push((
+                code.into(),
+                format!(
+                    "engine slot '{}' has no matching activated registration",
+                    expected.engine_slot
+                ),
+            ));
+            continue;
+        }
+        let fresh: Vec<_> = exact
+            .iter()
+            .filter(|(_, engine_fresh)| *engine_fresh)
+            .copied()
+            .collect();
+        if fresh.is_empty() {
+            conditions.push((
+                "STALE_ENGINE_HEARTBEAT".into(),
+                format!(
+                    "engine slot '{}' has no fresh matching registration",
+                    expected.engine_slot
+                ),
+            ));
+            continue;
+        }
+        if fresh.len() != 1 {
+            conditions.push((
+                "DUPLICATE_ENGINE_SLOT".into(),
+                format!(
+                    "engine slot '{}' has {} fresh matching registrations",
+                    expected.engine_slot,
+                    fresh.len()
+                ),
+            ));
+            continue;
+        }
+        let (engine, _) = fresh[0];
+        for module in &expected.modules {
+            if !engine.modules.iter().any(|advertised| {
+                advertised.namespace == module.namespace
+                    && advertised.name == module.name
+                    && advertised.version == module.version
+            }) {
+                conditions.push((
+                    "MISSING_MODULE".into(),
+                    format!(
+                        "engine slot '{}' does not advertise {}.{}@{}",
+                        expected.engine_slot, module.namespace, module.name, module.version
+                    ),
+                ));
+                continue;
+            }
+            let module_heartbeat = txn
+                .query_opt(
+                    "SELECT last_healthy >= NOW() - make_interval(secs => $5::double precision) AS fresh
+                     FROM wr_module_heartbeats
+                     WHERE engine_id = $1 AND namespace = $2 AND module_name = $3 AND version = $4",
+                    &[
+                        &engine.engine_id,
+                        &module.namespace,
+                        &module.name,
+                        &module.version,
+                        &module_timeout_secs,
+                    ],
+                )
+                .await
+                .internal()?;
+            let Some(module_heartbeat) = module_heartbeat else {
+                conditions.push((
+                    "MISSING_MODULE_HEARTBEAT".into(),
+                    format!(
+                        "engine slot '{}' module {}.{}@{} has no heartbeat",
+                        expected.engine_slot, module.namespace, module.name, module.version
+                    ),
+                ));
+                continue;
+            };
+            if !module_heartbeat.get::<_, bool>("fresh") {
+                conditions.push((
+                    "STALE_MODULE_HEARTBEAT".into(),
+                    format!(
+                        "engine slot '{}' module {}.{}@{} is not fresh",
+                        expected.engine_slot, module.namespace, module.name, module.version
+                    ),
+                ));
+                continue;
+            }
+            let rule_id = format!(
+                "{}/{}/{}/{}",
+                engine.engine_id, module.namespace, module.name, module.version
+            );
+            let route = txn
+                .query_opt(
+                    "SELECT healthy FROM wr_routing_rules
+                     WHERE rule_id = $1 AND engine_id = $2 AND destination_namespace = $3
+                       AND destination_module = $4 AND destination_version = $5",
+                    &[
+                        &rule_id,
+                        &engine.engine_id,
+                        &module.namespace,
+                        &module.name,
+                        &module.version,
+                    ],
+                )
+                .await
+                .internal()?;
+            match route {
+                None => conditions.push((
+                    "MISSING_ROUTE".into(),
+                    format!(
+                        "engine slot '{}' module {}.{}@{} has no default route",
+                        expected.engine_slot, module.namespace, module.name, module.version
+                    ),
+                )),
+                Some(route) if !route.get::<_, bool>("healthy") => conditions.push((
+                    "UNHEALTHY_ROUTE".into(),
+                    format!(
+                        "engine slot '{}' module {}.{}@{} default route is unhealthy",
+                        expected.engine_slot, module.namespace, module.name, module.version
+                    ),
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+    txn.commit().await.internal()?;
+    Ok(conditions)
+}
+
+pub async fn begin_rollback(
+    pool: &Pool,
+    node_id: &str,
+    to_revision: u64,
+    attempt_token: &str,
+) -> Result<DeploymentRow, Status> {
+    let mut client = pool.get().await.internal()?;
+    let txn = client.transaction().await.internal()?;
+    let current_revision: i64 = txn
+        .query_opt(
+            "SELECT current_revision FROM wr_nodes WHERE node_id = $1 FOR UPDATE",
+            &[&node_id],
+        )
+        .await
+        .internal()?
+        .ok_or_else(|| Status::not_found(format!("node '{node_id}' has no deployment history")))?
+        .get(0);
+
+    if let Some(row) = txn
+        .query_opt(
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, created_at, activated_at, completed_at
+             FROM wr_node_deployments WHERE node_id = $1 AND attempt_token = $2",
+            &[&node_id, &attempt_token],
+        )
+        .await
+        .internal()?
+    {
+        let existing = deployment_row(&row)?;
+        if existing.record.source_revision == 0
+            || (to_revision != 0 && existing.record.source_revision != to_revision)
+        {
+            return Err(Status::already_exists(
+                "attempt_token was already used for different deployment content",
+            ));
+        }
+        txn.commit().await.internal()?;
+        return Ok(existing);
+    }
+
+    let selected_row = if to_revision == 0 {
+        txn.query_opt(
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, created_at, activated_at, completed_at
+             FROM wr_node_deployments
+             WHERE node_id = $1 AND state = 'succeeded' AND revision < $2
+             ORDER BY revision DESC LIMIT 1",
+            &[&node_id, &current_revision],
+        )
+        .await
+        .internal()?
+    } else {
+        let requested = i64::try_from(to_revision)
+            .map_err(|_| Status::invalid_argument("to_revision is too large"))?;
+        txn.query_opt(
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, created_at, activated_at, completed_at
+             FROM wr_node_deployments
+             WHERE node_id = $1 AND revision = $2 AND revision < $3 AND state = 'succeeded'",
+            &[&node_id, &requested, &current_revision],
+        )
+        .await
+        .internal()?
+    }
+    .ok_or_else(|| Status::not_found("requested prior successful deployment snapshot not found"))?;
+    let selected = deployment_row(&selected_row)?.record;
+    let revision: i64 = txn
+        .query_one(
+            "UPDATE wr_nodes SET current_revision = current_revision + 1, updated_at = NOW()
+             WHERE node_id = $1 RETURNING current_revision",
+            &[&node_id],
+        )
+        .await
+        .internal()?
+        .get(0);
+    let snapshot = DeploymentRecord {
+        node_id: String::new(),
+        revision: 0,
+        attempt_token: String::new(),
+        bundle_digest: String::new(),
+        expected_engines: selected.expected_engines,
+        state: DeploymentState::Unspecified as i32,
+        created_at: None,
+        completed_at: None,
+        failure_detail: String::new(),
+        source_revision: selected.revision,
+        activated_at: None,
+    }
+    .encode_to_vec();
+    txn.execute(
+        "INSERT INTO wr_node_deployments
+           (node_id, revision, attempt_token, bundle_digest, expected_inventory, state, source_revision)
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6)",
+        &[
+            &node_id,
+            &revision,
+            &attempt_token,
+            &selected.bundle_digest,
+            &snapshot,
+            &(selected.revision as i64),
+        ],
+    )
+    .await
+    .internal()?;
+    let deployment = get_deployment_in_transaction(&txn, node_id, revision)
+        .await?
+        .expect("rollback deployment inserted in this transaction");
+    txn.commit().await.internal()?;
+    Ok(deployment)
 }
 
 // ── Routing operations ───────────────────────────────────────────────────────

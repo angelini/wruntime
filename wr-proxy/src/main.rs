@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
     tokio::spawn(accept_loop(internal_listener, internal_svc.clone()));
 
     // mTLS peer listener — all interfaces
-    let peer_bind = format!("0.0.0.0:{}", config.node.peer_port);
+    let peer_bind = format!("0.0.0.0:{}", config.node.peer_port()?);
     let peer_listener = TcpListener::bind(&peer_bind).await?;
     info!(address = %peer_bind, "proxy listening (mTLS peer)");
     tokio::spawn(tls_accept_loop(peer_listener, tls_acceptor, internal_svc));

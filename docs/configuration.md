@@ -69,8 +69,9 @@ listen_address  = "127.0.0.1:9001"         # loopback only — engines on same h
 control_address = "127.0.0.1:9002"         # gRPC control plane for engine registration/heartbeats
 
 [node]
-proxy_address = "http://127.0.0.1:9001"   # engines use this for outbound HTTP calls
-peer_port     = 9443                       # mTLS peer listener port
+proxy_address   = "http://127.0.0.1:9001" # local engine data-plane URL
+control_address = "http://127.0.0.1:9002" # local engine control-plane URL
+peer_address    = "https://node-a:9443"   # explicit advertised mTLS peer URL
 
 [node.tls]
 cert_path    = "certs/127.0.0.1.crt"
@@ -88,7 +89,7 @@ routing_table_ttl_secs = 5   # how often to poll the manager for routing updates
 allowed_domains = ["api.github.com", "*.openai.com"]
 ```
 
-`listen_address` and `control_address` **must** bind to loopback (`127.0.0.1`, `::1`, or `localhost`) — only engines on the same host reach them, and the proxy rejects a non-loopback value at config load. `node.proxy_address` must be an absolute `http` or `https` URI with a host. Cross-node traffic uses the mTLS peer listener on `peer_port` (default 9443, binds `0.0.0.0`). The peer address is derived automatically from `proxy_address` host + `peer_port`, including bracketed IPv6 authorities. The routing layer uses the derived peer address to distinguish local vs. remote rules.
+`listen_address`, `control_address`, `node.proxy_address`, and `node.control_address` must use the documented loopback boundary. `node.peer_address` is a required explicit `https://host:port` URL advertised to other nodes; the proxy binds that port on all interfaces. The runtime rejects the obsolete derived `peer_port` shape so a loopback data-plane URL cannot accidentally become a cross-node advertisement.
 
 `control_address` exposes a gRPC `NodeService` that engines on the same node use for registration and heartbeats instead of connecting directly to the manager. This decouples engines from the manager address and enables local-first orchestration.
 
@@ -145,9 +146,9 @@ just engine
 listen_address = "127.0.0.1:9100"
 
 [node]
-proxy_address   = "http://127.0.0.1:9001"  # local proxy; WASM outbound calls rewrite to this
-control_address = "http://127.0.0.1:9002"  # proxy's gRPC control plane for registration/heartbeats
-peer_port       = 9443                      # mTLS peer port (peer address derived from proxy_address host)
+proxy_address   = "http://127.0.0.1:9001" # local proxy; WASM outbound calls rewrite to this
+control_address = "http://127.0.0.1:9002" # proxy's gRPC control plane for registration/heartbeats
+peer_address    = "https://node-a:9443"   # explicit advertised mTLS peer URL
 
 [node.tls]
 cert_path    = "certs/127.0.0.1.crt"
@@ -454,7 +455,7 @@ grpcurl \
 }' 127.0.0.1:9000 wruntime.ManagerService/UpsertRoutingRule
 ```
 
-`peer_address` tells every proxy which node owns this rule. A proxy whose own derived `[node]` peer address matches will route directly to `engine_address`; all other proxies relay to `peer_address` and let that node route locally. The old `proxy_address` routing-rule field is reserved in `proto/wruntime.proto` and must not be used in new rules. `source_module` and `source_namespace` are retained as metadata for future policy work; current routing matches only the destination namespace, module, and optional version, so these source fields do not restrict callers.
+`peer_address` tells every proxy which node owns this rule. A proxy whose own explicit `[node].peer_address` matches will route directly to `engine_address`; all other proxies relay to `peer_address` and let that node route locally. The old `proxy_address` routing-rule field is reserved in `proto/wruntime.proto` and must not be used in new rules. `source_module` and `source_namespace` are retained as metadata for future policy work; current routing matches only the destination namespace, module, and optional version, so these source fields do not restrict callers.
 
 Current worker modules use the same descriptor/default-route path as service modules, so direct worker routes remain available but are gated by the same unhealthy-until-ready lifecycle. Queue-only workers with no default route require a future proto/control-plane route-publication flag or module mode.
 
@@ -464,7 +465,7 @@ To deploy a **new version** alongside the old one, register a new engine with `v
 
 ### Multi-node deployment
 
-Each proxy and engine binds its internal `listen_address`/`control_address` to loopback. Cross-node traffic uses the proxy mTLS peer listener on `peer_port`; each node's peer address is derived from `[node].proxy_address` host + `peer_port`.
+Each proxy and engine binds its internal `listen_address`/`control_address` and `[node]` local URLs to loopback. Cross-node traffic uses the proxy mTLS listener advertised explicitly as `[node].peer_address`.
 
 ```toml
 # examples/multi-node/node-a/proxy.toml
@@ -472,8 +473,9 @@ listen_address  = "127.0.0.1:9001"
 control_address = "127.0.0.1:9002"
 
 [node]
-proxy_address = "http://node-a-host:9001"
-peer_port     = 9443
+proxy_address   = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_address    = "https://node-a-host:9443"
 
 [node.tls]
 cert_path    = "certs/127.0.0.1.crt"
@@ -487,9 +489,9 @@ url = "postgres://postgres@db-host:5432/wruntime"
 listen_address = "127.0.0.1:9100"
 
 [node]
-proxy_address   = "http://node-a-host:9001"
+proxy_address   = "http://127.0.0.1:9001"
 control_address = "http://127.0.0.1:9002"
-peer_port       = 9443
+peer_address    = "https://node-a-host:9443"
 
 [node.tls]
 cert_path    = "certs/127.0.0.1.crt"
@@ -503,8 +505,9 @@ listen_address  = "127.0.0.1:9003"
 control_address = "127.0.0.1:9004"
 
 [node]
-proxy_address = "http://node-b-host:9003"
-peer_port     = 9444 # distinct from Node A so both proxies can run locally
+proxy_address   = "http://127.0.0.1:9003"
+control_address = "http://127.0.0.1:9004"
+peer_address    = "https://node-b-host:9444" # distinct locally for this example
 
 [node.tls]
 cert_path    = "certs/127.0.0.1.crt"
@@ -518,9 +521,9 @@ url = "postgres://postgres@db-host:5432/wruntime"
 listen_address = "127.0.0.1:9200"
 
 [node]
-proxy_address   = "http://node-b-host:9003"
+proxy_address   = "http://127.0.0.1:9003"
 control_address = "http://127.0.0.1:9004"
-peer_port       = 9444
+peer_address    = "https://node-b-host:9444"
 
 [node.tls]
 cert_path    = "certs/127.0.0.1.crt"
@@ -624,10 +627,10 @@ wr-cli node bundle --engine-config examples/codegen/engine.toml
 # 2. Deploy to each node (resolves {host}, {db_url})
 export WR_MANAGER=https://10.0.1.10:9000
 
-wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.20 \
+wr-cli node deploy --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.20 \
   --db-url "postgres://postgres@10.0.1.10:5432/wruntime"
 
-wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.30 \
+wr-cli node deploy --node-id node-b wr-node-bundle.tar.gz deploy@10.0.1.30 \
   --db-url "postgres://postgres@10.0.1.10:5432/wruntime"
 ```
 

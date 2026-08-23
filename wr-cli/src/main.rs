@@ -76,7 +76,7 @@ enum Commands {
     Schedules(cmd::schedules::SchedulesArgs),
     /// Manage namespace-scoped secrets
     Secrets(cmd::secrets::SecretsArgs),
-    /// Remote node deployment (bundle, deploy, status)
+    /// Remote node deployment (bundle, deploy, rollback, inspect-bundle)
     Node(cmd::node::NodeArgs),
     /// View logs from remote services
     Logs(cmd::logs::LogsArgs),

@@ -148,7 +148,7 @@ pub fn build_docker_logs_command(
     tail: u32,
     follow: bool,
 ) -> String {
-    let compose = format!("{workdir}/wr-node/docker/docker-compose.yml");
+    let compose = format!("{workdir}/wr-node/current/docker/docker-compose.yml");
     let mut cmd = format!("docker compose -f {compose} logs --tail {tail}");
     if follow {
         cmd.push_str(" -f");

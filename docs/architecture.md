@@ -40,12 +40,12 @@ A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. 
 ## Components
 
 | Binary | Default port | Role |
-|--------|-------------|------|
+| -------- | ------------- | ------ |
 | `wr-manager` | `9000` (gRPC) + `9010` (gossip) | Registry — engines register here, proxies sync routing tables from here. Runs active-active behind shared Postgres; chitchat gossip provides manager-to-manager liveness detection. On registration the manager resolves the engine's requested secrets and per-namespace DB credentials, then persists the engine, its schemas, and one initially-unhealthy default routing rule per schema-bearing module in a single transaction — a failed registration leaves no routing rules. |
 | `wr-proxy` | `9001` (HTTP) + `9002` (gRPC control plane) | Streaming header-based router — intercepts and routes inter-module traffic; forwards cross-node requests to peer proxies; request and response bodies flow through without buffering. The control plane (`NodeService`) handles engine registration and heartbeats |
 | `wr-engine` | `9100` (HTTP) | Loads WASM modules, runs them, and receives forwarded requests |
 
-A **node** groups one `wr-proxy` with one or more `wr-engine` instances behind a shared externally-reachable proxy address. Each node knows its own address via `[node] proxy_address` in its config files; the engine sends this value to the manager on registration so the routing table can distinguish local from remote destinations.
+A **node** groups one `wr-proxy` with one or more `wr-engine` instances. `[node].proxy_address` and `[node].control_address` are explicit loopback URLs; `[node].peer_address` is the separately advertised mTLS URL used across nodes. Engines keep ephemeral process IDs but deployed configs also report a stable operator-supplied node ID, manager-assigned monotonic revision, immutable bundle digest, and stable engine slot. The manager persists desired revision history and verifies those identities against fresh heartbeats and healthy default routes.
 
 At component load, the engine inspects top-level WIT imports and rejects modules that import the DB, blobstore, or LLM host interfaces without enabling the corresponding module capability. Runtime DB capability construction also requires a coherent pool+schema pair. Host-side missing-capability and input validation remain defense in depth for raw generated bindings.
 
@@ -132,7 +132,7 @@ inventory-service WASM module handles the request
 All internal routing uses a set of reserved `x-wr-*` HTTP headers. The proxy strips every `x-wr-*` header from externally-originated requests (public routes) to prevent spoofing.
 
 | Header | Set by | Read by | Description |
-|--------|--------|---------|-------------|
+| -------- | -------- | --------- | ------------- |
 | `x-wr-destination` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (public routes) | `wr-proxy` RoutingLayer, TracingLayer | Full destination URI of the original call — e.g. `http://ecommerce.inventory/inventory.InventoryService/GetItems`. The host encodes the destination as `{namespace}.{module}`; the path is the canonical generated RPC path `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`. Stripped by ForwardService before reaching the destination engine. |
 | `x-wr-source` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (set to `"external"` for public routes) | `wr-proxy` TracingLayer | Name of the calling module. Recorded as a span attribute for metrics attribution and error reporting. Stripped by ForwardService before reaching the destination engine. |
 | `x-wr-source-ns` | `wr-engine` (outbound WASM call) | — | Namespace of the calling module. Carried alongside `x-wr-source` as attribution metadata; not used for routing or authorization decisions. Stripped by ForwardService before reaching the destination engine. |

@@ -8,7 +8,9 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
         .query_one(
             "SELECT to_regclass('wr_engines') IS NOT NULL
                     AND to_regclass('wr_routing_rules') IS NOT NULL
-                    AND to_regclass('wr_schemas') IS NOT NULL",
+                    AND to_regclass('wr_schemas') IS NOT NULL
+                    AND to_regclass('wr_nodes') IS NOT NULL
+                    AND to_regclass('wr_node_deployments') IS NOT NULL",
             &[],
         )
         .await?

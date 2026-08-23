@@ -111,8 +111,9 @@ fn test_proxy_config_valid() {
         control_address = "127.0.0.1:9002"
 
         [node]
-        proxy_address = "http://127.0.0.1:9001"
-        peer_port     = 9443
+        proxy_address   = "http://127.0.0.1:9001"
+        control_address = "http://127.0.0.1:9002"
+        peer_address    = "https://127.0.0.1:9443"
 
         [node.tls]
         cert_path    = "certs/node.crt"
@@ -129,7 +130,7 @@ fn test_proxy_config_valid() {
     assert_eq!(cfg.listen_address, "127.0.0.1:9001");
     assert_eq!(cfg.control_address, "127.0.0.1:9002");
     assert_eq!(cfg.cache.routing_table_ttl_secs, 5);
-    assert_eq!(cfg.node.peer_port, 9443);
+    assert_eq!(cfg.node.peer_port().unwrap(), 9443);
 }
 
 #[test]
@@ -139,7 +140,9 @@ fn test_proxy_config_defaults() {
         control_address = "127.0.0.1:9002"
 
         [node]
-        proxy_address = "http://127.0.0.1:9001"
+        proxy_address   = "http://127.0.0.1:9001"
+        control_address = "http://127.0.0.1:9002"
+        peer_address    = "https://127.0.0.1:9443"
 
         [node.tls]
         cert_path    = "certs/node.crt"
@@ -151,7 +154,7 @@ fn test_proxy_config_defaults() {
     "#;
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
     assert_eq!(cfg.cache.routing_table_ttl_secs, 2);
-    assert_eq!(cfg.node.peer_port, 9443);
+    assert_eq!(cfg.node.peer_port().unwrap(), 9443);
     assert_eq!(cfg.circuit_breaker.failure_threshold, 5);
     assert_eq!(cfg.circuit_breaker.open_duration_secs, 30);
 }
@@ -198,7 +201,9 @@ fn test_proxy_config_rejects_zero_ttl() {
         control_address = "127.0.0.1:9002"
 
         [node]
-        proxy_address = "http://127.0.0.1:9001"
+        proxy_address   = "http://127.0.0.1:9001"
+        control_address = "http://127.0.0.1:9002"
+        peer_address    = "https://127.0.0.1:9443"
 
         [node.tls]
         cert_path    = "certs/node.crt"
@@ -330,8 +335,7 @@ fn test_example_config_files_parse() {
     struct NodeSection {
         proxy_address: String,
         control_address: String,
-        #[serde(default)]
-        peer_port: u16,
+        peer_address: String,
         tls: TlsSection,
     }
     #[derive(serde::Deserialize)]
@@ -405,26 +409,26 @@ fn test_example_config_files_parse() {
         }
     }
 
-    for (path, toml, expected_peer_port) in [
+    for (path, toml, expected_peer_address) in [
         (
             "examples/multi-node/node-a/engine-1.toml",
             include_str!("../../examples/multi-node/node-a/engine-1.toml"),
-            9443,
+            "https://127.0.0.1:9443",
         ),
         (
             "examples/multi-node/node-a/engine-2.toml",
             include_str!("../../examples/multi-node/node-a/engine-2.toml"),
-            9443,
+            "https://127.0.0.1:9443",
         ),
         (
             "examples/multi-node/node-b/engine-1.toml",
             include_str!("../../examples/multi-node/node-b/engine-1.toml"),
-            9444,
+            "https://127.0.0.1:9444",
         ),
     ] {
         let raw: EngineRaw =
             toml::from_str(toml).unwrap_or_else(|err| panic!("{path} must parse: {err}"));
-        assert_eq!(raw.node.peer_port, expected_peer_port, "{path}");
+        assert_eq!(raw.node.peer_address, expected_peer_address, "{path}");
         if path.ends_with("node-b/engine-1.toml") {
             assert_eq!(raw.modules.len(), 1, "{path} modules");
             assert_eq!(raw.modules[0]["name"].as_str(), Some("echo"), "{path}");
@@ -781,8 +785,9 @@ fn proxy_toml(listen: &str, control: &str) -> String {
         control_address = "{control}"
 
         [node]
-        proxy_address = "http://127.0.0.1:9001"
-        peer_port     = 9443
+        proxy_address   = "http://127.0.0.1:9001"
+        control_address = "http://127.0.0.1:9002"
+        peer_address    = "https://127.0.0.1:9443"
 
         [node.tls]
         cert_path    = "certs/node.crt"
@@ -804,7 +809,7 @@ fn engine_toml(listen: &str, allow_line: &str) -> String {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
-        peer_port       = 9443
+        peer_address    = "https://127.0.0.1:9443"
 
         [node.tls]
         cert_path    = "certs/node.crt"
@@ -822,7 +827,7 @@ fn engine_toml_with_modules(module_blocks: &str) -> String {
           [node]
           proxy_address   = "http://127.0.0.1:9001"
           control_address = "http://127.0.0.1:9002"
-          peer_port       = 9443
+          peer_address    = "https://127.0.0.1:9443"
 
           [node.tls]
           cert_path    = "certs/node.crt"

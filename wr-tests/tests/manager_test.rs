@@ -4,9 +4,10 @@ use helpers::{manager::manager_trio, proxy::TEST_SELF_PEER, wasm::minimal_file_d
 use anyhow::Result;
 
 use wr_common::wruntime::{
-    DeregisterEngineRequest, EngineRegistration, GetRoutingTableRequest, GetSchemaRequest,
-    HeartbeatRequest, ListEnginesRequest, ModuleDescriptor, RegisterEngineRequest, RoutingRule,
-    SecretRequest,
+    BeginDeploymentRequest, BeginRollbackRequest, CompleteDeploymentRequest, DeploymentMetadata,
+    DeregisterEngineRequest, EngineRegistration, ExpectedEngine, GetRoutingTableRequest,
+    GetSchemaRequest, HeartbeatRequest, ListEnginesRequest, ModuleDescriptor, ModuleIdentity,
+    RegisterEngineRequest, RoutingRule, SecretRequest, VerifyDeploymentRequest,
 };
 
 #[tokio::test]
@@ -27,6 +28,7 @@ async fn test_register_and_list_engines() -> Result<()> {
             }],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -56,6 +58,7 @@ async fn test_deregister_engine() -> Result<()> {
             modules: vec![],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -88,6 +91,7 @@ async fn test_heartbeat() -> Result<()> {
             modules: vec![],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -209,6 +213,7 @@ async fn test_get_schema_after_registration() -> Result<()> {
             }],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -311,6 +316,7 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
             }],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -330,6 +336,7 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
             }],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -379,6 +386,7 @@ async fn test_get_schema_cross_namespace_isolation() -> Result<()> {
             }],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -429,6 +437,7 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
             }],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -459,6 +468,7 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
             }],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -510,6 +520,7 @@ async fn test_get_schema_multi_module_engine() -> Result<()> {
             ],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -556,6 +567,7 @@ async fn test_register_engine_creates_default_routing_rule() -> Result<()> {
             }],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -616,6 +628,7 @@ async fn test_register_engine_dedups_duplicate_module_instances() -> Result<()> 
             ],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -654,6 +667,7 @@ async fn test_register_engine_missing_schema_rejected_no_writes() -> Result<()> 
                 }],
                 secrets: vec![],
                 db_namespaces: vec![],
+                deployment: None,
             }),
         })
         .await
@@ -708,6 +722,7 @@ async fn test_register_engine_missing_secret_leaves_no_routes() -> Result<()> {
                     key: "api-key".into(), // never stored -> resolve_secrets fails
                 }],
                 db_namespaces: vec![],
+                deployment: None,
             }),
         })
         .await
@@ -762,6 +777,7 @@ async fn test_reregister_removes_dropped_module_route_and_heartbeat() -> Result<
             modules: vec![module("alpha"), module("beta")],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -782,6 +798,7 @@ async fn test_reregister_removes_dropped_module_route_and_heartbeat() -> Result<
             modules: vec![module("alpha")],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -853,6 +870,7 @@ async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Re
             }],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -873,6 +891,7 @@ async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Re
             modules: vec![],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -916,5 +935,244 @@ async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Re
         "delete-only reconciliation must still bump the routing version",
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_revisioned_deployment_verification_and_rollback_history() -> Result<()> {
+    let (pool, _addr, mut client) = manager_trio().await?;
+    let expected = vec![ExpectedEngine {
+        engine_slot: "primary".into(),
+        modules: vec![ModuleIdentity {
+            namespace: "store".into(),
+            name: "inventory".into(),
+            version: "1.0.0".into(),
+        }],
+    }];
+    let digest_one = format!("sha256:{}", "1".repeat(64));
+    let digest_two = format!("sha256:{}", "2".repeat(64));
+
+    let first = client
+        .begin_deployment(BeginDeploymentRequest {
+            node_id: "node-a".into(),
+            attempt_token: "attempt-one".into(),
+            bundle_digest: digest_one.clone(),
+            expected_engines: expected.clone(),
+        })
+        .await?
+        .into_inner()
+        .deployment
+        .unwrap();
+    assert_eq!(first.revision, 1);
+    let retry = client
+        .begin_deployment(BeginDeploymentRequest {
+            node_id: "node-a".into(),
+            attempt_token: "attempt-one".into(),
+            bundle_digest: digest_one.clone(),
+            expected_engines: expected.clone(),
+        })
+        .await?
+        .into_inner()
+        .deployment
+        .unwrap();
+    assert_eq!(retry.revision, first.revision);
+    let conflict = client
+        .begin_deployment(BeginDeploymentRequest {
+            node_id: "node-a".into(),
+            attempt_token: "attempt-one".into(),
+            bundle_digest: digest_two.clone(),
+            expected_engines: expected.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+
+    let missing = client
+        .verify_deployment(VerifyDeploymentRequest {
+            node_id: "node-a".into(),
+            revision: first.revision,
+        })
+        .await?
+        .into_inner();
+    assert!(!missing.ready);
+    assert_eq!(missing.conditions[0].code, "MISSING_ENGINE");
+
+    async fn activate(
+        client: &mut wr_common::wruntime::manager_service_client::ManagerServiceClient<
+            tonic::transport::Channel,
+        >,
+        pool: &deadpool_postgres::Pool,
+        engine_id: &str,
+        revision: u64,
+        digest: &str,
+    ) -> Result<()> {
+        let module = ModuleDescriptor {
+            name: "inventory".into(),
+            namespace: "store".into(),
+            version: "1.0.0".into(),
+            proto_schema: minimal_file_descriptor_set(),
+        };
+        client
+            .register_engine(RegisterEngineRequest {
+                registration: Some(EngineRegistration {
+                    engine_id: engine_id.into(),
+                    address: "http://127.0.0.1:9700".into(),
+                    proxy_address: "http://127.0.0.1:9001".into(),
+                    peer_address: TEST_SELF_PEER.into(),
+                    modules: vec![module.clone()],
+                    secrets: vec![],
+                    db_namespaces: vec![],
+                    deployment: Some(DeploymentMetadata {
+                        node_id: "node-a".into(),
+                        revision,
+                        bundle_digest: digest.into(),
+                        engine_slot: "primary".into(),
+                    }),
+                }),
+            })
+            .await?;
+        client
+            .heartbeat(HeartbeatRequest {
+                engine_id: engine_id.into(),
+                healthy_modules: vec![module],
+            })
+            .await?;
+        wr_manager::db::update_route_health(pool, 10.0, 10.0).await?;
+        Ok(())
+    }
+
+    activate(&mut client, &pool, "deploy-e1", 1, &digest_one).await?;
+    let ready = client
+        .verify_deployment(VerifyDeploymentRequest {
+            node_id: "node-a".into(),
+            revision: 1,
+        })
+        .await?
+        .into_inner();
+    assert!(ready.ready, "conditions: {:?}", ready.conditions);
+    assert!(
+        ready
+            .deployment
+            .as_ref()
+            .and_then(|record| record.activated_at.as_ref())
+            .is_some(),
+        "registration should stamp activation time"
+    );
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE wr_engines SET last_heartbeat = NOW() - INTERVAL '30 seconds' WHERE engine_id = $1",
+            &[&"deploy-e1"],
+        )
+        .await?;
+    let stale = client
+        .verify_deployment(VerifyDeploymentRequest {
+            node_id: "node-a".into(),
+            revision: 1,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(stale.conditions[0].code, "STALE_ENGINE_HEARTBEAT");
+    client
+        .heartbeat(HeartbeatRequest {
+            engine_id: "deploy-e1".into(),
+            healthy_modules: vec![ModuleDescriptor {
+                name: "inventory".into(),
+                namespace: "store".into(),
+                version: "1.0.0".into(),
+                proto_schema: vec![],
+            }],
+        })
+        .await?;
+    client
+        .complete_deployment(CompleteDeploymentRequest {
+            node_id: "node-a".into(),
+            revision: 1,
+            succeeded: true,
+            failure_detail: String::new(),
+        })
+        .await?;
+
+    let second = client
+        .begin_deployment(BeginDeploymentRequest {
+            node_id: "node-a".into(),
+            attempt_token: "attempt-two".into(),
+            bundle_digest: digest_two.clone(),
+            expected_engines: expected,
+        })
+        .await?
+        .into_inner()
+        .deployment
+        .unwrap();
+    assert_eq!(second.revision, 2);
+    let superseded = client
+        .verify_deployment(VerifyDeploymentRequest {
+            node_id: "node-a".into(),
+            revision: 1,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(superseded.conditions[0].code, "SUPERSEDED_REVISION");
+    activate(&mut client, &pool, "deploy-e2", 2, &digest_two).await?;
+    client
+        .complete_deployment(CompleteDeploymentRequest {
+            node_id: "node-a".into(),
+            revision: 2,
+            succeeded: true,
+            failure_detail: String::new(),
+        })
+        .await?;
+
+    let rollback = client
+        .begin_rollback(BeginRollbackRequest {
+            node_id: "node-a".into(),
+            to_revision: 0,
+            attempt_token: "rollback-one".into(),
+        })
+        .await?
+        .into_inner()
+        .deployment
+        .unwrap();
+    assert_eq!(rollback.revision, 3);
+    assert_eq!(rollback.source_revision, 1);
+    assert_eq!(rollback.bundle_digest, digest_one);
+    let historical_count: i64 = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT COUNT(*) FROM wr_node_deployments WHERE node_id = 'node-a'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(historical_count, 3);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_concurrent_deployment_revision_allocation_is_unique() -> Result<()> {
+    let (_pool, _addr, client) = manager_trio().await?;
+    let request = |token: &str| BeginDeploymentRequest {
+        node_id: "concurrent-node".into(),
+        attempt_token: token.into(),
+        bundle_digest: format!("sha256:{}", "a".repeat(64)),
+        expected_engines: vec![ExpectedEngine {
+            engine_slot: "primary".into(),
+            modules: vec![],
+        }],
+    };
+    let mut left = client.clone();
+    let mut right = client;
+    let (left, right) = tokio::join!(
+        left.begin_deployment(request("concurrent-left")),
+        right.begin_deployment(request("concurrent-right")),
+    );
+    let mut revisions = vec![
+        left?.into_inner().deployment.unwrap().revision,
+        right?.into_inner().deployment.unwrap().revision,
+    ];
+    revisions.sort_unstable();
+    assert_eq!(revisions, vec![1, 2]);
     Ok(())
 }

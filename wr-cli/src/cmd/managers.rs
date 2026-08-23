@@ -265,6 +265,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
             dockerfile: "docker/Dockerfile.manager".into(),
             context: "..".into(),
             image: Some(format!("{image_prefix}-manager")),
+            network_mode: None,
             ports: vec![
                 format!("{listen_port}:{listen_port}"),
                 format!("{gossip_port}:{gossip_port}/udp"),

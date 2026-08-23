@@ -31,6 +31,8 @@ pub struct EngineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<NodeConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<DeploymentConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<DatabaseConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<toml::Value>,
@@ -41,17 +43,16 @@ pub struct EngineConfig {
 }
 
 #[derive(Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     #[serde(default)]
     pub proxy_address: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub control_address: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub peer_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<CliTlsConfig>,
-    #[serde(flatten)]
-    pub extra: ExtraFields,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -59,6 +60,16 @@ pub struct CliTlsConfig {
     pub cert_path: String,
     pub key_path: String,
     pub ca_cert_path: String,
+    #[serde(flatten)]
+    pub extra: ExtraFields,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct DeploymentConfig {
+    pub node_id: String,
+    pub revision: String,
+    pub bundle_digest: String,
+    pub engine_slot: String,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
@@ -143,17 +154,28 @@ impl EngineConfig {
             }
         }
 
-        // Template host-dependent node addresses (preserve ports from source)
+        // Engine-to-proxy HTTP and control traffic is host-local. Preserve the
+        // explicit loopback addresses from the source config; only the proxy's
+        // peer listener is target-advertised by the generated proxy config.
+        if self.node.is_none() {
+            anyhow::bail!("engine config requires [node]");
+        }
         if let Some(ref node) = self.node {
-            let proxy_port = super::helpers::extract_port(&node.proxy_address)?.get();
-            let control_port = super::helpers::extract_port(&node.control_address)?.get();
-            config.node = Some(NodeConfig {
-                proxy_address: format!("http://{{host}}:{proxy_port}"),
-                control_address: format!("http://{{host}}:{control_port}"),
-                peer_port: node.peer_port,
-                tls: node.tls.clone(),
-                extra: node.extra.clone(),
-            });
+            if !node.proxy_address.starts_with("http://")
+                || !wr_common::node::is_loopback_addr(&node.proxy_address)
+                || !node.control_address.starts_with("http://")
+                || !wr_common::node::is_loopback_addr(&node.control_address)
+            {
+                anyhow::bail!(
+                    "engine node proxy/control addresses must be absolute loopback HTTP URLs"
+                );
+            }
+            super::helpers::extract_port(&node.proxy_address)?;
+            super::helpers::extract_port(&node.control_address)?;
+            super::helpers::extract_port(&node.peer_address)?;
+            let mut bundled_node = node.clone();
+            bundled_node.peer_address = "https://{host}:{peer_port}".to_string();
+            config.node = Some(bundled_node);
         }
 
         // Template database URL
@@ -185,14 +207,13 @@ pub struct ProxyConfig {
 }
 
 #[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyNodeConfig {
     pub proxy_address: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub peer_port: Option<u16>,
+    pub control_address: String,
+    pub peer_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<CliTlsConfig>,
-    #[serde(flatten)]
-    pub extra: ExtraFields,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -295,8 +316,26 @@ impl ProxyConfig {
             db.url = "{db_url}".to_string();
         }
         if let (Some(source_node), Some(config_node)) = (&self.node, &mut config.node) {
-            let proxy_port = super::helpers::extract_port(&source_node.proxy_address)?.get();
-            config_node.proxy_address = format!("http://{{host}}:{proxy_port}");
+            if !wr_common::node::is_loopback_addr(&self.listen_address)
+                || self
+                    .control_address
+                    .as_deref()
+                    .is_none_or(|address| !wr_common::node::is_loopback_addr(address))
+                || !source_node.proxy_address.starts_with("http://")
+                || !wr_common::node::is_loopback_addr(&source_node.proxy_address)
+                || !source_node.control_address.starts_with("http://")
+                || !wr_common::node::is_loopback_addr(&source_node.control_address)
+            {
+                anyhow::bail!(
+                    "proxy listen/control and node proxy/control addresses must use loopback"
+                );
+            }
+            super::helpers::extract_port(&source_node.proxy_address)?;
+            super::helpers::extract_port(&source_node.control_address)?;
+            super::helpers::extract_port(&source_node.peer_address)?;
+            config_node.proxy_address = source_node.proxy_address.clone();
+            config_node.control_address = source_node.control_address.clone();
+            config_node.peer_address = "https://{host}:{peer_port}".to_string();
             let mut tls = config_node.tls.take().unwrap_or(CliTlsConfig {
                 cert_path: String::new(),
                 key_path: String::new(),
@@ -444,8 +483,7 @@ max_memory = "1GiB"
 [node]
 proxy_address = "http://127.0.0.1:9001"
 control_address = "http://127.0.0.1:9002"
-peer_port = 9443
-custom_node_key = "kept"
+peer_address = "https://127.0.0.1:9443"
 
 [node.tls]
 cert_path = "certs/source.crt"
@@ -498,13 +536,16 @@ wasm_path = "target/wasm32-wasip2/debug/client.wasm"
         assert_eq!(bundle["database"]["url"].as_str(), Some("{db_url}"));
         assert_eq!(
             bundle["node"]["proxy_address"].as_str(),
-            Some("http://{host}:9001")
+            Some("http://127.0.0.1:9001")
         );
         assert_eq!(
             bundle["node"]["control_address"].as_str(),
-            Some("http://{host}:9002")
+            Some("http://127.0.0.1:9002")
         );
-        assert_eq!(bundle["node"]["custom_node_key"].as_str(), Some("kept"));
+        assert_eq!(
+            bundle["node"]["peer_address"].as_str(),
+            Some("https://{host}:{peer_port}")
+        );
         assert_eq!(
             bundle["node"]["tls"]["verify_name"].as_str(),
             Some("node.local")
@@ -631,8 +672,9 @@ url = "postgres://localhost/source"
 max_connections = 12
 
 [node]
-proxy_address = "http://127.0.0.1:9443"
-peer_port = 9443
+proxy_address = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_address = "https://127.0.0.1:9443"
 
 [node.tls]
 cert_path = "certs/source.crt"
@@ -662,9 +704,12 @@ allowed_hosts = ["api.example.com"]
         assert_eq!(bundle["database"]["max_connections"].as_integer(), Some(12));
         assert_eq!(
             bundle["node"]["proxy_address"].as_str(),
-            Some("http://{host}:9443")
+            Some("http://127.0.0.1:9001")
         );
-        assert_eq!(bundle["node"]["peer_port"].as_integer(), Some(9443));
+        assert_eq!(
+            bundle["node"]["peer_address"].as_str(),
+            Some("https://{host}:{peer_port}")
+        );
         assert_eq!(
             bundle["node"]["tls"]["cert_path"].as_str(),
             Some("certs/node.crt")
@@ -706,7 +751,9 @@ control_address = "127.0.0.1:9002"
 url = "postgres://localhost/source"
 
 [node]
-proxy_address = "http://127.0.0.1:9443"
+proxy_address = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_address = "https://127.0.0.1:9443"
 "#;
         let minimal_config: ProxyConfig = toml::from_str(minimal).unwrap();
         let minimal_bundle = parse_proxy_bundle_toml(&minimal_config);
@@ -772,8 +819,9 @@ proxy_address = "http://127.0.0.1:9443"
             control_address = "127.0.0.1:9002"
 
             [node]
-            proxy_address = "http://10.0.0.5:9001"
-            peer_port = 9443
+            proxy_address = "http://127.0.0.1:9001"
+            control_address = "http://127.0.0.1:9002"
+            peer_address = "https://10.0.0.5:9443"
 
             [node.tls]
             cert_path = "certs/source-node.crt"
@@ -814,6 +862,7 @@ proxy_address = "http://127.0.0.1:9443"
             &bundle_toml,
             &[
                 ("host", "127.0.0.1"),
+                ("peer_port", "9443"),
                 ("db_url", "postgres://postgres@db/wruntime"),
             ],
         );
@@ -852,6 +901,7 @@ proxy_address = "http://127.0.0.1:9443"
             &codegen_bundle_toml,
             &[
                 ("host", "127.0.0.1"),
+                ("peer_port", "9443"),
                 ("db_url", "postgres://postgres@db/codegen"),
             ],
         );
@@ -887,6 +937,7 @@ proxy_address = "http://127.0.0.1:9443"
             &ledger_bundle_toml,
             &[
                 ("host", "127.0.0.1"),
+                ("peer_port", "9443"),
                 ("db_url", "postgres://postgres@db/stockmarket"),
             ],
         );

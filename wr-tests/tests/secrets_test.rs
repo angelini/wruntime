@@ -158,6 +158,7 @@ async fn test_set_secret_upsert_overwrites() -> Result<()> {
                     key: "API_KEY".into(),
                 }],
                 db_namespaces: vec![],
+                deployment: None,
             }),
         })
         .await?
@@ -279,6 +280,7 @@ async fn test_register_engine_with_secrets() -> Result<()> {
                     },
                 ],
                 db_namespaces: vec![],
+                deployment: None,
             }),
         })
         .await?
@@ -321,6 +323,7 @@ async fn test_register_engine_with_missing_secret_fails() -> Result<()> {
                     key: "NONEXISTENT".into(),
                 }],
                 db_namespaces: vec![],
+                deployment: None,
             }),
         })
         .await;
@@ -354,6 +357,7 @@ async fn test_register_engine_no_secrets_succeeds() -> Result<()> {
                 }],
                 secrets: vec![],
                 db_namespaces: vec![],
+                deployment: None,
             }),
         })
         .await?
@@ -418,6 +422,7 @@ async fn test_secrets_across_namespaces() -> Result<()> {
                     },
                 ],
                 db_namespaces: vec![],
+                deployment: None,
             }),
         })
         .await?
@@ -496,6 +501,7 @@ async fn test_secret_deleted_then_registration_fails() -> Result<()> {
                     key: "TEMP".into(),
                 }],
                 db_namespaces: vec![],
+                deployment: None,
             }),
         })
         .await;
@@ -529,6 +535,7 @@ async fn test_concurrent_db_credential_registration_same_password() -> Result<()
                         modules: vec![],
                         secrets: vec![],
                         db_namespaces: vec![ns],
+                        deployment: None,
                     }),
                 })
                 .await
@@ -564,6 +571,7 @@ async fn test_concurrent_db_credential_registration_same_password() -> Result<()
                 modules: vec![],
                 secrets: vec![],
                 db_namespaces: vec![namespace.into()],
+                deployment: None,
             }),
         })
         .await?
@@ -588,6 +596,7 @@ async fn test_db_credential_reregistration_returns_same_password() -> Result<()>
                 modules: vec![],
                 secrets: vec![],
                 db_namespaces: vec![namespace.into()],
+                deployment: None,
             }),
         })
         .await?
@@ -603,6 +612,7 @@ async fn test_db_credential_reregistration_returns_same_password() -> Result<()>
                 modules: vec![],
                 secrets: vec![],
                 db_namespaces: vec![namespace.into()],
+                deployment: None,
             }),
         })
         .await?

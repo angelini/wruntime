@@ -21,7 +21,8 @@ cargo install cargo-zigbuild
 | `wr-cli managers list` | List active managers in the cluster |
 | `wr-cli node bundle` | Package proxy + engine binaries, WASM modules, and schemas |
 | `wr-cli node deploy` | Push node bundle to a remote host and start services |
-| `wr-cli node status` | Inspect a node bundle without deploying |
+| `wr-cli node rollback` | Activate a retained prior successful bundle as a new revision |
+| `wr-cli node inspect-bundle` | Verify and inspect a node bundle without deploying |
 | `wr-cli logs node` | View logs from services on a remote node (systemd or Docker) |
 
 ## Bundle structure
@@ -125,7 +126,7 @@ Config files use placeholders that are resolved at deploy time:
 | `{db_url}` | `--db-url` / `WR_DB_URL` / config | manager, proxy, engine configs |
 | `{host}` | deploy target (`user@host`) | proxy/engine `[node]` addresses |
 | `{secret_key}` | `--secret-key` / `WR_SECRET_KEY` / config | manager systemd unit / Dockerfile |
-| `{peer_port}` | `--peer-port` / `WR_PEER_PORT` / config (default: 9443) | proxy config (`peer_port`) |
+| `{peer_port}` | `--peer-port` / `WR_PEER_PORT` / config (default: 9443) | explicit proxy/engine `peer_address` templates |
 | `{advertise_address}` | `--advertise-address` / `WR_ADVERTISE_ADDRESS` (auto-derived from remote host if omitted) | manager config (`advertise_grpc_address`) |
 
 Unresolved placeholders cause deployment to fail.
@@ -156,10 +157,10 @@ Add `--proxy-config examples/config/proxy.toml` (or set `proxy_config` in `wr-de
 
 ```bash
 # 4. Deploy node
-wr-cli node deploy wr-node-bundle.tar.gz deploy@10.0.1.1 --manager https://10.0.1.1:9000
+wr-cli node deploy --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.1 --manager https://10.0.1.1:9000
 
-# 5. Verify
-wr-cli engines list --manager https://10.0.1.1:9000
+# 5. Inspect the immutable bundle (runtime health is verified by deploy)
+wr-cli node inspect-bundle wr-node-bundle.tar.gz
 ```
 
 Without the config file, pass all values as flags:
@@ -179,12 +180,22 @@ wr-cli node bundle \
     --target aarch64-unknown-linux-gnu \
     --output myapp.tar.gz
 
-wr-cli node deploy myapp.tar.gz deploy@10.0.1.1 \
+wr-cli node deploy --node-id node-a myapp.tar.gz deploy@10.0.1.1 \
     --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
     --manager https://10.0.1.1:9000
 ```
 
-Deploy steps (systemd): SCP tarball, unpack to `--workdir` (default `/opt/wruntime`), install static units, resolve and upload config templates, provision TLS certificates, start services once with the final runtime files in place, then poll manager until the engine registers (60s timeout).
+Deploy steps (systemd): the CLI creates a manager-owned deployment attempt for the explicit stable `--node-id`, verifies and uploads the immutable bundle, resolves revision metadata into every engine config, provisions TLS, daemon-reloads, restarts all desired units, and removes obsolete engine units. It exits zero only after the manager verifies the exact current node/revision/digest/engine-slot/module inventory has fresh heartbeats and healthy default routes; timeout or any staging/activation/readiness failure is non-zero. A bundle has a deterministic SHA-256 digest while every deploy attempt receives a new monotonic per-node revision.
+
+On the remote host, immutable bundle content is retained under `{workdir}/wr-node/bundles/<digest>/`, activation instances under `releases/<revision>/`, and `current` is switched atomically only after staging is complete. A pre-switch failure leaves the previous release running. A post-switch failure remains a failed attempt and requires an explicit rollback; it is never silently reported as success.
+
+```bash
+# Select a successful historical revision explicitly, or omit --to for the previous successful revision.
+wr-cli node rollback deploy@10.0.1.1 --node-id node-a --to 3 \
+  --manager https://10.0.1.1:9000
+```
+
+Rollback verifies that the retained bundle and source release exist, reads the recorded systemd/Docker backend, allocates a new revision, copies the historical desired inventory/digest, injects the new revision metadata, force-restarts/recreates services, and runs the same exact readiness verification. Revisions never move backward. Bundles and releases are retained indefinitely in this initial lifecycle; garbage collection and automatic rollback are intentionally out of scope. An interrupted CLI can leave a pending/active attempt, which history records truthfully rather than inferring remote failure.
 
 ## Multi-node cluster setup
 
@@ -208,15 +219,15 @@ wr-cli managers deploy manager.tar.gz deploy@10.0.1.1
 # --- Node A ---
 
 wr-cli node bundle --engine-config examples/multi-node/node-a/engine-1.toml --output node-a.tar.gz
-wr-cli node deploy node-a.tar.gz deploy@10.0.1.50
+wr-cli node deploy --node-id node-a node-a.tar.gz deploy@10.0.1.50
 
 # --- Node B ---
 
 wr-cli node bundle --engine-config examples/multi-node/node-b/engine-1.toml --output node-b.tar.gz
-wr-cli node deploy node-b.tar.gz deploy@10.0.1.51
+wr-cli node deploy --node-id node-b node-b.tar.gz deploy@10.0.1.51
 ```
 
-Each node's proxy/engine internal listeners (`listen_address`, `control_address`) bind loopback; only the proxy's mTLS peer listener (`peer_port`, default 9443) is reachable across nodes. The example configs above bind loopback accordingly.
+Each node's proxy/engine internal listeners and `[node]` data/control URLs bind loopback. Only the proxy's explicitly advertised `[node].peer_address` mTLS listener is reachable across nodes; `--peer-port` fills that target-specific URL in a staged release.
 
 Without the config file, pass all values explicitly:
 
@@ -235,7 +246,7 @@ wr-cli node bundle \
     --target aarch64-unknown-linux-gnu \
     --output node-a.tar.gz
 
-wr-cli node deploy node-a.tar.gz deploy@10.0.1.50 \
+wr-cli node deploy --node-id node-a node-a.tar.gz deploy@10.0.1.50 \
     --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
     --manager https://10.0.1.1:9000
 ```
@@ -246,14 +257,12 @@ The same bundle works for Docker — override the format via flag, env, or confi
 
 ```bash
 # Via flag
-wr-cli node deploy myapp.tar.gz deploy@10.0.1.50 --format docker
+wr-cli node deploy --node-id node-a myapp.tar.gz deploy@10.0.1.50 --format docker
 
 # Via wr-deploy.toml
 # format = "docker"
 
-# Or extract locally and run with Docker Compose
-tar xzf myapp.tar.gz
-cd wr-node && docker compose -f docker/docker-compose.yml up -d
+Docker deployments use Linux host networking so proxy/engine loopback trust boundaries match systemd. The CLI builds and force-recreates every desired container for the activated revision; direct Compose startup from an unresolved bundle is not supported.
 ```
 
 ## TLS certificates
@@ -270,7 +279,7 @@ wr-cli cert generate 10.0.1.50 --ca-dir ./certs/   # node A
 wr-cli cert generate 10.0.1.51 --ca-dir ./certs/   # node B
 ```
 
-During `node deploy`, pass `--cert-dir ./certs/` (or set `cert_dir` in `wr-deploy.toml`). The deploy command SCPs `ca.crt`, `<host>.crt`, and `<host>.key` to `{workdir}/wr-node/certs/` on the remote host. The bundled proxy config references these paths.
+During `node deploy`, pass `--cert-dir ./certs/` (or set `cert_dir` in `wr-deploy.toml`). The deploy command stages `ca.crt`, `<host>.crt`, and `<host>.key` inside the revision release before switching `current`. The resolved proxy/engine configs reference those release-relative paths.
 
 For local development, run `just certs` to generate a CA and localhost certificates.
 
@@ -303,7 +312,7 @@ wr-cli managers deploy manager.tar.gz example@localhost \
     --secret-key "<64-char-hex-key>" \
     --advertise-address "https://10.0.2.2:9000"
 
-wr-cli node deploy node.tar.gz example@localhost \
+wr-cli node deploy --node-id node-a node.tar.gz example@localhost \
     --ssh-port 2202 \
     --db-url "postgres://postgres@10.0.2.2:5432/wruntime" \
     --manager https://10.0.2.2:9000
@@ -325,7 +334,7 @@ Services use automatic retries to tolerate startup ordering and transient failur
 
 If all retries are exhausted during startup, the engine exits with a descriptive error. Heartbeat retries are best-effort — a failed cycle is skipped and retried on the next interval (3s).
 
-The CLI `node deploy` command polls the manager for up to 60 seconds waiting for the engine to register. With the retry windows above, a healthy cluster typically completes registration within 10–15 seconds of service start.
+The CLI `node deploy` command polls `VerifyDeployment` for up to 60 seconds. Registration alone is insufficient: every exact-revision engine and module heartbeat must be fresh and every expected default route healthy. With the retry windows above, a healthy cluster typically verifies within 10–15 seconds of service start.
 
 ## Pre-compilation
 
@@ -333,14 +342,14 @@ During `node bundle`, WASM modules are pre-compiled to native `.cwasm` artifacts
 
 ## Inspecting bundles
 
-Use `status` to inspect a bundle without deploying:
+Inspect bundles without querying runtime status:
 
 ```bash
 wr-cli managers status manager.tar.gz
-wr-cli node status myapp.tar.gz
+wr-cli node inspect-bundle myapp.tar.gz
 ```
 
-Prints: target triple, workdir, modules, template variables, config files, and checksums.
+Node inspection recomputes every payload checksum and the canonical digest before printing the target, digest, stable engine slots, exact module versions, template variables, config files, and checksums. Cluster-wide runtime presentation belongs to the follow-up `cluster status` work.
 
 ## Viewing logs
 

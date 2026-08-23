@@ -103,6 +103,7 @@ async fn test_manager_rejects_module_without_namespace() -> Result<()> {
                 }],
                 secrets: vec![],
                 db_namespaces: vec![],
+                deployment: None,
             }),
         })
         .await;

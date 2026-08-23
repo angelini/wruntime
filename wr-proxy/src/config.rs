@@ -278,6 +278,16 @@ impl ProxyConfig {
             is_loopback_addr(&self.control_address),
             "control_address must bind to loopback (127.0.0.1, ::1, or localhost)",
         );
+        v.check(
+            self.node.proxy_address.starts_with("http://")
+                && is_loopback_addr(&self.node.proxy_address),
+            "node.proxy_address must be an absolute loopback HTTP URL",
+        );
+        v.check(
+            self.node.control_address.starts_with("http://")
+                && is_loopback_addr(&self.node.control_address),
+            "node.control_address must be an absolute loopback HTTP URL",
+        );
         v.check(!self.database.url.is_empty(), "database.url is required");
         if let Err(error) = self.node.peer_address() {
             v.check(false, format!("invalid node configuration: {error}"));

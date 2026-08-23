@@ -278,6 +278,7 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
             ],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -390,6 +391,7 @@ async fn test_engine_stale_marks_all_module_routes_unhealthy() -> Result<()> {
             ],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;
@@ -577,6 +579,7 @@ async fn test_malformed_module_entry_skipped_not_fatal() -> Result<()> {
             ],
             secrets: vec![],
             db_namespaces: vec![],
+            deployment: None,
         }),
     })
     .await?;

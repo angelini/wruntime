@@ -11,6 +11,19 @@ The mTLS `wruntime.ManagerService` is the cluster control plane. Engines use the
 | `Heartbeat` | `{ engine_id, healthy_modules }` | — | Bumps the engine's liveness unconditionally, then upserts a per-module heartbeat for each valid `healthy_modules` entry. Entries missing `namespace`/`name`/`version` are skipped and logged, never fatal. The background monitor marks a routing rule unhealthy when either its engine heartbeat or its specific module's heartbeat goes stale |
 | `ListEngines` | — | `[EngineRegistration]` | Returns all currently registered engines |
 
+`EngineRegistration.deployment`, when present, carries the stable node ID, manager-assigned revision, immutable `sha256:` bundle digest, and stable engine slot. `engine_id` remains a process identity and must not be used to infer deployment history.
+
+## Deployment lifecycle
+
+| RPC | Request | Response | Description |
+| ----- | --------- | ---------- | ------------- |
+| `BeginDeployment` | node ID, idempotency attempt token, digest, expected slot/module inventory | `DeploymentRecord` | Allocates the next monotonic per-node revision, or returns the existing attempt for the same token. |
+| `VerifyDeployment` | node ID, revision | readiness and condition codes | Verifies only registrations matching the requested revision and digest, with fresh engine/module heartbeats and healthy routes. |
+| `CompleteDeployment` | node ID, revision, outcome | `DeploymentRecord` | Records terminal failure, or records success only after the manager re-verifies exact readiness. |
+| `BeginRollback` | node ID, historical successful revision (or zero for previous), token | `DeploymentRecord` | Copies the selected immutable desired snapshot into a new monotonic revision and reports `source_revision`. |
+
+Verification uses one repeatable-read manager snapshot and only the current desired revision. Stable codes include `SUPERSEDED_REVISION`, `MISSING_ENGINE`, `REVISION_MISMATCH`, `DIGEST_MISMATCH`, `DUPLICATE_ENGINE_SLOT`, `MISSING_MODULE`, `STALE_ENGINE_HEARTBEAT`, `MISSING_MODULE_HEARTBEAT`, `STALE_MODULE_HEARTBEAT`, `MISSING_ROUTE`, and `UNHEALTHY_ROUTE`. CLI deployment success is defined by an empty condition set, not by `ListEngines` visibility.
+
 ## Routing table
 
 | RPC | Request | Response | Description |
@@ -38,7 +51,7 @@ message RoutingRule {
 }
 ```
 
-`RoutingRule.peer_address` is the sole cross-node forwarding address. Each proxy compares it with its own peer address, derived from `[node].proxy_address` host plus `peer_port`, to decide whether to forward directly to the local `engine_address` (`LocalEngine`) or relay over mTLS to `peer_address` (`RemoteProxy`). `EngineRegistration.proxy_address` remains separate plain-HTTP metadata: it is the local proxy URL used by an engine for outbound rewriting. The reserved routing-rule field 10 must not be reused.
+`RoutingRule.peer_address` is the sole cross-node forwarding address. Each proxy compares it with its explicit `[node].peer_address` to decide whether to forward directly to the local `engine_address` (`LocalEngine`) or relay over mTLS to `peer_address` (`RemoteProxy`). `EngineRegistration.proxy_address` remains separate plain-HTTP metadata: it is the local proxy URL used by an engine for outbound rewriting. The reserved routing-rule field 10 must not be reused.
 
 `source_module` and `source_namespace` are persisted metadata but are not currently routing or authorization constraints. Current matching uses only destination namespace, module, and optional version.
 
