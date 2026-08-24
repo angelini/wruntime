@@ -96,6 +96,9 @@ pub struct DeployArgs {
     /// Manager's externally-reachable gRPC address (derived from remote host if omitted)
     #[arg(long)]
     advertise_address: Option<String>,
+    /// Routable UDP bind/advertise address for manager gossip (derived if omitted)
+    #[arg(long)]
+    gossip_address: Option<String>,
 }
 
 #[derive(Args)]
@@ -112,6 +115,7 @@ struct ManagerManifest {
     workdir: String,
     image_prefix: String,
     listen_address: String,
+    gossip_listen_address: String,
     cluster_id: String,
     template_vars: Vec<String>,
     checksums: HashMap<String, String>,
@@ -240,8 +244,8 @@ fn bundle(args: BundleArgs) -> Result<()> {
     )?;
 
     // Docker artifacts
-    let listen_port = helpers::extract_port(&config.listen_address)?.get();
-    let gossip_port = helpers::extract_port(&config.cluster.gossip_listen_address)?.get();
+    helpers::extract_port(&config.listen_address)?;
+    helpers::extract_port(&config.cluster.gossip_listen_address)?;
 
     let dockerfile = DockerfileSpec {
         workdir: &workdir,
@@ -258,21 +262,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         0o644,
     )?;
 
-    let compose = service_gen::generate_compose(
-        "",
-        &[service_gen::ComposeService {
-            name: "manager".into(),
-            dockerfile: "docker/Dockerfile.manager".into(),
-            context: "..".into(),
-            image: Some(format!("{image_prefix}-manager")),
-            network_mode: None,
-            ports: vec![
-                format!("{listen_port}:{listen_port}"),
-                format!("{gossip_port}:{gossip_port}/udp"),
-            ],
-            depends_on: vec![],
-        }],
-    );
+    let compose = manager_docker_compose(&workdir, &image_prefix);
     bundle::tar_add_bytes(
         &mut tar,
         "wr-manager/docker/docker-compose.yml",
@@ -293,8 +283,13 @@ fn bundle(args: BundleArgs) -> Result<()> {
         workdir: workdir.clone(),
         image_prefix: image_prefix.clone(),
         listen_address: config.listen_address.clone(),
+        gossip_listen_address: config.cluster.gossip_listen_address.clone(),
         cluster_id: config.cluster.cluster_id.clone(),
-        template_vars: vec!["db_url".to_string()],
+        template_vars: vec![
+            "db_url".to_string(),
+            "gossip_address".to_string(),
+            "advertise_address".to_string(),
+        ],
         checksums,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
@@ -326,10 +321,12 @@ fn bundle(args: BundleArgs) -> Result<()> {
 fn resolve_manager_config_template(
     config_template: &str,
     db_url: &str,
+    gossip_address: &str,
     advertise_address: &str,
 ) -> Result<String> {
     let mut vars = HashMap::new();
     vars.insert("db_url", db_url);
+    vars.insert("gossip_address", gossip_address);
     vars.insert("advertise_address", advertise_address);
     helpers::resolve_template(config_template, &vars)
         .context("failed to resolve template in manager.toml")
@@ -369,8 +366,41 @@ fn manager_systemd_start_command() -> &'static str {
     "sudo systemctl daemon-reload && sudo systemctl enable --now wr-manager.service"
 }
 
+fn manager_docker_compose(workdir: &str, image_prefix: &str) -> String {
+    service_gen::generate_compose(
+        "",
+        &[service_gen::ComposeService {
+            name: "manager".into(),
+            dockerfile: "docker/Dockerfile.manager".into(),
+            context: "..".into(),
+            image: Some(format!("{image_prefix}-manager")),
+            network_mode: Some("host".into()),
+            ports: vec![],
+            volumes: vec![format!("../certs:{workdir}/certs:ro")],
+            depends_on: vec![],
+        }],
+    )
+}
+
 fn manager_docker_start_command(workdir: &str) -> String {
     format!("cd {workdir}/wr-manager && sudo docker compose -f docker/docker-compose.yml up -d")
+}
+
+fn manager_docker_logs_command(workdir: &str, tail: u32, follow: bool) -> String {
+    let mut command = format!(
+        "cd {workdir}/wr-manager && sudo docker compose -f docker/docker-compose.yml logs --tail {tail}"
+    );
+    if follow {
+        command.push_str(" -f");
+    }
+    command
+}
+
+fn remote_socket_address(remote_ip: &str, port: u16) -> String {
+    match remote_ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => format!("[{remote_ip}]:{port}"),
+        _ => format!("{remote_ip}:{port}"),
+    }
 }
 
 async fn deploy(args: DeployArgs) -> Result<()> {
@@ -393,24 +423,43 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port)?
         .map(helpers::DeployPort::get);
     let cert_dir = deploy_config::resolve_cert_dir(&args.cert_dir, deploy_cfg.cert_dir);
+    let configured_gossip_address = deploy_config::resolve_string(
+        args.gossip_address,
+        deploy_cfg.gossip_address,
+        "WR_GOSSIP_ADDRESS",
+    );
 
     let manifest: ManagerManifest = bundle::read_manifest(&args.bundle)?;
 
     let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
+    let remote_ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
 
-    // Auto-derive advertise_address from remote host + listen port if not provided
     let listen_port = helpers::extract_port(&manifest.listen_address)?.get();
+    let manager_addr = format!("https://{}", remote_socket_address(&remote_ip, listen_port));
     let advertise_address =
-        match deploy_config::resolve_string(args.advertise_address, None, "WR_ADVERTISE_ADDRESS") {
-            Some(addr) => addr,
-            None => {
-                let ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
-                format!("https://{ip}:{listen_port}")
-            }
-        };
+        deploy_config::resolve_string(args.advertise_address, None, "WR_ADVERTISE_ADDRESS")
+            .unwrap_or_else(|| manager_addr.clone());
+
+    let gossip_port = helpers::extract_port(&manifest.gossip_listen_address)?.get();
+    let gossip_address =
+        configured_gossip_address.unwrap_or_else(|| remote_socket_address(&remote_ip, gossip_port));
+    let parsed_gossip = gossip_address
+        .parse::<std::net::SocketAddr>()
+        .with_context(|| format!("invalid manager gossip address '{gossip_address}'"))?;
+    if parsed_gossip.port() != gossip_port {
+        bail!(
+            "manager gossip address port must match the bundled port {gossip_port}, got {}",
+            parsed_gossip.port()
+        );
+    }
 
     let config_template = bundle::read_file_from_tarball(&args.bundle, "manager.toml")?;
-    let resolved = resolve_manager_config_template(&config_template, &db_url, &advertise_address)?;
+    let resolved = resolve_manager_config_template(
+        &config_template,
+        &db_url,
+        &gossip_address,
+        &advertise_address,
+    )?;
 
     let mut first_start_timestamp = String::new();
     for phase in manager_deploy_phase_order(&format) {
@@ -512,45 +561,43 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         }
     }
 
-    // Configure mTLS so the readiness check can connect to the TLS-enabled manager.
-    // Cert files are named by the SSH host alias; the cert must include the resolved
-    // IP as a SAN (via `wr-cli cert generate <host> --ip <addr>`).
+    // Readiness must use the deploy-scoped certificate directory, not the global CLI TLS config.
+    // The host certificate must include the resolved poll IP as a SAN.
     let remote_host = helpers::extract_remote_host(&args.remote);
-    let remote_ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
-    crate::client::set_tls_config(wr_common::node::TlsConfig {
+    let deploy_tls = wr_common::node::TlsConfig {
         cert_path: format!("{cert_dir}/{remote_host}.crt"),
         key_path: format!("{cert_dir}/{remote_host}.key"),
         ca_cert_path: format!("{cert_dir}/ca.crt"),
-    });
+    };
 
-    // Connect to the resolved IP (the SSH alias may not be DNS-resolvable).
-    // The cert must have this IP as a SAN for TLS verification to succeed.
-    let manager_addr = format!("https://{remote_ip}:{listen_port}");
     println!("[deploy]  waiting for manager to become ready...");
 
-    // Tail manager logs in the background while we wait
     let log_cmd = match format {
         DeployFormat::Systemd => {
             super::logs::build_journalctl_command(Some("wr-manager"), 20, "1m", true)
         }
-        DeployFormat::Docker => {
-            let compose = format!("{}/wr-manager/docker/docker-compose.yml", manifest.workdir);
-            format!("docker compose -f {compose} logs --tail 20 -f")
+        DeployFormat::Docker => manager_docker_logs_command(&manifest.workdir, 20, true),
+    };
+    let log_tail = match helpers::spawn_ssh_prefixed(&ssh_base, &log_cmd, "\t") {
+        Ok(tail) => Some(tail),
+        Err(error) => {
+            eprintln!("[deploy]  could not start live log tail: {error:#}");
+            None
         }
     };
-    let _log_tail = helpers::spawn_ssh_prefixed(&ssh_base, &log_cmd, "\t");
 
-    let ready = helpers::wait_for_manager_ready(&manager_addr, Duration::from_secs(60)).await;
+    let readiness = helpers::wait_for_manager_ready(
+        &manager_addr,
+        &advertise_address,
+        &deploy_tls,
+        Duration::from_secs(60),
+    )
+    .await;
 
-    drop(_log_tail);
-    println!();
-
-    if ready {
-        println!("[deploy]  manager is ready at {manager_addr}");
-    } else {
-        println!("[deploy]  WARNING: manager did not respond within 60 seconds");
-        println!("          check remote logs for errors");
+    if let Some(tail) = log_tail {
+        tail.stop().await;
     }
+    println!();
 
     // Dump all startup logs from the deploy window (catches fast starts the tail missed)
     if !first_start_timestamp.is_empty() {
@@ -563,12 +610,18 @@ async fn deploy(args: DeployArgs) -> Result<()> {
                 &first_start_timestamp,
                 false,
             ),
-            DeployFormat::Docker => {
-                let compose = format!("{}/wr-manager/docker/docker-compose.yml", manifest.workdir);
-                format!("docker compose -f {compose} logs --tail 200")
-            }
+            DeployFormat::Docker => manager_docker_logs_command(&manifest.workdir, 200, false),
         };
         helpers::run_ssh_prefixed_best_effort(&ssh_base, &dump_cmd, "\t");
+    }
+
+    let ready = readiness?;
+    println!(
+        "[deploy]  verified manager {} at {}",
+        ready.manager_id, ready.advertised_address
+    );
+    if ready.poll_endpoint != ready.advertised_address {
+        println!("[deploy]  readiness poll endpoint: {}", ready.poll_endpoint);
     }
 
     Ok(())
@@ -706,12 +759,15 @@ fn status(args: StatusArgs) -> Result<()> {
     println!("  target:     {}", manifest.target);
     println!("  workdir:    {}", manifest.workdir);
     println!("  listen:     {}", manifest.listen_address);
+    println!("  gossip:     {}", manifest.gossip_listen_address);
     println!("  cluster_id: {}", manifest.cluster_id);
     println!();
     println!("Templates:");
     for var in &manifest.template_vars {
         let source = match var.as_str() {
             "db_url" => "--db-url flag / WR_DB_URL / wr-deploy.toml",
+            "gossip_address" => "--gossip-address / WR_GOSSIP_ADDRESS / wr-deploy.toml",
+            "advertise_address" => "--advertise-address / WR_ADVERTISE_ADDRESS",
             _ => "unknown",
         };
         println!("  {{{var}}}  {source}");
@@ -753,12 +809,13 @@ url = "{db_url}"
 
 [cluster]
 cluster_id = "local"
-gossip_listen_address = "127.0.0.1:9010"
+gossip_listen_address = "{gossip_address}"
 advertise_grpc_address = "{advertise_address}"
 "#;
         let resolved = resolve_manager_config_template(
             template,
             "postgres://postgres@localhost/wruntime",
+            "10.0.0.1:9010",
             "https://10.0.0.1:9000",
         )
         .unwrap();
@@ -767,6 +824,10 @@ advertise_grpc_address = "{advertise_address}"
         assert_eq!(
             value["database"]["url"].as_str(),
             Some("postgres://postgres@localhost/wruntime")
+        );
+        assert_eq!(
+            value["cluster"]["gossip_listen_address"].as_str(),
+            Some("10.0.0.1:9010")
         );
         assert_eq!(
             value["cluster"]["advertise_grpc_address"].as_str(),
@@ -842,5 +903,17 @@ advertise_grpc_address = "{advertise_address}"
         assert!(command.contains("docker compose"));
         assert!(command.contains("up -d"));
         assert!(!command.contains("restart"));
+
+        let compose = manager_docker_compose("/opt/wruntime", "wr");
+        assert!(compose.contains("network_mode: host"));
+        assert!(compose.contains("\"../certs:/opt/wruntime/certs:ro\""));
+        assert!(!compose.contains("ports:"));
+
+        for follow in [false, true] {
+            let logs = manager_docker_logs_command("/opt/wruntime", 20, follow);
+            assert!(logs.contains("sudo docker compose"));
+            assert!(logs.contains("--tail 20"));
+            assert_eq!(logs.ends_with(" -f"), follow);
+        }
     }
 }

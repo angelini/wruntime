@@ -20,6 +20,7 @@ fn test_engine_config_database_section_parses() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        peer_address    = "https://127.0.0.1:9443"
         [node.tls]
         cert_path    = "c.crt"
         key_path     = "c.key"
@@ -42,6 +43,7 @@ fn test_engine_config_database_max_connections_default() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        peer_address    = "https://127.0.0.1:9443"
         [node.tls]
         cert_path    = "c.crt"
         key_path     = "c.key"
@@ -64,6 +66,7 @@ fn test_engine_config_module_database_flag_parses() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        peer_address    = "https://127.0.0.1:9443"
         [node.tls]
         cert_path    = "c.crt"
         key_path     = "c.key"
@@ -94,6 +97,7 @@ fn test_engine_config_module_database_flag_defaults_to_false() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        peer_address    = "https://127.0.0.1:9443"
         [node.tls]
         cert_path    = "c.crt"
         key_path     = "c.key"

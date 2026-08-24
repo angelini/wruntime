@@ -281,10 +281,11 @@ impl ManagerConfig {
         toml::to_string_pretty(self).map_err(Into::into)
     }
 
-    /// Create a bundle-ready copy with `{db_url}` and `{advertise_address}` template placeholders.
+    /// Create a bundle-ready copy with deploy-varying database and manager addresses.
     pub fn to_bundle_config(&self) -> Self {
         let mut config = self.clone();
         config.database.url = "{db_url}".to_string();
+        config.cluster.gossip_listen_address = "{gossip_address}".to_string();
         config.cluster.advertise_grpc_address = Some("{advertise_address}".to_string());
         config.cluster.seed_nodes.clear();
         let mut tls = config.tls.take().unwrap_or(CliTlsConfig {
@@ -630,6 +631,10 @@ server_name = "manager.local"
 
         assert_eq!(bundle["database"]["url"].as_str(), Some("{db_url}"));
         assert_eq!(
+            bundle["cluster"]["gossip_listen_address"].as_str(),
+            Some("{gossip_address}")
+        );
+        assert_eq!(
             bundle["cluster"]["advertise_grpc_address"].as_str(),
             Some("{advertise_address}")
         );
@@ -797,6 +802,7 @@ peer_address = "https://127.0.0.1:9443"
             &bundle_toml,
             &[
                 ("db_url", "postgres://postgres@db/wruntime"),
+                ("gossip_address", "10.0.0.10:9010"),
                 ("advertise_address", "https://manager.example:9000"),
             ],
         );
@@ -809,6 +815,7 @@ peer_address = "https://127.0.0.1:9443"
         assert_eq!(cfg.scheduler_lease_secs, 60);
         assert_eq!(cfg.scheduler_retry_base_secs, 7);
         assert_eq!(cfg.scheduler_retry_cap_secs, 70);
+        assert_eq!(cfg.cluster.gossip_listen_address, "10.0.0.10:9010");
         assert_eq!(cfg.cluster.gossip_interval_ms, 750);
     }
 

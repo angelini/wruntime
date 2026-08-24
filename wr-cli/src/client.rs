@@ -16,23 +16,48 @@ pub fn set_tls_config(config: TlsConfig) {
     let _ = TLS_CONFIG.set(config);
 }
 
-/// Connect to a specific manager address with a 5-second timeout.
-/// Uses the global TLS config if set via [`set_tls_config`].
-pub async fn connect(addr: &str) -> Result<ManagerServiceClient<Channel>> {
+fn connection_tls_config(explicit: Option<&TlsConfig>) -> Option<&TlsConfig> {
+    match explicit {
+        Some(config) => Some(config),
+        None => TLS_CONFIG.get(),
+    }
+}
+
+fn endpoint(addr: &str, explicit_tls: Option<&TlsConfig>) -> Result<Endpoint> {
     let mut endpoint = Endpoint::from_shared(addr.to_string())?
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10));
 
-    if let Some(tls) = TLS_CONFIG.get() {
-        let tls_config = wr_common::tls::build_tonic_client_tls(tls)?;
-        endpoint = endpoint.tls_config(tls_config)?;
+    if let Some(tls) = connection_tls_config(explicit_tls) {
+        endpoint = endpoint.tls_config(wr_common::tls::build_tonic_client_tls(tls)?)?;
     }
 
-    let channel = endpoint
+    Ok(endpoint)
+}
+
+async fn connect_inner(
+    addr: &str,
+    explicit_tls: Option<&TlsConfig>,
+) -> Result<ManagerServiceClient<Channel>> {
+    let channel = endpoint(addr, explicit_tls)?
         .connect()
         .await
         .context("failed to connect to manager")?;
     Ok(ManagerServiceClient::new(channel))
+}
+
+/// Connect to a specific manager address with the standard endpoint timeouts.
+/// Uses the global TLS config if set via [`set_tls_config`].
+pub async fn connect(addr: &str) -> Result<ManagerServiceClient<Channel>> {
+    connect_inner(addr, None).await
+}
+
+/// Connect with caller-owned TLS credentials instead of the process-global config.
+pub async fn connect_with_tls(
+    addr: &str,
+    tls: &TlsConfig,
+) -> Result<ManagerServiceClient<Channel>> {
+    connect_inner(addr, Some(tls)).await
 }
 
 /// Fetch one coherent cluster status snapshot from a seed manager.
@@ -56,4 +81,29 @@ pub async fn list_managers(addr: &str) -> Result<Vec<(String, String)>> {
         .into_iter()
         .map(|m| (m.manager_id, m.grpc_address))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tls_config(prefix: &str) -> TlsConfig {
+        TlsConfig {
+            cert_path: format!("{prefix}/client.crt"),
+            key_path: format!("{prefix}/client.key"),
+            ca_cert_path: format!("{prefix}/ca.crt"),
+        }
+    }
+
+    #[test]
+    fn explicit_tls_overrides_initialized_global_config() {
+        set_tls_config(tls_config("global"));
+        let explicit = tls_config("deploy");
+
+        let selected = connection_tls_config(Some(&explicit)).unwrap();
+
+        assert_eq!(selected.cert_path, "deploy/client.crt");
+        assert_eq!(selected.key_path, "deploy/client.key");
+        assert_eq!(selected.ca_cert_path, "deploy/ca.crt");
+    }
 }

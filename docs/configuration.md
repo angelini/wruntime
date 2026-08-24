@@ -542,7 +542,7 @@ When a module on Node A calls a module whose routing rule has `peer_address = "h
 
 ### Manager high availability
 
-Run multiple managers against the same Postgres database for active-active HA. Each manager needs a unique `gossip_listen_address` and should set `advertise_grpc_address` to its externally-reachable gRPC address:
+Run multiple managers against the same Postgres database for active-active HA. The shared database provides bootstrap peer discovery; managers then use chitchat for live membership. Each manager needs a unique `gossip_listen_address` that is both bindable locally and reachable over UDP by its peers, and must set `advertise_grpc_address` to its externally reachable gRPC address:
 
 ```toml
 # manager-1.toml
@@ -554,7 +554,7 @@ url = "postgres://postgres@db-host:5432/wruntime"
 
 [cluster]
 cluster_id             = "prod"
-gossip_listen_address  = "0.0.0.0:9010"
+gossip_listen_address  = "10.0.1.10:9010"
 advertise_grpc_address = "https://manager-1:9000"
 
 # manager-2.toml
@@ -566,7 +566,7 @@ url = "postgres://postgres@db-host:5432/wruntime"
 
 [cluster]
 cluster_id             = "prod"
-gossip_listen_address  = "0.0.0.0:9010"
+gossip_listen_address  = "10.0.1.11:9010"
 advertise_grpc_address = "https://manager-2:9000"
 ```
 
@@ -619,7 +619,7 @@ wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10 \
 wr-cli managers inspect-bundle wr-manager-bundle.tar.gz
 ```
 
-The same bundle can be deployed to multiple managers with different `--db-url` and `--seed-node` values. With a `wr-deploy.toml`, deploy reduces to just the positional args:
+The same bundle can be deployed to multiple managers against the same shared database. At deploy time the CLI resolves a unique routable gossip address (or accepts `--gossip-address`) and the exact advertised gRPC address; `--seed-node` is reserved and does not alter runtime manager configuration. Deploy fails closed unless its mTLS `ListManagers` readiness check returns a non-empty runtime manager ID at that exact advertised address. See the [disposable first-deployment and two-manager acceptance procedure](deployment.md#disposable-first-deployment-and-two-manager-acceptance) for systemd/Docker coverage, non-default certificates, failure handling, and cross-seed verification. With a `wr-deploy.toml`, deploy can reduce to the positional arguments:
 
 ```bash
 wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10

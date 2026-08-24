@@ -37,9 +37,11 @@ pub struct DeployConfig {
     pub image_prefix: Option<String>,
     /// Source proxy config file for node bundle generation
     pub proxy_config: Option<String>,
-    /// Gossip seed node addresses (manager deploy only)
+    /// Gossip seed node addresses (manager deploy only; reserved)
     #[allow(dead_code)]
     pub seed_nodes: Option<Vec<String>>,
+    /// Routable UDP bind/advertise address for manager gossip
+    pub gossip_address: Option<String>,
     /// Disable OpenTelemetry export in generated service units
     pub no_otel: Option<bool>,
     /// Path to schedules TOML file for post-deploy apply

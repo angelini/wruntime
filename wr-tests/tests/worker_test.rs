@@ -23,6 +23,7 @@ async fn test_worker_config_parsing() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        peer_address    = "https://127.0.0.1:9443"
         [node.tls]
         cert_path    = "c.crt"
         key_path     = "c.key"
@@ -60,6 +61,7 @@ async fn test_worker_config_defaults() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        peer_address    = "https://127.0.0.1:9443"
         [node.tls]
         cert_path    = "c.crt"
         key_path     = "c.key"
@@ -91,6 +93,7 @@ async fn test_worker_config_rejects_zero_lifecycle_values() {
         [node]
         proxy_address = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        peer_address = "https://127.0.0.1:9443"
         [node.tls]
         cert_path = "c.crt"
         key_path = "c.key"
@@ -134,6 +137,7 @@ async fn test_worker_mode_service_default() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        peer_address    = "https://127.0.0.1:9443"
         [node.tls]
         cert_path    = "c.crt"
         key_path     = "c.key"
@@ -882,6 +886,7 @@ async fn test_worker_config_validation_requires_database() {
         [node]
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
+        peer_address    = "https://127.0.0.1:9443"
         [node.tls]
         cert_path    = "c.crt"
         key_path     = "c.key"

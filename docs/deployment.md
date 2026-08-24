@@ -87,7 +87,8 @@ proxy_config = "examples/config/proxy.toml"
 db_url     = "postgres://postgres@10.0.1.1:5432/wruntime"
 secret_key = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 ssh_key    = "~/.ssh/deploy_key"
-seed_nodes = ["10.0.1.11:9010", "10.0.1.12:9010"] # metadata/reserved; not emitted into manager runtime TOML
+seed_nodes = ["10.0.1.11:9010", "10.0.1.12:9010"] # reserved; not emitted into manager runtime TOML
+gossip_address = "10.0.1.10:9010" # optional manager UDP bind/advertise address
 cert_dir   = "./certs"    # CA + node certs from `wr-cli cert`
 peer_port  = 9443         # mTLS peer listener port
 # ssh_port     = 22
@@ -98,7 +99,7 @@ All fields are optional. Fields that only apply to specific commands (e.g. `secr
 
 `proxy_config` applies to `wr-cli node bundle`: when set (or passed as `--proxy-config` / `WR_PROXY_CONFIG`), the node bundle uses that source proxy TOML, templates deploy-varying database/node/TLS values, and preserves proxy runtime sections such as `[circuit_breaker]`, `[egress]`, and `[external]`. When omitted, the CLI keeps generating a minimal proxy config from the engine node settings.
 
-`seed_nodes` is deployment metadata/reserved for future gossip bootstrapping UX. It is accepted from `wr-deploy.toml` / `--seed-node` for compatibility, but the deploy flow does not write `cluster.seed_nodes` into runtime `manager.toml` by default because the runtime manager config has no such field.
+`seed_nodes` is reserved deployment metadata. The deploy flow does not write it into runtime `manager.toml` because the runtime manager config has no such field. Managers discover fresh peers through the shared database, then use each peer's deployed, routable gossip address to form the chitchat mesh.
 
 **Environment variables** are also supported for all deploy-related fields:
 
@@ -112,6 +113,7 @@ All fields are optional. Fields that only apply to specific commands (e.g. `secr
 | `--target` | `WR_TARGET` | `x86_64-unknown-linux-gnu` |
 | `--proxy-config` | `WR_PROXY_CONFIG` | — |
 | `--advertise-address` | `WR_ADVERTISE_ADDRESS` | derived from remote host |
+| `--gossip-address` | `WR_GOSSIP_ADDRESS` | resolved remote IP + bundled gossip port |
 | `--manager` | `WR_MANAGER` | — |
 | `--cert-dir` | `WR_CERT_DIR` | — |
 | `--peer-port` | `WR_PEER_PORT` | `9443` |
@@ -129,8 +131,17 @@ Config files use placeholders that are resolved at deploy time:
 | `{secret_key}` | `--secret-key` / `WR_SECRET_KEY` / config | manager systemd unit / Dockerfile |
 | `{peer_port}` | `--peer-port` / `WR_PEER_PORT` / config (default: 9443) | explicit proxy/engine `peer_address` templates |
 | `{advertise_address}` | `--advertise-address` / `WR_ADVERTISE_ADDRESS` (auto-derived from remote host if omitted) | manager config (`advertise_grpc_address`) |
+| `{gossip_address}` | `--gossip-address` / `WR_GOSSIP_ADDRESS` / config (resolved remote IP plus bundled port if omitted) | manager config (`gossip_listen_address`) |
 
-Unresolved placeholders cause deployment to fail.
+Unresolved placeholders cause deployment to fail. A supplied manager gossip address must be a socket address and retain the gossip port recorded by the bundle. Each manager needs a unique address that is both bindable on its host and reachable over UDP by every other manager. Manager Docker deployments use host networking so this address has the same meaning for systemd and Docker.
+
+### Manager deploy readiness contract
+
+After starting the manager, `wr-cli managers deploy` connects to the resolved SSH-host poll endpoint over mTLS using `ca.crt`, `<ssh-host>.crt`, and `<ssh-host>.key` from that deploy's resolved `cert_dir`. This connection does not use the CLI process's default/global certificate paths. The client certificate must cover the poll endpoint's IP in its SANs.
+
+Deploy exits zero only when the contacted manager's `ListManagers` response contains an entry whose `grpc_address` exactly equals the resolved or explicit `advertise_address` and whose runtime-generated `manager_id` is non-empty. A successful response containing only another manager does not pass. TLS, transport, RPC, malformed identity, expected-manager-absent, and 60-second timeout outcomes are non-zero. The terminal error reports the poll endpoint, expected advertised address, attempt count, and bounded last observation or error without exposing deployment secrets.
+
+Live startup logs are stopped before final diagnostics. A bounded startup-log dump is attempted on both readiness success and failure; log collection is best-effort and never replaces the readiness result. Manager Docker log collection uses privileged Compose, matching the passwordless-sudo deployment prerequisite.
 
 ## Single-node deployment (systemd)
 
@@ -252,6 +263,86 @@ wr-cli node deploy --node-id node-a node-a.tar.gz deploy@10.0.1.50 \
     --manager https://10.0.1.1:9000
 ```
 
+## Disposable first-deployment and two-manager acceptance
+
+Use this procedure only with disposable hosts, database, and CA. It exercises a failed first start, a systemd manager, a Docker manager, a non-default certificate directory, and cross-seed identity/address convergence.
+
+1. Provision clean Linux hosts `${HOST_A}` and `${HOST_B}` plus an empty shared PostgreSQL database `${DB_URL}` reachable from both. Host A must use systemd; Host B must have Docker Compose. Configure passwordless sudo. Allow manager gRPC TCP port 9000 and gossip UDP port 9010 between hosts. Resolve routable addresses `${IP_A}` and `${IP_B}`; each host must be able to bind its own IP. Use the same bundle/`cluster_id`, database, secret key, and CA on both hosts.
+2. Generate a disposable CA and host certificates in a deliberately non-default directory. The certificate SAN must cover the IP used by deploy's readiness poll:
+
+   ```bash
+   export CERT_DIR="$PWD/disposable-manager-certs"
+   wr-cli cert init-ca --output "$CERT_DIR"
+   wr-cli cert generate "${HOST_A}" --ca-dir "$CERT_DIR" --ip "${IP_A}"
+   wr-cli cert generate "${HOST_B}" --ca-dir "$CERT_DIR" --ip "${IP_B}"
+   ```
+
+3. Build one reusable manager bundle:
+
+   ```bash
+   wr-cli managers bundle \
+     --manager-config examples/config/manager.toml \
+     --output manager.tar.gz
+   ```
+
+4. On a throwaway snapshot or third disposable host, deploy with an unreachable `${BAD_DB_URL}` and capture the status. Acceptance requires a non-zero status after the 60-second gate, readiness evidence, and the bounded startup-log dump. Reset that host/snapshot and the database before continuing:
+
+   ```bash
+   set +e
+   wr-cli managers deploy manager.tar.gz "${USER}@${HOST_A}" \
+     --format systemd --db-url "${BAD_DB_URL}" --secret-key "${SECRET_KEY}" \
+     --advertise-address "https://${IP_A}:9000" \
+     --gossip-address "${IP_A}:9010" --cert-dir "$CERT_DIR"
+   status=$?
+   set -e
+   test "$status" -ne 0
+   ```
+
+5. Deploy the first manager on Host A. Zero is valid only after output reports a non-empty runtime ID at the exact advertised address:
+
+   ```bash
+   wr-cli managers deploy manager.tar.gz "${USER}@${HOST_A}" \
+     --format systemd --db-url "${DB_URL}" --secret-key "${SECRET_KEY}" \
+     --advertise-address "https://${IP_A}:9000" \
+     --gossip-address "${IP_A}:9010" --cert-dir "$CERT_DIR"
+   ```
+
+6. Query Host A and record `${MANAGER_A_ID}` from the exact ID/address pair:
+
+   ```bash
+   wr-cli --manager "https://${IP_A}:9000" \
+     --ca-cert "$CERT_DIR/ca.crt" \
+     --client-cert "$CERT_DIR/${HOST_A}.crt" \
+     --client-key "$CERT_DIR/${HOST_A}.key" managers list
+   ```
+
+7. Deploy the same bundle to Host B with Docker and the same database, cluster, secret, and CA. Manager A alone cannot satisfy this readiness gate; success must name a new non-empty manager ID at Host B's exact advertised address:
+
+   ```bash
+   wr-cli managers deploy manager.tar.gz "${USER}@${HOST_B}" \
+     --format docker --db-url "${DB_URL}" --secret-key "${SECRET_KEY}" \
+     --advertise-address "https://${IP_B}:9000" \
+     --gossip-address "${IP_B}:9010" --cert-dir "$CERT_DIR"
+   ```
+
+8. Query through both seeds. Each result must contain exactly `${MANAGER_A_ID}` at `https://${IP_A}:9000` and `${MANAGER_B_ID}` at `https://${IP_B}:9000`:
+
+   ```bash
+   wr-cli --manager "https://${IP_A}:9000" \
+     --ca-cert "$CERT_DIR/ca.crt" \
+     --client-cert "$CERT_DIR/${HOST_A}.crt" \
+     --client-key "$CERT_DIR/${HOST_A}.key" managers list
+
+   wr-cli --manager "https://${IP_B}:9000" \
+     --ca-cert "$CERT_DIR/ca.crt" \
+     --client-cert "$CERT_DIR/${HOST_B}.crt" \
+     --client-key "$CERT_DIR/${HOST_B}.key" managers list
+   ```
+
+   `cluster status --detail` is optional additional evidence; it is not the deploy readiness contract.
+
+9. Retain CLI transcripts and remote service/container logs, then destroy both hosts, drop the disposable database, and delete the disposable CA. Reverse the backend assignment when release qualification requires Docker coverage for the first manager itself.
+
 ## Docker deployment
 
 The same bundle works for Docker — override the format via flag, env, or config:
@@ -280,7 +371,9 @@ wr-cli cert generate 10.0.1.50 --ca-dir ./certs/   # node A
 wr-cli cert generate 10.0.1.51 --ca-dir ./certs/   # node B
 ```
 
-During `node deploy`, pass `--cert-dir ./certs/` (or set `cert_dir` in `wr-deploy.toml`). The deploy command stages `ca.crt`, `<host>.crt`, and `<host>.key` inside the revision release before switching `current`. The resolved proxy/engine configs reference those release-relative paths.
+During `managers deploy`, pass `--cert-dir <dir>` (or set `cert_dir` in `wr-deploy.toml`). The command provisions `ca.crt`, `<host>.crt`, and `<host>.key` for the remote manager and uses those same local files explicitly for its readiness connection. Docker mounts the provisioned remote certificate directory read-only into the manager container.
+
+During `node deploy`, the same option stages the files inside the revision release before switching `current`. The resolved proxy/engine configs reference those release-relative paths.
 
 For local development, run `just certs` to generate a CA and localhost certificates.
 
@@ -311,7 +404,8 @@ wr-cli managers deploy manager.tar.gz example@localhost \
     --ssh-port 2201 \
     --db-url "postgres://postgres@localhost:5432/wruntime" \
     --secret-key "<64-char-hex-key>" \
-    --advertise-address "https://10.0.2.2:9000"
+    --advertise-address "https://10.0.2.2:9000" \
+    --gossip-address "10.0.2.15:9010"
 
 wr-cli node deploy --node-id node-a node.tar.gz example@localhost \
     --ssh-port 2202 \

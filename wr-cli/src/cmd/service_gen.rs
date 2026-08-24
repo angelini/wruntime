@@ -108,6 +108,7 @@ pub struct ComposeService {
     pub image: Option<String>,
     pub network_mode: Option<String>,
     pub ports: Vec<String>,
+    pub volumes: Vec<String>,
     pub depends_on: Vec<String>,
 }
 
@@ -135,6 +136,12 @@ pub fn generate_compose(header: &str, services: &[ComposeService]) -> String {
             out.push_str("    ports:\n");
             for port in &svc.ports {
                 out.push_str(&format!("      - \"{port}\"\n"));
+            }
+        }
+        if !svc.volumes.is_empty() {
+            out.push_str("    volumes:\n");
+            for volume in &svc.volumes {
+                out.push_str(&format!("      - \"{volume}\"\n"));
             }
         }
         if !svc.depends_on.is_empty() {

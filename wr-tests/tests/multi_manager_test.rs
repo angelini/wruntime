@@ -354,6 +354,35 @@ async fn test_single_manager_list_managers_returns_self() {
 }
 
 #[tokio::test]
+async fn test_list_managers_converges_with_expected_identities_and_addresses_from_each_seed() {
+    let pool = manager_pool().await;
+    let managers = start_manager_cluster(pool.clone(), 2, 30).await.unwrap();
+    let mut expected = managers
+        .iter()
+        .map(|manager| (manager.manager_id.clone(), manager.addr.clone()))
+        .collect::<Vec<_>>();
+    expected.sort();
+
+    for seed in &managers {
+        let mut client = manager_client(&seed.addr).await.unwrap();
+        let infos = wait_for_manager_count(&mut client, 2, Duration::from_secs(10))
+            .await
+            .unwrap();
+        let mut observed = infos
+            .into_iter()
+            .map(|info| (info.manager_id, info.grpc_address))
+            .collect::<Vec<_>>();
+        observed.sort();
+
+        assert_eq!(
+            observed, expected,
+            "seed {} must report both exact runtime identity/address pairs",
+            seed.addr
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_dead_peer_excluded_from_list_managers() {
     let pool = manager_pool().await;
     let managers = start_manager_cluster_fast_death(pool.clone(), 2, 30)

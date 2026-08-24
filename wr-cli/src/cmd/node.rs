@@ -616,6 +616,7 @@ fn add_deployment_artifacts(
         image: None,
         network_mode: Some("host".into()),
         ports: vec![],
+        volumes: vec![],
         depends_on: vec![],
     }];
 
@@ -627,6 +628,7 @@ fn add_deployment_artifacts(
             image: None,
             network_mode: Some("host".into()),
             ports: vec![],
+            volumes: vec![],
             depends_on: vec!["proxy".into()],
         });
     }

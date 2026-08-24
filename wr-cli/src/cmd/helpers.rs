@@ -1,11 +1,15 @@
 //! Shared CLI and deployment helpers.
 
+use std::future::Future;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{bail, Result};
-use wr_common::wruntime::{GetRoutingTableRequest, ListEnginesRequest};
+use anyhow::{bail, Context, Result};
+use wr_common::node::TlsConfig;
+use wr_common::wruntime::{
+    GetRoutingTableRequest, ListEnginesRequest, ListManagersRequest, ManagerInfo,
+};
 
 use crate::client;
 
@@ -105,8 +109,6 @@ pub fn run_command(args: &[String]) -> Result<()> {
     debug!("exit code 0");
     Ok(())
 }
-
-use anyhow::Context;
 
 /// Build the base SSH argument list from remote, key, and port.
 /// When `ssh_port` is `None`, no `-p` flag is emitted so the SSH config default applies.
@@ -239,21 +241,34 @@ pub fn spawn_ssh_prefixed(
 
     Ok(PrefixedTail {
         child,
-        _stdout_task: stdout_task,
-        _stderr_task: stderr_task,
+        stdout_task,
+        stderr_task,
     })
 }
 
 /// Handle for a background prefixed SSH tail. Kills the child on drop.
 pub struct PrefixedTail {
     child: tokio::process::Child,
-    _stdout_task: tokio::task::JoinHandle<()>,
-    _stderr_task: tokio::task::JoinHandle<()>,
+    stdout_task: tokio::task::JoinHandle<()>,
+    stderr_task: tokio::task::JoinHandle<()>,
+}
+
+impl PrefixedTail {
+    /// Stop the remote tail and wait until its output readers can no longer print.
+    pub async fn stop(mut self) {
+        let _ = self.child.kill().await;
+        self.stdout_task.abort();
+        self.stderr_task.abort();
+        let _ = (&mut self.stdout_task).await;
+        let _ = (&mut self.stderr_task).await;
+    }
 }
 
 impl Drop for PrefixedTail {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+        self.stdout_task.abort();
+        self.stderr_task.abort();
     }
 }
 
@@ -346,46 +361,204 @@ pub async fn wait_for_engine_ready(manager: &str, listen_addr: &str, timeout: Du
     .is_ok()
 }
 
-/// Poll a manager gRPC address until it responds to ListManagers or timeout.
-/// Returns `true` if the manager became reachable.
-pub async fn wait_for_manager_ready(manager_addr: &str, timeout: Duration) -> bool {
-    use tokio_retry::strategy::FixedInterval;
-    use tokio_retry::Retry;
+const MANAGER_READINESS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_OBSERVED_MANAGERS: usize = 8;
+const MAX_EVIDENCE_FIELD_CHARS: usize = 160;
 
-    debug!(
-        "polling manager at {manager_addr} (timeout {}s)",
-        timeout.as_secs()
-    );
-    let attempt = std::sync::atomic::AtomicU32::new(0);
-    let strategy = FixedInterval::from_millis(2000).take(timeout.as_secs() as usize / 2);
-    Retry::start(strategy, || {
-        let n = attempt.fetch_add(1, Ordering::Relaxed) + 1;
-        async move {
-            debug!("attempt {n}: connecting to {manager_addr}");
-            match client::connect(manager_addr).await {
-                Ok(mut c) => match c
-                    .list_managers(wr_common::wruntime::ListManagersRequest {})
-                    .await
-                {
-                    Ok(resp) => {
-                        let count = resp.into_inner().managers.len();
-                        debug!("attempt {n}: ListManagers OK ({count} managers)");
-                        Ok(())
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerReadiness {
+    pub manager_id: String,
+    pub advertised_address: String,
+    pub poll_endpoint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManagerResponseClassification {
+    Ready { manager_id: String },
+    Pending { evidence: String },
+}
+
+fn bounded_evidence_field(value: &str) -> String {
+    let mut bounded = String::new();
+    let mut truncated = false;
+    for (index, character) in value.chars().enumerate() {
+        if index >= MAX_EVIDENCE_FIELD_CHARS {
+            truncated = true;
+            break;
+        }
+        bounded.push(if character.is_control() {
+            '�'
+        } else {
+            character
+        });
+    }
+    if truncated {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn format_manager_observation(managers: &[ManagerInfo]) -> String {
+    let shown = managers
+        .iter()
+        .take(MAX_OBSERVED_MANAGERS)
+        .map(|manager| {
+            let id = if manager.manager_id.is_empty() {
+                "<empty>".to_string()
+            } else {
+                bounded_evidence_field(&manager.manager_id)
+            };
+            format!(
+                "id='{id}' address='{}'",
+                bounded_evidence_field(&manager.grpc_address)
+            )
+        })
+        .collect::<Vec<_>>();
+    let omitted = managers.len().saturating_sub(shown.len());
+    let mut evidence = if shown.is_empty() {
+        "no managers returned".to_string()
+    } else {
+        format!("returned [{}]", shown.join(", "))
+    };
+    if omitted > 0 {
+        evidence.push_str(&format!(" ({omitted} more omitted)"));
+    }
+    evidence
+}
+
+fn classify_manager_response(
+    managers: &[ManagerInfo],
+    expected_advertised_address: &str,
+) -> ManagerResponseClassification {
+    if let Some(manager) = managers
+        .iter()
+        .find(|manager| manager.grpc_address == expected_advertised_address)
+    {
+        if !manager.manager_id.is_empty() {
+            return ManagerResponseClassification::Ready {
+                manager_id: manager.manager_id.clone(),
+            };
+        }
+        return ManagerResponseClassification::Pending {
+            evidence: format!(
+                "matching address has an empty manager ID; {}",
+                format_manager_observation(managers)
+            ),
+        };
+    }
+
+    ManagerResponseClassification::Pending {
+        evidence: format!(
+            "expected advertised address was absent; {}",
+            format_manager_observation(managers)
+        ),
+    }
+}
+
+async fn wait_for_manager_ready_with<P, Fut>(
+    poll_endpoint: &str,
+    expected_advertised_address: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut poll: P,
+) -> Result<ManagerReadiness>
+where
+    P: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<ManagerInfo>>>,
+{
+    let started = tokio::time::Instant::now();
+    let deadline = started + timeout;
+    let mut attempts = 0_u32;
+    let mut last_evidence: String;
+
+    loop {
+        attempts += 1;
+        debug!("attempt {attempts}: polling {poll_endpoint}");
+        match tokio::time::timeout_at(deadline, poll()).await {
+            Ok(Ok(managers)) => {
+                debug!(
+                    "attempt {attempts}: ListManagers OK ({} managers)",
+                    managers.len()
+                );
+                match classify_manager_response(&managers, expected_advertised_address) {
+                    ManagerResponseClassification::Ready { manager_id } => {
+                        return Ok(ManagerReadiness {
+                            manager_id,
+                            advertised_address: expected_advertised_address.to_string(),
+                            poll_endpoint: poll_endpoint.to_string(),
+                        });
                     }
-                    Err(e) => {
-                        debug!("attempt {n}: ListManagers RPC failed: {e}");
-                        Err(())
+                    ManagerResponseClassification::Pending { evidence } => {
+                        last_evidence = evidence;
                     }
-                },
-                Err(e) => {
-                    debug!("attempt {n}: connection failed: {e}");
-                    Err(())
                 }
             }
+            Ok(Err(error)) => {
+                debug!("attempt {attempts}: {error:#}");
+                last_evidence = format!("request failed: {error:#}");
+            }
+            Err(_) => {
+                last_evidence = "request exceeded the readiness deadline".to_string();
+                break;
+            }
         }
-    })
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep_until((now + poll_interval).min(deadline)).await;
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    bail!(
+        "manager readiness timed out after {:?} (timeout {:?}); poll endpoint: {}; expected advertised address: {}; attempts: {}; last evidence: {}",
+        started.elapsed(),
+        timeout,
+        poll_endpoint,
+        expected_advertised_address,
+        attempts,
+        last_evidence
+    )
+}
+
+/// Poll a manager through deploy-scoped mTLS until its exact advertised identity appears.
+pub async fn wait_for_manager_ready(
+    poll_endpoint: &str,
+    expected_advertised_address: &str,
+    tls: &TlsConfig,
+    timeout: Duration,
+) -> Result<ManagerReadiness> {
+    debug!(
+        "polling manager at {poll_endpoint} for {expected_advertised_address} (timeout {}s)",
+        timeout.as_secs()
+    );
+    let poll_endpoint_owned = poll_endpoint.to_string();
+    let tls = tls.clone();
+    wait_for_manager_ready_with(
+        poll_endpoint,
+        expected_advertised_address,
+        timeout,
+        MANAGER_READINESS_POLL_INTERVAL,
+        move || {
+            let poll_endpoint = poll_endpoint_owned.clone();
+            let tls = tls.clone();
+            async move {
+                let mut manager = client::connect_with_tls(&poll_endpoint, &tls)
+                    .await
+                    .context("manager TLS connection")?;
+                Ok(manager
+                    .list_managers(ListManagersRequest {})
+                    .await
+                    .context("ListManagers RPC")?
+                    .into_inner()
+                    .managers)
+            }
+        },
+    )
     .await
-    .is_ok()
 }
 
 /// Extract the host portion from a `user@host` remote string.
@@ -535,5 +708,120 @@ mod tests {
         for address in ["localhost", "localhost:not-a-port", "localhost:0"] {
             assert!(extract_port(address).is_err(), "{address} must be rejected");
         }
+    }
+
+    fn manager(id: &str, address: &str) -> ManagerInfo {
+        ManagerInfo {
+            manager_id: id.to_string(),
+            grpc_address: address.to_string(),
+            gossip_address: String::new(),
+        }
+    }
+
+    #[test]
+    fn manager_response_requires_exact_address_and_nonempty_id() {
+        let expected = "https://manager-a:9000";
+        assert_eq!(
+            classify_manager_response(
+                &[
+                    manager("other", "https://manager-b:9000"),
+                    manager("manager-a-id", expected),
+                ],
+                expected,
+            ),
+            ManagerResponseClassification::Ready {
+                manager_id: "manager-a-id".to_string()
+            }
+        );
+
+        for managers in [
+            vec![],
+            vec![manager("other", "https://manager-b:9000")],
+            vec![manager("", expected)],
+            vec![manager("manager-a-id", "https://MANAGER-A:9000")],
+            vec![manager("manager-a-id", "https://manager-a:9000/")],
+        ] {
+            assert!(matches!(
+                classify_manager_response(&managers, expected),
+                ManagerResponseClassification::Pending { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_readiness_retains_absent_response_evidence() {
+        let error = wait_for_manager_ready_with(
+            "https://poll:9000",
+            "https://expected:9000",
+            Duration::from_millis(15),
+            Duration::from_millis(1),
+            || async { Ok(vec![manager("other-id", "https://other:9000")]) },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("poll endpoint: https://poll:9000"));
+        assert!(error.contains("expected advertised address: https://expected:9000"));
+        assert!(error.contains("attempts:"));
+        assert!(error.contains("other-id"));
+        assert!(error.contains("https://other:9000"));
+    }
+
+    #[tokio::test]
+    async fn manager_readiness_can_recover_after_request_errors() {
+        let mut calls = 0;
+        let ready = wait_for_manager_ready_with(
+            "https://poll:9000",
+            "https://expected:9000",
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            move || {
+                calls += 1;
+                let call = calls;
+                async move {
+                    if call < 3 {
+                        Err(anyhow::anyhow!("temporary RPC failure {call}"))
+                    } else {
+                        Ok(vec![manager("runtime-id", "https://expected:9000")])
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ready.manager_id, "runtime-id");
+        assert_eq!(ready.poll_endpoint, "https://poll:9000");
+        assert_eq!(ready.advertised_address, "https://expected:9000");
+    }
+
+    #[tokio::test]
+    async fn manager_readiness_caps_a_hung_attempt_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let error = wait_for_manager_ready_with(
+            "https://poll:9000",
+            "https://expected:9000",
+            Duration::from_millis(20),
+            Duration::from_secs(2),
+            || async { std::future::pending::<Result<Vec<ManagerInfo>>>().await },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.contains("request exceeded the readiness deadline"));
+        assert!(error.contains("attempts: 1"));
+    }
+
+    #[tokio::test]
+    async fn prefixed_tail_stop_waits_for_reader_shutdown() {
+        let tail =
+            spawn_ssh_prefixed(&["sh".to_string(), "-c".to_string()], "sleep 30", "\t").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), tail.stop())
+            .await
+            .expect("tail shutdown must be bounded");
     }
 }
