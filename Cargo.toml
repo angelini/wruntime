@@ -21,3 +21,16 @@ exclude = [
   "wr-tests/guests/blobstore-guest",
 ]
 resolver = "2"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.test]
+debug       = "line-tables-only"
+incremental = false
+
+[profile.test.package."*"]
+debug = 0
