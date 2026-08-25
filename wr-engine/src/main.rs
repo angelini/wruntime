@@ -127,13 +127,7 @@ async fn async_main() -> Result<()> {
         let addr = config.listen_address.clone();
         let worker_defaults =
             std::sync::Arc::new(server::WorkerDefaults::from_modules(&config.modules));
-        let server_db_pool = config
-            .database
-            .as_ref()
-            .map(|db| {
-                wr_engine::pool::build_pool(&db.url, db.max_connections).map(std::sync::Arc::new)
-            })
-            .transpose()?;
+        let server_db_pool = runner.admin_pool();
         tokio::spawn(async move {
             if let Err(e) = server::serve(&addr, reg, server_db_pool, worker_defaults).await {
                 error!(error = %e, "inbound server error");
@@ -268,22 +262,10 @@ async fn async_main() -> Result<()> {
         .provision_schemas(&reg_response.db_credentials)
         .await?;
 
-    // Provision the wr__jobs schema if any module uses worker mode.
-    let has_workers = config
-        .modules
-        .iter()
-        .any(|m| m.mode == config::ModuleMode::Worker);
-    if has_workers {
-        let db = config
-            .database
-            .as_ref()
-            .expect("worker mode requires [database] section");
-        let admin_pool = wr_engine::pool::build_pool(&db.url, db.max_connections)?;
-        wr_engine::worker::provision_job_schema(&admin_pool).await?;
-    }
-
+    runner.run_job_migrations().await?;
     runner.run_migrations().await?;
     runner.build_namespace_pools(&reg_response.db_credentials)?;
+    runner.start_recovery_coordinator()?;
 
     // ── Resolve secrets into env vars per module ──────────────────────────
     // Build a lookup: (namespace, key) → plaintext value

@@ -87,14 +87,14 @@ fn submit_job_headers(worker_version: &str) -> Vec<(&'static str, &[u8])> {
     headers
 }
 
-/// Submit a job with explicit stale-running timeout and retry settings.
+/// Submit a job with explicit queue lease and retry settings.
 ///
 /// `engine_authority` is the worker's `namespace.name` (e.g. `"codegen.worker"`).
 /// An empty `worker_version` requests name-only dispatch; a non-empty value pins
-/// the exact version. `timeout_secs` controls stale-running recovery in the queue;
-/// worker dispatch uses the worker pool's configured job
-/// timeout. Pass 0 for `timeout_secs`; `max_attempts = 0` uses
-/// engine-configured worker defaults.
+/// the exact version. A positive `timeout_secs` becomes this row's fixed queue
+/// lease; it does not change the worker handler execution deadline and is not
+/// renewed. Pass 0 to use the routed worker's configured job timeout as the
+/// lease default. `max_attempts = 0` uses the engine-configured retry default.
 pub fn submit_job_with_options(
     engine_authority: &str,
     worker_version: &str,

@@ -183,7 +183,7 @@ On startup the engine:
 1. Starts an inbound HTTP server on `listen_address`.
 2. Registers itself and its modules with the manager to obtain requested secrets and DB credentials.
 3. The manager creates schemas and default routes as unhealthy and resets module readiness for advertised tuples.
-4. Provisions schemas and the job schema, runs migrations, builds pools, resolves secrets, validates component imports against each module's enabled DB/blobstore/LLM capabilities, and loads modules. Capability mismatches fail startup before the module becomes ready.
+4. Provisions unique module schemas, applies embedded engine job-queue migrations, runs unique module-schema migrations, builds namespace pools, starts one recovery coordinator when workers exist, resolves secrets, validates component imports against each module's enabled DB/blobstore/LLM capabilities, and loads modules. Capability mismatches or migration failures leave registered routes unhealthy and abort startup.
 5. Sends an immediate readiness heartbeat after module load, then every 3 seconds, reporting healthy loaded modules.
 6. Deregisters cleanly on `Ctrl+C`, which immediately marks its routing rules as unhealthy.
 
@@ -215,7 +215,7 @@ When `cwasm_path` exists and is compatible with the engine, startup deserializes
 
 ### Database pool and timeout settings
 
-The engine creates one guest pool per DB-enabled namespace. Every DB-enabled module contributes `db_max_connections`, or `[database].max_connections` when the module override is absent, and the contributions are summed for that namespace.
+When `[database]` exists, the engine eagerly creates exactly one administrative pool capped by `max_connections`, even if no module enables the DB capability. Provisioning, engine/module migrations, worker HTTP operations, claims/finalization, and recovery share this capacity. The engine also creates one guest pool per DB-enabled namespace. Every configured DB-enabled module instance contributes `db_max_connections`, or `[database].max_connections` when the override is absent, and contributions are checked and summed for that namespace. Each configured worker entry additionally owns one non-pooled PostgreSQL `LISTEN` session.
 
 ```toml
 [database]
@@ -234,7 +234,7 @@ database           = true
 db_max_connections = 10 # this module contributes 10 instead of 20
 ```
 
-`max_connections` defaults to **20**, `statement_timeout_secs` to **30**, and `idle_in_transaction_timeout_secs` to **60**. Pools authenticate with the manager-issued namespace role. The per-module `search_path` selects the default schema for unqualified SQL; it is not an authorization boundary. Fully qualified access to another module schema in the same namespace is allowed, while other namespace roles and all guest roles remain denied access to unrelated schemas and `wr_system`.
+`max_connections` defaults to **20**, `statement_timeout_secs` to **30**, and `idle_in_transaction_timeout_secs` to **60**; all three and every effective module contribution must be positive. Namespace capacity overflow fails config validation. Guest pools authenticate with the manager-issued namespace role and clean each recycled session before module-specific setup reapplies `search_path` and both timeouts. The per-module `search_path` selects the default schema for unqualified SQL; it is not an authorization boundary. Fully qualified access to another module schema in the same namespace is allowed, while other namespace roles and all guest roles remain denied access to unrelated schemas, `wr__jobs`, and `wr_system`. Module schemas remain admin-owned; namespace roles receive grants but cannot drop a schema.
 
 ### Database telemetry
 
@@ -279,11 +279,12 @@ modules/inventory/migrations/
 
 Key behaviors:
 
-- **Per-namespace DB roles:** The manager automatically generates and stores a random password for each namespace that needs database access. At engine registration, the manager returns per-namespace credentials (`wr_ns_{namespace}` roles). The engine uses its target-database admin credentials to create or synchronize those roles and schemas under provisioning locks, then connects guest pools using the namespace role. Modules never receive the password.
+- **Per-namespace DB roles:** The manager automatically generates and stores a random password for each namespace that needs database access. At engine registration, the manager returns per-namespace credentials (`wr_ns_{namespace}` roles). The engine uses its target-database admin credentials to create or synchronize those roles, admin-owned schemas, and grants under provisioning locks, then connects guest pools using the namespace role. Modules never receive the password.
 - **Namespace authorization, module default schema:** The namespace role is granted every DB-enabled module schema in that namespace. `search_path` selects the module's default for unqualified migration SQL but does not prevent trusted migration files from using fully qualified names for other schemas. Migration SQL runs with target-database admin privileges and must not be sourced from untrusted parties.
 - **Cancellation-safe advisory locking:** An engine acquires a Postgres advisory lock before running migrations, preventing concurrent execution across replicas for the same module. The lock is held on a detached physical connection, so cancellation or failure closes the session instead of returning a locked session to the pool.
-- **Idempotent:** Refinery tracks applied migrations in a `refinery_schema_history` table inside the module's schema. Already-applied migrations are skipped on subsequent startups.
-- **Fail-fast:** If any migration fails, the engine exits before the module becomes routable. Registered route rows remain unhealthy, so the module never receives traffic.
+- **Normalized ownership:** Config entries sharing `(namespace, module)` also share one Postgres schema. They provision and migrate it once, while each DB-enabled entry still contributes namespace-pool capacity and each configured module instance still loads. Their canonicalized `migrations_path` values must all resolve to the same directory; `None` versus `Some` is also a conflict. Validation fails before registration or DB writes rather than choosing by config order.
+- **Idempotent:** Refinery tracks applied module migrations in a `refinery_schema_history` table inside the module's schema. Engine-owned job queue migrations are embedded in the binary, use separate history in `wr__jobs`, and run once before module migrations or workers. Already-applied migrations are checked and skipped on subsequent startups.
+- **Fail-fast:** If any engine or module migration fails, the engine exits before the module becomes routable. Registered route rows remain unhealthy, so the module never receives traffic.
 
 ### Per-module request timeout
 
@@ -304,6 +305,8 @@ request_timeout_secs = 120
 ### Worker lifecycle settings
 
 Worker modules require non-zero `worker_concurrency`, `worker_poll_interval_secs`, `worker_job_timeout_secs`, and `worker_max_attempts`. Jobs expose the closed states `pending`, `running`, `complete`, and `dead`; the obsolete `claimed` spelling is rejected. Job submission uses zero only as the explicit wire sentinel for configured timeout/retry defaults.
+
+Three deadlines are independent: `request_timeout_secs` limits ordinary module HTTP requests; `worker_job_timeout_secs` limits worker handler execution and supplies the queue lease default; an explicit submitted `timeout_secs` overrides only that row's fixed queue lease. Claiming atomically stores its fence and `lease_expires_at`; leases are not renewed. If a submitted lease is shorter than legitimate handler execution, another engine may recover and redeliver the job before the first handler finishes. Fencing prevents the stale handler from changing queue state, but cannot make guest side effects exactly once, so handlers must remain idempotent.
 
 ### Module environment values
 
@@ -397,7 +400,7 @@ max_llm_streams     = 32     # concurrent open LLM completion streams
 | `max_db_cursors` | 256 | DB row cursors (`query-stream`) | returns `db-error::connection` |
 | `max_llm_streams` | 32 | LLM completion streams (`complete-stream`) | returns `llm-error::api` |
 
-A resource frees its slot when the guest drops it, so long-lived requests should drop transactions, cursors, spans, and streams promptly to stay under the caps.
+A resource frees its slot when the guest drops it, so long-lived requests should drop transactions, cursors, spans, and streams promptly to stay under the caps. Zero for `max_db_transactions` or `max_db_cursors` intentionally denies creation of that resource. Ordinary DB calls borrow a namespace-pool connection briefly; independent transactions and non-transaction cursors hold one until completion/drop, while transaction cursors share their parent transaction connection. These per-store caps are not required to sum below the namespace pool size; size pools from measured concurrency and wait behavior.
 
 ### Outbound HTTP body limit
 

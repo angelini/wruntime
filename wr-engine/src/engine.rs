@@ -17,6 +17,20 @@ use wr_engine::llm::LlmRuntime;
 use wr_engine::pool::{blob_key_prefix, module_schema};
 use wr_engine::state::{DbTimeouts, ModuleServices, ModuleState};
 
+struct DatabaseRuntime {
+    admin_pool: Arc<Pool>,
+    namespace_pools: HashMap<String, Arc<Pool>>,
+    recovery_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for DatabaseRuntime {
+    fn drop(&mut self) {
+        if let Some(task) = self.recovery_task.take() {
+            task.abort();
+        }
+    }
+}
+
 struct ResolvedServices {
     db_pool: Option<Arc<Pool>>,
     db_schema: Option<Arc<str>>,
@@ -29,10 +43,10 @@ struct ResolvedServices {
 pub struct EngineRunner {
     engine: Arc<Engine>,
     config: EngineConfig,
-    /// Admin pool used only for schema provisioning and migrations.
-    db_pool: Option<Arc<Pool>>,
-    /// One pool per namespace with DB-enabled modules.
-    db_pools: HashMap<String, Arc<Pool>>,
+    /// Engine-owned administrative pool, namespace pools, and DB background work.
+    database: Option<DatabaseRuntime>,
+    /// Normalized unique-schema startup work and summed namespace capacities.
+    startup_db: wr_engine::startup_db::StartupDbManifest,
     /// Shared S3-compatible blobstore client, present when `[blobstore]` is configured.
     blobstore_client: Option<Arc<BlobstoreRuntime>>,
     /// Shared LLM inference client, present when `[llm]` is configured.
@@ -44,18 +58,20 @@ pub struct EngineRunner {
 
 impl EngineRunner {
     pub fn new(config: EngineConfig) -> Result<Self> {
+        let startup_db = wr_engine::startup_db::StartupDbManifest::build(&config)?;
         let engine = wr_engine::runtime::build_engine(&config.pool)?;
 
-        let db_pool = config
+        let database = config
             .database
             .as_ref()
-            .map(|db| wr_engine::pool::build_pool(&db.url, db.max_connections))
-            .transpose()?
-            .map(Arc::new);
-
-        // Guest pools are built later from manager-provided credentials
-        // via build_namespace_pools().
-        let db_pools: HashMap<String, Arc<Pool>> = HashMap::new();
+            .map(|db| {
+                Ok::<_, anyhow::Error>(DatabaseRuntime {
+                    admin_pool: Arc::new(wr_engine::pool::build_pool(&db.url, db.max_connections)?),
+                    namespace_pools: HashMap::new(),
+                    recovery_task: None,
+                })
+            })
+            .transpose()?;
 
         let blobstore_client = config
             .blobstore
@@ -78,12 +94,46 @@ impl EngineRunner {
         Ok(Self {
             engine: Arc::new(engine),
             config,
-            db_pool,
-            db_pools,
+            database,
+            startup_db,
             blobstore_client,
             llm_client,
             instance_semaphore,
         })
+    }
+
+    pub fn admin_pool(&self) -> Option<Arc<Pool>> {
+        self.database
+            .as_ref()
+            .map(|database| database.admin_pool.clone())
+    }
+
+    pub async fn run_job_migrations(&self) -> Result<()> {
+        if !self.startup_db.has_workers {
+            return Ok(());
+        }
+        let pool = self
+            .admin_pool()
+            .context("worker mode requires an administrative database pool")?;
+        wr_engine::job_migration::run_job_migrations(&pool).await
+    }
+
+    pub fn start_recovery_coordinator(&mut self) -> Result<()> {
+        if !self.startup_db.has_workers {
+            return Ok(());
+        }
+        let database = self
+            .database
+            .as_mut()
+            .context("worker mode requires a database runtime")?;
+        anyhow::ensure!(
+            database.recovery_task.is_none(),
+            "job recovery coordinator already started"
+        );
+        database.recovery_task = Some(wr_engine::worker::spawn_recovery_coordinator(
+            database.admin_pool.clone(),
+        ));
+        Ok(())
     }
 
     /// Spawn a background task that increments the wasmtime epoch at the
@@ -106,28 +156,33 @@ impl EngineRunner {
         &mut self,
         credentials: &[wr_common::wruntime::NamespaceDbCredential],
     ) -> Result<()> {
-        let db = match &self.config.database {
+        let db_config = match &self.config.database {
             Some(db) => db,
             None => return Ok(()),
         };
-
-        // Sum max_connections per namespace from all DB-enabled modules
-        let mut ns_max_conns: HashMap<String, usize> = HashMap::new();
-        for module in &self.config.modules {
-            if module.database {
-                *ns_max_conns.entry(module.namespace.clone()).or_default() +=
-                    module.db_max_connections.unwrap_or(db.max_connections);
-            }
-        }
+        let database = self
+            .database
+            .as_mut()
+            .context("database config has no runtime")?;
 
         for cred in credentials {
-            let max_size = ns_max_conns
+            let Some(max_size) = self
+                .startup_db
+                .namespace_capacities
                 .get(&cred.namespace)
                 .copied()
-                .unwrap_or(db.max_connections);
-            let pool =
-                wr_engine::pool::build_guest_pool(&db.url, &cred.role, &cred.password, max_size)?;
-            self.db_pools.insert(cred.namespace.clone(), Arc::new(pool));
+            else {
+                continue;
+            };
+            let pool = wr_engine::pool::build_guest_pool(
+                &db_config.url,
+                &cred.role,
+                &cred.password,
+                max_size,
+            )?;
+            database
+                .namespace_pools
+                .insert(cred.namespace.clone(), Arc::new(pool));
         }
         Ok(())
     }
@@ -140,7 +195,7 @@ impl EngineRunner {
     ) -> Result<()> {
         use std::collections::{BTreeMap, BTreeSet};
 
-        let pool = match &self.db_pool {
+        let pool = match self.admin_pool() {
             Some(pool) => pool,
             None => return Ok(()),
         };
@@ -149,11 +204,11 @@ impl EngineRunner {
             .map(|credential| (credential.namespace.as_str(), credential))
             .collect();
         let mut schemas: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
-        for module in self.config.modules.iter().filter(|module| module.database) {
+        for schema in &self.startup_db.schemas {
             schemas
-                .entry(module.namespace.as_str())
+                .entry(schema.namespace.as_str())
                 .or_default()
-                .insert(module_schema(&module.namespace, &module.name));
+                .insert(schema.schema.clone());
         }
 
         let specifications = schemas
@@ -171,23 +226,33 @@ impl EngineRunner {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        wr_engine::provisioning::provision_namespaces(pool, &specifications).await
+        wr_engine::provisioning::provision_namespaces(&pool, &specifications).await
     }
 
     /// Run database migrations for every module that declares a `migrations_path`.
     /// Uses advisory locks to serialize across engine replicas and restricts
     /// `search_path` so migrations can only touch the module's own schema.
     pub async fn run_migrations(&self) -> Result<()> {
-        let pool = match &self.db_pool {
-            Some(p) => p,
+        let pool = match self.admin_pool() {
+            Some(pool) => pool,
             None => return Ok(()),
         };
-        for module in &self.config.modules {
-            if let Some(mig_path) = &module.migrations_path {
-                let schema = module_schema(&module.namespace, &module.name);
-                wr_engine::migration::run_module_migrations(pool, &schema, mig_path, &module.name)
-                    .await
-                    .with_context(|| format!("migration failed for module '{}'", module.name))?;
+        for schema in &self.startup_db.schemas {
+            if let Some(migrations_path) = &schema.migrations_path {
+                let migrations_path = migrations_path.to_str().with_context(|| {
+                    format!(
+                        "migration path for module '{}.{}' is not valid UTF-8",
+                        schema.namespace, schema.module
+                    )
+                })?;
+                wr_engine::migration::run_module_migrations(
+                    &pool,
+                    &schema.schema,
+                    migrations_path,
+                    &schema.module,
+                )
+                .await
+                .with_context(|| format!("migration failed for module '{}'", schema.module))?;
             }
         }
         Ok(())
@@ -222,7 +287,11 @@ impl EngineRunner {
     ) -> ResolvedServices {
         let (db_pool, db_schema) = if module_config.database {
             let schema: Arc<str> = Arc::from(module_schema(module_namespace, module_name));
-            let pool = self.db_pools.get(&module_config.namespace).cloned();
+            let pool = self
+                .database
+                .as_ref()
+                .and_then(|database| database.namespace_pools.get(&module_config.namespace))
+                .cloned();
             (pool, Some(schema))
         } else {
             (None, None)
@@ -418,7 +487,7 @@ impl EngineRunner {
         // For worker mode, also spawn the worker pool that pulls jobs from
         // the Postgres queue and dispatches them as HTTP requests.
         if module_config.mode == ModuleMode::Worker {
-            let admin_pool = self.db_pool.clone().expect("worker mode requires database");
+            let admin_pool = self.admin_pool().expect("worker mode requires database");
             let db_url = self
                 .config
                 .database

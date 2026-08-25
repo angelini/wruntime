@@ -259,8 +259,123 @@ fn prepare_param(v: PgValue) -> Result<PgParam, DbError> {
     )
 }
 
-pub(crate) fn prepare_params(params: Vec<PgValue>) -> Result<Vec<PgParam>, DbError> {
-    params.into_iter().map(prepare_param).collect()
+fn postgres_type(pg_type: PgType) -> tokio_postgres::types::Type {
+    use tokio_postgres::types::Type;
+
+    match pg_type {
+        PgType::Boolean => Type::BOOL,
+        PgType::Int2 => Type::INT2,
+        PgType::Int4 => Type::INT4,
+        PgType::Int8 => Type::INT8,
+        PgType::Float4 => Type::FLOAT4,
+        PgType::Float8 => Type::FLOAT8,
+        PgType::Text => Type::TEXT,
+        PgType::Bytea => Type::BYTEA,
+        PgType::Timestamptz => Type::TIMESTAMPTZ,
+        PgType::Timestamp => Type::TIMESTAMP,
+        PgType::Date => Type::DATE,
+        PgType::Time => Type::TIME,
+        PgType::Interval => Type::INTERVAL,
+        PgType::Numeric => Type::NUMERIC,
+        PgType::Uuid => Type::UUID,
+        PgType::Jsonb => Type::JSONB,
+        PgType::Oid => Type::OID,
+        PgType::BoolArray => Type::BOOL_ARRAY,
+        PgType::Int2Array => Type::INT2_ARRAY,
+        PgType::Int4Array => Type::INT4_ARRAY,
+        PgType::Int8Array => Type::INT8_ARRAY,
+        PgType::Float4Array => Type::FLOAT4_ARRAY,
+        PgType::Float8Array => Type::FLOAT8_ARRAY,
+        PgType::TextArray => Type::TEXT_ARRAY,
+        PgType::TimestamptzArray => Type::TIMESTAMPTZ_ARRAY,
+        PgType::TimestampArray => Type::TIMESTAMP_ARRAY,
+        PgType::UuidArray => Type::UUID_ARRAY,
+        PgType::JsonbArray => Type::JSONB_ARRAY,
+    }
+}
+
+impl PgParam {
+    fn postgres_type(&self) -> tokio_postgres::types::Type {
+        use tokio_postgres::types::Type;
+
+        match self {
+            Self::Null(pg_type) => postgres_type(*pg_type),
+            Self::Boolean(_) => Type::BOOL,
+            Self::Int2(_) => Type::INT2,
+            Self::Int4(_) => Type::INT4,
+            Self::Int8(_) => Type::INT8,
+            Self::Float4(_) => Type::FLOAT4,
+            Self::Float8(_) => Type::FLOAT8,
+            Self::Text(_) => Type::TEXT,
+            Self::Bytea(_) => Type::BYTEA,
+            Self::Timestamptz(_) => Type::TIMESTAMPTZ,
+            Self::Timestamp(_) => Type::TIMESTAMP,
+            Self::Date(_) => Type::DATE,
+            Self::Time(_) => Type::TIME,
+            Self::Interval(_) => Type::INTERVAL,
+            Self::Numeric(_) => Type::NUMERIC,
+            Self::Uuid(_) => Type::UUID,
+            Self::Jsonb(_) => Type::JSONB,
+            Self::Oid(_) => Type::OID,
+            Self::BoolArray(_) => Type::BOOL_ARRAY,
+            Self::Int2Array(_) => Type::INT2_ARRAY,
+            Self::Int4Array(_) => Type::INT4_ARRAY,
+            Self::Int8Array(_) => Type::INT8_ARRAY,
+            Self::Float4Array(_) => Type::FLOAT4_ARRAY,
+            Self::Float8Array(_) => Type::FLOAT8_ARRAY,
+            Self::TextArray(_) => Type::TEXT_ARRAY,
+            Self::TimestamptzArray(_) => Type::TIMESTAMPTZ_ARRAY,
+            Self::TimestampArray(_) => Type::TIMESTAMP_ARRAY,
+            Self::UuidArray(_) => Type::UUID_ARRAY,
+            Self::JsonbArray(_) => Type::JSONB_ARRAY,
+        }
+    }
+}
+
+/// One owned conversion of guest SQL and bind values, shared by query,
+/// execute, and stream paths (including transaction equivalents).
+pub(crate) struct PreparedGuestQuery {
+    sql: String,
+    params: Vec<PgParam>,
+    postgres_types: Vec<tokio_postgres::types::Type>,
+}
+
+impl PreparedGuestQuery {
+    pub(crate) fn new(sql: String, params: Vec<PgValue>) -> Result<Self, DbError> {
+        let params = params
+            .into_iter()
+            .map(prepare_param)
+            .collect::<Result<Vec<_>, _>>()?;
+        let postgres_types = params.iter().map(PgParam::postgres_type).collect();
+        Ok(Self {
+            sql,
+            params,
+            postgres_types,
+        })
+    }
+
+    pub(crate) fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    pub(crate) fn raw_params(&self) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
+        debug_assert_eq!(self.params.len(), self.postgres_types.len());
+        self.params.iter().map(|param| param as _).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn typed_params(
+        &self,
+    ) -> Vec<(
+        &(dyn tokio_postgres::types::ToSql + Sync),
+        tokio_postgres::types::Type,
+    )> {
+        self.params
+            .iter()
+            .zip(self.postgres_types.iter().cloned())
+            .map(|(param, pg_type)| (param as _, pg_type))
+            .collect()
+    }
 }
 
 /// Generates the `to_sql` match: every non-Null variant delegates to its
@@ -345,7 +460,7 @@ impl tokio_postgres::types::ToSql for PgParam {
 
 #[cfg(test)]
 mod tests {
-    use super::prepare_param;
+    use super::{prepare_param, PreparedGuestQuery};
     use crate::db::wruntime::db::database::{DbError, PgType, PgValue};
 
     fn assert_rejected(v: PgValue) {
@@ -389,6 +504,18 @@ mod tests {
         ] {
             assert!(prepare_param(v.clone()).is_ok(), "should accept {v:?}");
         }
+    }
+
+    #[test]
+    fn prepared_query_owns_explicit_parameter_types() {
+        let prepared = PreparedGuestQuery::new(
+            "SELECT $1::int4, $2::text".into(),
+            vec![PgValue::Int4(7), PgValue::Null(PgType::Text)],
+        )
+        .expect("prepared query");
+        let typed = prepared.typed_params();
+        assert_eq!(typed[0].1, tokio_postgres::types::Type::INT4);
+        assert_eq!(typed[1].1, tokio_postgres::types::Type::TEXT);
     }
 
     #[test]

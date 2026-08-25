@@ -3,7 +3,7 @@
 Start focused, then run the broader requirement for the change class.
 
 | Change class | Focused validation |
-|---|---|
+| --- | --- |
 | Docs only | `git diff --check`, `just fmt-check`, manual link/navigation review |
 | Workspace Rust | `just check` plus the owning crate or named test |
 | Proxy routing/version/circuit breaker | relevant `proxy_test`, `version_test`, `concurrent_routing_test`, `cross_node_test`, and `circuit_breaker_test` targets |
@@ -12,6 +12,7 @@ Start focused, then run the broader requirement for the change class.
 | WIT, SDK, build generator, or host binding | `just test-wasm-one <target>`, then `just test-wasm` |
 | Guest example | `just build-<example>`, guest format/lint, then its inline recipe |
 | Migration | migration tests plus tests for the owning manager or engine/module subsystem |
+| Engine job queue/database topology | `job_migration_test`, startup manifest unit tests, worker/namespace/provisioning tests; manual ignored `db_simplification_metrics` only for evidence claims |
 | Deployment generator | relevant CLI/config/bundle tests and deterministic output review |
 | Broad pre-merge | `just validate-all` |
 

@@ -4,7 +4,7 @@ use wr_common::pool::pg_error_string;
 
 use super::bindings::{CursorState, TxState};
 use super::connection::get_prepared_connection;
-use super::params::prepare_params;
+use super::params::PreparedGuestQuery;
 use super::rows::pg_row_to_wit;
 use super::telemetry::DbOperation;
 use super::wruntime::db::database::{DbError, Host, PgValue, Row};
@@ -30,14 +30,12 @@ impl HostDbError {
 
 pub(crate) async fn query_rows(
     client: &deadpool_postgres::Object,
-    sql: &str,
+    sql: String,
     params: Vec<PgValue>,
 ) -> Result<Vec<Row>, HostDbError> {
-    let pg_params = prepare_params(params).map_err(HostDbError::Parameter)?;
-    let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-        pg_params.iter().map(|p| p as _).collect();
+    let prepared = PreparedGuestQuery::new(sql, params).map_err(HostDbError::Parameter)?;
     let rows = client
-        .query(sql, &params_ref)
+        .query(prepared.sql(), &prepared.raw_params())
         .await
         .map_err(|e| HostDbError::Postgres(DbError::Query(pg_error_string(&e))))?;
     rows.iter()
@@ -48,28 +46,24 @@ pub(crate) async fn query_rows(
 
 pub(crate) async fn execute_statement(
     client: &deadpool_postgres::Object,
-    sql: &str,
+    sql: String,
     params: Vec<PgValue>,
 ) -> Result<u64, HostDbError> {
-    let pg_params = prepare_params(params).map_err(HostDbError::Parameter)?;
-    let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-        pg_params.iter().map(|p| p as _).collect();
+    let prepared = PreparedGuestQuery::new(sql, params).map_err(HostDbError::Parameter)?;
     client
-        .execute(sql, &params_ref)
+        .execute(prepared.sql(), &prepared.raw_params())
         .await
         .map_err(|e| HostDbError::Postgres(DbError::Query(pg_error_string(&e))))
 }
 
 pub(crate) async fn open_row_stream(
     client: &deadpool_postgres::Object,
-    sql: &str,
+    sql: String,
     params: Vec<PgValue>,
 ) -> Result<tokio_postgres::RowStream, HostDbError> {
-    let pg_params = prepare_params(params).map_err(HostDbError::Parameter)?;
-    let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-        pg_params.iter().map(|p| p as _).collect();
+    let prepared = PreparedGuestQuery::new(sql, params).map_err(HostDbError::Parameter)?;
     client
-        .query_raw(sql, params_ref)
+        .query_raw(prepared.sql(), prepared.raw_params())
         .await
         .map_err(|e| HostDbError::Postgres(DbError::Query(pg_error_string(&e))))
 }
@@ -88,7 +82,7 @@ impl Host for ModuleState {
             let result = async {
                 let (pool, schema, timeouts) = prepared?;
                 let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
-                query_rows(&client, sql.as_str(), params)
+                query_rows(&client, sql, params)
                     .await
                     .map_err(HostDbError::into_public)
             }
@@ -111,7 +105,7 @@ impl Host for ModuleState {
             let result = async {
                 let (pool, schema, timeouts) = prepared?;
                 let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
-                execute_statement(&client, sql.as_str(), params)
+                execute_statement(&client, sql, params)
                     .await
                     .map_err(HostDbError::into_public)
             }
@@ -154,7 +148,7 @@ impl Host for ModuleState {
                 return Err(error);
             }
         };
-        let stream = match open_row_stream(&client, sql.as_str(), params).await {
+        let stream = match open_row_stream(&client, sql, params).await {
             Ok(stream) => stream,
             Err(error) => {
                 let error = error.into_public();

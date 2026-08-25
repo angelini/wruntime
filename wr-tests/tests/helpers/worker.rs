@@ -26,9 +26,9 @@ pub async fn worker_pool() -> deadpool_postgres::Pool {
 
     PROVISIONED
         .get_or_init(|| async {
-            wr_engine::worker::provision_job_schema(&pool)
+            wr_engine::job_migration::run_job_migrations(&pool)
                 .await
-                .expect("provision wr__jobs");
+                .expect("migrate wr__jobs");
         })
         .await;
 

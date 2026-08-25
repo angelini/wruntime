@@ -99,7 +99,7 @@ async fn provision_namespace(pool: &Pool, specification: &NamespaceProvisioning)
         transaction
             .batch_execute(&format!(
                 "CREATE SCHEMA IF NOT EXISTS {quoted_schema}; \
-                 ALTER SCHEMA {quoted_schema} OWNER TO {quoted_role}; \
+                 ALTER SCHEMA {quoted_schema} OWNER TO CURRENT_USER; \
                  GRANT ALL ON SCHEMA {quoted_schema} TO {quoted_role}; \
                  GRANT ALL ON ALL TABLES IN SCHEMA {quoted_schema} TO {quoted_role}; \
                  GRANT ALL ON ALL SEQUENCES IN SCHEMA {quoted_schema} TO {quoted_role}; \
@@ -110,6 +110,25 @@ async fn provision_namespace(pool: &Pool, specification: &NamespaceProvisioning)
             ))
             .await
             .map_err(|_| anyhow::anyhow!("failed to converge namespace schema privileges"))?;
+    }
+
+    for control_schema in ["wr__jobs", "wr_system"] {
+        let exists = transaction
+            .query_one(
+                "SELECT EXISTS (SELECT FROM information_schema.schemata WHERE schema_name = $1)",
+                &[&control_schema],
+            )
+            .await
+            .context("failed to inspect control-plane schema")?
+            .get::<_, bool>(0);
+        if exists {
+            transaction
+                .batch_execute(&format!(
+                    "REVOKE ALL ON SCHEMA {control_schema} FROM {quoted_role}"
+                ))
+                .await
+                .map_err(|_| anyhow::anyhow!("failed to enforce control-plane schema isolation"))?;
+        }
     }
 
     transaction

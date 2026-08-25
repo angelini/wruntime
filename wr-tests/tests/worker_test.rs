@@ -851,20 +851,19 @@ async fn test_worker_stale_recovery_marks_dead_when_exhausted() {
     .await
     .unwrap();
 
-    // Backdate claimed_at so it appears stale.
+    // Expire the durable lease so it is eligible for recovery.
     let client = harness.pool.get().await.unwrap();
     client
         .execute(
-            "UPDATE wr__jobs.jobs SET claimed_at = now() - interval '10 seconds' WHERE job_id = $1",
+            "UPDATE wr__jobs.jobs SET lease_expires_at = now() - interval '10 seconds' WHERE job_id = $1",
             &[&id],
         )
         .await
         .unwrap();
     drop(client);
 
-    // Another test's worker pool stale-recovery task may have already recovered
-    // this job, so don't assert on the count — just ensure recovery ran and
-    // verify the final job state.
+    // Recovery is engine-scoped, so exercise the coordinator query directly
+    // and verify the final fenced state rather than a module-loop side effect.
     let _ = wr_engine::worker::recover_stale_jobs(&harness.pool)
         .await
         .unwrap();

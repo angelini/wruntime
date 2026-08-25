@@ -11,102 +11,6 @@ use wr_common::lifecycle::{
     AttemptCount, JobState, JobTimeoutSecs, MaxAttempts, WorkerConcurrency,
 };
 
-/// Provision the `wr__jobs` schema, table, indexes, and NOTIFY trigger.
-/// Idempotent — safe to call on every startup.
-pub async fn provision_job_schema(pool: &Pool) -> anyhow::Result<()> {
-    let client = pool.get().await?;
-
-    client
-        .batch_execute(
-            r#"
-CREATE SCHEMA IF NOT EXISTS wr__jobs;
-
-CREATE TABLE IF NOT EXISTS wr__jobs.jobs (
-    job_id            TEXT        PRIMARY KEY,
-    worker_namespace  TEXT        NOT NULL,
-    worker_name       TEXT        NOT NULL,
-    worker_version    TEXT        NOT NULL,
-    job_type          TEXT        NOT NULL DEFAULT '/',
-    payload           BYTEA      NOT NULL DEFAULT '',
-    status            TEXT        NOT NULL DEFAULT 'pending',
-    result            BYTEA,
-    error_message     TEXT,
-    attempt           INT         NOT NULL DEFAULT 0,
-    max_attempts      INT         NOT NULL DEFAULT 3,
-    timeout_secs      INT         NOT NULL DEFAULT 300,
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    claimed_at        TIMESTAMPTZ,
-    completed_at      TIMESTAMPTZ,
-    claimed_by        TEXT,
-    source_namespace  TEXT        NOT NULL DEFAULT '',
-    source_module     TEXT        NOT NULL DEFAULT '',
-    claim_id          UUID
-);
-
-ALTER TABLE wr__jobs.jobs ADD COLUMN IF NOT EXISTS claim_id UUID;
-
-DROP INDEX IF EXISTS wr__jobs.idx_jobs_pending;
-CREATE INDEX IF NOT EXISTS idx_jobs_pending
-    ON wr__jobs.jobs (worker_namespace, worker_name, worker_version, created_at)
-    WHERE status = 'pending';
-
-UPDATE wr__jobs.jobs SET status = 'dead' WHERE status NOT IN ('pending', 'running', 'complete', 'dead');
-UPDATE wr__jobs.jobs SET timeout_secs = 300 WHERE timeout_secs <= 0;
-UPDATE wr__jobs.jobs SET max_attempts = 3 WHERE max_attempts <= 0;
-UPDATE wr__jobs.jobs SET attempt = 0 WHERE attempt < 0;
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'jobs_status_valid' AND conrelid = 'wr__jobs.jobs'::regclass) THEN
-        ALTER TABLE wr__jobs.jobs ADD CONSTRAINT jobs_status_valid CHECK (status IN ('pending', 'running', 'complete', 'dead')) NOT VALID;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'jobs_timeout_positive' AND conrelid = 'wr__jobs.jobs'::regclass) THEN
-        ALTER TABLE wr__jobs.jobs ADD CONSTRAINT jobs_timeout_positive CHECK (timeout_secs > 0) NOT VALID;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'jobs_max_attempts_positive' AND conrelid = 'wr__jobs.jobs'::regclass) THEN
-        ALTER TABLE wr__jobs.jobs ADD CONSTRAINT jobs_max_attempts_positive CHECK (max_attempts > 0) NOT VALID;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'jobs_attempt_valid' AND conrelid = 'wr__jobs.jobs'::regclass) THEN
-        ALTER TABLE wr__jobs.jobs ADD CONSTRAINT jobs_attempt_valid CHECK (attempt >= 0 AND attempt <= max_attempts) NOT VALID;
-    END IF;
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-ALTER TABLE wr__jobs.jobs VALIDATE CONSTRAINT jobs_status_valid;
-ALTER TABLE wr__jobs.jobs VALIDATE CONSTRAINT jobs_timeout_positive;
-ALTER TABLE wr__jobs.jobs VALIDATE CONSTRAINT jobs_max_attempts_positive;
-ALTER TABLE wr__jobs.jobs VALIDATE CONSTRAINT jobs_attempt_valid;
-
-DROP INDEX IF EXISTS wr__jobs.idx_jobs_stale;
-CREATE INDEX IF NOT EXISTS idx_jobs_stale
-    ON wr__jobs.jobs (claimed_at)
-    WHERE status = 'running';
-
-CREATE OR REPLACE FUNCTION wr__jobs.notify_new_job() RETURNS trigger AS $$
-DECLARE
-    channel_name TEXT := CASE WHEN NEW.worker_version = ''
-        THEN 'wr_jobs_' || NEW.worker_namespace || '_' || NEW.worker_name || '_unversioned'
-        ELSE 'wr_jobs_' || NEW.worker_namespace || '_' || NEW.worker_name || '_' || NEW.worker_version
-    END;
-BEGIN
-    IF octet_length(channel_name) > 63 THEN
-        channel_name := 'wr_jobs_long_identity';
-    END IF;
-    PERFORM pg_notify(channel_name, NEW.job_id);
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_notify_new_job ON wr__jobs.jobs;
-CREATE TRIGGER trg_notify_new_job
-    AFTER INSERT ON wr__jobs.jobs
-    FOR EACH ROW EXECUTE FUNCTION wr__jobs.notify_new_job();
-"#,
-        )
-        .await?;
-
-    info!("wr__jobs schema provisioned");
-    Ok(())
-}
-
 /// Insert a job into the queue. Returns the generated job_id.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_job(
@@ -228,6 +132,7 @@ pub async fn claim_job(
     let row = client
         .query_opt(
             "UPDATE wr__jobs.jobs SET status = 'running', claimed_at = now(), \
+             lease_expires_at = now() + timeout_secs * interval '1 second', \
              claimed_by = $4, attempt = attempt + 1, claim_id = $5, updated_at = now() \
              WHERE job_id = ( \
                SELECT job_id FROM wr__jobs.jobs \
@@ -259,7 +164,8 @@ pub async fn complete_job(
     let client = pool.get().await?;
     let rows = client
         .execute(
-            "UPDATE wr__jobs.jobs SET status = 'complete', result = $3, claim_id = NULL, \
+            "UPDATE wr__jobs.jobs SET status = 'complete', result = $3, \
+             claimed_at = NULL, claimed_by = NULL, claim_id = NULL, lease_expires_at = NULL, \
              completed_at = now(), updated_at = now() \
              WHERE job_id = $1 AND status = 'running' AND claim_id = $2",
             &[&job_id, &claim_id, &result],
@@ -284,6 +190,7 @@ pub async fn fail_job(
                claimed_at = NULL, \
                claimed_by = NULL, \
                claim_id = NULL, \
+               lease_expires_at = NULL, \
                updated_at = now() \
              WHERE job_id = $1 AND status = 'running' AND claim_id = $2",
             &[&job_id, &claim_id, &error_msg],
@@ -292,24 +199,55 @@ pub async fn fail_job(
     Ok(Finalization::from_affected_rows(rows))
 }
 
-/// Reset jobs that have been running longer than their timeout.
+/// Recover expired leases with the active claim fence in the update predicate.
+/// `SKIP LOCKED` keeps multiple engine coordinators safe and non-blocking.
 pub async fn recover_stale_jobs(pool: &Pool) -> anyhow::Result<u64> {
     let client = pool.get().await?;
     let count = client
         .execute(
-            "UPDATE wr__jobs.jobs SET \
-               status = CASE WHEN attempt < max_attempts THEN 'pending' ELSE 'dead' END, \
-               error_message = COALESCE(error_message, '') || ' [stale recovery]', \
-               claimed_at = NULL, \
-               claimed_by = NULL, \
-               claim_id = NULL, \
+            "WITH expired AS ( \
+               SELECT job_id, claim_id FROM wr__jobs.jobs \
+               WHERE status = 'running' AND lease_expires_at <= now() \
+               FOR UPDATE SKIP LOCKED \
+             ) \
+             UPDATE wr__jobs.jobs AS jobs SET \
+               status = CASE WHEN jobs.attempt < jobs.max_attempts THEN 'pending' ELSE 'dead' END, \
+               error_message = COALESCE(jobs.error_message, '') || ' [stale recovery]', \
+               claimed_at = NULL, claimed_by = NULL, claim_id = NULL, lease_expires_at = NULL, \
                updated_at = now() \
-             WHERE status = 'running' \
-               AND claimed_at < now() - (timeout_secs || ' seconds')::interval",
+             FROM expired \
+             WHERE jobs.job_id = expired.job_id \
+               AND jobs.status = 'running' \
+               AND jobs.claim_id = expired.claim_id",
             &[],
         )
         .await?;
     Ok(count)
+}
+
+/// Spawn the engine-level stale lease recovery coordinator.
+pub fn spawn_recovery_coordinator(pool: Arc<Pool>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let started = std::time::Instant::now();
+            match recover_stale_jobs(&pool).await {
+                Ok(recovered) => info!(
+                    scans = 1_u64,
+                    recovered,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "stale job recovery scan complete"
+                ),
+                Err(error) => warn!(
+                    scans = 1_u64,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    %error,
+                    "stale job recovery failed"
+                ),
+            }
+        }
+    })
 }
 
 /// Configuration for a worker pool.
@@ -341,7 +279,7 @@ fn worker_channel(namespace: &str, name: &str, version: &str) -> String {
     }
 }
 
-/// Spawn the worker pool: N worker loops + a LISTEN task + a stale recovery task.
+/// Spawn the worker pool: N module-specific worker loops plus one LISTEN task.
 /// The worker loops dispatch jobs as HTTP requests through the provided `ModuleTx`.
 pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx) {
     let notify = Arc::new(Notify::new());
@@ -388,22 +326,6 @@ pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx
                 job_timeout,
             )
             .await;
-        });
-    }
-
-    // Spawn stale recovery task.
-    {
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                match recover_stale_jobs(&pool).await {
-                    Ok(0) => {}
-                    Ok(n) => info!(recovered = n, "recovered stale jobs"),
-                    Err(e) => warn!(error = %e, "stale job recovery failed"),
-                }
-            }
         });
     }
 
@@ -643,7 +565,9 @@ mod tests {
         // Provision the schema exactly once across all parallel tests.
         PROVISIONED
             .get_or_init(|| async {
-                provision_job_schema(&pool).await.expect("provision schema");
+                crate::job_migration::run_job_migrations(&pool)
+                    .await
+                    .expect("migrate job schema");
             })
             .await;
 
@@ -969,6 +893,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_persists_complete_fixed_lease_metadata() {
+        let pool = require_pool!();
+        let namespace = unique_prefix();
+        let id = insert_job(
+            &pool, &namespace, "mod", "1.0.0", "/test", b"", 47, 3, "", "",
+        )
+        .await
+        .unwrap();
+        let claim = claim_job(&pool, &namespace, "mod", "1.0.0", "engine-lease")
+            .await
+            .unwrap()
+            .unwrap();
+        let row = pool
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT claim_id, claimed_by, \
+                 extract(epoch FROM (lease_expires_at - claimed_at))::bigint \
+                 FROM wr__jobs.jobs WHERE job_id = $1",
+                &[&id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, uuid::Uuid>(0), claim.claim_id);
+        assert_eq!(row.get::<_, String>(1), "engine-lease");
+        assert_eq!(row.get::<_, i64>(2), 47);
+    }
+
+    #[tokio::test]
     async fn test_recover_stale_jobs() {
         let pool = require_pool!();
         let p = unique_prefix();
@@ -980,18 +934,49 @@ mod tests {
         let client = pool.get().await.unwrap();
         client
             .execute(
-                "UPDATE wr__jobs.jobs SET claimed_at = now() - interval '10 seconds' WHERE job_id = $1",
+                "UPDATE wr__jobs.jobs SET lease_expires_at = now() - interval '10 seconds' WHERE job_id = $1",
                 &[&id],
             )
             .await
             .unwrap();
 
-        let recovered = recover_stale_jobs(&pool).await.expect("recover");
-        assert!(recovered >= 1);
+        recover_stale_jobs(&pool).await.expect("recover");
 
         let status = get_job_status(&pool, &id).await.unwrap().unwrap();
         assert_eq!(status.status, "pending");
         assert!(status.error_message.contains("[stale recovery]"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_engine_recovery_applies_each_lease_once() {
+        let pool = require_pool!();
+        let namespace = unique_prefix();
+        let id = insert_job(
+            &pool, &namespace, "mod", "1.0.0", "/test", b"", 1, 3, "", "",
+        )
+        .await
+        .unwrap();
+        claim_job(&pool, &namespace, "mod", "1.0.0", "engine-a")
+            .await
+            .unwrap()
+            .unwrap();
+        pool.get()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE wr__jobs.jobs SET lease_expires_at = now() - interval '1 second' \
+                 WHERE job_id = $1",
+                &[&id],
+            )
+            .await
+            .unwrap();
+
+        let (left, right) = tokio::join!(recover_stale_jobs(&pool), recover_stale_jobs(&pool));
+        left.unwrap();
+        right.unwrap();
+        let status = get_job_status(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(status.status, "pending");
+        assert_eq!(status.error_message.matches("[stale recovery]").count(), 1);
     }
 
     #[tokio::test]
@@ -1010,12 +995,12 @@ mod tests {
         let client = pool.get().await.unwrap();
         client
             .execute(
-                "UPDATE wr__jobs.jobs SET claimed_at = now() - interval '10 seconds' WHERE job_id = $1",
+                "UPDATE wr__jobs.jobs SET lease_expires_at = now() - interval '10 seconds' WHERE job_id = $1",
                 &[&id],
             )
             .await
             .unwrap();
-        assert!(recover_stale_jobs(&pool).await.unwrap() >= 1);
+        recover_stale_jobs(&pool).await.unwrap();
 
         let claim_b = claim_job(&pool, &namespace, "mod", "1.0.0", "engine-b")
             .await

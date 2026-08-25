@@ -31,7 +31,7 @@ Read these rules before writing a guest. Exact APIs live in Rust/WIT source; see
 - Put schema changes in versioned module migrations. Do not use `CREATE TABLE IF NOT EXISTS` in guest handlers.
 - Database inputs are converted strictly. Prefer typed SDK wrappers and row extraction.
 - Dropping an uncommitted transaction rolls it back. A transaction permits one active cursor; other operations reject until it drains. Cursor batches are limited to 1,024 rows. Do not issue raw transaction-control SQL through query builders.
-- Database authorization is per namespace. `search_path` selects a module's default schema but does not block fully qualified access to another granted schema in that namespace. Cross-namespace and `wr_system` access remain denied.
+- Database authorization is per namespace. `search_path` selects a module's default schema but does not block fully qualified access to another granted schema in that namespace. Cross-namespace and `wr__jobs`/`wr_system` access remain denied. Namespace roles have object privileges but do not own or drop module schemas.
 - Spans, DB resources, and LLM streams consume per-request host resource slots until dropped. Drop them promptly.
 - Blobstore object/list limits and HTTP body limits are enforced by the host.
 - LLM stream order is text deltas, one usage, one stop, then `None`. Tool-enabled streaming is rejected before an upstream request; use non-streaming completion for tools.
@@ -40,7 +40,7 @@ Read these rules before writing a guest. Exact APIs live in Rust/WIT source; see
 
 - Worker handlers must be idempotent. Delivery is at least once because leases can expire and failed jobs can retry.
 - Non-empty ad-hoc worker versions are claimed exactly. Empty versions are name-only and may be claimed by any matching namespace/name version. Manager schedules remain version-pinned.
-- `timeout_secs` controls stale-running recovery; worker dispatch also uses the configured worker job timeout. Zero option values select engine defaults; negative values are rejected.
+- `request_timeout_secs`, worker execution timeout, and queue lease are distinct. `worker_job_timeout_secs` is the execution deadline and default lease; an explicit submitted `timeout_secs` changes only the fixed row lease. Zero option values select engine defaults; negative values are rejected. Leases are not renewed, and a too-short lease can redeliver while the first handler still runs.
 - Generated result helpers return `None` while pending/running, decode successful results, and surface dead or malformed results as errors.
 
 ## Frequent failures

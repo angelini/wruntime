@@ -62,7 +62,7 @@ impl HostTransaction for ModuleState {
                 .client
                 .as_ref()
                 .ok_or_else(|| DbError::Query("transaction already completed".into()))?;
-            query_rows(client, sql.as_str(), params)
+            query_rows(client, sql, params)
                 .await
                 .map_err(|error| public_transaction_error(&state.lifecycle, error))
         }
@@ -88,7 +88,7 @@ impl HostTransaction for ModuleState {
                 .client
                 .as_ref()
                 .ok_or_else(|| DbError::Query("transaction already completed".into()))?;
-            execute_statement(client, sql.as_str(), params)
+            execute_statement(client, sql, params)
                 .await
                 .map_err(|error| public_transaction_error(&state.lifecycle, error))
         }
@@ -147,7 +147,7 @@ impl HostTransaction for ModuleState {
                 telemetry.finish_error(&error);
                 return Err(error);
             };
-            match open_row_stream(client, sql.as_str(), params).await {
+            match open_row_stream(client, sql, params).await {
                 Ok(stream) => stream,
                 Err(error) => {
                     lifecycle.release_cursor();

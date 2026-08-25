@@ -30,8 +30,9 @@ For each change, **preserve** the contract, **inspect** the listed implementatio
 
 ## Database, secrets, and capabilities
 
-- **Preserve:** the manager generates/stores namespace credentials; the engine uses target-database admin credentials to provision roles and schemas; guest pools use clean-recycled namespace-role sessions; `search_path` selects a module default but namespace grants are the authorization boundary; other namespace roles and guest roles cannot access unrelated schemas or `wr_system`; direct database access is limited to documented control-plane and host-capability exceptions.
-- **Inspect:** manager DB/migrations/crypto, engine pool/migration/DB host modules, and namespace tests.
+- **Preserve:** the manager generates/stores namespace credentials; the engine uses target-database admin credentials to provision roles, admin-owned schemas, and grants; guest pools use clean-recycled namespace-role sessions; `search_path` selects a module default but namespace grants are the authorization boundary; namespace roles cannot drop module schemas; other namespace roles and guest roles cannot access unrelated schemas, `wr__jobs`, or `wr_system`; direct database access is limited to documented control-plane and host-capability exceptions.
+- **Preserve topology:** configured `[database]` creates one eager admin pool capped by its `max_connections`; every DB-enabled namespace has one guest pool sized by the checked sum of all configured instance contributions; every worker entry has one non-pooled `LISTEN` session. Admin policy is `Fast`, guest policy is clean recycle followed by module checkout setup.
+- **Inspect:** manager DB/migrations/crypto, engine startup manifest/database runtime/pool/migration/provisioning/DB host modules, and namespace tests.
 - **Prove:** DB, namespace, migration, and secrets tests.
 
 - **Preserve:** secret values never appear in manager APIs, logs, generated config, or guest metadata. Guests receive only resolved environment values for explicitly referenced secrets.
@@ -44,8 +45,8 @@ For each change, **preserve** the contract, **inspect** the listed implementatio
 
 ## Workers and schedules
 
-- **Preserve:** job claims use leases and fencing; stale workers cannot complete reclaimed jobs; retries honor attempt/timeout policy; delivery is at least once, so handlers must be idempotent.
-- **Inspect:** engine `worker.rs`, manager `scheduler.rs`, control-plane proto, SDK jobs, and worker client generator.
+- **Preserve:** job claims atomically persist a fence plus fixed `lease_expires_at`; stale completion/failure/recovery transitions require the active fence and clear claim metadata; retries honor attempt/timeout policy; delivery is at least once, so handlers must be idempotent. One recovery coordinator runs per engine after queue migration, remains safe alongside other engines, and progresses independently of module worker loops.
+- **Inspect:** engine database runtime/job migrations/`worker.rs`, manager `scheduler.rs`, control-plane proto, SDK jobs, and worker client generator.
 - **Prove:** worker, scheduler, and schedules tests.
 
 - **Preserve:** a non-empty ad-hoc worker version is claimed exactly; an empty ad-hoc version is name-only; manager schedules remain version-pinned. Canonical job types use `/{package}.{Service}/{Method}`.
@@ -54,8 +55,8 @@ For each change, **preserve** the contract, **inspect** the listed implementatio
 
 ## Migrations and generated contracts
 
-- **Preserve:** manager migrations are embedded control-plane migrations under their advisory-lock policy. Module migrations are trusted guest-owned SQL run with engine admin credentials, use the module schema as their default `search_path`, hold cancellation-safe per-schema serialization locks, and complete before readiness.
-- **Inspect:** `wr-manager/src/migrate.rs`, manager migrations, `wr-engine/src/migration.rs`, guest configs/migrations.
+- **Preserve:** manager migrations are embedded control-plane migrations under their advisory-lock policy. Engine job-queue migrations are embedded, use a distinct detached-session lock/history in `wr__jobs`, and complete before module migrations, workers, recovery, or readiness. Module migrations are trusted guest-owned SQL run with engine admin credentials, use the module schema as their default `search_path`, hold cancellation-safe per-schema serialization locks, and complete before readiness. Duplicate configured instances sharing `(namespace, module)` migrate once and must agree on one canonical migration source.
+- **Inspect:** `wr-manager/src/migrate.rs`, manager migrations, `wr-engine/src/{startup_db,job_migration,migration}.rs`, engine job migrations, and guest configs/migrations.
 - **Prove:** migration and startup/health tests plus affected example.
 
 - **Preserve:** canonical protobuf/WIT sources fan out consistently; generated `OUT_DIR` Rust is never edited; WIT mirrors and checked-in descriptors stay synchronized.

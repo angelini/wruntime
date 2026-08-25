@@ -47,10 +47,27 @@ async fn concurrent_namespace_provisioning_converges() -> Result<()> {
              CREATE SEQUENCE \"{schema_b}\".default_grant_test"
         ))
         .await?;
+    let drop_error = client
+        .batch_execute(&format!("DROP SCHEMA \"{schema_a}\" CASCADE"))
+        .await
+        .expect_err("namespace role must not own its module schema");
+    assert_eq!(
+        drop_error.as_db_error().map(|error| error.code().code()),
+        Some("42501")
+    );
     drop(client);
     drop(guest);
 
     let admin = pool.get().await?;
+    let owner: String = admin
+        .query_one(
+            "SELECT schema_owner FROM information_schema.schemata WHERE schema_name = $1",
+            &[&schema_a],
+        )
+        .await?
+        .get(0);
+    let current_user: String = admin.query_one("SELECT current_user", &[]).await?.get(0);
+    assert_eq!(owner, current_user);
     admin
         .batch_execute(&format!(
             "DROP SCHEMA \"{schema_a}\" CASCADE; \

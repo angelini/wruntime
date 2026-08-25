@@ -71,9 +71,9 @@ Wruntime is a Cargo workspace implementing a distributed WASI Preview 2 runtime:
 
 Modules use `(namespace, name, version)` identity and call `http://namespace.module/{package}.{Service}/{Method}`. The engine intercepts outbound HTTP and supplies internal routing metadata; the proxy resolves a healthy local/peer destination and streams the body; the destination engine dispatches to a module instance.
 
-Engine startup registers unhealthy routes, provisions namespace resources, runs module migrations, resolves secrets, validates capabilities, loads components, sends an immediate readiness heartbeat, then starts periodic heartbeats. Manager migrations and module migrations follow separate policies.
+Engine startup registers unhealthy routes, provisions namespace resources, applies embedded job-queue migrations and unique module-schema migrations, builds namespace pools, starts engine-level recovery when needed, resolves secrets, validates capabilities, loads components, sends an immediate readiness heartbeat, then starts periodic heartbeats. Manager, engine queue, and module migrations follow separate policies.
 
-Manager gRPC and peer-proxy cross-node traffic use mTLS; manager liveness uses chitchat UDP gossip on its separately configured listener. Loopback engine/proxy traffic is plain HTTP only on documented listeners. Source routing metadata is not authorization. Guest DB pools use namespace roles without access to `wr_system`.
+Manager gRPC and peer-proxy cross-node traffic use mTLS; manager liveness uses chitchat UDP gossip on its separately configured listener. Loopback engine/proxy traffic is plain HTTP only on documented listeners. Source routing metadata is not authorization. Guest DB pools use namespace roles without access to `wr__jobs` or `wr_system`; module schemas remain admin-owned.
 
 Host interfaces are canonical under `wit/` and implemented asynchronously in `wr-engine`; guest calls remain synchronous from the guest perspective. Do not use `block_in_place` or `block_on` in host implementations.
 

@@ -480,6 +480,20 @@ impl EngineConfig {
             );
         }
 
+        if let Some(database) = &self.database {
+            v.check(
+                database.max_connections > 0,
+                "database.max_connections must be > 0",
+            );
+            v.check(
+                database.statement_timeout_secs > 0,
+                "database.statement_timeout_secs must be > 0",
+            );
+            v.check(
+                database.idle_in_transaction_timeout_secs > 0,
+                "database.idle_in_transaction_timeout_secs must be > 0",
+            );
+        }
         if let Some(blobstore) = &self.blobstore {
             v.check(
                 !blobstore.allowed_buckets.is_empty(),
@@ -592,6 +606,13 @@ impl EngineConfig {
             }
         }
 
+        if let Err(error) = crate::startup_db::StartupDbManifest::build(self) {
+            v.check(
+                false,
+                format!("invalid database startup manifest: {error:#}"),
+            );
+        }
+
         v.finish()
     }
 }
@@ -600,7 +621,8 @@ impl EngineConfig {
 mod database_telemetry_tests {
     use serde::Deserialize;
 
-    use super::DatabaseConfig;
+    use super::{DatabaseConfig, EngineConfig};
+    use wr_common::config::Validatable as _;
 
     #[derive(Deserialize)]
     struct TestConfig {
@@ -629,5 +651,39 @@ mod database_telemetry_tests {
         )
         .expect("enabled database telemetry config");
         assert!(enabled.database.telemetry.include_query_text);
+    }
+
+    fn engine_with_database(database_fields: &str) -> EngineConfig {
+        toml::from_str(&format!(
+            r#"
+listen_address = "127.0.0.1:9100"
+[node]
+proxy_address = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_address = "https://127.0.0.1:9443"
+[node.tls]
+cert_path = "c.crt"
+key_path = "c.key"
+ca_cert_path = "ca.crt"
+[database]
+url = "postgres://localhost/test"
+{database_fields}
+"#
+        ))
+        .expect("engine config")
+    }
+
+    #[test]
+    fn database_pool_and_timeouts_must_be_positive() {
+        for field in [
+            "max_connections = 0",
+            "statement_timeout_secs = 0",
+            "idle_in_transaction_timeout_secs = 0",
+        ] {
+            let error = engine_with_database(field)
+                .validate()
+                .expect_err("zero database setting must fail");
+            assert!(error.to_string().contains("must be > 0"), "{error:#}");
+        }
     }
 }

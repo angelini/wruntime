@@ -24,15 +24,17 @@ database        = true
 migrations_path = "examples/stockmarket/exchange/migrations"
 
 [[module]]
-name      = "exchange"
-namespace = "stockmarket"
-version   = "1.0.0"
-wasm_path = "examples/stockmarket/exchange/target/wasm32-wasip2/debug/exchange.wasm"
-database  = true
+name            = "exchange"
+namespace       = "stockmarket"
+version         = "1.0.0"
+wasm_path       = "examples/stockmarket/exchange/target/wasm32-wasip2/debug/exchange.wasm"
+database        = true
+migrations_path = "examples/stockmarket/exchange/migrations"
 
 [[module]]
-name      = "exchange"
-namespace = "stockmarket"
-version   = "1.0.0"
-wasm_path = "examples/stockmarket/exchange/target/wasm32-wasip2/debug/exchange.wasm"
-database  = true
+name            = "exchange"
+namespace       = "stockmarket"
+version         = "1.0.0"
+wasm_path       = "examples/stockmarket/exchange/target/wasm32-wasip2/debug/exchange.wasm"
+database        = true
+migrations_path = "examples/stockmarket/exchange/migrations"

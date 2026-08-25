@@ -38,24 +38,31 @@ fn canonical_worker_path(path: &str) -> Option<&'static str> {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WorkerDefaults {
     max_attempts: HashMap<(String, String, String), u32>,
+    timeout_secs: HashMap<(String, String, String), u32>,
 }
 
 impl WorkerDefaults {
     pub(crate) fn from_modules(modules: &[wr_engine::config::ModuleConfig]) -> Self {
         let mut max_attempts = HashMap::new();
+        let mut timeout_secs = HashMap::new();
         for module in modules {
             if module.mode == wr_engine::config::ModuleMode::Worker {
-                max_attempts.insert(
-                    (
-                        module.namespace.clone(),
-                        module.name.clone(),
-                        module.version.clone(),
-                    ),
-                    module.worker_max_attempts,
+                let key = (
+                    module.namespace.clone(),
+                    module.name.clone(),
+                    module.version.clone(),
+                );
+                max_attempts.insert(key.clone(), module.worker_max_attempts);
+                timeout_secs.insert(
+                    key,
+                    u32::try_from(module.worker_job_timeout_secs).unwrap_or(u32::MAX),
                 );
             }
         }
-        Self { max_attempts }
+        Self {
+            max_attempts,
+            timeout_secs,
+        }
     }
 
     fn max_attempts_for(&self, namespace: &str, name: &str, version: &str) -> u32 {
@@ -64,6 +71,14 @@ impl WorkerDefaults {
             .copied()
             .filter(|attempts| *attempts > 0)
             .unwrap_or(3)
+    }
+
+    fn timeout_secs_for(&self, namespace: &str, name: &str, version: &str) -> u32 {
+        self.timeout_secs
+            .get(&(namespace.to_owned(), name.to_owned(), version.to_owned()))
+            .copied()
+            .filter(|timeout| *timeout > 0)
+            .unwrap_or(300)
     }
 }
 
@@ -397,6 +412,11 @@ async fn handle_submit_job(
     } else {
         worker_defaults.max_attempts_for(&req.worker_namespace, &req.worker_name, defaults_version)
     };
+    let timeout_secs = if req.timeout_secs > 0 {
+        req.timeout_secs
+    } else {
+        worker_defaults.timeout_secs_for(&req.worker_namespace, &req.worker_name, defaults_version)
+    };
 
     match wr_engine::worker::insert_job(
         pool,
@@ -405,7 +425,7 @@ async fn handle_submit_job(
         &req.worker_version,
         &req.job_type,
         &req.payload,
-        req.timeout_secs,
+        timeout_secs,
         max_attempts,
         "", // source_namespace (not available on this path)
         "", // source_module (not available on this path)
@@ -486,9 +506,9 @@ mod tests {
         let pool = wr_engine::pool::build_pool(&url, 2).expect("build pool");
         PROVISIONED
             .get_or_init(|| async {
-                wr_engine::worker::provision_job_schema(&pool)
+                wr_engine::job_migration::run_job_migrations(&pool)
                     .await
-                    .expect("provision schema");
+                    .expect("migrate job schema");
             })
             .await;
         Some(Arc::new(pool))
@@ -594,6 +614,10 @@ mod tests {
                 (ns.clone(), "mod".to_string(), "1.0.0".to_string()),
                 7,
             )]),
+            timeout_secs: HashMap::from([(
+                (ns.clone(), "mod".to_string(), "1.0.0".to_string()),
+                47,
+            )]),
         };
         let resp = handle_worker_grpc_bytes(
             SUBMIT_JOB_PATH,
@@ -611,13 +635,14 @@ mod tests {
         let client = pool.get().await.unwrap();
         let row = client
             .query_one(
-                "SELECT worker_version, max_attempts FROM wr__jobs.jobs WHERE job_id = $1",
+                "SELECT worker_version, max_attempts, timeout_secs FROM wr__jobs.jobs WHERE job_id = $1",
                 &[&job_id],
             )
             .await
             .unwrap();
         assert_eq!(row.get::<_, String>(0), "");
         assert_eq!(row.get::<_, i32>(1), 7);
+        assert_eq!(row.get::<_, i32>(2), 47);
     }
 
     #[tokio::test]
@@ -706,6 +731,7 @@ mod tests {
                 (ns.clone(), "mod".to_string(), "1.0.0".to_string()),
                 7,
             )]),
+            ..WorkerDefaults::default()
         };
 
         let resp = handle_worker_grpc_bytes(
