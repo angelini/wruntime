@@ -39,13 +39,15 @@ schema_path = "schemas/inventory_service.binpb"
 # database omitted — no DB access for this module
 ```
 
-Each namespace gets one guest pool. Its maximum size is the sum of `db_max_connections` (or the `[database].max_connections` default) contributed by every DB-enabled module in that namespace. The manager provisions a namespace role, and the pool uses that role while each module retains its own schema-specific `search_path`.
+Each namespace gets one guest pool. Its maximum size is the sum of `db_max_connections` (or the `[database].max_connections` default) contributed by every DB-enabled module in that namespace. The manager generates and stores the namespace credential; the engine uses its target-database admin connection to converge the role, schemas, and grants before readiness. The pool authenticates as that namespace role. A module-specific `search_path` selects the default schema for unqualified SQL but does not prevent fully qualified access to other granted schemas in the same namespace.
 
 ### Transport and resources
 
 The raw WIT interface supports query, execute, streaming query, transactions, and transaction-scoped equivalents. Exact signatures and transport records are owned by [`wit/db.wit`](../wit/db.wit); preferred guest builders and row decoding are documented in the [guest API guide](agents/guest-module-author/api_guide.md#database).
 
-The engine acquires a pool connection inside the module's provisioned namespace role and schema. Transactions retain one connection until commit, rollback, or drop; dropping an active transaction rolls it back. Streaming retains its connection while the row cursor is live. An empty batch is end-of-stream, and dropping a cursor early cancels/releases it. Completed transaction resources reject later use. `[limits].max_db_transactions` and `max_db_cursors` cap live resources; over-cap creation returns `db-error::connection` without weakening capability or namespace enforcement.
+The engine acquires a clean-recycled pool connection under the namespace role, then reapplies the module `search_path` and statement/idle-transaction timeouts on every checkout. Cleanup failure or timeout discards the physical session. Transactions retain one connection until commit, rollback, or drop. At most one transaction cursor may be active; other transaction operations reject until that cursor is drained and protocol synchronization completes. A PostgreSQL statement/stream failure poisons the transaction, so a later `commit` rolls back and returns an error rather than reporting false success. Local parameter conversion and post-execution result conversion do not poison it.
+
+Each `next-batch` accepts `1..=1024`; an empty batch is end-of-stream. Dropping a transaction cursor early drains and synchronizes it before releasing its parent relationship. Completed transaction resources reject later use. Raw guest SQL that issues `BEGIN`, `COMMIT`, or `ROLLBACK` can desynchronize host-owned transaction resources and is unsupported; use the lifecycle methods. `[limits].max_db_transactions` and `max_db_cursors` cap live resources; over-cap creation returns `db-error::connection` without weakening capability or namespace enforcement.
 
 ### Typed values and strict errors
 
@@ -219,6 +221,6 @@ fs          = "tempdir"
 The directory is created fresh on the host for every dispatch and deleted when that dispatch's store is dropped. This applies to both service requests and worker jobs: each gets a new store and therefore a new empty temp directory. It is not shared between module instances or dispatches. Use it only for scratch space or temporary files — do not rely on it for cross-request caching or durable state.
 
 | Value | Effect |
-|-------|--------|
+| --- | --- |
 | `fs = "tempdir"` | Mount an ephemeral temp directory at `/` |
 | *(omitted)* | No filesystem access (default) |

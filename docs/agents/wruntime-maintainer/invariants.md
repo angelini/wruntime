@@ -30,7 +30,7 @@ For each change, **preserve** the contract, **inspect** the listed implementatio
 
 ## Database, secrets, and capabilities
 
-- **Preserve:** manager/admin credentials provision schemas and roles; guest pools use namespace roles; guest roles cannot read `wr_system`; direct database access is limited to documented control-plane and host-capability exceptions.
+- **Preserve:** the manager generates/stores namespace credentials; the engine uses target-database admin credentials to provision roles and schemas; guest pools use clean-recycled namespace-role sessions; `search_path` selects a module default but namespace grants are the authorization boundary; other namespace roles and guest roles cannot access unrelated schemas or `wr_system`; direct database access is limited to documented control-plane and host-capability exceptions.
 - **Inspect:** manager DB/migrations/crypto, engine pool/migration/DB host modules, and namespace tests.
 - **Prove:** DB, namespace, migration, and secrets tests.
 
@@ -54,7 +54,7 @@ For each change, **preserve** the contract, **inspect** the listed implementatio
 
 ## Migrations and generated contracts
 
-- **Preserve:** manager migrations are embedded control-plane migrations under their advisory-lock policy. Module migrations are guest-owned, schema-isolated, serialized across replicas, and complete before readiness.
+- **Preserve:** manager migrations are embedded control-plane migrations under their advisory-lock policy. Module migrations are trusted guest-owned SQL run with engine admin credentials, use the module schema as their default `search_path`, hold cancellation-safe per-schema serialization locks, and complete before readiness.
 - **Inspect:** `wr-manager/src/migrate.rs`, manager migrations, `wr-engine/src/migration.rs`, guest configs/migrations.
 - **Prove:** migration and startup/health tests plus affected example.
 

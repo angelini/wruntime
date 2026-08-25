@@ -32,7 +32,7 @@ guest/example/test .proto
 - `wr-build` emits service `_router` and `_handle` helpers; worker clients are generated only for services whose names end in `WorkerService`.
 - SDK, WIT, build-generator, or host-binding changes require focused `just test-wasm-one <target>` where possible and full `just test-wasm` before completion.
 - Update the guest API guide when preferred usage or guest-visible semantics change. Exact signatures stay in Rust/WIT source.
-- Manager migrations under `wr-manager/migrations/` modify control-plane state. Module migrations belong to a guest, run at engine startup under its namespace role/schema, and use a separate history/locking policy.
+- Manager migrations under `wr-manager/migrations/` modify control-plane state. Module migrations are trusted guest-owned SQL, run at engine startup with target-database admin credentials and the module schema as the default `search_path`, and use a separate history/cancellation-safe locking policy.
 
 ## Review checklist
 

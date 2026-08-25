@@ -182,12 +182,12 @@ interface database {
 
     /// A streaming cursor over query results.
     ///
-    /// Each call to `next-batch` returns up to `max` rows from the underlying
-    /// Postgres row stream.  An empty list signals that all rows have been
-    /// consumed.  Dropping the handle cancels the in-flight query and returns
-    /// the connection to the pool.
+    /// Each call to `next-batch` accepts `max` in `1..=1024` and returns up to
+    /// that many rows from the underlying Postgres row stream.  An empty list
+    /// signals that all rows have been consumed.  Dropping the handle cancels
+    /// the in-flight query and returns the connection to the pool.
     resource row-cursor {
-        /// Pull the next batch of rows.  Returns an empty list when exhausted.
+        /// Pull 1..=1024 rows. Returns an empty list when exhausted.
         next-batch: func(max: u32) -> result<list<row>, db-error>;
     }
 

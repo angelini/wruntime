@@ -124,9 +124,10 @@ impl fmt::Display for DbError {
               Self::Cardinality { expected, actual } => {
                   write!(f, "expected {expected:?} row cardinality, got {actual}")
               }
-Self::InvalidBatchSize(value) => {
-write!(f, "batch size must be greater than zero, got {value}")
-}
+Self::InvalidBatchSize(value) => write!(
+    f,
+    "batch size must be between 1 and {MAX_CURSOR_BATCH_ROWS}, got {value}"
+),
 Self::Field { field, source } => write!(f, "field `{field}`: {source}"),
 }
     }
@@ -286,14 +287,21 @@ impl Oid {
     }
 }
 
+pub const MAX_CURSOR_BATCH_ROWS: u32 = 1_024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BatchSize(std::num::NonZeroU32);
 
 impl BatchSize {
+    /// Creates a cursor batch size in the host-supported range `1..=1024`.
     pub fn new(value: u32) -> Result<Self, DbError> {
-        std::num::NonZeroU32::new(value)
-            .map(Self)
-            .ok_or(DbError::InvalidBatchSize(value))
+        if !(1..=MAX_CURSOR_BATCH_ROWS).contains(&value) {
+            return Err(DbError::InvalidBatchSize(value));
+        }
+        let Some(value) = std::num::NonZeroU32::new(value) else {
+            return Err(DbError::InvalidBatchSize(0));
+        };
+        Ok(Self(value))
     }
 
     pub fn get(self) -> u32 {
@@ -1686,10 +1694,17 @@ mod tests {
         assert!(Time::from_micros(86_400_000_000).is_err());
         assert!(Numeric::parse("not-numeric").is_err());
         assert_eq!(Uuid::from_u128(1), Uuid::from_parts(0, 1));
-        assert!(matches!(
-            BatchSize::new(0),
-            Err(DbError::InvalidBatchSize(0))
-        ));
+        for value in [0, MAX_CURSOR_BATCH_ROWS + 1, u32::MAX] {
+            assert!(matches!(
+                BatchSize::new(value),
+                Err(DbError::InvalidBatchSize(actual)) if actual == value
+            ));
+        }
+        assert_eq!(BatchSize::new(1).unwrap().get(), 1);
+        assert_eq!(
+            BatchSize::new(MAX_CURSOR_BATCH_ROWS).unwrap().get(),
+            MAX_CURSOR_BATCH_ROWS
+        );
     }
 
     #[cfg(feature = "serde")]

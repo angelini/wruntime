@@ -382,9 +382,11 @@ impl proto::DbTestService for Component {
         &self,
         _req: proto::QueryTypesRequest,
     ) -> Result<proto::QueryTypesResponse, ServiceError> {
-        // Create a temp table with various types, insert, query back
-        database::execute(
-            "CREATE TEMP TABLE IF NOT EXISTS type_test (
+        // Keep temp-table setup and use on one host-owned transaction
+        // connection; checkout hygiene intentionally discards temp objects.
+        let tx = database::begin_transaction().map_err(raw_db_error)?;
+        tx.execute(
+            "CREATE TEMP TABLE type_test (
                 b boolean, i2 smallint, i4 integer, i8 bigint,
                 f4 real, f8 double precision, t text, ts timestamptz
             )",
@@ -392,7 +394,7 @@ impl proto::DbTestService for Component {
         )
         .map_err(raw_db_error)?;
 
-        database::execute(
+        tx.execute(
             "INSERT INTO type_test (b, i2, i4, i8, f4, f8, t, ts) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             &[
                 PgValue::Boolean(true),
@@ -407,7 +409,10 @@ impl proto::DbTestService for Component {
         )
         .map_err(raw_db_error)?;
 
-        let rows = database::query("SELECT * FROM type_test LIMIT 1", &[]).map_err(raw_db_error)?;
+        let rows = tx
+            .query("SELECT * FROM type_test LIMIT 1", &[])
+            .map_err(raw_db_error)?;
+        tx.commit().map_err(raw_db_error)?;
 
         let row = rows.first().map(|row| proto::QueryRow {
             columns: row
@@ -549,6 +554,13 @@ impl proto::DbTestService for Component {
                 drop(transaction);
                 result
             })(),
+            "transaction-commit-after-error" => (|| {
+                let transaction = database::begin_transaction()?;
+                if transaction.query(&req.sql, &params).is_err() {
+                    transaction.commit()?;
+                }
+                Ok(())
+            })(),
             "stream" => (|| {
                 let cursor = database::query_stream(&req.sql, &params)?;
                 let result = cursor.next_batch(1).map(|_| ());
@@ -591,6 +603,11 @@ impl proto::DbTestService for Component {
             req.batch_size
         };
         let cursor = database::query_stream(&req.sql, &params).map_err(raw_db_error)?;
+        if cursor.next_batch(1_025).is_ok() {
+            return Err(ServiceError::internal(
+                "oversized raw cursor batch unexpectedly succeeded",
+            ));
+        }
         let mut all_rows = vec![];
         let mut batch_count: u32 = 0;
         loop {

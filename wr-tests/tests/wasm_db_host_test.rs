@@ -454,6 +454,31 @@ async fn wasm_db_error() -> Result<()> {
 }
 
 #[tokio::test]
+async fn wasm_db_aborted_transaction_commit_returns_error() -> Result<()> {
+    if skip_without_db("wasm_db_aborted_transaction_commit_returns_error") {
+        return Ok(());
+    }
+    let Some(harness) = GuestHarness::load(TestGuest::Db).await? else {
+        return Ok(());
+    };
+    let state = db_state_for_module(1, "test-ns", "db-aborted-commit-test").await;
+    let response: proto::ErrorResponse = harness
+        .dispatch_typed(
+            state,
+            RpcPath::new("/Error")?,
+            proto::ErrorRequest {
+                sql: "SELECT 1 / 0".into(),
+                params: vec![],
+                operation: "transaction-commit-after-error".into(),
+            },
+        )
+        .await?;
+    assert_eq!(response.error_kind, "query");
+    assert!(response.error_message.contains("rolled back"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn wasm_db_invalid_param() -> Result<()> {
     if skip_without_db("wasm_db_invalid_param") {
         return Ok(());

@@ -213,6 +213,132 @@ fn db_url() -> Option<String> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn guest_pool_recycling_cleans_or_replaces_sessions() {
+    let Some(url) = db_url() else { return };
+    let admin_pool = crate::pool::build_pool(&url, 2).expect("admin pool");
+    let admin = admin_pool.get().await.expect("admin connection");
+    let role = format!("wr_clean_{}", uuid::Uuid::new_v4().simple());
+    let password = "wr-clean-test-password";
+    admin
+        .batch_execute(&format!(
+            "CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'"
+        ))
+        .await
+        .expect("create guest role");
+
+    let pool = crate::pool::build_guest_pool(&url, &role, password, 1).expect("guest pool");
+    let schema = Some(Arc::<str>::from("public"));
+    let timeouts = crate::state::DbTimeouts {
+        statement_timeout_secs: 7,
+        idle_in_transaction_timeout_secs: 11,
+    };
+    let first = pool.get().await.expect("first checkout");
+    first
+        .batch_execute(
+            "BEGIN; SET application_name = 'dirty'; \
+             CREATE TEMP TABLE wr_open_transaction (value INT)",
+        )
+        .await
+        .expect("dirty transaction");
+    drop(first);
+    let replacement = super::connection::get_prepared_connection(&pool, &schema, &timeouts)
+        .await
+        .expect("checkout after raw transaction");
+    assert!(replacement
+        .query_one(
+            "SELECT to_regclass('pg_temp.wr_open_transaction') IS NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    replacement
+        .batch_execute(
+            "SET application_name = 'dirty'; \
+             LISTEN wr_clean_test; \
+             SELECT pg_advisory_lock(987654321); \
+             CREATE TEMP TABLE wr_clean_temp (value INT); \
+             CREATE TEMP SEQUENCE wr_clean_sequence",
+        )
+        .await
+        .expect("dirty session state");
+    drop(replacement);
+
+    let clean = super::connection::get_prepared_connection(&pool, &schema, &timeouts)
+        .await
+        .expect("clean checkout");
+    assert_eq!(
+        clean
+            .query_one("SHOW application_name", &[])
+            .await
+            .unwrap()
+            .get::<_, &str>(0),
+        ""
+    );
+    assert!(clean
+        .query_one("SELECT pg_try_advisory_lock(987654321)", &[])
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    assert_eq!(
+        clean
+            .query_one("SELECT count(*) FROM pg_listening_channels()", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    assert!(clean
+        .query_one("SELECT to_regclass('pg_temp.wr_clean_temp') IS NULL", &[])
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
+    clean.batch_execute("RESET ALL").await.unwrap();
+    drop(clean);
+
+    let prepared = super::connection::get_prepared_connection(&pool, &schema, &timeouts)
+        .await
+        .expect("prepared checkout");
+    assert_eq!(
+        prepared
+            .query_one("SHOW search_path", &[])
+            .await
+            .unwrap()
+            .get::<_, &str>(0),
+        "public"
+    );
+    assert_eq!(
+        prepared
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .unwrap()
+            .get::<_, &str>(0),
+        "7s"
+    );
+    assert_eq!(
+        prepared
+            .query_one("SHOW idle_in_transaction_session_timeout", &[])
+            .await
+            .unwrap()
+            .get::<_, &str>(0),
+        "11s"
+    );
+    drop(prepared);
+    drop(pool);
+    admin
+        .execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1 AND pid <> pg_backend_pid()",
+            &[&role],
+        )
+        .await
+        .unwrap();
+    admin
+        .batch_execute(&format!("DROP ROLE \"{role}\""))
+        .await
+        .expect("drop guest role");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_query_with_postgres() {
     let url = match db_url() {
         Some(u) => u,
@@ -767,6 +893,138 @@ async fn test_transaction_rollback() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn postgres_error_poisoning_prevents_false_commit_success() {
+    use super::wruntime::db::database::{Host, HostTransaction};
+
+    let Some(url) = db_url() else { return };
+    let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test".into(),
+        proxy_uri(),
+        test_http_pool(),
+        ModuleServices {
+            db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
+            ..Default::default()
+        },
+    )
+    .expect("state");
+    Host::execute(
+        &mut state,
+        "CREATE TEMP TABLE _wr_tx_poison_test (val INT)".into(),
+        vec![],
+    )
+    .await
+    .expect("create table");
+
+    let tx = state.begin_transaction().await.expect("begin");
+    let rep = tx.rep();
+    HostTransaction::execute(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(rep),
+        "INSERT INTO _wr_tx_poison_test VALUES (1)".into(),
+        vec![],
+    )
+    .await
+    .expect("insert");
+    assert!(matches!(
+        HostTransaction::query(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(rep),
+            "SELECT 1 / 0".into(),
+            vec![],
+        )
+        .await,
+        Err(DbError::Query(_))
+    ));
+    let commit =
+        HostTransaction::commit(&mut state, wasmtime::component::Resource::new_borrow(rep)).await;
+    assert!(matches!(commit, Err(DbError::Query(message)) if message.contains("rolled back")));
+    HostTransaction::drop(&mut state, tx).await.expect("drop");
+
+    let rows = Host::query(
+        &mut state,
+        "SELECT val FROM _wr_tx_poison_test".into(),
+        vec![],
+    )
+    .await
+    .expect("query after aborted commit");
+    assert!(rows.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_parameter_and_result_errors_do_not_poison_transactions() {
+    use super::wruntime::db::database::{Host, HostTransaction};
+
+    let Some(url) = db_url() else { return };
+    let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test".into(),
+        proxy_uri(),
+        test_http_pool(),
+        ModuleServices {
+            db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
+            ..Default::default()
+        },
+    )
+    .expect("state");
+    Host::execute(
+        &mut state,
+        "CREATE TEMP TABLE _wr_tx_local_error_test (val INT)".into(),
+        vec![],
+    )
+    .await
+    .expect("create table");
+
+    let tx = state.begin_transaction().await.expect("begin");
+    let rep = tx.rep();
+    assert!(HostTransaction::query(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(rep),
+        "SELECT $1::numeric".into(),
+        vec![PgValue::Numeric("not-a-number".into())],
+    )
+    .await
+    .is_err());
+    assert!(matches!(
+        HostTransaction::query(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(rep),
+            "SELECT '127.0.0.1'::inet".into(),
+            vec![],
+        )
+        .await,
+        Err(DbError::UnsupportedResultType(_))
+    ));
+    HostTransaction::execute(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(rep),
+        "INSERT INTO _wr_tx_local_error_test VALUES (2)".into(),
+        vec![],
+    )
+    .await
+    .expect("valid insert");
+    HostTransaction::commit(&mut state, wasmtime::component::Resource::new_borrow(rep))
+        .await
+        .expect("commit");
+    HostTransaction::drop(&mut state, tx).await.expect("drop");
+    assert_eq!(
+        Host::query(
+            &mut state,
+            "SELECT val FROM _wr_tx_local_error_test".into(),
+            vec![],
+        )
+        .await
+        .unwrap()
+        .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_transaction_implicit_rollback_on_drop() {
     use super::wruntime::db::database::{Host, HostTransaction};
 
@@ -973,6 +1231,65 @@ async fn test_query_stream_in_transaction() {
     .expect("query_stream in tx");
     let cursor_rep = cursor.rep();
 
+    assert!(matches!(
+        HostRowCursor::next_batch(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(cursor_rep),
+            super::cursor::MAX_CURSOR_BATCH_ROWS + 1,
+        )
+        .await,
+        Err(DbError::Query(_))
+    ));
+    assert!(matches!(
+        HostTransaction::query(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(tx_rep),
+            "SELECT 1".into(),
+            vec![],
+        )
+        .await,
+        Err(DbError::Query(_))
+    ));
+    assert!(matches!(
+        HostTransaction::execute(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(tx_rep),
+            "SELECT 1".into(),
+            vec![],
+        )
+        .await,
+        Err(DbError::Query(_))
+    ));
+    assert!(HostTransaction::query_stream(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(tx_rep),
+        "SELECT 1".into(),
+        vec![],
+    )
+    .await
+    .is_err());
+    assert!(matches!(
+        HostTransaction::commit(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(tx_rep),
+        )
+        .await,
+        Err(DbError::Query(_))
+    ));
+    assert!(matches!(
+        HostTransaction::rollback(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(tx_rep),
+        )
+        .await,
+        Err(DbError::Query(_))
+    ));
+    assert!(
+        HostTransaction::drop(&mut state, wasmtime::component::Resource::new_own(tx_rep),)
+            .await
+            .is_err()
+    );
+
     let batch = HostRowCursor::next_batch(
         &mut state,
         wasmtime::component::Resource::new_borrow(cursor_rep),
@@ -1005,6 +1322,60 @@ async fn test_query_stream_in_transaction() {
     HostTransaction::drop(&mut state, tx)
         .await
         .expect("drop tx");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transaction_stream_server_error_poisoning_releases_cursor_ordering() {
+    use super::wruntime::db::database::{Host, HostTransaction};
+
+    let Some(url) = db_url() else { return };
+    let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
+    let mut state = ModuleState::new(
+        "test".into(),
+        "test".into(),
+        proxy_uri(),
+        test_http_pool(),
+        ModuleServices {
+            db_pool: Some(Arc::new(pool)),
+            db_schema: Some(Arc::from("public")),
+            ..Default::default()
+        },
+    )
+    .expect("state");
+    let tx = state.begin_transaction().await.expect("begin");
+    let tx_rep = tx.rep();
+    let cursor = HostTransaction::query_stream(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(tx_rep),
+        "SELECT 1 / (n - 2) FROM generate_series(1, 3) AS n".into(),
+        vec![],
+    )
+    .await
+    .expect("open stream");
+    let cursor_rep = cursor.rep();
+    assert!(matches!(
+        HostRowCursor::next_batch(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(cursor_rep),
+            10,
+        )
+        .await,
+        Err(DbError::Query(_))
+    ));
+    HostRowCursor::drop(&mut state, cursor)
+        .await
+        .expect("drop synchronized cursor");
+    assert!(matches!(
+        HostTransaction::commit(
+            &mut state,
+            wasmtime::component::Resource::new_borrow(tx_rep),
+        )
+        .await,
+        Err(DbError::Query(message)) if message.contains("rolled back")
+    ));
+    HostTransaction::drop(&mut state, tx)
+        .await
+        .expect("drop transaction");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1,7 +1,44 @@
-use deadpool_postgres::{Config, Pool, PoolConfig, Runtime};
+use std::time::Duration;
+
+use deadpool_postgres::{
+    Config, ManagerConfig, Pool, PoolConfig, RecyclingMethod, Runtime, Timeouts,
+};
+
+const GUEST_RECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
+const GUEST_RECYCLE_SQL: &str = "SET client_min_messages = error; ROLLBACK; CLOSE ALL; \
+SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; \
+SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES;";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PoolPolicy {
+    Admin,
+    Guest,
+}
+
+fn manager_config(policy: PoolPolicy) -> ManagerConfig {
+    ManagerConfig {
+        recycling_method: match policy {
+            PoolPolicy::Admin => RecyclingMethod::Fast,
+            // Deadpool's built-in Clean sequence does not end a raw open
+            // transaction, so prepend ROLLBACK and retain the same cleanup.
+            PoolPolicy::Guest => RecyclingMethod::Custom(GUEST_RECYCLE_SQL.into()),
+        },
+    }
+}
+
+fn pool_config(max_size: usize, policy: PoolPolicy) -> PoolConfig {
+    PoolConfig {
+        max_size,
+        timeouts: Timeouts {
+            recycle: (policy == PoolPolicy::Guest).then_some(GUEST_RECYCLE_TIMEOUT),
+            ..Timeouts::default()
+        },
+        ..PoolConfig::default()
+    }
+}
 
 pub fn build_pool(database_url: &str, max_size: usize) -> anyhow::Result<Pool> {
-    build_pool_with_options(database_url, max_size, None)
+    build_pool_with_options(database_url, max_size, None, PoolPolicy::Admin)
 }
 
 /// Build a pool that sets `search_path` on every connection via libpq options.
@@ -14,6 +51,7 @@ pub fn build_pool_with_search_path(
         database_url,
         max_size,
         Some(format!("-c search_path={search_path}")),
+        PoolPolicy::Admin,
     )
 }
 
@@ -21,14 +59,13 @@ fn build_pool_with_options(
     database_url: &str,
     max_size: usize,
     options: Option<String>,
+    policy: PoolPolicy,
 ) -> anyhow::Result<Pool> {
     let mut cfg = Config::new();
     cfg.url = Some(database_url.to_string());
     cfg.options = options;
-    cfg.pool = Some(PoolConfig {
-        max_size,
-        ..Default::default()
-    });
+    cfg.manager = Some(manager_config(policy));
+    cfg.pool = Some(pool_config(max_size, policy));
     cfg.create_pool(Some(Runtime::Tokio1), tokio_postgres::NoTls)
         .map_err(Into::into)
 }
@@ -82,7 +119,7 @@ pub fn build_guest_pool(
     max_size: usize,
 ) -> anyhow::Result<Pool> {
     let url = guest_pool_url(admin_url, role, password);
-    build_pool(&url, max_size)
+    build_pool_with_options(&url, max_size, None, PoolPolicy::Guest)
 }
 
 /// Format a `tokio_postgres::Error` with its full source chain.
@@ -105,7 +142,28 @@ pub fn pg_error_string(e: &tokio_postgres::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{guest_pool_url, redact_database_url};
+    use std::time::Duration;
+
+    use deadpool_postgres::RecyclingMethod;
+
+    use super::{guest_pool_url, manager_config, pool_config, redact_database_url, PoolPolicy};
+
+    #[test]
+    fn pool_policies_are_explicit() {
+        assert_eq!(
+            manager_config(PoolPolicy::Admin).recycling_method,
+            RecyclingMethod::Fast
+        );
+        assert_eq!(
+            manager_config(PoolPolicy::Guest).recycling_method.query(),
+            Some(super::GUEST_RECYCLE_SQL)
+        );
+        assert_eq!(pool_config(7, PoolPolicy::Admin).timeouts.recycle, None);
+        assert_eq!(
+            pool_config(7, PoolPolicy::Guest).timeouts.recycle,
+            Some(Duration::from_secs(5))
+        );
+    }
 
     #[test]
     fn test_redact_database_url_with_password() {

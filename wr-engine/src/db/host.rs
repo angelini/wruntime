@@ -10,47 +10,68 @@ use super::telemetry::DbOperation;
 use super::wruntime::db::database::{DbError, Host, PgValue, Row};
 use crate::state::{ModuleState, ResourceKind};
 
+pub(crate) enum HostDbError {
+    Parameter(DbError),
+    Postgres(DbError),
+    Result(DbError),
+}
+
+impl HostDbError {
+    pub(crate) fn into_public(self) -> DbError {
+        match self {
+            Self::Parameter(error) | Self::Postgres(error) | Self::Result(error) => error,
+        }
+    }
+
+    pub(crate) fn is_postgres(&self) -> bool {
+        matches!(self, Self::Postgres(_))
+    }
+}
+
 pub(crate) async fn query_rows(
     client: &deadpool_postgres::Object,
     sql: &str,
     params: Vec<PgValue>,
-) -> Result<Vec<Row>, DbError> {
-    let pg_params = prepare_params(params)?;
+) -> Result<Vec<Row>, HostDbError> {
+    let pg_params = prepare_params(params).map_err(HostDbError::Parameter)?;
     let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         pg_params.iter().map(|p| p as _).collect();
     let rows = client
         .query(sql, &params_ref)
         .await
-        .map_err(|e| DbError::Query(pg_error_string(&e)))?;
-    rows.iter().map(pg_row_to_wit).collect()
+        .map_err(|e| HostDbError::Postgres(DbError::Query(pg_error_string(&e))))?;
+    rows.iter()
+        .map(pg_row_to_wit)
+        .collect::<Result<_, _>>()
+        .map_err(HostDbError::Result)
 }
 
 pub(crate) async fn execute_statement(
     client: &deadpool_postgres::Object,
     sql: &str,
     params: Vec<PgValue>,
-) -> Result<u64, DbError> {
-    let pg_params = prepare_params(params)?;
+) -> Result<u64, HostDbError> {
+    let pg_params = prepare_params(params).map_err(HostDbError::Parameter)?;
     let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         pg_params.iter().map(|p| p as _).collect();
     client
         .execute(sql, &params_ref)
         .await
-        .map_err(|e| DbError::Query(pg_error_string(&e)))
+        .map_err(|e| HostDbError::Postgres(DbError::Query(pg_error_string(&e))))
 }
 
 pub(crate) async fn open_row_stream(
     client: &deadpool_postgres::Object,
     sql: &str,
     params: Vec<PgValue>,
-) -> Result<tokio_postgres::RowStream, DbError> {
-    let pg_params = prepare_params(params)?;
+) -> Result<tokio_postgres::RowStream, HostDbError> {
+    let pg_params = prepare_params(params).map_err(HostDbError::Parameter)?;
     let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         pg_params.iter().map(|p| p as _).collect();
     client
         .query_raw(sql, params_ref)
         .await
-        .map_err(|e| DbError::Query(pg_error_string(&e)))
+        .map_err(|e| HostDbError::Postgres(DbError::Query(pg_error_string(&e))))
 }
 
 impl Host for ModuleState {
@@ -67,7 +88,9 @@ impl Host for ModuleState {
             let result = async {
                 let (pool, schema, timeouts) = prepared?;
                 let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
-                query_rows(&client, sql.as_str(), params).await
+                query_rows(&client, sql.as_str(), params)
+                    .await
+                    .map_err(HostDbError::into_public)
             }
             .await;
             telemetry.finish_result(&result, |rows| rows.len() as u64);
@@ -88,7 +111,9 @@ impl Host for ModuleState {
             let result = async {
                 let (pool, schema, timeouts) = prepared?;
                 let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
-                execute_statement(&client, sql.as_str(), params).await
+                execute_statement(&client, sql.as_str(), params)
+                    .await
+                    .map_err(HostDbError::into_public)
             }
             .await;
             telemetry.finish_result(&result, |affected| *affected);
@@ -132,14 +157,17 @@ impl Host for ModuleState {
         let stream = match open_row_stream(&client, sql.as_str(), params).await {
             Ok(stream) => stream,
             Err(error) => {
+                let error = error.into_public();
                 telemetry.finish_error(&error);
                 return Err(error);
             }
         };
         self.table()
             .push(CursorState {
-                stream: Box::pin(stream),
-                _conn: Some(client),
+                stream: Some(Box::pin(stream)),
+                conn: Some(client),
+                parent: None,
+                lifecycle: None,
                 done: false,
                 telemetry,
                 _count: guard,
@@ -168,8 +196,8 @@ impl Host for ModuleState {
             .map_err(|error| DbError::Query(pg_error_string(&error)))?;
         self.table()
             .push(TxState {
-                client,
-                done: false,
+                client: Some(client),
+                lifecycle: super::bindings::TxLifecycle::new(),
                 _count: guard,
             })
             .map_err(|error| DbError::Connection(error.to_string()))

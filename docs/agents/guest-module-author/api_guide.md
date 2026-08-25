@@ -3,7 +3,7 @@
 This is a discovery and semantic guide, not an exhaustive signature reference. Use these authorities for exact APIs:
 
 | Need | Exact source |
-|---|---|
+| --- | --- |
 | Guest SDK APIs | [`wr-sdk/src/*.rs`](../../../wr-sdk/src/) |
 | Generated clients/routers | [`wr-build/src/lib.rs`](../../../wr-build/src/lib.rs) |
 | Host ABI | root [`wit/*.wit`](../../../wit/) |
@@ -14,7 +14,7 @@ This is a discovery and semantic guide, not an exhaustive signature reference. U
 ## Task-to-API map
 
 | Task | Prefer | Raw escape hatch |
-|---|---|---|
+| --- | --- | --- |
 | Serve protobuf RPCs | generated service trait and `_handle` | generated `_router` plus `wr_sdk::io` |
 | Call a module RPC | generated `{Service}Client` | typed `wr_sdk::http` request |
 | Submit/query worker jobs | generated `*WorkerServiceClient` | `wr_sdk::jobs` |
@@ -72,7 +72,9 @@ let item = query_as::<Item>("SELECT id, name FROM items WHERE id = $1")
 
 `query`, `query_as`, and `query_scalar` provide `execute`, `fetch_first`, `fetch_optional`, `fetch_exactly_one`, `fetch_all`, and `stream` terminals; transactions expose the same builders. `fetch_optional` rejects more than one row, `fetch_exactly_one` rejects zero or multiple rows, and `fetch_first` rejects zero rows. A `Row` owns its data: `get("name")` rejects missing or duplicate names and `get_at(0)` rejects a missing index. Type mismatches and a SQL `NULL` decoded into a non-`Option<T>` are errors with column, expected-type, and actual/null-type context. Use `Option<T>` for nullable values, `Json<T>` (with the `wr-sdk` `serde` feature) for JSONB serde conversion, and `#[derive(FromRow)]` with `#[wr_db(rename = "...")]` or `#[wr_db(flatten)]` for named rows; decoding never supplies `Default` fallbacks.
 
-Parameters implement `EncodePg`; ambiguous integers and heterogeneous arrays are rejected, and raw SQL nulls carry a `PgType`. `BatchSize::new` rejects zero. A stream is a synchronous iterator of `Result<T, DbError>`; reaching an empty batch ends it, a decode/host error terminates it, and dropping it early releases the host cursor. Transactions roll back on drop unless consumed by `commit` or `rollback`. Put schema DDL in module migrations, not request handlers. Exact types and signatures remain in [`wr-sdk/src/db.rs`](../../../wr-sdk/src/db.rs) and [`wit/db.wit`](../../../wit/db.wit).
+Parameters implement `EncodePg`; ambiguous integers and heterogeneous arrays are rejected, and raw SQL nulls carry a `PgType`. `BatchSize::new` accepts `1..=1024`. A stream is a synchronous iterator of `Result<T, DbError>`; reaching an empty batch ends it, a decode/host error terminates it, and dropping it early releases the host cursor. A transaction permits only one active stream and rejects other operations until that stream drains. Transactions roll back on drop unless consumed by `commit` or `rollback`; a PostgreSQL error aborts the transaction and makes `commit` return an error after rollback. Do not issue raw transaction-control SQL through query builders.
+
+Database authorization is per namespace, not per module. The module `search_path` selects the default schema for unqualified SQL, while fully qualified access to another DB-enabled module schema in the same namespace is permitted by the namespace role. Cross-namespace access and access to `wr_system` remain denied. Put schema DDL in versioned module migrations, not request handlers, and treat migration files as trusted admin-executed input rather than a schema sandbox. Exact types and signatures remain in [`wr-sdk/src/db.rs`](../../../wr-sdk/src/db.rs) and [`wit/db.wit`](../../../wit/db.wit).
 
 ## Blobstore
 

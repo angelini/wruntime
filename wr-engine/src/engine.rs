@@ -132,91 +132,46 @@ impl EngineRunner {
         Ok(())
     }
 
-    /// For every DB-enabled module, ensure its Postgres schema and per-namespace
-    /// role exist. Creates roles, schemas, and grants access.
-    /// Idempotent — safe to run on every startup.
+    /// Converge target-database roles, schemas, and grants for DB-enabled modules.
+    /// Idempotent and safe across concurrent engine startup.
     pub async fn provision_schemas(
         &self,
         credentials: &[wr_common::wruntime::NamespaceDbCredential],
     ) -> Result<()> {
+        use std::collections::{BTreeMap, BTreeSet};
+
         let pool = match &self.db_pool {
-            Some(p) => p,
+            Some(pool) => pool,
             None => return Ok(()),
         };
-
-        let client = pool
-            .get()
-            .await
-            .context("failed to get DB connection for schema provisioning")?;
-
-        // Create per-namespace roles
-        for cred in credentials {
-            client
-                .batch_execute(&format!(
-                    "DO $$ BEGIN \
-                       IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') THEN \
-                         CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'; \
-                       END IF; \
-                     END $$; \
-                     ALTER ROLE \"{role}\" PASSWORD '{password}';",
-                    role = cred.role,
-                    password = cred.password,
-                ))
-                .await
-                .with_context(|| format!("failed to provision role '{}'", cred.role))?;
-            info!(role = %cred.role, namespace = %cred.namespace, "db role provisioned");
-        }
-
-        // Build a lookup from namespace → role for grant statements
-        let ns_roles: HashMap<&str, &str> = credentials
+        let credentials: HashMap<_, _> = credentials
             .iter()
-            .map(|c| (c.namespace.as_str(), c.role.as_str()))
+            .map(|credential| (credential.namespace.as_str(), credential))
             .collect();
-
-        for module in &self.config.modules {
-            if !module.database {
-                continue;
-            }
-            let schema = module_schema(&module.namespace, &module.name);
-            let result = client
-                .execute(
-                    &format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""),
-                    &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)],
-                )
-                .await;
-            match result {
-                Ok(_) => {}
-                Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_SCHEMA) => {
-                    // Race condition: another engine instance created the schema concurrently.
-                }
-                Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("failed to provision schema '{schema}'"));
-                }
-            }
-
-            // Grant the namespace role full access to this module's schema
-            if let Some(role) = ns_roles.get(module.namespace.as_str()) {
-                client
-                    .batch_execute(&format!(
-                        "GRANT ALL ON SCHEMA \"{schema}\" TO \"{role}\"; \
-                         GRANT ALL ON ALL TABLES IN SCHEMA \"{schema}\" TO \"{role}\"; \
-                         GRANT ALL ON ALL SEQUENCES IN SCHEMA \"{schema}\" TO \"{role}\"; \
-                         GRANT ALL ON ALL FUNCTIONS IN SCHEMA \"{schema}\" TO \"{role}\"; \
-                         ALTER DEFAULT PRIVILEGES IN SCHEMA \"{schema}\" GRANT ALL ON TABLES TO \"{role}\"; \
-                         ALTER DEFAULT PRIVILEGES IN SCHEMA \"{schema}\" GRANT ALL ON SEQUENCES TO \"{role}\"; \
-                         ALTER DEFAULT PRIVILEGES IN SCHEMA \"{schema}\" GRANT ALL ON FUNCTIONS TO \"{role}\";"
-                    ))
-                    .await
-                    .with_context(|| {
-                        format!("failed to grant schema '{schema}' access to role '{role}'")
-                    })?;
-            }
-
-            info!(schema, "schema provisioned");
+        let mut schemas: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        for module in self.config.modules.iter().filter(|module| module.database) {
+            schemas
+                .entry(module.namespace.as_str())
+                .or_default()
+                .insert(module_schema(&module.namespace, &module.name));
         }
 
-        Ok(())
+        let specifications = schemas
+            .into_iter()
+            .map(|(namespace, schemas)| {
+                let credential = credentials.get(namespace).ok_or_else(|| {
+                    anyhow::anyhow!("manager omitted database credentials for a namespace")
+                })?;
+                Ok(wr_engine::provisioning::NamespaceProvisioning {
+                    namespace: namespace.to_string(),
+                    role: credential.role.clone(),
+                    password: credential.password.clone(),
+                    schemas: schemas.into_iter().collect(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        wr_engine::provisioning::provision_namespaces(pool, &specifications).await
     }
 
     /// Run database migrations for every module that declares a `migrations_path`.

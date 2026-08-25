@@ -49,6 +49,8 @@ A **node** groups one `wr-proxy` with one or more `wr-engine` instances. `[node]
 
 At component load, the engine inspects top-level WIT imports and rejects modules that import the DB, blobstore, or LLM host interfaces without enabling the corresponding module capability. Runtime DB capability construction also requires a coherent pool+schema pair. Host-side missing-capability and input validation remain defense in depth for raw generated bindings.
 
+Database authorization is per namespace. The manager generates and stores a namespace credential during registration; the engine uses its target-database admin connection to converge that role, module schemas, and grants before readiness. Guest pools authenticate as the namespace role. A module-specific `search_path` selects the default schema for unqualified SQL, but the role can use fully qualified names for every module schema granted to its namespace. Other namespace roles and every guest role remain denied access to unrelated schemas and `wr_system`.
+
 ## Manager clustering (active-active)
 
 Multiple `wr-manager` instances can run simultaneously for high availability. All managers share the same Postgres database — concurrent writes are serialized via `SELECT ... FOR UPDATE NOWAIT` on a lock sentinel row. Each manager:

@@ -30,7 +30,8 @@ Read these rules before writing a guest. Exact APIs live in Rust/WIT source; see
 
 - Put schema changes in versioned module migrations. Do not use `CREATE TABLE IF NOT EXISTS` in guest handlers.
 - Database inputs are converted strictly. Prefer typed SDK wrappers and row extraction.
-- Dropping an uncommitted transaction rolls it back. Dropping a cursor cancels it and releases its connection.
+- Dropping an uncommitted transaction rolls it back. A transaction permits one active cursor; other operations reject until it drains. Cursor batches are limited to 1,024 rows. Do not issue raw transaction-control SQL through query builders.
+- Database authorization is per namespace. `search_path` selects a module's default schema but does not block fully qualified access to another granted schema in that namespace. Cross-namespace and `wr_system` access remain denied.
 - Spans, DB resources, and LLM streams consume per-request host resource slots until dropped. Drop them promptly.
 - Blobstore object/list limits and HTTP body limits are enforced by the host.
 - LLM stream order is text deltas, one usage, one stop, then `None`. Tool-enabled streaming is rejected before an upstream request; use non-streaming completion for tools.
@@ -45,7 +46,7 @@ Read these rules before writing a guest. Exact APIs live in Rust/WIT source; see
 ## Frequent failures
 
 | Symptom | Likely cause | Fix |
-|---|---|---|
+| --- | --- | --- |
 | No usable `.wasm` | Missing `cdylib` or wrong target | Apply the template manifest and build for `wasm32-wasip2` |
 | Component import/package error | Missing local bindings block or `wit/deps` | Generate the local world and link SDK WIT dependencies |
 | Engine rejects module before ready | Capability import/config mismatch or unresolved secret | Align WIT imports, module flags, engine provider config, and namespace secrets |

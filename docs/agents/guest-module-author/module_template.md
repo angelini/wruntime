@@ -246,7 +246,7 @@ The referenced secret must exist under the module namespace. The guest reads onl
 
 ## Migrations
 
-Use refinery names such as `V1__create_tables.sql`. Migrations run on the host under the module schema/namespace role before readiness and are serialized across replicas. Do not issue schema DDL in request or worker handlers.
+Use refinery names such as `V1__create_tables.sql`. Migrations run with engine target-database admin credentials and the module schema as the default `search_path`; they complete before readiness and are serialized across replicas. Migration files are trusted input, not a PostgreSQL authorization sandbox. Do not issue schema DDL in request or worker handlers.
 
 ## Build and validation
 

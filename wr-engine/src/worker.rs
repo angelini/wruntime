@@ -40,8 +40,11 @@ CREATE TABLE IF NOT EXISTS wr__jobs.jobs (
     completed_at      TIMESTAMPTZ,
     claimed_by        TEXT,
     source_namespace  TEXT        NOT NULL DEFAULT '',
-    source_module     TEXT        NOT NULL DEFAULT ''
+    source_module     TEXT        NOT NULL DEFAULT '',
+    claim_id          UUID
 );
+
+ALTER TABLE wr__jobs.jobs ADD COLUMN IF NOT EXISTS claim_id UUID;
 
 DROP INDEX IF EXISTS wr__jobs.idx_jobs_pending;
 CREATE INDEX IF NOT EXISTS idx_jobs_pending
@@ -192,6 +195,23 @@ pub struct ClaimedJob {
     pub job_id: String,
     pub job_type: String,
     pub payload: Vec<u8>,
+    pub claim_id: uuid::Uuid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Finalization {
+    Applied,
+    Stale,
+}
+
+impl Finalization {
+    fn from_affected_rows(rows: u64) -> Self {
+        if rows == 1 {
+            Self::Applied
+        } else {
+            Self::Stale
+        }
+    }
 }
 
 /// Claim one pending job for the given worker module.
@@ -204,10 +224,11 @@ pub async fn claim_job(
     engine_id: &str,
 ) -> anyhow::Result<Option<ClaimedJob>> {
     let client = pool.get().await?;
+    let claim_id = uuid::Uuid::new_v4();
     let row = client
         .query_opt(
             "UPDATE wr__jobs.jobs SET status = 'running', claimed_at = now(), \
-             claimed_by = $4, attempt = attempt + 1, updated_at = now() \
+             claimed_by = $4, attempt = attempt + 1, claim_id = $5, updated_at = now() \
              WHERE job_id = ( \
                SELECT job_id FROM wr__jobs.jobs \
                WHERE worker_namespace = $1 \
@@ -215,8 +236,8 @@ pub async fn claim_job(
                   AND (worker_version = $3 OR worker_version = '') \
                   AND status = 'pending' \
                ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED \
-             ) RETURNING job_id, job_type, payload",
-            &[&namespace, &name, &version, &engine_id],
+             ) RETURNING job_id, job_type, payload, claim_id",
+            &[&namespace, &name, &version, &engine_id, &claim_id],
         )
         .await?;
 
@@ -224,39 +245,51 @@ pub async fn claim_job(
         job_id: r.get(0),
         job_type: r.get(1),
         payload: r.get::<_, Vec<u8>>(2),
+        claim_id: r.get(3),
     }))
 }
 
-/// Mark a job as complete with a result.
-pub async fn complete_job(pool: &Pool, job_id: &str, result: &[u8]) -> anyhow::Result<()> {
+/// Mark a job as complete with a result if this is still its active claim.
+pub async fn complete_job(
+    pool: &Pool,
+    job_id: &str,
+    claim_id: uuid::Uuid,
+    result: &[u8],
+) -> anyhow::Result<Finalization> {
     let client = pool.get().await?;
-    client
+    let rows = client
         .execute(
-            "UPDATE wr__jobs.jobs SET status = 'complete', result = $2, \
-             completed_at = now(), updated_at = now() WHERE job_id = $1",
-            &[&job_id, &result],
+            "UPDATE wr__jobs.jobs SET status = 'complete', result = $3, claim_id = NULL, \
+             completed_at = now(), updated_at = now() \
+             WHERE job_id = $1 AND status = 'running' AND claim_id = $2",
+            &[&job_id, &claim_id, &result],
         )
         .await?;
-    Ok(())
+    Ok(Finalization::from_affected_rows(rows))
 }
 
-/// Mark a job as failed. If retries remain, reset to pending; otherwise mark dead.
-pub async fn fail_job(pool: &Pool, job_id: &str, error_msg: &str) -> anyhow::Result<()> {
+/// Mark a job as failed if this is still its active claim.
+pub async fn fail_job(
+    pool: &Pool,
+    job_id: &str,
+    claim_id: uuid::Uuid,
+    error_msg: &str,
+) -> anyhow::Result<Finalization> {
     let client = pool.get().await?;
-    // Check if we can retry.
-    client
+    let rows = client
         .execute(
             "UPDATE wr__jobs.jobs SET \
                status = CASE WHEN attempt < max_attempts THEN 'pending' ELSE 'dead' END, \
-               error_message = $2, \
+               error_message = $3, \
                claimed_at = NULL, \
                claimed_by = NULL, \
+               claim_id = NULL, \
                updated_at = now() \
-             WHERE job_id = $1",
-            &[&job_id, &error_msg],
+             WHERE job_id = $1 AND status = 'running' AND claim_id = $2",
+            &[&job_id, &claim_id, &error_msg],
         )
         .await?;
-    Ok(())
+    Ok(Finalization::from_affected_rows(rows))
 }
 
 /// Reset jobs that have been running longer than their timeout.
@@ -269,6 +302,7 @@ pub async fn recover_stale_jobs(pool: &Pool) -> anyhow::Result<u64> {
                error_message = COALESCE(error_message, '') || ' [stale recovery]', \
                claimed_at = NULL, \
                claimed_by = NULL, \
+               claim_id = NULL, \
                updated_at = now() \
              WHERE status = 'running' \
                AND claimed_at < now() - (timeout_secs || ' seconds')::interval",
@@ -447,10 +481,19 @@ async fn listen_loop(
     anyhow::bail!("LISTEN connection closed")
 }
 
+async fn finalize_failure(pool: &Pool, job_id: &str, claim_id: uuid::Uuid, message: &str) {
+    match fail_job(pool, job_id, claim_id, message).await {
+        Ok(Finalization::Applied) => {}
+        Ok(Finalization::Stale) => warn!(job_id, "ignored stale job failure"),
+        Err(error) => error!(job_id, %error, "failed to mark job failed"),
+    }
+}
+
 /// Dispatch a single claimed job: build an HTTP request, send it through the
 /// module channel, wait for the response, and update job status accordingly.
 async fn dispatch_job(pool: &Pool, tx: &ModuleTx, job: ClaimedJob, job_timeout: Duration) {
     let job_id = job.job_id.clone();
+    let claim_id = job.claim_id;
 
     // Build HTTP request: POST /{job_type} with payload body.
     let request = match http::Request::builder()
@@ -465,7 +508,7 @@ async fn dispatch_job(pool: &Pool, tx: &ModuleTx, job: ClaimedJob, job_timeout: 
         Err(e) => {
             let msg = format!("build request: {e}");
             warn!(job_id = %job_id, error = %msg, "failed to build job request");
-            let _ = fail_job(pool, &job_id, &msg).await;
+            finalize_failure(pool, &job_id, claim_id, &msg).await;
             return;
         }
     };
@@ -481,7 +524,7 @@ async fn dispatch_job(pool: &Pool, tx: &ModuleTx, job: ClaimedJob, job_timeout: 
     if tx.send(inbound).await.is_err() {
         let msg = "module channel closed";
         warn!(job_id = %job_id, msg);
-        let _ = fail_job(pool, &job_id, msg).await;
+        finalize_failure(pool, &job_id, claim_id, msg).await;
         return;
     }
 
@@ -489,8 +532,10 @@ async fn dispatch_job(pool: &Pool, tx: &ModuleTx, job: ClaimedJob, job_timeout: 
     match tokio::time::timeout(job_timeout, resp_rx).await {
         Ok(Ok(resp)) if resp.status().is_success() => {
             let body = resp.into_body();
-            if let Err(e) = complete_job(pool, &job_id, body.as_ref()).await {
-                error!(job_id = %job_id, error = %e, "failed to mark job complete");
+            match complete_job(pool, &job_id, claim_id, body.as_ref()).await {
+                Ok(Finalization::Applied) => {}
+                Ok(Finalization::Stale) => warn!(job_id = %job_id, "ignored stale job completion"),
+                Err(e) => error!(job_id = %job_id, error = %e, "failed to mark job complete"),
             }
         }
         Ok(Ok(resp)) => {
@@ -498,17 +543,17 @@ async fn dispatch_job(pool: &Pool, tx: &ModuleTx, job: ClaimedJob, job_timeout: 
             let body = String::from_utf8_lossy(resp.body().as_ref()).to_string();
             let msg = format!("HTTP {status}: {body}");
             warn!(job_id = %job_id, status, "job failed");
-            let _ = fail_job(pool, &job_id, &msg).await;
+            finalize_failure(pool, &job_id, claim_id, &msg).await;
         }
         Ok(Err(_)) => {
             let msg = "module dropped response";
             warn!(job_id = %job_id, msg);
-            let _ = fail_job(pool, &job_id, msg).await;
+            finalize_failure(pool, &job_id, claim_id, msg).await;
         }
         Err(_) => {
             let msg = format!("job timed out after {}s", job_timeout.as_secs());
             warn!(job_id = %job_id, %msg);
-            let _ = fail_job(pool, &job_id, &msg).await;
+            finalize_failure(pool, &job_id, claim_id, &msg).await;
         }
     }
 }
@@ -862,11 +907,17 @@ mod tests {
         let id = insert_job(&pool, &p, "mod", "1.0.0", "/test", b"", 60, 3, "", "")
             .await
             .unwrap();
-        let _ = claim_job(&pool, &p, "mod", "1.0.0", "engine-1").await;
-
-        complete_job(&pool, &id, b"result-data")
+        let claim = claim_job(&pool, &p, "mod", "1.0.0", "engine-1")
             .await
-            .expect("complete");
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            complete_job(&pool, &id, claim.claim_id, b"result-data")
+                .await
+                .expect("complete"),
+            Finalization::Applied
+        );
         let status = get_job_status(&pool, &id).await.unwrap().unwrap();
         assert_eq!(status.status, "complete");
         assert_eq!(status.result, b"result-data");
@@ -879,9 +930,17 @@ mod tests {
         let id = insert_job(&pool, &p, "mod", "1.0.0", "/test", b"", 60, 3, "", "")
             .await
             .unwrap();
-        let _ = claim_job(&pool, &p, "mod", "1.0.0", "engine-1").await;
+        let claim = claim_job(&pool, &p, "mod", "1.0.0", "engine-1")
+            .await
+            .unwrap()
+            .unwrap();
 
-        fail_job(&pool, &id, "oops").await.expect("fail");
+        assert_eq!(
+            fail_job(&pool, &id, claim.claim_id, "oops")
+                .await
+                .expect("fail"),
+            Finalization::Applied
+        );
         let status = get_job_status(&pool, &id).await.unwrap().unwrap();
         assert_eq!(status.status, "pending");
         assert_eq!(status.error_message, "oops");
@@ -894,9 +953,17 @@ mod tests {
         let id = insert_job(&pool, &p, "mod", "1.0.0", "/test", b"", 60, 1, "", "")
             .await
             .unwrap();
-        let _ = claim_job(&pool, &p, "mod", "1.0.0", "engine-1").await;
+        let claim = claim_job(&pool, &p, "mod", "1.0.0", "engine-1")
+            .await
+            .unwrap()
+            .unwrap();
 
-        fail_job(&pool, &id, "final failure").await.expect("fail");
+        assert_eq!(
+            fail_job(&pool, &id, claim.claim_id, "final failure")
+                .await
+                .expect("fail"),
+            Finalization::Applied
+        );
         let status = get_job_status(&pool, &id).await.unwrap().unwrap();
         assert_eq!(status.status, "dead");
     }
@@ -925,6 +992,64 @@ mod tests {
         let status = get_job_status(&pool, &id).await.unwrap().unwrap();
         assert_eq!(status.status, "pending");
         assert!(status.error_message.contains("[stale recovery]"));
+    }
+
+    #[tokio::test]
+    async fn stale_claim_cannot_finalize_a_recovered_job() {
+        let pool = require_pool!();
+        let namespace = unique_prefix();
+        let id = insert_job(
+            &pool, &namespace, "mod", "1.0.0", "/test", b"payload", 1, 3, "", "",
+        )
+        .await
+        .unwrap();
+        let claim_a = claim_job(&pool, &namespace, "mod", "1.0.0", "engine-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let client = pool.get().await.unwrap();
+        client
+            .execute(
+                "UPDATE wr__jobs.jobs SET claimed_at = now() - interval '10 seconds' WHERE job_id = $1",
+                &[&id],
+            )
+            .await
+            .unwrap();
+        assert!(recover_stale_jobs(&pool).await.unwrap() >= 1);
+
+        let claim_b = claim_job(&pool, &namespace, "mod", "1.0.0", "engine-b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(claim_a.claim_id, claim_b.claim_id);
+        assert_eq!(
+            complete_job(&pool, &id, claim_a.claim_id, b"stale")
+                .await
+                .unwrap(),
+            Finalization::Stale
+        );
+        assert_eq!(
+            fail_job(&pool, &id, claim_a.claim_id, "stale failure")
+                .await
+                .unwrap(),
+            Finalization::Stale
+        );
+        let row = client
+            .query_one(
+                "SELECT status, claimed_by, result FROM wr__jobs.jobs WHERE job_id = $1",
+                &[&id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, &str>(0), "running");
+        assert_eq!(row.get::<_, &str>(1), "engine-b");
+        assert_eq!(row.get::<_, Option<Vec<u8>>>(2), None);
+        assert_eq!(
+            complete_job(&pool, &id, claim_b.claim_id, b"fresh")
+                .await
+                .unwrap(),
+            Finalization::Applied
+        );
     }
 
     #[tokio::test]
@@ -992,7 +1117,12 @@ mod tests {
         assert_eq!(s.status, "running");
         assert_eq!(s.attempt, 1);
 
-        complete_job(&pool, &id, b"done").await.unwrap();
+        assert_eq!(
+            complete_job(&pool, &id, claimed.claim_id, b"done")
+                .await
+                .unwrap(),
+            Finalization::Applied
+        );
         let s = get_job_status(&pool, &id).await.unwrap().unwrap();
         assert_eq!(s.status, "complete");
         assert_eq!(s.result, b"done");
@@ -1006,14 +1136,31 @@ mod tests {
             .await
             .unwrap();
 
-        let _ = claim_job(&pool, &p, "mod", "1.0.0", "e1").await;
-        fail_job(&pool, &id, "transient error").await.unwrap();
+        let claim1 = claim_job(&pool, &p, "mod", "1.0.0", "e1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fail_job(&pool, &id, claim1.claim_id, "transient error")
+                .await
+                .unwrap(),
+            Finalization::Applied
+        );
         let s = get_job_status(&pool, &id).await.unwrap().unwrap();
         assert_eq!(s.status, "pending");
         assert_eq!(s.attempt, 1);
 
-        let _ = claim_job(&pool, &p, "mod", "1.0.0", "e1").await;
-        complete_job(&pool, &id, b"ok").await.unwrap();
+        let claim2 = claim_job(&pool, &p, "mod", "1.0.0", "e1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(claim1.claim_id, claim2.claim_id);
+        assert_eq!(
+            complete_job(&pool, &id, claim2.claim_id, b"ok")
+                .await
+                .unwrap(),
+            Finalization::Applied
+        );
         let s = get_job_status(&pool, &id).await.unwrap().unwrap();
         assert_eq!(s.status, "complete");
         assert_eq!(s.attempt, 2);

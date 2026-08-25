@@ -7,6 +7,7 @@ pub mod db;
 pub mod llm;
 pub mod migration;
 pub mod pool;
+pub mod provisioning;
 pub mod runtime;
 pub mod state;
 pub mod tracing;

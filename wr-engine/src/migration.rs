@@ -75,10 +75,13 @@ pub async fn run_module_migrations(
     }
 
     let lock_key = advisory_lock_key(schema);
-    let mut client = pool
+    let pooled = pool
         .get()
         .await
         .context("failed to get DB connection for migrations")?;
+    // Session advisory locks must never return to the pool. Detaching first
+    // makes every cancellation, panic, or error close this physical session.
+    let mut client = deadpool_postgres::Object::take(pooled);
 
     // Acquire advisory lock to serialize migrations across engine replicas.
     client
@@ -88,15 +91,17 @@ pub async fn run_module_migrations(
 
     // Run migrations inside the module's schema, releasing the lock on all exit paths.
     let result = async {
-        // Restrict search_path so migrations cannot touch other schemas.
+        // This selects the default schema for trusted migration SQL; it is not
+        // an authorization boundary.
+        let quoted_schema = format!("\"{}\"", schema.replace('"', "\"\""));
         client
-            .execute(&format!("SET search_path = \"{schema}\""), &[])
+            .execute(&format!("SET search_path = {quoted_schema}"), &[])
             .await
             .context("failed to set search_path")?;
 
         let runner = refinery::Runner::new(&migrations);
         runner
-            .run_async(&mut **client)
+            .run_async(&mut *client)
             .await
             .context("migration execution failed")?;
 
@@ -104,19 +109,19 @@ pub async fn run_module_migrations(
     }
     .await;
 
-    // Always release the advisory lock.
-    if let Err(e) = client
-        .execute("SELECT pg_advisory_unlock($1)", &[&lock_key])
+    // Successful completion requires proof that this session owned and
+    // released the lock. The detached client is dropped on every path.
+    let unlocked = client
+        .query_one("SELECT pg_advisory_unlock($1)", &[&lock_key])
         .await
-    {
-        tracing::warn!(module = module_name, error = %e, "failed to release advisory lock");
-    }
+        .context("failed to release advisory lock")?
+        .get::<_, bool>(0);
+    anyhow::ensure!(unlocked, "migration advisory lock was not held");
 
     result?;
 
     info!(
         module = module_name,
-        schema,
         count = migrations.len(),
         "migrations complete",
     );

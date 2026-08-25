@@ -15,7 +15,8 @@ pub(crate) async fn prepare_connection(
     use std::fmt::Write;
     let mut sql = String::new();
     if let Some(s) = schema {
-        write!(sql, "SET search_path = \"{s}\"; ").unwrap();
+        let quoted = s.replace('"', "\"\"");
+        write!(sql, "SET search_path = \"{quoted}\"; ").unwrap();
     }
     write!(
         sql,

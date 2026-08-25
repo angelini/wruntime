@@ -234,7 +234,7 @@ database           = true
 db_max_connections = 10 # this module contributes 10 instead of 20
 ```
 
-`max_connections` defaults to **20**, `statement_timeout_secs` to **30**, and `idle_in_transaction_timeout_secs` to **60**. Pools authenticate with the manager-provisioned namespace role; module schemas remain isolated through their connection `search_path`.
+`max_connections` defaults to **20**, `statement_timeout_secs` to **30**, and `idle_in_transaction_timeout_secs` to **60**. Pools authenticate with the manager-issued namespace role. The per-module `search_path` selects the default schema for unqualified SQL; it is not an authorization boundary. Fully qualified access to another module schema in the same namespace is allowed, while other namespace roles and all guest roles remain denied access to unrelated schemas and `wr_system`.
 
 ### Database telemetry
 
@@ -279,9 +279,9 @@ modules/inventory/migrations/
 
 Key behaviors:
 
-- **Per-namespace DB roles:** The manager automatically generates and stores a random password for each namespace that needs database access. At engine registration, the manager returns per-namespace credentials (`wr_ns_{namespace}` roles). The engine creates these roles, grants them access to the relevant schemas, and connects module pools using the namespace role — modules never see the DB password. This provides namespace-level privilege isolation without any manual role or secret configuration.
-- **Schema isolation:** `search_path` is set to the module's own schema before migrations run. A migration cannot modify tables belonging to another module.
-- **Advisory locking:** An engine acquires a Postgres advisory lock before running migrations, preventing concurrent execution across engine replicas for the same module.
+- **Per-namespace DB roles:** The manager automatically generates and stores a random password for each namespace that needs database access. At engine registration, the manager returns per-namespace credentials (`wr_ns_{namespace}` roles). The engine uses its target-database admin credentials to create or synchronize those roles and schemas under provisioning locks, then connects guest pools using the namespace role. Modules never receive the password.
+- **Namespace authorization, module default schema:** The namespace role is granted every DB-enabled module schema in that namespace. `search_path` selects the module's default for unqualified migration SQL but does not prevent trusted migration files from using fully qualified names for other schemas. Migration SQL runs with target-database admin privileges and must not be sourced from untrusted parties.
+- **Cancellation-safe advisory locking:** An engine acquires a Postgres advisory lock before running migrations, preventing concurrent execution across replicas for the same module. The lock is held on a detached physical connection, so cancellation or failure closes the session instead of returning a locked session to the pool.
 - **Idempotent:** Refinery tracks applied migrations in a `refinery_schema_history` table inside the module's schema. Already-applied migrations are skipped on subsequent startups.
 - **Fail-fast:** If any migration fails, the engine exits before the module becomes routable. Registered route rows remain unhealthy, so the module never receives traffic.
 
