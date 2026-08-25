@@ -8,7 +8,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use deadpool_postgres::Pool;
 use http::{Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message;
@@ -35,50 +35,66 @@ fn canonical_worker_path(path: &str) -> Option<&'static str> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WorkerPolicy {
+    max_attempts: u32,
+    timeout_secs: u32,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WorkerDefaults {
-    max_attempts: HashMap<(String, String, String), u32>,
-    timeout_secs: HashMap<(String, String, String), u32>,
+    policies: HashMap<wr_common::identity::ModuleId, WorkerPolicy>,
+}
+
+struct RoutedIdentity(wr_common::identity::ModuleId);
+
+impl RoutedIdentity {
+    fn from_headers(headers: &http::HeaderMap) -> std::result::Result<Self, String> {
+        let header = |name, message: &'static str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| message.to_string())
+        };
+        let namespace = header(WR_NAMESPACE, "missing x-wr-namespace header")?;
+        let module = header(WR_MODULE, "missing x-wr-module header")?;
+        let version = header(WR_VERSION, "missing x-wr-version header")?;
+        wr_common::identity::ModuleId::parse(namespace, module, version)
+            .map(Self)
+            .map_err(|error| format!("invalid routed identity: {error}"))
+    }
 }
 
 impl WorkerDefaults {
-    pub(crate) fn from_modules(modules: &[wr_engine::config::ModuleConfig]) -> Self {
-        let mut max_attempts = HashMap::new();
-        let mut timeout_secs = HashMap::new();
+    pub(crate) fn from_modules(
+        modules: &[wr_engine::config::ModuleConfig],
+    ) -> anyhow::Result<Self> {
+        let mut policies = HashMap::new();
         for module in modules {
             if module.mode == wr_engine::config::ModuleMode::Worker {
-                let key = (
-                    module.namespace.clone(),
-                    module.name.clone(),
-                    module.version.clone(),
-                );
-                max_attempts.insert(key.clone(), module.worker_max_attempts);
-                timeout_secs.insert(
-                    key,
-                    u32::try_from(module.worker_job_timeout_secs).unwrap_or(u32::MAX),
+                let id = wr_common::identity::ModuleId::parse(
+                    &module.namespace,
+                    &module.name,
+                    &module.version,
+                )?;
+                policies.insert(
+                    id,
+                    WorkerPolicy {
+                        max_attempts: module.worker_max_attempts,
+                        timeout_secs: u32::try_from(module.worker_job_timeout_secs)
+                            .unwrap_or(u32::MAX),
+                    },
                 );
             }
         }
-        Self {
-            max_attempts,
-            timeout_secs,
-        }
+        Ok(Self { policies })
     }
 
-    fn max_attempts_for(&self, namespace: &str, name: &str, version: &str) -> u32 {
-        self.max_attempts
-            .get(&(namespace.to_owned(), name.to_owned(), version.to_owned()))
-            .copied()
-            .filter(|attempts| *attempts > 0)
-            .unwrap_or(3)
-    }
-
-    fn timeout_secs_for(&self, namespace: &str, name: &str, version: &str) -> u32 {
-        self.timeout_secs
-            .get(&(namespace.to_owned(), name.to_owned(), version.to_owned()))
-            .copied()
-            .filter(|timeout| *timeout > 0)
-            .unwrap_or(300)
+    fn policy_for(&self, id: &wr_common::identity::ModuleId) -> WorkerPolicy {
+        self.policies.get(id).copied().unwrap_or(WorkerPolicy {
+            max_attempts: 3,
+            timeout_secs: 300,
+        })
     }
 }
 
@@ -107,9 +123,19 @@ pub async fn serve(
                 let db_pool = db_pool.clone();
                 let worker_defaults = worker_defaults.clone();
                 async move {
-                    let namespace = header_owned(req.headers(), WR_NAMESPACE);
-                    let module = header_owned(req.headers(), WR_MODULE);
-                    let version = header_owned(req.headers(), WR_VERSION);
+                    let routed = RoutedIdentity::from_headers(req.headers());
+                    let namespace = routed
+                        .as_ref()
+                        .map(|identity| identity.0.route.namespace.as_str())
+                        .unwrap_or("");
+                    let module = routed
+                        .as_ref()
+                        .map(|identity| identity.0.route.module.as_str())
+                        .unwrap_or("");
+                    let version = routed
+                        .as_ref()
+                        .map(|identity| identity.0.version.to_string())
+                        .unwrap_or_default();
                     let method = req.method().to_string();
                     let path = req.uri().path().to_string();
 
@@ -126,7 +152,7 @@ pub async fn serve(
                     );
                     wr_common::telemetry::set_parent_from_headers(&span, req.headers());
 
-                    let resp = handle(req, registry, db_pool, worker_defaults)
+                    let resp = handle(req, routed, registry, db_pool, worker_defaults)
                         .instrument(span.clone())
                         .await;
 
@@ -152,15 +178,16 @@ pub async fn serve(
 
 async fn handle(
     req: Request<hyper::body::Incoming>,
+    routed: std::result::Result<RoutedIdentity, String>,
     registry: ModuleRegistry,
     db_pool: Option<Arc<Pool>>,
     worker_defaults: Arc<WorkerDefaults>,
-) -> Response<Full<Bytes>> {
+) -> wr_engine::EngineResponse {
     // ── Health check — no headers required ────────────────────────────────
     if req.uri().path() == "/healthz" {
         return Response::builder()
             .status(StatusCode::OK)
-            .body(Full::new(Bytes::from("ok")))
+            .body(wr_engine::response_full(Bytes::from("ok")))
             .unwrap();
     }
 
@@ -170,52 +197,24 @@ async fn handle(
         || canonical_worker_path(request_path).is_some()
     {
         let path = request_path.to_owned();
-        return handle_worker_grpc(req, &path, db_pool, worker_defaults).await;
+        return handle_worker_grpc(
+            req,
+            &path,
+            routed.ok().map(|identity| identity.0),
+            db_pool,
+            worker_defaults,
+        )
+        .await;
     }
 
-    // The proxy injects x-wr-namespace, x-wr-module, and x-wr-version so we
-    // know which module instance to dispatch to.
-    let namespace = match req
-        .headers()
-        .get(WR_NAMESPACE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-    {
-        Some(n) => n,
-        None => return err(StatusCode::BAD_REQUEST, "missing x-wr-namespace header"),
+    let routed = match routed {
+        Ok(identity) => identity.0,
+        Err(message) => return err(StatusCode::BAD_REQUEST, &message),
     };
-
-    let module = match req
-        .headers()
-        .get(WR_MODULE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-    {
-        Some(m) => m,
-        None => return err(StatusCode::BAD_REQUEST, "missing x-wr-module header"),
-    };
-
-    let version = match req
-        .headers()
-        .get(WR_VERSION)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-    {
-        Some(v) => v,
-        None => return err(StatusCode::BAD_REQUEST, "missing x-wr-version header"),
-    };
-
-    // Buffer body.
-    let (parts, body) = req.into_parts();
-    let bytes = match BodyExt::collect(body).await {
-        Ok(c) => c.to_bytes(),
-        Err(e) => {
-            warn!(error = %e, "body read error");
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "failed to read body");
-        }
-    };
-
-    let sender = match registry.next_sender(&namespace, &module, &version).await {
+    let module = routed.route.module.as_str();
+    let namespace = routed.route.namespace.as_str();
+    let version = routed.version.to_string();
+    let sender = match registry.next_sender(&routed).await {
         Some(s) => s,
         None => {
             return err(
@@ -225,9 +224,10 @@ async fn handle(
         }
     };
 
+    let (parts, body) = req.into_parts();
     let (resp_tx, resp_rx) = oneshot::channel();
     let inbound = InboundRequest {
-        request: Request::from_parts(parts, bytes),
+        request: Request::from_parts(parts, wr_engine::inbound_network(body)),
         response_tx: resp_tx,
         span: tracing::Span::current(),
     };
@@ -236,7 +236,7 @@ async fn handle(
     match sender.try_send(inbound) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
-            return too_many_requests(&module);
+            return too_many_requests(module);
         }
         Err(TrySendError::Closed(_)) => {
             return err(StatusCode::SERVICE_UNAVAILABLE, "module channel closed");
@@ -244,17 +244,14 @@ async fn handle(
     }
 
     match resp_rx.await {
-        Ok(resp) => {
-            let (rp, rb) = resp.into_parts();
-            Response::from_parts(rp, Full::new(rb))
-        }
+        Ok(resp) => resp,
         Err(_) => err(StatusCode::INTERNAL_SERVER_ERROR, "module did not respond"),
     }
 }
 
-use wr_common::http_headers::{header_owned, WR_MODULE, WR_NAMESPACE, WR_VERSION};
+use wr_common::http_headers::{WR_MODULE, WR_NAMESPACE, WR_VERSION};
 
-fn too_many_requests(module: &str) -> Response<Full<Bytes>> {
+fn too_many_requests(module: &str) -> wr_engine::EngineResponse {
     let body = json!({
         "error": "too_many_requests",
         "reason": "module channel at capacity",
@@ -264,47 +261,36 @@ fn too_many_requests(module: &str) -> Response<Full<Bytes>> {
         .status(StatusCode::TOO_MANY_REQUESTS)
         .header(http::header::CONTENT_TYPE, "application/json")
         .header("Retry-After", "1")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(wr_engine::response_full(Bytes::from(body.to_string())))
         .unwrap()
 }
 
-fn err(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
+fn err(status: StatusCode, msg: &str) -> wr_engine::EngineResponse {
     Response::builder()
         .status(status)
-        .body(Full::new(Bytes::from(msg.to_string())))
+        .body(wr_engine::response_full(Bytes::from(msg.to_string())))
         .unwrap()
 }
 
-fn worker_err(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
+fn worker_err(status: StatusCode, msg: &str) -> wr_engine::EngineResponse {
     let body = json!({ "error": msg });
     Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(wr_engine::response_full(Bytes::from(body.to_string())))
         .unwrap()
 }
 
 async fn handle_worker_grpc(
     req: Request<hyper::body::Incoming>,
     path: &str,
+    routed: Option<wr_common::identity::ModuleId>,
     db_pool: Option<Arc<Pool>>,
     worker_defaults: Arc<WorkerDefaults>,
-) -> Response<Full<Bytes>> {
-    let routed_namespace = req
-        .headers()
-        .get(WR_NAMESPACE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let routed_module = req
-        .headers()
-        .get(WR_MODULE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let routed_version = req
-        .headers()
-        .get(WR_VERSION)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+) -> wr_engine::EngineResponse {
+    let routed_version = routed.as_ref().map(|id| id.version.to_string());
+    let routed_namespace = routed.as_ref().map(|id| id.route.namespace.as_str());
+    let routed_module = routed.as_ref().map(|id| id.route.module.as_str());
     let body = match BodyExt::collect(req.into_body()).await {
         Ok(c) => c.to_bytes(),
         Err(e) => {
@@ -317,8 +303,8 @@ async fn handle_worker_grpc(
         path,
         body,
         db_pool,
-        routed_namespace.as_deref(),
-        routed_module.as_deref(),
+        routed_namespace,
+        routed_module,
         routed_version.as_deref(),
         worker_defaults.as_ref(),
     )
@@ -333,7 +319,7 @@ async fn handle_worker_grpc_bytes(
     routed_module: Option<&str>,
     routed_version: Option<&str>,
     worker_defaults: &WorkerDefaults,
-) -> Response<Full<Bytes>> {
+) -> wr_engine::EngineResponse {
     let path = match canonical_worker_path(path) {
         Some(path) => path,
         None => return worker_err(StatusCode::NOT_FOUND, "unknown worker endpoint"),
@@ -368,7 +354,7 @@ async fn handle_submit_job(
     routed_module: Option<&str>,
     routed_version: Option<&str>,
     worker_defaults: &WorkerDefaults,
-) -> Response<Full<Bytes>> {
+) -> wr_engine::EngineResponse {
     let req = match SubmitJobRequest::decode(body) {
         Ok(r) => r,
         Err(e) => return worker_err(StatusCode::BAD_REQUEST, &format!("decode: {e}")),
@@ -407,15 +393,26 @@ async fn handle_submit_job(
         &req.worker_version
     };
 
+    let policy = wr_common::identity::ModuleId::parse(
+        &req.worker_namespace,
+        &req.worker_name,
+        defaults_version,
+    )
+    .ok()
+    .map(|id| worker_defaults.policy_for(&id))
+    .unwrap_or(WorkerPolicy {
+        max_attempts: 3,
+        timeout_secs: 300,
+    });
     let max_attempts = if req.max_attempts > 0 {
         req.max_attempts
     } else {
-        worker_defaults.max_attempts_for(&req.worker_namespace, &req.worker_name, defaults_version)
+        policy.max_attempts
     };
     let timeout_secs = if req.timeout_secs > 0 {
         req.timeout_secs
     } else {
-        worker_defaults.timeout_secs_for(&req.worker_namespace, &req.worker_name, defaults_version)
+        policy.timeout_secs
     };
 
     match wr_engine::worker::insert_job(
@@ -437,7 +434,7 @@ async fn handle_submit_job(
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/x-protobuf")
-                .body(Full::new(Bytes::from(resp.encode_to_vec())))
+                .body(wr_engine::response_full(Bytes::from(resp.encode_to_vec())))
                 .unwrap()
         }
         Err(e) => {
@@ -447,7 +444,7 @@ async fn handle_submit_job(
     }
 }
 
-async fn handle_get_job_status(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>> {
+async fn handle_get_job_status(pool: &Pool, body: &[u8]) -> wr_engine::EngineResponse {
     let req = match GetJobStatusRequest::decode(body) {
         Ok(r) => r,
         Err(e) => return worker_err(StatusCode::BAD_REQUEST, &format!("decode: {e}")),
@@ -479,7 +476,7 @@ async fn handle_get_job_status(pool: &Pool, body: &[u8]) -> Response<Full<Bytes>
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/x-protobuf")
-                .body(Full::new(Bytes::from(resp.encode_to_vec())))
+                .body(wr_engine::response_full(Bytes::from(resp.encode_to_vec())))
                 .unwrap()
         }
         Ok(None) => worker_err(StatusCode::NOT_FOUND, "job not found"),
@@ -539,7 +536,7 @@ mod tests {
         )
     }
 
-    async fn response_json(resp: Response<Full<Bytes>>) -> (StatusCode, serde_json::Value) {
+    async fn response_json(resp: wr_engine::EngineResponse) -> (StatusCode, serde_json::Value) {
         let status = resp.status();
         assert_eq!(
             resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
@@ -610,13 +607,12 @@ mod tests {
         };
         let ns = unique_prefix();
         let defaults = WorkerDefaults {
-            max_attempts: HashMap::from([(
-                (ns.clone(), "mod".to_string(), "1.0.0".to_string()),
-                7,
-            )]),
-            timeout_secs: HashMap::from([(
-                (ns.clone(), "mod".to_string(), "1.0.0".to_string()),
-                47,
+            policies: HashMap::from([(
+                wr_common::identity::ModuleId::parse(&ns, "mod", "1.0.0").unwrap(),
+                WorkerPolicy {
+                    max_attempts: 7,
+                    timeout_secs: 47,
+                },
             )]),
         };
         let resp = handle_worker_grpc_bytes(
@@ -727,11 +723,13 @@ mod tests {
         };
         let ns = unique_prefix();
         let defaults = WorkerDefaults {
-            max_attempts: HashMap::from([(
-                (ns.clone(), "mod".to_string(), "1.0.0".to_string()),
-                7,
+            policies: HashMap::from([(
+                wr_common::identity::ModuleId::parse(&ns, "mod", "1.0.0").unwrap(),
+                WorkerPolicy {
+                    max_attempts: 7,
+                    timeout_secs: 300,
+                },
             )]),
-            ..WorkerDefaults::default()
         };
 
         let resp = handle_worker_grpc_bytes(

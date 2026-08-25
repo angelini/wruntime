@@ -1,4 +1,5 @@
 use anyhow::Context as _;
+use bytes::{Buf as _, BytesMut};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -102,7 +103,16 @@ impl LlmRuntime {
                         return;
                     }
                 };
-                for event in parser.feed(&String::from_utf8_lossy(&chunk)) {
+                let events = match parser.feed(&chunk) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        let _ = tx
+                            .send(HostStreamEvent::Error(LlmErrorKind::Api(error.to_string())))
+                            .await;
+                        return;
+                    }
+                };
+                for event in events {
                     match event {
                         SseEvent::MessageStart { input_tokens: it } => {
                             input_tokens = it;
@@ -167,6 +177,7 @@ impl LlmRuntime {
 
 // ── SSE stream parser ───────────────────────────────────────────────────────
 
+#[derive(Debug, PartialEq)]
 enum SseEvent {
     MessageStart {
         input_tokens: u32,
@@ -182,31 +193,52 @@ enum SseEvent {
 }
 
 struct SseParser {
-    buf: String,
+    buf: BytesMut,
 }
+
+#[derive(Debug)]
+struct SseParserError;
+
+impl std::fmt::Display for SseParserError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("invalid UTF-8 in SSE frame")
+    }
+}
+
+impl std::error::Error for SseParserError {}
 
 impl SseParser {
     fn new() -> Self {
-        Self { buf: String::new() }
+        Self {
+            buf: BytesMut::new(),
+        }
     }
 
-    fn feed(&mut self, chunk: &str) -> Vec<SseEvent> {
-        self.buf.push_str(chunk);
-        // Normalize CRLF -> LF over the whole retained buffer so frame splitting
-        // on "\n\n" is line-ending agnostic (handles \r\n\r\n and a \r split
-        // across chunk boundaries).
-        if self.buf.contains('\r') {
-            self.buf = self.buf.replace("\r\n", "\n");
-        }
+    fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, SseParserError> {
+        self.buf.extend_from_slice(chunk);
         let mut events = Vec::new();
-        while let Some(pos) = self.buf.find("\n\n") {
-            let block = self.buf[..pos].to_string();
-            self.buf = self.buf[pos + 2..].to_string();
-            if let Some(event) = Self::parse_block(&block) {
+        while let Some((frame_len, delimiter_len)) = Self::frame_boundary(&self.buf) {
+            let frame = self.buf.split_to(frame_len);
+            self.buf.advance(delimiter_len);
+            let block = std::str::from_utf8(&frame).map_err(|_| SseParserError)?;
+            if let Some(event) = Self::parse_block(block) {
                 events.push(event);
             }
         }
-        events
+        Ok(events)
+    }
+
+    fn frame_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+        buf.windows(2)
+            .position(|window| window == b"\n\n")
+            .map(|position| (position, 2))
+            .into_iter()
+            .chain(
+                buf.windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| (position, 4)),
+            )
+            .min_by_key(|(position, _)| *position)
     }
 
     fn parse_block(block: &str) -> Option<SseEvent> {
@@ -723,6 +755,7 @@ mod tests {
     }
 
     fn runtime_with_limit(max_tokens_limit: u32) -> LlmRuntime {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         LlmRuntime {
             client: Client::new(),
             provider: LlmProvider::Anthropic,
@@ -856,6 +889,78 @@ mod tests {
         assert_eq!(api_request.messages[0].role, "user");
         assert_eq!(api_request.messages[1].role, "assistant");
         assert_eq!(api_request.max_tokens, 1000);
+    }
+
+    fn text_delta_frame(text: &str, delimiter: &str) -> Vec<u8> {
+        format!(
+            "event: content_block_delta{delimiter}data: {{\"delta\":{{\"type\":\"text_delta\",\"text\":{}}}}}{delimiter}{delimiter}",
+            serde_json::to_string(text).unwrap()
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn sse_parser_preserves_unicode_split_between_chunks() {
+        let frame = text_delta_frame("café 🍵", "\n");
+        let split = frame
+            .windows(4)
+            .position(|window| window == "🍵".as_bytes())
+            .unwrap()
+            + 2;
+        let mut parser = SseParser::new();
+        assert!(parser.feed(&frame[..split]).unwrap().is_empty());
+        assert_eq!(
+            parser.feed(&frame[split..]).unwrap(),
+            vec![SseEvent::TextDelta("café 🍵".into())]
+        );
+    }
+
+    #[test]
+    fn sse_parser_accepts_split_lf_and_crlf_delimiters() {
+        for delimiter in ["\n", "\r\n"] {
+            let frame = text_delta_frame("hello", delimiter);
+            for split in 1..frame.len() {
+                let mut parser = SseParser::new();
+                let mut events = parser.feed(&frame[..split]).unwrap();
+                events.extend(parser.feed(&frame[split..]).unwrap());
+                assert_eq!(
+                    events,
+                    vec![SseEvent::TextDelta("hello".into())],
+                    "delimiter {delimiter:?}, split {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sse_parser_handles_many_chunks_and_many_frames() {
+        let first = text_delta_frame("one", "\n");
+        let second = text_delta_frame("two", "\r\n");
+        let mut parser = SseParser::new();
+        let mut events = Vec::new();
+        for byte in first {
+            events.extend(parser.feed(&[byte]).unwrap());
+        }
+        assert_eq!(events, vec![SseEvent::TextDelta("one".into())]);
+
+        let mut combined = second;
+        combined.extend(text_delta_frame("three", "\n"));
+        assert_eq!(
+            parser.feed(&combined).unwrap(),
+            vec![
+                SseEvent::TextDelta("two".into()),
+                SseEvent::TextDelta("three".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn sse_parser_rejects_invalid_utf8_frame() {
+        let mut parser = SseParser::new();
+        let error = parser
+            .feed(b"event: ping\ndata: \xff\n\n")
+            .expect_err("invalid UTF-8 must fail");
+        assert_eq!(error.to_string(), "invalid UTF-8 in SSE frame");
     }
 
     #[test]

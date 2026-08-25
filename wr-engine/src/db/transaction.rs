@@ -2,7 +2,7 @@ use wasmtime::component::Resource;
 
 use wr_common::pool::pg_error_string;
 
-use super::bindings::{CursorState, TxState};
+use super::bindings::{CursorOwner, CursorResourceState, CursorState, TxState};
 use super::host::{execute_statement, open_row_stream, query_rows, HostDbError};
 use super::telemetry::DbOperation;
 use super::wruntime::db::database::{DbError, HostTransaction, PgValue, Row};
@@ -58,10 +58,7 @@ impl HostTransaction for ModuleState {
                 .get(&self_)
                 .map_err(|error| DbError::Connection(error.to_string()))?;
             state.lifecycle.ensure_operation()?;
-            let client = state
-                .client
-                .as_ref()
-                .ok_or_else(|| DbError::Query("transaction already completed".into()))?;
+            let client = state.client()?;
             query_rows(client, sql, params)
                 .await
                 .map_err(|error| public_transaction_error(&state.lifecycle, error))
@@ -84,10 +81,7 @@ impl HostTransaction for ModuleState {
                 .get(&self_)
                 .map_err(|error| DbError::Connection(error.to_string()))?;
             state.lifecycle.ensure_operation()?;
-            let client = state
-                .client
-                .as_ref()
-                .ok_or_else(|| DbError::Query("transaction already completed".into()))?;
+            let client = state.client()?;
             execute_statement(client, sql, params)
                 .await
                 .map_err(|error| public_transaction_error(&state.lifecycle, error))
@@ -141,11 +135,13 @@ impl HostTransaction for ModuleState {
                     return Err(error);
                 }
             };
-            let Some(client) = state.client.as_ref() else {
-                lifecycle.release_cursor();
-                let error = DbError::Query("transaction already completed".into());
-                telemetry.finish_error(&error);
-                return Err(error);
+            let client = match state.client() {
+                Ok(client) => client,
+                Err(error) => {
+                    lifecycle.release_cursor();
+                    telemetry.finish_error(&error);
+                    return Err(error);
+                }
             };
             match open_row_stream(client, sql, params).await {
                 Ok(stream) => stream,
@@ -161,11 +157,13 @@ impl HostTransaction for ModuleState {
         let parent = self_.rep();
         match self.table().push_child(
             CursorState {
-                stream: Some(Box::pin(stream)),
-                conn: None,
-                parent: Some(parent),
-                lifecycle: Some(lifecycle.clone()),
-                done: false,
+                state: CursorResourceState::Active {
+                    stream: Box::pin(stream),
+                    owner: CursorOwner::Transaction {
+                        parent,
+                        lifecycle: lifecycle.clone(),
+                    },
+                },
                 telemetry,
                 _count: guard,
             },
@@ -190,10 +188,12 @@ impl HostTransaction for ModuleState {
     async fn drop(&mut self, rep: Resource<TxState>) -> wasmtime::Result<()> {
         let mut state = self.table().delete(rep)?;
         state.lifecycle.complete();
-        let Some(client) = state.client.take() else {
+        let Some(client) = state.take_active() else {
             return Ok(());
         };
-        if let Err(error) = client.execute("ROLLBACK", &[]).await {
+        if state.lifecycle.must_discard() {
+            drop(deadpool_postgres::Object::take(client));
+        } else if let Err(error) = client.execute("ROLLBACK", &[]).await {
             tracing::warn!(error = %pg_error_string(&error), "transaction rollback during drop failed");
             drop(deadpool_postgres::Object::take(client));
         }
@@ -228,32 +228,22 @@ impl ModuleState {
                 .table()
                 .get(&transaction)
                 .map_err(|error| DbError::Connection(error.to_string()))?;
-            let client = state
-                .client
-                .as_ref()
-                .ok_or_else(|| DbError::Query("transaction already completed".into()))?;
-            client.execute(command, &[]).await
+            state.client()?.execute(command, &[]).await
         };
         terminal_guard.disarm();
 
-        lifecycle.complete();
-        let client = self
-            .table()
-            .get_mut(&transaction)
-            .map_err(|error| DbError::Connection(error.to_string()))?
-            .client
-            .take();
-
         if let Err(error) = terminal_result {
-            if let Some(client) = client {
-                drop(deadpool_postgres::Object::take(client));
-            }
             return Err(DbError::Query(format!(
-                "transaction terminal outcome is unknown: {}",
+                "transaction terminal command failed: {}",
                 pg_error_string(&error)
             )));
         }
-        drop(client);
+
+        lifecycle.complete();
+        self.table()
+            .get_mut(&transaction)
+            .map_err(|error| DbError::Connection(error.to_string()))?
+            .complete();
 
         if commit && poisoned {
             return Err(DbError::Query(

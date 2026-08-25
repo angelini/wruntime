@@ -47,7 +47,7 @@ A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. 
 
 A **node** groups one `wr-proxy` with one or more `wr-engine` instances. `[node].proxy_address` and `[node].control_address` are explicit loopback URLs; `[node].peer_address` is the separately advertised mTLS URL used across nodes. Engines keep ephemeral process IDs but deployed configs also report a stable operator-supplied node ID, manager-assigned monotonic revision, immutable bundle digest, and stable engine slot. The manager persists desired revision history and verifies those identities against fresh heartbeats and healthy default routes.
 
-At component load, the engine inspects top-level WIT imports and rejects modules that import the DB, blobstore, or LLM host interfaces without enabling the corresponding module capability. Runtime DB capability construction also requires a coherent pool+schema pair. Host-side missing-capability and input validation remain defense in depth for raw generated bindings.
+At component load, the engine inspects top-level WIT imports and rejects modules that import the DB, blobstore, or LLM host interfaces without enabling the corresponding module capability. Enabled capabilities are constructed as scoped bundles: DB access always carries its namespace pool, required module schema, timeouts, and telemetry policy; blobstore access always carries its runtime, namespace prefix, and limits. Host-side missing-capability and input validation remain defense in depth for raw generated bindings.
 
 Database authorization is per namespace. The manager generates and stores a namespace credential during registration; the engine uses one eager administrative pool, capped by `[database].max_connections`, to converge roles, admin-owned module schemas, and grants before readiness. Each DB-enabled namespace has one clean-recycled guest pool sized by the checked sum of every configured instance's effective `db_max_connections` contribution. Each configured worker has one additional non-pooled PostgreSQL `LISTEN` session. Guest pools authenticate as the namespace role. A module-specific `search_path` selects the default schema for unqualified SQL, but the role can use fully qualified names for every module schema granted to its namespace. Namespace roles can create objects in granted schemas but do not own or drop the schemas. Other namespace roles and every guest role remain denied access to unrelated schemas, `wr__jobs`, and `wr_system`.
 
@@ -130,12 +130,15 @@ wr-proxy A  (Node A)
                                                                        wr-engine B
 
 wr-engine (destination)
-  │  Inbound HTTP server reads x-wr-module + x-wr-version + x-wr-namespace,
-  │  dispatches to the correct WASM instance via round-robin
+  │  Inbound HTTP server parses x-wr-module + x-wr-version + x-wr-namespace
+  │  once, selects a WASM instance via round-robin, and passes the network body
+  │  directly to WASI HTTP with bounded backpressure
   │
   ▼
-inventory-service WASM module handles the request
+inventory-service WASM module streams the response
 ```
+
+The engine does not collect network request or guest response bodies at dispatch. A response-body owner retains the guest task, `Store<ModuleState>`, and owned instance permit through body completion. Normal end joins the task; a body error, timeout, or client drop cancels it so those resources cannot remain detached. Health checks drain their responses. Worker requests enter through the same body type from their already-buffered protobuf payload, and worker responses are deliberately collected only at the job-result persistence boundary.
 
 ## Request headers (`x-wr-*`)
 

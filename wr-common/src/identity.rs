@@ -216,6 +216,7 @@ macro_rules! endpoint_type {
 }
 endpoint_type!(EngineHttpUrl, "engine address", &["http", "https"], false);
 endpoint_type!(ProxyHttpUrl, "proxy address", &["http", "https"], false);
+endpoint_type!(ControlHttpUrl, "control address", &["http", "https"], false);
 endpoint_type!(PeerHttpsUrl, "peer address", &["https"], true);
 
 #[cfg(test)]
@@ -263,6 +264,8 @@ mod tests {
     fn versions_and_endpoints_are_typed() {
         assert!(ModuleVersion::parse("1.2.3").is_ok());
         assert!(ModuleVersion::parse("latest").is_err());
+        assert!(ControlHttpUrl::parse("http://127.0.0.1:9002").is_ok());
+        assert!(ControlHttpUrl::parse("127.0.0.1:9002").is_err());
         assert!(PeerHttpsUrl::parse("https://node:9443").is_ok());
         assert!(PeerHttpsUrl::parse("http://node:9443").is_err());
     }

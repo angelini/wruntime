@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt as _, Full, StreamBody};
+use hyper::body::Frame;
 
 use wr_engine::llm::LlmRuntime;
 
@@ -29,6 +30,8 @@ pub enum MockLlmMode {
     Stream { chunks: Vec<String> },
     /// Return a streaming SSE response that emits partial text then a stream-level `error` event.
     StreamError,
+    /// Return a complete SSE frame containing invalid UTF-8.
+    InvalidUtf8Stream,
 }
 
 /// Spawn a mock Claude API HTTP server that returns canned responses.
@@ -77,10 +80,24 @@ pub async fn spawn_mock_llm_server(
     Ok((format!("http://127.0.0.1:{}", addr.port()), shutdown_tx))
 }
 
+type MockBody = UnsyncBoxBody<Bytes, std::convert::Infallible>;
+
+fn full(body: Bytes) -> MockBody {
+    Full::new(body).boxed_unsync()
+}
+
+fn fragmented(body: Vec<u8>) -> MockBody {
+    let frames = body
+        .chunks(1)
+        .map(|chunk| Ok(Frame::data(Bytes::copy_from_slice(chunk))))
+        .collect::<Vec<Result<_, std::convert::Infallible>>>();
+    StreamBody::new(tokio_stream::iter(frames)).boxed_unsync()
+}
+
 async fn handle_mock_llm_request(
     _req: hyper::Request<hyper::body::Incoming>,
     mode: MockLlmMode,
-) -> Result<hyper::Response<http_body_util::Full<Bytes>>, std::convert::Infallible> {
+) -> Result<hyper::Response<MockBody>, std::convert::Infallible> {
     match mode {
         MockLlmMode::Text {
             text,
@@ -102,7 +119,7 @@ async fn handle_mock_llm_request(
             Ok(hyper::Response::builder()
                 .status(200)
                 .header("content-type", "application/json")
-                .body(Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
+                .body(full(Bytes::from(serde_json::to_vec(&body).unwrap())))
                 .unwrap())
         }
         MockLlmMode::ToolUse {
@@ -129,13 +146,13 @@ async fn handle_mock_llm_request(
             Ok(hyper::Response::builder()
                 .status(200)
                 .header("content-type", "application/json")
-                .body(Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
+                .body(full(Bytes::from(serde_json::to_vec(&body).unwrap())))
                 .unwrap())
         }
         MockLlmMode::Error { status, body } => Ok(hyper::Response::builder()
             .status(status)
             .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(body)))
+            .body(full(Bytes::from(body)))
             .unwrap()),
         MockLlmMode::Stream { chunks } => {
             let mut sse = String::new();
@@ -165,7 +182,7 @@ async fn handle_mock_llm_request(
             Ok(hyper::Response::builder()
                 .status(200)
                 .header("content-type", "text/event-stream")
-                .body(Full::new(Bytes::from(sse)))
+                .body(fragmented(sse.into_bytes()))
                 .unwrap())
         }
         MockLlmMode::StreamError => {
@@ -178,9 +195,14 @@ async fn handle_mock_llm_request(
             Ok(hyper::Response::builder()
                 .status(200)
                 .header("content-type", "text/event-stream")
-                .body(Full::new(Bytes::from(sse)))
+                .body(fragmented(sse.into_bytes()))
                 .unwrap())
         }
+        MockLlmMode::InvalidUtf8Stream => Ok(hyper::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(fragmented(b"event: ping\ndata: \xff\n\n".to_vec()))
+            .unwrap()),
     }
 }
 
@@ -207,7 +229,7 @@ pub fn llm_state(llm: Arc<LlmRuntime>) -> ModuleState {
         "http://127.0.0.1:9001".parse().unwrap(),
         http_pool(),
         ModuleServices {
-            llm: Some(llm),
+            llm: Some(wr_engine::state::LlmAccess { runtime: llm }),
             ..Default::default()
         },
     )
@@ -224,7 +246,7 @@ pub fn llm_state_with_limits(
         "http://127.0.0.1:9001".parse().unwrap(),
         http_pool(),
         ModuleServices {
-            llm: Some(llm),
+            llm: Some(wr_engine::state::LlmAccess { runtime: llm }),
             limits,
             ..Default::default()
         },

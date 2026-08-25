@@ -187,7 +187,7 @@ impl WorkerPoolHarness {
     pub fn respond(inbound: wr_engine::InboundRequest, status: u16, body: impl Into<Bytes>) {
         let response = Response::builder()
             .status(status)
-            .body(body.into())
+            .body(wr_engine::response_full(body.into()))
             .expect("build worker response");
         inbound
             .response_tx

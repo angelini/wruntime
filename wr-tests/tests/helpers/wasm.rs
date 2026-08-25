@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message as _;
@@ -368,39 +368,33 @@ async fn wasm_engine_serve(
                 let module_namespace = module_namespace.clone();
                 let pool = pool.clone();
                 async move {
-                    // Collect the body on this stream, then spawn the
-                    // CPU-heavy WASM work onto a separate tokio task so
-                    // hyper's HTTP/2 serve_connection can drive other
-                    // streams concurrently.
                     let (parts, body) = req.into_parts();
-                    let body_bytes = body
-                        .collect()
-                        .await
-                        .map(|c| c.to_bytes())
-                        .unwrap_or_default();
-                    let request = Request::from_parts(parts, body_bytes);
+                    let request = Request::from_parts(parts, wr_engine::inbound_network(body));
+                    let state = ModuleState::new(
+                        module_name.into(),
+                        module_namespace.into(),
+                        proxy_uri,
+                        pool,
+                        ModuleServices::default(),
+                    )
+                    .expect("ModuleState");
 
-                    let handle = tokio::spawn(async move {
-                        let state = ModuleState::new(
-                            module_name.into(),
-                            module_namespace.into(),
-                            proxy_uri,
-                            pool,
-                            ModuleServices::default(),
-                        )
-                        .expect("ModuleState");
-
-                        dispatch_to_wasm(&engine, &pre, state, request).await
-                    });
-
-                    match handle.await.expect("wasm task panicked") {
-                        Ok(resp) => {
-                            let (parts, body) = resp.into_parts();
-                            Ok::<_, Infallible>(Response::from_parts(parts, Full::new(body)))
-                        }
-                        Err(e) => Ok(Response::builder()
+                    match wr_engine::runtime::run_incoming_handler_streaming(
+                        &engine,
+                        &pre,
+                        state,
+                        request,
+                        std::time::Duration::from_secs(30),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(response) => Ok::<_, Infallible>(response),
+                        Err(error) => Ok(Response::builder()
                             .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .body(Full::new(Bytes::from(format!("WASM error: {e}"))))
+                            .body(wr_engine::response_full(Bytes::from(format!(
+                                "WASM error: {error}"
+                            ))))
                             .unwrap()),
                     }
                 }

@@ -213,6 +213,8 @@ channel_capacity = 128 # queued inbound dispatches before the engine returns 429
 
 When `cwasm_path` exists and is compatible with the engine, startup deserializes it instead of JIT-compiling `wasm_path`; a missing or incompatible artifact falls back to the WASM file. `channel_capacity` defaults to **128** per configured module instance.
 
+The engine TOML shape and defaults are unchanged. Configuration is parsed into permissive raw values, validated as one aggregate, and only then consumed by runtime startup. Operational capacities and safety deadlines must be positive: pool instance/memory counts, the epoch interval, module request timeout and channel capacity, database pool contributions and safety timeouts, the LLM token limit, and worker lifecycle values reject zero. Zero remains valid as an explicit deny-all ceiling for `[limits]`, `max_outbound_body_bytes`, and blobstore byte/list limits. Flat `worker_*` keys on a service module remain accepted and ignored; they are validated only when `mode = "worker"`.
+
 ### Database pool and timeout settings
 
 When `[database]` exists, the engine eagerly creates exactly one administrative pool capped by `max_connections`, even if no module enables the DB capability. Provisioning, engine/module migrations, worker HTTP operations, claims/finalization, and recovery share this capacity. The engine also creates one guest pool per DB-enabled namespace. Every configured DB-enabled module instance contributes `db_max_connections`, or `[database].max_connections` when the override is absent, and contributions are checked and summed for that namespace. Each configured worker entry additionally owns one non-pooled PostgreSQL `LISTEN` session.
@@ -288,7 +290,7 @@ Key behaviors:
 
 ### Per-module request timeout
 
-`request_timeout_secs` sets a hard deadline on every request dispatched to a module. If the WASM handler does not produce a response within that window, the engine cancels the request and returns `504 Gateway Timeout` to the proxy. The proxy treats a `504` as a terminal error and does not retry on another instance.
+`request_timeout_secs` sets a hard deadline on every request dispatched to a module, including production of its response body. Before response headers, expiry returns `504 Gateway Timeout`; after headers have already been sent, expiry terminates the streamed body because the status can no longer change. Dropping the client response body cancels the guest task and releases its store and instance permit. The proxy treats a pre-header `504` as a terminal error and does not retry on another instance.
 
 The default is **30 seconds**. Set it lower for latency-sensitive modules, or higher for modules that perform long-running work such as batch imports.
 
@@ -304,7 +306,7 @@ request_timeout_secs = 120
 
 ### Worker lifecycle settings
 
-Worker modules require non-zero `worker_concurrency`, `worker_poll_interval_secs`, `worker_job_timeout_secs`, and `worker_max_attempts`. Jobs expose the closed states `pending`, `running`, `complete`, and `dead`; the obsolete `claimed` spelling is rejected. Job submission uses zero only as the explicit wire sentinel for configured timeout/retry defaults.
+Worker modules require the database capability plus global `[database]` configuration and non-zero `worker_concurrency`, `worker_poll_interval_secs`, `worker_job_timeout_secs`, and `worker_max_attempts`. Service modules may retain flat worker keys; those values are ignored. Jobs expose the closed states `pending`, `running`, `complete`, and `dead`; the obsolete `claimed` spelling is rejected. Job submission uses zero only as the explicit wire sentinel for configured timeout/retry defaults.
 
 Three deadlines are independent: `request_timeout_secs` limits ordinary module HTTP requests; `worker_job_timeout_secs` limits worker handler execution and supplies the queue lease default; an explicit submitted `timeout_secs` overrides only that row's fixed queue lease. Claiming atomically stores its fence and `lease_expires_at`; leases are not renewed. If a submitted lease is shorter than legitimate handler execution, another engine may recover and redeliver the job before the first handler finishes. Fencing prevents the stale handler from changing queue state, but cannot make guest side effects exactly once, so handlers must remain idempotent.
 

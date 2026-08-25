@@ -253,6 +253,20 @@ pub enum ModuleMode {
     Worker,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerConfig {
+    pub concurrency: wr_common::lifecycle::WorkerConcurrency,
+    pub poll_interval: std::time::Duration,
+    pub job_timeout: std::time::Duration,
+    pub max_attempts: wr_common::lifecycle::MaxAttempts,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionMode {
+    Service,
+    Worker(WorkerConfig),
+}
+
 /// A validated secret environment reference. The TOML marker must be
 /// `{ secret = true }`; `false` is not a meaningful runtime state.
 #[derive(Clone, Debug)]
@@ -423,6 +437,32 @@ fn default_worker_max_attempts() -> u32 {
     3
 }
 
+impl ModuleConfig {
+    pub fn execution(&self) -> Result<ExecutionMode> {
+        if self.mode == ModuleMode::Service {
+            return Ok(ExecutionMode::Service);
+        }
+        anyhow::ensure!(
+            self.database,
+            "worker mode requires the module database capability"
+        );
+        Ok(ExecutionMode::Worker(WorkerConfig {
+            concurrency: wr_common::lifecycle::WorkerConcurrency::new(self.worker_concurrency)?,
+            poll_interval: wr_common::lifecycle::PositiveDuration::from_secs(
+                self.worker_poll_interval_secs,
+                "worker poll interval",
+            )?
+            .get(),
+            job_timeout: wr_common::lifecycle::PositiveDuration::from_secs(
+                self.worker_job_timeout_secs,
+                "worker job timeout",
+            )?
+            .get(),
+            max_attempts: wr_common::lifecycle::MaxAttempts::new(self.worker_max_attempts)?,
+        }))
+    }
+}
+
 impl wr_common::config::Validatable for EngineConfig {
     fn validate(&self) -> Result<()> {
         self.validate_inner()
@@ -479,6 +519,19 @@ impl EngineConfig {
                 "deployment.engine_slot is required",
             );
         }
+
+        v.check(
+            self.pool.total_component_instances > 0,
+            "pool.total_component_instances must be > 0",
+        );
+        v.check(
+            self.pool.max_memory_size > 0,
+            "pool.max_memory_size must be > 0",
+        );
+        v.check(
+            self.pool.epoch_tick_interval_ms > 0,
+            "pool.epoch_tick_interval_ms must be > 0",
+        );
 
         if let Some(database) = &self.database {
             v.check(
@@ -558,6 +611,20 @@ impl EngineConfig {
                 }
                 None => {}
             }
+            if let Some(contribution) = module.db_max_connections {
+                v.check(
+                    contribution > 0,
+                    format!("module '{m}' db_max_connections must be > 0"),
+                );
+            }
+            v.check(
+                module.request_timeout_secs > 0,
+                format!("module '{m}' request_timeout_secs must be > 0"),
+            );
+            v.check(
+                module.channel_capacity > 0,
+                format!("module '{m}' channel_capacity must be > 0"),
+            );
             v.check(
                 !module.database || self.database.is_some(),
                 format!("module '{m}' has database = true but no [database] section is configured"),
@@ -685,5 +752,97 @@ url = "postgres://localhost/test"
                 .expect_err("zero database setting must fail");
             assert!(error.to_string().contains("must be > 0"), "{error:#}");
         }
+    }
+
+    #[test]
+    fn operational_zero_values_are_reported_together() {
+        let config: EngineConfig = toml::from_str(
+            r#"
+listen_address = "127.0.0.1:9100"
+max_outbound_body_bytes = 0
+[node]
+proxy_address = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_address = "https://127.0.0.1:9443"
+[node.tls]
+cert_path = "c.crt"
+key_path = "c.key"
+ca_cert_path = "ca.crt"
+[pool]
+total_component_instances = 0
+max_memory_size = 0
+epoch_tick_interval_ms = 0
+[database]
+url = "postgres://localhost/test"
+max_connections = 0
+statement_timeout_secs = 0
+idle_in_transaction_timeout_secs = 0
+[llm]
+provider = "anthropic"
+api_key_env = "TEST_KEY"
+max_tokens_limit = 0
+[[module]]
+name = "orders"
+namespace = "shop"
+version = "1.0.0"
+wasm_path = "Cargo.toml"
+schema_path = "Cargo.toml"
+database = true
+db_max_connections = 0
+request_timeout_secs = 0
+channel_capacity = 0
+"#,
+        )
+        .unwrap();
+        let error = config.validate().expect_err("operational zeros must fail");
+        let message = format!("{error:#}");
+        for field in [
+            "pool.total_component_instances",
+            "pool.max_memory_size",
+            "pool.epoch_tick_interval_ms",
+            "database.max_connections",
+            "database.statement_timeout_secs",
+            "database.idle_in_transaction_timeout_secs",
+            "llm.max_tokens_limit",
+            "db_max_connections",
+            "request_timeout_secs",
+            "channel_capacity",
+        ] {
+            assert!(message.contains(field), "missing {field}: {message}");
+        }
+        assert!(!message.contains("max_outbound_body_bytes"));
+    }
+
+    #[test]
+    fn service_mode_ignores_flat_worker_zero_values() {
+        let config: EngineConfig = toml::from_str(
+            r#"
+listen_address = "127.0.0.1:9100"
+[node]
+proxy_address = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_address = "https://127.0.0.1:9443"
+[node.tls]
+cert_path = "c.crt"
+key_path = "c.key"
+ca_cert_path = "ca.crt"
+[[module]]
+name = "orders"
+namespace = "shop"
+version = "1.0.0"
+wasm_path = "Cargo.toml"
+schema_path = "Cargo.toml"
+worker_concurrency = 0
+worker_poll_interval_secs = 0
+worker_job_timeout_secs = 0
+worker_max_attempts = 0
+"#,
+        )
+        .unwrap();
+        config.validate().expect("service worker keys are ignored");
+        assert!(matches!(
+            config.modules[0].execution().unwrap(),
+            super::ExecutionMode::Service
+        ));
     }
 }

@@ -103,7 +103,7 @@ impl TxLifecycle {
         self.state().phase == TxPhase::Poisoned
     }
 
-    fn must_discard(&self) -> bool {
+    pub(crate) fn must_discard(&self) -> bool {
         self.state().discard
     }
 
@@ -114,12 +114,38 @@ impl TxLifecycle {
     }
 }
 
+pub(crate) enum TxResourceState {
+    Active(Box<deadpool_postgres::Object>),
+    Completed,
+}
+
 /// Host-side state for a WIT `transaction` resource.
 pub struct TxState {
-    /// `None` after a terminal command releases or discards the connection.
-    pub(crate) client: Option<deadpool_postgres::Object>,
+    pub(crate) state: TxResourceState,
     pub(crate) lifecycle: TxLifecycle,
     pub(crate) _count: CounterGuard,
+}
+
+impl TxState {
+    pub(crate) fn client(&self) -> Result<&deadpool_postgres::Object, DbError> {
+        match &self.state {
+            TxResourceState::Active(client) => Ok(client),
+            TxResourceState::Completed => {
+                Err(DbError::Query("transaction already completed".into()))
+            }
+        }
+    }
+
+    pub(crate) fn complete(&mut self) {
+        self.state = TxResourceState::Completed;
+    }
+
+    pub(crate) fn take_active(&mut self) -> Option<deadpool_postgres::Object> {
+        match std::mem::replace(&mut self.state, TxResourceState::Completed) {
+            TxResourceState::Active(client) => Some(*client),
+            TxResourceState::Completed => None,
+        }
+    }
 }
 
 impl Drop for TxState {
@@ -127,22 +153,33 @@ impl Drop for TxState {
         if !self.lifecycle.must_discard() {
             return;
         }
-        let Some(client) = self.client.take() else {
-            return;
-        };
-        drop(deadpool_postgres::Object::take(client));
+        if let Some(client) = self.take_active() {
+            drop(deadpool_postgres::Object::take(client));
+        }
     }
+}
+
+pub(crate) enum CursorOwner {
+    Connection {
+        _lease: Box<deadpool_postgres::Object>,
+    },
+    Transaction {
+        parent: u32,
+        lifecycle: TxLifecycle,
+    },
+}
+
+pub(crate) enum CursorResourceState {
+    Active {
+        stream: Pin<Box<tokio_postgres::RowStream>>,
+        owner: CursorOwner,
+    },
+    Exhausted,
 }
 
 /// Host-side state for a WIT `row-cursor` resource.
 pub struct CursorState {
-    pub(crate) stream: Option<Pin<Box<tokio_postgres::RowStream>>>,
-    /// Keeps the connection alive for non-transactional cursors.
-    pub(crate) conn: Option<deadpool_postgres::Object>,
-    /// Parent table index for a transaction cursor.
-    pub(crate) parent: Option<u32>,
-    pub(crate) lifecycle: Option<TxLifecycle>,
-    pub(crate) done: bool,
+    pub(crate) state: CursorResourceState,
     pub(crate) telemetry: DbSpan,
     pub(crate) _count: CounterGuard,
 }

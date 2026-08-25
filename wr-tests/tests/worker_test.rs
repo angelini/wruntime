@@ -457,7 +457,7 @@ async fn test_worker_pool_dispatches_job_as_http() {
     harness.spawn(1, Duration::from_millis(100), Duration::from_secs(10));
 
     // Wait for the worker to pick up the job and send it as an InboundRequest.
-    let inbound = harness.recv_dispatch(Duration::from_secs(5)).await.unwrap();
+    let mut inbound = harness.recv_dispatch(Duration::from_secs(5)).await.unwrap();
 
     // Verify the request shape.
     assert_eq!(inbound.request.method(), "POST");
@@ -466,7 +466,14 @@ async fn test_worker_pool_dispatches_job_as_http() {
         inbound.request.headers().get("x-wr-job-id").unwrap(),
         &job_id
     );
-    assert_eq!(inbound.request.body().as_ref(), b"job-payload");
+    let body = http_body_util::BodyExt::collect(std::mem::replace(
+        inbound.request.body_mut(),
+        wr_engine::inbound_full(Bytes::new()),
+    ))
+    .await
+    .unwrap()
+    .to_bytes();
+    assert_eq!(body, b"job-payload"[..]);
 
     // Respond with 200 OK.
     WorkerPoolHarness::respond(inbound, 200, "done");
@@ -1059,11 +1066,18 @@ async fn test_worker_pool_preserves_payload_and_job_type() {
     let job_id = harness.insert_job(job_type, &payload, 60, 3).await.unwrap();
     harness.spawn(1, Duration::from_millis(100), Duration::from_secs(10));
 
-    let inbound = harness.recv_dispatch(Duration::from_secs(5)).await.unwrap();
+    let mut inbound = harness.recv_dispatch(Duration::from_secs(5)).await.unwrap();
 
     // Verify exact path and binary payload survive the round-trip.
     assert_eq!(inbound.request.uri().path(), job_type);
-    assert_eq!(inbound.request.body().as_ref(), &payload);
+    let body = http_body_util::BodyExt::collect(std::mem::replace(
+        inbound.request.body_mut(),
+        wr_engine::inbound_full(Bytes::new()),
+    ))
+    .await
+    .unwrap()
+    .to_bytes();
+    assert_eq!(body, payload);
     assert_eq!(
         inbound
             .request

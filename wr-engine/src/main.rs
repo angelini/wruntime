@@ -41,10 +41,11 @@ async fn collect_healthy_module_descriptors(
         if !checked.insert((&m.namespace, &m.name, &m.version)) {
             continue;
         }
-        if let Some(tx) = registry
-            .next_sender(&m.namespace, &m.name, &m.version)
-            .await
-        {
+        let Ok(module_id) = wr_common::identity::ModuleId::parse(&m.namespace, &m.name, &m.version)
+        else {
+            continue;
+        };
+        if let Some(tx) = registry.next_sender(&module_id).await {
             if engine::check_module_health(&tx).await {
                 healthy.push(ModuleDescriptor {
                     name: m.name.clone(),
@@ -126,7 +127,7 @@ async fn async_main() -> Result<()> {
         let reg = registry.clone();
         let addr = config.listen_address.clone();
         let worker_defaults =
-            std::sync::Arc::new(server::WorkerDefaults::from_modules(&config.modules));
+            std::sync::Arc::new(server::WorkerDefaults::from_modules(&config.modules)?);
         let server_db_pool = runner.admin_pool();
         tokio::spawn(async move {
             if let Err(e) = server::serve(&addr, reg, server_db_pool, worker_defaults).await {

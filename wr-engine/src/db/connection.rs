@@ -9,15 +9,13 @@ use crate::state::DbTimeouts;
 /// Uses `batch_execute` so all SET commands travel in a single round-trip.
 pub(crate) async fn prepare_connection(
     client: &deadpool_postgres::Object,
-    schema: &Option<Arc<str>>,
+    schema: &Arc<str>,
     timeouts: &DbTimeouts,
 ) -> Result<(), DbError> {
     use std::fmt::Write;
     let mut sql = String::new();
-    if let Some(s) = schema {
-        let quoted = s.replace('"', "\"\"");
-        write!(sql, "SET search_path = \"{quoted}\"; ").unwrap();
-    }
+    let quoted = schema.replace('"', "\"\"");
+    write!(sql, "SET search_path = \"{quoted}\"; ").unwrap();
     write!(
         sql,
         "SET statement_timeout = '{}s'; SET idle_in_transaction_session_timeout = '{}s';",
@@ -38,7 +36,7 @@ pub(crate) async fn prepare_connection(
 /// (ModuleState contains non-Send WASI streams).
 pub(crate) async fn get_prepared_connection(
     pool: &deadpool_postgres::Pool,
-    schema: &Option<Arc<str>>,
+    schema: &Arc<str>,
     timeouts: &DbTimeouts,
 ) -> Result<deadpool_postgres::Object, DbError> {
     let client = pool

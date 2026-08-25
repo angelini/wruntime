@@ -199,7 +199,7 @@ async fn wasm_llm_stream() -> Result<()> {
         return Ok(());
     };
     let (base_url, _shutdown) = spawn_mock_llm_server(MockLlmMode::Stream {
-        chunks: vec!["Hello".into(), " from".into(), " streaming!".into()],
+        chunks: vec!["Hello".into(), " café".into(), " 🍵".into()],
     })
     .await?;
     let llm = mock_llm_runtime(&base_url);
@@ -213,7 +213,7 @@ async fn wasm_llm_stream() -> Result<()> {
     assert_eq!(resp.status(), 200);
 
     let body = proto::StreamResponse::decode(resp.into_body())?;
-    assert_eq!(body.text, "Hello from streaming!");
+    assert_eq!(body.text, "Hello café 🍵");
     assert_eq!(body.chunk_count, 3);
     assert_eq!(
         body.events,
@@ -226,7 +226,7 @@ async fn wasm_llm_stream() -> Result<()> {
         ]
     );
     assert_eq!(body.input_tokens, 25);
-    assert_eq!(body.output_tokens, 21); // "Hello"(5) + " from"(5) + " streaming!"(11)
+    assert_eq!(body.output_tokens, 16); // byte count from the mocked provider
     assert_eq!(body.stop_reason, proto::StopReason::EndTurn as i32);
     assert!(body.usage_mid_none, "usage() must be None mid-stream");
     assert!(body.usage_present_after, "usage() must be Some after drain");
@@ -257,6 +257,30 @@ async fn wasm_llm_stream_error() -> Result<()> {
     // The stream-level error surfaces as an llm-error, not a silent truncation.
     assert_eq!(body.error_kind, proto::LlmErrorKind::Api as i32);
     assert!(body.error_message.contains("overloaded"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn wasm_llm_invalid_utf8_stream_error() -> Result<()> {
+    let Some(harness) = GuestHarness::load(TestGuest::Llm).await? else {
+        return Ok(());
+    };
+    let (base_url, _shutdown) = spawn_mock_llm_server(MockLlmMode::InvalidUtf8Stream).await?;
+    let state = llm_state(mock_llm_runtime(&base_url));
+
+    let response = harness
+        .dispatch(
+            state,
+            "/Stream",
+            proto::StreamRequest {
+                user_message: "Invalid bytes".into(),
+                with_tools: false,
+            },
+        )
+        .await?;
+    let body = proto::StreamResponse::decode(response.into_body())?;
+    assert_eq!(body.error_kind, proto::LlmErrorKind::Api as i32);
+    assert_eq!(body.error_message, "invalid UTF-8 in SSE frame");
     Ok(())
 }
 

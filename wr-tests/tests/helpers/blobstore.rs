@@ -34,7 +34,11 @@ pub fn blobstore_state(blobstore: Arc<BlobstoreRuntime>) -> ModuleState {
         "http://127.0.0.1:9001".parse().unwrap(),
         http_pool(),
         ModuleServices {
-            blobstore: Some(blobstore),
+            blobstore: Some(wr_engine::state::BlobAccess {
+                runtime: blobstore,
+                prefix: Arc::from("wr/test-ns/"),
+                limits: Default::default(),
+            }),
             ..Default::default()
         },
     )
@@ -52,8 +56,11 @@ pub fn blobstore_state_with_limits(
         "http://127.0.0.1:9001".parse().unwrap(),
         http_pool(),
         ModuleServices {
-            blobstore: Some(blobstore),
-            blob_limits,
+            blobstore: Some(wr_engine::state::BlobAccess {
+                runtime: blobstore,
+                prefix: Arc::from("wr/test-ns/"),
+                limits: blob_limits,
+            }),
             ..Default::default()
         },
     )

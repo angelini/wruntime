@@ -2,7 +2,7 @@ use wasmtime::component::Resource;
 
 use wr_common::pool::pg_error_string;
 
-use super::bindings::{CursorState, TxState};
+use super::bindings::{CursorOwner, CursorResourceState, CursorState, TxResourceState, TxState};
 use super::connection::get_prepared_connection;
 use super::params::PreparedGuestQuery;
 use super::rows::pg_row_to_wit;
@@ -158,11 +158,12 @@ impl Host for ModuleState {
         };
         self.table()
             .push(CursorState {
-                stream: Some(Box::pin(stream)),
-                conn: Some(client),
-                parent: None,
-                lifecycle: None,
-                done: false,
+                state: CursorResourceState::Active {
+                    stream: Box::pin(stream),
+                    owner: CursorOwner::Connection {
+                        _lease: Box::new(client),
+                    },
+                },
                 telemetry,
                 _count: guard,
             })
@@ -190,7 +191,7 @@ impl Host for ModuleState {
             .map_err(|error| DbError::Query(pg_error_string(&error)))?;
         self.table()
             .push(TxState {
-                client: Some(client),
+                state: TxResourceState::Active(Box::new(client)),
                 lifecycle: super::bindings::TxLifecycle::new(),
                 _count: guard,
             })

@@ -227,7 +227,7 @@ async fn guest_pool_recycling_cleans_or_replaces_sessions() {
         .expect("create guest role");
 
     let pool = crate::pool::build_guest_pool(&url, &role, password, 1).expect("guest pool");
-    let schema = Some(Arc::<str>::from("public"));
+    let schema = Arc::<str>::from("public");
     let timeouts = crate::state::DbTimeouts {
         statement_timeout_secs: 7,
         idle_in_transaction_timeout_secs: 11,
@@ -774,7 +774,7 @@ async fn test_transaction_commit() {
         None => return,
     };
 
-    let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
+    let pool = crate::pool::build_pool(&url, 1).expect("build_pool");
     let mut state = ModuleState::new(
         "test".into(),
         "test".into(),
@@ -813,12 +813,18 @@ async fn test_transaction_commit() {
         .await
         .expect("commit");
 
-    // Release the resource first so its connection is returned to the pool.
-    // done=true means no ROLLBACK is issued.
-    HostTransaction::drop(&mut state, tx).await.expect("drop");
+    let completed = HostTransaction::query(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(rep),
+        "SELECT 1".into(),
+        vec![],
+    )
+    .await;
+    assert!(
+        matches!(completed, Err(DbError::Query(message)) if message.contains("already completed"))
+    );
 
-    // After the connection is back in the pool, Host::query reacquires it
-    // and can see the TEMP TABLE (TEMP tables are connection-scoped).
+    // The committed handle remains live, but its size-one pool lease is already free.
     let rows = Host::query(
         &mut state,
         "SELECT val FROM _wr_tx_commit_test".into(),
@@ -828,6 +834,7 @@ async fn test_transaction_commit() {
     .expect("query after commit");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].columns[0].value, PgValue::Int4(42));
+    HostTransaction::drop(&mut state, tx).await.expect("drop");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -839,7 +846,7 @@ async fn test_transaction_rollback() {
         None => return,
     };
 
-    let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
+    let pool = crate::pool::build_pool(&url, 1).expect("build_pool");
     let mut state = ModuleState::new(
         "test".into(),
         "test".into(),
@@ -877,11 +884,18 @@ async fn test_transaction_rollback() {
         .await
         .expect("rollback");
 
-    // Release the resource first so its connection is returned to the pool.
-    HostTransaction::drop(&mut state, tx).await.expect("drop");
+    let completed = HostTransaction::execute(
+        &mut state,
+        wasmtime::component::Resource::new_borrow(rep),
+        "SELECT 1".into(),
+        vec![],
+    )
+    .await;
+    assert!(
+        matches!(completed, Err(DbError::Query(message)) if message.contains("already completed"))
+    );
 
-    // After the connection is back in the pool, Host::query reacquires it
-    // and can see the TEMP TABLE with the rolled-back INSERT absent.
+    // The rolled-back handle remains live, but its size-one pool lease is free.
     let rows = Host::query(
         &mut state,
         "SELECT val FROM _wr_tx_rollback_test".into(),
@@ -890,6 +904,7 @@ async fn test_transaction_rollback() {
     .await
     .expect("query after rollback");
     assert_eq!(rows.len(), 0);
+    HostTransaction::drop(&mut state, tx).await.expect("drop");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1087,7 +1102,7 @@ async fn test_query_stream_with_postgres() {
         None => return,
     };
 
-    let pool = crate::pool::build_pool(&url, 2).expect("build_pool");
+    let pool = crate::pool::build_pool(&url, 1).expect("build_pool");
     let mut state = ModuleState::new(
         "test".into(),
         "test".into(),
@@ -1144,6 +1159,14 @@ async fn test_query_stream_with_postgres() {
     .await
     .expect("batch4");
     assert!(batch4.is_empty());
+
+    // Exhaustion releases the ordinary cursor's size-one pool lease before
+    // the guest drops its WIT handle.
+    let rows = state
+        .query("SELECT 1".into(), vec![])
+        .await
+        .expect("reacquire");
+    assert_eq!(rows.len(), 1);
 
     HostRowCursor::drop(&mut state, cursor).await.expect("drop");
 }

@@ -3,7 +3,7 @@ use wasmtime::component::Resource;
 
 use wr_common::pool::pg_error_string;
 
-use super::bindings::{CursorState, TxState};
+use super::bindings::{CursorOwner, CursorResourceState, CursorState, TxState};
 use super::rows::pg_row_to_wit;
 use super::wruntime::db::database::{DbError, HostRowCursor, Row};
 use crate::state::ModuleState;
@@ -27,12 +27,13 @@ impl HostRowCursor for ModuleState {
         max: u32,
     ) -> Result<Vec<Row>, DbError> {
         validate_batch_size(max)?;
-        if self
-            .table()
-            .get(&self_)
-            .map_err(|error| DbError::Connection(error.to_string()))?
-            .done
-        {
+        if matches!(
+            self.table()
+                .get(&self_)
+                .map_err(|error| DbError::Connection(error.to_string()))?
+                .state,
+            CursorResourceState::Exhausted
+        ) {
             return Ok(vec![]);
         }
 
@@ -43,11 +44,10 @@ impl HostRowCursor for ModuleState {
                     .table()
                     .get_mut(&self_)
                     .map_err(|error| DbError::Connection(error.to_string()))?;
-                let stream = cursor
-                    .stream
-                    .as_mut()
-                    .ok_or_else(|| DbError::Connection("cursor stream is unavailable".into()))?;
-                stream.next().await
+                match &mut cursor.state {
+                    CursorResourceState::Active { stream, .. } => stream.next().await,
+                    CursorResourceState::Exhausted => return Ok(rows),
+                }
             };
             match next {
                 Some(Ok(pg_row)) => match pg_row_to_wit(&pg_row) {
@@ -60,11 +60,17 @@ impl HostRowCursor for ModuleState {
                 },
                 Some(Err(error)) => {
                     let error = DbError::Query(pg_error_string(&error));
-                    if let Some(lifecycle) = self
-                        .table()
-                        .get(&self_)
-                        .ok()
-                        .and_then(|cursor| cursor.lifecycle.clone())
+                    if let Some(lifecycle) =
+                        self.table()
+                            .get(&self_)
+                            .ok()
+                            .and_then(|cursor| match &cursor.state {
+                                CursorResourceState::Active {
+                                    owner: CursorOwner::Transaction { lifecycle, .. },
+                                    ..
+                                } => Some(lifecycle.clone()),
+                                _ => None,
+                            })
                     {
                         lifecycle.mark_postgres_error();
                     }
@@ -92,14 +98,21 @@ impl HostRowCursor for ModuleState {
     }
 
     async fn drop(&mut self, rep: Resource<CursorState>) -> wasmtime::Result<()> {
-        let is_transaction = self.table().get(&rep)?.parent.is_some();
-        if is_transaction {
+        let active_transaction = matches!(
+            &self.table().get(&rep)?.state,
+            CursorResourceState::Active {
+                owner: CursorOwner::Transaction { .. },
+                ..
+            }
+        );
+        if active_transaction {
             self.finish_cursor(rep.rep(), None, true, false)
                 .await
                 .map_err(|error| wasmtime::Error::msg(format!("{error:?}")))?;
         }
         let mut cursor = self.table().delete(rep)?;
-        if !cursor.done {
+        if matches!(cursor.state, CursorResourceState::Active { .. }) {
+            cursor.state = CursorResourceState::Exhausted;
             cursor.telemetry.finish_cancelled();
         }
         Ok(())
@@ -115,25 +128,30 @@ impl ModuleState {
         exhausted: bool,
     ) -> Result<(), DbError> {
         let cursor_resource = Resource::<CursorState>::new_borrow(cursor_rep);
-        let (parent_rep, lifecycle) = {
+        let transaction = {
             let cursor = self
                 .table()
                 .get(&cursor_resource)
                 .map_err(|error| DbError::Connection(error.to_string()))?;
-            if cursor.done {
-                return Ok(());
+            match &cursor.state {
+                CursorResourceState::Exhausted => return Ok(()),
+                CursorResourceState::Active {
+                    owner: CursorOwner::Connection { .. },
+                    ..
+                } => None,
+                CursorResourceState::Active {
+                    owner: CursorOwner::Transaction { parent, lifecycle },
+                    ..
+                } => Some((*parent, lifecycle.clone())),
             }
-            (cursor.parent, cursor.lifecycle.clone())
         };
 
-        let Some(parent_rep) = parent_rep else {
+        let Some((parent_rep, lifecycle)) = transaction else {
             let cursor = self
                 .table()
                 .get_mut(&cursor_resource)
                 .map_err(|error| DbError::Connection(error.to_string()))?;
-            cursor.done = true;
-            cursor.stream.take();
-            cursor.conn.take();
+            cursor.state = CursorResourceState::Exhausted;
             if let Some(error) = first_error.as_ref() {
                 cursor.telemetry.finish_error(error);
             } else if cancelled {
@@ -143,9 +161,6 @@ impl ModuleState {
             }
             return Ok(());
         };
-        let lifecycle = lifecycle.ok_or_else(|| {
-            DbError::Connection("transaction cursor lifecycle is unavailable".into())
-        })?;
 
         if !exhausted {
             loop {
@@ -154,9 +169,9 @@ impl ModuleState {
                         .table()
                         .get_mut(&cursor_resource)
                         .map_err(|error| DbError::Connection(error.to_string()))?;
-                    match cursor.stream.as_mut() {
-                        Some(stream) => stream.next().await,
-                        None => None,
+                    match &mut cursor.state {
+                        CursorResourceState::Active { stream, .. } => stream.next().await,
+                        CursorResourceState::Exhausted => None,
                     }
                 };
                 match next {
@@ -171,13 +186,21 @@ impl ModuleState {
                 }
             }
         }
-        // Drop the completed response receiver before issuing the protocol
-        // barrier so the connection driver can advance to the next request.
-        self.table()
-            .get_mut(&cursor_resource)
-            .map_err(|error| DbError::Connection(error.to_string()))?
-            .stream
-            .take();
+
+        let owner = {
+            let cursor = self
+                .table()
+                .get_mut(&cursor_resource)
+                .map_err(|error| DbError::Connection(error.to_string()))?;
+            match std::mem::replace(&mut cursor.state, CursorResourceState::Exhausted) {
+                CursorResourceState::Active { stream, owner } => {
+                    drop(stream);
+                    owner
+                }
+                CursorResourceState::Exhausted => return Ok(()),
+            }
+        };
+        debug_assert!(matches!(owner, CursorOwner::Transaction { .. }));
 
         let parent_resource = Resource::<TxState>::new_borrow(parent_rep);
         let synchronized = {
@@ -185,27 +208,25 @@ impl ModuleState {
                 .table()
                 .get(&parent_resource)
                 .map_err(|error| DbError::Connection(error.to_string()))?;
-            let client = parent.client.as_ref().ok_or_else(|| {
-                DbError::Connection("transaction connection is unavailable".into())
-            })?;
-            client.simple_query("").await
+            parent.client()?.simple_query("").await
         };
         if let Err(error) = synchronized {
             lifecycle.mark_discard();
-            return Err(first_error.unwrap_or_else(|| {
-                DbError::Connection(format!(
+            if first_error.is_none() {
+                first_error = Some(DbError::Connection(format!(
                     "failed to synchronize transaction cursor: {}",
                     pg_error_string(&error)
-                ))
-            }));
+                )));
+            }
         }
 
-        self.table()
+        let remove_result = self
+            .table()
             .remove_child(cursor_resource, parent_resource)
-            .map_err(|error| {
-                lifecycle.mark_discard();
-                DbError::Connection(error.to_string())
-            })?;
+            .map_err(|error| DbError::Connection(error.to_string()));
+        if remove_result.is_err() {
+            lifecycle.mark_discard();
+        }
         lifecycle.release_cursor();
 
         let cursor_resource = Resource::<CursorState>::new_borrow(cursor_rep);
@@ -213,14 +234,17 @@ impl ModuleState {
             .table()
             .get_mut(&cursor_resource)
             .map_err(|error| DbError::Connection(error.to_string()))?;
-        cursor.done = true;
-        cursor.stream.take();
         if let Some(error) = first_error.as_ref() {
             cursor.telemetry.finish_error(error);
         } else if cancelled {
             cursor.telemetry.finish_cancelled();
         } else {
             cursor.telemetry.finish_success();
+        }
+
+        remove_result?;
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }

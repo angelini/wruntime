@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use deadpool_postgres::Pool;
+use http_body_util::BodyExt as _;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
@@ -424,7 +425,7 @@ async fn dispatch_job(pool: &Pool, tx: &ModuleTx, job: ClaimedJob, job_timeout: 
         .header("x-wr-job-id", &job.job_id)
         .header("x-wr-timeout", job_timeout.as_secs().to_string())
         .header("content-type", "application/x-protobuf")
-        .body(Bytes::from(job.payload))
+        .body(crate::inbound_full(Bytes::from(job.payload)))
     {
         Ok(r) => r,
         Err(e) => {
@@ -450,27 +451,41 @@ async fn dispatch_job(pool: &Pool, tx: &ModuleTx, job: ClaimedJob, job_timeout: 
         return;
     }
 
-    // Wait for response with timeout.
-    match tokio::time::timeout(job_timeout, resp_rx).await {
-        Ok(Ok(resp)) if resp.status().is_success() => {
-            let body = resp.into_body();
-            match complete_job(pool, &job_id, claim_id, body.as_ref()).await {
+    // Worker results are persisted bytes, so this boundary deliberately buffers
+    // the streamed guest response under the existing job timeout.
+    let response = tokio::time::timeout(job_timeout, async {
+        let response = resp_rx
+            .await
+            .map_err(|_| "module dropped response".to_string())?;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|error| format!("response body: {error}"))?
+            .to_bytes();
+        Ok::<_, String>((status, body))
+    })
+    .await;
+
+    match response {
+        Ok(Ok((status, body))) if status.is_success() => {
+            match complete_job(pool, &job_id, claim_id, &body).await {
                 Ok(Finalization::Applied) => {}
                 Ok(Finalization::Stale) => warn!(job_id = %job_id, "ignored stale job completion"),
                 Err(e) => error!(job_id = %job_id, error = %e, "failed to mark job complete"),
             }
         }
-        Ok(Ok(resp)) => {
-            let status = resp.status().as_u16();
-            let body = String::from_utf8_lossy(resp.body().as_ref()).to_string();
+        Ok(Ok((status, body))) => {
+            let status = status.as_u16();
+            let body = String::from_utf8_lossy(&body);
             let msg = format!("HTTP {status}: {body}");
             warn!(job_id = %job_id, status, "job failed");
             finalize_failure(pool, &job_id, claim_id, &msg).await;
         }
-        Ok(Err(_)) => {
-            let msg = "module dropped response";
-            warn!(job_id = %job_id, msg);
-            finalize_failure(pool, &job_id, claim_id, msg).await;
+        Ok(Err(message)) => {
+            warn!(job_id = %job_id, %message);
+            finalize_failure(pool, &job_id, claim_id, &message).await;
         }
         Err(_) => {
             let msg = format!("job timed out after {}s", job_timeout.as_secs());

@@ -95,21 +95,15 @@ fn normalize_key(key: &str) -> Option<String> {
 
 /// Prepend the namespace prefix to a key after normalizing it. Returns an
 /// error if the key attempts path traversal.
-fn scoped_key(prefix: &Option<Arc<str>>, key: &str) -> Result<String, BlobError> {
+fn scoped_key(prefix: &Arc<str>, key: &str) -> Result<String, BlobError> {
     let clean = normalize_key(key)
         .ok_or_else(|| BlobError::AccessDenied("path traversal in key".into()))?;
-    match prefix {
-        Some(p) => Ok(format!("{p}{clean}")),
-        None => Ok(clean),
-    }
+    Ok(format!("{prefix}{clean}"))
 }
 
 /// Strip the namespace prefix from a key returned by S3.
-fn unscoped_key(prefix: &Option<Arc<str>>, key: &str) -> String {
-    match prefix {
-        Some(p) => key.strip_prefix(&**p).unwrap_or(key).to_string(),
-        None => key.to_string(),
-    }
+fn unscoped_key(prefix: &Arc<str>, key: &str) -> String {
+    key.strip_prefix(&**prefix).unwrap_or(key).to_string()
 }
 
 impl ModuleState {
@@ -302,7 +296,7 @@ mod tests {
 
     #[test]
     fn test_scoped_key_with_prefix() {
-        let prefix = Some(Arc::<str>::from("wr/ecommerce/"));
+        let prefix = Arc::<str>::from("wr/ecommerce/");
         assert_eq!(
             scoped_key(&prefix, "file.txt").unwrap(),
             "wr/ecommerce/file.txt"
@@ -311,35 +305,35 @@ mod tests {
 
     #[test]
     fn test_scoped_key_without_prefix() {
-        assert_eq!(scoped_key(&None, "file.txt").unwrap(), "file.txt");
+        assert_eq!(scoped_key(&Arc::from(""), "file.txt").unwrap(), "file.txt");
     }
 
     #[test]
     fn test_scoped_key_rejects_traversal() {
-        let prefix = Some(Arc::<str>::from("wr/ecommerce/"));
+        let prefix = Arc::<str>::from("wr/ecommerce/");
         assert!(scoped_key(&prefix, "../../other/secret").is_err());
     }
 
     #[test]
     fn test_scoped_key_normalizes_dots() {
-        let prefix = Some(Arc::<str>::from("wr/ecommerce/"));
+        let prefix = Arc::<str>::from("wr/ecommerce/");
         assert_eq!(scoped_key(&prefix, "a/../b").unwrap(), "wr/ecommerce/b");
     }
 
     #[test]
     fn test_unscoped_key_strips_prefix() {
-        let prefix = Some(Arc::<str>::from("wr/ecommerce/"));
+        let prefix = Arc::<str>::from("wr/ecommerce/");
         assert_eq!(unscoped_key(&prefix, "wr/ecommerce/file.txt"), "file.txt");
     }
 
     #[test]
     fn test_unscoped_key_without_prefix() {
-        assert_eq!(unscoped_key(&None, "file.txt"), "file.txt");
+        assert_eq!(unscoped_key(&Arc::from(""), "file.txt"), "file.txt");
     }
 
     #[test]
     fn test_unscoped_key_missing_prefix_is_passthrough() {
-        let prefix = Some(Arc::<str>::from("wr/other/"));
+        let prefix = Arc::<str>::from("wr/other/");
         assert_eq!(unscoped_key(&prefix, "file.txt"), "file.txt");
     }
 

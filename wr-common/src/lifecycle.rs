@@ -148,6 +148,11 @@ impl PositiveDuration {
             NonZeroU64::new(value).ok_or_else(|| anyhow::anyhow!("{label} must be > 0"))?;
         Ok(Self(Duration::from_secs(seconds.get())))
     }
+    pub fn from_millis(value: u64, label: &str) -> Result<Self> {
+        let milliseconds =
+            NonZeroU64::new(value).ok_or_else(|| anyhow::anyhow!("{label} must be > 0"))?;
+        Ok(Self(Duration::from_millis(milliseconds.get())))
+    }
     pub const fn get(self) -> Duration {
         self.0
     }
@@ -163,6 +168,14 @@ mod tests {
         assert!(JobTimeoutSecs::new(0).is_err());
         assert!(ScheduleIntervalSecs::new(0).is_err());
         assert!(WorkerConcurrency::new(0).is_err());
+        assert!(PositiveDuration::from_secs(0, "seconds").is_err());
+        assert!(PositiveDuration::from_millis(0, "milliseconds").is_err());
+        assert_eq!(
+            PositiveDuration::from_millis(25, "milliseconds")
+                .unwrap()
+                .get(),
+            Duration::from_millis(25)
+        );
         assert!(JobState::try_from("claimed").is_err());
         assert!(AttemptCount::new(4)
             .validate(MaxAttempts::new(3).unwrap())

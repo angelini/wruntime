@@ -219,12 +219,33 @@ pub enum ResourceKind {
 /// consumes and drops the never-inserted state — a failed push self-corrects the
 /// count. Never construct one except via `ResourceAccounting::try_track`.
 pub struct CounterGuard {
-    counter: Arc<AtomicU32>,
+    counters: Arc<ResourceCounters>,
+    kind: ResourceKind,
 }
 
 impl Drop for CounterGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Relaxed);
+        self.counters
+            .counter(self.kind)
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct ResourceCounters {
+    spans: AtomicU32,
+    db_transactions: AtomicU32,
+    db_cursors: AtomicU32,
+    llm_streams: AtomicU32,
+}
+
+impl ResourceCounters {
+    fn counter(&self, kind: ResourceKind) -> &AtomicU32 {
+        match kind {
+            ResourceKind::Span => &self.spans,
+            ResourceKind::DbTransaction => &self.db_transactions,
+            ResourceKind::DbCursor => &self.db_cursors,
+            ResourceKind::LlmStream => &self.llm_streams,
+        }
     }
 }
 
@@ -240,31 +261,31 @@ impl Drop for CounterGuard {
 /// `try_track` cannot race.
 #[derive(Clone)]
 pub struct ResourceAccounting {
-    spans: Arc<AtomicU32>,
-    db_transactions: Arc<AtomicU32>,
-    db_cursors: Arc<AtomicU32>,
-    llm_streams: Arc<AtomicU32>,
+    counters: Arc<ResourceCounters>,
     limits: ResourceLimits,
 }
 
 impl ResourceAccounting {
     pub fn new(limits: ResourceLimits) -> Self {
         Self {
-            spans: Arc::new(AtomicU32::new(0)),
-            db_transactions: Arc::new(AtomicU32::new(0)),
-            db_cursors: Arc::new(AtomicU32::new(0)),
-            llm_streams: Arc::new(AtomicU32::new(0)),
+            counters: Arc::new(ResourceCounters {
+                spans: AtomicU32::new(0),
+                db_transactions: AtomicU32::new(0),
+                db_cursors: AtomicU32::new(0),
+                llm_streams: AtomicU32::new(0),
+            }),
             limits,
         }
     }
 
-    fn slot(&self, kind: ResourceKind) -> (&Arc<AtomicU32>, u32) {
-        match kind {
-            ResourceKind::Span => (&self.spans, self.limits.max_spans),
-            ResourceKind::DbTransaction => (&self.db_transactions, self.limits.max_db_transactions),
-            ResourceKind::DbCursor => (&self.db_cursors, self.limits.max_db_cursors),
-            ResourceKind::LlmStream => (&self.llm_streams, self.limits.max_llm_streams),
-        }
+    fn slot(&self, kind: ResourceKind) -> (&AtomicU32, u32) {
+        let cap = match kind {
+            ResourceKind::Span => self.limits.max_spans,
+            ResourceKind::DbTransaction => self.limits.max_db_transactions,
+            ResourceKind::DbCursor => self.limits.max_db_cursors,
+            ResourceKind::LlmStream => self.limits.max_llm_streams,
+        };
+        (self.counters.counter(kind), cap)
     }
 
     /// Reserve one live slot for `kind`. On success increments the live-count and
@@ -279,32 +300,54 @@ impl ResourceAccounting {
         }
         counter.fetch_add(1, Ordering::Relaxed);
         Some(CounterGuard {
-            counter: counter.clone(),
+            counters: self.counters.clone(),
+            kind,
         })
     }
+}
+
+#[derive(Clone)]
+pub struct DbAccess {
+    pub pool: Arc<Pool>,
+    pub schema: Arc<str>,
+    pub timeouts: DbTimeouts,
+    pub telemetry_include_query_text: bool,
+}
+
+#[derive(Clone)]
+pub struct BlobAccess {
+    pub runtime: Arc<BlobstoreRuntime>,
+    pub prefix: Arc<str>,
+    pub limits: BlobstoreLimits,
+}
+
+#[derive(Clone)]
+pub struct LlmAccess {
+    pub runtime: Arc<LlmRuntime>,
 }
 
 /// Optional services and capabilities for a module.
 /// All fields default to `None`/no-op, so tests can simply use `Default::default()`.
 pub struct ModuleServices {
-    /// Shared connection pool, present when the module has DB access enabled.
+    pub db: Option<DbAccess>,
+    pub blobstore: Option<BlobAccess>,
+    pub llm: Option<LlmAccess>,
+    #[doc(hidden)]
     pub db_pool: Option<Arc<Pool>>,
-    /// Postgres schema name for this module (`wr__{namespace}__{name}`).
-    /// Set when DB access is enabled; used to scope all queries to the module's schema.
+    #[doc(hidden)]
     pub db_schema: Option<Arc<str>>,
-    /// Timeout configuration for guest DB connections.
+    #[doc(hidden)]
     pub db_timeouts: DbTimeouts,
-    /// Whether host DB spans may include whitespace-normalized statement text.
+    #[doc(hidden)]
     pub db_telemetry_include_query_text: bool,
-    /// Shared S3-compatible blobstore client, present when the module has blobstore access enabled.
-    pub blobstore: Option<Arc<BlobstoreRuntime>>,
-    /// S3 key prefix for namespace isolation (e.g. `wr/ecommerce/`).
-    /// Set when blobstore access is enabled; transparently prepended to all object keys.
+    #[doc(hidden)]
+    pub blob_runtime: Option<Arc<BlobstoreRuntime>>,
+    #[doc(hidden)]
     pub blob_prefix: Option<Arc<str>>,
-    /// Host-enforced blobstore size/list ceilings. Defaults in tests.
+    #[doc(hidden)]
     pub blob_limits: BlobstoreLimits,
-    /// Shared LLM inference client, present when the module has LLM access enabled.
-    pub llm: Option<Arc<LlmRuntime>>,
+    #[doc(hidden)]
+    pub llm_runtime: Option<Arc<LlmRuntime>>,
     /// WASI filesystem mode (e.g. `FsMode::Tempdir`).
     pub fs: Option<FsMode>,
     /// Resolved environment variables for this module (plain + decrypted secrets).
@@ -324,14 +367,17 @@ pub struct ModuleServices {
 impl Default for ModuleServices {
     fn default() -> Self {
         Self {
+            db: None,
+            blobstore: None,
+            llm: None,
             db_pool: None,
             db_schema: None,
             db_timeouts: DbTimeouts::default(),
             db_telemetry_include_query_text: false,
-            blobstore: None,
+            blob_runtime: None,
             blob_prefix: None,
             blob_limits: BlobstoreLimits::default(),
-            llm: None,
+            llm_runtime: None,
             fs: None,
             env_vars: Arc::new(std::collections::HashMap::new()),
             active_span: tracing::Span::none(),
@@ -343,23 +389,30 @@ impl Default for ModuleServices {
 
 /// DB capability: pool, schema, timeouts, and transaction/cursor accounting.
 pub(crate) struct DbCapability {
-    pub(crate) pool: Arc<Pool>,
-    pub(crate) schema: Option<Arc<str>>,
-    pub(crate) timeouts: DbTimeouts,
+    access: DbAccess,
     pub(crate) accounting: ResourceAccounting,
 }
 
-/// Blobstore capability: S3 runtime + namespace key prefix + host-enforced size/list limits.
-pub(crate) struct BlobstoreCapability {
-    pub(crate) runtime: Arc<BlobstoreRuntime>,
-    pub(crate) prefix: Option<Arc<str>>,
-    pub(crate) limits: BlobstoreLimits,
+impl std::ops::Deref for DbCapability {
+    type Target = DbAccess;
+
+    fn deref(&self) -> &Self::Target {
+        &self.access
+    }
 }
 
 /// LLM capability: inference runtime and stream accounting.
 pub(crate) struct LlmCapability {
-    pub(crate) runtime: Arc<LlmRuntime>,
+    access: LlmAccess,
     pub(crate) accounting: ResourceAccounting,
+}
+
+impl std::ops::Deref for LlmCapability {
+    type Target = LlmAccess;
+
+    fn deref(&self) -> &Self::Target {
+        &self.access
+    }
 }
 
 /// Tracing capability (always present): request-level span, guest span stack,
@@ -378,10 +431,9 @@ pub(crate) struct FsCapability {
 
 struct ModuleCapabilities {
     db: Option<DbCapability>,
-    blobstore: Option<BlobstoreCapability>,
+    blobstore: Option<BlobAccess>,
     llm: Option<LlmCapability>,
     tracing: TracingCapability,
-    db_telemetry_include_query_text: bool,
     _fs: FsCapability,
 }
 
@@ -416,23 +468,44 @@ impl ModuleState {
         };
         let outbound_parent = Arc::new(std::sync::Mutex::new(None));
         let accounting = ResourceAccounting::new(services.limits);
-        let db = match (services.db_pool, services.db_schema) {
-            (Some(pool), Some(schema)) => Some(DbCapability {
+        let db_access = match (services.db, services.db_pool, services.db_schema) {
+            (Some(access), None, None) => Some(access),
+            (None, Some(pool), Some(schema)) => Some(DbAccess {
                 pool,
-                schema: Some(schema),
+                schema,
                 timeouts: services.db_timeouts,
-                accounting: accounting.clone(),
+                telemetry_include_query_text: services.db_telemetry_include_query_text,
             }),
-            (None, None) => None,
-            _ => anyhow::bail!("database capability requires both pool and schema"),
+            (None, None, None) => None,
+            _ => anyhow::bail!("database capability requires one complete scoped bundle"),
         };
-        let blobstore = services.blobstore.map(|runtime| BlobstoreCapability {
-            runtime,
-            prefix: services.blob_prefix,
-            limits: services.blob_limits,
+        let blob_access = match (
+            services.blobstore,
+            services.blob_runtime,
+            services.blob_prefix,
+        ) {
+            (Some(access), None, None) => Some(access),
+            (None, Some(runtime), Some(prefix)) => Some(BlobAccess {
+                runtime,
+                prefix,
+                limits: services.blob_limits,
+            }),
+            (None, None, None) => None,
+            _ => anyhow::bail!("blobstore capability requires one complete scoped bundle"),
+        };
+        let llm_access = match (services.llm, services.llm_runtime) {
+            (Some(access), None) => Some(access),
+            (None, Some(runtime)) => Some(LlmAccess { runtime }),
+            (None, None) => None,
+            _ => anyhow::bail!("LLM capability requires one complete bundle"),
+        };
+        let db = db_access.map(|access| DbCapability {
+            access,
+            accounting: accounting.clone(),
         });
-        let llm = services.llm.map(|runtime| LlmCapability {
-            runtime,
+        let blobstore = blob_access;
+        let llm = llm_access.map(|access| LlmCapability {
+            access,
             accounting: accounting.clone(),
         });
         Ok(Self {
@@ -457,7 +530,6 @@ impl ModuleState {
                     outbound_parent,
                     accounting,
                 },
-                db_telemetry_include_query_text: services.db_telemetry_include_query_text,
                 _fs: FsCapability { _root: fs_root },
             },
         })
@@ -470,7 +542,7 @@ impl ModuleState {
             .ok_or_else(|| DbError::Connection("no database configured for this module".into()))
     }
 
-    pub(crate) fn blobstore(&mut self) -> Result<&mut BlobstoreCapability, BlobError> {
+    pub(crate) fn blobstore(&mut self) -> Result<&mut BlobAccess, BlobError> {
         self.capabilities
             .blobstore
             .as_mut()
@@ -489,8 +561,11 @@ impl ModuleState {
             self.capabilities
                 .db
                 .as_ref()
-                .and_then(|database| database.schema.clone()),
-            self.capabilities.db_telemetry_include_query_text,
+                .map(|database| database.schema.clone()),
+            self.capabilities
+                .db
+                .as_ref()
+                .is_some_and(|database| database.telemetry_include_query_text),
         )
     }
 
@@ -523,5 +598,29 @@ impl WasiHttpView for ModuleState {
             table: &mut self.table,
             hooks: &mut self.hooks,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_counters_share_one_allocation_and_release_exactly() {
+        let accounting = ResourceAccounting::new(ResourceLimits {
+            max_spans: 1,
+            max_db_transactions: 1,
+            max_db_cursors: 0,
+            max_llm_streams: 1,
+        });
+        let clone = accounting.clone();
+        assert!(Arc::ptr_eq(&accounting.counters, &clone.counters));
+
+        let span = accounting.try_track(ResourceKind::Span).unwrap();
+        assert!(clone.try_track(ResourceKind::Span).is_none());
+        assert!(accounting.try_track(ResourceKind::DbCursor).is_none());
+        assert!(accounting.try_track(ResourceKind::DbTransaction).is_some());
+        drop(span);
+        assert!(clone.try_track(ResourceKind::Span).is_some());
     }
 }
