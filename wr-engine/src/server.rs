@@ -513,7 +513,7 @@ mod tests {
 
     fn unique_prefix() -> String {
         format!(
-            "srv_{}",
+            "srv-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
