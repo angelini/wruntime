@@ -15,6 +15,13 @@ use super::db::manager_pool;
 use super::proxy::{register_module_raw, EngineSpec, ModuleSpec, TEST_SELF_PEER};
 use super::wasm::minimal_file_descriptor_set;
 
+fn test_secret_crypto() -> Arc<wr_manager::crypto::SecretCrypto> {
+    let key = wr_manager::crypto::SecretCrypto::generate_random_password();
+    Arc::new(
+        wr_manager::crypto::SecretCrypto::from_hex(&key).expect("generated test encryption key"),
+    )
+}
+
 async fn test_cluster_handle() -> Result<std::sync::Arc<wr_manager::cluster::ClusterHandle>> {
     let gossip_port = {
         let tmp = TcpListener::bind("127.0.0.1:0").await?;
@@ -38,13 +45,7 @@ async fn test_cluster_handle() -> Result<std::sync::Arc<wr_manager::cluster::Clu
 pub async fn start_manager(pool: deadpool_postgres::Pool) -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    // Use a fixed test key (32 bytes = 64 hex chars)
-    let crypto = std::sync::Arc::new(
-        wr_manager::crypto::SecretCrypto::from_hex(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        )
-        .expect("test encryption key"),
-    );
+    let crypto = test_secret_crypto();
     let cluster = test_cluster_handle().await?;
     tokio::spawn(
         Server::builder()
@@ -277,12 +278,7 @@ pub async fn start_manager_with_monitor(
     pool: deadpool_postgres::Pool,
     timeout_secs: u64,
 ) -> Result<String> {
-    let crypto = std::sync::Arc::new(
-        wr_manager::crypto::SecretCrypto::from_hex(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        )
-        .expect("test encryption key"),
-    );
+    let crypto = test_secret_crypto();
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let cluster = test_cluster_handle().await?;
@@ -411,12 +407,7 @@ async fn start_manager_cluster_inner(
 
         gossip_addrs.push(gossip_addr_str);
 
-        let crypto = Arc::new(
-            wr_manager::crypto::SecretCrypto::from_hex(
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            )
-            .expect("test encryption key"),
-        );
+        let crypto = test_secret_crypto();
 
         let manager = Manager::new(pool.clone(), crypto, cluster.clone());
 

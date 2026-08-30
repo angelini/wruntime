@@ -1,0 +1,13 @@
+title = "Wruntime secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated project artifacts"
+paths = [
+  '''(^|/)target/''',
+  '''^certs/''',
+  '''(^|/)\.venv/''',
+  '''^dev/observability/data/''',
+]

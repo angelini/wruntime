@@ -124,12 +124,12 @@ build-multi-node:
 
 # Run the full local multi-node topology (requires Postgres — see `just dev-up`)
 multi-node: build-multi-node build
-    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
     DB_URL={{db_url_example}} bash examples/multi-node/run.sh
 
 # Verify a cross-node echo request, then stop the local topology
 multi-node-inline: build-multi-node build
-    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
     DB_URL={{db_url_example}} bash examples/multi-node/run.sh --inline
 
 # Start only node A proxy (listens :9001, peer TLS :9443)
@@ -312,12 +312,12 @@ build-ecommerce:
 
 # Run the full ecommerce example (requires Postgres — see `just dev-up`)
 ecommerce: build-ecommerce build
-    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
     DB_URL={{db_url_example}} bash examples/ecommerce/run.sh
 
 # Run the ecommerce example inline (single invocation, exits on failure)
 ecommerce-inline: build-ecommerce build
-    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
     DB_URL={{db_url_example}} bash examples/ecommerce/run.sh --inline
 
 # Run ecommerce inline and fail if any warning is emitted
@@ -345,12 +345,12 @@ build-stockmarket:
 # Run the full stockmarket example (requires Postgres + RustFS S3 — see `just dev-up`)
 # Pass exchanges=N to run N exchange engines in parallel (default: 1)
 stockmarket exchanges="1": build-stockmarket build
-    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
     DB_URL={{db_url_example}} bash examples/stockmarket/run.sh --exchanges {{exchanges}}
 
 # Run the stockmarket example inline (single invocation, exits on failure)
 stockmarket-inline exchanges="1": build-stockmarket build
-    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
     DB_URL={{db_url_example}} bash examples/stockmarket/run.sh --inline --exchanges {{exchanges}}
 
 # ── Codegen Example ───────────────────────────────────────────────────────────
@@ -361,12 +361,12 @@ build-codegen:
 
 # Run the full codegen example (requires Postgres + RustFS S3 — see `just dev-up`)
 codegen: build-codegen build
-    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
     DB_URL={{db_url_example}} bash examples/codegen/run.sh
 
 # Run the codegen example inline (single invocation, exits on failure)
 codegen-inline: build-codegen build
-    WRT_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
     DB_URL={{db_url_example}} bash examples/codegen/run.sh --inline
 
 # ── Dev Workflow ──────────────────────────────────────────────────────────────

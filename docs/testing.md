@@ -103,6 +103,13 @@ known-hosts file defaults to `~/.ssh/wruntime-e2e-known_hosts` and can be
 overridden with `WRT_DEPLOY_E2E_KNOWN_HOSTS`. Never pass these values in a
 checked-in config or transcript.
 
+The Proxmox HTTPS client uses the Debian/Ubuntu OS CA bundle at
+`/etc/ssl/certs/ca-certificates.crt` instead of Requests' bundled `certifi`
+roots. Install the private Proxmox CA under `/usr/local/share/ca-certificates/`
+and run `sudo update-ca-certificates` before preflight. Set `PVE_CA_BUNDLE` to
+an alternate bundle path on other operating systems or runner layouts; TLS
+verification is never disabled.
+
 Each backend starts and ends with snapshot rollback and normally takes several
 minutes plus cross-compilation time. Per-task output, lifecycle state JSON,
 remote diagnostics, bundle inspections, and the final reset result are retained

@@ -3,7 +3,7 @@ name            = "wruntime-deployment-e2e-tools"
 version         = "0.1.0"
 description     = "Python tooling for wruntime deployment lifecycle validation"
 requires-python = ">=3.12"
-dependencies    = ["proxmoxer==2.3.0"]
+dependencies    = ["proxmoxer==2.3.0", "requests>=2.34.2"]
 
 [tool.uv]
 package = false

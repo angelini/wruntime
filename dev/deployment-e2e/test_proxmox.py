@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("proxmox.py")
 CONFIG_PATH = Path(__file__).parents[1] / "deployment-e2e.toml"
@@ -73,6 +75,23 @@ def marker(target):
 class ProviderTests(unittest.TestCase):
     def provider(self, fake, marker_reader=marker, **kwargs):
         return pve.LifecycleProvider(config(), fake, marker_reader, sleep=lambda _: None, **kwargs)
+
+    def test_ca_bundle_defaults_to_system_path_and_accepts_override(self):
+        with tempfile.NamedTemporaryFile() as default_bundle:
+            with (
+                mock.patch.object(pve, "DEFAULT_CA_BUNDLE", Path(default_bundle.name)),
+                mock.patch.dict(os.environ, {"PVE_CA_BUNDLE": ""}),
+            ):
+                self.assertEqual(pve.ca_bundle_path(), Path(default_bundle.name))
+
+        with tempfile.NamedTemporaryFile() as override_bundle:
+            with mock.patch.dict(os.environ, {"PVE_CA_BUNDLE": override_bundle.name}):
+                self.assertEqual(pve.ca_bundle_path(), Path(override_bundle.name))
+
+    def test_ca_bundle_must_exist(self):
+        with mock.patch.dict(os.environ, {"PVE_CA_BUNDLE": "/missing/proxmox-ca-bundle.pem"}):
+            with self.assertRaisesRegex(pve.ProviderError, "PVE_CA_BUNDLE"):
+                pve.ca_bundle_path()
 
     def test_successful_stop_rollback_start_task_order(self):
         fake = FakeClient()

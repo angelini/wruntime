@@ -22,6 +22,7 @@ from typing import Any, Callable, Protocol
 ENV_KEYS = ("PVE_HOST", "PVE_USER", "PVE_TOKEN_NAME", "PVE_TOKEN_VALUE")
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "deployment-e2e.toml"
 DEFAULT_KNOWN_HOSTS = Path("~/.ssh/wruntime-e2e-known_hosts").expanduser()
+DEFAULT_CA_BUNDLE = Path("/etc/ssl/certs/ca-certificates.crt")
 API_TIMEOUT = 15
 TASK_TIMEOUT = 180
 STATE_TIMEOUT = 120
@@ -145,8 +146,18 @@ def load_config(path: Path) -> Config:
     return Config(provider, proxmox_node, snapshot, image, lock_file, workdir, node_id, (targets[0], targets[1]))
 
 
+def ca_bundle_path() -> Path:
+    path = Path(os.environ.get("PVE_CA_BUNDLE") or DEFAULT_CA_BUNDLE).expanduser()
+    if not path.is_file():
+        raise ProviderError(
+            f"Proxmox CA bundle is unavailable at {path}; install the CA into the OS trust store "
+            "or set PVE_CA_BUNDLE"
+        )
+    return path
+
+
 class ProxmoxerClient:
-    def __init__(self, host: str, user: str, token_name: str, token_value: str):
+    def __init__(self, host: str, user: str, token_name: str, token_value: str, ca_bundle: Path):
         try:
             proxmoxer = importlib.import_module("proxmoxer")
         except ImportError as exc:
@@ -157,7 +168,7 @@ class ProxmoxerClient:
             token_name=token_name,
             token_value=token_value,
             backend="https",
-            verify_ssl=True,
+            verify_ssl=str(ca_bundle),
             timeout=API_TIMEOUT,
         )
 
@@ -350,7 +361,7 @@ def build_live_client() -> tuple[ProxmoxerClient, tuple[str, ...]]:
     if missing:
         raise ProviderError(f"missing required environment variables: {', '.join(missing)}")
     values = tuple(os.environ[name] for name in ENV_KEYS)
-    return ProxmoxerClient(values[0], values[1], values[2], values[3]), (values[3],)
+    return ProxmoxerClient(values[0], values[1], values[2], values[3], ca_bundle_path()), (values[3],)
 
 
 def main(argv: list[str] | None = None) -> int:
