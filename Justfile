@@ -261,6 +261,28 @@ test-wasm-one target: build-test-guests
     WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
     cargo test -p wr-tests --test "$test_target"
 
+# Run pure deployment E2E Python tests in the locked uv project
+deployment-e2e-python-test:
+    uv run --project dev/deployment-e2e --locked python -m unittest -v \
+        dev/deployment-e2e/test_proxmox.py \
+        dev/deployment-e2e/test_assert_cluster.py
+
+# Verify the protected Proxmox deployment targets without mutating them
+deployment-e2e-preflight:
+    uv run --project dev/deployment-e2e --locked python dev/deployment-e2e/proxmox.py preflight
+
+# Run both deployment lifecycle backends serially against disposable VMs
+deployment-e2e:
+    bash dev/validate-deployment-lifecycle.sh
+
+# Run only the systemd deployment lifecycle backend
+deployment-e2e-systemd:
+    bash dev/validate-deployment-lifecycle.sh --backend systemd
+
+# Run only the Docker deployment lifecycle backend
+deployment-e2e-docker:
+    bash dev/validate-deployment-lifecycle.sh --backend docker
+
 # Run the comprehensive validation suite (format, lints, WASM, tests, E2E examples)
 [positional-arguments]
 validate-all *args:

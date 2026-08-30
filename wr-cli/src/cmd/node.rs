@@ -939,8 +939,12 @@ fn node_systemd_start_command(engine_slots: &[String]) -> String {
     )
 }
 
+const NODE_COMPOSE_PROJECT: &str = "wruntime-node";
+
 fn node_docker_start_command(workdir: &str) -> String {
-    format!("cd {workdir}/wr-node/current && sudo docker compose -f docker/docker-compose.yml up -d --build --force-recreate --remove-orphans")
+    format!(
+        "cd {workdir}/wr-node/current && sudo docker compose --project-name {NODE_COMPOSE_PROJECT} -f docker/docker-compose.yml up -d --build --force-recreate --remove-orphans"
+    )
 }
 
 fn staging_release_dir(workdir: &str, revision: u64) -> String {
@@ -1827,6 +1831,8 @@ mod tests {
         assert_eq!(configs[0], "proxy.toml");
         let command = node_docker_start_command("/opt/wruntime");
         assert!(command.contains("docker compose"));
+        assert!(command.contains("--project-name wruntime-node"));
+        assert!(!command.contains("--project-name wruntime-manager"));
         assert!(command.contains("up -d"));
         assert!(command.contains("--build"));
         assert!(command.contains("--force-recreate"));

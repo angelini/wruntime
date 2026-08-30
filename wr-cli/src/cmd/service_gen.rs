@@ -3,6 +3,13 @@
 //! Template variables like `{run_user}`, `{run_group}`, `{secret_key}` are emitted
 //! as literal `{...}` strings and resolved later by `helpers::resolve_template()`.
 
+/// Reviewed OCI index identity for distroless cc-debian13 `latest`.
+///
+/// Keep the digest in the generated deployment contract so rebuilding an immutable
+/// wruntime bundle cannot silently select a different base image.
+const DISTROLESS_CC_DEBIAN13: &str =
+    "gcr.io/distroless/cc-debian13@sha256:9b615fff20e1a4fad29c2b30562580b212c7dd5e2225236735cca0070ed11c78";
+
 /// A systemd service unit definition.
 pub struct ServiceUnit<'a> {
     pub description: &'a str,
@@ -79,7 +86,7 @@ pub struct DockerfileSpec<'a> {
 impl DockerfileSpec<'_> {
     pub fn render(&self) -> String {
         let mut out = String::new();
-        out.push_str("FROM gcr.io/distroless/cc-debian13\n");
+        out.push_str(&format!("FROM {DISTROLESS_CC_DEBIAN13}\n"));
         out.push_str(&format!("WORKDIR {}\n", self.workdir));
         out.push_str(&format!("COPY {} {}\n", self.binary, self.binary));
         out.push_str(&format!("COPY {} {}\n", self.config, self.config));
@@ -159,4 +166,25 @@ pub fn generate_compose(header: &str, services: &[ComposeService]) -> String {
 /// Sysctl config for wasmtime memory pooling.
 pub fn sysctl_config() -> &'static str {
     "# Wasmtime pooling allocator requires higher mmap limit for COW-based instantiation.\nvm.max_map_count = 262144\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dockerfile_base_is_digest_pinned() {
+        let rendered = DockerfileSpec {
+            workdir: "/opt/wruntime",
+            binary: "bin/service",
+            config: "config/service.toml",
+            extra_copies: vec![],
+            env_vars: vec![],
+            no_otel: true,
+        }
+        .render();
+        let first_line = rendered.lines().next().expect("Dockerfile has FROM line");
+        assert!(first_line.starts_with("FROM gcr.io/distroless/cc-debian13@sha256:"));
+        assert_eq!(first_line.matches("sha256:").count(), 1);
+    }
 }

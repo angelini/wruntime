@@ -12,6 +12,7 @@ cd "$ROOT"
 
 RUN_E2E=true
 RUN_CODEGEN_E2E=auto
+RUN_DEPLOYMENT_E2E="unset"
 E2E_ONLY=false
 START_DEV=true
 SKIPPED_CODEGEN_E2E=false
@@ -25,16 +26,21 @@ usage() {
 Usage: dev/validate-all.sh [OPTIONS]
 
 Options:
-  --no-e2e          Skip fixed-port E2E examples.
-  --e2e-only        Run only dev infra setup and fixed-port E2E examples.
-  --codegen-e2e     Require codegen E2E; fails if ANTHROPIC_API_KEY is unset.
-  --no-codegen-e2e  Skip codegen E2E even if ANTHROPIC_API_KEY is set.
+  --no-e2e             Skip fixed-port local E2E examples (not deployment E2E).
+  --e2e-only           Run only setup and enabled E2E stages.
+  --deployment-e2e    Require serial systemd and Docker deployment lifecycle E2E.
+  --no-deployment-e2e Deliberately skip deployment lifecycle E2E.
+  --codegen-e2e        Require codegen E2E; fails if ANTHROPIC_API_KEY is unset.
+  --no-codegen-e2e     Skip codegen E2E even if ANTHROPIC_API_KEY is set.
   --skip-dev-up     Do not run `just dev-up` before DB/S3-backed tests.
   -h, --help        Show this help.
 
 Environment:
   ANTHROPIC_API_KEY   Enables codegen E2E in default auto mode.
   WR_VALIDATE_LOG_DIR Override the log directory (default: target/validate-all/<timestamp>).
+
+Exactly one deployment E2E flag is required. --no-e2e may be combined with
+--deployment-e2e; --e2e-only runs whichever E2E stages were explicitly enabled.
 USAGE
 }
 
@@ -45,6 +51,20 @@ while [ $# -gt 0 ]; do
 		;;
 	--e2e-only)
 		E2E_ONLY=true
+		;;
+	--deployment-e2e)
+		if [ "$RUN_DEPLOYMENT_E2E" = false ]; then
+			echo "--deployment-e2e contradicts --no-deployment-e2e" >&2
+			exit 2
+		fi
+		RUN_DEPLOYMENT_E2E=true
+		;;
+	--no-deployment-e2e)
+		if [ "$RUN_DEPLOYMENT_E2E" = true ]; then
+			echo "--no-deployment-e2e contradicts --deployment-e2e" >&2
+			exit 2
+		fi
+		RUN_DEPLOYMENT_E2E=false
 		;;
 	--codegen-e2e)
 		RUN_CODEGEN_E2E=true
@@ -67,6 +87,12 @@ while [ $# -gt 0 ]; do
 	esac
 	shift
 done
+
+if [ "$RUN_DEPLOYMENT_E2E" = unset ]; then
+	echo "choose --deployment-e2e or --no-deployment-e2e explicitly" >&2
+	usage >&2
+	exit 2
+fi
 
 if [ "$E2E_ONLY" = true ]; then
 	RUN_E2E=true
@@ -162,6 +188,7 @@ run_cmd() {
 	name="$1"
 	cmd="$2"
 	log="$LOG_ROOT/${name//[^A-Za-z0-9_.-]/_}.log"
+	reported_log="${3:-$log}"
 
 	printf '  • %s\n' "$name"
 	printf '$ %s\n' "$cmd" >"$log"
@@ -169,13 +196,13 @@ run_cmd() {
 	status=$?
 	if [ "$status" -eq 0 ]; then
 		printf '    ok (%s)\n' "$log"
-		append_result "$name" OK "$log" ""
+		append_result "$name" OK "$reported_log" ""
 		return 0
 	fi
 
 	printf '    FAILED (%s, exit %s)\n' "$log" "$status" >&2
 	tail -n "$TAIL_LINES" "$log" >&2
-	append_result "$name" FAILED "$log" "exit $status"
+	append_result "$name" FAILED "$reported_log" "exit $status (runner log: $log)"
 	finish_failure "$status"
 }
 
@@ -257,9 +284,16 @@ require_cmd just
 if [ "$START_DEV" = true ]; then
 	require_cmd docker
 fi
-if [ "$RUN_E2E" = true ]; then
+if [ "$RUN_E2E" = true ] || [ "$RUN_DEPLOYMENT_E2E" = true ]; then
 	require_cmd psql
+fi
+if [ "$RUN_E2E" = true ]; then
 	require_cmd aws
+fi
+if [ "$RUN_DEPLOYMENT_E2E" = true ]; then
+	for command in uv flock ssh scp timeout cargo-zigbuild; do
+		require_cmd "$command"
+	done
 fi
 
 section "setup"
@@ -288,6 +322,17 @@ if [ "$E2E_ONLY" != true ]; then
 
 	section "rust tests"
 	run_cmd "workspace tests including wasm host tests" "just test"
+fi
+
+section "deployment lifecycle E2E"
+if [ "$RUN_DEPLOYMENT_E2E" = true ]; then
+	run_cmd "deployment E2E systemd" "WR_VALIDATE_LOG_DIR='$LOG_ROOT/deployment-e2e-systemd' bash dev/validate-deployment-lifecycle.sh --backend systemd" "$LOG_ROOT/deployment-e2e-systemd"
+	run_cmd "deployment E2E docker" "WR_VALIDATE_LOG_DIR='$LOG_ROOT/deployment-e2e-docker' bash dev/validate-deployment-lifecycle.sh --backend docker" "$LOG_ROOT/deployment-e2e-docker"
+else
+	printf '  • deployment E2E systemd skipped: --no-deployment-e2e\n'
+	append_result "deployment E2E systemd" SKIPPED "" "--no-deployment-e2e"
+	printf '  • deployment E2E docker skipped: --no-deployment-e2e\n'
+	append_result "deployment E2E docker" SKIPPED "" "--no-deployment-e2e"
 fi
 
 if [ "$RUN_E2E" = true ]; then

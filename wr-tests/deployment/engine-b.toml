@@ -1,0 +1,18 @@
+listen_address = "127.0.0.1:9100"
+
+[node]
+proxy_address   = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_address    = "https://127.0.0.1:9443"
+
+[node.tls]
+cert_path    = "certs/127.0.0.1.crt"
+key_path     = "certs/127.0.0.1.key"
+ca_cert_path = "certs/ca.crt"
+
+[[module]]
+name        = "echo"
+namespace   = "deployment"
+version     = "2.0.0"
+wasm_path   = "examples/multi-node/echo/target/wasm32-wasip2/debug/echo.wasm"
+schema_path = "examples/multi-node/echo/schemas/echo.binpb"

@@ -1,0 +1,21 @@
+provider               = "proxmox"
+proxmox_node           = "server"
+snapshot               = "wr-e2e-v1"
+expected_image_version = "wr-e2e-v1"
+lock_file              = "/var/lock/wruntime-deployment-e2e.lock"
+workdir                = "/opt/wruntime"
+node_id                = "wr-e2e-node"
+
+[manager]
+vmid     = 120
+name     = "wr-e2e-manager"
+host     = "192.168.178.77"
+ssh_user = "deploy"
+role     = "manager"
+
+[node]
+vmid     = 121
+name     = "wr-e2e-node"
+host     = "192.168.178.78"
+ssh_user = "deploy"
+role     = "node"

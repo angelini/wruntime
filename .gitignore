@@ -5,6 +5,9 @@
 bindings.rs
 !wr-engine/src/db/bindings.rs
 observability
+__pycache__/
+*.py[cod]
+.venv/
 target
 wr-deploy.toml
 wr-manager-bundle.tar.gz

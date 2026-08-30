@@ -2,6 +2,12 @@
 
 Wruntime provides CLI commands for packaging and deploying services to remote hosts. The workflow is **bundle once, deploy anywhere** — a single tarball contains everything needed for both systemd and Docker deployments.
 
+Maintainers changing deployment generation or lifecycle behavior must run the
+protected lifecycle qualification described in [Testing](testing.md) and the
+[maintainer validation matrix](agents/wruntime-maintainer/validation.md). The
+public deployment workflow below is not a substitute for that disposable-VM
+systemd/Docker validation.
+
 ## Prerequisites
 
 Cross-compilation of host binaries uses `cargo-zigbuild`, which bundles a Linux sysroot via Zig:

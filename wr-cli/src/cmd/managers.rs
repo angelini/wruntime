@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -118,7 +118,7 @@ struct ManagerManifest {
     gossip_listen_address: String,
     cluster_id: String,
     template_vars: Vec<String>,
-    checksums: HashMap<String, String>,
+    checksums: BTreeMap<String, String>,
 }
 
 // --- Entry point ---
@@ -218,8 +218,9 @@ fn bundle(args: BundleArgs) -> Result<()> {
 
     // Add template config
     let bundle_config = config.to_bundle_config();
-    bundle::tar_add_bytes(
+    bundle::tar_add_bytes_checked(
         &mut tar,
+        &mut checksums,
         "wr-manager/config/manager.toml",
         bundle_config.to_toml()?.as_bytes(),
         0o644,
@@ -236,8 +237,9 @@ fn bundle(args: BundleArgs) -> Result<()> {
         after: vec![],
         requires: vec![],
     };
-    bundle::tar_add_bytes(
+    bundle::tar_add_bytes_checked(
         &mut tar,
+        &mut checksums,
         "wr-manager/systemd/wr-manager.service",
         unit.to_systemd().as_bytes(),
         0o644,
@@ -255,23 +257,26 @@ fn bundle(args: BundleArgs) -> Result<()> {
         env_vars: vec![("WRT_SECRET_ENCRYPTION_KEY", "{secret_key}")],
         no_otel,
     };
-    bundle::tar_add_bytes(
+    bundle::tar_add_bytes_checked(
         &mut tar,
+        &mut checksums,
         "wr-manager/docker/Dockerfile.manager",
         dockerfile.render().as_bytes(),
         0o644,
     )?;
 
     let compose = manager_docker_compose(&workdir, &image_prefix);
-    bundle::tar_add_bytes(
+    bundle::tar_add_bytes_checked(
         &mut tar,
+        &mut checksums,
         "wr-manager/docker/docker-compose.yml",
         compose.as_bytes(),
         0o644,
     )?;
 
-    bundle::tar_add_bytes(
+    bundle::tar_add_bytes_checked(
         &mut tar,
+        &mut checksums,
         "wr-manager/docker/.dockerignore",
         b"*.tar.gz\n",
         0o644,
@@ -290,7 +295,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
             "gossip_address".to_string(),
             "advertise_address".to_string(),
         ],
-        checksums,
+        checksums: checksums.into_iter().collect(),
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     bundle::tar_add_bytes(
@@ -382,13 +387,17 @@ fn manager_docker_compose(workdir: &str, image_prefix: &str) -> String {
     )
 }
 
+const MANAGER_COMPOSE_PROJECT: &str = "wruntime-manager";
+
 fn manager_docker_start_command(workdir: &str) -> String {
-    format!("cd {workdir}/wr-manager && sudo docker compose -f docker/docker-compose.yml up -d")
+    format!(
+        "cd {workdir}/wr-manager && sudo docker compose --project-name {MANAGER_COMPOSE_PROJECT} -f docker/docker-compose.yml up -d"
+    )
 }
 
 fn manager_docker_logs_command(workdir: &str, tail: u32, follow: bool) -> String {
     let mut command = format!(
-        "cd {workdir}/wr-manager && sudo docker compose -f docker/docker-compose.yml logs --tail {tail}"
+        "cd {workdir}/wr-manager && sudo docker compose --project-name {MANAGER_COMPOSE_PROJECT} -f docker/docker-compose.yml logs --tail {tail}"
     );
     if follow {
         command.push_str(" -f");
@@ -430,6 +439,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     );
 
     let manifest: ManagerManifest = bundle::read_manifest(&args.bundle)?;
+    verify_manager_bundle(&args.bundle, &manifest)?;
 
     let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
     let remote_ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
@@ -745,6 +755,38 @@ fn start_docker(ssh_base: &[String], manifest: &ManagerManifest) -> Result<()> {
     helpers::run_ssh(ssh_base, &manager_docker_start_command(&manifest.workdir))
 }
 
+fn verify_manager_bundle(bundle_path: &str, manifest: &ManagerManifest) -> Result<()> {
+    let actual: BTreeMap<_, _> = bundle::read_payload_checksums(bundle_path)?
+        .into_iter()
+        .collect();
+    if actual != manifest.checksums {
+        let missing: Vec<_> = manifest
+            .checksums
+            .keys()
+            .filter(|path| !actual.contains_key(*path))
+            .cloned()
+            .collect();
+        let changed: Vec<_> = manifest
+            .checksums
+            .iter()
+            .filter(|(path, checksum)| actual.get(*path) != Some(*checksum))
+            .map(|(path, _)| path.clone())
+            .collect();
+        let unexpected: Vec<_> = actual
+            .keys()
+            .filter(|path| !manifest.checksums.contains_key(*path))
+            .cloned()
+            .collect();
+        bail!(
+            "bundle payload checksums do not match manifest (missing: {}; changed: {}; unexpected: {})",
+            missing.join(", "),
+            changed.join(", "),
+            unexpected.join(", ")
+        );
+    }
+    Ok(())
+}
+
 // --- status ---
 
 fn status(args: StatusArgs) -> Result<()> {
@@ -753,6 +795,7 @@ fn status(args: StatusArgs) -> Result<()> {
     }
 
     let manifest: ManagerManifest = bundle::read_manifest(&args.bundle)?;
+    verify_manager_bundle(&args.bundle, &manifest)?;
 
     println!("Bundle: {}", args.bundle);
     println!();
@@ -786,6 +829,70 @@ fn status(args: StatusArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn manager_test_bundle(payload: &[u8], declared_payload: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "wr-manager-bundle-test-{}-{}.tar.gz",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = fs::File::create(&path).unwrap();
+        let mut tar = tar::Builder::new(GzEncoder::new(output, Compression::default()));
+        bundle::tar_add_bytes(&mut tar, "wr-manager/bin/wr-manager", payload, 0o755).unwrap();
+        let manifest = ManagerManifest {
+            target: "x86_64-unknown-linux-gnu".into(),
+            workdir: "/opt/wruntime".into(),
+            image_prefix: "wr".into(),
+            listen_address: "0.0.0.0:9000".into(),
+            gossip_listen_address: "0.0.0.0:9010".into(),
+            cluster_id: "test".into(),
+            template_vars: vec!["db_url".into()],
+            checksums: BTreeMap::from([(
+                "wr-manager/bin/wr-manager".into(),
+                format!("{:x}", Sha256::digest(declared_payload)),
+            )]),
+        };
+        bundle::tar_add_bytes(
+            &mut tar,
+            "wr-manager/manifest.json",
+            serde_json::to_vec_pretty(&manifest).unwrap().as_slice(),
+            0o644,
+        )
+        .unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn manager_bundle_verification_rejects_tampered_payload() {
+        let path = manager_test_bundle(b"tampered", b"original");
+        let manifest: ManagerManifest = bundle::read_manifest(path.to_str().unwrap()).unwrap();
+        let error = verify_manager_bundle(path.to_str().unwrap(), &manifest).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed: wr-manager/bin/wr-manager"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn manager_manifest_checksum_order_is_deterministic() {
+        let manifest = ManagerManifest {
+            target: "target".into(),
+            workdir: "/opt/wruntime".into(),
+            image_prefix: "wr".into(),
+            listen_address: "0.0.0.0:9000".into(),
+            gossip_listen_address: "0.0.0.0:9010".into(),
+            cluster_id: "test".into(),
+            template_vars: vec![],
+            checksums: BTreeMap::from([("z".into(), "2".into()), ("a".into(), "1".into())]),
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(json.find("\"a\":\"1\"").unwrap() < json.find("\"z\":\"2\"").unwrap());
+    }
 
     #[test]
     fn manager_deploy_resolution_does_not_inject_seed_nodes() {
@@ -901,6 +1008,7 @@ advertise_grpc_address = "{advertise_address}"
             .contains(&"wr-manager/docker/Dockerfile.manager"));
         let command = manager_docker_start_command("/opt/wruntime");
         assert!(command.contains("docker compose"));
+        assert!(command.contains("--project-name wruntime-manager"));
         assert!(command.contains("up -d"));
         assert!(!command.contains("restart"));
 
@@ -912,6 +1020,7 @@ advertise_grpc_address = "{advertise_address}"
         for follow in [false, true] {
             let logs = manager_docker_logs_command("/opt/wruntime", 20, follow);
             assert!(logs.contains("sudo docker compose"));
+            assert!(logs.contains("--project-name wruntime-manager"));
             assert!(logs.contains("--tail 20"));
             assert_eq!(logs.ends_with(" -f"), follow);
         }

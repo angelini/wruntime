@@ -149,7 +149,8 @@ pub fn build_docker_logs_command(
     follow: bool,
 ) -> String {
     let compose = format!("{workdir}/wr-node/current/docker/docker-compose.yml");
-    let mut cmd = format!("docker compose -f {compose} logs --tail {tail}");
+    let mut cmd =
+        format!("sudo docker compose --project-name wruntime-node -f {compose} logs --tail {tail}");
     if follow {
         cmd.push_str(" -f");
     }
@@ -158,4 +159,18 @@ pub fn build_docker_logs_command(
         cmd.push_str(s);
     }
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docker_logs_use_privileged_isolated_compose_project() {
+        let command = build_docker_logs_command("/opt/wruntime", Some("engine-echo"), 50, true);
+        assert!(command.starts_with("sudo docker compose"));
+        assert!(command.contains("--project-name wruntime-node"));
+        assert!(command.contains("/opt/wruntime/wr-node/current/docker/docker-compose.yml"));
+        assert!(command.contains("--tail 50 -f engine-echo"));
+    }
 }

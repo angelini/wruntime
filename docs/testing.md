@@ -16,7 +16,10 @@ just test-wasm               # build WASM guests, then run host binding tests
 just clean-wasm-cache        # remove only the shared Cargo guest cache
 just validate-ecommerce      # ecommerce inline run, failing on WARN/WARNING output
 just bench-proxy-routing     # warmed HTTP/2 proxy routing/forwarding benchmark
-just validate-all            # full format/lint/WASM/test/E2E suite
+just validate-all --no-deployment-e2e # full local suite with an explicit live-stage skip
+just validate-all --deployment-e2e    # trusted runner: require both live deployment backends
+just deployment-e2e-python-test       # locked provider/assertion unit tests
+just deployment-e2e-preflight         # non-mutating Proxmox target verification
 just dev-down                # stop dev infrastructure
 ```
 
@@ -78,6 +81,42 @@ and `summary.txt` are written under `target/validate-all/<timestamp>/`; terminal
 failure output is capped for agent-friendly context use. Codegen E2E runs only
 when `ANTHROPIC_API_KEY` is set by default; use `--codegen-e2e` to require it
 or `--no-codegen-e2e` to always skip it.
+
+The deployment lifecycle stage always requires an explicit choice. Trusted
+runners use `just validate-all --deployment-e2e`, which runs the systemd and
+Docker passes serially before fixed-port local examples. Local development uses
+`just validate-all --no-deployment-e2e`; the summary records separate `SKIPPED`
+rows for both backends. `--no-e2e` affects only fixed-port local examples, so it
+may be combined with `--deployment-e2e`. `--e2e-only` still requires an explicit
+deployment choice and runs the enabled E2E stages.
+
+Live deployment requires `uv`, `cargo-zigbuild`, `flock`, SSH, and `psql`.
+Python dependencies and the Python 3.12 toolchain request are owned by the
+nested `dev/deployment-e2e` project through `pyproject.toml`, `.python-version`,
+and the checked-in `uv.lock`. Recipes and the lifecycle harness use
+`uv run --project dev/deployment-e2e --locked`, so no manually activated virtual
+environment or system `pip` installation is required. Protected runner inputs
+are `PVE_HOST`, `PVE_USER`,
+`PVE_TOKEN_NAME`, `PVE_TOKEN_VALUE`, `WRT_DEPLOY_E2E_SSH_KEY`,
+`WRT_DEPLOY_E2E_DB_URL`, and `WRT_SECRET_ENCRYPTION_KEY`. The dedicated SSH
+known-hosts file defaults to `~/.ssh/wruntime-e2e-known_hosts` and can be
+overridden with `WRT_DEPLOY_E2E_KNOWN_HOSTS`. Never pass these values in a
+checked-in config or transcript.
+
+Each backend starts and ends with snapshot rollback and normally takes several
+minutes plus cross-compilation time. Per-task output, lifecycle state JSON,
+remote diagnostics, bundle inspections, and the final reset result are retained
+under `WR_VALIDATE_LOG_DIR` (or `target/validate-all/<timestamp>/`). Live runs
+must not be started unless all protected inputs are present. The provider never
+creates or deletes snapshots or VMs, and reset failures are fatal.
+
+Focused commands are `just deployment-e2e-python-test`, `just
+deployment-e2e-preflight`, `just deployment-e2e-systemd`, `just
+deployment-e2e-docker`, and `just deployment-e2e`. The locked Python test recipe
+runs the provider and JSON assertion `unittest` targets without Proxmox access.
+After intentionally changing Python dependencies, refresh the nested lock with
+`uv lock --project dev/deployment-e2e` and commit `pyproject.toml` and `uv.lock`
+together.
 
 ## Dev infrastructure
 

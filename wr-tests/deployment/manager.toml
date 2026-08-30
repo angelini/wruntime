@@ -1,0 +1,18 @@
+listen_address                = "0.0.0.0:9000"
+engine_heartbeat_timeout_secs = 8
+module_heartbeat_timeout_secs = 8
+local_proxy_address           = "http://127.0.0.1:9001"
+
+[tls]
+cert_path    = "certs/manager.crt"
+key_path     = "certs/manager.key"
+ca_cert_path = "certs/ca.crt"
+
+[database]
+url             = "postgres://postgres@127.0.0.1:5432/wruntime_deployment_e2e"
+max_connections = 10
+
+[cluster]
+cluster_id             = "deployment-e2e"
+gossip_listen_address  = "0.0.0.0:9010"
+advertise_grpc_address = "https://127.0.0.1:9000"

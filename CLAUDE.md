@@ -23,7 +23,8 @@ just build-ecommerce
 just build-stockmarket
 just build-codegen
 just validate-ecommerce     # ecommerce E2E; fails on WARN/WARNING
-just validate-all
+just validate-all --no-deployment-e2e # explicit local skip
+just validate-all --deployment-e2e    # protected runner, live systemd + Docker
 
 # Development infrastructure and services
 just certs
@@ -55,7 +56,7 @@ Changes to host bindings (`wr-engine/src/db/`, `wr-engine/src/blobstore.rs`, `wr
 
 Keep documentation synchronized according to [documentation ownership](docs/agents/wruntime-maintainer/documentation_ownership.md). Guest-visible SDK/WIT/build semantics require review of the guest API guide; exact signatures remain in source.
 
-**Prerequisites:** `rustc`, `cargo`, `just`, `protoc`, and `taplo`. WASM work also requires `wasm32-wasip2` and `wasm-tools`. Cross-compilation requires `zig` and `cargo-zigbuild`.
+**Prerequisites:** `rustc`, `cargo`, `just`, `protoc`, and `taplo`. WASM work also requires `wasm32-wasip2` and `wasm-tools`. Cross-compilation requires `zig` and `cargo-zigbuild`. Live deployment E2E also requires `uv`.
 
 Integration helpers live in `wr-tests/tests/helpers/mod.rs`. Direct DB-backed tests use `WRT_TEST_DB_URL=postgres://postgres@localhost:5433/wruntime_test` and skip under the shared policy when it is absent. Just test recipes set required DB/S3 variables; run `just dev-up` first.
 
