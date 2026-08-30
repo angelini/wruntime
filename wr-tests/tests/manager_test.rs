@@ -5,10 +5,10 @@ use anyhow::Result;
 
 use wr_common::wruntime::{
     BeginDeploymentRequest, BeginRollbackRequest, CompleteDeploymentRequest, DeploymentMetadata,
-    DeregisterEngineRequest, EngineRegistration, ExpectedEngine, GetClusterStatusRequest,
-    GetRoutingTableRequest, GetSchemaRequest, HeartbeatRequest, ListEnginesRequest,
-    ModuleDescriptor, ModuleIdentity, RegisterEngineRequest, RoutingRule, SecretRequest,
-    StatusSeverity, VerifyDeploymentRequest,
+    DeploymentState, DeregisterEngineRequest, EngineRegistration, ExpectedEngine,
+    GetClusterStatusRequest, GetRoutingTableRequest, GetSchemaRequest, HeartbeatRequest,
+    ListEnginesRequest, ModuleDescriptor, ModuleIdentity, RegisterEngineRequest, RoutingRule,
+    SecretRequest, StatusSeverity, VerifyDeploymentRequest,
 };
 
 #[tokio::test]
@@ -1130,10 +1130,53 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
         })
         .await?;
 
-    let second = client
+    let failed = client
         .begin_deployment(BeginDeploymentRequest {
             node_id: "node-a".into(),
             attempt_token: "attempt-two".into(),
+            bundle_digest: digest_two.clone(),
+            expected_engines: expected.clone(),
+        })
+        .await?
+        .into_inner()
+        .deployment
+        .unwrap();
+    assert_eq!(failed.revision, 2);
+    client
+        .complete_deployment(CompleteDeploymentRequest {
+            node_id: "node-a".into(),
+            revision: failed.revision,
+            succeeded: false,
+            failure_detail: "staging failed".into(),
+        })
+        .await?;
+    let preserved = client
+        .get_cluster_status(GetClusterStatusRequest {})
+        .await?
+        .into_inner();
+    let preserved_node = preserved
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "node-a")
+        .expect("status should retain the prior serving deployment");
+    assert_eq!(preserved_node.severity, StatusSeverity::Healthy as i32);
+    assert_eq!(preserved.services[0].healthy_routes, 1);
+    assert_eq!(
+        preserved_node
+            .desired_deployment
+            .as_ref()
+            .expect("desired deployment")
+            .revision,
+        1
+    );
+    assert!(preserved_node.deployment_history.iter().any(|deployment| {
+        deployment.revision == failed.revision && deployment.state == DeploymentState::Failed as i32
+    }));
+
+    let second = client
+        .begin_deployment(BeginDeploymentRequest {
+            node_id: "node-a".into(),
+            attempt_token: "attempt-three".into(),
             bundle_digest: digest_two.clone(),
             expected_engines: expected,
         })
@@ -1141,7 +1184,7 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
         .into_inner()
         .deployment
         .unwrap();
-    assert_eq!(second.revision, 2);
+    assert_eq!(second.revision, 3);
     let superseded = client
         .verify_deployment(VerifyDeploymentRequest {
             node_id: "node-a".into(),
@@ -1150,11 +1193,18 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
         .await?
         .into_inner();
     assert_eq!(superseded.conditions[0].code, "SUPERSEDED_REVISION");
-    activate(&mut client, &pool, "deploy-e2", 2, &digest_two).await?;
+    activate(
+        &mut client,
+        &pool,
+        "deploy-e2",
+        second.revision,
+        &digest_two,
+    )
+    .await?;
     client
         .complete_deployment(CompleteDeploymentRequest {
             node_id: "node-a".into(),
-            revision: 2,
+            revision: second.revision,
             succeeded: true,
             failure_detail: String::new(),
         })
@@ -1170,7 +1220,7 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
         .into_inner()
         .deployment
         .unwrap();
-    assert_eq!(rollback.revision, 3);
+    assert_eq!(rollback.revision, 4);
     assert_eq!(rollback.source_revision, 1);
     assert_eq!(rollback.bundle_digest, digest_one);
     let historical_count: i64 = pool
@@ -1182,7 +1232,7 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
         )
         .await?
         .get(0);
-    assert_eq!(historical_count, 3);
+    assert_eq!(historical_count, 4);
 
     Ok(())
 }

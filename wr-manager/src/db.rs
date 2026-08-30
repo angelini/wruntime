@@ -649,7 +649,12 @@ pub async fn begin_deployment(
 
     let revision: i64 = txn
         .query_one(
-            "UPDATE wr_nodes SET current_revision = current_revision + 1, updated_at = NOW()
+            "UPDATE wr_nodes
+             SET current_revision = (
+                 SELECT COALESCE(MAX(revision), 0) + 1
+                 FROM wr_node_deployments
+                 WHERE node_id = $1
+             ), updated_at = NOW()
              WHERE node_id = $1 RETURNING current_revision",
             &[&request.node_id],
         )
@@ -716,19 +721,16 @@ pub async fn complete_deployment(
     succeeded: bool,
     failure_detail: &str,
 ) -> Result<DeploymentRow, Status> {
-    let client = pool.get().await.internal()?;
+    let mut client = pool.get().await.internal()?;
+    let txn = client.transaction().await.internal()?;
     let state = if succeeded { "succeeded" } else { "failed" };
-    let updated = client
+    let database_revision = deployment_revision(revision)?;
+    let updated = txn
         .execute(
             "UPDATE wr_node_deployments
              SET state = $3, failure_detail = $4, completed_at = NOW()
              WHERE node_id = $1 AND revision = $2 AND state IN ('pending', 'active')",
-            &[
-                &node_id,
-                &deployment_revision(revision)?,
-                &state,
-                &failure_detail,
-            ],
+            &[&node_id, &database_revision, &state, &failure_detail],
         )
         .await
         .internal()?;
@@ -737,7 +739,31 @@ pub async fn complete_deployment(
             "deployment {node_id}/{revision} is not pending or active"
         )));
     }
-    get_deployment(pool, node_id, revision).await
+    if !succeeded {
+        // Preserve the prior serving deployment when the current attempt fails.
+        // The current-revision guard prevents an older failure from replacing a
+        // newer concurrent attempt.
+        txn.execute(
+            "UPDATE wr_nodes n
+             SET current_revision = previous.revision, updated_at = NOW()
+             FROM (
+                 SELECT revision
+                 FROM wr_node_deployments
+                 WHERE node_id = $1 AND revision < $2 AND state = 'succeeded'
+                 ORDER BY revision DESC
+                 LIMIT 1
+             ) previous
+             WHERE n.node_id = $1 AND n.current_revision = $2",
+            &[&node_id, &database_revision],
+        )
+        .await
+        .internal()?;
+    }
+    let deployment = get_deployment_in_transaction(&txn, node_id, database_revision)
+        .await?
+        .ok_or_else(|| Status::internal("completed deployment disappeared"))?;
+    txn.commit().await.internal()?;
+    Ok(deployment)
 }
 
 /// Capture all DB-backed cluster status evidence under one repeatable-read,
@@ -1157,7 +1183,12 @@ pub async fn begin_rollback(
     let selected = deployment_row(&selected_row)?.record;
     let revision: i64 = txn
         .query_one(
-            "UPDATE wr_nodes SET current_revision = current_revision + 1, updated_at = NOW()
+            "UPDATE wr_nodes
+             SET current_revision = (
+                 SELECT COALESCE(MAX(revision), 0) + 1
+                 FROM wr_node_deployments
+                 WHERE node_id = $1
+             ), updated_at = NOW()
              WHERE node_id = $1 RETURNING current_revision",
             &[&node_id],
         )

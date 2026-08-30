@@ -61,6 +61,8 @@ for command in uv flock ssh scp timeout psql cargo-zigbuild; do
 	}
 done
 PYTHON=(uv run --project "$ROOT/dev/deployment-e2e" --locked python)
+# shellcheck source=deployment-e2e/lifecycle_logging.sh
+source "$ROOT/dev/deployment-e2e/lifecycle_logging.sh"
 [ -f "$WRT_DEPLOY_E2E_SSH_KEY" ] || {
 	echo "deployment SSH key file is unavailable" >&2
 	exit 2
@@ -115,7 +117,8 @@ MANAGER_ADDR="https://${MANAGER_HOST}:9000"
 MANAGER_REMOTE="${MANAGER_USER}@${MANAGER_HOST}"
 NODE_REMOTE="${NODE_USER}@${NODE_HOST}"
 SSH=(timeout -k 5 60 ssh -i "$WRT_DEPLOY_E2E_SSH_KEY" -o ConnectTimeout=5)
-CLI=(timeout -k 10 600 "$ROOT/target/debug/wr-cli" --manager "$MANAGER_ADDR" --ca-cert "$CERT_DIR/ca.crt" --client-cert "$CERT_DIR/${MANAGER_HOST}.crt" --client-key "$CERT_DIR/${MANAGER_HOST}.key")
+CLI_ARGS=("$ROOT/target/debug/wr-cli" --manager "$MANAGER_ADDR" --ca-cert "$CERT_DIR/ca.crt" --client-cert "$CERT_DIR/${MANAGER_HOST}.crt" --client-key "$CERT_DIR/${MANAGER_HOST}.key")
+CLI=(timeout -k 10 600 "${CLI_ARGS[@]}")
 
 mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
 exec 9>"$LOCK_FILE" || {
@@ -185,8 +188,7 @@ trap 'record_failure 130; exit 130' INT TERM
 run_logged() {
 	local name="$1"
 	shift
-	echo "==> $name"
-	"$@" >"$LOG_BASE/${name//[^A-Za-z0-9_.-]/_}.log" 2>&1
+	run_to_log "$name" "$LOG_BASE/${name//[^A-Za-z0-9_.-]/_}.log" "$@"
 }
 status_json() {
 	local output="$1"
@@ -202,7 +204,7 @@ PY
 }
 digest_from_inspect() { awk '$1 == "digest:" {print $2; exit}' "$1"; }
 invoke_echo() {
-	local expected="$1" log="$2" port tunnel_log
+	local expected="$1" log="$2" port tunnel_log invoke_error status
 	port="$(
 		"${PYTHON[@]}" - <<'PY'
 import socket
@@ -242,9 +244,21 @@ PY
 		echo "SSH proxy tunnel did not become ready" >&2
 		return 1
 	fi
-	"${CLI[@]}" invoke --json --proxy "http://127.0.0.1:${port}" \
+	invoke_error="${log%.json}.stderr"
+	# Manager readiness can precede the deployed proxy's next routing-table poll.
+	if run_with_retry "$log" "$invoke_error" 10 0.5 \
+		"^Error: Request failed with status 503 Service Unavailable: no route for (destination|module)" \
+		timeout -k 1 3 "${CLI_ARGS[@]}" invoke --json --proxy "http://127.0.0.1:${port}" \
 		--destination http://deployment.echo/multinode.EchoService/Echo \
-		--source deployment-e2e --source-ns deployment --body "{\"message\":\"$expected\"}" >"$log"
+		--source deployment-e2e --source-ns deployment --body "{\"message\":\"$expected\"}"; then
+		:
+	else
+		status=$?
+		stop_tunnel
+		echo "guest invocation did not become routable" >&2
+		print_failure_excerpt "$invoke_error"
+		return "$status"
+	fi
 	"${PYTHON[@]}" - "$log" "$expected" <<'PY'
 import json,sys
 value=json.load(open(sys.argv[1]))
@@ -253,9 +267,9 @@ PY
 	stop_tunnel
 }
 assert_db_clean() {
-	local count="" ready=false
+	local count="" ready=false error_log="$LOG_BASE/postgres-readiness.log"
 	for _ in $(seq 1 30); do
-		if count="$(timeout 10 psql "$WRT_DEPLOY_E2E_DB_URL" -XAtqc "SELECT count(*) FROM information_schema.schemata WHERE schema_name LIKE 'wr\\_\\_%' ESCAPE '\\' OR schema_name='wr_system'; SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name LIKE 'wr\\_%' ESCAPE '\\'; SELECT count(*) FROM pg_roles WHERE rolname LIKE 'wr\\_ns\\_%' ESCAPE '\\';" 2>/dev/null)"; then
+		if count="$(PGCONNECT_TIMEOUT=5 timeout 10 psql "$WRT_DEPLOY_E2E_DB_URL" -XAtqc "SELECT count(*) FROM information_schema.schemata WHERE schema_name LIKE 'wr\\_\\_%' ESCAPE '\\' OR schema_name='wr_system'; SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name LIKE 'wr\\_%' ESCAPE '\\'; SELECT count(*) FROM pg_roles WHERE rolname LIKE 'wr\\_ns\\_%' ESCAPE '\\';" 2>"$error_log")"; then
 			ready=true
 			break
 		fi
@@ -263,6 +277,9 @@ assert_db_clean() {
 	done
 	[ "$ready" = true ] || {
 		echo "deployment PostgreSQL did not become reachable" >&2
+		echo "failure log: $error_log" >&2
+		redact_logs
+		print_failure_excerpt "$error_log"
 		return 1
 	}
 	[ "$count" = $'0\n0\n0' ] || {
@@ -275,25 +292,26 @@ collect_diagnostics() {
 	local backend="$1"
 	local out="$LOG_BASE/$backend-diagnostics"
 	mkdir -p "$out"
-	set +e
-	status_json "$out/cluster.json" 2>"$out/cluster.stderr"
-	"${CLI[@]}" node inspect-bundle "$BUNDLE_A" >"$out/bundle-a.txt" 2>&1
-	"${CLI[@]}" node inspect-bundle "$BUNDLE_B" >"$out/bundle-b.txt" 2>&1
-	"${SSH[@]}" "$MANAGER_REMOTE" "sudo systemctl status --no-pager 'wr-*' || true; sudo journalctl -q -u 'wr-*' -n 300 --no-pager || true; sudo find '$WORKDIR' -maxdepth 5 -type f -o -type l | sort" >"$out/manager-remote.txt" 2>&1
-	"${SSH[@]}" "$NODE_REMOTE" "sudo systemctl status --no-pager 'wr-*' || true; sudo journalctl -q -u 'wr-*' -n 300 --no-pager || true; sudo find '$WORKDIR' -maxdepth 6 -type f -o -type l | sort" >"$out/node-remote.txt" 2>&1
+	status_json "$out/cluster.json" 2>"$out/cluster.stderr" || true
+	"${CLI[@]}" node inspect-bundle "$BUNDLE_A" >"$out/bundle-a.txt" 2>&1 || true
+	"${CLI[@]}" node inspect-bundle "$BUNDLE_B" >"$out/bundle-b.txt" 2>&1 || true
+	"${SSH[@]}" "$MANAGER_REMOTE" "sudo systemctl status --no-pager 'wr-*' || true; sudo journalctl -q -u 'wr-*' -n 300 --no-pager || true; sudo find '$WORKDIR' -maxdepth 5 -type f -o -type l | sort" >"$out/manager-remote.txt" 2>&1 || true
+	"${SSH[@]}" "$NODE_REMOTE" "sudo systemctl status --no-pager 'wr-*' || true; sudo journalctl -q -u 'wr-*' -n 300 --no-pager || true; sudo find '$WORKDIR' -maxdepth 6 -type f -o -type l | sort" >"$out/node-remote.txt" 2>&1 || true
 	if [ "$backend" = docker ]; then
-		"${SSH[@]}" "$MANAGER_REMOTE" "cd '$WORKDIR/wr-manager' && sudo docker compose --project-name wruntime-manager -f docker/docker-compose.yml ps -a && sudo docker compose --project-name wruntime-manager -f docker/docker-compose.yml logs --no-color --tail 300" >"$out/manager-compose.txt" 2>&1
-		"${SSH[@]}" "$NODE_REMOTE" "cd '$WORKDIR/wr-node/current' && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml ps -a && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml images && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml logs --no-color --tail 300" >"$out/node-compose.txt" 2>&1
+		"${SSH[@]}" "$MANAGER_REMOTE" "cd '$WORKDIR/wr-manager' && sudo docker compose --project-name wruntime-manager -f docker/docker-compose.yml ps -a && sudo docker compose --project-name wruntime-manager -f docker/docker-compose.yml logs --no-color --tail 300" >"$out/manager-compose.txt" 2>&1 || true
+		"${SSH[@]}" "$NODE_REMOTE" "cd '$WORKDIR/wr-node/current' && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml ps -a && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml images && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml logs --no-color --tail 300" >"$out/node-compose.txt" 2>&1 || true
 	fi
-	set -e
 }
 
+# Invoked indirectly by the ERR trap.
+# shellcheck disable=SC2317
 on_error() {
 	local status="$1"
 	[ "$ERROR_HANDLED" = false ] || exit "$status"
 	ERROR_HANDLED=true
 	trap - ERR
 	set +e
+	report_active_failure "$status"
 	if [ -n "$ACTIVE_BACKEND" ]; then collect_diagnostics "$ACTIVE_BACKEND"; fi
 	record_failure "$status"
 	exit "$status"
@@ -328,7 +346,7 @@ lifecycle() {
 	local pass="$LOG_BASE/$backend"
 	mkdir -p "$pass"
 	echo "==> deployment lifecycle: $backend"
-	provider reset >"$pass/provider-reset.json"
+	run_to_log "$backend provider reset" "$pass/provider-reset.json" provider reset
 	assert_db_clean
 	if [ "$backend" = docker ]; then
 		"${SSH[@]}" "$MANAGER_REMOTE" "sudo -n docker info >/dev/null && sudo -n docker compose version >/dev/null"
@@ -336,26 +354,30 @@ lifecycle() {
 	fi
 
 	# Secrets are passed directly to wr-cli and are never included in an echoed command transcript.
-	"${CLI[@]}" managers deploy "$MANAGER_BUNDLE" "$MANAGER_REMOTE" --format "$backend" \
+	run_to_log "$backend manager deploy" "$pass/manager-deploy.log" \
+		"${CLI[@]}" managers deploy "$MANAGER_BUNDLE" "$MANAGER_REMOTE" --format "$backend" \
 		--db-url "$WRT_DEPLOY_E2E_DB_URL" --secret-key "$WRT_SECRET_ENCRYPTION_KEY" \
 		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR" \
-		--advertise-address "$MANAGER_ADDR" --gossip-address "${MANAGER_HOST}:9010" >"$pass/manager-deploy.log" 2>&1
+		--advertise-address "$MANAGER_ADDR" --gossip-address "${MANAGER_HOST}:9010"
 	status_json "$pass/manager-status.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/manager-status.json" manager --address "$MANAGER_ADDR" >"$pass/manager-assert.json"
 
-	"${CLI[@]}" node deploy --node-id "$NODE_ID" "$BUNDLE_A" "$NODE_REMOTE" --format "$backend" \
-		--db-url "$WRT_DEPLOY_E2E_DB_URL" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR" >"$pass/deploy-a.log" 2>&1
+	run_to_log "$backend node A deploy" "$pass/deploy-a.log" \
+		"${CLI[@]}" node deploy --node-id "$NODE_ID" "$BUNDLE_A" "$NODE_REMOTE" --format "$backend" \
+		--db-url "$WRT_DEPLOY_E2E_DB_URL" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
 	status_json "$pass/status-a.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-a.json" desired --node-id "$NODE_ID" --digest "$DIGEST_A" --version 1.0.0 >"$pass/assert-a.json"
 	local revision_a revision_b
 	revision_a="$(revision_from "$pass/status-a.json")"
 	invoke_echo "hello-$backend-a" "$pass/invoke-a.json"
 
-	set +e
-	"${CLI[@]}" node deploy --node-id "$NODE_ID" "$BUNDLE_B" "$NODE_REMOTE" --format "$backend" \
-		--db-url "$WRT_DEPLOY_E2E_DB_URL" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$RUN_DIR/missing-certs" >"$pass/failed-attempt.log" 2>&1
-	local failed_status=$?
-	set -e
+	local failed_status
+	if "${CLI[@]}" node deploy --node-id "$NODE_ID" "$BUNDLE_B" "$NODE_REMOTE" --format "$backend" \
+		--db-url "$WRT_DEPLOY_E2E_DB_URL" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$RUN_DIR/missing-certs" >"$pass/failed-attempt.log" 2>&1; then
+		failed_status=0
+	else
+		failed_status=$?
+	fi
 	[ "$failed_status" -ne 0 ] || {
 		echo "intentionally invalid deployment unexpectedly succeeded" >&2
 		return 1
@@ -364,8 +386,9 @@ lifecycle() {
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-failed.json" failed --node-id "$NODE_ID" --serving-digest "$DIGEST_A" --failed-digest "$DIGEST_B" --after-revision "$revision_a" >"$pass/assert-failed.json"
 	invoke_echo "hello-$backend-after-failure" "$pass/invoke-after-failure.json"
 
-	"${CLI[@]}" node deploy --node-id "$NODE_ID" "$BUNDLE_B" "$NODE_REMOTE" --format "$backend" \
-		--db-url "$WRT_DEPLOY_E2E_DB_URL" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR" >"$pass/deploy-b.log" 2>&1
+	run_to_log "$backend node B deploy" "$pass/deploy-b.log" \
+		"${CLI[@]}" node deploy --node-id "$NODE_ID" "$BUNDLE_B" "$NODE_REMOTE" --format "$backend" \
+		--db-url "$WRT_DEPLOY_E2E_DB_URL" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
 	status_json "$pass/status-b.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-b.json" desired --node-id "$NODE_ID" --digest "$DIGEST_B" --version 2.0.0 >"$pass/assert-b.json"
 	revision_b="$(revision_from "$pass/status-b.json")"
@@ -379,10 +402,11 @@ lifecycle() {
 	fi
 	local gate_status=0
 	for _ in $(seq 1 15); do
-		set +e
-		"${CLI[@]}" cluster status --node "$NODE_ID" --output json --fail-on unhealthy >"$pass/status-unhealthy.json" 2>"$pass/status-unhealthy.stderr"
-		gate_status=$?
-		set -e
+		if "${CLI[@]}" cluster status --node "$NODE_ID" --output json --fail-on unhealthy >"$pass/status-unhealthy.json" 2>"$pass/status-unhealthy.stderr"; then
+			gate_status=0
+		else
+			gate_status=$?
+		fi
 		[ "$gate_status" -ne 0 ] && break
 		sleep 1
 	done
@@ -392,12 +416,13 @@ lifecycle() {
 	}
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-unhealthy.json" unhealthy --node-id "$NODE_ID" >"$pass/assert-unhealthy.json"
 
-	"${CLI[@]}" node rollback "$NODE_REMOTE" --node-id "$NODE_ID" --to "$revision_a" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" >"$pass/rollback.log" 2>&1
+	run_to_log "$backend node rollback" "$pass/rollback.log" \
+		"${CLI[@]}" node rollback "$NODE_REMOTE" --node-id "$NODE_ID" --to "$revision_a" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY"
 	status_json "$pass/status-rollback.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-rollback.json" rollback --node-id "$NODE_ID" --source-revision "$revision_a" --after-revision "$revision_b" --digest "$DIGEST_A" --version 1.0.0 >"$pass/assert-rollback.json"
 	invoke_echo "hello-$backend-rollback" "$pass/invoke-rollback.json"
 	collect_diagnostics "$backend"
-	provider stop-reset >"$pass/provider-stop-reset.json"
+	run_to_log "$backend provider stop-reset" "$pass/provider-stop-reset.json" provider stop-reset
 }
 
 for backend in "${BACKENDS[@]}"; do

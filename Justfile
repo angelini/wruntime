@@ -265,7 +265,8 @@ test-wasm-one target: build-test-guests
 deployment-e2e-python-test:
     uv run --project dev/deployment-e2e --locked python -m unittest -v \
         dev/deployment-e2e/test_proxmox.py \
-        dev/deployment-e2e/test_assert_cluster.py
+        dev/deployment-e2e/test_assert_cluster.py \
+        dev/deployment-e2e/test_lifecycle_logging.py
 
 # Verify the protected Proxmox deployment targets without mutating them
 deployment-e2e-preflight:

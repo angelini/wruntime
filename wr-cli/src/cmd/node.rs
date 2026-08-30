@@ -501,6 +501,20 @@ struct DeployArtifactParams<'a> {
     no_otel: bool,
 }
 
+fn engine_docker_extra_copies(
+    has_schema_artifacts: bool,
+    has_migration_artifacts: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let mut copies = vec![("certs/", "certs/"), ("modules/", "modules/")];
+    if has_schema_artifacts {
+        copies.push(("schemas/", "schemas/"));
+    }
+    if has_migration_artifacts {
+        copies.push(("migrations/", "migrations/"));
+    }
+    copies
+}
+
 /// Generate and add systemd units, Dockerfiles, and docker-compose.yml to the tarball.
 fn add_deployment_artifacts(
     tar: &mut tar::Builder<GzEncoder<fs::File>>,
@@ -514,6 +528,12 @@ fn add_deployment_artifacts(
         ..
     } = params;
     let no_otel = params.no_otel;
+    let has_schema_artifacts = checksums
+        .keys()
+        .any(|path| path.starts_with("wr-node/schemas/"));
+    let has_migration_artifacts = checksums
+        .keys()
+        .any(|path| path.starts_with("wr-node/migrations/"));
 
     // Systemd units
     let proxy_unit = ServiceUnit {
@@ -587,12 +607,7 @@ fn add_deployment_artifacts(
             workdir,
             binary: "bin/wr-engine",
             config: &format!("config/{cfg_name}"),
-            extra_copies: vec![
-                ("certs/", "certs/"),
-                ("modules/", "modules/"),
-                ("schemas/", "schemas/"),
-                ("migrations/", "migrations/"),
-            ],
+            extra_copies: engine_docker_extra_copies(has_schema_artifacts, has_migration_artifacts),
             env_vars: vec![],
             no_otel,
         };
@@ -1000,7 +1015,11 @@ fn deployment_attempt_token(prefix: &str) -> String {
 fn validate_deploy_listener_ports(configs: &[(String, String)], peer_port: u16) -> Result<()> {
     let mut ports = std::collections::HashSet::from([peer_port]);
     for (name, content) in configs {
-        let config: toml::Value = toml::from_str(content)
+        // Bundled engine configs carry an unquoted numeric placeholder until the
+        // manager assigns a revision. Substitute a valid sentinel solely for
+        // pre-deployment listener validation.
+        let parseable = content.replace("revision = {revision}", "revision = 1");
+        let config: toml::Value = toml::from_str(&parseable)
             .with_context(|| format!("failed to parse bundled config {name}"))?;
         for field in ["listen_address", "control_address"] {
             if let Some(address) = config.get(field).and_then(toml::Value::as_str) {
@@ -1723,6 +1742,23 @@ mod tests {
     }
 
     #[test]
+    fn engine_dockerfile_copies_only_present_optional_artifacts() {
+        assert_eq!(
+            engine_docker_extra_copies(false, false),
+            vec![("certs/", "certs/"), ("modules/", "modules/")]
+        );
+        assert_eq!(
+            engine_docker_extra_copies(true, true),
+            vec![
+                ("certs/", "certs/"),
+                ("modules/", "modules/"),
+                ("schemas/", "schemas/"),
+                ("migrations/", "migrations/")
+            ]
+        );
+    }
+
+    #[test]
     fn bundle_digest_is_stable_across_inventory_order() {
         let mut checksums = BTreeMap::new();
         checksums.insert("wr-node/bin/wr-engine".into(), "a".repeat(64));
@@ -1775,6 +1811,25 @@ mod tests {
         assert!(command.contains("releases/7"));
         assert!(command.contains("mv -Tf"));
         assert!(!command.contains("ln -sfn"));
+    }
+
+    #[test]
+    fn listener_validation_accepts_unresolved_revision_template() {
+        let configs = vec![(
+            "engine.toml".to_string(),
+            r#"
+listen_address = "127.0.0.1:9100"
+
+[deployment]
+node_id = "{node_id}"
+revision = {revision}
+bundle_digest = "{bundle_digest}"
+engine_slot = "engine"
+"#
+            .to_string(),
+        )];
+
+        validate_deploy_listener_ports(&configs, 9443).unwrap();
     }
 
     #[test]
@@ -1944,6 +1999,10 @@ allowed_hosts = ["api.example.com"]
                 Some("certs/ca.crt")
             );
 
+            let engine_dockerfile =
+                bundle::read_file_from_tarball(path.to_str().unwrap(), "Dockerfile.engine-engine")?;
+            assert!(!engine_dockerfile.contains("COPY schemas/ schemas/"));
+            assert!(!engine_dockerfile.contains("COPY migrations/ migrations/"));
             let compose =
                 bundle::read_file_from_tarball(path.to_str().unwrap(), "docker-compose.yml")?;
             assert_eq!(

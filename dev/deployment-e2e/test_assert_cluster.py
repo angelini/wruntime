@@ -81,6 +81,15 @@ class AssertionTests(unittest.TestCase):
         args = argparse.Namespace(node_id="wr-e2e-node", condition=["STALE_ENGINE_HEARTBEAT"])
         self.assertEqual(assert_cluster.assert_unhealthy(status, args)["severity"], "unhealthy")
 
+    def test_unhealthy_defaults_accept_clean_engine_deregistration(self):
+        status = healthy_status()
+        status["nodes"][0]["severity"] = "unhealthy"
+        status["nodes"][0]["engines"] = []
+        status["nodes"][0]["conditions"] = [{"code": "MISSING_ENGINE", "detail": "ignored"}]
+        args = assert_cluster.parser().parse_args(["unhealthy", "--node-id", "wr-e2e-node"])
+        result = assert_cluster.assert_unhealthy(status, args)
+        self.assertEqual(result["condition_codes"], ["MISSING_ENGINE"])
+
     def test_rollback_is_monotonic_and_restores_source(self):
         status = healthy_status(7, source=3)
         args = argparse.Namespace(node_id="wr-e2e-node", digest="sha256:a", version="1.0.0", engine_slot="engine", source_revision=3, after_revision=6)

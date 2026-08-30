@@ -80,6 +80,7 @@ pub async fn run(args: InvokeArgs, manager_addr: &str) -> Result<()> {
     let body = resp.bytes().await?;
 
     if args.json {
+        ensure_success_response(status, &body)?;
         if body.is_empty() {
             println!("{{}}");
         } else {
@@ -237,6 +238,19 @@ fn transcode_proto_to_json(schema_bytes: &[u8], path: &str, proto_body: &[u8]) -
     Ok(String::from_utf8(serializer.into_inner())?)
 }
 
+fn ensure_success_response(status: reqwest::StatusCode, body: &[u8]) -> Result<()> {
+    if status.is_success() {
+        return Ok(());
+    }
+
+    let detail = String::from_utf8_lossy(body);
+    let detail = detail.trim();
+    if detail.is_empty() {
+        anyhow::bail!("Request failed with status {status}");
+    }
+    anyhow::bail!("Request failed with status {status}: {detail}");
+}
+
 /// Build the proxy URL for a destination like `http://ecommerce.inventory/Seed`.
 fn build_proxy_url(proxy: &str, destination: &str) -> Result<String> {
     let dest: reqwest::Url = destination
@@ -247,4 +261,23 @@ fn build_proxy_url(proxy: &str, destination: &str) -> Result<String> {
         None => dest.path().to_string(),
     };
     Ok(format!("{}{path_and_query}", proxy.trim_end_matches('/')))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsuccessful_response_reports_status_and_plain_text_body() {
+        let error = ensure_success_response(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            b"no route for destination 'deployment.echo'",
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Request failed with status 503 Service Unavailable: no route for destination 'deployment.echo'"
+        );
+    }
 }

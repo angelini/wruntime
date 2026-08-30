@@ -587,6 +587,20 @@ impl ManagerService for Manager {
         )
         .await?
         .record;
+        if !request.succeeded {
+            match db::update_route_health(
+                &self.pool,
+                self.engine_heartbeat_timeout_secs,
+                self.module_heartbeat_timeout_secs,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(%error, node_id = request.node_id, revision = request.revision, "failed to reconcile routes after deployment failure");
+                }
+            }
+        }
         Ok(Response::new(CompleteDeploymentResponse {
             deployment: Some(deployment),
         }))
