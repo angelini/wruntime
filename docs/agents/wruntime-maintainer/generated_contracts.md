@@ -2,25 +2,37 @@
 
 Treat generators and generated artifacts as a fanout, not as isolated files.
 
-```text
-proto/wruntime.proto
-  → wr-common/build.rs
-  → generated tonic/prost types in OUT_DIR
-  → manager / proxy / engine / CLI / tests
+```mermaid
+flowchart TB
+    subgraph control_proto["Control-plane protobuf fanout"]
+        direction LR
+        runtime_proto["Canonical source<br/>proto/wruntime.proto"] --> common_build["wr-common/build.rs"]
+        common_build --> runtime_types["tonic/prost types<br/>generated in OUT_DIR"]
+        runtime_types --> manager["Manager"]
+        runtime_types --> proxy["Proxy"]
+        runtime_types --> engine["Engine"]
+        runtime_types --> cli["CLI"]
+        runtime_types --> tests["Tests"]
+    end
 
-wit/*.wit
-  → engine async host bindings
-  → wr-sdk guest bindings
-  → wr-sdk/wit/deps mirrors
-  → guest component worlds
-  → split WASM host tests
-  → guest API guide when preferred usage or semantics change
+    subgraph host_abi["Host ABI fanout"]
+        direction LR
+        root_wit["Canonical source<br/>wit/*.wit"] --> host_bindings["Engine async<br/>host bindings"]
+        root_wit --> sdk_bindings["wr-sdk guest<br/>bindings"]
+        root_wit --> wit_mirrors["wr-sdk/wit/deps<br/>mirrors"]
+        wit_mirrors --> guest_worlds["Guest component<br/>worlds"]
+        guest_worlds --> wasm_tests["Split WASM<br/>host tests"]
+        root_wit -.->|"usage or semantics change"| api_guide["Guest API guide"]
+    end
 
-guest/example/test .proto
-  → prost-build + wr-build
-  → generated Rust in OUT_DIR
-  → checked-in .binpb descriptors
-  → engine schema registration
+    subgraph guest_schema["Guest schema fanout"]
+        direction LR
+        guest_proto["Canonical source<br/>guest, example, or test .proto"] --> generators["prost-build<br/>and wr-build"]
+        generators --> generated_rust["Rust generated<br/>in OUT_DIR"]
+        guest_proto --> protoc["protoc with imports"]
+        protoc --> descriptors["Checked-in .binpb<br/>descriptor"]
+        descriptors --> schema_registration["Engine schema<br/>registration"]
+    end
 ```
 
 ## Rules

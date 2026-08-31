@@ -11,22 +11,25 @@ or across nodes.
 > LLM-assisted development. The custom `wruntime:*` guest WIT APIs may change
 > incompatibly; pin the runtime and SDK versions used by guest modules.
 
-```text
-caller WASM
-    │ logical HTTP (intercepted by its wr-engine)
-    ▼
-wr-proxy A ─────── mTLS peer routing ──────► wr-proxy B
-    │                                           │
-    ▼                                           ▼
-local wr-engine                           remote wr-engine
-    │                                           │
-    └──────────────► destination WASM ◄─────────┘
+```mermaid
+flowchart LR
+    subgraph data_plane["Streaming data plane"]
+        caller["Caller WASM"] -->|"logical HTTP"| source_engine["Source wr-engine<br/>WASI HTTP interception"]
+        source_engine -->|"loopback"| proxy_a["wr-proxy A"]
+        proxy_a --> route{"Selected instance<br/>location"}
+        route -->|"local"| local_engine["Local wr-engine"]
+        route -->|"peer"| proxy_b["wr-proxy B"]
+        proxy_b -->|"local"| remote_engine["Remote wr-engine"]
+        local_engine --> destination["Destination WASM"]
+        remote_engine --> destination
+    end
 
-          routing, readiness, schedules, deployment state
-                              ▲
-                 active-active wr-manager cluster
-                              │
-                       shared PostgreSQL
+    subgraph control_plane["Control plane"]
+        postgres[("Shared PostgreSQL")] <--> managers["Active-active<br/>wr-manager cluster"]
+    end
+
+    proxy_a -.->|"engine registration, readiness,<br/>and deployment identity"| managers
+    managers -.->|"route sync and scheduled jobs"| proxy_a
 ```
 
 The proxy streams internal and cross-node request and response bodies without

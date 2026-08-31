@@ -38,19 +38,35 @@ Version selection distinguishes exact, semver-range, and unpinned requests. Circ
 
 Engine startup follows this conceptual sequence:
 
-```text
-register engine/modules (routes initially unhealthy)
-  → provision namespace DB roles/schemas and worker storage
-  → run module migrations
-  → build guest pools
-  → resolve requested secrets to module environment values
-  → validate component imports against capability flags
-  → load components
-  → send immediate readiness heartbeat
-  → run periodic heartbeats
+```mermaid
+sequenceDiagram
+    participant engine as wr-engine
+    participant proxy as Local wr-proxy<br/>NodeService
+    participant manager as wr-manager
+    participant database as PostgreSQL
+
+    engine->>engine: Bind listener with workload admission closed
+    engine->>proxy: Register engine and modules
+    proxy->>manager: Forward registration to a healthy manager
+    manager->>database: Persist registration and initially unhealthy routes
+    manager-->>proxy: Return namespace credentials and resolved secrets
+    proxy-->>engine: Return registration result
+    engine->>database: Provision roles, schemas, worker storage, and migrations
+    engine->>engine: Build pools, start owned work, validate, load, and health-check components
+    engine->>proxy: Publish synchronous readiness heartbeat
+    proxy->>manager: Forward first healthy heartbeat
+    manager->>database: Mark routes healthy and advance routing version atomically
+    manager-->>proxy: Return required routing version
+    proxy->>proxy: Converge local routing snapshot to that version
+    proxy-->>engine: Confirm manager and proxy versions
+    engine->>engine: Open workload and worker admission, then enter READY
+    loop While serving
+        engine->>proxy: Publish health heartbeat
+        proxy->>manager: Continue manager heartbeat publication
+    end
 ```
 
-This ordering prevents traffic from reaching a module before migrations, secrets, capability checks, and component load complete. Current lifecycle code is in [`wr-engine/src/main.rs`](../wr-engine/src/main.rs); public behavior is described in [configuration](configuration.md).
+This ordering prevents traffic from reaching a module before migrations, secrets, capability checks, and component load complete, or before the local proxy can route to it. Current lifecycle code is in [`wr-engine/src/main.rs`](../wr-engine/src/main.rs); public behavior is described in [configuration](configuration.md).
 
 ## Host capabilities
 
@@ -77,8 +93,13 @@ Module secret references are resolved at registration/startup and passed only as
 
 The semantic stream is:
 
-```text
-zero or more text deltas → one usage event → one stop event → end
+```mermaid
+stateDiagram-v2
+    [*] --> Streaming
+    Streaming --> Streaming: text delta (zero or more)
+    Streaming --> Usage: exactly one usage event
+    Usage --> Stop: exactly one stop event
+    Stop --> [*]
 ```
 
 Tool use is non-streaming only. Exact event types belong to [`wit/llm.wit`](../wit/llm.wit); preferred use belongs to the [guest API guide](agents/guest-module-author/api_guide.md#llm).
@@ -87,12 +108,16 @@ Tool use is non-streaming only. Exact event types belong to [`wit/llm.wit`](../w
 
 Workers are HTTP service implementations consumed through an engine-managed durable queue. The stable flow is:
 
-```text
-submit canonical job type
-  → persist pending job
-  → worker claims under lease/fence
-  → execute handler
-  → fenced complete or retry/dead transition
+```mermaid
+stateDiagram-v2
+    [*] --> Pending: submit canonical job type
+    Pending --> Running: claim with lease and fence
+    Running --> Completed: fenced completion
+    Running --> Pending: retryable failure
+    Running --> Pending: lease expires and recovery reclaims
+    Running --> Dead: terminal failure
+    Completed --> [*]
+    Dead --> [*]
 ```
 
 A non-empty ad-hoc version matches exactly. An empty ad-hoc version is name-only and may be claimed by any matching worker version. Manager schedules are version-pinned. Leases and retries make delivery at least once, so handlers must be idempotent.

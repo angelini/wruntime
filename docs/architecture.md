@@ -2,39 +2,45 @@
 
 A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. Nodes are independent — each proxy handles its own inbound traffic and forwards cross-node requests directly to the peer proxy, which then routes locally to its engines.
 
-```text
-              ┌────────────────────────┐    gossip    ┌────────────────────────┐
-              │    wr-manager (1)     │◄───(UDP)───►│    wr-manager (2)     │
-              │  Engine registry      │             │  Engine registry      │
-              │  Routing table        │             │  Routing table        │
-              └──────────┬───────────┘             └──────────┬───────────┘
-                         │          shared Postgres           │
-                         │     (serialized via row locks)     │
-                         └────────────────┬───────────────────┘
-                                          │ gRPC (all nodes)
-               ┌──────────────────────────┴───────────────────────┐
-               │                                          │
-               ▼                                          ▼
-┌─────────────────────────────┐        ┌─────────────────────────────┐
-│           Node A            │        │           Node B            │
-│                             │        │                             │
-│  ┌───────────────────────┐  │        │  ┌───────────────────────┐  │
-│  │      wr-proxy A       │◄─┼────────┼─►│      wr-proxy B       │  │
-│  │  TracingLayer         │  │  HTTP  │  │  TracingLayer         │  │
-│  │  RoutingLayer         │  │        │  │  RoutingLayer         │  │
-│  │  EgressLayer          │  │        │  │  ForwardService       │  │
-│  │  ForwardService       │  │        │  │                       │  │
-│  └──────────┬────────────┘  │        │  │                       │  │
-│             │ local         │        │  └──────────┬────────────┘  │
-│             ▼               │        │             │ local         │
-│  ┌───────────────────────┐  │        │  ┌──────────▼────────────┐  │
-│  │      wr-engine A      │  │        │  │      wr-engine B      │  │
-│  │  ┌─────────────────┐  │  │        │  │  ┌─────────────────┐  │  │
-│  │  │  order-service  │  │  │        │  │  │inventory-service│  │  │
-│  │  │  (WASM module)  │  │  │        │  │  │  (WASM module)  │  │  │
-│  │  └─────────────────┘  │  │        │  │  └─────────────────┘  │  │
-│  └───────────────────────┘  │        │  └───────────────────────┘  │
-└─────────────────────────────┘        └─────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph control_plane["Active-active control plane"]
+        direction TB
+        subgraph manager_cluster["Manager cluster"]
+            direction LR
+            manager_1["wr-manager 1"] <-->|"UDP gossip"| manager_2["wr-manager 2"]
+            manager_api["Manager gRPC API served by each manager<br/>registry, routes, schedules, deployment state"]
+            manager_1 --- manager_api
+            manager_2 --- manager_api
+        end
+        postgres[("Shared PostgreSQL<br/>writes serialized by row locks")]
+        manager_1 <--> postgres
+        manager_2 <--> postgres
+    end
+
+    subgraph node_a["Node A"]
+        direction TB
+        proxy_a["wr-proxy A<br/>trace, route, egress, forward"]
+        engine_a["wr-engine A"]
+        order["order-service<br/>WASM module"]
+        proxy_a <-->|"loopback HTTP"| engine_a
+        engine_a --- order
+    end
+
+    subgraph node_b["Node B"]
+        direction TB
+        proxy_b["wr-proxy B<br/>trace, route, egress, forward"]
+        engine_b["wr-engine B"]
+        inventory["inventory-service<br/>WASM module"]
+        proxy_b <-->|"loopback HTTP"| engine_b
+        engine_b --- inventory
+    end
+
+    proxy_a -.->|"engine registration and heartbeats"| manager_api
+    proxy_b -.->|"engine registration and heartbeats"| manager_api
+    manager_api -.->|"manager discovery and route snapshots"| proxy_a
+    manager_api -.->|"manager discovery and route snapshots"| proxy_b
+    proxy_a <-->|"mTLS peer HTTP"| proxy_b
 ```
 
 ## Components
@@ -94,64 +100,37 @@ Delivery is **at-least-once** — a manager crash between submit and finalize le
 
 Public ingress is the guest-module data-plane trust boundary. `IngressLayer` strips reserved headers, authorizes a configured public path and method, and rewrites any REST-style alias to the route's required canonical `rpc_path`. After routing selects an exact healthy module version, `SchemaValidationLayer` lazily loads that version's descriptor set from the manager, buffers the external request body once, and decodes it as the RPC input message before forwarding. Invalid protobuf is rejected at the boundary. The loopback internal stack and mTLS peer stack deliberately omit this layer, so wruntime-generated module, worker, scheduler, and cross-node continuation traffic remains trusted and streams without repeated validation.
 
-```text
-WASM module makes HTTP call to "http://ecommerce.inventory/inventory.InventoryService/GetItems"
-  │
-  ▼  [WasiHttpView::send_request intercepts — transparent to the module]
-  │  Adds headers:
-  │    x-wr-source:      "order-service"
-  │    x-wr-destination: "http://ecommerce.inventory/inventory.InventoryService/GetItems"
-  │  Rewrites URI to the local wr-proxy (Node A)
-  │
-  ▼
-wr-proxy A  (Node A)
-  │  1. TracingLayer       — opens an OTel span (captures source, destination,
-  │                          status, duration); injects W3C traceparent header
-  │  2. RoutingLayer       — single routing snapshot read and one borrowed
-  │                          namespace/module lookup per internal request;
-  │                          parses an optional x-wr-version selector once and
-  │                          scans sync-time prepared, descending version groups;
-  │                          when omitted, load-balances across all healthy versions;
-  │                          returns 503 if no healthy instance matches;
-  │                          inserts sync-time prepared x-wr-module,
-  │                          x-wr-namespace, and resolved x-wr-version values;
-  │                          skips known-open prepared circuit-breaker handles
-  │                          when another eligible replica exists, then carries
-  │                          the selected destination and breaker forward; when
-  │                          egress is enabled and no internal route matches,
-  │                          sets ExternalEgress extension
-  │  3. EgressLayer        — handles ExternalEgress requests: enforces the domain
-  │                          allowlist and forwards to external hosts;
-  │                          passes internal requests through to ForwardService
-  │  4. ForwardService     — assembles normal local/peer URIs from prepared
-  │                          scheme/authority plus the borrowed request path/query;
-  │                          strips x-wr-destination / x-wr-source, injects
-  │                          traceparent, performs the final carried-breaker check,
-  │                          and streams both bodies without buffering; then:
-  │
-  ├── destination is on Node A (LocalEngine) ──────────────────────────────────┐
-  │     strips x-wr-destination / x-wr-source / x-wr-via-proxy                 │
-  │     forwards directly to wr-engine A                                       │
-  │                                                                            ▼
-  │                                                                    wr-engine A
-  │
-  └── destination is on Node B (RemoteProxy) ──────────────────────────────────┐
-        sets x-wr-via-proxy: 1                                                 │
-        forwards to wr-proxy B                                                 │
-                                                                               ▼
-                                                               wr-proxy B  (Node B)
-                                                                 RoutingLayer routes locally
-                                                                               │
-                                                                               ▼
-                                                                       wr-engine B
+```mermaid
+flowchart TD
+    caller["Caller WASM<br/>logical inventory service URL"]
+    host["WasiHttpView<br/>set trusted source and destination headers;<br/>rewrite URI to the loopback proxy"]
 
-wr-engine (destination)
-  │  Inbound HTTP server parses x-wr-module + x-wr-version + x-wr-namespace
-  │  once, selects a WASM instance via round-robin, and passes the network body
-  │  directly to WASI HTTP with bounded backpressure
-  │
-  ▼
-inventory-service WASM module streams the response
+    subgraph proxy_a["wr-proxy A request stack"]
+        direction TB
+        tracing["1. TracingLayer<br/>open OTel span and inject traceparent"]
+        routing["2. RoutingLayer<br/>resolve namespace, module, version, instance,<br/>and prepared circuit-breaker handle"]
+        egress{"3. EgressLayer"}
+        forward["4. ForwardService<br/>prepare URI, recheck breaker,<br/>and stream without buffering"]
+        tracing --> routing
+        routing -->|"healthy internal route"| egress
+        egress -->|"internal: pass through"| forward
+    end
+
+    caller --> host -->|"stream request"| tracing
+    routing -->|"no healthy matching instance"| unavailable(["503 unavailable"])
+    routing -->|"no internal route and egress enabled"| egress
+    egress -->|"external and allowlisted"| external["External host"]
+    egress -->|"external and denied"| blocked(["Reject request"])
+
+    forward --> location{"Prepared destination"}
+    location -->|"LocalEngine"| local_engine["wr-engine A<br/>parse identity once, select an instance,<br/>and preserve bounded backpressure"]
+    location -->|"RemoteProxy over mTLS"| peer_proxy["wr-proxy B<br/>set via-proxy marker and route locally"]
+    peer_proxy --> remote_engine["wr-engine B<br/>parse identity once, select an instance,<br/>and preserve bounded backpressure"]
+    local_engine --> destination["inventory-service WASM"]
+    remote_engine --> destination
+
+    destination -.->|"response streams back over the selected path"| caller
+    external -.->|"response streams back"| caller
 ```
 
 The engine does not collect network request or guest response bodies at dispatch. A response-body owner retains the guest task, `Store<ModuleState>`, and owned instance permit through body completion. Normal end joins the task; a body error, timeout, or client drop cancels it so those resources cannot remain detached. Health checks drain their responses. Worker requests enter through the same body type from their already-buffered protobuf payload, and worker responses are deliberately collected only at the job-result persistence boundary.
@@ -174,23 +153,24 @@ All internal routing uses a set of reserved `x-wr-*` HTTP headers. The proxy str
 
 ### Header lifecycle per request
 
-```text
-WASM module calls http://ecommerce.inventory/inventory.InventoryService/GetItems
-  │
-  │  WasiHttpView (wr-engine) sets:
-  │    x-wr-destination: http://ecommerce.inventory/inventory.InventoryService/GetItems
-  │    x-wr-source:      order-service
-  │    x-wr-source-ns:   ecommerce
-  │
-  ▼ wr-proxy (same node)
-  │  RoutingLayer injects:
-  │    x-wr-module:    inventory
-  │    x-wr-namespace: ecommerce
-  │    x-wr-version:   1.2.0          ← resolved (or forwarded from caller)
-  │
-  ├─ local engine ──► ForwardService strips x-wr-destination, x-wr-source,
-  │                   x-wr-source-ns, x-wr-via-proxy before sending to wr-engine
-  │
-  └─ peer proxy   ──► ForwardService sets x-wr-via-proxy: 1; preserves
-                      x-wr-destination for peer RoutingLayer to resolve
+```mermaid
+sequenceDiagram
+    actor module as WASM module
+    participant host as WasiHttpView<br/>wr-engine
+    participant local_proxy as Local wr-proxy
+    participant local_engine as Local destination wr-engine
+    participant peer_proxy as Peer wr-proxy
+    participant remote_engine as Remote destination wr-engine
+
+    module->>host: Call logical inventory service URL
+    Note right of host: Set x-wr-destination,<br/>x-wr-source: order-service,<br/>and x-wr-source-ns: ecommerce
+    host->>local_proxy: Forward to same-node proxy
+    Note right of local_proxy: RoutingLayer injects x-wr-module: inventory,<br/>x-wr-namespace: ecommerce, and resolved x-wr-version: 1.2.0
+
+    alt Local engine
+        local_proxy->>local_engine: Strip destination, source, source namespace, and via-proxy headers
+    else Peer proxy
+        local_proxy->>peer_proxy: Set x-wr-via-proxy and preserve x-wr-destination
+        peer_proxy->>remote_engine: Resolve locally, then strip reserved routing headers
+    end
 ```
