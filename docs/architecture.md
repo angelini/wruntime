@@ -53,6 +53,20 @@ Database authorization is per namespace. The manager generates and stores a name
 
 The engine normalizes database startup work by `(namespace, module)`: duplicate configured instances or versions still load independently and all contribute pool capacity, but their shared schema is provisioned and migrated once. Engine-owned `wr__jobs` migrations are embedded, serialized separately from module migrations, and complete before worker loops or readiness. Claims atomically persist a fence and fixed lease expiry derived from the submitted job timeout. One recovery coordinator per engine reclaims expired leases; multiple engines remain safe through row locking and fenced updates.
 
+## Service lifecycle and readiness
+
+Every service exposes the monotonic process stages `STARTING → READY → DRAINING → STOPPING` through `LifecycleService`. Lifecycle is a process-stage contract, not cluster availability: a manager can be `READY` while gossip evidence is degraded, and route/module health remains in `GetClusterStatus`.
+
+Readiness barriers are service-specific:
+
+- A manager becomes ready after configuration/TLS validation, database bootstrap and migrations, manager registration, gossip bind and metadata publication, scheduler/route-monitor ownership, and successful mTLS gRPC bind.
+- A proxy becomes ready after manager discovery succeeds, an initial routing snapshot is installed, and its loopback control, internal, peer mTLS, and optional external listeners are all bound.
+- An engine binds its loopback control/workload listener with workload admission closed, then registers, provisions schemas, runs job and module migrations, builds pools, starts owned recovery/worker/module work, loads and health-checks every configured module, and publishes one synchronous readiness heartbeat. The manager atomically records that publication and returns a routing version; the proxy does not acknowledge it until its local routing snapshot contains at least that version. Only then does the engine open workload and worker admission and enter `READY`.
+
+Lifecycle control remains on existing trusted listeners: manager control uses its mTLS gRPC listener, proxy control uses the loopback NodeService listener, and engine control uses its loopback HTTP/2 listener. Engine startup rejects a non-loopback bind, and routed requests cannot invoke lifecycle methods. All listeners, refresh/heartbeat loops, worker/LISTEN/recovery tasks, module request tasks, and accepted connections are owned and joined; unexpected required-task exit fails the process.
+
+Drain closes admission before teardown. An engine first stops new worker claims and healthy-heartbeat publication, asks the manager to make its routes non-serving, waits for the local proxy to install the returned withdrawal version, closes HTTP admission, drains accepted requests and claimed jobs, and only then deregisters. Proxy drain closes and acknowledges every data listener before replying while retaining lifecycle/NodeService control until stop. Manager drain rejects new deployment, routing, secret, schedule, and registration mutations while retaining status and engine drain/deregister operations. Each active drain or stop operation uses one absolute 30-second deadline; nested waits never reset it. Because `Drain` deliberately does not imply process exit, a later explicit `Stop` starts the separate final control-listener/task-join budget. Deadline expiry aborts and joins named leftovers and produces a non-zero exit.
+
 ## Manager clustering (active-active)
 
 Multiple `wr-manager` instances can run simultaneously for high availability. All managers share the same Postgres database — concurrent writes are serialized via `SELECT ... FOR UPDATE NOWAIT` on a lock sentinel row. Each manager:

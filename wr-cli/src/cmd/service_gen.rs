@@ -45,7 +45,8 @@ impl ServiceUnit<'_> {
 
         // [Service]
         out.push_str("[Service]\n");
-        out.push_str("Type=simple\n");
+        out.push_str("Type=notify\n");
+        out.push_str("NotifyAccess=main\n");
         out.push_str("User={run_user}\n");
         out.push_str("Group={run_group}\n");
         out.push_str(&format!("WorkingDirectory={}\n", self.working_directory));
@@ -61,6 +62,9 @@ impl ServiceUnit<'_> {
         }
         out.push_str("Restart=on-failure\n");
         out.push_str("RestartSec=5\n");
+        out.push_str("KillSignal=SIGTERM\n");
+        out.push_str("TimeoutStopSec=45s\n");
+        out.push_str("SendSIGKILL=yes\n");
         out.push('\n');
 
         // [Install]
@@ -107,6 +111,19 @@ impl DockerfileSpec<'_> {
     }
 }
 
+pub struct ComposeDependency {
+    pub service: String,
+    pub condition: &'static str,
+}
+
+pub struct ComposeHealthcheck {
+    pub test: Vec<String>,
+    pub interval: &'static str,
+    pub timeout: &'static str,
+    pub retries: u32,
+    pub start_period: &'static str,
+}
+
 /// A service entry in a docker-compose file.
 pub struct ComposeService {
     pub name: String,
@@ -116,7 +133,8 @@ pub struct ComposeService {
     pub network_mode: Option<String>,
     pub ports: Vec<String>,
     pub volumes: Vec<String>,
-    pub depends_on: Vec<String>,
+    pub depends_on: Vec<ComposeDependency>,
+    pub healthcheck: ComposeHealthcheck,
 }
 
 /// Render a docker-compose.yml from a list of services.
@@ -153,10 +171,28 @@ pub fn generate_compose(header: &str, services: &[ComposeService]) -> String {
         }
         if !svc.depends_on.is_empty() {
             out.push_str("    depends_on:\n");
-            for dep in &svc.depends_on {
-                out.push_str(&format!("      - {dep}\n"));
+            for dependency in &svc.depends_on {
+                out.push_str(&format!(
+                    "      {}:\n        condition: {}\n",
+                    dependency.service, dependency.condition
+                ));
             }
         }
+        out.push_str("    healthcheck:\n");
+        let healthcheck_test = match serde_json::to_string(&svc.healthcheck.test) {
+            Ok(test) => test,
+            Err(_) => "[]".to_string(),
+        };
+        out.push_str(&format!("      test: {healthcheck_test}\n"));
+        out.push_str(&format!("      interval: {}\n", svc.healthcheck.interval));
+        out.push_str(&format!("      timeout: {}\n", svc.healthcheck.timeout));
+        out.push_str(&format!("      retries: {}\n", svc.healthcheck.retries));
+        out.push_str(&format!(
+            "      start_period: {}\n",
+            svc.healthcheck.start_period
+        ));
+        out.push_str("    stop_signal: SIGTERM\n");
+        out.push_str("    stop_grace_period: 45s\n");
         out.push_str("    restart: on-failure\n");
     }
 
@@ -171,6 +207,88 @@ pub fn sysctl_config() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_definitions_use_semantic_readiness_and_bounded_shutdown() {
+        let unit = ServiceUnit {
+            description: "test",
+            binary_path: "/opt/test",
+            config_path: "/opt/test.toml",
+            working_directory: "/opt",
+            env_vars: vec![],
+            no_otel: true,
+            after: vec!["wr-proxy.service"],
+            requires: vec!["wr-proxy.service"],
+        }
+        .to_systemd();
+        assert!(unit.contains("Type=notify\n"));
+        assert!(unit.contains("NotifyAccess=main\n"));
+        assert!(unit.contains("KillSignal=SIGTERM\n"));
+        assert!(unit.contains("TimeoutStopSec=45s\n"));
+        assert!(!unit.contains("Type=simple"));
+
+        let compose = generate_compose(
+            "",
+            &[ComposeService {
+                name: "engine".into(),
+                dockerfile: "Dockerfile.engine".into(),
+                context: ".".into(),
+                image: None,
+                network_mode: Some("host".into()),
+                ports: vec![],
+                volumes: vec![],
+                depends_on: vec![ComposeDependency {
+                    service: "proxy".into(),
+                    condition: "service_healthy",
+                }],
+                healthcheck: ComposeHealthcheck {
+                    test: vec![
+                        "CMD".into(),
+                        "/opt/engine".into(),
+                        "--lifecycle-probe".into(),
+                    ],
+                    interval: "2s",
+                    timeout: "2s",
+                    retries: 15,
+                    start_period: "30s",
+                },
+            }],
+        );
+        assert!(compose.contains("condition: service_healthy"));
+        assert!(compose.contains("--lifecycle-probe"));
+        assert!(compose.contains("stop_signal: SIGTERM"));
+        assert!(compose.contains("stop_grace_period: 45s"));
+        assert_eq!(
+            compose,
+            generate_compose(
+                "",
+                &[ComposeService {
+                    name: "engine".into(),
+                    dockerfile: "Dockerfile.engine".into(),
+                    context: ".".into(),
+                    image: None,
+                    network_mode: Some("host".into()),
+                    ports: vec![],
+                    volumes: vec![],
+                    depends_on: vec![ComposeDependency {
+                        service: "proxy".into(),
+                        condition: "service_healthy",
+                    }],
+                    healthcheck: ComposeHealthcheck {
+                        test: vec![
+                            "CMD".into(),
+                            "/opt/engine".into(),
+                            "--lifecycle-probe".into()
+                        ],
+                        interval: "2s",
+                        timeout: "2s",
+                        retries: 15,
+                        start_period: "30s",
+                    },
+                }]
+            )
+        );
+    }
 
     #[test]
     fn dockerfile_base_is_digest_pinned() {

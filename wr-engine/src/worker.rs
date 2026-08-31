@@ -11,6 +11,8 @@ use crate::{InboundRequest, ModuleTx};
 use wr_common::lifecycle::{
     AttemptCount, JobState, JobTimeoutSecs, MaxAttempts, WorkerConcurrency,
 };
+use wr_common::lifecycle_service::AdmissionGate;
+use wr_common::task_group::{TaskCancellation, TaskExit, TaskGroup};
 
 /// Insert a job into the queue. Returns the generated job_id.
 #[allow(clippy::too_many_arguments)]
@@ -226,12 +228,15 @@ pub async fn recover_stale_jobs(pool: &Pool) -> anyhow::Result<u64> {
     Ok(count)
 }
 
-/// Spawn the engine-level stale lease recovery coordinator.
-pub fn spawn_recovery_coordinator(pool: Arc<Pool>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+/// Register the engine-level stale lease recovery coordinator as owned work.
+pub fn spawn_recovery_coordinator(tasks: &mut TaskGroup, pool: Arc<Pool>) {
+    tasks.spawn("engine-job-recovery", move |mut cancellation| async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
+                _ = interval.tick() => {}
+            }
             let started = std::time::Instant::now();
             match recover_stale_jobs(&pool).await {
                 Ok(recovered) => info!(
@@ -248,7 +253,7 @@ pub fn spawn_recovery_coordinator(pool: Arc<Pool>) -> tokio::task::JoinHandle<()
                 ),
             }
         }
-    })
+    });
 }
 
 /// Configuration for a worker pool.
@@ -280,16 +285,20 @@ fn worker_channel(namespace: &str, name: &str, version: &str) -> String {
     }
 }
 
-/// Spawn the worker pool: N module-specific worker loops plus one LISTEN task.
-/// The worker loops dispatch jobs as HTTP requests through the provided `ModuleTx`.
-pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx) {
+/// Register N module-specific worker loops and one LISTEN task as owned work.
+pub fn spawn_worker_pool(
+    tasks: &mut TaskGroup,
+    pool: Arc<Pool>,
+    config: WorkerPoolConfig,
+    tx: ModuleTx,
+    admission: AdmissionGate,
+) {
     let notify = Arc::new(Notify::new());
     let channels = vec![
         worker_channel(&config.namespace, &config.name, &config.version),
         worker_channel(&config.namespace, &config.name, ""),
     ];
 
-    // Spawn LISTEN task with a raw tokio-postgres connection.
     {
         let notify = notify.clone();
         let channels = channels.clone();
@@ -297,13 +306,22 @@ pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx
         let name = config.name.clone();
         let version = config.version.clone();
         let db_url = config.database_url.clone();
-        tokio::spawn(async move {
-            listen_task(&db_url, &channels, notify, &ns, &name, &version).await;
+        let task_name = format!("worker-listen-{ns}-{name}-{version}");
+        tasks.spawn(task_name, move |cancellation| async move {
+            listen_task(
+                &db_url,
+                &channels,
+                notify,
+                &ns,
+                &name,
+                &version,
+                cancellation,
+            )
+            .await
         });
     }
 
-    // Spawn worker loops.
-    for i in 0..config.concurrency.get() {
+    for worker_id in 0..config.concurrency.get() {
         let pool = pool.clone();
         let tx = tx.clone();
         let notify = notify.clone();
@@ -313,9 +331,11 @@ pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx
         let engine_id = config.engine_id.clone();
         let poll_interval = config.poll_interval;
         let job_timeout = config.job_timeout;
-        tokio::spawn(async move {
+        let admission = admission.clone();
+        let task_name = format!("worker-{ns}-{name}-{version}-{worker_id}");
+        tasks.spawn(task_name, move |cancellation| async move {
             worker_loop(
-                i,
+                worker_id,
                 &pool,
                 &tx,
                 &notify,
@@ -325,8 +345,10 @@ pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx
                 &engine_id,
                 poll_interval,
                 job_timeout,
+                admission,
+                cancellation,
             )
-            .await;
+            .await
         });
     }
 
@@ -339,7 +361,6 @@ pub fn spawn_worker_pool(pool: Arc<Pool>, config: WorkerPoolConfig, tx: ModuleTx
     );
 }
 
-/// Dedicated connection that runs LISTEN and wakes worker loops via Notify.
 async fn listen_task(
     db_url: &str,
     channels: &[String],
@@ -347,19 +368,23 @@ async fn listen_task(
     ns: &str,
     name: &str,
     version: &str,
-) {
+    mut cancellation: TaskCancellation,
+) -> anyhow::Result<TaskExit> {
     loop {
-        match listen_loop(db_url, channels, &notify).await {
-            Ok(()) => break,
-            Err(e) => {
+        match listen_loop(db_url, channels, &notify, cancellation.clone()).await {
+            Ok(exit) => return Ok(exit),
+            Err(error) => {
                 warn!(
                     namespace = %ns,
                     module = %name,
                     version = %version,
-                    error = %e,
+                    %error,
                     "LISTEN connection lost, reconnecting in 2s",
                 );
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::select! {
+                    _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
             }
         }
     }
@@ -369,23 +394,25 @@ async fn listen_loop(
     db_url: &str,
     channels: &[String],
     notify: &Arc<Notify>,
-) -> anyhow::Result<()> {
+    cancellation: TaskCancellation,
+) -> anyhow::Result<TaskExit> {
     let (client, mut connection) = tokio_postgres::connect(db_url, tokio_postgres::NoTls).await?;
-
-    // Drive the connection manually so we can intercept notifications.
-    let notify = Arc::clone(notify);
-    let conn_handle = tokio::spawn(async move {
+    let driver_notify = Arc::clone(notify);
+    let mut driver_cancellation = cancellation.clone();
+    let driver = tokio::spawn(async move {
         loop {
-            match std::future::poll_fn(|cx| connection.poll_message(cx)).await {
-                Some(Ok(tokio_postgres::AsyncMessage::Notification(_))) => {
-                    notify.notify_waiters();
+            tokio::select! {
+                _ = driver_cancellation.cancelled() => return Ok(TaskExit::Cancelled),
+                message = std::future::poll_fn(|cx| connection.poll_message(cx)) => {
+                    match message {
+                        Some(Ok(tokio_postgres::AsyncMessage::Notification(_))) => {
+                            driver_notify.notify_waiters();
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => return Err(error.into()),
+                        None => anyhow::bail!("LISTEN connection closed"),
+                    }
                 }
-                Some(Ok(_)) => {} // parameter status, etc.
-                Some(Err(e)) => {
-                    warn!(error = %e, "LISTEN connection error");
-                    break;
-                }
-                None => break,
             }
         }
     });
@@ -395,13 +422,16 @@ async fn listen_loop(
         .map(|channel| format!("LISTEN \"{}\"", channel.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join("; ");
-    client.batch_execute(&listen_sql).await?;
-
+    if let Err(error) = client.batch_execute(&listen_sql).await {
+        driver.abort();
+        let _ = driver.await;
+        return Err(error.into());
+    }
     info!(channels = ?channels, "LISTEN active");
 
-    // Wait for the connection task to finish (connection lost).
-    conn_handle.await?;
-    anyhow::bail!("LISTEN connection closed")
+    let result = driver.await?;
+    drop(client);
+    result
 }
 
 async fn finalize_failure(pool: &Pool, job_id: &str, claim_id: uuid::Uuid, message: &str) {
@@ -508,25 +538,30 @@ async fn worker_loop(
     engine_id: &str,
     poll_interval: Duration,
     job_timeout: Duration,
-) {
+    admission: AdmissionGate,
+    mut cancellation: TaskCancellation,
+) -> anyhow::Result<TaskExit> {
     loop {
         tokio::select! {
+            _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
             _ = notify.notified() => {}
             _ = tokio::time::sleep(poll_interval) => {}
         }
 
-        // Drain: keep claiming until no more pending jobs.
         loop {
+            let Some(_claim_guard) = admission.try_enter() else {
+                break;
+            };
             let job = match claim_job(pool, namespace, name, version, engine_id).await {
                 Ok(Some(job)) => job,
                 Ok(None) => break,
-                Err(e) => {
+                Err(error) => {
                     warn!(
                         worker_id,
                         namespace,
                         module = name,
                         version,
-                        error = %e,
+                        %error,
                         "claim_job failed",
                     );
                     break;
@@ -542,7 +577,6 @@ async fn worker_loop(
                 job_type = %job.job_type,
                 "processing job",
             );
-
             dispatch_job(pool, tx, job, job_timeout).await;
         }
     }

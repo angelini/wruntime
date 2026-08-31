@@ -4,9 +4,11 @@ For each change, **preserve** the contract, **inspect** the listed implementatio
 
 ## Lifecycle and readiness
 
-- **Preserve:** manager, proxy, and engine startup/shutdown ordering; registrations begin with unhealthy routes; engine provisioning, module migrations, pool creation, and component loading finish before the immediate readiness heartbeat; periodic engine/module heartbeats continue afterward.
-- **Inspect:** manager service/state/database, engine `main.rs`/`engine.rs`/`registry.rs`, shutdown tasks, and health recomputation.
-- **Prove:** manager, health, migration, and multi-manager tests; warning-free ecommerce validation when flow changes.
+- **Preserve:** manager, proxy, and engine startup/shutdown ordering; registrations begin with unhealthy routes; semantic readiness opens admission only after each service's documented barriers; engine provisioning, migrations, pools, component loading, module health checks, atomic manager publication, and local proxy routing-version convergence finish before `READY`; periodic engine/module heartbeats continue afterward.
+- **Preserve:** lifecycle state remains distinct from cluster health severity. Every long-lived, listener, connection, module-request, worker, LISTEN, recovery, scheduler, discovery, and heartbeat task is owned and joined. Drain closes the relevant admission before teardown, worker claims stop before waiting, route withdrawal converges before engine HTTP admission closes, heartbeat publication is fenced before drain/deregister, and final deregistration cannot be undone by stale proxy state.
+- **Preserve:** each active drain or stop operation uses one absolute 30-second deadline; nested convergence, admission, deregistration, and join waits never reset it. Because drain does not imply process exit, a later explicit stop starts the separate final control-listener/task-join deadline. Generated systemd and Compose supervisors provide 45 seconds for signal-driven full shutdown, use semantic readiness notification/probes and SIGTERM, and stop engines before their proxy. Deadline escalation aborts and joins named leftovers and exits non-zero.
+- **Inspect:** manager service/state/database and orchestration; proxy NodeService/routing/admission/listeners; engine `main.rs`/`server.rs`/`engine.rs`/`worker.rs`/`registry.rs`; lifecycle task ownership and deployment generation.
+- **Prove:** lifecycle, manager, health, proxy, version, worker, migration, multi-manager, and deployment-template tests; warning-free ecommerce validation and protected systemd/Docker lifecycle qualification when generation changes.
 
 ## Routing and circuit breaking
 

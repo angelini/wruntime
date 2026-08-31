@@ -1,24 +1,33 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use serde_json::json;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use bytes::Bytes;
 use deadpool_postgres::Pool;
 use http::{Request, Response, StatusCode};
+use http_body::Body;
 use http_body_util::BodyExt;
 use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tracing::{info, info_span, warn, Instrument};
 
 use crate::registry::{InboundRequest, ModuleRegistry};
+use wr_common::lifecycle_service::{AdmissionGate, AdmissionGuard};
+use wr_common::process_lifecycle::{ProcessLifecycleCoordinator, TransitionReason};
+use wr_common::signal::{apply_shutdown_request, ShutdownRequest};
+use wr_common::task_group::{TaskCancellation, TaskExit};
 use wr_common::wruntime::{
-    GetJobStatusRequest, GetJobStatusResponse, SubmitJobRequest, SubmitJobResponse,
+    DrainRequest, DrainResponse, GetJobStatusRequest, GetJobStatusResponse,
+    GetLifecycleStatusResponse, StopRequest, StopResponse, SubmitJobRequest, SubmitJobResponse,
 };
 
 const WORKER_SERVICE_PREFIX: &str = "/wruntime.WorkerService/";
@@ -44,6 +53,12 @@ struct WorkerPolicy {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WorkerDefaults {
     policies: HashMap<wr_common::identity::ModuleId, WorkerPolicy>,
+}
+
+#[derive(Clone)]
+pub(crate) struct EngineAdmission {
+    pub(crate) workload: AdmissionGate,
+    pub(crate) worker: AdmissionGate,
 }
 
 struct RoutedIdentity(wr_common::identity::ModuleId);
@@ -98,82 +113,270 @@ impl WorkerDefaults {
     }
 }
 
-/// Start the engine's inbound HTTP server.  The proxy forwards module-to-module
-/// requests here; we route each request to the appropriate WASM module task
-/// via the registry.
+/// Run the already-bound engine listener with lifecycle control always
+/// available and workload admission derived from the semantic lifecycle gate.
 pub async fn serve(
-    addr: &str,
+    listener: TcpListener,
     registry: ModuleRegistry,
     db_pool: Option<Arc<Pool>>,
     worker_defaults: Arc<WorkerDefaults>,
-) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    info!(address = %addr, "inbound server listening");
+    admission: EngineAdmission,
+    lifecycle: ProcessLifecycleCoordinator,
+    mut cancellation: TaskCancellation,
+) -> Result<TaskExit> {
+    info!(address = %listener.local_addr()?, "inbound server listening");
+    let mut connections = JoinSet::new();
 
     loop {
-        let (stream, _peer) = listener.accept().await?;
-        let registry = registry.clone();
-        let db_pool = db_pool.clone();
-        let worker_defaults = worker_defaults.clone();
-
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+        tokio::select! {
+            _ = cancellation.cancelled() => break,
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
                 let registry = registry.clone();
                 let db_pool = db_pool.clone();
                 let worker_defaults = worker_defaults.clone();
-                async move {
-                    let routed = RoutedIdentity::from_headers(req.headers());
-                    let namespace = routed
-                        .as_ref()
-                        .map(|identity| identity.0.route.namespace.as_str())
-                        .unwrap_or("");
-                    let module = routed
-                        .as_ref()
-                        .map(|identity| identity.0.route.module.as_str())
-                        .unwrap_or("");
-                    let version = routed
-                        .as_ref()
-                        .map(|identity| identity.0.version.to_string())
-                        .unwrap_or_default();
-                    let method = req.method().to_string();
-                    let path = req.uri().path().to_string();
-
-                    let span = info_span!(
-                        "engine.dispatch",
-                        otel.name                 = format!("{method} {namespace}.{module}"),
-                        wr.namespace              = %namespace,
-                        wr.module                 = %module,
-                        wr.version                = %version,
-                        http.request.method       = %method,
-                        url.path                  = %path,
-                        http.response.status_code = tracing::field::Empty,
-                        otel.status_code          = tracing::field::Empty,
+                let admission = admission.clone();
+                let lifecycle = lifecycle.clone();
+                let connection_cancellation = cancellation.clone();
+                connections.spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let service = hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
+                        let registry = registry.clone();
+                        let db_pool = db_pool.clone();
+                        let worker_defaults = worker_defaults.clone();
+                        let admission = admission.clone();
+                        let lifecycle = lifecycle.clone();
+                        async move {
+                            if request.uri().path().starts_with("/wruntime.LifecycleService/") {
+                                return Ok::<_, Infallible>(
+                                    handle_lifecycle(request, &lifecycle, &admission.worker).await,
+                                );
+                            }
+                            let Some(guard) = admission.workload.try_enter() else {
+                                return Ok(err(StatusCode::SERVICE_UNAVAILABLE, "engine is not admitting workload"));
+                            };
+                            let routed = RoutedIdentity::from_headers(request.headers());
+                            let namespace = routed
+                                .as_ref()
+                                .map(|identity| identity.0.route.namespace.as_str())
+                                .unwrap_or("");
+                            let module = routed
+                                .as_ref()
+                                .map(|identity| identity.0.route.module.as_str())
+                                .unwrap_or("");
+                            let version = routed
+                                .as_ref()
+                                .map(|identity| identity.0.version.to_string())
+                                .unwrap_or_default();
+                            let method = request.method().to_string();
+                            let path = request.uri().path().to_string();
+                            let span = info_span!(
+                                "engine.dispatch",
+                                otel.name                 = format!("{method} {namespace}.{module}"),
+                                wr.namespace              = %namespace,
+                                wr.module                 = %module,
+                                wr.version                = %version,
+                                http.request.method       = %method,
+                                url.path                  = %path,
+                                http.response.status_code = tracing::field::Empty,
+                                otel.status_code          = tracing::field::Empty,
+                            );
+                            wr_common::telemetry::set_parent_from_headers(&span, request.headers());
+                            let response = handle(request, routed, registry, db_pool, worker_defaults)
+                                .instrument(span.clone())
+                                .await;
+                            let status = response.status().as_u16();
+                            span.record("http.response.status_code", status);
+                            span.record("otel.status_code", if status >= 400 { "ERROR" } else { "OK" });
+                            Ok(guard_response(response, guard))
+                        }
+                    });
+                    let mut connection = Box::pin(
+                        http2::Builder::new(TokioExecutor::new()).serve_connection(io, service),
                     );
-                    wr_common::telemetry::set_parent_from_headers(&span, req.headers());
-
-                    let resp = handle(req, routed, registry, db_pool, worker_defaults)
-                        .instrument(span.clone())
-                        .await;
-
-                    let status = resp.status().as_u16();
-                    span.record("http.response.status_code", status);
-                    span.record(
-                        "otel.status_code",
-                        if status >= 400 { "ERROR" } else { "OK" },
-                    );
-
-                    Ok::<_, Infallible>(resp)
-                }
-            });
-            if let Err(e) = http2::Builder::new(TokioExecutor::new())
-                .serve_connection(io, svc)
-                .await
-            {
-                warn!(error = %e, "inbound connection error");
+                    let mut shutdown = connection_cancellation;
+                    tokio::select! {
+                        result = &mut connection => {
+                            if let Err(error) = result {
+                                tracing::debug!(%peer, %error, "engine connection closed");
+                            }
+                        }
+                        _ = shutdown.cancelled() => {
+                            connection.as_mut().graceful_shutdown();
+                            if let Err(error) = connection.await {
+                                tracing::debug!(%peer, %error, "engine connection closed during shutdown");
+                            }
+                        }
+                    }
+                });
             }
-        });
+            joined = connections.join_next(), if !connections.is_empty() => {
+                if let Some(result) = joined {
+                    result.context("engine connection task panicked")?;
+                }
+            }
+        }
     }
+
+    while let Some(result) = connections.join_next().await {
+        result.context("engine connection task panicked during shutdown")?;
+    }
+    Ok(TaskExit::Cancelled)
+}
+
+struct GuardedResponseBody {
+    inner: wr_engine::ResponseBody,
+    _guard: AdmissionGuard,
+}
+
+impl Body for GuardedResponseBody {
+    type Data = Bytes;
+    type Error = wr_engine::EngineBodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn guard_response(
+    response: wr_engine::EngineResponse,
+    guard: AdmissionGuard,
+) -> wr_engine::EngineResponse {
+    response.map(|inner| {
+        GuardedResponseBody {
+            inner,
+            _guard: guard,
+        }
+        .boxed_unsync()
+    })
+}
+
+async fn handle_lifecycle(
+    request: Request<hyper::body::Incoming>,
+    lifecycle: &ProcessLifecycleCoordinator,
+    worker_admission: &AdmissionGate,
+) -> wr_engine::EngineResponse {
+    if request
+        .headers()
+        .keys()
+        .any(|name| name.as_str().starts_with("x-wr-"))
+    {
+        return grpc_error(tonic::Code::PermissionDenied);
+    }
+    let path = request.uri().path().to_string();
+    let body = match request.into_body().collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(_) => return grpc_error(tonic::Code::Internal),
+    };
+
+    match path.as_str() {
+        "/wruntime.LifecycleService/GetStatus" => grpc_success(GetLifecycleStatusResponse {
+            status: Some((&lifecycle.current()).into()),
+        }),
+        "/wruntime.LifecycleService/Drain" => {
+            let request = match decode_grpc::<DrainRequest>(&body) {
+                Ok(request) => request,
+                Err(code) => return grpc_error(code),
+            };
+            worker_admission.close();
+            match apply_shutdown_request(
+                lifecycle,
+                ShutdownRequest::drain(TransitionReason::ControlDrainRequested, request.detail),
+            ) {
+                Ok(snapshot) => grpc_success(DrainResponse {
+                    status: Some((&snapshot).into()),
+                }),
+                Err(_) => grpc_error(tonic::Code::FailedPrecondition),
+            }
+        }
+        "/wruntime.LifecycleService/Stop" => {
+            let request = match decode_grpc::<StopRequest>(&body) {
+                Ok(request) => request,
+                Err(code) => return grpc_error(code),
+            };
+            worker_admission.close();
+            match apply_shutdown_request(
+                lifecycle,
+                ShutdownRequest::stop(TransitionReason::ControlStopRequested, request.detail),
+            ) {
+                Ok(snapshot) => grpc_success(StopResponse {
+                    status: Some((&snapshot).into()),
+                }),
+                Err(_) => grpc_error(tonic::Code::FailedPrecondition),
+            }
+        }
+        _ => grpc_error(tonic::Code::Unimplemented),
+    }
+}
+
+fn decode_grpc<M: Message + Default>(body: &[u8]) -> std::result::Result<M, tonic::Code> {
+    if body.len() < 5 || body[0] != 0 {
+        return Err(tonic::Code::InvalidArgument);
+    }
+    let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+    if body.len() != length + 5 {
+        return Err(tonic::Code::InvalidArgument);
+    }
+    M::decode(&body[5..]).map_err(|_| tonic::Code::InvalidArgument)
+}
+
+fn grpc_success<M: Message>(message: M) -> wr_engine::EngineResponse {
+    let payload = message.encode_to_vec();
+    let mut body = Vec::with_capacity(payload.len() + 5);
+    body.push(0);
+    body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    body.extend_from_slice(&payload);
+    let mut response = Response::new(wr_engine::response_full(Bytes::from(body)));
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/grpc"),
+    );
+    response
+        .headers_mut()
+        .insert("grpc-status", http::HeaderValue::from_static("0"));
+    response
+}
+
+fn grpc_error(code: tonic::Code) -> wr_engine::EngineResponse {
+    let status = match code {
+        tonic::Code::Ok => "0",
+        tonic::Code::Cancelled => "1",
+        tonic::Code::Unknown => "2",
+        tonic::Code::InvalidArgument => "3",
+        tonic::Code::DeadlineExceeded => "4",
+        tonic::Code::NotFound => "5",
+        tonic::Code::AlreadyExists => "6",
+        tonic::Code::PermissionDenied => "7",
+        tonic::Code::ResourceExhausted => "8",
+        tonic::Code::FailedPrecondition => "9",
+        tonic::Code::Aborted => "10",
+        tonic::Code::OutOfRange => "11",
+        tonic::Code::Unimplemented => "12",
+        tonic::Code::Internal => "13",
+        tonic::Code::Unavailable => "14",
+        tonic::Code::DataLoss => "15",
+        tonic::Code::Unauthenticated => "16",
+    };
+    let mut response = Response::new(wr_engine::response_full(Bytes::new()));
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/grpc"),
+    );
+    response
+        .headers_mut()
+        .insert("grpc-status", http::HeaderValue::from_static(status));
+    response
 }
 
 async fn handle(
@@ -183,14 +386,6 @@ async fn handle(
     db_pool: Option<Arc<Pool>>,
     worker_defaults: Arc<WorkerDefaults>,
 ) -> wr_engine::EngineResponse {
-    // ── Health check — no headers required ────────────────────────────────
-    if req.uri().path() == "/healthz" {
-        return Response::builder()
-            .status(StatusCode::OK)
-            .body(wr_engine::response_full(Bytes::from("ok")))
-            .unwrap();
-    }
-
     // ── Worker job queue gRPC endpoints ──────────────────────────────────
     let request_path = req.uri().path();
     if request_path.starts_with(WORKER_SERVICE_PREFIX)
@@ -491,6 +686,66 @@ async fn handle_get_job_status(pool: &Pool, body: &[u8]) -> wr_engine::EngineRes
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn lifecycle_rpc_remains_available_while_workload_is_closed() -> anyhow::Result<()> {
+        use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
+        use wr_common::wruntime::{DrainRequest, GetLifecycleStatusRequest, ProcessLifecycleState};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let lifecycle = ProcessLifecycleCoordinator::new(
+            wr_common::process_lifecycle::ServiceKind::Engine,
+            "engine-server-test",
+        );
+        let admission = AdmissionGate::closed();
+        let worker_admission = AdmissionGate::closed();
+        worker_admission.open();
+        let worker_admission_observer = worker_admission.clone();
+        let mut tasks = wr_common::task_group::TaskGroup::new();
+        tasks.spawn("test-engine-server", move |cancellation| {
+            serve(
+                listener,
+                ModuleRegistry::new(),
+                None,
+                Arc::new(WorkerDefaults::default()),
+                EngineAdmission {
+                    workload: admission,
+                    worker: worker_admission,
+                },
+                lifecycle,
+                cancellation,
+            )
+        });
+
+        let mut client = LifecycleServiceClient::connect(format!("http://{address}")).await?;
+        let starting = client
+            .get_status(GetLifecycleStatusRequest {})
+            .await?
+            .into_inner()
+            .status
+            .context("status missing")?;
+        assert_eq!(starting.state, ProcessLifecycleState::Starting as i32);
+        let draining = client
+            .drain(DrainRequest {
+                detail: "test".into(),
+            })
+            .await?
+            .into_inner()
+            .status
+            .context("drain status missing")?;
+        assert_eq!(draining.state, ProcessLifecycleState::Draining as i32);
+        assert!(
+            !worker_admission_observer.is_open(),
+            "drain acknowledgement must synchronously fence worker claims"
+        );
+
+        let report = tasks
+            .shutdown(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await;
+        assert!(report.is_clean(), "{report:?}");
+        Ok(())
+    }
 
     fn db_url() -> Option<String> {
         std::env::var("WRT_TEST_DB_URL").ok()

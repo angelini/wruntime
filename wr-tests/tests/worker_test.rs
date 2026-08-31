@@ -487,6 +487,44 @@ async fn test_worker_pool_dispatches_job_as_http() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_worker_drain_fences_new_claims_before_acknowledged_work_finishes() {
+    let Some(mut harness) =
+        WorkerPoolHarness::new("test_worker_drain_fences_new_claims", "drain-mod").await
+    else {
+        return;
+    };
+    let first = harness.insert_job("/test/First", b"", 60, 2).await.unwrap();
+    let second = harness
+        .insert_job("/test/Second", b"", 60, 2)
+        .await
+        .unwrap();
+    harness.spawn(1, Duration::from_millis(10), Duration::from_secs(10));
+
+    let inbound = harness.recv_dispatch(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(inbound.request.uri().path(), "/test/First");
+    harness.begin_drain();
+    WorkerPoolHarness::respond(inbound, 200, "done");
+    harness
+        .wait_for_status(&first, "complete", Duration::from_secs(5))
+        .await
+        .unwrap();
+    harness
+        .expect_no_dispatch(Duration::from_millis(250))
+        .await
+        .unwrap();
+    let pending = wr_engine::worker::get_job_status(&harness.pool, &second)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.status, "pending");
+
+    let report = harness
+        .shutdown(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.is_clean(), "{report:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_worker_pool_retries_on_failure() {
     let Some(mut harness) =
         WorkerPoolHarness::new("test_worker_pool_retries_on_failure", "retry-mod").await

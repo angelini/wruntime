@@ -633,9 +633,22 @@ fn add_deployment_artifacts(
         ports: vec![],
         volumes: vec![],
         depends_on: vec![],
+        healthcheck: service_gen::ComposeHealthcheck {
+            test: vec![
+                "CMD".into(),
+                format!("{workdir}/bin/wr-proxy"),
+                "--lifecycle-probe".into(),
+                format!("{workdir}/config/proxy.toml"),
+            ],
+            interval: "2s",
+            timeout: "2s",
+            retries: 15,
+            start_period: "30s",
+        },
     }];
 
-    for name in *engine_names {
+    for (index, name) in engine_names.iter().enumerate() {
+        let cfg_name = &config_names[index + 1];
         compose_services.push(service_gen::ComposeService {
             name: format!("engine-{name}"),
             dockerfile: format!("docker/Dockerfile.engine-{name}"),
@@ -644,7 +657,22 @@ fn add_deployment_artifacts(
             network_mode: Some("host".into()),
             ports: vec![],
             volumes: vec![],
-            depends_on: vec!["proxy".into()],
+            depends_on: vec![service_gen::ComposeDependency {
+                service: "proxy".into(),
+                condition: "service_healthy",
+            }],
+            healthcheck: service_gen::ComposeHealthcheck {
+                test: vec![
+                    "CMD".into(),
+                    format!("{workdir}/bin/wr-engine"),
+                    "--lifecycle-probe".into(),
+                    format!("{workdir}/config/{cfg_name}"),
+                ],
+                interval: "2s",
+                timeout: "2s",
+                retries: 30,
+                start_period: "60s",
+            },
         });
     }
 

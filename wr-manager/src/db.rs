@@ -120,7 +120,8 @@ pub async fn register_engine_and_routes(
                peer_address = EXCLUDED.peer_address,
                registration = EXCLUDED.registration,
                updated_at = NOW(),
-               last_heartbeat = NOW()",
+               last_heartbeat = NOW(),
+               draining = FALSE",
         &[
             &reg.engine_id,
             &reg.address,
@@ -338,50 +339,109 @@ pub async fn deregister_engine(pool: &Pool, engine_id: &str) -> Result<(), Statu
     Ok(())
 }
 
-/// Update an engine's heartbeat timestamp.
-pub async fn heartbeat_engine(pool: &Pool, engine_id: &str) -> Result<(), Status> {
-    let client = pool.get().await.internal()?;
-    let updated = client
+/// Atomically publish engine/module readiness, make matching routes serving,
+/// and return the routing-table version that contains the publication.
+pub async fn publish_engine_readiness(
+    pool: &Pool,
+    engine_id: &str,
+    modules: &[ModuleDescriptor],
+) -> Result<u64, Status> {
+    let mut client = pool.get().await.internal()?;
+    let txn = client.transaction().await.internal()?;
+    let mut version = acquire_global_lock_wait(&txn).await?;
+
+    let updated = txn
         .execute(
-            "UPDATE wr_engines SET last_heartbeat = NOW() WHERE engine_id = $1",
+            "UPDATE wr_engines
+             SET last_heartbeat = NOW(), updated_at = NOW()
+             WHERE engine_id = $1 AND draining = FALSE",
             &[&engine_id],
         )
         .await
         .internal()?;
     if updated == 0 {
-        return Err(Status::not_found(format!(
-            "engine {engine_id} not registered"
+        return Err(Status::failed_precondition(format!(
+            "engine {engine_id} is not registered or is draining"
         )));
     }
-    Ok(())
+
+    let mut namespaces = Vec::with_capacity(modules.len());
+    let mut names = Vec::with_capacity(modules.len());
+    let mut versions = Vec::with_capacity(modules.len());
+    for module in modules {
+        txn.execute(
+            "INSERT INTO wr_module_heartbeats (engine_id, namespace, module_name, version)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (engine_id, namespace, module_name, version)
+             DO UPDATE SET last_healthy = NOW()",
+            &[&engine_id, &module.namespace, &module.name, &module.version],
+        )
+        .await
+        .internal()?;
+        namespaces.push(module.namespace.clone());
+        names.push(module.name.clone());
+        versions.push(module.version.clone());
+    }
+
+    let changed = txn
+        .execute(
+            "UPDATE wr_routing_rules r
+             SET healthy = TRUE, updated_at = NOW()
+             WHERE r.engine_id = $1 AND r.healthy = FALSE
+               AND (r.destination_namespace, r.destination_module, r.destination_version) IN (
+                 SELECT namespace, name, version
+                 FROM unnest($2::text[], $3::text[], $4::text[])
+                   AS healthy(namespace, name, version)
+               )",
+            &[&engine_id, &namespaces, &names, &versions],
+        )
+        .await
+        .internal()?;
+    if changed > 0 {
+        version = increment_version(&txn).await?;
+    }
+
+    txn.commit().await.internal()?;
+    u64::try_from(version).map_err(|_| Status::internal("routing version is negative"))
 }
 
-/// Upsert a per-module heartbeat (`last_healthy = NOW()`) for each module an
-/// engine reports healthy. Idempotent per
-/// (engine_id, namespace, module_name, version). Does not bump the routing
-/// version — route health is recomputed by the background monitor.
-pub async fn upsert_module_heartbeats(
-    pool: &Pool,
-    engine_id: &str,
-    modules: &[ModuleDescriptor],
-) -> Result<(), Status> {
-    if modules.is_empty() {
-        return Ok(());
+/// Idempotently fence an engine from future readiness publication and make
+/// every route for it non-serving without deleting its registration.
+pub async fn begin_engine_drain(pool: &Pool, engine_id: &str) -> Result<u64, Status> {
+    let mut client = pool.get().await.internal()?;
+    let txn = client.transaction().await.internal()?;
+    let mut version = acquire_global_lock_wait(&txn).await?;
+
+    let exists = txn
+        .query_opt(
+            "UPDATE wr_engines
+             SET draining = TRUE, updated_at = NOW()
+             WHERE engine_id = $1
+             RETURNING engine_id",
+            &[&engine_id],
+        )
+        .await
+        .internal()?;
+    if exists.is_none() {
+        return Err(Status::not_found(format!(
+            "engine {engine_id} is not registered"
+        )));
     }
-    let client = pool.get().await.internal()?;
-    for module in modules {
-        client
-            .execute(
-                "INSERT INTO wr_module_heartbeats (engine_id, namespace, module_name, version)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (engine_id, namespace, module_name, version)
-                 DO UPDATE SET last_healthy = NOW()",
-                &[&engine_id, &module.namespace, &module.name, &module.version],
-            )
-            .await
-            .internal()?;
+
+    let changed = txn
+        .execute(
+            "UPDATE wr_routing_rules SET healthy = FALSE, updated_at = NOW()
+             WHERE engine_id = $1 AND healthy = TRUE",
+            &[&engine_id],
+        )
+        .await
+        .internal()?;
+    if changed > 0 {
+        version = increment_version(&txn).await?;
     }
-    Ok(())
+
+    txn.commit().await.internal()?;
+    u64::try_from(version).map_err(|_| Status::internal("routing version is negative"))
 }
 
 /// Recompute routing-rule health from BOTH engine and per-module heartbeats.
@@ -418,6 +478,7 @@ pub async fn update_route_health(
                   AND m.module_name = r.destination_module
                   AND m.version     = r.destination_version
                  WHERE e.engine_id = r.engine_id
+                   AND e.draining = FALSE
                    AND e.last_heartbeat >= NOW() - make_interval(secs => $1::double precision)
                    AND m.last_healthy   >= NOW() - make_interval(secs => $2::double precision)
                )
@@ -440,6 +501,7 @@ pub async fn update_route_health(
                   AND m.module_name = r.destination_module
                   AND m.version     = r.destination_version
                  WHERE e.engine_id = r.engine_id
+                   AND e.draining = FALSE
                    AND e.last_heartbeat >= NOW() - make_interval(secs => $1::double precision)
                    AND m.last_healthy   >= NOW() - make_interval(secs => $2::double precision)
                )

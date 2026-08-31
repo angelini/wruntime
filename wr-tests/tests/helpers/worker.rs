@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
@@ -55,6 +55,8 @@ pub struct WorkerPoolHarness {
     db_url: String,
     tx: mpsc::Sender<wr_engine::InboundRequest>,
     rx: mpsc::Receiver<wr_engine::InboundRequest>,
+    tasks: Mutex<wr_common::task_group::TaskGroup>,
+    worker_admission: wr_common::lifecycle_service::AdmissionGate,
 }
 
 impl WorkerPoolHarness {
@@ -74,6 +76,8 @@ impl WorkerPoolHarness {
             db_url,
             tx,
             rx,
+            tasks: Mutex::new(wr_common::task_group::TaskGroup::new()),
+            worker_admission: wr_common::lifecycle_service::AdmissionGate::closed(),
         })
     }
 
@@ -124,7 +128,13 @@ impl WorkerPoolHarness {
     }
 
     pub fn spawn(&self, concurrency: usize, poll_interval: Duration, job_timeout: Duration) {
+        self.worker_admission.open();
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         wr_engine::worker::spawn_worker_pool(
+            &mut tasks,
             self.pool.clone(),
             wr_engine::worker::WorkerPoolConfig {
                 namespace: self.namespace.clone(),
@@ -138,7 +148,26 @@ impl WorkerPoolHarness {
                 database_url: self.db_url.clone(),
             },
             self.tx.clone(),
+            self.worker_admission.clone(),
         );
+    }
+
+    pub fn begin_drain(&self) {
+        self.worker_admission.close();
+    }
+
+    pub async fn shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> wr_common::task_group::TaskShutdownReport {
+        let mut tasks = {
+            let mut owned = self
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *owned)
+        };
+        tasks.shutdown(deadline).await
     }
 
     pub async fn wait_for_listener(&self, timeout: Duration) -> Result<()> {

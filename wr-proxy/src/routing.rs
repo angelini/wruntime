@@ -2,8 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
+use tokio::time::Instant;
 use tracing::{info, warn};
 use wr_common::discovery::ManagerDiscovery;
+use wr_common::task_group::{TaskCancellation, TaskExit};
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, GetRoutingTableRequest, RoutingTable,
 };
@@ -106,15 +108,51 @@ pub async fn sync_once(
     Ok(())
 }
 
-/// Background task: polls a random manager for the routing table via discovery.
+/// Synchronize until the local snapshot contains at least `target_version`.
+pub async fn converge_to_version(
+    discovery: &ManagerDiscovery,
+    table: &CachedRoutingTable,
+    target_version: u64,
+    deadline: Instant,
+) -> Result<u64, tonic::Status> {
+    loop {
+        let local_version = table.version().await;
+        if local_version >= target_version {
+            return Ok(local_version);
+        }
+        if Instant::now() >= deadline {
+            return Err(tonic::Status::deadline_exceeded(format!(
+                "routing convergence timed out: manager version {target_version}, local version {local_version}"
+            )));
+        }
+
+        let mut client = discovery.get_client().await?;
+        sync_once(&mut client, table).await?;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            _ = tokio::time::sleep_until(deadline) => {
+                let local_version = table.version().await;
+                return Err(tonic::Status::deadline_exceeded(format!(
+                    "routing convergence timed out: manager version {target_version}, local version {local_version}"
+                )));
+            }
+        }
+    }
+}
+
+/// Background task: polls a manager for the routing table until cancellation.
 pub async fn sync_routing_table(
     discovery: Arc<ManagerDiscovery>,
     table: CachedRoutingTable,
     ttl_secs: u64,
-) {
+    mut cancellation: TaskCancellation,
+) -> anyhow::Result<TaskExit> {
     let mut interval = tokio::time::interval(Duration::from_secs(ttl_secs));
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
+            _ = interval.tick() => {}
+        }
         match discovery.get_client().await {
             Ok(mut client) => {
                 if let Err(error) = sync_once(&mut client, &table).await {

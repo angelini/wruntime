@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 
 use chitchat::transport::UdpTransport;
 use chitchat::{ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, NodeState};
-use tracing::warn;
 
 /// Re-exported so callers can construct/override the failure detector without a
 /// direct chitchat dependency.
@@ -194,10 +193,13 @@ impl ClusterHandle {
         self.handle.initiate_shutdown()
     }
 
+    /// Wait until the owned chitchat server exits after shutdown is initiated.
+    pub async fn wait_for_termination(&self) -> anyhow::Result<()> {
+        self.handle.termination_watcher().await
+    }
+
     /// Gracefully shut down the chitchat server.
-    pub async fn shutdown(self) {
-        if let Err(e) = self.handle.shutdown().await {
-            warn!(error = %e, "chitchat shutdown error");
-        }
+    pub async fn shutdown(self) -> anyhow::Result<()> {
+        self.handle.shutdown().await
     }
 }

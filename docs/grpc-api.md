@@ -16,7 +16,7 @@ The mTLS `wruntime.ManagerService` is the cluster control plane. Engines use the
 | `Drain` | optional detail | `LifecycleStatus` | Idempotently closes admission and begins bounded quiescence without requesting process exit. |
 | `Stop` | optional detail | `LifecycleStatus` | Idempotently implies drain when necessary and requests full shutdown. |
 
-Transitions never move backward. Duplicate drain or stop requests return the current state. Invalid or unsupported requests return a gRPC status error. `LifecycleTransitionReason` is the machine-readable transition key; `detail` is bounded explanatory text and must not be parsed by automation.
+Transitions never move backward. Duplicate drain or stop requests return the current state. Invalid or unsupported requests return a gRPC status error. Proxy `Drain` closes admission and waits for all data listeners to stop accepting before it acknowledges `DRAINING`; its loopback control endpoint remains available for `Stop`. `LifecycleTransitionReason` is the machine-readable transition key; `detail` is bounded explanatory text and must not be parsed by automation.
 
 ## Engine lifecycle
 
@@ -24,8 +24,8 @@ Transitions never move backward. Duplicate drain or stop requests return the cur
 | ----- | --------- | ---------- | ------------- |
 | `RegisterEngine` | `EngineRegistration` | `{ accepted }` | Engine announces itself and its modules; the manager resolves requested secrets and DB credentials, then persists the engine, its schemas, and one initially-unhealthy default routing rule per schema-bearing module in a single transaction; module readiness rows are reset for advertised tuples |
 | `DeregisterEngine` | `{ engine_id }` | — | Engine removes itself on shutdown |
-| `Heartbeat` | `{ engine_id, healthy_modules }` | manager/proxy routing versions | Bumps the engine's liveness unconditionally, then upserts a per-module heartbeat for each valid `healthy_modules` entry. Entries missing `namespace`/`name`/`version` are skipped and logged, never fatal. The response acknowledges the manager routing version produced by readiness publication and, through `NodeService`, the locally installed proxy version. |
-| `BeginEngineDrain` | `{ engine_id }` | manager/proxy routing versions | Idempotently withdraws route admission and returns convergence evidence without deleting the final engine registration. |
+| `Heartbeat` | `{ engine_id, healthy_modules }` | manager/proxy routing versions | Atomically records engine/module readiness and makes only matching routes serving. A draining or deregistered engine is rejected. The manager response identifies the durable routing version; `NodeService` adds the locally installed proxy version and does not acknowledge initial readiness before it converges. Invalid module identities are skipped without starving valid entries. |
+| `BeginEngineDrain` | `{ engine_id }` | manager/proxy routing versions | Idempotently fences later heartbeat publication, makes the engine's routes non-serving without deleting registration, and returns manager/local-proxy convergence evidence. Final deregistration remains separate. |
 | `ListEngines` | — | `[EngineRegistration]` | Returns all currently registered engines |
 
 `EngineRegistration.deployment`, when present, carries the stable node ID, manager-assigned revision, immutable `sha256:` bundle digest, and stable engine slot. `engine_id` remains a process identity and must not be used to infer deployment history.
@@ -130,10 +130,12 @@ The `wruntime.NodeService` gRPC service is exposed by `wr-proxy` on its `control
 | ----- | --------- | ---------- | ------------- |
 | `RegisterEngine` | `RegisterEngineRequest` | `RegisterEngineResponse` | Engine announces itself and its modules to the local proxy |
 | `DeregisterEngine` | `DeregisterEngineRequest` | `DeregisterEngineResponse` | Engine removes itself on shutdown |
-| `Heartbeat` | `HeartbeatRequest` | `HeartbeatResponse` | Sent after module load immediately, then every 3 s; the proxy forwards to the manager and replies only after the acknowledged manager version is installed locally. |
-| `BeginEngineDrain` | `BeginEngineDrainRequest` | `BeginEngineDrainResponse` | Withdraws engine route admission through the manager and returns manager/local-proxy convergence versions without deregistration. |
+| `Heartbeat` | `HeartbeatRequest` | `HeartbeatResponse` | The first post-load heartbeat is forwarded synchronously and acknowledged only after the returned manager version is installed locally; later heartbeats are cached and aggregated every 3 s. |
+| `BeginEngineDrain` | `BeginEngineDrainRequest` | `BeginEngineDrainResponse` | Fences heartbeat publication, withdraws engine route admission through the manager, and returns manager/local-proxy convergence versions without deregistration. |
 
-This decouples engines from the manager address — engines only need to know their local proxy's control address.
+NodeService serializes heartbeat/readiness/drain/deregister forwarding behind a per-engine fence and generation; unrelated engines do not hold one another's manager RPC or convergence path. A periodic flush snapshots the generation and discards it if the per-engine generation changed before the forward fence. Drain removes an engine from periodic publication before the manager route update. Deregistration tombstones it before the manager RPC, so an older flush or later heartbeat cannot recreate serving routes.
+
+This decouples engines from the manager address — engines only need to know their local proxy's loopback control address.
 
 ## Worker job queue (HTTP RPC)
 

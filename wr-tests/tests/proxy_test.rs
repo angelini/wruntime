@@ -19,8 +19,8 @@ use http_body_util::Full;
 use wr_common::discovery::ManagerDiscovery;
 use wr_common::wruntime::node_service_server::NodeService; // brings register_engine into scope
 use wr_common::wruntime::{
-    EngineRegistration, GetRoutingTableRequest, HeartbeatRequest, ModuleDescriptor,
-    RegisterEngineRequest,
+    BeginEngineDrainRequest, EngineRegistration, GetRoutingTableRequest, HeartbeatRequest,
+    ModuleDescriptor, RegisterEngineRequest,
 };
 use wr_proxy::node_service::NodeAgent;
 
@@ -148,7 +148,11 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
     let discovery = Arc::new(ManagerDiscovery::new(pool.clone(), None));
     discovery.refresh().await;
 
-    let agent = Arc::new(NodeAgent::new(discovery));
+    let routing = wr_proxy::routing::new_routing_table(
+        wr_proxy::config::CircuitBreakerConfig::default(),
+        "https://127.0.0.1:9443",
+    );
+    let agent = Arc::new(NodeAgent::new(discovery, routing));
 
     let resp = agent
         .register_engine(tonic::Request::new(RegisterEngineRequest {
@@ -189,7 +193,28 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
         "forwarded manager-created default starts unhealthy"
     );
 
-    agent.spawn_heartbeat_loop(Duration::from_millis(20));
+    let readiness = agent
+        .heartbeat(tonic::Request::new(HeartbeatRequest {
+            engine_id: "proxy-e1".into(),
+            healthy_modules: vec![ModuleDescriptor {
+                name: "inventory".into(),
+                namespace: "store".into(),
+                version: "1.0.0".into(),
+                proto_schema: vec![],
+            }],
+        }))
+        .await?
+        .into_inner();
+    assert!(
+        readiness.proxy_routing_table_version >= readiness.manager_routing_table_version,
+        "first heartbeat must synchronously converge the local proxy"
+    );
+
+    let mut tasks = wr_common::task_group::TaskGroup::new();
+    let heartbeat_agent = Arc::clone(&agent);
+    tasks.spawn("test-heartbeat-loop", move |cancellation| {
+        heartbeat_agent.run_heartbeat_loop(Duration::from_millis(20), cancellation)
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
     let heartbeat_count: i64 = pool
         .get()
@@ -200,10 +225,59 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
         )
         .await?
         .get(0);
-    assert_eq!(
-        heartbeat_count, 0,
-        "registration metadata must not be forwarded as module readiness"
+    assert_eq!(heartbeat_count, 1, "ready heartbeat must reach the manager");
+
+    let withdrawal = agent
+        .begin_engine_drain(tonic::Request::new(BeginEngineDrainRequest {
+            engine_id: "proxy-e1".into(),
+        }))
+        .await?
+        .into_inner();
+    assert!(
+        withdrawal.proxy_routing_table_version >= withdrawal.manager_routing_table_version,
+        "drain must synchronously converge route withdrawal"
     );
+    let stale = match agent
+        .heartbeat(tonic::Request::new(HeartbeatRequest {
+            engine_id: "proxy-e1".into(),
+            healthy_modules: vec![],
+        }))
+        .await
+    {
+        Ok(_) => anyhow::bail!("draining engine heartbeat was not fenced"),
+        Err(status) => status,
+    };
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+    let heartbeat_before: f64 = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT EXTRACT(EPOCH FROM last_healthy)::double precision
+             FROM wr_module_heartbeats WHERE engine_id = $1",
+            &[&"proxy-e1"],
+        )
+        .await?
+        .get(0);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let heartbeat_after: f64 = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT EXTRACT(EPOCH FROM last_healthy)::double precision
+             FROM wr_module_heartbeats WHERE engine_id = $1",
+            &[&"proxy-e1"],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        heartbeat_after, heartbeat_before,
+        "a stale periodic snapshot must not refresh heartbeat state after drain"
+    );
+
+    let report = tasks
+        .shutdown(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.is_clean(), "{report:?}");
     Ok(())
 }
 

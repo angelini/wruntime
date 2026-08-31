@@ -7,6 +7,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
+use wr_common::lifecycle_service::AdmissionGate;
+use wr_common::task_group::{TaskCancellation, TaskExit};
 use wr_common::wruntime::{SubmitJobRequest, SubmitJobResponse};
 
 use crate::db;
@@ -30,10 +32,18 @@ pub async fn run_scheduler(
     retry_base_secs: f64,
     retry_cap_secs: f64,
     local_proxy_address: String,
-) {
+    admission: AdmissionGate,
+    mut cancellation: TaskCancellation,
+) -> anyhow::Result<TaskExit> {
     let mut tick = tokio::time::interval(interval);
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
+            _ = tick.tick() => {}
+        }
+        if !admission.is_open() {
+            continue;
+        }
         if let Err(e) = evaluate_schedules(
             &pool,
             &manager_id,
@@ -155,30 +165,35 @@ pub async fn submit_job(
     let do_submit = async {
         let stream = TcpStream::connect(addr).await?;
         let io = TokioIo::new(stream);
-        let (mut sender, conn) =
+        let (mut sender, connection) =
             hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await?;
-        tokio::spawn(conn);
+        let connection = tokio::spawn(connection);
 
-        let http_req = http::Request::builder()
-            .method("POST")
-            .uri(SUBMIT_JOB_PATH)
-            .header("content-type", "application/x-protobuf")
-            .header("x-wr-destination", &destination)
-            .header("x-wr-version", &schedule.worker_version)
-            .header("x-wr-source", "wr-manager-scheduler")
-            .body(Full::new(Bytes::from(body)))?;
-
-        let resp = sender.send_request(http_req).await?;
-        let status = resp.status();
-        let resp_body = resp.into_body().collect().await?.to_bytes();
-        if !status.is_success() {
-            anyhow::bail!(
-                "proxy returned {}: {}",
-                status,
-                String::from_utf8_lossy(&resp_body)
-            );
+        let request_result = async {
+            let http_request = http::Request::builder()
+                .method("POST")
+                .uri(SUBMIT_JOB_PATH)
+                .header("content-type", "application/x-protobuf")
+                .header("x-wr-destination", &destination)
+                .header("x-wr-version", &schedule.worker_version)
+                .header("x-wr-source", "wr-manager-scheduler")
+                .body(Full::new(Bytes::from(body)))?;
+            let response = sender.send_request(http_request).await?;
+            let status = response.status();
+            let response_body = response.into_body().collect().await?.to_bytes();
+            if !status.is_success() {
+                anyhow::bail!(
+                    "proxy returned {}: {}",
+                    status,
+                    String::from_utf8_lossy(&response_body)
+                );
+            }
+            Ok::<Bytes, anyhow::Error>(response_body)
         }
-        Ok::<Bytes, anyhow::Error>(resp_body)
+        .await;
+        drop(sender);
+        connection.await??;
+        request_result
     };
 
     match tokio::time::timeout(SUBMIT_TIMEOUT, do_submit).await {

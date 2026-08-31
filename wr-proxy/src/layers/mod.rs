@@ -20,6 +20,7 @@ use bytes::Bytes;
 use http::Response;
 use http_body::Body;
 use http_body_util::{BodyExt as _, Full};
+use wr_common::lifecycle_service::AdmissionGuard;
 
 /// A streaming body type used throughout the proxy Tower stack.
 ///
@@ -43,6 +44,39 @@ impl ProxyBody {
         Self(Box::pin(
             Full::new(bytes.into()).map_err(|never| match never {}),
         ))
+    }
+
+    /// Keep admitted work counted until the streaming response finishes or is dropped.
+    pub fn with_admission_guard(self, guard: AdmissionGuard) -> Self {
+        Self(Box::pin(GuardedBody {
+            inner: self,
+            _guard: guard,
+        }))
+    }
+}
+
+struct GuardedBody {
+    inner: ProxyBody,
+    _guard: AdmissionGuard,
+}
+
+impl Body for GuardedBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, hyper::Error>>> {
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 

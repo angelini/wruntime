@@ -9,6 +9,7 @@ use wr_common::identity::{
     EngineHttpUrl, EngineId, ModuleId, Namespace, NamespaceFilter, PeerHttpsUrl, ProxyHttpUrl,
     RouteKey, RuleId,
 };
+use wr_common::lifecycle_service::{AdmissionGate, AdmissionGuard};
 use wr_common::naming::namespace_role;
 use wr_common::wruntime::{
     manager_service_server::ManagerService, BeginDeploymentRequest, BeginDeploymentResponse,
@@ -132,11 +133,23 @@ pub struct Manager {
     cluster: Arc<ClusterHandle>,
     engine_heartbeat_timeout_secs: f64,
     module_heartbeat_timeout_secs: f64,
+    admission: AdmissionGate,
 }
 
 impl Manager {
     pub fn new(pool: Pool, crypto: Arc<SecretCrypto>, cluster: Arc<ClusterHandle>) -> Self {
-        Self::with_heartbeat_timeouts(pool, crypto, cluster, 10.0, 10.0)
+        let admission = AdmissionGate::closed();
+        admission.open();
+        Self::with_admission(pool, crypto, cluster, admission)
+    }
+
+    pub fn with_admission(
+        pool: Pool,
+        crypto: Arc<SecretCrypto>,
+        cluster: Arc<ClusterHandle>,
+        admission: AdmissionGate,
+    ) -> Self {
+        Self::with_heartbeat_timeouts(pool, crypto, cluster, 10.0, 10.0, admission)
     }
 
     pub fn with_heartbeat_timeouts(
@@ -145,6 +158,7 @@ impl Manager {
         cluster: Arc<ClusterHandle>,
         engine_heartbeat_timeout_secs: f64,
         module_heartbeat_timeout_secs: f64,
+        admission: AdmissionGate,
     ) -> Self {
         Self {
             pool,
@@ -152,7 +166,14 @@ impl Manager {
             cluster,
             engine_heartbeat_timeout_secs,
             module_heartbeat_timeout_secs,
+            admission,
         }
+    }
+
+    fn require_admission(&self) -> Result<AdmissionGuard, Status> {
+        self.admission
+            .try_enter()
+            .ok_or_else(|| Status::unavailable("manager is draining"))
     }
 
     fn valid_deployment_token(value: &str) -> bool {
@@ -356,6 +377,7 @@ impl ManagerService for Manager {
         &self,
         request: Request<RegisterEngineRequest>,
     ) -> Result<Response<RegisterEngineResponse>, Status> {
+        let _admission = self.require_admission()?;
         let reg = request
             .into_inner()
             .registration
@@ -452,12 +474,6 @@ impl ManagerService for Manager {
             healthy_modules,
         } = request.into_inner();
 
-        // Bump engine liveness FIRST and unconditionally. Engine liveness keeps
-        // every route on the engine healthy, so a single malformed module
-        // descriptor must never starve it (which would flip ALL the engine's
-        // routes unhealthy after the timeout).
-        db::heartbeat_engine(&self.pool, &engine_id).await?;
-
         // Validate each reported module independently; skip and log invalid
         // entries rather than rejecting the whole heartbeat.
         let mut valid = Vec::with_capacity(healthy_modules.len());
@@ -475,21 +491,26 @@ impl ManagerService for Manager {
             valid.push(m);
         }
 
-        db::upsert_module_heartbeats(&self.pool, &engine_id, &valid).await?;
+        let routing_version = db::publish_engine_readiness(&self.pool, &engine_id, &valid).await?;
 
         Ok(Response::new(HeartbeatResponse {
-            manager_routing_table_version: 0,
+            manager_routing_table_version: routing_version,
             proxy_routing_table_version: 0,
         }))
     }
 
     async fn begin_engine_drain(
         &self,
-        _request: Request<BeginEngineDrainRequest>,
+        request: Request<BeginEngineDrainRequest>,
     ) -> Result<Response<BeginEngineDrainResponse>, Status> {
-        Err(Status::unimplemented(
-            "engine drain convergence is wired by lifecycle plan 2",
-        ))
+        let engine_id = request.into_inner().engine_id;
+        EngineId::parse(&engine_id).map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let routing_version = db::begin_engine_drain(&self.pool, &engine_id).await?;
+        info!(engine_id, routing_version, "engine routes withdrawn");
+        Ok(Response::new(BeginEngineDrainResponse {
+            manager_routing_table_version: routing_version,
+            proxy_routing_table_version: 0,
+        }))
     }
 
     async fn list_engines(
@@ -506,6 +527,7 @@ impl ManagerService for Manager {
         &self,
         request: Request<BeginDeploymentRequest>,
     ) -> Result<Response<BeginDeploymentResponse>, Status> {
+        let _admission = self.require_admission()?;
         let mut request = request.into_inner();
         Self::validate_deployment_request(&request)?;
         Self::canonicalize_deployment_request(&mut request);
@@ -549,6 +571,7 @@ impl ManagerService for Manager {
         &self,
         request: Request<CompleteDeploymentRequest>,
     ) -> Result<Response<CompleteDeploymentResponse>, Status> {
+        let _admission = self.require_admission()?;
         let request = request.into_inner();
         if request.node_id.is_empty() || request.revision == 0 {
             return Err(Status::invalid_argument(
@@ -622,6 +645,7 @@ impl ManagerService for Manager {
         &self,
         request: Request<BeginRollbackRequest>,
     ) -> Result<Response<BeginRollbackResponse>, Status> {
+        let _admission = self.require_admission()?;
         let request = request.into_inner();
         Namespace::parse(&request.node_id)
             .map_err(|_| Status::invalid_argument("node_id must be a valid stable identity"))?;
@@ -710,6 +734,7 @@ impl ManagerService for Manager {
         &self,
         request: Request<RoutingRule>,
     ) -> Result<Response<UpsertRoutingRuleResponse>, Status> {
+        let _admission = self.require_admission()?;
         let mut rule = request.into_inner();
         rule.healthy = true; // explicitly upserted rules are always healthy
 
@@ -749,6 +774,7 @@ impl ManagerService for Manager {
         &self,
         request: Request<DeleteRoutingRuleRequest>,
     ) -> Result<Response<DeleteRoutingRuleResponse>, Status> {
+        let _admission = self.require_admission()?;
         let rule_id = request.into_inner().rule_id;
 
         if db::delete_routing_rule(&self.pool, &rule_id).await? {
@@ -781,6 +807,7 @@ impl ManagerService for Manager {
         &self,
         request: Request<SetSecretRequest>,
     ) -> Result<Response<SetSecretResponse>, Status> {
+        let _admission = self.require_admission()?;
         let req = request.into_inner();
         Namespace::parse(&req.namespace)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -807,6 +834,7 @@ impl ManagerService for Manager {
         &self,
         request: Request<DeleteSecretRequest>,
     ) -> Result<Response<DeleteSecretResponse>, Status> {
+        let _admission = self.require_admission()?;
         let req = request.into_inner();
         Namespace::parse(&req.namespace)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -841,6 +869,7 @@ impl ManagerService for Manager {
         &self,
         request: Request<UpsertScheduleRequest>,
     ) -> Result<Response<UpsertScheduleResponse>, Status> {
+        let _admission = self.require_admission()?;
         let req = request.into_inner();
         ModuleId::parse(&req.worker_namespace, &req.worker_name, &req.worker_version)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -879,6 +908,7 @@ impl ManagerService for Manager {
         &self,
         request: Request<DeleteScheduleRequest>,
     ) -> Result<Response<DeleteScheduleResponse>, Status> {
+        let _admission = self.require_admission()?;
         let req = request.into_inner();
         ModuleId::parse(&req.worker_namespace, &req.worker_name, &req.worker_version)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;

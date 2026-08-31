@@ -383,6 +383,18 @@ fn manager_docker_compose(workdir: &str, image_prefix: &str) -> String {
             ports: vec![],
             volumes: vec![format!("../certs:{workdir}/certs:ro")],
             depends_on: vec![],
+            healthcheck: service_gen::ComposeHealthcheck {
+                test: vec![
+                    "CMD".into(),
+                    format!("{workdir}/bin/wr-manager"),
+                    "--lifecycle-probe".into(),
+                    format!("{workdir}/config/manager.toml"),
+                ],
+                interval: "2s",
+                timeout: "2s",
+                retries: 15,
+                start_period: "30s",
+            },
         }],
     )
 }

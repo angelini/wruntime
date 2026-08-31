@@ -421,21 +421,17 @@ wr-cli node deploy --node-id node-a node.tar.gz example@localhost \
 
 In QEMU user-mode networking, `10.0.2.2` is the host gateway address reachable from all VMs.
 
-## Startup retry behavior
+## Semantic startup and bounded shutdown
 
-Services use automatic retries to tolerate startup ordering and transient failures during deployment. This means services can be started in any order — the engine will wait for the proxy and manager to become available rather than crashing immediately.
+Generated systemd units use `Type=notify`; each process sends `READY=1` only after its semantic startup barriers and sends `STOPPING=1` when final shutdown begins. Units use `SIGTERM`, `TimeoutStopSec=45s`, and final `SIGKILL` only after that external grace period. Generated Compose services use the same binary-native lifecycle probe, `stop_signal: SIGTERM`, and `stop_grace_period: 45s`. Engines depend on the proxy with `condition: service_healthy`, so startup waits for proxy semantic readiness and reverse dependency order stops engines before the proxy.
 
-| Operation | Retry strategy | Total window |
-| ----------- | --------------- | -------------- |
-| Engine → proxy connection | Exponential backoff (200ms → 5s cap), 10 attempts | ~30s |
-| Engine → manager registration (via proxy) | Exponential backoff (500ms → 5s cap), 10 attempts | ~30s |
-| Engine heartbeat (per cycle) | 3 attempts, 50ms apart; reconnects on total failure | 100ms per cycle |
-| Proxy heartbeat flush (per engine) | 3 attempts, 50ms apart; clears manager affinity on failure | 100ms per engine |
-| Manager routing table lock | Exponential backoff (10ms → 80ms), 4 attempts | ~150ms |
+Each active drain or stop operation has one absolute 30-second internal deadline; route convergence, admission waits, deregistration, and task joins consume that deadline without resetting it. `Drain` may remain observably quiesced without exiting; a later explicit `Stop` starts the separate final control-listener/task-join deadline. The supervisor's 45-second grace leaves 15 seconds after a signal-driven full shutdown for telemetry finalization and process exit; needing the supervisor's final kill is a failed graceful shutdown. Healthchecks execute the service binary with `--lifecycle-probe <config>` and succeed only in `READY`; a successful TCP connection while `STARTING` is not readiness.
 
-If all retries are exhausted during startup, the engine exits with a descriptive error. Heartbeat retries are best-effort — a failed cycle is skipped and retried on the next interval (3s).
+Startup remains tolerant only through bounded, owned retries. A proxy must reach a manager and install an initial routing snapshot before readiness. An engine retries its proxy connection and registration, but startup fails non-zero if those attempts expire, a configured module is unhealthy, or readiness publication cannot converge. The first healthy engine heartbeat is synchronous: the manager returns the routing version containing the atomic readiness update, and the local proxy replies only after installing at least that version. Callers do not need fixed sleeps or manager-health polling.
 
-The CLI `node deploy` command polls `VerifyDeployment` for up to 60 seconds. Registration alone is insufficient: every exact-revision engine and module heartbeat must be fresh and every expected default route healthy. With the retry windows above, a healthy cluster typically verifies within 10–15 seconds of service start.
+On engine shutdown, route withdrawal and local proxy convergence happen before HTTP admission closes and before final deregistration. Existing HTTP requests and claimed jobs drain to the shared deadline; new work is rejected deterministically. Proxy drain closes data-plane admission and waits until every data listener has stopped accepting before acknowledging `DRAINING`, while retaining loopback lifecycle/NodeService control until stop. Manager drain rejects new administrative mutations but retains lifecycle, read-only status, and engine drain/deregister operations. Deadline expiry or failed required deregistration is a non-zero process outcome.
+
+The CLI `node deploy` command still verifies the exact desired revision, digest, engine slots, fresh heartbeats, and healthy routes through `VerifyDeployment`; process lifecycle readiness and cluster availability remain distinct contracts.
 
 ## Pre-compilation
 

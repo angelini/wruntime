@@ -4,11 +4,11 @@ use helpers::{manager::manager_trio, proxy::TEST_SELF_PEER, wasm::minimal_file_d
 use anyhow::Result;
 
 use wr_common::wruntime::{
-    BeginDeploymentRequest, BeginRollbackRequest, CompleteDeploymentRequest, DeploymentMetadata,
-    DeploymentState, DeregisterEngineRequest, EngineRegistration, ExpectedEngine,
-    GetClusterStatusRequest, GetRoutingTableRequest, GetSchemaRequest, HeartbeatRequest,
-    ListEnginesRequest, ModuleDescriptor, ModuleIdentity, RegisterEngineRequest, RoutingRule,
-    SecretRequest, StatusSeverity, VerifyDeploymentRequest,
+    BeginDeploymentRequest, BeginEngineDrainRequest, BeginRollbackRequest,
+    CompleteDeploymentRequest, DeploymentMetadata, DeploymentState, DeregisterEngineRequest,
+    EngineRegistration, ExpectedEngine, GetClusterStatusRequest, GetRoutingTableRequest,
+    GetSchemaRequest, HeartbeatRequest, ListEnginesRequest, ModuleDescriptor, ModuleIdentity,
+    RegisterEngineRequest, RoutingRule, SecretRequest, StatusSeverity, VerifyDeploymentRequest,
 };
 
 #[tokio::test]
@@ -103,6 +103,87 @@ async fn test_heartbeat() -> Result<()> {
     })
     .await?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_readiness_and_drain_are_atomic_versioned_and_fenced() -> Result<()> {
+    let (_pool, _addr, mut client) = manager_trio().await?;
+    client
+        .register_engine(RegisterEngineRequest {
+            registration: Some(EngineRegistration {
+                engine_id: "lifecycle-engine".into(),
+                address: "http://127.0.0.1:9199".into(),
+                proxy_address: TEST_SELF_PEER.into(),
+                peer_address: TEST_SELF_PEER.into(),
+                modules: vec![ModuleDescriptor {
+                    name: "lifecycle-service".into(),
+                    namespace: "store".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: minimal_file_descriptor_set(),
+                }],
+                secrets: vec![],
+                db_namespaces: vec![],
+                deployment: None,
+            }),
+        })
+        .await?;
+
+    let readiness = client
+        .heartbeat(HeartbeatRequest {
+            engine_id: "lifecycle-engine".into(),
+            healthy_modules: vec![ModuleDescriptor {
+                name: "lifecycle-service".into(),
+                namespace: "store".into(),
+                version: "1.0.0".into(),
+                proto_schema: vec![],
+            }],
+        })
+        .await?
+        .into_inner();
+    assert!(readiness.manager_routing_table_version > 0);
+    let ready_table = client
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
+        .await?
+        .into_inner()
+        .table
+        .ok_or_else(|| anyhow::anyhow!("ready routing table missing"))?;
+    assert!(ready_table.rules[0].healthy);
+
+    let drained = client
+        .begin_engine_drain(BeginEngineDrainRequest {
+            engine_id: "lifecycle-engine".into(),
+        })
+        .await?
+        .into_inner();
+    assert!(drained.manager_routing_table_version > readiness.manager_routing_table_version);
+    let drained_table = client
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
+        .await?
+        .into_inner()
+        .table
+        .ok_or_else(|| anyhow::anyhow!("drained routing table missing"))?;
+    assert!(!drained_table.rules[0].healthy);
+
+    let stale = match client
+        .heartbeat(HeartbeatRequest {
+            engine_id: "lifecycle-engine".into(),
+            healthy_modules: vec![],
+        })
+        .await
+    {
+        Ok(_) => anyhow::bail!("draining engine heartbeat was not fenced"),
+        Err(status) => status,
+    };
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+
+    for _ in 0..2 {
+        client
+            .deregister_engine(DeregisterEngineRequest {
+                engine_id: "lifecycle-engine".into(),
+            })
+            .await?;
+    }
     Ok(())
 }
 

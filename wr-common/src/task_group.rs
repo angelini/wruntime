@@ -132,6 +132,14 @@ impl TaskGroup {
         }
     }
 
+    /// Observe a task that has already exited without waiting.
+    pub fn try_next_completion(&mut self) -> Option<TaskOutcome> {
+        let joined = self.tasks.try_join_next_with_id()?;
+        let outcome = self.task_outcome(joined);
+        self.observed.push(outcome.clone());
+        Some(outcome)
+    }
+
     /// Wait for one task to exit without cancelling the group. The outcome is
     /// retained for the eventual shutdown report so a service run loop can
     /// react immediately to premature completion, failure, or panic.

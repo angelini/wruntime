@@ -5,12 +5,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{info, warn, Instrument};
 use wasmtime::component::Component;
 use wasmtime::Engine;
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
 
 use crate::registry::{InboundRequest, ModuleRegistry, ModuleTx};
+use wr_common::lifecycle_service::AdmissionGate;
+use wr_common::task_group::{TaskCancellation, TaskExit, TaskGroup};
 use wr_engine::blobstore::BlobstoreRuntime;
 use wr_engine::config::{
     BlobstoreLimits, EngineConfig, ExecutionMode, ModuleConfig, ResourceLimits,
@@ -22,15 +25,6 @@ use wr_engine::state::{BlobAccess, DbAccess, DbTimeouts, LlmAccess, ModuleServic
 struct DatabaseRuntime {
     admin_pool: Arc<Pool>,
     namespace_pools: HashMap<String, Arc<Pool>>,
-    recovery_task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for DatabaseRuntime {
-    fn drop(&mut self) {
-        if let Some(task) = self.recovery_task.take() {
-            task.abort();
-        }
-    }
 }
 
 struct ResolvedServices {
@@ -67,7 +61,6 @@ impl EngineRunner {
                 Ok::<_, anyhow::Error>(DatabaseRuntime {
                     admin_pool: Arc::new(wr_engine::pool::build_pool(&db.url, db.max_connections)?),
                     namespace_pools: HashMap::new(),
-                    recovery_task: None,
                 })
             })
             .transpose()?;
@@ -117,34 +110,29 @@ impl EngineRunner {
         wr_engine::job_migration::run_job_migrations(&pool).await
     }
 
-    pub fn start_recovery_coordinator(&mut self) -> Result<()> {
+    pub fn start_recovery_coordinator(&self, tasks: &mut TaskGroup) -> Result<()> {
         if !self.startup_db.has_workers {
             return Ok(());
         }
         let database = self
             .database
-            .as_mut()
+            .as_ref()
             .context("worker mode requires a database runtime")?;
-        anyhow::ensure!(
-            database.recovery_task.is_none(),
-            "job recovery coordinator already started"
-        );
-        database.recovery_task = Some(wr_engine::worker::spawn_recovery_coordinator(
-            database.admin_pool.clone(),
-        ));
+        wr_engine::worker::spawn_recovery_coordinator(tasks, database.admin_pool.clone());
         Ok(())
     }
 
-    /// Spawn a background task that increments the wasmtime epoch at the
-    /// configured tick interval, enabling preemption of CPU-bound WASM code.
-    pub fn spawn_epoch_ticker(&self) {
+    /// Register the wasmtime epoch ticker as owned background work.
+    pub fn spawn_epoch_ticker(&self, tasks: &mut TaskGroup) {
         let tick_ms = self.config.pool.epoch_tick_interval_ms;
         let engine = self.engine.clone();
-        tokio::spawn(async move {
+        tasks.spawn("engine-epoch-ticker", move |mut cancellation| async move {
             let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
             loop {
-                interval.tick().await;
-                engine.increment_epoch();
+                tokio::select! {
+                    _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
+                    _ = interval.tick() => engine.increment_epoch(),
+                }
             }
         });
     }
@@ -264,14 +252,23 @@ impl EngineRunner {
         registry: &ModuleRegistry,
         resolved_envs: &HashMap<(String, String), HashMap<String, String>>,
         engine_id: &str,
+        tasks: &mut TaskGroup,
+        worker_admission: AdmissionGate,
     ) -> Result<()> {
         for module_config in &self.config.modules {
             let env_vars = resolved_envs
                 .get(&(module_config.namespace.clone(), module_config.name.clone()))
                 .cloned()
                 .unwrap_or_default();
-            self.spawn_module(module_config, registry, env_vars, engine_id)
-                .await?;
+            self.spawn_module(
+                module_config,
+                registry,
+                env_vars,
+                engine_id,
+                tasks,
+                worker_admission.clone(),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -411,6 +408,8 @@ impl EngineRunner {
         registry: &ModuleRegistry,
         env_vars: HashMap<String, String>,
         engine_id: &str,
+        tasks: &mut TaskGroup,
+        worker_admission: AdmissionGate,
     ) -> Result<()> {
         info!(module = %module_config.name, "loading module");
 
@@ -469,7 +468,13 @@ impl EngineRunner {
             limits: self.config.limits.clone(),
             max_outbound_body_bytes: self.config.max_outbound_body_bytes,
         });
-        tokio::spawn(http_handler_task(module, rx));
+        let task_name = format!(
+            "module-{}-{}-{}",
+            module_namespace, module_name, module_version
+        );
+        tasks.spawn(task_name, move |cancellation| {
+            http_handler_task(module, rx, cancellation)
+        });
 
         // For worker mode, also spawn the worker pool that pulls jobs from
         // the Postgres queue and dispatches them as HTTP requests.
@@ -485,6 +490,7 @@ impl EngineRunner {
                 .url
                 .clone();
             wr_engine::worker::spawn_worker_pool(
+                tasks,
                 admin_pool,
                 wr_engine::worker::WorkerPoolConfig {
                     namespace: module_namespace.to_string(),
@@ -497,6 +503,7 @@ impl EngineRunner {
                     database_url: db_url,
                 },
                 tx,
+                worker_admission,
             );
         }
 
@@ -529,59 +536,85 @@ struct LoadedModuleContext {
 async fn http_handler_task(
     module: Arc<LoadedModuleContext>,
     mut rx: mpsc::Receiver<InboundRequest>,
-) {
-    while let Some(inbound) = rx.recv().await {
-        let module = module.clone();
-        let InboundRequest {
-            request,
-            response_tx,
-            span,
-        } = inbound;
-
-        tokio::spawn(
-            async move {
-                // Worker-dispatched jobs carry x-wr-timeout with the job-level
-                // timeout; use it instead of the default request_timeout_secs.
-                let timeout = request
-                    .headers()
-                    .get("x-wr-timeout")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .map(Duration::from_secs)
-                    .unwrap_or(module.request_timeout);
-
-                let response = match dispatch_request(&module, request, timeout).await {
-                    Ok(resp) => resp,
-                    Err(e)
-                        if e.downcast_ref::<wr_engine::runtime::RuntimeError>()
-                            .is_some_and(|error| {
-                                matches!(error, wr_engine::runtime::RuntimeError::Timeout)
-                            }) =>
-                    {
-                        warn!(
-                            module = %module.name,
-                            timeout_secs = timeout.as_secs(),
-                            "request timed out"
-                        );
-                        http::Response::builder()
-                            .status(http::StatusCode::GATEWAY_TIMEOUT)
-                            .body(wr_engine::response_full(Bytes::from("request timed out")))
-                            .unwrap()
-                    }
-                    Err(e) => {
-                        warn!(module = %module.name, error = %e, "inbound request error");
-                        http::Response::builder()
-                            .status(http::StatusCode::INTERNAL_SERVER_ERROR)
-                            .body(wr_engine::response_full(Bytes::from("internal error")))
-                            .unwrap()
-                    }
-                };
-
-                let _ = response_tx.send(response);
+    mut cancellation: TaskCancellation,
+) -> Result<TaskExit> {
+    let mut requests = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                rx.close();
+                break;
             }
-            .instrument(span),
-        );
+            inbound = rx.recv() => {
+                let Some(inbound) = inbound else {
+                    anyhow::bail!("module request channel closed unexpectedly");
+                };
+                let module = module.clone();
+                requests.spawn(handle_inbound(module, inbound));
+            }
+            joined = requests.join_next(), if !requests.is_empty() => {
+                if let Some(result) = joined {
+                    result.context("module request task panicked")?;
+                }
+            }
+        }
     }
+
+    while let Some(inbound) = rx.recv().await {
+        requests.spawn(handle_inbound(module.clone(), inbound));
+    }
+    while let Some(result) = requests.join_next().await {
+        result.context("module request task panicked during drain")?;
+    }
+    Ok(TaskExit::Cancelled)
+}
+
+async fn handle_inbound(module: Arc<LoadedModuleContext>, inbound: InboundRequest) {
+    let InboundRequest {
+        request,
+        response_tx,
+        span,
+    } = inbound;
+    async move {
+        let timeout = request
+            .headers()
+            .get("x-wr-timeout")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(module.request_timeout);
+
+        let response = match dispatch_request(&module, request, timeout).await {
+            Ok(response) => response,
+            Err(error)
+                if error
+                    .downcast_ref::<wr_engine::runtime::RuntimeError>()
+                    .is_some_and(|error| {
+                        matches!(error, wr_engine::runtime::RuntimeError::Timeout)
+                    }) =>
+            {
+                warn!(
+                    module = %module.name,
+                    timeout_secs = timeout.as_secs(),
+                    "request timed out"
+                );
+                http::Response::builder()
+                    .status(http::StatusCode::GATEWAY_TIMEOUT)
+                    .body(wr_engine::response_full(Bytes::from("request timed out")))
+                    .unwrap()
+            }
+            Err(error) => {
+                warn!(module = %module.name, %error, "inbound request error");
+                http::Response::builder()
+                    .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(wr_engine::response_full(Bytes::from("internal error")))
+                    .unwrap()
+            }
+        };
+        let _ = response_tx.send(response);
+    }
+    .instrument(span)
+    .await;
 }
 
 /// Instantiate the component for one request and drive the WASI HTTP

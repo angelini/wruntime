@@ -13,6 +13,8 @@ pub mod http_headers;
 pub mod http_pool;
 pub mod identity;
 pub mod lifecycle;
+#[cfg(any(feature = "signal", test))]
+pub mod lifecycle_service;
 pub mod naming;
 pub mod node;
 #[cfg(feature = "pool")]

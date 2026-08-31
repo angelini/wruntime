@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(feature = "signal")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -143,16 +144,21 @@ impl ManagerDiscovery {
         *self.affinity.write().await = None;
     }
 
-    /// Spawn a background task that refreshes the manager list every 30 seconds.
-    pub fn spawn_refresh_task(self: &Arc<Self>) {
-        let discovery = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                discovery.refresh().await;
+    /// Run the refresh loop as an owned, cancellation-aware service task.
+    #[cfg(feature = "signal")]
+    pub async fn run_refresh_loop(
+        self: Arc<Self>,
+        mut cancellation: crate::task_group::TaskCancellation,
+    ) -> anyhow::Result<crate::task_group::TaskExit> {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Ok(crate::task_group::TaskExit::Cancelled);
+                }
+                _ = interval.tick() => self.refresh().await,
             }
-        });
+        }
     }
 
     async fn connect_new(&self) -> Result<ManagerServiceClient<Channel>, tonic::Status> {
