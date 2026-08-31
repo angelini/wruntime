@@ -17,6 +17,7 @@ just clean-wasm-cache        # remove only the shared Cargo guest cache
 just validate-ecommerce      # ecommerce inline run, failing on WARN/WARNING output
 just bench-proxy-routing     # warmed HTTP/2 proxy routing/forwarding benchmark
 just validate-all --no-deployment-e2e # full local suite with an explicit live-stage skip
+just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e # Pi sandbox
 just validate-all --deployment-e2e    # trusted runner: require both live deployment backends
 just deployment-e2e-python-test       # locked provider/assertion unit tests
 just deployment-e2e-preflight         # non-mutating Proxmox target verification
@@ -86,8 +87,13 @@ The deployment lifecycle stage always requires an explicit choice. Trusted
 runners use `just validate-all --deployment-e2e`, which runs the systemd and
 Docker passes serially before fixed-port local examples. Local development uses
 `just validate-all --no-deployment-e2e`; the summary records separate `SKIPPED`
-rows for both backends. `--no-e2e` affects only fixed-port local examples, so it
-may be combined with `--deployment-e2e`. `--e2e-only` still requires an explicit
+rows for both backends. In the Pi sandbox (`DOTGEN_PI_SANDBOX=1`), use
+`just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e`: Docker
+cannot run there, but the existing development services are exposed. Only
+`ANTHROPIC_API_KEY` is unavailable for the local examples, so codegen is skipped
+while multi-node, ecommerce, and stockmarket still run. Do not pass `--no-e2e`
+in Pi. Outside Pi, `--no-e2e` affects only fixed-port local examples, so it may
+be combined with `--deployment-e2e`. `--e2e-only` still requires an explicit
 deployment choice and runs the enabled E2E stages.
 
 Live deployment requires `uv`, `cargo-zigbuild`, `flock`, SSH, and `psql`.

@@ -24,6 +24,7 @@ just build-stockmarket
 just build-codegen
 just validate-ecommerce     # ecommerce E2E; fails on WARN/WARNING
 just validate-all --no-deployment-e2e # explicit local skip
+just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e # Pi sandbox
 just validate-all --deployment-e2e    # protected runner, live systemd + Docker
 
 # Development infrastructure and services
@@ -36,6 +37,8 @@ just engine
 ```
 
 Continuous compilation is available through `just watch [check|clippy|test|build-ecommerce|build-codegen|build-stockmarket]`.
+
+In the Pi sandbox (`DOTGEN_PI_SANDBOX=1`), always run `just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e`. Docker is unavailable, but the existing development services are exposed. `--skip-dev-up` avoids Docker startup, and `--no-codegen-e2e` skips only codegen because `ANTHROPIC_API_KEY` is not exposed. The multi-node, ecommerce, and stockmarket E2E examples must still run; do not pass `--no-e2e` or omit the rest of `validate-all`.
 
 ## Agent modes
 

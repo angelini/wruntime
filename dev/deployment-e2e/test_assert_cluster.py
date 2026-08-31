@@ -90,6 +90,18 @@ class AssertionTests(unittest.TestCase):
         result = assert_cluster.assert_unhealthy(status, args)
         self.assertEqual(result["condition_codes"], ["MISSING_ENGINE"])
 
+    def test_unhealthy_defaults_accept_deregistration_with_an_old_revision(self):
+        status = healthy_status()
+        status["nodes"][0]["severity"] = "unhealthy"
+        old_engine = status["nodes"][0]["engines"][0]
+        old_engine["deployment"]["revision"] = 1
+        old_engine["authoritative_for_desired_revision"] = False
+        old_engine["severity"] = "degraded"
+        status["nodes"][0]["conditions"] = [{"code": "REVISION_MISMATCH", "detail": "ignored"}]
+        args = assert_cluster.parser().parse_args(["unhealthy", "--node-id", "wr-e2e-node"])
+        result = assert_cluster.assert_unhealthy(status, args)
+        self.assertEqual(result["condition_codes"], ["REVISION_MISMATCH"])
+
     def test_rollback_is_monotonic_and_restores_source(self):
         status = healthy_status(7, source=3)
         args = argparse.Namespace(node_id="wr-e2e-node", digest="sha256:a", version="1.0.0", engine_slot="engine", source_revision=3, after_revision=6)

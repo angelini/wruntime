@@ -19,6 +19,7 @@ Start focused, then run the broader requirement for the change class.
 ## Environment and command policy
 
 - Run `just dev-up` before recipes that require Postgres, RustFS S3, or LGTM. `just test`, `just test-integration`, `just test-one`, and `just test-wasm` set the repository test environment variables but do not replace the services.
+- In the Pi sandbox (`DOTGEN_PI_SANDBOX=1`), run `just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e`. Docker is unavailable there, but the existing development services are exposed. Only `ANTHROPIC_API_KEY` is unavailable for the local examples, so skip codegen explicitly while still running the multi-node, ecommerce, and stockmarket E2E examples. Do not pass `--no-e2e`.
 - Direct `cargo test` is useful for fast pure tests. DB-backed tests skip under the shared helper policy when `WRT_TEST_DB_URL` is absent; direct S3-backed tests require `WRT_TEST_S3_*` variables.
 - WASM tests require `wasm32-wasip2`, `protoc`, `wasm-tools`, and built guest artifacts. Prefer Just recipes because they build fixtures and set environment variables.
 - Fixed-port E2E examples share ports and resources. Run them serially, not concurrently.

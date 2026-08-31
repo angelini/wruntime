@@ -190,7 +190,7 @@ def parser() -> argparse.ArgumentParser:
     unhealthy.add_argument(
         "--condition",
         action="append",
-        default=["MISSING_ENGINE", "STALE_ENGINE_HEARTBEAT", "STALE_MODULE_HEARTBEAT"],
+        default=["MISSING_ENGINE", "REVISION_MISMATCH", "STALE_ENGINE_HEARTBEAT", "STALE_MODULE_HEARTBEAT"],
     )
     rollback = commands.choices["rollback"]
     rollback.add_argument("--source-revision", required=True, type=int)
