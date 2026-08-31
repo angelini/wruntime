@@ -10,6 +10,17 @@ use crate::wruntime;
 /// Maximum UTF-8 byte length accepted for explanatory transition detail.
 pub const MAX_TRANSITION_DETAIL_BYTES: usize = 1_024;
 
+/// Optional launcher-provided identity used to bind lifecycle observations to
+/// one exact process activation.
+pub const PROCESS_INSTANCE_ID_ENV: &str = "WRT_LIFECYCLE_INSTANCE_ID";
+
+pub fn resolve_process_instance_id(default: impl Into<String>) -> String {
+    std::env::var(PROCESS_INSTANCE_ID_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.into())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum ProcessState {
     Starting,

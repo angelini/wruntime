@@ -9,8 +9,8 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
 use wr_common::wruntime::{
-    BeginDeploymentRequest, BeginRollbackRequest, CompleteDeploymentRequest, ExpectedEngine,
-    ModuleIdentity, VerifyDeploymentRequest,
+    BeginDeploymentRequest, BeginRollbackRequest, CompleteDeploymentRequest, DeploymentState,
+    ExpectedEngine, ModuleIdentity, VerifyDeploymentRequest,
 };
 
 use super::build_helpers::{self, BuildModule};
@@ -1084,41 +1084,107 @@ async fn wait_for_deployment(
     manager: &str,
     node_id: &str,
     revision: u64,
+    bundle_digest: &str,
     timeout: Duration,
 ) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let conditions = match client::connect(manager).await {
-            Ok(mut client) => match client
+    let subject = format!("deployment {node_id}/{revision}/{bundle_digest}");
+    helpers::wait_with_deadline(
+        &subject,
+        timeout,
+        Duration::from_millis(500),
+        || async {
+            let mut manager_client = match client::connect(manager).await {
+                Ok(client) => client,
+                Err(error) => return helpers::WaitAttempt::QueryFailure(error),
+            };
+            let response = match manager_client
                 .verify_deployment(VerifyDeploymentRequest {
                     node_id: node_id.to_string(),
                     revision,
                 })
                 .await
             {
-                Ok(response) => {
-                    let verification = response.into_inner();
-                    if verification.ready {
-                        return Ok(());
-                    }
-                    verification
-                        .conditions
-                        .into_iter()
-                        .map(|condition| format!("{}: {}", condition.code, condition.detail))
-                        .collect()
+                Ok(response) => response,
+                Err(error) => {
+                    return helpers::WaitAttempt::QueryFailure(anyhow::Error::new(error))
                 }
-                Err(error) => vec![format!("verification RPC: {error}")],
-            },
-            Err(error) => vec![format!("manager connection: {error}")],
-        };
-        if tokio::time::Instant::now() >= deadline {
-            bail!(
-                "deployment {node_id}/{revision} did not become ready within {}s: {}",
-                timeout.as_secs(),
-                conditions.join("; ")
-            );
+            };
+            let verification = response.into_inner();
+            let deployment = match verification.deployment {
+                Some(deployment) => deployment,
+                None => {
+                    return helpers::WaitAttempt::Terminal(anyhow::anyhow!(
+                        "VerifyDeployment returned no deployment record"
+                    ))
+                }
+            };
+            if deployment.node_id != node_id
+                || deployment.revision != revision
+                || deployment.bundle_digest != bundle_digest
+            {
+                return helpers::WaitAttempt::Terminal(anyhow::anyhow!(
+                    "deployment identity mismatch: expected {node_id}/{revision}/{bundle_digest}, observed {}/{}/{}",
+                    deployment.node_id,
+                    deployment.revision,
+                    deployment.bundle_digest
+                ));
+            }
+            let deployment_state = match DeploymentState::try_from(deployment.state) {
+                Ok(DeploymentState::Unspecified) | Err(_) => {
+                    return helpers::WaitAttempt::Terminal(anyhow::anyhow!(
+                        "VerifyDeployment returned malformed deployment state {}",
+                        deployment.state
+                    ))
+                }
+                Ok(state) => state,
+            };
+            let evidence = if verification.conditions.is_empty() {
+                format!("state={}; no conditions", deployment_state.as_str_name())
+            } else {
+                verification
+                    .conditions
+                    .iter()
+                    .map(|condition| {
+                        format!(
+                            "{} severity={} affected={} desired={} actual={}: {}",
+                            condition.code,
+                            condition.severity,
+                            condition.affected_identity,
+                            condition.desired,
+                            condition.actual,
+                            condition.detail
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            if verification.ready {
+                return helpers::WaitAttempt::Matched(());
+            }
+            if deployment_state == DeploymentState::Failed {
+                return helpers::WaitAttempt::Terminal(anyhow::anyhow!(
+                    "deployment entered FAILED: {evidence}"
+                ));
+            }
+            helpers::WaitAttempt::Pending(evidence)
+        },
+    )
+    .await
+}
+
+fn combine_deployment_readiness_and_tail(
+    readiness: Result<()>,
+    tail_result: Result<()>,
+) -> Result<()> {
+    match (readiness, tail_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(tail_error)) => Err(anyhow::anyhow!(
+            "live startup log tail did not shut down cleanly: {tail_error:#}"
+        )),
+        (Err(error), Err(tail_error)) => {
+            bail!("{error:#}; live startup log tail also failed to shut down: {tail_error:#}")
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -1312,42 +1378,30 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
             super::logs::build_docker_logs_command(&manifest.workdir, None, 20, true)
         }
     };
-    let _log_tail = helpers::spawn_ssh_prefixed(&ssh_base, &log_cmd, "\t");
+    let log_tail = match helpers::spawn_ssh_prefixed(&ssh_base, &log_cmd, "\t") {
+        Ok(tail) => Some(tail),
+        Err(error) => {
+            eprintln!("[deploy]  live log diagnostic unavailable: {error:#}");
+            None
+        }
+    };
 
     let registered = wait_for_deployment(
         manager,
         &deployment.node_id,
         deployment.revision,
+        &deployment.bundle_digest,
         Duration::from_secs(60),
     )
     .await;
 
-    // _log_tail dropped here, killing the background SSH process
-    drop(_log_tail);
+    let tail_result = match log_tail {
+        Some(tail) => tail.stop().await,
+        None => Ok(()),
+    };
     println!();
 
-    if registered.is_ok() {
-        println!("[deploy]  exact revision is healthy and routable");
-
-        // Apply schedules from config if present
-        if let Some(ref schedules_path) = deploy_cfg.schedules_path {
-            if std::path::Path::new(schedules_path).exists() {
-                println!("[deploy]  applying schedules from {schedules_path}...");
-                let content = std::fs::read_to_string(schedules_path)?;
-                let schedules_file: SchedulesFile = toml::from_str(&content)?;
-                super::schedules::apply_entries(manager, &schedules_file.schedule).await?;
-                println!(
-                    "[deploy]  {} schedule(s) applied.",
-                    schedules_file.schedule.len()
-                );
-            } else {
-                println!(
-                    "[deploy]  WARNING: schedules_path '{}' not found, skipping",
-                    schedules_path
-                );
-            }
-        }
-    } else {
+    if registered.is_err() {
         println!("[deploy]  revision verification failed; check remote logs for conditions");
     }
 
@@ -1366,10 +1420,32 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
                 super::logs::build_docker_logs_command(&manifest.workdir, None, 200, false)
             }
         };
-        helpers::run_ssh_prefixed_best_effort(&ssh_base, &dump_cmd, "\t");
+        if let Err(error) = helpers::run_ssh_prefixed_diagnostic(&ssh_base, &dump_cmd, "\t") {
+            eprintln!("[deploy]  startup log diagnostic unavailable: {error:#}");
+        }
     }
 
-    registered?;
+    combine_deployment_readiness_and_tail(registered, tail_result)?;
+
+    println!("[deploy]  exact revision is healthy and routable");
+    // Apply schedules from config if present.
+    if let Some(ref schedules_path) = deploy_cfg.schedules_path {
+        if std::path::Path::new(schedules_path).exists() {
+            println!("[deploy]  applying schedules from {schedules_path}...");
+            let content = std::fs::read_to_string(schedules_path)?;
+            let schedules_file: SchedulesFile = toml::from_str(&content)?;
+            super::schedules::apply_entries(manager, &schedules_file.schedule).await?;
+            println!(
+                "[deploy]  {} schedule(s) applied.",
+                schedules_file.schedule.len()
+            );
+        } else {
+            println!(
+                "[deploy]  WARNING: schedules_path '{}' not found, skipping",
+                schedules_path
+            );
+        }
+    }
     Ok(())
     }
     .await;
@@ -1388,17 +1464,26 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
             Ok(())
         }
         Err(error) => {
-            if let Ok(mut manager_client) = client::connect(manager).await {
-                let _ = manager_client
+            let failure_detail = deployment_failure_detail(&error);
+            let completion = async {
+                client::connect(manager)
+                    .await?
                     .complete_deployment(CompleteDeploymentRequest {
                         node_id: deployment.node_id,
                         revision: deployment.revision,
                         succeeded: false,
-                        failure_detail: deployment_failure_detail(&error),
+                        failure_detail,
                     })
-                    .await;
+                    .await?;
+                Result::<()>::Ok(())
             }
-            Err(error)
+            .await;
+            match completion {
+                Ok(()) => Err(error),
+                Err(completion_error) => Err(anyhow::anyhow!(
+                    "{error:#}; reporting deployment failure also failed: {completion_error:#}"
+                )),
+            }
         }
     }
 }
@@ -1637,6 +1722,7 @@ async fn rollback(args: RollbackArgs, manager: &str) -> Result<()> {
             manager,
             &deployment.node_id,
             deployment.revision,
+            &deployment.bundle_digest,
             Duration::from_secs(60),
         )
         .await
@@ -1658,17 +1744,26 @@ async fn rollback(args: RollbackArgs, manager: &str) -> Result<()> {
             Ok(())
         }
         Err(error) => {
-            if let Ok(mut manager_client) = client::connect(manager).await {
-                let _ = manager_client
+            let failure_detail = deployment_failure_detail(&error);
+            let completion = async {
+                client::connect(manager)
+                    .await?
                     .complete_deployment(CompleteDeploymentRequest {
                         node_id: deployment.node_id,
                         revision: deployment.revision,
                         succeeded: false,
-                        failure_detail: deployment_failure_detail(&error),
+                        failure_detail,
                     })
-                    .await;
+                    .await?;
+                Result::<()>::Ok(())
             }
-            Err(error)
+            .await;
+            match completion {
+                Ok(()) => Err(error),
+                Err(completion_error) => Err(anyhow::anyhow!(
+                    "{error:#}; reporting rollback failure also failed: {completion_error:#}"
+                )),
+            }
         }
     }
 }
@@ -1767,6 +1862,26 @@ mod tests {
             .iter()
             .position(|item| item == &needle)
             .expect("expected item in deploy phase order")
+    }
+
+    #[test]
+    fn node_deploy_propagates_live_tail_failure() {
+        let error =
+            combine_deployment_readiness_and_tail(Ok(()), Err(anyhow::anyhow!("tail exited 255")))
+                .unwrap_err();
+        assert!(error.to_string().contains("tail exited 255"));
+        assert!(error
+            .to_string()
+            .contains("live startup log tail did not shut down cleanly"));
+
+        let combined = combine_deployment_readiness_and_tail(
+            Err(anyhow::anyhow!("deployment failed")),
+            Err(anyhow::anyhow!("tail exited 255")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(combined.contains("deployment failed"));
+        assert!(combined.contains("tail exited 255"));
     }
 
     #[test]

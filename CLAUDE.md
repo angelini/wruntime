@@ -13,6 +13,7 @@ just check
 just test
 just test-integration
 just test-one <name>
+just test-lifecycle-runners
 just tidy                    # format + clippy -D warnings
 
 # WASM and examples

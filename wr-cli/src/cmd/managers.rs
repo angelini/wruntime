@@ -157,6 +157,13 @@ async fn list(manager: &str) -> Result<()> {
 
 // --- bundle ---
 
+fn manager_runtime_env() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("WRT_SECRET_ENCRYPTION_KEY", "{secret_key}"),
+        ("WRT_LIFECYCLE_INSTANCE_ID", "{lifecycle_instance_id}"),
+    ]
+}
+
 fn bundle(args: BundleArgs) -> Result<()> {
     if !Path::new(&args.manager_config).exists() {
         bail!("Manager config not found: {}", args.manager_config);
@@ -232,7 +239,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         binary_path: &format!("{workdir}/wr-manager/bin/wr-manager"),
         config_path: &format!("{workdir}/wr-manager/config/manager.toml"),
         working_directory: &format!("{workdir}/wr-manager"),
-        env_vars: vec![("WRT_SECRET_ENCRYPTION_KEY", "{secret_key}")],
+        env_vars: manager_runtime_env(),
         no_otel,
         after: vec![],
         requires: vec![],
@@ -254,7 +261,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         binary: "bin/wr-manager",
         config: "config/manager.toml",
         extra_copies: vec![],
-        env_vars: vec![("WRT_SECRET_ENCRYPTION_KEY", "{secret_key}")],
+        env_vars: manager_runtime_env(),
         no_otel,
     };
     bundle::tar_add_bytes_checked(
@@ -368,7 +375,7 @@ fn manager_secret_template_archive_paths() -> &'static [&'static str] {
 }
 
 fn manager_systemd_start_command() -> &'static str {
-    "sudo systemctl daemon-reload && sudo systemctl enable --now wr-manager.service"
+    "sudo systemctl daemon-reload && sudo systemctl enable wr-manager.service && sudo systemctl restart wr-manager.service"
 }
 
 fn manager_docker_compose(workdir: &str, image_prefix: &str) -> String {
@@ -403,7 +410,7 @@ const MANAGER_COMPOSE_PROJECT: &str = "wruntime-manager";
 
 fn manager_docker_start_command(workdir: &str) -> String {
     format!(
-        "cd {workdir}/wr-manager && sudo docker compose --project-name {MANAGER_COMPOSE_PROJECT} -f docker/docker-compose.yml up -d"
+        "cd {workdir}/wr-manager && sudo docker compose --project-name {MANAGER_COMPOSE_PROJECT} -f docker/docker-compose.yml up -d --build --force-recreate"
     )
 }
 
@@ -421,6 +428,42 @@ fn remote_socket_address(remote_ip: &str, port: u16) -> String {
     match remote_ip.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V6(_)) => format!("[{remote_ip}]:{port}"),
         _ => format!("{remote_ip}:{port}"),
+    }
+}
+
+fn validate_manager_activation(
+    observation: helpers::LifecycleObservation,
+    expected_instance: &str,
+) -> Result<helpers::LifecycleObservation> {
+    let kind = observation.service_kind_enum()?;
+    if kind != wr_common::wruntime::ServiceKind::Manager {
+        bail!(
+            "manager lifecycle endpoint reported service kind {}",
+            kind.as_str_name()
+        );
+    }
+    if observation.process_instance_id != expected_instance {
+        bail!(
+            "manager lifecycle endpoint reported instance {}, expected activation instance {expected_instance}",
+            observation.process_instance_id
+        );
+    }
+    Ok(observation)
+}
+
+fn combine_manager_readiness_and_tail(
+    readiness: Result<helpers::LifecycleObservation>,
+    tail_result: Result<()>,
+) -> Result<helpers::LifecycleObservation> {
+    match (readiness, tail_result) {
+        (Ok(ready), Ok(())) => Ok(ready),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(tail_error)) => Err(anyhow::anyhow!(
+            "live startup log tail did not shut down cleanly: {tail_error:#}"
+        )),
+        (Err(error), Err(tail_error)) => {
+            bail!("{error:#}; live startup log tail also failed to shut down: {tail_error:#}")
+        }
     }
 }
 
@@ -483,6 +526,17 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         &advertise_address,
     )?;
 
+    // Generate an activation identity before installing service artifacts. The
+    // launched manager must report this exact token, so neither a stale process
+    // nor a bind-race winner can satisfy deployment readiness.
+    let expected_instance = format!("manager-deploy-{}", uuid::Uuid::new_v4());
+    let remote_host = helpers::extract_remote_host(&args.remote);
+    let deploy_tls = wr_common::node::TlsConfig {
+        cert_path: format!("{cert_dir}/{remote_host}.crt"),
+        key_path: format!("{cert_dir}/{remote_host}.key"),
+        ca_cert_path: format!("{cert_dir}/ca.crt"),
+    };
+
     let mut first_start_timestamp = String::new();
     for phase in manager_deploy_phase_order(&format) {
         match phase {
@@ -517,6 +571,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
                     manifest: &manifest,
                     ssh_base: &ssh_base,
                     secret_key: &secret_key,
+                    lifecycle_instance_id: &expected_instance,
                     format: &format,
                 })?;
             }
@@ -583,16 +638,8 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         }
     }
 
-    // Readiness must use the deploy-scoped certificate directory, not the global CLI TLS config.
-    // The host certificate must include the resolved poll IP as a SAN.
-    let remote_host = helpers::extract_remote_host(&args.remote);
-    let deploy_tls = wr_common::node::TlsConfig {
-        cert_path: format!("{cert_dir}/{remote_host}.crt"),
-        key_path: format!("{cert_dir}/{remote_host}.key"),
-        ca_cert_path: format!("{cert_dir}/ca.crt"),
-    };
-
-    println!("[deploy]  waiting for manager to become ready...");
+    // Readiness uses the deploy-scoped certificate directory, not global CLI TLS.
+    println!("[deploy]  waiting for replacement manager to become ready...");
 
     let log_cmd = match format {
         DeployFormat::Systemd => {
@@ -608,17 +655,18 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         }
     };
 
-    let readiness = helpers::wait_for_manager_ready(
+    let readiness = helpers::wait_for_lifecycle_ready(
         &manager_addr,
-        &advertise_address,
-        &deploy_tls,
+        Some(&deploy_tls),
+        Some(&expected_instance),
         Duration::from_secs(60),
     )
     .await;
 
-    if let Some(tail) = log_tail {
-        tail.stop().await;
-    }
+    let tail_result = match log_tail {
+        Some(tail) => tail.stop().await,
+        None => Ok(()),
+    };
     println!();
 
     // Dump all startup logs from the deploy window (catches fast starts the tail missed)
@@ -634,17 +682,19 @@ async fn deploy(args: DeployArgs) -> Result<()> {
             ),
             DeployFormat::Docker => manager_docker_logs_command(&manifest.workdir, 200, false),
         };
-        helpers::run_ssh_prefixed_best_effort(&ssh_base, &dump_cmd, "\t");
+        if let Err(error) = helpers::run_ssh_prefixed_diagnostic(&ssh_base, &dump_cmd, "\t") {
+            eprintln!("[deploy]  startup log diagnostic unavailable: {error:#}");
+        }
     }
 
-    let ready = readiness?;
+    let ready = validate_manager_activation(
+        combine_manager_readiness_and_tail(readiness, tail_result)?,
+        &expected_instance,
+    )?;
     println!(
-        "[deploy]  verified manager {} at {}",
-        ready.manager_id, ready.advertised_address
+        "[deploy]  verified replacement manager process {} READY at {} (advertised {})",
+        ready.process_instance_id, manager_addr, advertise_address
     );
-    if ready.poll_endpoint != ready.advertised_address {
-        println!("[deploy]  readiness poll endpoint: {}", ready.poll_endpoint);
-    }
 
     Ok(())
 }
@@ -718,6 +768,7 @@ struct ManagerRuntimeArtifactInstall<'a> {
     manifest: &'a ManagerManifest,
     ssh_base: &'a [String],
     secret_key: &'a str,
+    lifecycle_instance_id: &'a str,
     format: &'a DeployFormat,
 }
 
@@ -731,6 +782,7 @@ fn install_resolved_manager_runtime_artifacts(
         .to_string();
     let mut secret_vars = HashMap::new();
     secret_vars.insert("secret_key", params.secret_key);
+    secret_vars.insert("lifecycle_instance_id", params.lifecycle_instance_id);
     secret_vars.insert("run_user", run_user.as_str());
     secret_vars.insert("run_group", run_user.as_str());
 
@@ -880,6 +932,52 @@ mod tests {
     }
 
     #[test]
+    fn manager_activation_identity_is_installed_in_every_backend() {
+        let environment = manager_runtime_env();
+        assert!(environment.contains(&("WRT_LIFECYCLE_INSTANCE_ID", "{lifecycle_instance_id}")));
+        assert!(manager_secret_template_archive_paths()
+            .contains(&"wr-manager/systemd/wr-manager.service"));
+        assert!(manager_secret_template_archive_paths()
+            .contains(&"wr-manager/docker/Dockerfile.manager"));
+    }
+
+    #[test]
+    fn manager_deploy_propagates_live_tail_failure() {
+        let observation = helpers::LifecycleObservation {
+            state: wr_common::wruntime::ProcessLifecycleState::Ready as i32,
+            service_kind: wr_common::wruntime::ServiceKind::Manager as i32,
+            process_instance_id: "manager-deploy-fixture".to_string(),
+            reason: 0,
+            detail: "ready".to_string(),
+        };
+        let error = combine_manager_readiness_and_tail(
+            Ok(observation.clone()),
+            Err(anyhow::anyhow!("tail exited 255")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("tail exited 255"));
+        assert!(error
+            .to_string()
+            .contains("live startup log tail did not shut down cleanly"));
+
+        let combined = combine_manager_readiness_and_tail(
+            Err(anyhow::anyhow!("readiness failed")),
+            Err(anyhow::anyhow!("tail exited 255")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(combined.contains("readiness failed"));
+        assert!(combined.contains("tail exited 255"));
+
+        validate_manager_activation(observation.clone(), "manager-deploy-fixture").unwrap();
+        let wrong_kind = helpers::LifecycleObservation {
+            service_kind: wr_common::wruntime::ServiceKind::Proxy as i32,
+            ..observation
+        };
+        assert!(validate_manager_activation(wrong_kind, "manager-deploy-fixture").is_err());
+    }
+
+    #[test]
     fn manager_bundle_verification_rejects_tampered_payload() {
         let path = manager_test_bundle(b"tampered", b"original");
         let manifest: ManagerManifest = bundle::read_manifest(path.to_str().unwrap()).unwrap();
@@ -984,8 +1082,8 @@ advertise_grpc_address = "{advertise_address}"
             index_of(phases, ManagerDeployPhase::CaptureFirstStartTimestamp)
                 < index_of(phases, ManagerDeployPhase::FirstStart)
         );
-        assert!(manager_systemd_start_command().contains("enable --now wr-manager.service"));
-        assert!(!manager_systemd_start_command().contains("restart"));
+        assert!(manager_systemd_start_command().contains("enable wr-manager.service"));
+        assert!(manager_systemd_start_command().contains("restart wr-manager.service"));
         let cfg: DeployConfig = toml::from_str(r#"seed_nodes = ["10.0.0.2:9010"]"#).unwrap();
         assert_eq!(cfg.seed_nodes.as_ref().unwrap().len(), 1);
         assert_eq!(phases, manager_deploy_phase_order(&DeployFormat::Systemd));
@@ -1021,7 +1119,7 @@ advertise_grpc_address = "{advertise_address}"
         let command = manager_docker_start_command("/opt/wruntime");
         assert!(command.contains("docker compose"));
         assert!(command.contains("--project-name wruntime-manager"));
-        assert!(command.contains("up -d"));
+        assert!(command.contains("up -d --build --force-recreate"));
         assert!(!command.contains("restart"));
 
         let compose = manager_docker_compose("/opt/wruntime", "wr");

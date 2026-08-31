@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tonic::transport::{Channel, Endpoint};
 use wr_common::node::TlsConfig;
+use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
 use wr_common::wruntime::manager_service_client::ManagerServiceClient;
 use wr_common::wruntime::{GetClusterStatusRequest, GetClusterStatusResponse, ListManagersRequest};
 
@@ -23,16 +24,20 @@ fn connection_tls_config(explicit: Option<&TlsConfig>) -> Option<&TlsConfig> {
     }
 }
 
-fn endpoint(addr: &str, explicit_tls: Option<&TlsConfig>) -> Result<Endpoint> {
+fn endpoint_with_tls(addr: &str, tls: Option<&TlsConfig>) -> Result<Endpoint> {
     let mut endpoint = Endpoint::from_shared(addr.to_string())?
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10));
 
-    if let Some(tls) = connection_tls_config(explicit_tls) {
+    if let Some(tls) = tls {
         endpoint = endpoint.tls_config(wr_common::tls::build_tonic_client_tls(tls)?)?;
     }
 
     Ok(endpoint)
+}
+
+fn endpoint(addr: &str, explicit_tls: Option<&TlsConfig>) -> Result<Endpoint> {
+    endpoint_with_tls(addr, connection_tls_config(explicit_tls))
 }
 
 async fn connect_inner(
@@ -52,12 +57,22 @@ pub async fn connect(addr: &str) -> Result<ManagerServiceClient<Channel>> {
     connect_inner(addr, None).await
 }
 
-/// Connect with caller-owned TLS credentials instead of the process-global config.
-pub async fn connect_with_tls(
+/// Return the process-global CLI TLS credentials, when initialized.
+pub fn tls_config() -> Option<&'static TlsConfig> {
+    TLS_CONFIG.get()
+}
+
+/// Connect to a lifecycle endpoint. Passing `None` intentionally creates a
+/// plaintext channel and does not inherit the manager TLS configuration.
+pub async fn connect_lifecycle(
     addr: &str,
-    tls: &TlsConfig,
-) -> Result<ManagerServiceClient<Channel>> {
-    connect_inner(addr, Some(tls)).await
+    tls: Option<&TlsConfig>,
+) -> Result<LifecycleServiceClient<Channel>> {
+    let channel = endpoint_with_tls(addr, tls)?
+        .connect()
+        .await
+        .with_context(|| format!("failed to connect to lifecycle endpoint {addr}"))?;
+    Ok(LifecycleServiceClient::new(channel))
 }
 
 /// Fetch one coherent cluster status snapshot from a seed manager.

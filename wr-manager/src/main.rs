@@ -96,7 +96,10 @@ async fn lifecycle_probe(config_path: &str) -> Result<()> {
 
 async fn run_service(config_path: &str) -> Result<()> {
     let manager_id = Uuid::new_v4().to_string();
-    let lifecycle = ProcessLifecycleCoordinator::new(ServiceKind::Manager, manager_id.clone());
+    let lifecycle = ProcessLifecycleCoordinator::new(
+        ServiceKind::Manager,
+        wr_common::process_lifecycle::resolve_process_instance_id(manager_id.clone()),
+    );
     let admission = AdmissionGate::closed();
     let config = config::ManagerConfig::load(config_path)?;
     let addr = config.listen_address.parse()?;

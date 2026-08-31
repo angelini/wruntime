@@ -120,7 +120,7 @@ SSH=(timeout -k 5 60 ssh -i "$WRT_DEPLOY_E2E_SSH_KEY" -o ConnectTimeout=5)
 CLI_ARGS=("$ROOT/target/debug/wr-cli" --manager "$MANAGER_ADDR" --ca-cert "$CERT_DIR/ca.crt" --client-cert "$CERT_DIR/${MANAGER_HOST}.crt" --client-key "$CERT_DIR/${MANAGER_HOST}.key")
 CLI=(timeout -k 10 600 "${CLI_ARGS[@]}")
 
-mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+mkdir -p "$(dirname "$LOCK_FILE")"
 exec 9>"$LOCK_FILE" || {
 	echo "cannot open deployment E2E lock: $LOCK_FILE" >&2
 	exit 1
@@ -133,7 +133,7 @@ flock -n 9 || {
 provider() { "${PYTHON[@]}" "$PROVIDER" --config "$CONFIG" "$@"; }
 record_failure() {
 	local status="$1"
-	[ "$PRIMARY_STATUS" -ne 0 ] || PRIMARY_STATUS="$status"
+	PRIMARY_STATUS="$(preserve_primary_status "$PRIMARY_STATUS" "$status")"
 }
 redact_logs() {
 	"${PYTHON[@]}" - "$LOG_BASE" <<'PY'
@@ -159,27 +159,71 @@ for path in root.rglob("*"):
 PY
 }
 stop_tunnel() {
-	if [ -n "$TUNNEL_PID" ]; then
-		kill "$TUNNEL_PID" 2>/dev/null || true
-		wait "$TUNNEL_PID" 2>/dev/null || true
-		TUNNEL_PID=""
+	local status=0 pid="$TUNNEL_PID"
+	[ -n "$pid" ] || return 0
+	TUNNEL_PID=""
+	if kill -0 "$pid" 2>/dev/null; then
+		if kill "$pid"; then
+			:
+		else
+			status=$?
+		fi
+		if wait "$pid"; then
+			:
+		else
+			status=$?
+			case "$status" in 130 | 143) status=0 ;; esac
+		fi
+	elif wait "$pid"; then
+		status=0
+	else
+		status=$?
 	fi
+	return "$status"
 }
+record_tunnel_cleanup_failure() {
+	local context="$1" status="$2" log="$LOG_BASE/tunnel-cleanup-failures.log"
+	printf '%s status=%s\n' "$context" "$status" >>"$log"
+	record_promoted_cleanup_failure "$context SSH tunnel" "$status" "$log"
+	echo "$context: SSH tunnel cleanup failed with $status (recorded in $log)" >&2
+}
+# Invoked indirectly by EXIT/INT/TERM traps.
+# shellcheck disable=SC2317
 cleanup() {
-	local incoming=$?
+	local incoming=$? cleanup_status=0
 	[ "$incoming" -eq 0 ] || record_failure "$incoming"
 	[ "$CLEANUP_STARTED" = false ] || return
 	CLEANUP_STARTED=true
-	set +e
-	stop_tunnel
-	provider status >"$LOG_BASE/final-provider-status-before-reset.json" 2>&1
-	provider stop-reset >"$LOG_BASE/final-provider-stop-reset.json" 2>&1
-	local reset_status=$?
-	if [ "$reset_status" -ne 0 ]; then record_failure "$reset_status"; fi
-	redact_logs
-	rm -rf "$RUN_DIR"
+	if stop_tunnel; then :; else
+		cleanup_status=$?
+		record_promoted_cleanup_failure "EXIT SSH tunnel" "$cleanup_status"
+	fi
+	collect_diagnostic "final provider status" \
+		"$LOG_BASE/final-provider-status-before-reset.json" provider status
+	if provider stop-reset >"$LOG_BASE/final-provider-stop-reset.json" 2>&1; then
+		:
+	else
+		cleanup_status=$?
+		record_promoted_cleanup_failure "final provider reset" "$cleanup_status" \
+			"$LOG_BASE/final-provider-stop-reset.json"
+	fi
+	if redact_logs; then :; else
+		cleanup_status=$?
+		record_promoted_cleanup_failure "final log redaction" "$cleanup_status" "$LOG_BASE"
+	fi
+	if flock -u 9; then :; else
+		cleanup_status=$?
+		record_promoted_cleanup_failure "deployment lock release" "$cleanup_status" "$LOCK_FILE"
+	fi
+	report_diagnostic_failures
+	report_cleanup_failures
+	if [ "$cleanup_status" -eq 0 ]; then
+		if remove_directory_with_cleanup_accounting \
+			"deployment run-directory removal" "$RUN_DIR"; then :; else
+			cleanup_status=$?
+		fi
+	fi
 	if [ "$PRIMARY_STATUS" -ne 0 ]; then echo "deployment E2E failure logs retained: $LOG_BASE" >&2; fi
-	flock -u 9
 	exit "$PRIMARY_STATUS"
 }
 trap cleanup EXIT
@@ -223,9 +267,9 @@ PY
 	local ready=false
 	for _ in $(seq 1 20); do
 		if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-			wait "$TUNNEL_PID" || true
+			if wait "$TUNNEL_PID"; then status=0; else status=$?; fi
 			TUNNEL_PID=""
-			echo "SSH proxy tunnel exited before becoming ready" >&2
+			echo "SSH proxy tunnel exited before becoming ready (exit ${status})" >&2
 			return 1
 		fi
 		if "${PYTHON[@]}" - "$port" <<'PY' 2>/dev/null
@@ -240,22 +284,27 @@ PY
 		sleep 0.25
 	done
 	if [ "$ready" != true ]; then
-		stop_tunnel
+		if stop_tunnel; then :; else
+			status=$?
+			record_tunnel_cleanup_failure "proxy tunnel readiness failure" "$status"
+		fi
 		echo "SSH proxy tunnel did not become ready" >&2
 		return 1
 	fi
 	invoke_error="${log%.json}.stderr"
-	# Manager readiness can precede the deployed proxy's next routing-table poll.
-	if run_with_retry "$log" "$invoke_error" 10 0.5 \
-		"^Error: Request failed with status 503 Service Unavailable: no route for (destination|module)" \
-		timeout -k 1 3 "${CLI_ARGS[@]}" invoke --json --proxy "http://127.0.0.1:${port}" \
+	if timeout -k 1 3 "${CLI_ARGS[@]}" invoke --json \
+		--proxy "http://127.0.0.1:${port}" \
 		--destination http://deployment.echo/multinode.EchoService/Echo \
-		--source deployment-e2e --source-ns deployment --body "{\"message\":\"$expected\"}"; then
+		--source deployment-e2e --source-ns deployment \
+		--body "{\"message\":\"$expected\"}" >"$log" 2>"$invoke_error"; then
 		:
 	else
 		status=$?
-		stop_tunnel
-		echo "guest invocation did not become routable" >&2
+		if stop_tunnel; then :; else
+			local cleanup_status=$?
+			record_tunnel_cleanup_failure "one-shot invoke failure" "$cleanup_status"
+		fi
+		echo "one-shot guest invocation failed after semantic readiness" >&2
 		print_failure_excerpt "$invoke_error"
 		return "$status"
 	fi
@@ -264,8 +313,105 @@ import json,sys
 value=json.load(open(sys.argv[1]))
 if value.get("message") != sys.argv[2]: raise SystemExit(f"unexpected echo response: {value!r}")
 PY
-	stop_tunnel
+	if stop_tunnel; then :; else
+		status=$?
+		record_tunnel_cleanup_failure "successful one-shot invoke" "$status"
+		return "$status"
+	fi
 }
+stop_engine_semantically() {
+	local backend="$1" pass="$2" port tunnel_log state status process_instance stop_state
+	local exit_ready=false
+	port="$(
+		"${PYTHON[@]}" - <<'PY'
+import socket
+with socket.socket() as listener:
+    listener.bind(("127.0.0.1", 0))
+    print(listener.getsockname()[1])
+PY
+	)"
+	tunnel_log="$pass/engine-lifecycle-tunnel.log"
+	ssh -i "$WRT_DEPLOY_E2E_SSH_KEY" -o ConnectTimeout=5 \
+		-o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+		-N -L "127.0.0.1:${port}:127.0.0.1:9100" "$NODE_REMOTE" >"$tunnel_log" 2>&1 &
+	TUNNEL_PID=$!
+	local ready=false
+	for _ in $(seq 1 20); do
+		if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+			if wait "$TUNNEL_PID"; then state=0; else state=$?; fi
+			TUNNEL_PID=""
+			echo "engine lifecycle tunnel exited before readiness (exit ${state})" >&2
+			return 1
+		fi
+		if "${PYTHON[@]}" - "$port" <<'PY' 2>/dev/null
+import socket, sys
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=0.25):
+    pass
+PY
+		then
+			ready=true
+			break
+		fi
+		sleep 0.25
+	done
+	[ "$ready" = true ] || {
+		if stop_tunnel; then :; else
+			status=$?
+			record_tunnel_cleanup_failure "engine lifecycle tunnel readiness failure" "$status"
+		fi
+		echo "engine lifecycle tunnel did not become ready" >&2
+		return 1
+	}
+	"${CLI[@]}" lifecycle stop --endpoint "http://127.0.0.1:${port}" \
+		--detail "deployment lifecycle qualification" >"$pass/engine-stop.json"
+	read -r process_instance stop_state < <(
+		"${PYTHON[@]}" - "$pass/engine-stop.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1]))["observation"]
+print(value["process_instance_id"], value["state"])
+PY
+	)
+	if stop_tunnel; then :; else
+		status=$?
+		record_tunnel_cleanup_failure "engine lifecycle stop" "$status"
+		return "$status"
+	fi
+	local deadline=$((SECONDS + 45)) probe_timeout probe_status
+	local probe_error="$pass/engine-exit-probe.stderr"
+	# Reserve two seconds inside the absolute budget for timeout's one-second
+	# SIGKILL grace and post-probe evidence handling.
+	while probe_timeout="$(remaining_deadline_seconds "$deadline" 5 2)"; do
+		if [ "$backend" = systemd ]; then
+			if state=$(timeout -k 1 "$probe_timeout" "${SSH[@]}" "$NODE_REMOTE" \
+				"sudo systemctl show wr-engine-engine.service --property=ActiveState --value" 2>"$probe_error"); then
+				if [ "$state" = inactive ]; then
+					exit_ready=true
+					break
+				fi
+			else
+				probe_status=$?
+				state="systemd query failure exit $probe_status: $(tail -n 1 "$probe_error")"
+			fi
+		else
+			if state=$(timeout -k 1 "$probe_timeout" "${SSH[@]}" "$NODE_REMOTE" \
+				"cd '$WORKDIR/wr-node/current' && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml ps --all --status exited --services engine-engine" 2>"$probe_error"); then
+				if [ "$state" = engine-engine ]; then
+					exit_ready=true
+					break
+				fi
+			else
+				probe_status=$?
+				state="container query failure exit $probe_status: $(tail -n 1 "$probe_error")"
+			fi
+		fi
+		if remaining_deadline_seconds "$deadline" 5 2 >/dev/null; then sleep 0.5; fi
+	done
+	[ "$exit_ready" = true ] || {
+		echo "engine process $process_instance did not exit after lifecycle state $stop_state; last backend state: ${state:-unknown}" >&2
+		return 1
+	}
+}
+
 assert_db_clean() {
 	local count="" ready=false error_log="$LOG_BASE/postgres-readiness.log"
 	for _ in $(seq 1 30); do
@@ -292,14 +438,29 @@ collect_diagnostics() {
 	local backend="$1"
 	local out="$LOG_BASE/$backend-diagnostics"
 	mkdir -p "$out"
-	status_json "$out/cluster.json" 2>"$out/cluster.stderr" || true
-	"${CLI[@]}" node inspect-bundle "$BUNDLE_A" >"$out/bundle-a.txt" 2>&1 || true
-	"${CLI[@]}" node inspect-bundle "$BUNDLE_B" >"$out/bundle-b.txt" 2>&1 || true
-	"${SSH[@]}" "$MANAGER_REMOTE" "sudo systemctl status --no-pager 'wr-*' || true; sudo journalctl -q -u 'wr-*' -n 300 --no-pager || true; sudo find '$WORKDIR' -maxdepth 5 -type f -o -type l | sort" >"$out/manager-remote.txt" 2>&1 || true
-	"${SSH[@]}" "$NODE_REMOTE" "sudo systemctl status --no-pager 'wr-*' || true; sudo journalctl -q -u 'wr-*' -n 300 --no-pager || true; sudo find '$WORKDIR' -maxdepth 6 -type f -o -type l | sort" >"$out/node-remote.txt" 2>&1 || true
+	collect_diagnostic "cluster status" "$out/cluster.json" \
+		"${CLI[@]}" cluster status --node "$NODE_ID" --output json
+	collect_diagnostic "inspect bundle A" "$out/bundle-a.txt" \
+		"${CLI[@]}" node inspect-bundle "$BUNDLE_A"
+	collect_diagnostic "inspect bundle B" "$out/bundle-b.txt" \
+		"${CLI[@]}" node inspect-bundle "$BUNDLE_B"
+	collect_diagnostic "manager systemd status" "$out/manager-systemd.txt" \
+		"${SSH[@]}" "$MANAGER_REMOTE" "sudo systemctl status --no-pager 'wr-*'"
+	collect_diagnostic "manager journal" "$out/manager-journal.txt" \
+		"${SSH[@]}" "$MANAGER_REMOTE" "sudo journalctl -q -u 'wr-*' -n 300 --no-pager"
+	collect_diagnostic "manager files" "$out/manager-files.txt" \
+		"${SSH[@]}" "$MANAGER_REMOTE" "sudo find '$WORKDIR' -maxdepth 5 \( -type f -o -type l \) | sort"
+	collect_diagnostic "node systemd status" "$out/node-systemd.txt" \
+		"${SSH[@]}" "$NODE_REMOTE" "sudo systemctl status --no-pager 'wr-*'"
+	collect_diagnostic "node journal" "$out/node-journal.txt" \
+		"${SSH[@]}" "$NODE_REMOTE" "sudo journalctl -q -u 'wr-*' -n 300 --no-pager"
+	collect_diagnostic "node files" "$out/node-files.txt" \
+		"${SSH[@]}" "$NODE_REMOTE" "sudo find '$WORKDIR' -maxdepth 6 \( -type f -o -type l \) | sort"
 	if [ "$backend" = docker ]; then
-		"${SSH[@]}" "$MANAGER_REMOTE" "cd '$WORKDIR/wr-manager' && sudo docker compose --project-name wruntime-manager -f docker/docker-compose.yml ps -a && sudo docker compose --project-name wruntime-manager -f docker/docker-compose.yml logs --no-color --tail 300" >"$out/manager-compose.txt" 2>&1 || true
-		"${SSH[@]}" "$NODE_REMOTE" "cd '$WORKDIR/wr-node/current' && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml ps -a && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml images && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml logs --no-color --tail 300" >"$out/node-compose.txt" 2>&1 || true
+		collect_diagnostic "manager compose" "$out/manager-compose.txt" \
+			"${SSH[@]}" "$MANAGER_REMOTE" "cd '$WORKDIR/wr-manager' && sudo docker compose --project-name wruntime-manager -f docker/docker-compose.yml ps -a && sudo docker compose --project-name wruntime-manager -f docker/docker-compose.yml logs --no-color --tail 300"
+		collect_diagnostic "node compose" "$out/node-compose.txt" \
+			"${SSH[@]}" "$NODE_REMOTE" "cd '$WORKDIR/wr-node/current' && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml ps -a && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml images && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml logs --no-color --tail 300"
 	fi
 }
 
@@ -310,7 +471,6 @@ on_error() {
 	[ "$ERROR_HANDLED" = false ] || exit "$status"
 	ERROR_HANDLED=true
 	trap - ERR
-	set +e
 	report_active_failure "$status"
 	if [ -n "$ACTIVE_BACKEND" ]; then collect_diagnostics "$ACTIVE_BACKEND"; fi
 	record_failure "$status"
@@ -395,25 +555,14 @@ lifecycle() {
 	[ "$revision_b" -gt "$revision_a" ]
 	invoke_echo "hello-$backend-b" "$pass/invoke-b.json"
 
-	if [ "$backend" = systemd ]; then
-		"${SSH[@]}" "$NODE_REMOTE" "sudo systemctl stop wr-engine-engine.service"
-	else
-		"${SSH[@]}" "$NODE_REMOTE" "cd '$WORKDIR/wr-node/current' && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml stop engine-engine"
-	fi
-	local gate_status=0
-	for _ in $(seq 1 15); do
-		if "${CLI[@]}" cluster status --node "$NODE_ID" --output json --fail-on unhealthy >"$pass/status-unhealthy.json" 2>"$pass/status-unhealthy.stderr"; then
-			gate_status=0
-		else
-			gate_status=$?
-		fi
-		[ "$gate_status" -ne 0 ] && break
-		sleep 1
-	done
-	[ "$gate_status" -ne 0 ] || {
-		echo "cluster status did not become unhealthy" >&2
-		return 1
-	}
+	stop_engine_semantically "$backend" "$pass"
+	"${CLI[@]}" cluster wait --node "$NODE_ID" --severity unhealthy \
+		--timeout-secs 30 >"$pass/expect-unhealthy.json"
+	"${PYTHON[@]}" - "$pass/expect-unhealthy.json" "$pass/status-unhealthy.json" <<'PY'
+import json, pathlib, sys
+value = json.load(open(sys.argv[1]))
+pathlib.Path(sys.argv[2]).write_text(json.dumps(value["snapshot"], indent=2) + "\n")
+PY
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-unhealthy.json" unhealthy --node-id "$NODE_ID" >"$pass/assert-unhealthy.json"
 
 	run_to_log "$backend node rollback" "$pass/rollback.log" \

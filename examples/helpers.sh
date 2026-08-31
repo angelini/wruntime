@@ -5,12 +5,15 @@
 set -euo pipefail
 
 # ── Parse --inline flag ──────────────────────────────────────────────────────
+# Consumed by scripts that source this helper.
+# shellcheck disable=SC2034
 INLINE=false
 for arg in "$@"; do
 	case "$arg" in
 	--inline) INLINE=true ;;
 	esac
 done
+export INLINE
 
 # ── Repo root ────────────────────────────────────────────────────────────────
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,30 +33,42 @@ CONFIG_DIR="${RUN_DIR}/config"
 WR_DEV_STATE_DIR="${RUN_DIR}/dev-state"
 mkdir -p "${CONFIG_DIR}" "${WR_DEV_STATE_DIR}"
 DEV_STATE_ARGS=(--state-dir "${WR_DEV_STATE_DIR}")
-EXAMPLE_CHILD_PIDS=()
 
-register_example_child() {
-	EXAMPLE_CHILD_PIDS+=("$1")
+stop_example_supervisor() {
+	./target/debug/wr-cli dev "${DEV_STATE_ARGS[@]}" down
 }
 
-stop_example_children() {
-	local pid
-	for pid in "${EXAMPLE_CHILD_PIDS[@]}"; do
-		kill "$pid" 2>/dev/null || true
-	done
-	for pid in "${EXAMPLE_CHILD_PIDS[@]}"; do
-		wait "$pid" 2>/dev/null || true
-	done
+remove_example_run_directory() {
+	rm -rf "$1"
 }
 
 cleanup_example_run() {
-	local status=$?
+	local primary_status=$?
+	local cleanup_status=0
+	local final_status
 	trap - EXIT INT TERM
 	echo "==> Shutting down..."
-	./target/debug/wr-cli dev "${DEV_STATE_ARGS[@]}" down 2>/dev/null || true
-	stop_example_children
-	rm -rf "${RUN_DIR}"
-	exit "$status"
+	if stop_example_supervisor; then
+		cleanup_status=0
+	else
+		cleanup_status=$?
+		echo "Cleanup failed; retained run state: ${RUN_DIR}" >&2
+	fi
+	if [ "$cleanup_status" -eq 0 ]; then
+		if remove_example_run_directory "${RUN_DIR}"; then
+			:
+		else
+			cleanup_status=$?
+			echo "Cleanup failed: run-directory removal=${cleanup_status}:${RUN_DIR}" >&2
+		fi
+	fi
+	final_status=$primary_status
+	if [ "$primary_status" -eq 0 ] && [ "$cleanup_status" -ne 0 ]; then
+		final_status=$cleanup_status
+	elif [ "$primary_status" -ne 0 ] && [ "$cleanup_status" -ne 0 ]; then
+		echo "Primary run failed with ${primary_status}; cleanup also failed with ${cleanup_status}." >&2
+	fi
+	exit "$final_status"
 }
 trap cleanup_example_run EXIT
 trap 'exit 130' INT
@@ -114,9 +129,15 @@ prepare_proxy_config() {
 
 # ── Clean stale manager state ────────────────────────────────────────────────
 clean_manager_state() {
+	local manager_table
 	echo "==> Cleaning manager state..."
-	psql "${DB_URL}" -c "TRUNCATE wr_system.wr_engines, wr_system.wr_routing_rules, wr_system.wr_schemas, wr_system.wr_managers CASCADE" 2>/dev/null ||
-		echo "   (tables may not exist yet — first run)"
+	manager_table=$(psql "${DB_URL}" -Atqc "SELECT to_regclass('wr_system.wr_managers')")
+	if [ -z "$manager_table" ]; then
+		echo "   manager tables do not exist yet — first run"
+		return 0
+	fi
+	psql "${DB_URL}" -v ON_ERROR_STOP=1 -c \
+		"TRUNCATE wr_system.wr_engines, wr_system.wr_routing_rules, wr_system.wr_schemas, wr_system.wr_managers, wr_system.wr_secrets CASCADE"
 }
 
 # ── Start manager + proxy ────────────────────────────────────────────────────
@@ -150,13 +171,19 @@ list_services() {
 # ── Create S3 bucket ─────────────────────────────────────────────────────────
 # Usage: create_s3_bucket <bucket_name>
 create_s3_bucket() {
-	local bucket="$1"
-	echo "==> Creating S3 bucket '${bucket}'"
+	local bucket="$1" buckets
+	echo "==> Ensuring S3 bucket '${bucket}' exists"
+	buckets=$(AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${S3_SECRET_KEY}" \
+		aws --endpoint-url "${S3_ENDPOINT}" s3api list-buckets \
+		--query 'Buckets[].Name' --output text)
+	if grep -Fxq "$bucket" <<<"${buckets//$'\t'/$'\n'}"; then
+		echo "   bucket already exists"
+		return 0
+	fi
 	AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${S3_SECRET_KEY}" \
-		aws --endpoint-url "${S3_ENDPOINT}" s3 mb "s3://${bucket}" 2>/dev/null || true
+		aws --endpoint-url "${S3_ENDPOINT}" s3 mb "s3://${bucket}"
 }
 
-# ── Wait forever (block until Ctrl-C) ────────────────────────────────────────
-wait_forever() {
-	while true; do sleep 60; done
+wait_for_supervisor() {
+	./target/debug/wr-cli dev "${DEV_STATE_ARGS[@]}" wait
 }

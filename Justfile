@@ -268,6 +268,18 @@ deployment-e2e-python-test:
         dev/deployment-e2e/test_assert_cluster.py \
         dev/deployment-e2e/test_lifecycle_logging.py
 
+# Run focused lifecycle waiter, supervisor ownership, and cleanup accounting fixtures
+test-lifecycle-runners:
+    cargo test -p wr-cli cmd::dev_supervisor::tests
+    cargo test -p wr-cli cmd::helpers::tests
+    cargo test -p wr-cli cmd::cluster::tests::expectation
+    cargo test -p wr-cli cmd::managers::tests::manager_deploy_propagates_live_tail_failure
+    cargo test -p wr-cli cmd::managers::tests::manager_activation_identity_is_installed_in_every_backend
+    cargo test -p wr-cli cmd::managers::tests::manager_docker_deploy_sequence_resolves_artifacts_before_compose_start
+    cargo test -p wr-cli cmd::node::tests::node_deploy_propagates_live_tail_failure
+    cargo test -p wr-common process_lifecycle::tests
+    just deployment-e2e-python-test
+
 # Verify the protected Proxmox deployment targets without mutating them
 deployment-e2e-preflight:
     uv run --project dev/deployment-e2e --locked python dev/deployment-e2e/proxmox.py preflight

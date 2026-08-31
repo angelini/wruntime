@@ -145,9 +145,9 @@ Unresolved placeholders cause deployment to fail. A supplied manager gossip addr
 
 After starting the manager, `wr-cli managers deploy` connects to the resolved SSH-host poll endpoint over mTLS using `ca.crt`, `<ssh-host>.crt`, and `<ssh-host>.key` from that deploy's resolved `cert_dir`. This connection does not use the CLI process's default/global certificate paths. The client certificate must cover the poll endpoint's IP in its SANs.
 
-Deploy exits zero only when the contacted manager's `ListManagers` response contains an entry whose `grpc_address` exactly equals the resolved or explicit `advertise_address` and whose runtime-generated `manager_id` is non-empty. A successful response containing only another manager does not pass. TLS, transport, RPC, malformed identity, expected-manager-absent, and 60-second timeout outcomes are non-zero. The terminal error reports the poll endpoint, expected advertised address, attempt count, and bounded last observation or error without exposing deployment secrets.
+Deploy exits zero only when the contacted process's `LifecycleService` reports `READY` with the exact activation identity installed into the systemd unit or container image for that deployment. Manager membership remains a later cluster-health assertion and cannot satisfy startup readiness. TLS, transport, malformed lifecycle evidence, process-instance replacement, terminal-before-ready, and 60-second timeout outcomes are distinct non-zero failures with the last typed observation. No `ListManagers` visibility or advertised-address polling is used as the startup gate.
 
-Live startup logs are stopped before final diagnostics. A bounded startup-log dump is attempted on both readiness success and failure; log collection is best-effort and never replaces the readiness result. Manager Docker log collection uses privileged Compose, matching the passwordless-sudo deployment prerequisite.
+Live startup logs are stopped and both output-reader tasks are joined before final diagnostics. A bounded startup-log dump is attempted on both readiness success and failure; diagnostic collection reports its own outcome without replacing the primary readiness failure. Manager Docker log collection uses privileged Compose, matching the passwordless-sudo deployment prerequisite.
 
 ## Single-node deployment (systemd)
 
@@ -291,20 +291,22 @@ Use this procedure only with disposable hosts, database, and CA. It exercises a 
      --output manager.tar.gz
    ```
 
-4. On a throwaway snapshot or third disposable host, deploy with an unreachable `${BAD_DB_URL}` and capture the status. Acceptance requires a non-zero status after the 60-second gate, readiness evidence, and the bounded startup-log dump. Reset that host/snapshot and the database before continuing:
+4. On a throwaway snapshot or third disposable host, deploy with an unreachable `${BAD_DB_URL}` and capture the status. Acceptance requires a non-zero lifecycle wait with last typed evidence and the bounded startup-log dump. Reset that host/snapshot and the database before continuing:
 
    ```bash
-   set +e
-   wr-cli managers deploy manager.tar.gz "${USER}@${HOST_A}" \
+   if wr-cli managers deploy manager.tar.gz "${USER}@${HOST_A}" \
      --format systemd --db-url "${BAD_DB_URL}" --secret-key "${SECRET_KEY}" \
      --advertise-address "https://${IP_A}:9000" \
-     --gossip-address "${IP_A}:9010" --cert-dir "$CERT_DIR"
-   status=$?
-   set -e
+     --gossip-address "${IP_A}:9010" --cert-dir "$CERT_DIR"; then
+     echo "invalid deployment unexpectedly succeeded" >&2
+     exit 1
+   else
+     status=$?
+   fi
    test "$status" -ne 0
    ```
 
-5. Deploy the first manager on Host A. Zero is valid only after output reports a non-empty runtime ID at the exact advertised address:
+5. Deploy the first manager on Host A. Deployment explicitly restarts the systemd service (or force-recreates the Compose container). Zero is valid only after output reports the replacement process instance `READY` at Host A's lifecycle endpoint; when a prior instance was observable, the new ID must differ:
 
    ```bash
    wr-cli managers deploy manager.tar.gz "${USER}@${HOST_A}" \
@@ -322,7 +324,7 @@ Use this procedure only with disposable hosts, database, and CA. It exercises a 
      --client-key "$CERT_DIR/${HOST_A}.key" managers list
    ```
 
-7. Deploy the same bundle to Host B with Docker and the same database, cluster, secret, and CA. Manager A alone cannot satisfy this readiness gate; success must name a new non-empty manager ID at Host B's exact advertised address:
+7. Deploy the same bundle to Host B with Docker and the same database, cluster, secret, and CA. Manager A cannot satisfy this process-local readiness gate; success must report Host B's newly observed process instance `READY`:
 
    ```bash
    wr-cli managers deploy manager.tar.gz "${USER}@${HOST_B}" \
@@ -421,6 +423,12 @@ wr-cli node deploy --node-id node-a node.tar.gz example@localhost \
 
 In QEMU user-mode networking, `10.0.2.2` is the host gateway address reachable from all VMs.
 
+## Local development supervisor
+
+`wr-cli dev --state-dir <dir> up` starts or contacts one persistent supervisor, which owns manager and primary-proxy children and waits for each exact lifecycle endpoint to report `READY`. Before spawning, it rejects an endpoint that already accepts connections; at spawn it supplies a unique activation identity and requires every lifecycle observation to report that identity plus the expected service kind, so a bind-race winner, replaced process, or unrelated responder cannot satisfy readiness. Any service-start operation that fails becomes a terminal supervisor outcome: all owned children receive ordered cleanup, the supervisor exits, and retained failure state blocks reuse. `dev deploy <engine.toml>` asks that same owner to replace the matching engine through lifecycle stop plus confirmed exit before starting it. `dev start-proxy --name <name> <proxy.toml>` adds a named proxy for local multi-node runs. `dev status` reports owned PID, config, process-instance ID, lifecycle state, and exit evidence. `dev wait` is an interruptible client subscription: the supervisor event loop remains available for concurrent status/down requests and performs ordered cleanup before its failure state becomes observable.
+
+`dev down` is idempotent. It requests lifecycle stop and reaps all engines concurrently, then all proxies, then the manager. Each wave allows the service's 30-second internal budget, a 10-second SIGTERM fallback window, and a final 5-second SIGKILL/reap window. Needing fallback, a failed lifecycle stop, a non-zero exit, or an unreaped child remains non-zero even when later escalation reaps the process. Clean state is removed only after all owned children exit, and `dev down` is not acknowledged until socket, lock, and clean state removal also succeed. Failed or unexpected exit retains `supervisor.json` for diagnosis and blocks restart; an explicit later `dev down` validates the lock owner and each retained child against `/proc` executable/argument identity before removing stale socket, lock, or state metadata. Legacy PID state is rejected rather than imported.
+
 ## Semantic startup and bounded shutdown
 
 Generated systemd units use `Type=notify`; each process sends `READY=1` only after its semantic startup barriers and sends `STOPPING=1` when final shutdown begins. Units use `SIGTERM`, `TimeoutStopSec=45s`, and final `SIGKILL` only after that external grace period. Generated Compose services use the same binary-native lifecycle probe, `stop_signal: SIGTERM`, and `stop_grace_period: 45s`. Engines depend on the proxy with `condition: service_healthy`, so startup waits for proxy semantic readiness and reverse dependency order stops engines before the proxy.
@@ -431,7 +439,7 @@ Startup remains tolerant only through bounded, owned retries. A proxy must reach
 
 On engine shutdown, route withdrawal and local proxy convergence happen before HTTP admission closes and before final deregistration. Existing HTTP requests and claimed jobs drain to the shared deadline; new work is rejected deterministically. Proxy drain closes data-plane admission and waits until every data listener has stopped accepting before acknowledging `DRAINING`, while retaining loopback lifecycle/NodeService control until stop. Manager drain rejects new administrative mutations but retains lifecycle, read-only status, and engine drain/deregister operations. Deadline expiry or failed required deregistration is a non-zero process outcome.
 
-The CLI `node deploy` command still verifies the exact desired revision, digest, engine slots, fresh heartbeats, and healthy routes through `VerifyDeployment`; process lifecycle readiness and cluster availability remain distinct contracts.
+The CLI `node deploy` and `node rollback` commands use one absolute deadline around `VerifyDeployment`, require the exact node/revision/digest record, and retain every typed condition as timeout evidence. The protected deployment harness likewise places all systemd/container exit probes after lifecycle stop under one absolute deadline; every SSH query consumes that shared budget and the failure reports the pinned process instance plus last backend/query evidence. A ready result is sufficient because engine readiness already proves local proxy route convergence; callers perform no post-ready sleep or invoke retry. Process lifecycle readiness and cluster availability remain distinct contracts.
 
 ## Pre-compilation
 
@@ -458,13 +466,14 @@ wr-cli cluster status --output json
 wr-cli cluster status --node node-a --detail
 wr-cli cluster status --service ecommerce.inventory@1.0.0
 wr-cli cluster status --fail-on unhealthy
+wr-cli cluster wait --node node-a --severity unhealthy --timeout-secs 30
 ```
 
 The default table prints aggregate counts and problem rows; `--detail` expands healthy and unknown records. JSON always emits the complete typed snapshot DTO with `schema_version: 1`, raw observation/heartbeat/deployment timestamps, server-computed ages, desired and actual identities, routing version, route evidence, and stable condition codes. Human `detail` text is explanatory; automation must use severity and code.
 
 A healthy rollout reports the exact current node revision and digest with one authoritative fresh registration per desired slot, fresh module heartbeats, and healthy routes. Common failures are `REVISION_MISMATCH` for an old activated revision and `STALE_ENGINE_HEARTBEAT`/`STALE_MODULE_HEARTBEAT` for expired observations. A service remains available but becomes degraded with `PARTIAL_ROUTE_AVAILABILITY` when only some desired routes are healthy; zero healthy desired routes is unhealthy. Manager DB/gossip convergence and disagreement use `BOOTSTRAP_CONVERGING`, `GOSSIP_DEAD`, and `MANAGER_DB_GOSSIP_DISAGREEMENT` with separately stamped DB and gossip observation times.
 
-No direct proxy or host scrape occurs. Routing-sync age, circuit-breaker state, CPU, and memory therefore remain `SIGNAL_NOT_REPORTED`; stale/unmanaged registrations remain visible but cannot satisfy a desired revision. The default command never acts as a monitoring gate. `--fail-on degraded` and `--fail-on unhealthy` gate known aggregate severity; `--fail-on unknown` is strict and fails for any unknown/not-reported signal. RPC/mTLS failures are always non-zero.
+No direct proxy or host scrape occurs. Routing-sync age, circuit-breaker state, CPU, and memory therefore remain `SIGNAL_NOT_REPORTED`; stale/unmanaged registrations remain visible but cannot satisfy a desired revision. The default command never acts as a monitoring gate. `--fail-on degraded` and `--fail-on unhealthy` retain display-gate behavior. For scripts, `cluster wait` returns zero only when a non-empty filtered target reaches the exact requested severity and writes the matching typed snapshot; timeout, transport/query failure, malformed evidence, and an empty/impossible filter remain distinct non-zero outcomes. Lifecycle state expectations use the separate `wr-cli lifecycle` command.
 
 ## Viewing logs
 

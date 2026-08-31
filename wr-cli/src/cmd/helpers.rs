@@ -6,9 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use wr_common::node::TlsConfig;
 use wr_common::wruntime::{
-    GetRoutingTableRequest, ListEnginesRequest, ListManagersRequest, ManagerInfo,
+    DrainRequest, GetLifecycleStatusRequest, LifecycleStatus, ProcessLifecycleState, ServiceKind,
+    StopRequest,
 };
 
 use crate::client;
@@ -68,17 +70,6 @@ pub fn extract_port(addr: &str) -> Result<DeployPort> {
         .parse::<u16>()
         .with_context(|| format!("invalid port in address '{addr}'"))?;
     DeployPort::new(parsed).with_context(|| format!("invalid port in address '{addr}'"))
-}
-
-/// Parse the `listen_address` field from a TOML config file.
-pub fn parse_listen_address(config_path: &str) -> Result<String> {
-    let content = std::fs::read_to_string(config_path)?;
-    let config: toml::Value = toml::from_str(&content)?;
-    config
-        .get("listen_address")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("no listen_address in {config_path}"))
 }
 
 /// Run a command (given as a slice of args) and bail on failure.
@@ -182,26 +173,26 @@ pub fn get_remote_timestamp(ssh_base: &[String]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Like `run_ssh_streaming` but ignores non-zero exit codes and prefixes each
-/// output line with `prefix` (e.g. journalctl returning 1 when no entries match).
-pub fn run_ssh_prefixed_best_effort(ssh_base: &[String], command: &str, prefix: &str) {
+/// Collect a supplemental SSH diagnostic while preserving its real outcome.
+pub fn run_ssh_prefixed_diagnostic(ssh_base: &[String], command: &str, prefix: &str) -> Result<()> {
     let mut args = ssh_base.to_vec();
     args.push(command.to_string());
     let output = Command::new(&args[0])
         .args(&args[1..])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output();
-    if let Ok(out) = output {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            println!("{prefix}{line}");
-        }
-        let err = String::from_utf8_lossy(&out.stderr);
-        for line in err.lines() {
-            eprintln!("{prefix}{line}");
-        }
+        .output()
+        .with_context(|| format!("failed to run diagnostic command {}", args[0]))?;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        println!("{prefix}{line}");
     }
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        eprintln!("{prefix}{line}");
+    }
+    if !output.status.success() {
+        bail!("diagnostic command exited with {}", output.status);
+    }
+    Ok(())
 }
 
 /// Spawn an SSH command in the background, prefixing each stdout line with `prefix`.
@@ -224,19 +215,27 @@ pub fn spawn_ssh_prefixed(
         .spawn()
         .with_context(|| format!("failed to spawn {}", args[0]))?;
 
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
+    let stdout = child
+        .stdout
+        .take()
+        .context("spawned SSH command is missing its stdout pipe")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("spawned SSH command is missing its stderr pipe")?;
     let stdout_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        while let Some(line) = lines.next_line().await? {
             println!("{prefix}{line}");
         }
+        std::io::Result::Ok(())
     });
     let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        while let Some(line) = lines.next_line().await? {
             eprintln!("{prefix}{line}");
         }
+        std::io::Result::Ok(())
     });
 
     Ok(PrefixedTail {
@@ -249,18 +248,61 @@ pub fn spawn_ssh_prefixed(
 /// Handle for a background prefixed SSH tail. Kills the child on drop.
 pub struct PrefixedTail {
     child: tokio::process::Child,
-    stdout_task: tokio::task::JoinHandle<()>,
-    stderr_task: tokio::task::JoinHandle<()>,
+    stdout_task: tokio::task::JoinHandle<std::io::Result<()>>,
+    stderr_task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
 impl PrefixedTail {
-    /// Stop the remote tail and wait until its output readers can no longer print.
-    pub async fn stop(mut self) {
-        let _ = self.child.kill().await;
-        self.stdout_task.abort();
-        self.stderr_task.abort();
-        let _ = (&mut self.stdout_task).await;
-        let _ = (&mut self.stderr_task).await;
+    /// Stop the remote tail and join the child plus both output readers.
+    /// A child that exited before the local stop request is a diagnostic failure.
+    pub async fn stop(mut self) -> Result<()> {
+        let mut errors = Vec::new();
+        let preexisting_status = match self.child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                errors.push(format!("failed to inspect prefixed SSH tail: {error}"));
+                None
+            }
+        };
+        let status = if let Some(status) = preexisting_status {
+            Some(status)
+        } else {
+            if let Err(error) = self.child.start_kill() {
+                errors.push(format!(
+                    "failed to request prefixed SSH tail termination: {error}"
+                ));
+            }
+            match self.child.wait().await {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    errors.push(format!("failed to reap prefixed SSH tail: {error}"));
+                    None
+                }
+            }
+        };
+        match (&mut self.stdout_task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(format!("prefixed stdout reader failed: {error}")),
+            Err(error) => errors.push(format!("prefixed stdout reader panicked: {error}")),
+        }
+        match (&mut self.stderr_task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(format!("prefixed stderr reader failed: {error}")),
+            Err(error) => errors.push(format!("prefixed stderr reader panicked: {error}")),
+        }
+        if preexisting_status.is_some() {
+            errors.push(format!(
+                "prefixed SSH tail exited before requested stop with {}",
+                status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "unknown status".to_string())
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!("{}", errors.join("; "))
+        }
     }
 }
 
@@ -272,234 +314,199 @@ impl Drop for PrefixedTail {
     }
 }
 
-/// Poll the manager until an engine registers and every advertised module has
-/// a healthy default route. Engines without modules are ready after registration.
-pub async fn wait_for_engine_ready(manager: &str, listen_addr: &str, timeout: Duration) -> bool {
-    use tokio_retry::strategy::FixedInterval;
-    use tokio_retry::Retry;
+const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-    let normalized = normalize_address(listen_addr);
-    debug!("polling manager {manager} for ready engine at {listen_addr} (normalized: {normalized}, timeout {}s)", timeout.as_secs());
-    let attempt = std::sync::atomic::AtomicU32::new(0);
-    let normalized = &normalized;
-    let strategy = FixedInterval::from_millis(1000).take(timeout.as_secs() as usize);
-    Retry::start(strategy, || {
-        let n = attempt.fetch_add(1, Ordering::Relaxed) + 1;
-        async move {
-            let mut client = match client::connect(manager).await {
-                Ok(client) => client,
-                Err(e) => {
-                    debug!("attempt {n}: connection to {manager} failed: {e}");
-                    return Err(());
-                }
-            };
-            let engines = match client.list_engines(ListEnginesRequest {}).await {
-                Ok(resp) => resp.into_inner().engines,
-                Err(e) => {
-                    debug!("attempt {n}: ListEngines RPC failed: {e}");
-                    return Err(());
-                }
-            };
-            let Some(engine) = engines
-                .iter()
-                .find(|engine| normalize_address(&engine.address) == *normalized)
-            else {
-                debug!("attempt {n}: engine has not registered");
-                return Err(());
-            };
-            if engine.modules.is_empty() {
-                return Ok(());
-            }
+/// Machine-readable lifecycle evidence returned by CLI waits and supervisor IPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleObservation {
+    pub state: i32,
+    pub service_kind: i32,
+    pub process_instance_id: String,
+    pub reason: i32,
+    pub detail: String,
+}
 
-            let rules = match client
-                .get_routing_table(GetRoutingTableRequest { known_version: 0 })
-                .await
-            {
-                Ok(resp) => resp
-                    .into_inner()
-                    .table
-                    .map(|table| table.rules)
-                    .unwrap_or_default(),
-                Err(e) => {
-                    debug!("attempt {n}: GetRoutingTable RPC failed: {e}");
-                    return Err(());
-                }
-            };
-            let all_ready = engine.modules.iter().all(|module| {
-                rules.iter().any(|rule| {
-                    rule.engine_id == engine.engine_id
-                        && rule.destination_namespace == module.namespace
-                        && rule.destination_module == module.name
-                        && rule.destination_version == module.version
-                        && rule.healthy
-                })
-            });
-            debug!(
-                "attempt {n}: engine {} has {}/{} ready module route(s)",
-                engine.engine_id,
-                engine
-                    .modules
-                    .iter()
-                    .filter(|module| rules.iter().any(|rule| {
-                        rule.engine_id == engine.engine_id
-                            && rule.destination_namespace == module.namespace
-                            && rule.destination_module == module.name
-                            && rule.destination_version == module.version
-                            && rule.healthy
-                    }))
-                    .count(),
-                engine.modules.len()
-            );
-            if all_ready {
-                Ok(())
-            } else {
-                Err(())
-            }
+impl LifecycleObservation {
+    pub fn state_enum(&self) -> Result<ProcessLifecycleState> {
+        let state = ProcessLifecycleState::try_from(self.state)
+            .map_err(|_| anyhow::anyhow!("unknown lifecycle state {}", self.state))?;
+        if state == ProcessLifecycleState::Unspecified {
+            bail!("lifecycle endpoint returned an unspecified state");
         }
-    })
-    .await
-    .is_ok()
-}
+        Ok(state)
+    }
 
-const MANAGER_READINESS_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const MAX_OBSERVED_MANAGERS: usize = 8;
-const MAX_EVIDENCE_FIELD_CHARS: usize = 160;
+    pub fn state_name(&self) -> Result<&'static str> {
+        Ok(self.state_enum()?.as_str_name())
+    }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManagerReadiness {
-    pub manager_id: String,
-    pub advertised_address: String,
-    pub poll_endpoint: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ManagerResponseClassification {
-    Ready { manager_id: String },
-    Pending { evidence: String },
-}
-
-fn bounded_evidence_field(value: &str) -> String {
-    let mut bounded = String::new();
-    let mut truncated = false;
-    for (index, character) in value.chars().enumerate() {
-        if index >= MAX_EVIDENCE_FIELD_CHARS {
-            truncated = true;
-            break;
+    pub fn service_kind_enum(&self) -> Result<ServiceKind> {
+        let kind = ServiceKind::try_from(self.service_kind)
+            .map_err(|_| anyhow::anyhow!("unknown lifecycle service kind {}", self.service_kind))?;
+        if kind == ServiceKind::Unspecified {
+            bail!("lifecycle endpoint returned an unspecified service kind");
         }
-        bounded.push(if character.is_control() {
-            '�'
-        } else {
-            character
-        });
+        Ok(kind)
     }
-    if truncated {
-        bounded.push('…');
-    }
-    bounded
 }
 
-fn format_manager_observation(managers: &[ManagerInfo]) -> String {
-    let shown = managers
-        .iter()
-        .take(MAX_OBSERVED_MANAGERS)
-        .map(|manager| {
-            let id = if manager.manager_id.is_empty() {
-                "<empty>".to_string()
-            } else {
-                bounded_evidence_field(&manager.manager_id)
-            };
-            format!(
-                "id='{id}' address='{}'",
-                bounded_evidence_field(&manager.grpc_address)
-            )
-        })
-        .collect::<Vec<_>>();
-    let omitted = managers.len().saturating_sub(shown.len());
-    let mut evidence = if shown.is_empty() {
-        "no managers returned".to_string()
-    } else {
-        format!("returned [{}]", shown.join(", "))
+fn lifecycle_state_rank(state: ProcessLifecycleState) -> Result<u8> {
+    match state {
+        ProcessLifecycleState::Starting => Ok(0),
+        ProcessLifecycleState::Ready => Ok(1),
+        ProcessLifecycleState::Draining => Ok(2),
+        ProcessLifecycleState::Stopping => Ok(3),
+        ProcessLifecycleState::Unspecified => bail!("unspecified lifecycle state has no rank"),
+    }
+}
+
+fn classify_lifecycle_observation(
+    observation: LifecycleObservation,
+    expected: ProcessLifecycleState,
+    evidence: &str,
+) -> WaitAttempt<LifecycleObservation> {
+    let state = match observation.state_enum() {
+        Ok(state) => state,
+        Err(error) => return WaitAttempt::Terminal(error),
     };
-    if omitted > 0 {
-        evidence.push_str(&format!(" ({omitted} more omitted)"));
+    if state == expected {
+        return WaitAttempt::Matched(observation);
     }
-    evidence
+    let observed_rank = match lifecycle_state_rank(state) {
+        Ok(rank) => rank,
+        Err(error) => return WaitAttempt::Terminal(error),
+    };
+    let expected_rank = match lifecycle_state_rank(expected) {
+        Ok(rank) => rank,
+        Err(error) => return WaitAttempt::Terminal(error),
+    };
+    if observed_rank > expected_rank {
+        return WaitAttempt::Terminal(anyhow::anyhow!(
+            "lifecycle process passed expected state {}: {evidence}",
+            expected.as_str_name()
+        ));
+    }
+    WaitAttempt::Pending(evidence.to_string())
 }
 
-fn classify_manager_response(
-    managers: &[ManagerInfo],
-    expected_advertised_address: &str,
-) -> ManagerResponseClassification {
-    if let Some(manager) = managers
-        .iter()
-        .find(|manager| manager.grpc_address == expected_advertised_address)
-    {
-        if !manager.manager_id.is_empty() {
-            return ManagerResponseClassification::Ready {
-                manager_id: manager.manager_id.clone(),
-            };
-        }
-        return ManagerResponseClassification::Pending {
-            evidence: format!(
-                "matching address has an empty manager ID; {}",
-                format_manager_observation(managers)
-            ),
-        };
+fn lifecycle_observation(status: LifecycleStatus) -> Result<LifecycleObservation> {
+    let observation = LifecycleObservation {
+        state: status.state,
+        service_kind: status.service_kind,
+        process_instance_id: status.process_instance_id,
+        reason: status.reason,
+        detail: status.detail,
+    };
+    observation.state_enum()?;
+    observation.service_kind_enum()?;
+    if observation.process_instance_id.is_empty() {
+        bail!("lifecycle endpoint returned an empty process instance ID");
     }
-
-    ManagerResponseClassification::Pending {
-        evidence: format!(
-            "expected advertised address was absent; {}",
-            format_manager_observation(managers)
-        ),
-    }
+    Ok(observation)
 }
 
-async fn wait_for_manager_ready_with<P, Fut>(
-    poll_endpoint: &str,
-    expected_advertised_address: &str,
+pub async fn get_lifecycle_status(
+    endpoint: &str,
+    tls: Option<&TlsConfig>,
+) -> Result<LifecycleObservation> {
+    let mut lifecycle = client::connect_lifecycle(endpoint, tls).await?;
+    let response = lifecycle
+        .get_status(GetLifecycleStatusRequest {})
+        .await
+        .with_context(|| format!("lifecycle status RPC failed for {endpoint}"))?
+        .into_inner();
+    lifecycle_observation(
+        response
+            .status
+            .ok_or_else(|| anyhow::anyhow!("lifecycle endpoint returned no status"))?,
+    )
+}
+
+pub async fn request_lifecycle_drain(
+    endpoint: &str,
+    tls: Option<&TlsConfig>,
+    detail: &str,
+) -> Result<LifecycleObservation> {
+    let mut lifecycle = client::connect_lifecycle(endpoint, tls).await?;
+    lifecycle_observation(
+        lifecycle
+            .drain(DrainRequest {
+                detail: detail.to_string(),
+            })
+            .await
+            .with_context(|| format!("lifecycle drain RPC failed for {endpoint}"))?
+            .into_inner()
+            .status
+            .ok_or_else(|| anyhow::anyhow!("lifecycle drain returned no status"))?,
+    )
+}
+
+pub async fn request_lifecycle_stop(
+    endpoint: &str,
+    tls: Option<&TlsConfig>,
+    detail: &str,
+) -> Result<LifecycleObservation> {
+    let mut lifecycle = client::connect_lifecycle(endpoint, tls).await?;
+    lifecycle_observation(
+        lifecycle
+            .stop(StopRequest {
+                detail: detail.to_string(),
+            })
+            .await
+            .with_context(|| format!("lifecycle stop RPC failed for {endpoint}"))?
+            .into_inner()
+            .status
+            .ok_or_else(|| anyhow::anyhow!("lifecycle stop returned no status"))?,
+    )
+}
+
+/// One typed result from a protocol poll under an absolute deadline.
+pub enum WaitAttempt<T> {
+    Matched(T),
+    Pending(String),
+    Terminal(anyhow::Error),
+    QueryFailure(anyhow::Error),
+}
+
+/// Poll one semantic owner under one absolute deadline while preserving the
+/// distinction between a valid-but-pending observation and a query failure.
+pub async fn wait_with_deadline<T, F, Fut>(
+    subject: &str,
     timeout: Duration,
     poll_interval: Duration,
-    mut poll: P,
-) -> Result<ManagerReadiness>
+    mut poll: F,
+) -> Result<T>
 where
-    P: FnMut() -> Fut,
-    Fut: Future<Output = Result<Vec<ManagerInfo>>>,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = WaitAttempt<T>>,
 {
+    enum LastEvidence {
+        Pending(String),
+        QueryFailure(String),
+    }
+
     let started = tokio::time::Instant::now();
     let deadline = started + timeout;
     let mut attempts = 0_u32;
-    let mut last_evidence: String;
+    let mut last_evidence;
 
     loop {
         attempts += 1;
-        debug!("attempt {attempts}: polling {poll_endpoint}");
         match tokio::time::timeout_at(deadline, poll()).await {
-            Ok(Ok(managers)) => {
-                debug!(
-                    "attempt {attempts}: ListManagers OK ({} managers)",
-                    managers.len()
-                );
-                match classify_manager_response(&managers, expected_advertised_address) {
-                    ManagerResponseClassification::Ready { manager_id } => {
-                        return Ok(ManagerReadiness {
-                            manager_id,
-                            advertised_address: expected_advertised_address.to_string(),
-                            poll_endpoint: poll_endpoint.to_string(),
-                        });
-                    }
-                    ManagerResponseClassification::Pending { evidence } => {
-                        last_evidence = evidence;
-                    }
-                }
+            Ok(WaitAttempt::Matched(value)) => return Ok(value),
+            Ok(WaitAttempt::Pending(evidence)) => {
+                last_evidence = Some(LastEvidence::Pending(evidence));
             }
-            Ok(Err(error)) => {
-                debug!("attempt {attempts}: {error:#}");
-                last_evidence = format!("request failed: {error:#}");
+            Ok(WaitAttempt::Terminal(error)) => {
+                return Err(error).with_context(|| format!("{subject} reached a terminal outcome"));
+            }
+            Ok(WaitAttempt::QueryFailure(error)) => {
+                last_evidence = Some(LastEvidence::QueryFailure(format!("{error:#}")));
             }
             Err(_) => {
-                last_evidence = "request exceeded the readiness deadline".to_string();
-                break;
+                last_evidence = Some(LastEvidence::QueryFailure(
+                    "protocol query exceeded the absolute deadline".to_string(),
+                ));
             }
         }
 
@@ -508,55 +515,91 @@ where
             break;
         }
         tokio::time::sleep_until((now + poll_interval).min(deadline)).await;
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
     }
 
-    bail!(
-        "manager readiness timed out after {:?} (timeout {:?}); poll endpoint: {}; expected advertised address: {}; attempts: {}; last evidence: {}",
-        started.elapsed(),
-        timeout,
-        poll_endpoint,
-        expected_advertised_address,
-        attempts,
-        last_evidence
-    )
+    match last_evidence {
+        Some(LastEvidence::Pending(evidence)) => bail!(
+            "{subject} timed out after {:?}; attempts: {attempts}; last observation: {evidence}",
+            started.elapsed()
+        ),
+        Some(LastEvidence::QueryFailure(error)) => bail!(
+            "{subject} ended in transport/query failure at the absolute deadline after {:?}; attempts: {attempts}; last error: {error}",
+            started.elapsed()
+        ),
+        None => bail!(
+            "{subject} timed out after {:?} without an observation; attempts: {attempts}",
+            started.elapsed()
+        ),
+    }
 }
 
-/// Poll a manager through deploy-scoped mTLS until its exact advertised identity appears.
-pub async fn wait_for_manager_ready(
-    poll_endpoint: &str,
-    expected_advertised_address: &str,
-    tls: &TlsConfig,
+/// Wait for one exact lifecycle state under a single absolute deadline.
+pub async fn wait_for_lifecycle_state(
+    endpoint: &str,
+    tls: Option<&TlsConfig>,
+    expected: ProcessLifecycleState,
+    expected_instance: Option<&str>,
     timeout: Duration,
-) -> Result<ManagerReadiness> {
-    debug!(
-        "polling manager at {poll_endpoint} for {expected_advertised_address} (timeout {}s)",
-        timeout.as_secs()
+) -> Result<LifecycleObservation> {
+    if expected == ProcessLifecycleState::Unspecified {
+        bail!("cannot wait for an unspecified lifecycle state");
+    }
+    let pinned_instance = std::rc::Rc::new(std::cell::RefCell::new(
+        expected_instance.map(str::to_string),
+    ));
+    let subject = format!(
+        "lifecycle wait at {endpoint} for {}",
+        expected.as_str_name()
     );
-    let poll_endpoint_owned = poll_endpoint.to_string();
-    let tls = tls.clone();
-    wait_for_manager_ready_with(
-        poll_endpoint,
-        expected_advertised_address,
-        timeout,
-        MANAGER_READINESS_POLL_INTERVAL,
-        move || {
-            let poll_endpoint = poll_endpoint_owned.clone();
-            let tls = tls.clone();
-            async move {
-                let mut manager = client::connect_with_tls(&poll_endpoint, &tls)
-                    .await
-                    .context("manager TLS connection")?;
-                Ok(manager
-                    .list_managers(ListManagersRequest {})
-                    .await
-                    .context("ListManagers RPC")?
-                    .into_inner()
-                    .managers)
+
+    wait_with_deadline(&subject, timeout, LIFECYCLE_POLL_INTERVAL, || {
+        let pinned_instance = std::rc::Rc::clone(&pinned_instance);
+        async move {
+            let observation = match get_lifecycle_status(endpoint, tls).await {
+                Ok(observation) => observation,
+                Err(error) => return WaitAttempt::QueryFailure(error),
+            };
+            let state = match observation.state_enum() {
+                Ok(state) => state,
+                Err(error) => return WaitAttempt::Terminal(error),
+            };
+            let evidence = format!(
+                "state={} instance={} detail={}",
+                state.as_str_name(),
+                observation.process_instance_id,
+                observation.detail
+            );
+            {
+                let mut pinned = pinned_instance.borrow_mut();
+                if let Some(instance) = pinned.as_deref() {
+                    if instance != observation.process_instance_id {
+                        return WaitAttempt::Terminal(anyhow::anyhow!(
+                            "lifecycle process instance mismatch at {endpoint}: expected {instance}, observed {}",
+                            observation.process_instance_id
+                        ));
+                    }
+                } else {
+                    *pinned = Some(observation.process_instance_id.clone());
+                }
             }
-        },
+            classify_lifecycle_observation(observation, expected, &evidence)
+        }
+    })
+    .await
+}
+
+pub async fn wait_for_lifecycle_ready(
+    endpoint: &str,
+    tls: Option<&TlsConfig>,
+    expected_instance: Option<&str>,
+    timeout: Duration,
+) -> Result<LifecycleObservation> {
+    wait_for_lifecycle_state(
+        endpoint,
+        tls,
+        ProcessLifecycleState::Ready,
+        expected_instance,
+        timeout,
     )
     .await
 }
@@ -630,17 +673,16 @@ pub fn resolve_template(
     let bytes = result.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(end) = result[i + 1..].find('}') {
-                let name = &result[i + 1..i + 1 + end];
-                // Skip empty braces or TOML inline tables (contain spaces/quotes/commas)
-                if !name.is_empty()
-                    && !name.contains(' ')
-                    && !name.contains('"')
-                    && !name.contains(',')
-                {
-                    bail!("unresolved template variable: {{{name}}}");
-                }
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        if let Some(end) = result[i + 1..].find('}') {
+            let name = &result[i + 1..i + 1 + end];
+            // Skip empty braces or TOML inline tables (contain spaces/quotes/commas)
+            if !name.is_empty() && !name.contains(' ') && !name.contains('"') && !name.contains(',')
+            {
+                bail!("unresolved template variable: {{{name}}}");
             }
         }
         i += 1;
@@ -710,118 +752,144 @@ mod tests {
         }
     }
 
-    fn manager(id: &str, address: &str) -> ManagerInfo {
-        ManagerInfo {
-            manager_id: id.to_string(),
-            grpc_address: address.to_string(),
-            gossip_address: String::new(),
-        }
+    #[test]
+    fn lifecycle_observation_rejects_invalid_wire_evidence() {
+        assert!(lifecycle_observation(LifecycleStatus::default()).is_err());
+        let missing_instance = LifecycleStatus {
+            state: ProcessLifecycleState::Ready as i32,
+            service_kind: ServiceKind::Manager as i32,
+            ..Default::default()
+        };
+        assert!(lifecycle_observation(missing_instance).is_err());
+        let missing_kind = LifecycleStatus {
+            state: ProcessLifecycleState::Ready as i32,
+            process_instance_id: "instance".to_string(),
+            ..Default::default()
+        };
+        assert!(lifecycle_observation(missing_kind).is_err());
     }
 
     #[test]
-    fn manager_response_requires_exact_address_and_nonempty_id() {
-        let expected = "https://manager-a:9000";
-        assert_eq!(
-            classify_manager_response(
-                &[
-                    manager("other", "https://manager-b:9000"),
-                    manager("manager-a-id", expected),
-                ],
-                expected,
-            ),
-            ManagerResponseClassification::Ready {
-                manager_id: "manager-a-id".to_string()
-            }
-        );
+    fn lifecycle_observation_preserves_typed_identity_and_state() -> Result<()> {
+        let observation = lifecycle_observation(LifecycleStatus {
+            state: ProcessLifecycleState::Ready as i32,
+            service_kind: ServiceKind::Manager as i32,
+            process_instance_id: "manager-instance".to_string(),
+            detail: "startup complete".to_string(),
+            ..Default::default()
+        })?;
+        assert_eq!(observation.state_enum()?, ProcessLifecycleState::Ready);
+        assert_eq!(observation.process_instance_id, "manager-instance");
+        assert_eq!(observation.detail, "startup complete");
+        Ok(())
+    }
 
-        for managers in [
-            vec![],
-            vec![manager("other", "https://manager-b:9000")],
-            vec![manager("", expected)],
-            vec![manager("manager-a-id", "https://MANAGER-A:9000")],
-            vec![manager("manager-a-id", "https://manager-a:9000/")],
+    #[test]
+    fn lifecycle_expectation_rejects_states_already_passed() {
+        for (observed, expected) in [
+            (
+                ProcessLifecycleState::Ready,
+                ProcessLifecycleState::Starting,
+            ),
+            (
+                ProcessLifecycleState::Stopping,
+                ProcessLifecycleState::Draining,
+            ),
         ] {
+            let observation = LifecycleObservation {
+                state: observed as i32,
+                service_kind: ServiceKind::Engine as i32,
+                process_instance_id: "engine-instance".to_string(),
+                reason: 0,
+                detail: "advanced".to_string(),
+            };
             assert!(matches!(
-                classify_manager_response(&managers, expected),
-                ManagerResponseClassification::Pending { .. }
+                classify_lifecycle_observation(observation, expected, "advanced"),
+                WaitAttempt::Terminal(_)
             ));
         }
     }
 
     #[tokio::test]
-    async fn manager_readiness_retains_absent_response_evidence() {
-        let error = wait_for_manager_ready_with(
-            "https://poll:9000",
-            "https://expected:9000",
-            Duration::from_millis(15),
+    async fn absolute_wait_preserves_pending_timeout_and_query_failure() -> Result<()> {
+        let pending = wait_with_deadline::<(), _, _>(
+            "pending fixture",
+            Duration::from_millis(5),
             Duration::from_millis(1),
-            || async { Ok(vec![manager("other-id", "https://other:9000")]) },
+            || async { WaitAttempt::Pending("state=STARTING".to_string()) },
         )
-        .await
-        .unwrap_err()
-        .to_string();
+        .await;
+        let pending_error = match pending {
+            Ok(()) => bail!("pending fixture unexpectedly matched"),
+            Err(error) => error,
+        };
+        assert!(pending_error.to_string().contains("timed out"));
+        assert!(pending_error.to_string().contains("state=STARTING"));
 
-        assert!(error.contains("poll endpoint: https://poll:9000"));
-        assert!(error.contains("expected advertised address: https://expected:9000"));
-        assert!(error.contains("attempts:"));
-        assert!(error.contains("other-id"));
-        assert!(error.contains("https://other:9000"));
+        let unavailable = wait_with_deadline::<(), _, _>(
+            "query fixture",
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+            || async { WaitAttempt::QueryFailure(anyhow::anyhow!("offline")) },
+        )
+        .await;
+        let query_error = match unavailable {
+            Ok(()) => bail!("query fixture unexpectedly matched"),
+            Err(error) => error,
+        };
+        assert!(query_error.to_string().contains("transport/query failure"));
+        assert!(query_error.to_string().contains("offline"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn manager_readiness_can_recover_after_request_errors() {
-        let mut calls = 0;
-        let ready = wait_for_manager_ready_with(
-            "https://poll:9000",
-            "https://expected:9000",
-            Duration::from_millis(100),
+    async fn absolute_wait_matches_after_valid_pending_evidence() -> Result<()> {
+        let attempts = std::cell::Cell::new(0_u8);
+        let value = wait_with_deadline(
+            "matching fixture",
+            Duration::from_secs(1),
             Duration::from_millis(1),
-            move || {
-                calls += 1;
-                let call = calls;
+            || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
                 async move {
-                    if call < 3 {
-                        Err(anyhow::anyhow!("temporary RPC failure {call}"))
+                    if attempt == 1 {
+                        WaitAttempt::Pending("not yet".to_string())
                     } else {
-                        Ok(vec![manager("runtime-id", "https://expected:9000")])
+                        WaitAttempt::Matched("ready")
                     }
                 }
             },
         )
-        .await
-        .unwrap();
-
-        assert_eq!(ready.manager_id, "runtime-id");
-        assert_eq!(ready.poll_endpoint, "https://poll:9000");
-        assert_eq!(ready.advertised_address, "https://expected:9000");
+        .await?;
+        assert_eq!(value, "ready");
+        assert_eq!(attempts.get(), 2);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn manager_readiness_caps_a_hung_attempt_at_the_deadline() {
-        let started = std::time::Instant::now();
-        let error = wait_for_manager_ready_with(
-            "https://poll:9000",
-            "https://expected:9000",
-            Duration::from_millis(20),
-            Duration::from_secs(2),
-            || async { std::future::pending::<Result<Vec<ManagerInfo>>>().await },
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(error.contains("request exceeded the readiness deadline"));
-        assert!(error.contains("attempts: 1"));
+    async fn prefixed_tail_reports_a_preexisting_nonzero_exit() -> Result<()> {
+        let tail = spawn_ssh_prefixed(&["sh".to_string(), "-c".to_string()], "exit 23", "\t")?;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let result = tail.stop().await;
+        let error = match result {
+            Ok(()) => bail!("pre-exited nonzero tail unexpectedly reported clean stop"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exited before requested stop"));
+        assert!(error.to_string().contains("23"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn prefixed_tail_stop_waits_for_reader_shutdown() {
+    async fn prefixed_tail_stop_waits_for_reader_shutdown() -> Result<()> {
         let tail =
-            spawn_ssh_prefixed(&["sh".to_string(), "-c".to_string()], "sleep 30", "\t").unwrap();
+            spawn_ssh_prefixed(&["sh".to_string(), "-c".to_string()], "exec sleep 30", "\t")?;
 
         tokio::time::timeout(Duration::from_secs(1), tail.stop())
             .await
-            .expect("tail shutdown must be bounded");
+            .context("tail shutdown must be bounded")?
+            .context("tail shutdown must be clean")?;
+        Ok(())
     }
 }

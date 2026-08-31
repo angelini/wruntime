@@ -8,7 +8,7 @@
 set -u -o pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 RUN_E2E=true
 RUN_CODEGEN_E2E=auto
@@ -222,7 +222,15 @@ run_cmd_no_warn() {
 		finish_failure "$status"
 	fi
 
-	warning_count=$(grep -Ec "$WARN_PATTERN" "$log" || true)
+	warning_count=$(grep -Ec "$WARN_PATTERN" "$log")
+	grep_status=$?
+	if [ "$grep_status" -eq 1 ]; then
+		warning_count=0
+	elif [ "$grep_status" -ne 0 ]; then
+		printf '    FAILED (warning scan failed for %s, exit %s)\n' "$log" "$grep_status" >&2
+		append_result "$name" FAILED "$log" "warning scan exit $grep_status"
+		finish_failure "$grep_status"
+	fi
 	if [ "$warning_count" -gt 0 ]; then
 		printf '    FAILED (%s contains %s warning match(es))\n' "$log" "$warning_count" >&2
 		grep -En "$WARN_PATTERN" "$log" | head -n "$WARN_MATCH_LIMIT" >&2
@@ -336,7 +344,7 @@ else
 fi
 
 if [ "$RUN_E2E" = true ]; then
-	section "fixed-port E2E examples"
+	section "semantic lifecycle E2E examples"
 	run_cmd "reset example db for multi-node" "just dev-reset-db"
 	run_cmd "multi-node cross-node echo" "just multi-node-inline"
 

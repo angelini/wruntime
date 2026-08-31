@@ -8,6 +8,8 @@ import textwrap
 import unittest
 
 HELPERS = Path(__file__).with_name("lifecycle_logging.sh")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+EXAMPLE_HELPERS = REPO_ROOT / "examples" / "helpers.sh"
 
 
 class LifecycleLoggingTests(unittest.TestCase):
@@ -40,7 +42,6 @@ PY_REDACT
                 on_error() {{
                     status=$?
                     trap - ERR
-                    set +e
                     report_active_failure "$status"
                     exit "$status"
                 }}
@@ -74,90 +75,131 @@ PY_REDACT
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(log.read_text(), "ok\n")
 
-    def test_retry_replaces_failed_attempt_output(self):
+    def test_diagnostic_failure_is_recorded_without_masking_primary_flow(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            output = root / "output.log"
-            error = root / "error.log"
-            counter = root / "counter"
+            log = Path(directory) / "diagnostic.log"
             result = self.run_bash(
                 f"""
                 set -Eeuo pipefail
                 source {HELPERS}
-                attempt() {{
-                    count=0
-                    [ ! -f {counter} ] || count=$(cat {counter})
-                    count=$((count + 1))
-                    printf '%s' "$count" >{counter}
-                    if [ "$count" -lt 3 ]; then
-                        printf 'partial-%s\\n' "$count"
-                        printf 'error-%s\\n' "$count" >&2
-                        return 75
-                    fi
-                    printf 'ready\\n'
-                }}
-                run_with_retry {output} {error} 3 0 '^error-[12]$' attempt
+                collect_diagnostic "remote status" {log} bash -c 'echo unavailable; exit 42'
+                test "${{#DIAGNOSTIC_FAILURES[@]}}" -eq 1
+                report_diagnostic_failures
                 """
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(counter.read_text(), "3")
-            self.assertEqual(output.read_text(), "ready\n")
-            self.assertIn("attempt 1 failed (exit 75)", error.read_text())
-            self.assertIn("error-2", error.read_text())
+            self.assertIn(f"remote status=42:{log}", result.stderr)
+            self.assertEqual(log.read_text(), "unavailable\n")
 
-    def test_retry_returns_final_failure_status(self):
+    def test_remaining_deadline_budget_is_capped_and_expires(self):
+        result = self.run_bash(
+            f"""
+            set -Eeuo pipefail
+            source {HELPERS}
+            deadline=$((SECONDS + 10))
+            test "$(remaining_deadline_seconds "$deadline" 5)" -eq 5
+            deadline=$SECONDS
+            if remaining_deadline_seconds "$deadline" 5; then exit 1; fi
+            """
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_absolute_deadline_bounds_a_hung_probe(self):
+        result = self.run_bash(
+            f"""
+            set -Eeuo pipefail
+            source {HELPERS}
+            started=$SECONDS
+            deadline=$((SECONDS + 3))
+            budget="$(remaining_deadline_seconds "$deadline" 5 2)"
+            if timeout -k 1 "$budget" sh -c 'trap "" TERM; exec sleep 30'; then exit 1; fi
+            elapsed=$((SECONDS - started))
+            test "$elapsed" -le 3
+            """
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cleanup_failure_is_aggregated_separately(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            output = root / "output.log"
-            error = root / "error.log"
+            log = Path(directory) / "cleanup.log"
             result = self.run_bash(
                 f"""
                 set -Eeuo pipefail
                 source {HELPERS}
-                fail() {{
-                    printf 'retryable error\\n' >&2
-                    return 42
-                }}
-                if run_with_retry {output} {error} 2 0 '^retryable error$' fail; then
-                    exit 99
-                else
-                    test "$?" -eq 42
-                fi
+                PRIMARY_STATUS=0
+                record_promoted_cleanup_failure "SSH tunnel" 17 {log}
+                test "$PRIMARY_STATUS" -eq 17
+                PRIMARY_STATUS=23
+                record_promoted_cleanup_failure "provider reset" 19 {log}
+                test "$PRIMARY_STATUS" -eq 23
+                test "${{#CLEANUP_FAILURES[@]}}" -eq 2
+                report_cleanup_failures
                 """
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(error.read_text().count("retryable error"), 2)
+            self.assertIn(f"cleanup failure: SSH tunnel=17:{log}", result.stderr)
+            self.assertIn(f"cleanup failure: provider reset=19:{log}", result.stderr)
 
-    def test_retry_stops_after_non_matching_failure(self):
+    def test_run_directory_removal_uses_real_cleanup_promotion(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            output = root / "output.log"
-            error = root / "error.log"
-            counter = root / "counter"
             result = self.run_bash(
                 f"""
                 set -Eeuo pipefail
                 source {HELPERS}
-                fail() {{
-                    count=0
-                    [ ! -f {counter} ] || count=$(cat {counter})
-                    printf '%s' "$((count + 1))" >{counter}
-                    printf 'schema mismatch\\n' >&2
-                    return 19
-                }}
-                if run_with_retry {output} {error} 5 0 '^no route' fail; then
-                    exit 99
-                else
-                    test "$?" -eq 19
-                fi
+                rm() {{ return 17; }}
+                PRIMARY_STATUS=0
+                if remove_directory_with_cleanup_accounting "run directory" {directory}; then exit 1; else status=$?; fi
+                test "$status" -eq 17
+                test "$PRIMARY_STATUS" -eq 17
+                test "${{#CLEANUP_FAILURES[@]}}" -eq 1
+                PRIMARY_STATUS=23
+                if remove_directory_with_cleanup_accounting "run directory again" {directory}; then exit 1; else status=$?; fi
+                test "$status" -eq 17
+                test "$PRIMARY_STATUS" -eq 23
                 """
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(counter.read_text(), "1")
-            self.assertIn("schema mismatch", error.read_text())
+
+    def test_example_cleanup_removal_failure_is_promoted_and_preserves_primary(self):
+        for primary, expected in [(0, 17), (23, 23)]:
+            with self.subTest(primary=primary), tempfile.TemporaryDirectory() as directory:
+                result = self.run_bash(
+                    f"""
+                    WR_EXAMPLE_RUN_DIR={directory}
+                    source {EXAMPLE_HELPERS}
+                    stop_example_supervisor() {{ return 0; }}
+                    remove_example_run_directory() {{ return 17; }}
+                    exit {primary}
+                    """
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertIn("run-directory removal=17", result.stderr)
+                if primary:
+                    self.assertIn("Primary run failed with 23", result.stderr)
+
+    def test_failure_excerpt_is_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "long.log"
+            with log.open("w", encoding="utf-8") as stream:
+                stream.writelines(f"line-{line}\n" for line in range(40))
+            result = self.run_bash(
+                f"""
+                set -Eeuo pipefail
+                PYTHON=(python3)
+                source {HELPERS}
+                print_failure_excerpt {log}
+                """
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("line-29", result.stderr)
+            self.assertNotIn("line-30", result.stderr)
+            self.assertIn("10 more lines", result.stderr)
 
 
 if __name__ == "__main__":

@@ -154,7 +154,10 @@ async fn connect_proxy(address: &str) -> Result<NodeServiceClient<tonic::transpo
 async fn run_service(config_path: &str) -> Result<()> {
     let config = config::EngineConfig::load(config_path)?;
     let engine_id = Uuid::new_v4().to_string();
-    let lifecycle = ProcessLifecycleCoordinator::new(ServiceKind::Engine, engine_id.clone());
+    let lifecycle = ProcessLifecycleCoordinator::new(
+        ServiceKind::Engine,
+        wr_common::process_lifecycle::resolve_process_instance_id(engine_id.clone()),
+    );
     let http_admission = AdmissionGate::closed();
     let worker_admission = AdmissionGate::closed();
 

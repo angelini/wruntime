@@ -2,6 +2,7 @@
 # Run from the repo root: bash examples/ecommerce/run.sh
 # Prerequisites: cargo, rustup target add wasm32-wasip2, wasm-tools,
 #                Postgres running via `just dev-up` (uses wruntime_example by default).
+# shellcheck disable=SC1091
 source "$(dirname "$0")/../helpers.sh" "$@"
 
 echo "DB_URL: ${DB_URL}"
@@ -18,7 +19,7 @@ copy_config examples/ecommerce/engine-client.toml "$CLIENT_CFG"
 
 # ── Prepare manager + proxy configs ──────────────────────────────────────
 MANAGER_CFG=$(prepare_manager_config)
-PROXY_CFG=$(prepare_proxy_config)
+PROXY_CFG=$(prepare_proxy_config "${CONFIG_DIR}/proxy.toml")
 
 # ── Clean stale manager state ────────────────────────────────────────────
 clean_manager_state
@@ -39,7 +40,7 @@ just cli invoke \
   --destination http://ecommerce.inventory/ecommerce.InventoryService/Seed \
   --source bootstrap \
   --source-ns ecommerce \
-  --body '' || echo " (seed may already exist)"
+  --body ''
 
 # ── Deploy client engine ─────────────────────────────────────────────────
 deploy_engine "$CLIENT_CFG" "client engine" 9200
@@ -85,4 +86,4 @@ Inspect metrics:
   just cli --manager https://127.0.0.1:9000 metrics summary
 USAGE
 
-wait_forever
+wait_for_supervisor

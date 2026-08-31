@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand, ValueEnum};
@@ -10,6 +11,7 @@ use wr_common::wruntime::{
     ServiceStatus, StatusSeverity,
 };
 
+use super::helpers::{self, WaitAttempt};
 use crate::client;
 
 #[derive(Args)]
@@ -22,6 +24,8 @@ pub struct ClusterArgs {
 pub enum ClusterCommand {
     /// Show one coherent manager-composed cluster status snapshot
     Status(StatusArgs),
+    /// Wait until a selected cluster target has one exact health severity.
+    Wait(WaitArgs),
 }
 
 #[derive(Args)]
@@ -43,6 +47,22 @@ pub struct StatusArgs {
     fail_on: FailOn,
 }
 
+#[derive(Args)]
+pub struct WaitArgs {
+    /// Restrict the expectation to one stable node ID.
+    #[arg(long)]
+    node: Option<String>,
+    /// Restrict the expectation to namespace.module[@version].
+    #[arg(long)]
+    service: Option<String>,
+    /// Exact severity that must be observed.
+    #[arg(long, value_enum)]
+    severity: ExpectedSeverity,
+    /// One absolute wait deadline in seconds.
+    #[arg(long, default_value_t = 60)]
+    timeout_secs: u64,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum OutputFormat {
     Table,
@@ -57,9 +77,29 @@ enum FailOn {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ExpectedSeverity {
+    Healthy,
+    Degraded,
+    Unhealthy,
+    Unknown,
+}
+
+impl From<ExpectedSeverity> for StatusSeverity {
+    fn from(value: ExpectedSeverity) -> Self {
+        match value {
+            ExpectedSeverity::Healthy => Self::Healthy,
+            ExpectedSeverity::Degraded => Self::Degraded,
+            ExpectedSeverity::Unhealthy => Self::Unhealthy,
+            ExpectedSeverity::Unknown => Self::Unknown,
+        }
+    }
+}
+
 pub async fn run(args: ClusterArgs, manager: &str) -> Result<()> {
     match args.command {
         ClusterCommand::Status(args) => status(args, manager).await,
+        ClusterCommand::Wait(args) => wait(args, manager).await,
     }
 }
 
@@ -86,6 +126,99 @@ async fn status(args: StatusArgs, manager: &str) -> Result<()> {
             }
         );
     }
+    Ok(())
+}
+
+fn validated_severity(value: i32, target: &str) -> Result<StatusSeverity> {
+    StatusSeverity::try_from(value)
+        .map_err(|_| anyhow::anyhow!("malformed {target} severity value {value}"))
+}
+
+fn expectation_matches(
+    response: &GetClusterStatusResponse,
+    node: Option<&str>,
+    service: Option<&str>,
+    expected: StatusSeverity,
+) -> Result<bool> {
+    validated_severity(response.severity, "cluster")?;
+    let observed = if service.is_some() {
+        if response.services.is_empty() {
+            bail!("cluster expectation target matched no services");
+        }
+        response
+            .services
+            .iter()
+            .map(|item| validated_severity(item.severity, "service"))
+            .collect::<Result<Vec<_>>>()?
+    } else if node.is_some() {
+        if response.nodes.is_empty() {
+            bail!("cluster expectation target matched no nodes");
+        }
+        response
+            .nodes
+            .iter()
+            .map(|item| validated_severity(item.severity, "node"))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        vec![validated_severity(response.severity, "cluster")?]
+    };
+    Ok(observed.iter().all(|value| *value == expected))
+}
+
+#[derive(Serialize)]
+struct WaitOutput<'a> {
+    outcome: &'static str,
+    expected_severity: &'static str,
+    snapshot: ClusterDto<'a>,
+}
+
+async fn wait(args: WaitArgs, manager: &str) -> Result<()> {
+    if let Some(service) = args.service.as_deref() {
+        parse_service_filter(service)?;
+    }
+    let expected: StatusSeverity = args.severity.into();
+    let timeout = Duration::from_secs(args.timeout_secs);
+    let node = args.node.clone();
+    let service = args.service.clone();
+    let subject = format!("cluster expectation for {}", severity_name(expected as i32));
+    let filtered =
+        helpers::wait_with_deadline(&subject, timeout, Duration::from_millis(500), || async {
+            let response = match client::get_cluster_status(manager).await {
+                Ok(response) => response,
+                Err(error) => return WaitAttempt::QueryFailure(error),
+            };
+            let filtered = match filter(response, node.as_deref(), service.as_deref()) {
+                Ok(filtered) => filtered,
+                Err(error) => return WaitAttempt::Terminal(error),
+            };
+            let matched =
+                match expectation_matches(&filtered, node.as_deref(), service.as_deref(), expected)
+                {
+                    Ok(matched) => matched,
+                    Err(error) => return WaitAttempt::Terminal(error),
+                };
+            if matched {
+                WaitAttempt::Matched(filtered)
+            } else {
+                match serde_json::to_string(&ClusterDto::from(&filtered)) {
+                    Ok(evidence) => WaitAttempt::Pending(evidence),
+                    Err(error) => WaitAttempt::Terminal(
+                        anyhow::Error::new(error)
+                            .context("failed to serialize cluster expectation evidence"),
+                    ),
+                }
+            }
+        })
+        .await?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&WaitOutput {
+            outcome: "observed",
+            expected_severity: severity_name(expected as i32),
+            snapshot: ClusterDto::from(&filtered),
+        })?
+    );
     Ok(())
 }
 
@@ -705,6 +838,44 @@ mod tests {
         assert_eq!(
             parse_service_filter("payments.orders@1.2.3").unwrap(),
             ("payments", "orders", Some("1.2.3"))
+        );
+    }
+
+    #[test]
+    fn expectation_rejects_malformed_wire_severity() {
+        let malformed = GetClusterStatusResponse {
+            severity: 999,
+            ..Default::default()
+        };
+        let error = expectation_matches(&malformed, None, None, StatusSeverity::Unknown)
+            .expect_err("malformed severity must not satisfy UNKNOWN");
+        assert!(error.to_string().contains("malformed cluster severity"));
+    }
+
+    #[test]
+    fn expectation_requires_a_present_exact_target() {
+        let empty = response(StatusSeverity::Unhealthy);
+        assert!(expectation_matches(
+            &empty,
+            Some("missing-node"),
+            None,
+            StatusSeverity::Unhealthy,
+        )
+        .is_err());
+
+        let mut selected = response(StatusSeverity::Healthy);
+        selected.nodes.push(NodeStatus {
+            node_id: "node-a".to_string(),
+            severity: StatusSeverity::Unhealthy as i32,
+            ..Default::default()
+        });
+        assert!(
+            expectation_matches(&selected, Some("node-a"), None, StatusSeverity::Unhealthy,)
+                .unwrap()
+        );
+        assert!(
+            !expectation_matches(&selected, Some("node-a"), None, StatusSeverity::Healthy,)
+                .unwrap()
         );
     }
 }

@@ -123,4 +123,4 @@ Poll task status until complete:
   curl http://localhost:8080/tasks/{task_id}
 USAGE
 
-wait_forever
+wait_for_supervisor

@@ -6,6 +6,7 @@
 # Options:
 #   --inline          Run a default simulation and exit
 #   --exchanges N     Number of exchange engines to deploy (default: 1)
+# shellcheck disable=SC1091
 source "$(dirname "$0")/../helpers.sh" "$@"
 
 # ── Parse --exchanges N flag ────────────────────────────────────────────
@@ -70,7 +71,7 @@ copy_config examples/stockmarket/engine-simulator.toml "$SIMULATOR_CFG"
 
 # ── Prepare manager + proxy configs ──────────────────────────────────────
 MANAGER_CFG=$(prepare_manager_config)
-PROXY_CFG=$(prepare_proxy_config)
+PROXY_CFG=$(prepare_proxy_config "${CONFIG_DIR}/proxy.toml")
 
 # ── Create S3 bucket ─────────────────────────────────────────────────────
 create_s3_bucket stockmarket
@@ -147,4 +148,4 @@ Inspect metrics:
   just cli --manager https://127.0.0.1:9000 metrics summary
 USAGE
 
-wait_forever
+wait_for_supervisor

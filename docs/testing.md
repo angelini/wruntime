@@ -20,6 +20,7 @@ just validate-all --no-deployment-e2e # full local suite with an explicit live-s
 just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e # Pi sandbox
 just validate-all --deployment-e2e    # trusted runner: require both live deployment backends
 just deployment-e2e-python-test       # locked provider/assertion unit tests
+just test-lifecycle-runners            # supervisor/wait/cleanup fixtures
 just deployment-e2e-preflight         # non-mutating Proxmox target verification
 just dev-down                # stop dev infrastructure
 ```
@@ -65,16 +66,19 @@ WASM host binding tests require:
 - Postgres and RustFS from `just dev-up`
 
 Example inline scripts require the built workspace binaries, the same dev
-infrastructure, and Python 3 for small JSON/config rendering and readiness
-helpers. The multi-node smoke test requires Postgres but not RustFS. They
-create per-run temporary config directories and call
-`wr-cli dev --state-dir <run-dir>/dev-state`, so cleanup only observes that
-run's PID state. The codegen example uses `wr-cli invoke --json` and Python
-stdlib JSON parsing; no `jq` dependency is required.
+infrastructure, and Python 3 for small JSON/config rendering and assertions.
+The multi-node smoke test requires Postgres but not RustFS. Each run creates a
+temporary config/state directory and uses one persistent `wr-cli dev`
+supervisor. The supervisor owns every local service child, waits on typed
+lifecycle state, and reaps engines, proxies, then manager before cleanup removes
+the run directory. A primary test failure remains primary; cleanup failure is
+reported separately, makes an otherwise clean run fail, and retains the run
+state. The codegen example uses `wr-cli invoke --json` and Python stdlib JSON
+parsing; no `jq` dependency is required.
 
 `just validate-all` is a thin alias for `dev/validate-all.sh`. The script
 orchestrates existing Just recipes for formatting, compile checks, lints, WASM
-guest builds, Rust tests, and fixed-port E2E examples. All guests are built
+guest builds, Rust tests, and semantic-lifecycle fixed-port E2E examples. All guests are built
 through one sequential `just build-wasm-guests` invocation so independent
 Cargo processes never contend on the shared target during that stage. E2E
 examples run sequentially because they share ports and example resources. Logs
@@ -117,11 +121,19 @@ an alternate bundle path on other operating systems or runner layouts; TLS
 verification is never disabled.
 
 Each backend starts and ends with snapshot rollback and normally takes several
-minutes plus cross-compilation time. Per-task output, lifecycle state JSON,
-remote diagnostics, bundle inspections, and the final reset result are retained
-under `WR_VALIDATE_LOG_DIR` (or `target/validate-all/<timestamp>/`). Live runs
-must not be started unless all protected inputs are present. The provider never
-creates or deletes snapshots or VMs, and reset failures are fatal.
+minutes plus cross-compilation time. Manager deployment restarts/recreates the
+service and waits on the exact launcher-issued activation identity and manager service kind; node
+deployment and rollback wait on exact `VerifyDeployment` identity and conditions. Post-ready guest invocations run
+once. Expected unhealthy evidence uses `cluster wait` and therefore succeeds
+with a matching JSON snapshot rather than an expected non-zero display gate.
+Engine stop uses lifecycle control followed by a systemd/container-exit expectation under one absolute deadline; each SSH probe consumes the same budget, and failure records the requested process instance plus the last backend or query state.
+Per-task output, lifecycle state JSON, remote diagnostics, bundle inspections,
+and the final reset result are retained under `WR_VALIDATE_LOG_DIR` (or
+`target/validate-all/<timestamp>/`). Diagnostic collection failures are listed
+without replacing a primary failure; cleanup/reset failure makes a nominally
+successful run fail. Live runs must not be started unless all protected inputs
+are present. The provider never creates or deletes snapshots or VMs, and reset
+failures are fatal.
 
 Focused commands are `just deployment-e2e-python-test`, `just
 deployment-e2e-preflight`, `just deployment-e2e-systemd`, `just
@@ -130,6 +142,12 @@ runs the provider and JSON assertion `unittest` targets without Proxmox access.
 After intentionally changing Python dependencies, refresh the nested lock with
 `uv lock --project dev/deployment-e2e` and commit `pyproject.toml` and `uv.lock`
 together.
+
+The remaining polling in runner code is deliberately outside wruntime service
+readiness: codegen polls application task status, deployment waits for the SSH
+forward and PostgreSQL infrastructure under bounded deadlines, and the Proxmox
+provider waits for asynchronous platform tasks. These paths preserve typed last
+error/status evidence and must not be copied into service lifecycle gates.
 
 ## Dev infrastructure
 

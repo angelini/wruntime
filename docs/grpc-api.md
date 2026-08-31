@@ -18,6 +18,8 @@ The mTLS `wruntime.ManagerService` is the cluster control plane. Engines use the
 
 Transitions never move backward. Duplicate drain or stop requests return the current state. Invalid or unsupported requests return a gRPC status error. Proxy `Drain` closes admission and waits for all data listeners to stop accepting before it acknowledges `DRAINING`; its loopback control endpoint remains available for `Stop`. `LifecycleTransitionReason` is the machine-readable transition key; `detail` is bounded explanatory text and must not be parsed by automation.
 
+`wr-cli lifecycle status|wait|drain|stop --endpoint <url>` exposes this contract for trusted operator and runner use; `--tls` selects the CLI's manager mTLS credentials. Waits pin the first observed process instance and return distinct errors for transport/query failure, instance replacement, terminal-before-ready state, and timeout. These commands never interpret cluster health severity.
+
 ## Engine lifecycle
 
 | RPC | Request | Response | Description |
@@ -61,7 +63,9 @@ Aggregation rules are:
 
 Additional stable cluster codes include `GOSSIP_DEAD`, `MANAGER_DB_GOSSIP_DISAGREEMENT`, `BOOTSTRAP_CONVERGING`, `UNMANAGED_ENGINE`, `NO_HEALTHY_ROUTE`, `PARTIAL_ROUTE_AVAILABILITY`, `MANUAL_ROUTE_REASON_UNAVAILABLE`, and `SIGNAL_NOT_REPORTED`. Consumers must branch on code/severity and use raw timestamps, ages, desired/actual revisions, and affected identities as evidence rather than parsing `detail`.
 
-`wr-cli cluster status` performs exactly this RPC; it does not join `ListManagers`, `ListEngines`, and `GetRoutingTable` client-side. `--output json` emits the versioned CLI DTO (`schema_version: 1`) with complete typed records; field meanings and condition codes are stable automation surfaces. Table output defaults to the summary and problem rows, while `--detail` includes healthy and unknown records. `--node` and `--service namespace.module[@version]` filter presentation. The default command is display-only; `--fail-on degraded` and `--fail-on unhealthy` make known severity a gate, and `--fail-on unknown` is strict unknown handling. Transport/query failures are always non-zero.
+`wr-cli cluster status` performs exactly this RPC; it does not join `ListManagers`, `ListEngines`, and `GetRoutingTable` client-side. `--output json` emits the versioned CLI DTO (`schema_version: 1`) with complete typed records; field meanings and condition codes are stable automation surfaces. Table output defaults to the summary and problem rows, while `--detail` includes healthy and unknown records. `--node` and `--service namespace.module[@version]` filter presentation. The default command is display-only; `--fail-on` remains a display gate.
+
+`wr-cli cluster wait --severity healthy|degraded|unhealthy|unknown` is the expectation surface for automation. It returns zero only when the exact severity is observed for a present filtered node/service (or the cluster when unfiltered) and emits an `outcome: observed` object containing the matching snapshot. Empty targets, malformed filters or wire severity enums, transport/query failure, and timeout are non-zero and cannot satisfy an expected unhealthy check.
 
 Typical condition evidence:
 

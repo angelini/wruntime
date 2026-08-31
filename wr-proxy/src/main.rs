@@ -251,7 +251,10 @@ async fn run_service(config_path: &str) -> Result<()> {
             .unwrap_or_default()
             .as_nanos()
     );
-    let lifecycle = ProcessLifecycleCoordinator::new(ServiceKind::Proxy, process_id);
+    let lifecycle = ProcessLifecycleCoordinator::new(
+        ServiceKind::Proxy,
+        wr_common::process_lifecycle::resolve_process_instance_id(process_id),
+    );
     let admission = AdmissionGate::closed();
     let config = config::ProxyConfig::load(config_path)?;
     let self_address = config.node.peer_address()?;
