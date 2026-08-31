@@ -113,26 +113,29 @@ Omitting the entire `[circuit_breaker]` section keeps circuit breaking enabled w
 
 ### External routes (public API)
 
-Expose a subset of internal module routes to external callers on a separate port. All `x-wr-*` headers are stripped from incoming requests before routing, preventing header spoofing.
+Expose a subset of internal protobuf RPCs to external callers on a separate port. All `x-wr-*` headers are stripped from incoming requests before routing, preventing header spoofing. Public request bodies are buffered and validated once against the selected module version's protobuf input schema; internal loopback and mTLS peer traffic remains trusted, streaming, and unvalidated.
 
 ```toml
 [external]
 listen_address = "0.0.0.0:8080"
+max_request_body_bytes = 16777216 # default: 16 MiB
 
 [[external.route]]
 path      = "/items"
-methods   = ["GET", "POST"]
+rpc_path  = "/inventory.InventoryService/ListItems"
+methods   = ["GET"]
 module    = "inventory"
 namespace = "ecommerce"
 
 [[external.route]]
 path      = "/items/{id}"
+rpc_path  = "/inventory.InventoryService/GetItem"
 methods   = ["GET"]
 module    = "inventory"
 namespace = "ecommerce"
 ```
 
-Omit the `[external]` section to keep all routes internal-only. Route patterns are parsed with `matchit` during config load, methods are normalized and validated once as HTTP method tokens, and conflicting patterns fail startup with a config error. An empty `methods` list still means all methods.
+Omit the `[external]` section to keep all routes internal-only. `path` is the public path or REST-style alias. The required `rpc_path` uses the canonical `/{proto_package}.{Service}/{Method}` form, selects the request message schema, and replaces the public path before forwarding to the generated module router; the query string is preserved. Route patterns are parsed with `matchit` during config load, methods are normalized and validated once as HTTP method tokens, and conflicting patterns fail startup with a config error. An empty `methods` list still means all methods. Invalid protobuf returns `400`, a body over `max_request_body_bytes` returns `413`, and an unavailable descriptor fails closed with `503`.
 
 ## wr-engine
 

@@ -45,9 +45,16 @@ fn default_discovery_max_connections() -> usize {
 pub struct ExternalConfig {
     /// TCP address to bind the external listener, e.g. "0.0.0.0:8080"
     pub listen_address: String,
+    /// Maximum public request body buffered for protobuf validation.
+    #[serde(default = "default_external_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
     /// Routes accessible to external callers.
     #[serde(default, alias = "route")]
     pub routes: Vec<ExternalRoute>,
+}
+
+fn default_external_max_request_body_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 /// A validated external route pattern accepted by `matchit`.
@@ -131,10 +138,39 @@ impl ModuleTarget {
     }
 }
 
-/// A single publicly-exposed route mapping an HTTP path to an internal module.
+/// A canonical protobuf service method path.
+#[derive(Clone, Debug)]
+pub struct RpcPath(String);
+
+impl RpcPath {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for RpcPath {
+    type Error = anyhow::Error;
+
+    fn try_from(path: String) -> Result<Self> {
+        let mut segments = path.strip_prefix('/').unwrap_or_default().split('/');
+        let service = segments.next().unwrap_or_default();
+        let method = segments.next().unwrap_or_default();
+        anyhow::ensure!(
+            !service.is_empty()
+                && !method.is_empty()
+                && segments.next().is_none()
+                && !path.contains(['?', '#', '{', '}']),
+            "rpc_path must use the canonical '/package.Service/Method' form"
+        );
+        Ok(Self(path))
+    }
+}
+
+/// A single publicly-exposed route mapping an HTTP path to a protobuf RPC.
 #[derive(Clone, Debug)]
 pub struct ExternalRoute {
     path: RoutePattern,
+    rpc_path: RpcPath,
     methods: MethodSet,
     target: ModuleTarget,
 }
@@ -142,12 +178,14 @@ pub struct ExternalRoute {
 impl ExternalRoute {
     pub fn new(
         path: impl Into<String>,
+        rpc_path: impl Into<String>,
         methods: Vec<String>,
         module: impl Into<String>,
         namespace: impl Into<String>,
     ) -> Result<Self> {
         Ok(Self {
             path: RoutePattern::try_from(path.into())?,
+            rpc_path: RpcPath::try_from(rpc_path.into())?,
             methods: MethodSet::try_from_strings(methods)?,
             target: ModuleTarget::new(namespace.into(), module.into())?,
         })
@@ -155,6 +193,10 @@ impl ExternalRoute {
 
     pub fn path(&self) -> &RoutePattern {
         &self.path
+    }
+
+    pub fn rpc_path(&self) -> &RpcPath {
+        &self.rpc_path
     }
 
     pub fn methods(&self) -> &MethodSet {
@@ -169,6 +211,7 @@ impl ExternalRoute {
 #[derive(Deserialize)]
 struct RawExternalRoute {
     path: String,
+    rpc_path: String,
     #[serde(default)]
     methods: Vec<String>,
     module: String,
@@ -181,7 +224,14 @@ impl<'de> Deserialize<'de> for ExternalRoute {
         D: Deserializer<'de>,
     {
         let raw = RawExternalRoute::deserialize(deserializer)?;
-        Self::new(raw.path, raw.methods, raw.module, raw.namespace).map_err(D::Error::custom)
+        Self::new(
+            raw.path,
+            raw.rpc_path,
+            raw.methods,
+            raw.module,
+            raw.namespace,
+        )
+        .map_err(D::Error::custom)
     }
 }
 
@@ -348,6 +398,10 @@ impl ProxyConfig {
             v.check(
                 !ext.listen_address.is_empty(),
                 "external.listen_address is required",
+            );
+            v.check(
+                ext.max_request_body_bytes > 0,
+                "external.max_request_body_bytes must be > 0",
             );
             if let Err(error) = build_external_route_index(&ext.routes) {
                 v.check(false, format!("invalid external routes: {error:#}"));

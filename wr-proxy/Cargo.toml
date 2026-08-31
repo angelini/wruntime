@@ -41,6 +41,7 @@ http-body = "1"
 http-body-util = "0.1"
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["transport"] }
+prost-reflect = "0.16"
 bytes = "1"
 anyhow = "1"
 semver = "1"
@@ -60,3 +61,7 @@ tokio-retry = "0.3"
 tracing = "0.1"
 smallvec = "1"
 allocation-counter = { version = "0.8.1", optional = true }
+
+[dev-dependencies]
+prost       = "0.14"
+prost-types = "0.14"

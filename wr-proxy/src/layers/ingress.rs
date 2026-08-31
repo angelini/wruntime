@@ -97,11 +97,43 @@ where
             };
 
             let target = route.target();
+            let rpc_path = route.rpc_path().as_str();
 
-            // Set routing headers and pass through to the inner stack.
-            let dest = format!("http://{}.{}/", target.namespace(), target.module());
-            if let Ok(v) = http::HeaderValue::from_str(&dest) {
-                parts.headers.insert(WR_DESTINATION, v);
+            // The public path may be a REST-style alias. Forward the canonical RPC
+            // path while preserving the caller's query string.
+            let path_and_query = match parts.uri.query() {
+                Some(query) => format!("{rpc_path}?{query}"),
+                None => rpc_path.to_owned(),
+            };
+            let mut uri_parts = parts.uri.into_parts();
+            uri_parts.path_and_query = match path_and_query.parse() {
+                Ok(path_and_query) => Some(path_and_query),
+                Err(_) => {
+                    return Ok(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "configured rpc_path is invalid",
+                    ));
+                }
+            };
+            parts.uri = match http::Uri::from_parts(uri_parts) {
+                Ok(uri) => uri,
+                Err(_) => {
+                    return Ok(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "configured rpc_path is invalid",
+                    ));
+                }
+            };
+
+            // Set routing headers and pass through to schema validation.
+            let dest = format!(
+                "http://{}.{}{}",
+                target.namespace(),
+                target.module(),
+                rpc_path
+            );
+            if let Ok(value) = http::HeaderValue::from_str(&dest) {
+                parts.headers.insert(WR_DESTINATION, value);
             }
             parts
                 .headers

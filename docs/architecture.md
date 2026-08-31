@@ -78,6 +78,8 @@ Delivery is **at-least-once** — a manager crash between submit and finalize le
 
 ## Request flow
 
+Public ingress is the guest-module data-plane trust boundary. `IngressLayer` strips reserved headers, authorizes a configured public path and method, and rewrites any REST-style alias to the route's required canonical `rpc_path`. After routing selects an exact healthy module version, `SchemaValidationLayer` lazily loads that version's descriptor set from the manager, buffers the external request body once, and decodes it as the RPC input message before forwarding. Invalid protobuf is rejected at the boundary. The loopback internal stack and mTLS peer stack deliberately omit this layer, so wruntime-generated module, worker, scheduler, and cross-node continuation traffic remains trusted and streams without repeated validation.
+
 ```text
 WASM module makes HTTP call to "http://ecommerce.inventory/inventory.InventoryService/GetItems"
   │
@@ -146,7 +148,7 @@ All internal routing uses a set of reserved `x-wr-*` HTTP headers. The proxy str
 
 | Header | Set by | Read by | Description |
 | -------- | -------- | --------- | ------------- |
-| `x-wr-destination` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (public routes) | `wr-proxy` RoutingLayer, TracingLayer | Full destination URI of the original call — e.g. `http://ecommerce.inventory/inventory.InventoryService/GetItems`. The host encodes the destination as `{namespace}.{module}`; the path is the canonical generated RPC path `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`. Stripped by ForwardService before reaching the destination engine. |
+| `x-wr-destination` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (public routes) | `wr-proxy` RoutingLayer, TracingLayer | Full destination URI — e.g. `http://ecommerce.inventory/inventory.InventoryService/GetItems`. The host encodes internal destinations as `{namespace}.{module}`; public ingress replaces any external alias with the route's canonical `rpc_path`. Stripped by ForwardService before reaching the destination engine. |
 | `x-wr-source` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (set to `"external"` for public routes) | `wr-proxy` TracingLayer | Name of the calling module. Recorded as a span attribute for metrics attribution and error reporting. Stripped by ForwardService before reaching the destination engine. |
 | `x-wr-source-ns` | `wr-engine` (outbound WASM call) | — | Namespace of the calling module. Carried alongside `x-wr-source` as attribution metadata; not used for routing or authorization decisions. Stripped by ForwardService before reaching the destination engine. |
 | `x-wr-version` | Caller (optional — WASM module or `wr-cli`) | `wr-proxy` RoutingLayer | Pins the request to a specific semver of the destination module (e.g. `1.2.0`). When omitted the proxy load-balances across all healthy versions of the module. RoutingLayer overwrites the value with the resolved version before forwarding. |

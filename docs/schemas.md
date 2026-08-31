@@ -7,7 +7,7 @@ Every module **must** declare a protobuf schema. Schemas serve two purposes:
 1. **Code generation** — `wr-build` generates service traits and client stubs from the proto definitions, giving modules type-safe RPC interfaces.
 2. **Discovery** — engines upload schemas to the manager on registration. Tools like `wr-cli` can fetch schemas to inspect available RPCs and message types.
 
-The proxy does **not** validate request bodies against schemas at runtime — it is a streaming header-based router that forwards bodies without buffering or inspection. Modules are responsible for handling malformed input gracefully.
+The proxy trusts wruntime-generated module, worker, scheduler, and peer traffic and forwards those request bodies without buffering or schema validation. Public traffic entering through the optional external listener is different: each configured route names an `rpc_path`, and the proxy validates the external request body against that RPC's protobuf input type before forwarding it. Modules should still handle malformed internal input gracefully.
 
 Schemas are compiled `FileDescriptorSet` binaries produced by `protoc`.
 
@@ -44,15 +44,15 @@ The resulting `.binpb` file is the value of `schema_path` in `engine.toml`.
 
 ## How routing works
 
-When the proxy receives a request with `x-wr-destination: http://ecommerce.inventory/inventory.InventoryService/GetItems` it:
+When the proxy receives a trusted internal request with `x-wr-destination: http://ecommerce.inventory/inventory.InventoryService/GetItems` it:
 
 1. Parses the host (`ecommerce.inventory`) as `namespace.module`.
 2. Looks up healthy routing rules for that module in the cached routing table.
-3. Selects a candidate via round-robin and forwards the request — body is streamed through without buffering.
+3. Selects a candidate via round-robin and streams the request body without inspection.
 
-Generated routers match the canonical path `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`; public ingress routes must use that path unless a manual wrapper handles a different public route.
+Generated routers match the canonical path `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`. An external route may expose a REST-style alias in `path`; its required `rpc_path` supplies the canonical generated path. Public ingress strips reserved headers, rewrites the alias to `rpc_path`, resolves the selected module version, lazily caches that version's descriptor set from the manager, buffers the external request body once, and decodes it as the RPC input message. Invalid protobuf is rejected with `400`, bodies over `external.max_request_body_bytes` with `413`, and an unavailable schema fails closed with `503`. Responses are still streamed and are not schema-validated.
 
-The proxy only inspects headers — it never reads, decodes, or validates the request or response body.
+Internal loopback and mTLS peer stacks never include this validation layer, so module-to-module and cross-node continuation traffic retains the streaming fast path.
 
 The manager control API uses present/absent `google.protobuf.Timestamp` values for schedule `last_fired_at` and `next_fire_at`; absence is no longer encoded as an empty RFC3339 string. Generated clients should test field presence before formatting these timestamps.
 

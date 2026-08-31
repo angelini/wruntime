@@ -4,3 +4,4 @@ pub mod indexed_routing;
 pub mod layers;
 pub mod node_service;
 pub mod routing;
+pub mod schema;

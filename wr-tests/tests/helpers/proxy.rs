@@ -108,11 +108,16 @@ pub async fn start_proxy(table: wr_proxy::routing::CachedRoutingTable) -> Result
 /// Build and start an external-facing ingress proxy on an ephemeral port.
 pub async fn start_ingress_proxy(
     table: wr_proxy::routing::CachedRoutingTable,
+    schema_cache: Arc<wr_proxy::schema::SchemaCache>,
     routes: Vec<ExternalRoute>,
 ) -> Result<SocketAddr> {
     let svc = tower::ServiceBuilder::new()
         .layer(wr_proxy::layers::IngressLayer::new(routes)?)
         .layer(wr_proxy::layers::RoutingLayer::new(table.clone()))
+        .layer(wr_proxy::layers::SchemaValidationLayer::new(
+            schema_cache,
+            1024,
+        ))
         .service(wr_proxy::layers::ForwardService::new(
             table.open_duration_secs(),
             test_mtls_pool(),

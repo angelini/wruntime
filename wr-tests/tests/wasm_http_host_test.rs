@@ -116,9 +116,20 @@ async fn wasm_http_ingress() -> Result<()> {
 
     // Ingress proxy with a public route for Echo.
     let table = synced_routing_table(&mgr_addr).await?;
+    let schema_cache = std::sync::Arc::new(wr_proxy::schema::SchemaCache::default());
+    schema_cache
+        .insert(
+            "test-ns",
+            "http-svc",
+            "1.0.0",
+            include_bytes!("../guests/schemas/http_test.binpb"),
+        )
+        .await?;
     let ingress_addr = start_ingress_proxy(
         table,
+        schema_cache,
         vec![ExternalRoute::new(
+            "/echo",
             "/test.HttpTestService/Echo",
             vec!["POST".into()],
             "http-svc",
@@ -135,7 +146,7 @@ async fn wasm_http_ingress() -> Result<()> {
         .request(
             http::Request::builder()
                 .method("POST")
-                .uri(format!("http://{ingress_addr}/test.HttpTestService/Echo"))
+                .uri(format!("http://{ingress_addr}/echo"))
                 .body(Full::new(Bytes::from(req_body.encode_to_vec())))?,
         )
         .await?;

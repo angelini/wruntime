@@ -854,6 +854,7 @@ peer_address = "https://127.0.0.1:9443"
 
             [[external.route]]
             path = "/tasks"
+            rpc_path = "/codegen.CoordinatorService/RunTask"
             methods = ["POST"]
             module = "coordinator"
             namespace = "codegen"

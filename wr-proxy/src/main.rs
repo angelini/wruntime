@@ -4,6 +4,7 @@ pub mod indexed_routing;
 mod layers;
 pub mod node_service;
 pub mod routing;
+mod schema;
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -18,7 +19,8 @@ use tonic::transport::Server;
 use tower::{Service, ServiceBuilder};
 
 use layers::{
-    EgressLayer, ForwardService, IngressLayer, ProxyBody, ResBody, RoutingLayer, TracingLayer,
+    EgressLayer, ForwardService, IngressLayer, ProxyBody, ResBody, RoutingLayer,
+    SchemaValidationLayer, TracingLayer,
 };
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
@@ -56,6 +58,7 @@ async fn main() -> Result<()> {
     let discovery = Arc::new(ManagerDiscovery::new(db_pool, Some(manager_tls)));
     discovery.refresh().await;
     discovery.spawn_refresh_task();
+    let schema_cache = Arc::new(schema::SchemaCache::new(discovery.clone()));
     info!("manager discovery initialized");
 
     // ── Initial routing table sync (blocks until first fetch succeeds) ──
@@ -78,7 +81,7 @@ async fn main() -> Result<()> {
     ));
 
     // ── NodeService gRPC control plane ───────────────────────────────────
-    let node_agent = Arc::new(node_service::NodeAgent::new(discovery));
+    let node_agent = Arc::new(node_service::NodeAgent::new(discovery.clone()));
     node_agent.spawn_heartbeat_loop(Duration::from_secs(3));
 
     let control_addr = config
@@ -138,13 +141,18 @@ async fn main() -> Result<()> {
     //     |                     injects x-wr-destination + x-wr-source: external
     //     └─ TracingLayer
     //          └─ RoutingLayer
-    //               └─ ForwardService
+    //               └─ SchemaValidationLayer ← buffers and validates external bodies only
+    //                    └─ ForwardService
     //
     if let Some(ext) = &config.external {
         let external_svc = ServiceBuilder::new()
             .layer(IngressLayer::new(ext.routes.clone())?)
             .layer(TracingLayer)
             .layer(RoutingLayer::new(routing_table.clone()))
+            .layer(SchemaValidationLayer::new(
+                schema_cache,
+                ext.max_request_body_bytes,
+            ))
             .service(ForwardService::new(
                 routing_table.open_duration_secs(),
                 mtls_pool,

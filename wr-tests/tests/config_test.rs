@@ -239,7 +239,7 @@ fn test_proxy_config_accepts_positive_ttl() {
 #[test]
 fn test_proxy_config_rejects_invalid_external_route_pattern() {
     let toml = format!(
-        "{}\n[external]\nlisten_address = \"0.0.0.0:8080\"\n[[external.route]]\npath = \"/items/{{id\"\nmodule = \"inventory\"\nnamespace = \"ecommerce\"\n",
+        "{}\n[external]\nlisten_address = \"0.0.0.0:8080\"\n[[external.route]]\npath = \"/items/{{id\"\nrpc_path = \"/inventory.InventoryService/GetItem\"\nmodule = \"inventory\"\nnamespace = \"ecommerce\"\n",
         proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")
     );
     let error = match toml::from_str::<ProxyConfig>(&toml) {
@@ -250,9 +250,24 @@ fn test_proxy_config_rejects_invalid_external_route_pattern() {
 }
 
 #[test]
+fn test_proxy_config_rejects_invalid_external_rpc_path() {
+    let toml = format!(
+        "{}\n[external]\nlisten_address = \"0.0.0.0:8080\"\n[[external.route]]\npath = \"/items\"\nrpc_path = \"/items\"\nmodule = \"inventory\"\nnamespace = \"ecommerce\"\n",
+        proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")
+    );
+    let error = match toml::from_str::<ProxyConfig>(&toml) {
+        Ok(_) => panic!("non-canonical rpc_path must fail parsing"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("canonical '/package.Service/Method'"));
+}
+
+#[test]
 fn test_proxy_config_rejects_invalid_external_route_method() {
     let toml = format!(
-        "{}\n[external]\nlisten_address = \"0.0.0.0:8080\"\n[[external.route]]\npath = \"/items\"\nmethods = [\"G ET\"]\nmodule = \"inventory\"\nnamespace = \"ecommerce\"\n",
+        "{}\n[external]\nlisten_address = \"0.0.0.0:8080\"\n[[external.route]]\npath = \"/items\"\nrpc_path = \"/inventory.InventoryService/GetItems\"\nmethods = [\"G ET\"]\nmodule = \"inventory\"\nnamespace = \"ecommerce\"\n",
         proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")
     );
     let error = match toml::from_str::<ProxyConfig>(&toml) {
@@ -265,7 +280,7 @@ fn test_proxy_config_rejects_invalid_external_route_method() {
 #[test]
 fn test_proxy_config_rejects_invalid_external_route_target() {
     let toml = format!(
-        "{}\n[external]\nlisten_address = \"0.0.0.0:8080\"\n[[external.route]]\npath = \"/items\"\nmodule = \"inventory_service\"\nnamespace = \"ecommerce\"\n",
+        "{}\n[external]\nlisten_address = \"0.0.0.0:8080\"\n[[external.route]]\npath = \"/items\"\nrpc_path = \"/inventory.InventoryService/GetItems\"\nmodule = \"inventory_service\"\nnamespace = \"ecommerce\"\n",
         proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")
     );
     let error = match toml::from_str::<ProxyConfig>(&toml) {
@@ -278,7 +293,7 @@ fn test_proxy_config_rejects_invalid_external_route_target() {
 #[test]
 fn test_proxy_config_rejects_conflicting_external_routes() {
     let toml = format!(
-        "{}\n[external]\nlisten_address = \"0.0.0.0:8080\"\n[[external.route]]\npath = \"/items/{{id}}\"\nmodule = \"inventory\"\nnamespace = \"ecommerce\"\n[[external.route]]\npath = \"/items/{{name}}\"\nmodule = \"inventory\"\nnamespace = \"ecommerce\"\n",
+        "{}\n[external]\nlisten_address = \"0.0.0.0:8080\"\n[[external.route]]\npath = \"/items/{{id}}\"\nrpc_path = \"/inventory.InventoryService/GetItem\"\nmodule = \"inventory\"\nnamespace = \"ecommerce\"\n[[external.route]]\npath = \"/items/{{name}}\"\nrpc_path = \"/inventory.InventoryService/GetItem\"\nmodule = \"inventory\"\nnamespace = \"ecommerce\"\n",
         proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")
     );
     let cfg: ProxyConfig = toml::from_str(&toml).unwrap();

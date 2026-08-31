@@ -39,15 +39,18 @@ routing_table_ttl_secs = 1
 #
 # [external]
 # listen_address = "0.0.0.0:8080"
+# max_request_body_bytes = 16777216
 #
 # [[external.route]]
 # path      = "/items"
-# methods   = ["GET", "POST"]
+# rpc_path  = "/inventory.InventoryService/ListItems"
+# methods   = ["GET"]
 # module    = "inventory"
 # namespace = "ecommerce"
 #
 # [[external.route]]
 # path      = "/items/{id}"
+# rpc_path  = "/inventory.InventoryService/GetItem"
 # methods   = ["GET"]
 # module    = "inventory"
 # namespace = "ecommerce"

@@ -5,15 +5,16 @@ use helpers::{
         manager_trio, register_test_module_raw, register_test_module_ready, start_manager_cluster,
         sync_table, synced_routing_table,
     },
-    proxy::{proxy_get, start_proxy},
+    proxy::{http_client, proxy_get, start_proxy},
     stubs::spawn_stub_engine,
-    wasm::minimal_file_descriptor_set,
+    wasm::{invalid_protobuf, minimal_file_descriptor_set},
 };
 
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
-use http::StatusCode;
+use http::{Request, StatusCode};
+use http_body_util::Full;
 
 use wr_common::discovery::ManagerDiscovery;
 use wr_common::wruntime::node_service_server::NodeService; // brings register_engine into scope
@@ -48,6 +49,44 @@ async fn test_proxy_routes_to_engine() -> Result<()> {
     assert!(
         body.contains("/Ping"),
         "expected stub to echo request path, got: {body}"
+    );
+
+    let _ = engine_shutdown.send(());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_internal_proxy_trusts_protobuf_body() -> Result<()> {
+    let (pool, mgr_addr, mut mgr_c) = manager_trio().await?;
+    let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
+    register_test_module_ready(
+        &pool,
+        &mut mgr_c,
+        "trusted-engine",
+        &engine_addr,
+        "store",
+        "inventory-service",
+        "1.0.0",
+    )
+    .await?;
+
+    let proxy = start_proxy(synced_routing_table(&mgr_addr).await?).await?;
+    let response = http_client()
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{proxy}/test.PingService/Ping"))
+                .header(
+                    "x-wr-destination",
+                    "http://store.inventory-service/test.PingService/Ping",
+                )
+                .body(Full::new(invalid_protobuf()))?,
+        )
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "trusted internal traffic must reach the engine without proxy schema validation"
     );
 
     let _ = engine_shutdown.send(());

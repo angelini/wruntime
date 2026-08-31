@@ -3,7 +3,10 @@ use helpers::{
     manager::{manager_trio, register_test_module_ready, synced_routing_table},
     proxy::{http_client, start_ingress_proxy, ExternalRoute},
     stubs::spawn_stub_engine,
+    wasm::{invalid_protobuf, minimal_file_descriptor_set},
 };
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use http::{Request, StatusCode};
@@ -31,8 +34,12 @@ async fn ingress_fixture(
     .await?;
 
     let table = synced_routing_table(&mgr_addr).await?;
+    let schema_cache = Arc::new(wr_proxy::schema::SchemaCache::default());
+    schema_cache
+        .insert(namespace, module, "1.0.0", &minimal_file_descriptor_set())
+        .await?;
 
-    let ingress_addr = start_ingress_proxy(table, routes).await?;
+    let ingress_addr = start_ingress_proxy(table, schema_cache, routes).await?;
     Ok((ingress_addr, engine_shutdown))
 }
 
@@ -64,6 +71,7 @@ async fn external_request(
 fn route(path: &str, methods: &[&str]) -> ExternalRoute {
     ExternalRoute::new(
         path,
+        "/test.PingService/Ping",
         methods.iter().map(|method| (*method).to_string()).collect(),
         "inventory",
         "ecommerce",
@@ -78,7 +86,10 @@ async fn test_external_route_dispatches_to_engine() -> Result<()> {
 
     let (status, body) = external_get(addr, "/items").await?;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "/items", "stub engine should echo the request path");
+    assert_eq!(
+        body, "/test.PingService/Ping",
+        "ingress should rewrite the public alias to its canonical RPC path"
+    );
     Ok(())
 }
 
@@ -89,7 +100,43 @@ async fn test_external_route_wildcard_segment() -> Result<()> {
 
     let (status, body) = external_get(addr, "/items/42").await?;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "/items/42");
+    assert_eq!(body, "/test.PingService/Ping");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_external_route_rejects_invalid_protobuf() -> Result<()> {
+    let routes = vec![route("/items", &["POST"])];
+    let (addr, _shutdown) = ingress_fixture("inventory", "ecommerce", routes).await?;
+
+    let response = http_client()
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{addr}/items"))
+                .body(Full::new(invalid_protobuf()))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.into_body().collect().await?.to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("protobuf schema validation"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_external_route_rejects_oversized_body() -> Result<()> {
+    let routes = vec![route("/items", &["POST"])];
+    let (addr, _shutdown) = ingress_fixture("inventory", "ecommerce", routes).await?;
+
+    let response = http_client()
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{addr}/items"))
+                .body(Full::new(bytes::Bytes::from(vec![0; 1025])))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     Ok(())
 }
 
