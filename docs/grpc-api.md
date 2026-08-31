@@ -2,13 +2,30 @@
 
 The mTLS `wruntime.ManagerService` is the cluster control plane. Engines use the local proxy's `wruntime.NodeService` for lifecycle calls, and worker job submission/status use HTTP RPC through the proxy rather than gRPC.
 
+## Process lifecycle
+
+`wruntime.LifecycleService` reports and controls one local process. It is a transport-neutral contract mounted only on each service's trusted control listener. Process stage is monotonic:
+
+`STARTING → READY → DRAINING → STOPPING`
+
+`READY` means the owning service crossed its startup barriers and admits its intended work. It does not imply dependency, module, route, or cluster health; those remain `StatusSeverity` evidence from `GetClusterStatus`. `UNSPECIFIED` is invalid wire input, and there is no remotely observable `STOPPED` state after the endpoint disappears.
+
+| RPC | Request | Response | Semantics |
+| --- | --- | --- | --- |
+| `GetStatus` | empty | `LifecycleStatus` | Side-effect-free snapshot containing process state, stable service kind and process instance ID, transition timestamp, typed reason, and explanatory detail. |
+| `Drain` | optional detail | `LifecycleStatus` | Idempotently closes admission and begins bounded quiescence without requesting process exit. |
+| `Stop` | optional detail | `LifecycleStatus` | Idempotently implies drain when necessary and requests full shutdown. |
+
+Transitions never move backward. Duplicate drain or stop requests return the current state. Invalid or unsupported requests return a gRPC status error. `LifecycleTransitionReason` is the machine-readable transition key; `detail` is bounded explanatory text and must not be parsed by automation.
+
 ## Engine lifecycle
 
 | RPC | Request | Response | Description |
 | ----- | --------- | ---------- | ------------- |
 | `RegisterEngine` | `EngineRegistration` | `{ accepted }` | Engine announces itself and its modules; the manager resolves requested secrets and DB credentials, then persists the engine, its schemas, and one initially-unhealthy default routing rule per schema-bearing module in a single transaction; module readiness rows are reset for advertised tuples |
 | `DeregisterEngine` | `{ engine_id }` | — | Engine removes itself on shutdown |
-| `Heartbeat` | `{ engine_id, healthy_modules }` | — | Bumps the engine's liveness unconditionally, then upserts a per-module heartbeat for each valid `healthy_modules` entry. Entries missing `namespace`/`name`/`version` are skipped and logged, never fatal. The background monitor marks a routing rule unhealthy when either its engine heartbeat or its specific module's heartbeat goes stale |
+| `Heartbeat` | `{ engine_id, healthy_modules }` | manager/proxy routing versions | Bumps the engine's liveness unconditionally, then upserts a per-module heartbeat for each valid `healthy_modules` entry. Entries missing `namespace`/`name`/`version` are skipped and logged, never fatal. The response acknowledges the manager routing version produced by readiness publication and, through `NodeService`, the locally installed proxy version. |
+| `BeginEngineDrain` | `{ engine_id }` | manager/proxy routing versions | Idempotently withdraws route admission and returns convergence evidence without deleting the final engine registration. |
 | `ListEngines` | — | `[EngineRegistration]` | Returns all currently registered engines |
 
 `EngineRegistration.deployment`, when present, carries the stable node ID, manager-assigned revision, immutable `sha256:` bundle digest, and stable engine slot. `engine_id` remains a process identity and must not be used to infer deployment history.
@@ -92,7 +109,7 @@ The `healthy` field is managed entirely by the manager — it is always set to `
 ## Manager discovery
 
 | RPC | Request | Response | Description |
-|-----|---------|----------|-------------|
+| --- | --- | --- | --- |
 | `ListManagers` | — | `[ManagerInfo]` | Reconciles DB-fresh registrations with chitchat liveness. Gossip-live managers are included, gossip-dead managers are excluded immediately, and DB-fresh managers not yet observed by gossip are included only during the startup convergence window. Use for peer discovery from any seed manager—no client database access required. |
 
 A `ManagerInfo` has the fields:
@@ -113,7 +130,8 @@ The `wruntime.NodeService` gRPC service is exposed by `wr-proxy` on its `control
 | ----- | --------- | ---------- | ------------- |
 | `RegisterEngine` | `RegisterEngineRequest` | `RegisterEngineResponse` | Engine announces itself and its modules to the local proxy |
 | `DeregisterEngine` | `DeregisterEngineRequest` | `DeregisterEngineResponse` | Engine removes itself on shutdown |
-| `Heartbeat` | `HeartbeatRequest` | `HeartbeatResponse` | Sent after module load immediately, then every 3 s; the proxy forwards to the manager |
+| `Heartbeat` | `HeartbeatRequest` | `HeartbeatResponse` | Sent after module load immediately, then every 3 s; the proxy forwards to the manager and replies only after the acknowledged manager version is installed locally. |
+| `BeginEngineDrain` | `BeginEngineDrainRequest` | `BeginEngineDrainResponse` | Withdraws engine route admission through the manager and returns manager/local-proxy convergence versions without deregistration. |
 
 This decouples engines from the manager address — engines only need to know their local proxy's control address.
 
@@ -124,7 +142,7 @@ Worker jobs use HTTP RPC via the proxy (not a gRPC service). The SDK provides er
 The fully qualified endpoints are canonical. `/SubmitJob` and `/GetJobStatus` remain supported compatibility aliases; SDKs and new callers should use the canonical paths.
 
 | Endpoint | Request | Response | Description |
-|----------|---------|----------|-------------|
+| --- | --- | --- | --- |
 | `POST /wruntime.WorkerService/SubmitJob` | `SubmitJobRequest` | `SubmitJobResponse` | Submit a job to a worker module's queue |
 | `POST /wruntime.WorkerService/GetJobStatus` | `GetJobStatusRequest` | `GetJobStatusResponse` | Query the status of a previously submitted job |
 
@@ -183,7 +201,7 @@ Schedule delivery is at least once. Handlers must be idempotent, and `job_type` 
 ## Schemas
 
 | RPC | Description |
-|-----|-------------|
+| --- | --- |
 | `GetSchema` | Retrieve the stored schema bytes |
 
 Schemas are automatically uploaded when engines register; the first occurrence of each unique `(namespace, name, version)` tuple in `engine.toml` supplies `schema_path`.

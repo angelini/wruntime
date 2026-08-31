@@ -2,6 +2,7 @@
 
 pub mod blobstore;
 pub mod db;
+pub mod lifecycle;
 pub mod llm;
 pub mod manager;
 pub mod pki;

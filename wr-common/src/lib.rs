@@ -17,8 +17,12 @@ pub mod naming;
 pub mod node;
 #[cfg(feature = "pool")]
 pub mod pool;
-#[cfg(feature = "signal")]
+#[cfg(any(feature = "signal", test))]
+pub mod process_lifecycle;
+#[cfg(any(feature = "signal", test))]
 pub mod signal;
+#[cfg(any(feature = "signal", test))]
+pub mod task_group;
 pub mod telemetry;
 #[cfg(feature = "tls")]
 pub mod tls;

@@ -12,10 +12,10 @@ use wr_common::identity::{
 use wr_common::naming::namespace_role;
 use wr_common::wruntime::{
     manager_service_server::ManagerService, BeginDeploymentRequest, BeginDeploymentResponse,
-    BeginRollbackRequest, BeginRollbackResponse, CompleteDeploymentRequest,
-    CompleteDeploymentResponse, DeleteRoutingRuleRequest, DeleteRoutingRuleResponse,
-    DeleteScheduleRequest, DeleteScheduleResponse, DeleteSecretRequest, DeleteSecretResponse,
-    DeploymentCondition, DeregisterEngineRequest, DeregisterEngineResponse,
+    BeginEngineDrainRequest, BeginEngineDrainResponse, BeginRollbackRequest, BeginRollbackResponse,
+    CompleteDeploymentRequest, CompleteDeploymentResponse, DeleteRoutingRuleRequest,
+    DeleteRoutingRuleResponse, DeleteScheduleRequest, DeleteScheduleResponse, DeleteSecretRequest,
+    DeleteSecretResponse, DeploymentCondition, DeregisterEngineRequest, DeregisterEngineResponse,
     GetClusterStatusRequest, GetClusterStatusResponse, GetRoutingTableRequest,
     GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse, HeartbeatRequest,
     HeartbeatResponse, ListEnginesRequest, ListEnginesResponse, ListManagersRequest,
@@ -477,7 +477,19 @@ impl ManagerService for Manager {
 
         db::upsert_module_heartbeats(&self.pool, &engine_id, &valid).await?;
 
-        Ok(Response::new(HeartbeatResponse {}))
+        Ok(Response::new(HeartbeatResponse {
+            manager_routing_table_version: 0,
+            proxy_routing_table_version: 0,
+        }))
+    }
+
+    async fn begin_engine_drain(
+        &self,
+        _request: Request<BeginEngineDrainRequest>,
+    ) -> Result<Response<BeginEngineDrainResponse>, Status> {
+        Err(Status::unimplemented(
+            "engine drain convergence is wired by lifecycle plan 2",
+        ))
     }
 
     async fn list_engines(

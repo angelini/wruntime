@@ -7,7 +7,7 @@ useDefault = true
 description = "Generated project artifacts"
 paths = [
   '''(^|/)target/''',
-  '''^certs/''',
+  '''(^|/)certs/''',
   '''(^|/)\.venv/''',
-  '''^dev/observability/data/''',
+  '''(^|/)dev/observability/data/''',
 ]

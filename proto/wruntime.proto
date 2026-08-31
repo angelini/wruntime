@@ -5,6 +5,74 @@ import "google/protobuf/timestamp.proto";
 
 // ── Shared messages ───────────────────────────────────────────────────────
 
+// Process lifecycle is a monotonic stage, not an availability or health
+// severity. STATUS_SEVERITY_* remains the cluster-health evidence contract.
+enum ProcessLifecycleState {
+  PROCESS_LIFECYCLE_STATE_UNSPECIFIED = 0; // invalid or unknown wire input only
+  PROCESS_LIFECYCLE_STATE_STARTING = 1;
+  // The owning service crossed its startup barriers and admits intended work;
+  // dependency and routing health remain separate StatusSeverity evidence.
+  PROCESS_LIFECYCLE_STATE_READY = 2;
+  PROCESS_LIFECYCLE_STATE_DRAINING = 3;
+  // Final shutdown is in progress. No STOPPED state is remotely observable
+  // after the lifecycle endpoint is gone.
+  PROCESS_LIFECYCLE_STATE_STOPPING = 4;
+}
+
+// Stable process role. A process instance reports exactly one non-unspecified
+// kind for its lifetime.
+enum ServiceKind {
+  SERVICE_KIND_UNSPECIFIED = 0;
+  SERVICE_KIND_MANAGER = 1;
+  SERVICE_KIND_PROXY = 2;
+  SERVICE_KIND_ENGINE = 3;
+}
+
+// Stable automation keys for the most recent lifecycle transition. `detail`
+// on LifecycleStatus is explanatory text and must not be parsed by automation.
+enum LifecycleTransitionReason {
+  LIFECYCLE_TRANSITION_REASON_UNSPECIFIED = 0;
+  LIFECYCLE_TRANSITION_REASON_PROCESS_STARTED = 1;
+  LIFECYCLE_TRANSITION_REASON_STARTUP_COMPLETE = 2;
+  LIFECYCLE_TRANSITION_REASON_CONTROL_DRAIN_REQUESTED = 3;
+  LIFECYCLE_TRANSITION_REASON_CONTROL_STOP_REQUESTED = 4;
+  LIFECYCLE_TRANSITION_REASON_SIGNAL_INTERRUPT = 5;
+  LIFECYCLE_TRANSITION_REASON_SIGNAL_TERMINATE = 6;
+  LIFECYCLE_TRANSITION_REASON_SHUTDOWN_ORCHESTRATION = 7;
+  LIFECYCLE_TRANSITION_REASON_TASK_FAILURE = 8;
+}
+
+message LifecycleStatus {
+  ProcessLifecycleState state = 1;
+  ServiceKind service_kind = 2;
+  string process_instance_id = 3;
+  google.protobuf.Timestamp transitioned_at = 4;
+  LifecycleTransitionReason reason = 5;
+  string detail = 6; // bounded explanatory text; never an automation key
+}
+
+message GetLifecycleStatusRequest {}
+message GetLifecycleStatusResponse { LifecycleStatus status = 1; }
+message DrainRequest {
+  string detail = 1; // optional bounded operator context; not an automation key
+}
+message DrainResponse { LifecycleStatus status = 1; }
+message StopRequest {
+  string detail = 1; // optional bounded operator context; not an automation key
+}
+message StopResponse { LifecycleStatus status = 1; }
+
+// Transport-neutral process control. Plan-specific service bootstrap code mounts
+// this only on an existing trusted control listener.
+service LifecycleService {
+  rpc GetStatus(GetLifecycleStatusRequest) returns (GetLifecycleStatusResponse);
+  // Drain is idempotent: close admission and begin bounded quiescence without
+  // requiring process exit. Repeated requests return the current state.
+  rpc Drain(DrainRequest) returns (DrainResponse);
+  // Stop is idempotent and implies drain when necessary before full shutdown.
+  rpc Stop(StopRequest) returns (StopResponse);
+}
+
 message ModuleDescriptor {
   string name         = 1;
   string version      = 2;
@@ -138,7 +206,22 @@ message HeartbeatRequest {
   string                    engine_id       = 1;
   repeated ModuleDescriptor healthy_modules = 2; // modules the engine considers healthy
 }
-message HeartbeatResponse        {}
+// A manager reply reports the routing-table version produced by readiness
+// publication. A NodeService reply additionally reports the local proxy version
+// installed before it replies. Zero means no convergence evidence was produced.
+message HeartbeatResponse {
+  uint64 manager_routing_table_version = 1;
+  uint64 proxy_routing_table_version = 2;
+}
+
+// Begin drain withdraws route admission but intentionally retains the final
+// engine registration. It is idempotent and returns the same convergence
+// evidence as HeartbeatResponse.
+message BeginEngineDrainRequest { string engine_id = 1; }
+message BeginEngineDrainResponse {
+  uint64 manager_routing_table_version = 1;
+  uint64 proxy_routing_table_version = 2;
+}
 message ListEnginesRequest       {}
 message ListEnginesResponse      { repeated EngineRegistration engines = 1; }
 
@@ -375,6 +458,7 @@ service NodeService {
   rpc RegisterEngine   (RegisterEngineRequest)   returns (RegisterEngineResponse);
   rpc DeregisterEngine (DeregisterEngineRequest)  returns (DeregisterEngineResponse);
   rpc Heartbeat        (HeartbeatRequest)          returns (HeartbeatResponse);
+  rpc BeginEngineDrain (BeginEngineDrainRequest)   returns (BeginEngineDrainResponse);
 }
 
 // ── ManagerService ────────────────────────────────────────────────────────
@@ -384,6 +468,7 @@ service ManagerService {
   rpc RegisterEngine    (RegisterEngineRequest)    returns (RegisterEngineResponse);
   rpc DeregisterEngine  (DeregisterEngineRequest)  returns (DeregisterEngineResponse);
   rpc Heartbeat         (HeartbeatRequest)         returns (HeartbeatResponse);
+  rpc BeginEngineDrain  (BeginEngineDrainRequest)  returns (BeginEngineDrainResponse);
   rpc ListEngines       (ListEnginesRequest)       returns (ListEnginesResponse);
 
   // Routing table

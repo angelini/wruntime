@@ -10,9 +10,9 @@ use tracing::{info, warn};
 
 use wr_common::discovery::ManagerDiscovery;
 use wr_common::wruntime::{
-    node_service_server::NodeService, DeregisterEngineRequest, DeregisterEngineResponse,
-    HeartbeatRequest, HeartbeatResponse, ModuleDescriptor, RegisterEngineRequest,
-    RegisterEngineResponse,
+    node_service_server::NodeService, BeginEngineDrainRequest, BeginEngineDrainResponse,
+    DeregisterEngineRequest, DeregisterEngineResponse, HeartbeatRequest, HeartbeatResponse,
+    ModuleDescriptor, RegisterEngineRequest, RegisterEngineResponse,
 };
 
 /// Cached heartbeat state for a single engine.
@@ -178,6 +178,18 @@ impl NodeService for NodeAgent {
             state.healthy_modules = req.healthy_modules;
         }
 
-        Ok(Response::new(HeartbeatResponse {}))
+        Ok(Response::new(HeartbeatResponse {
+            manager_routing_table_version: 0,
+            proxy_routing_table_version: 0,
+        }))
+    }
+
+    async fn begin_engine_drain(
+        &self,
+        _request: Request<BeginEngineDrainRequest>,
+    ) -> Result<Response<BeginEngineDrainResponse>, Status> {
+        Err(Status::unimplemented(
+            "engine drain convergence is wired by lifecycle plan 2",
+        ))
     }
 }

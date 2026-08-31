@@ -102,10 +102,16 @@ tls = [
 ]
 
 [dev-dependencies]
-tempfile       = "3"
+tempfile = "3"
 http-body-util = "0.1"
-bytes          = "1"
-toml           = "1"
+bytes = "1"
+toml = "1"
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "test-util",
+] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

@@ -1,259 +1,151 @@
 # Wruntime
 
+A distributed WASI Preview 2 runtime for building networks of WebAssembly modules.
+Guests call logical HTTP endpoints such as
+`http://ecommerce.inventory/inventory.InventoryService/GetItems`; Wruntime
+intercepts the call, discovers a healthy module instance, and routes it locally
+or across nodes.
+
 > [!NOTE]
-> This project was an experiment in LLM-assisted development. Much of the code
-> in this repo was written with Claude.
+> Wruntime is an experimental, pre-1.0 project built in part through
+> LLM-assisted development. The custom `wruntime:*` guest WIT APIs may change
+> incompatibly; pin the runtime and SDK versions used by guest modules.
 
-A distributed runtime that networks WASM modules via transparent HTTP
-interception. Modules make ordinary HTTP calls to each other — Wruntime
-intercepts, routes, and delivers them automatically.
+```text
+caller WASM
+    │ logical HTTP (intercepted by its wr-engine)
+    ▼
+wr-proxy A ─────── mTLS peer routing ──────► wr-proxy B
+    │                                           │
+    ▼                                           ▼
+local wr-engine                           remote wr-engine
+    │                                           │
+    └──────────────► destination WASM ◄─────────┘
 
-```
-                                 ①  http://example.echo/echo.EchoService/Echo  
-┌────────────┐                                ┌────────────┐
-│   caller   │ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─►   │    echo    │
-│   (WASM)   │        (appears direct)        │   (WASM)   │
-└──────┬─────┘                                └──────▲─────┘
-       │                                             │
-       │ ② intercepted                   ④ routed   │
-       │                                             │
-       │         ┌─────────────────┐                 │
-       └────────►│    wr-proxy     ├─────────────────┘
-                 │                 │
-                 │  routes         │
-                 │  load-balances  │
-                 │  streams        │
-                 └────────┬────────┘
-                          │ ③ syncs
-                   ┌──────▼──────┐
-                   │  wr-manager │
-                   └─────────────┘
+          routing, readiness, schedules, deployment state
+                              ▲
+                 active-active wr-manager cluster
+                              │
+                       shared PostgreSQL
 ```
 
-Modules address each other using `http://{namespace}.{module}/{proto_package}.{ProtoServiceName}/{ProtoMethodName}` URLs. The runtime handles service discovery, version routing, circuit-breaker-aware load balancing across instances, and OpenTelemetry tracing — all transparent to the module code. Request and response bodies are streamed through the proxy with zero buffering.
+The proxy streams internal and cross-node request and response bodies without
+buffering. Public ingress is a separate trust boundary: it strips reserved
+headers and buffers one bounded request body for protobuf schema validation.
 
-## Echo service API sketch
+## Scope
 
-The snippets below illustrate the guest API; they are not standalone workspace crates. The runnable Echo component lives in [`examples/multi-node/echo`](examples/multi-node/echo) and is exercised by the multi-node Just recipes.
+Wruntime currently provides:
 
-### 1. Define the schema
+- logical service discovery, semantic-version routing, load balancing, circuit
+  breaking, and OpenTelemetry tracing;
+- multi-node peer routing over mTLS and active-active managers with PostgreSQL
+  persistence and gossip-based liveness;
+- protobuf service modules plus durable, at-least-once workers and schedules;
+- optional public ingress with schema validation and deny-by-default,
+  allowlisted external HTTP egress;
+- guest capabilities for PostgreSQL, S3-compatible blob storage, tracing,
+  Anthropic Claude, namespace-scoped secrets/environment values, and ephemeral
+  scratch filesystems;
+- systemd and Docker deployment bundles, exact-revision readiness checks,
+  retained-release rollback, and coherent cluster status.
 
-```protobuf
-// schemas/echo.proto
-syntax = "proto3";
-package echo;
+See [Architecture](docs/architecture.md) for the full request and control-plane
+flows.
 
-service EchoService {
-  rpc Echo (EchoRequest) returns (EchoResponse);
-}
+## Quick start
 
-message EchoRequest  { string message = 1; }
-message EchoResponse { string message = 1; }
-```
+A source checkout requires:
 
-Compile it:
+- stable Rust and Cargo;
+- [`just`](https://github.com/casey/just), `protoc`, and Python 3;
+- the `wasm32-wasip2` Rust target and
+  [`wasm-tools`](https://github.com/bytecodealliance/wasm-tools);
+- Docker with Compose for PostgreSQL, RustFS, and local observability services;
+- OpenSSL for local example secrets.
 
 ```bash
-protoc --descriptor_set_out=schemas/echo.binpb --include_imports schemas/echo.proto
-```
+rustup target add wasm32-wasip2
 
-### 2. Echo module (handler)
-
-`build.rs`:
-
-```rust
-fn main() {
-    prost_build::Config::new()
-        .service_generator(Box::new(wr_build::WrServiceGenerator))
-        .compile_protos(&["schemas/echo.proto"], &["schemas"])
-        .unwrap();
-}
-```
-
-`src/lib.rs`:
-
-```rust
-mod proto { include!(concat!(env!("OUT_DIR"), "/echo.rs")); }
-
-// The complete local world is shown in docs/agents/guest-module-author/module_template.md.
-#[allow(dead_code, unused_imports)]
-mod bindings {
-    wit_bindgen::generate!({ path: "wit", world: "echo", generate_all });
-}
-
-use wr_sdk::prelude::*;
-
-struct Component;
-wr_sdk::export!(Component with_types_in wr_sdk::bindings);
-
-impl ServiceGuest for Component {
-    fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        proto::echo_service_handle(&Component, request, response_out);
-    }
-}
-
-impl proto::EchoService for Component {
-    fn echo(&self, req: proto::EchoRequest) -> Result<proto::EchoResponse, ServiceError> {
-        Ok(proto::EchoResponse { message: req.message })
-    }
-}
-```
-
-`WrServiceGenerator` generates a trait (`EchoService`) and a `_handle` function (`echo_service_handle`) from the proto definition — you implement the trait and delegate `handle` to the generated function.
-
-### 3. Caller module (runner)
-
-`build.rs`:
-
-```rust
-fn main() {
-    prost_build::Config::new()
-        .service_generator(Box::new(wr_build::WrClientGenerator))
-        .compile_protos(&["schemas/echo.proto"], &["schemas"])
-        .unwrap();
-}
-```
-
-`src/lib.rs`:
-
-```rust
-mod proto { include!(concat!(env!("OUT_DIR"), "/echo.rs")); }
-
-// The complete local world is shown in docs/agents/guest-module-author/module_template.md.
-#[allow(dead_code, unused_imports)]
-mod bindings {
-    wit_bindgen::generate!({ path: "wit", world: "caller", generate_all });
-}
-
-use prost::Message;
-use proto::EchoServiceClient;
-use wr_sdk::prelude::*;
-
-struct Component;
-wr_sdk::export!(Component with_types_in wr_sdk::bindings);
-
-impl ServiceGuest for Component {
-    fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
-        let client = EchoServiceClient::new("example.echo");
-
-        match client.echo(proto::EchoRequest { message: "hello".into() }) {
-            Ok(resp) => send_response(response_out, 200, resp.encode_to_vec()),
-            Err(e)   => wr_sdk::log!("error: {e}"),
-        }
-    }
-}
-```
-
-`WrClientGenerator` generates a typed `EchoServiceClient` struct with one method per RPC. The client calls `http://example.echo/echo.EchoService/Echo` under the hood via `wr_sdk::http::http_request`.
-
-### 4. Run the executable example
-
-The repository's multi-node example supplies the component crate, schema, engine/proxy configs, and invocation. Prepare Postgres and local certificates before running it:
-
-```bash
 just dev-up
 just certs
 just multi-node-inline
 ```
 
-For an interactive topology that stays running, use `just multi-node`. Its Echo service is invoked through Node A and routed over mTLS to Node B. Manager-facing CLI commands use `https://127.0.0.1:9000` and, by default, the CA/client certificates under `certs/`.
+A successful run sends an Echo request through Node A, across an mTLS peer
+connection, to a WASM module on Node B. Stop the shared development services
+with `just dev-down`. See the [multi-node example](examples/multi-node/) for the
+interactive topology and port map.
 
-## Host bindings
+## Build a guest module
 
-WASM modules can access host-provided capabilities through WIT interfaces:
+Start with the [Guest Module Author guide](docs/agents/guest-module-author/README.md):
 
-| Binding | WIT | Preferred SDK surface | Description |
-| --------- | ----- | ----------------------- | ------------- |
-| **Database** | `wit/db.wit` | `wr_sdk::db` builders and owned rows | Parameterized SQL queries, transactions, and streaming through a per-namespace Postgres pool |
-| **Blobstore** | `wit/blobstore.wit` | `wr_sdk::blobstore::bucket` scoped handle | S3-compatible object storage constrained to a host-configured bucket allowlist |
-| **Tracing** | `wit/tracing.wit` | `span!`, `set_attrs!`, and `event!` | Typed OpenTelemetry spans and batched attributes from within modules |
-| **LLM** | `wit/llm.wit` | `wr_sdk::llm::CompletionBuilder` | Validated Anthropic Claude completions, streaming, and tool use |
+- [module template](docs/agents/guest-module-author/module_template.md) — current
+  manifest, WIT world, build script, and validation shape;
+- [API guide](docs/agents/guest-module-author/api_guide.md) — preferred SDK usage
+  and lifecycle semantics;
+- [worked examples](docs/agents/guest-module-author/examples.md) — production
+  patterns and their supporting configuration.
 
-Prefer these facades for application code. `wr_sdk::bindings::wruntime::*` exposes the raw WIT bindings as an intentional escape hatch for unsupported operations and protocol/negative tests.
+Exact guest contracts live in [`wr-sdk/src/`](wr-sdk/src/),
+[`wr-build/src/lib.rs`](wr-build/src/lib.rs), and root [`wit/`](wit/). Prefer the
+SDK facades and generated protobuf clients over raw WIT bindings unless an
+operation is not otherwise exposed.
 
-See [docs/host-bindings.md](docs/host-bindings.md) for configuration and usage examples.
+## Executable examples
 
-## Deployment
+| Example | Demonstrates |
+| --- | --- |
+| [Ecommerce](examples/ecommerce/) | Generated client/service calls, PostgreSQL migrations, load balancing, tracing |
+| [Stockmarket](examples/stockmarket/) | Multiple services, persistence, and configurable replicas |
+| [Codegen](examples/codegen/) | Workers, LLM, database, blobstore, egress, and scratch filesystem |
+| [Multi-node](examples/multi-node/) | Cross-node placement and mTLS peer routing |
 
-Bundle once, deploy anywhere — the CLI packages cross-compiled binaries, WASM modules, and configs into a single tarball that works with both systemd and Docker. Shared settings (target, db_url, format, etc.) can live in a `wr-deploy.toml` so commands stay short.
-
-```bash
-# Bundle a node (proxy + engine) — target defaults to x86_64-unknown-linux-gnu
-wr-cli node bundle --engine-config engine.toml
-
-# Deploy to a remote host via SSH (format defaults to systemd)
-wr-cli node deploy --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.50 \
-    --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
-    --manager https://10.0.1.1:9000
-
-# Or with a wr-deploy.toml providing db_url, just the positional args:
-wr-cli node deploy --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.50 \
-    --manager https://10.0.1.1:9000
-```
-
-Every node deployment receives a manager-owned monotonic revision and exits successfully only after that exact bundle digest and engine-slot inventory is healthy and routable. Use `wr-cli node rollback --node-id <id> <remote>` for an explicit retained-release rollback and `wr-cli node inspect-bundle` / `wr-cli managers inspect-bundle` for bundle inspection. Manager deployment follows the same packaging pattern.
-
-Query any seed manager for the authoritative composed runtime view:
+Use `just` with no arguments to list every build, test, example, and deployment
+validation recipe. Common maintainer commands are:
 
 ```bash
-wr-cli --manager https://10.0.1.1:9000 cluster status
-wr-cli cluster status --output json
-wr-cli cluster status --fail-on unhealthy
+just build
+just tidy
+just test
+just test-wasm
+just validate-ecommerce
 ```
 
-The snapshot correlates desired revisions with manager membership, engine/module heartbeats, and persisted routes. Table output emphasizes problems; JSON is the stable complete automation view. Unknown proxy/resource/circuit signals are reported honestly, and only explicit `--fail-on` policy turns status into an exit gate. See [docs/deployment.md](docs/deployment.md) for lifecycle, status semantics, release layout, and configuration details.
+Testing prerequisites and the change-sensitive validation matrix are linked
+from [Testing](docs/testing.md). To inspect the repository-local CLI, run
+`just cli --help`.
 
-## Prerequisites
+## Repository map
 
-| Tool | Purpose |
-| ------ | --------- |
-| Rust + Cargo (stable) | Build all binaries |
-| [`just`](https://github.com/casey/just) | Run project recipes (see `Justfile`) |
-| `protoc` | Compile `.proto` schemas to `FileDescriptorSet` binaries |
-| `wasm32-wasip2` target | `rustup target add wasm32-wasip2` — build WASM component modules |
-| [`wasm-tools`](https://github.com/bytecodealliance/wasm-tools) | Strip/inspect WASM components (install: `cargo install --locked wasm-tools`) |
-
-```bash
-just build               # debug build
-just build-release       # release build
-just dev-up              # start Postgres/RustFS for integration tests and examples
-just multi-node          # run two local proxy nodes and three engines
-just test                # all tests with test DB/S3 env vars set
-just test-wasm           # WASM host binding tests
-just validate-ecommerce  # ecommerce inline run with zero-warning enforcement
-```
-
-## Project layout
-
-```
-wruntime/
-├── proto/
-│   └── wruntime.proto      # single source of truth for all gRPC messages
-├── wr-common/              # generated proto types (tonic + prost); shared NodeConfig
-├── wr-manager/             # central registry gRPC server
-├── wr-proxy/               # streaming HTTP routing proxy
-├── wr-engine/              # WASM runtime (wasmtime) + inbound HTTP server
-├── wr-sdk/                 # WASM module SDK: http, io, db, tracing, llm, export macros
-├── wr-build/               # build.rs helper: service/client generators from proto
-├── wr-cli/                 # CLI: cluster status, deployment, invoke, narrow views, metrics
-├── wr-tests/               # integration tests
-├── wit/                    # WIT interfaces (db, blobstore, tracing, llm)
-├── examples/
-│   ├── config/             # example single-node configs
-│   ├── ecommerce/          # example: inventory (handler) + client (runner)
-│   ├── codegen/            # example: LLM agent sandbox (code generation)
-│   ├── stockmarket/        # example: multi-module trading system
-│   └── multi-node/         # local and deployment multi-node topology
-```
+| Path | Purpose |
+| --- | --- |
+| `wr-manager/` | Active-active registry, routing state, schedules, secrets, and cluster status |
+| `wr-proxy/` | Local/peer routing, public ingress, egress policy, and circuit breaking |
+| `wr-engine/` | Wasmtime component execution, host capabilities, workers, and module lifecycle |
+| `wr-sdk/`, `wr-sdk-macros/`, `wr-build/` | Guest SDK, macros, and protobuf service/client generators |
+| `wr-cli/` | Development, operations, certificate, and deployment CLI |
+| `wr-common/`, `proto/`, `wit/` | Shared Rust types, control-plane protobuf, and guest host ABI |
+| `wr-tests/` | Integration and WASM host-binding tests |
+| `examples/` | Executable guest applications and local topologies |
+| `docs/` | Public guides, references, and contributor workflows |
 
 ## Documentation
 
-- [Agent guide](docs/agents/README.md) — choose guest module author or wruntime maintainer mode
-- [Architecture](docs/architecture.md) — detailed system diagram, request flow, internal headers
-- [Configuration](docs/configuration.md) — manager, proxy, and engine TOML configs; health checks; routing rules; multi-node setup
-- [gRPC API](docs/grpc-api.md) — `ManagerService` and `NodeService` RPC reference, worker job queue API
-- [Protobuf Schemas](docs/schemas.md) — writing, compiling, and validation behavior
-- [Module SDK](docs/sdk.md) — `wr-sdk` + `wr-build` reference; handler and runner module guides
-- [Host Bindings](docs/host-bindings.md) — database, blobstore, tracing, LLM, and filesystem access
-- [Deployment](docs/deployment.md) — bundle, deploy, multi-node clusters, systemd and Docker
-- [Testing](docs/testing.md) — running integration tests
+- [Architecture](docs/architecture.md) — topology, trust boundaries, request flow,
+  clustering, workers, and schedules
+- [Configuration](docs/configuration.md) — manager, proxy, engine, module, ingress,
+  egress, and capability configuration
+- [Module SDK](docs/sdk.md) — `wr-sdk` and `wr-build` overview
+- [Host bindings](docs/host-bindings.md) — database, blobstore, tracing, LLM,
+  environment, and filesystem behavior
+- [Schemas](docs/schemas.md) — protobuf descriptors, validation, and RPC paths
+- [Control-plane and job APIs](docs/grpc-api.md) — manager/node gRPC and worker HTTP
+  RPC contracts
+- [Deployment](docs/deployment.md) — bundles, systemd/Docker lifecycle, mTLS,
+  rollback, and cluster status
+- [Testing](docs/testing.md) — local infrastructure, focused tests, and full
+  validation
+- [Contributor modes](docs/agents/README.md) — guest-module and runtime-maintainer
+  workflows
