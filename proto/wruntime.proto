@@ -13,10 +13,9 @@ enum ProcessLifecycleState {
   // The owning service crossed its startup barriers and admits intended work;
   // dependency and routing health remain separate StatusSeverity evidence.
   PROCESS_LIFECYCLE_STATE_READY = 2;
-  PROCESS_LIFECYCLE_STATE_DRAINING = 3;
-  // Final shutdown is in progress. No STOPPED state is remotely observable
-  // after the lifecycle endpoint is gone.
-  PROCESS_LIFECYCLE_STATE_STOPPING = 4;
+  // Graceful shutdown is in progress. Service-specific phases remain internal;
+  // no STOPPED state is remotely observable after the endpoint is gone.
+  PROCESS_LIFECYCLE_STATE_STOPPING = 3;
 }
 
 // Stable process role. A process instance reports exactly one non-unspecified
@@ -34,12 +33,10 @@ enum LifecycleTransitionReason {
   LIFECYCLE_TRANSITION_REASON_UNSPECIFIED = 0;
   LIFECYCLE_TRANSITION_REASON_PROCESS_STARTED = 1;
   LIFECYCLE_TRANSITION_REASON_STARTUP_COMPLETE = 2;
-  LIFECYCLE_TRANSITION_REASON_CONTROL_DRAIN_REQUESTED = 3;
-  LIFECYCLE_TRANSITION_REASON_CONTROL_STOP_REQUESTED = 4;
-  LIFECYCLE_TRANSITION_REASON_SIGNAL_INTERRUPT = 5;
-  LIFECYCLE_TRANSITION_REASON_SIGNAL_TERMINATE = 6;
-  LIFECYCLE_TRANSITION_REASON_SHUTDOWN_ORCHESTRATION = 7;
-  LIFECYCLE_TRANSITION_REASON_TASK_FAILURE = 8;
+  LIFECYCLE_TRANSITION_REASON_SIGNAL_INTERRUPT = 3;
+  LIFECYCLE_TRANSITION_REASON_SIGNAL_TERMINATE = 4;
+  LIFECYCLE_TRANSITION_REASON_SHUTDOWN_ORCHESTRATION = 5;
+  LIFECYCLE_TRANSITION_REASON_TASK_FAILURE = 6;
 }
 
 message LifecycleStatus {
@@ -53,24 +50,11 @@ message LifecycleStatus {
 
 message GetLifecycleStatusRequest {}
 message GetLifecycleStatusResponse { LifecycleStatus status = 1; }
-message DrainRequest {
-  string detail = 1; // optional bounded operator context; not an automation key
-}
-message DrainResponse { LifecycleStatus status = 1; }
-message StopRequest {
-  string detail = 1; // optional bounded operator context; not an automation key
-}
-message StopResponse { LifecycleStatus status = 1; }
 
-// Transport-neutral process control. Plan-specific service bootstrap code mounts
-// this only on an existing trusted control listener.
+// Read-only semantic process observation. Process owners initiate graceful
+// shutdown exclusively with operating-system signals, never lifecycle RPCs.
 service LifecycleService {
   rpc GetStatus(GetLifecycleStatusRequest) returns (GetLifecycleStatusResponse);
-  // Drain is idempotent: close admission and begin bounded quiescence without
-  // requiring process exit. Repeated requests return the current state.
-  rpc Drain(DrainRequest) returns (DrainResponse);
-  // Stop is idempotent and implies drain when necessary before full shutdown.
-  rpc Stop(StopRequest) returns (StopResponse);
 }
 
 message ModuleDescriptor {
@@ -452,13 +436,23 @@ message ListSchedulesResponse { repeated Schedule schedules = 1; }
 
 // ── NodeService ──────────────────────────────────────────────────────────
 // Local gRPC service exposed by wr-proxy for engines on the same node.
-// Engines use this instead of connecting directly to wr-manager.
+// Engines use this instead of connecting directly to wr-manager. Local process
+// owners may also read the proxy's activation-bound routing progress.
+
+message GetProxyRoutingStatusRequest {}
+message GetProxyRoutingStatusResponse {
+  // Exact identity reported by LifecycleService.GetStatus on this listener.
+  string process_instance_id = 1;
+  // Latest routing-table version atomically installed by this proxy.
+  uint64 installed_routing_table_version = 2;
+}
 
 service NodeService {
   rpc RegisterEngine   (RegisterEngineRequest)   returns (RegisterEngineResponse);
   rpc DeregisterEngine (DeregisterEngineRequest)  returns (DeregisterEngineResponse);
   rpc Heartbeat        (HeartbeatRequest)          returns (HeartbeatResponse);
   rpc BeginEngineDrain (BeginEngineDrainRequest)   returns (BeginEngineDrainResponse);
+  rpc GetProxyRoutingStatus(GetProxyRoutingStatusRequest) returns (GetProxyRoutingStatusResponse);
 }
 
 // ── ManagerService ────────────────────────────────────────────────────────

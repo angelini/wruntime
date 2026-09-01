@@ -5,7 +5,7 @@ use serde::Deserialize;
 use super::helpers::DeployPort;
 
 /// Shared deployment format used by both manager and node deploy commands.
-#[derive(Clone, ValueEnum, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeployFormat {
     Systemd,
@@ -83,8 +83,21 @@ pub fn resolve_string(
     config: Option<String>,
     env_key: &str,
 ) -> Option<String> {
-    cli.or(config)
-        .or_else(|| std::env::var(env_key).ok().filter(|s| !s.is_empty()))
+    resolve_string_from(
+        cli,
+        config,
+        std::env::var(env_key)
+            .ok()
+            .filter(|value| !value.is_empty()),
+    )
+}
+
+pub(crate) fn resolve_string_from(
+    cli: Option<String>,
+    config: Option<String>,
+    environment: Option<String>,
+) -> Option<String> {
+    cli.or(config).or(environment)
 }
 
 /// Resolve a required string value. Bails with a message listing all sources.
@@ -120,15 +133,21 @@ pub fn resolve_with_default(
 
 /// Resolve deploy format from CLI > config > env > default (Systemd).
 pub fn resolve_format(cli: Option<DeployFormat>, config: Option<DeployFormat>) -> DeployFormat {
+    resolve_format_from(cli, config, std::env::var("WR_FORMAT").ok())
+}
+
+pub(crate) fn resolve_format_from(
+    cli: Option<DeployFormat>,
+    config: Option<DeployFormat>,
+    environment: Option<String>,
+) -> DeployFormat {
     cli.or(config)
         .or_else(|| {
-            std::env::var("WR_FORMAT")
-                .ok()
-                .and_then(|s| match s.to_lowercase().as_str() {
-                    "systemd" => Some(DeployFormat::Systemd),
-                    "docker" => Some(DeployFormat::Docker),
-                    _ => None,
-                })
+            environment.and_then(|value| match value.to_lowercase().as_str() {
+                "systemd" => Some(DeployFormat::Systemd),
+                "docker" => Some(DeployFormat::Docker),
+                _ => None,
+            })
         })
         .unwrap_or(DeployFormat::Systemd)
 }
@@ -156,15 +175,51 @@ fn env_deploy_port(key: &str) -> Result<Option<DeployPort>> {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) enum SshPortEnvironment {
+    #[default]
+    NotPresent,
+    Value(String),
+    NotUnicode,
+}
+
+impl SshPortEnvironment {
+    pub(crate) fn from_var(value: std::result::Result<String, std::env::VarError>) -> Self {
+        match value {
+            Ok(value) => Self::Value(value),
+            Err(std::env::VarError::NotPresent) => Self::NotPresent,
+            Err(std::env::VarError::NotUnicode(_)) => Self::NotUnicode,
+        }
+    }
+}
+
 /// Resolve SSH port from CLI > config > env. Returns None to use SSH default.
 pub fn resolve_ssh_port(cli: Option<u16>, config: Option<u16>) -> Result<Option<DeployPort>> {
+    resolve_ssh_port_from(
+        cli,
+        config,
+        SshPortEnvironment::from_var(std::env::var("WR_SSH_PORT")),
+    )
+}
+
+pub(crate) fn resolve_ssh_port_from(
+    cli: Option<u16>,
+    config: Option<u16>,
+    environment: SshPortEnvironment,
+) -> Result<Option<DeployPort>> {
     if let Some(port) = optional_deploy_port(cli, "--ssh-port")? {
         return Ok(Some(port));
     }
     if let Some(port) = optional_deploy_port(config, "ssh_port in wr-deploy.toml")? {
         return Ok(Some(port));
     }
-    env_deploy_port("WR_SSH_PORT")
+    match environment {
+        SshPortEnvironment::NotPresent => Ok(None),
+        SshPortEnvironment::Value(value) => parse_deploy_port(&value, "WR_SSH_PORT").map(Some),
+        SshPortEnvironment::NotUnicode => {
+            anyhow::bail!("WR_SSH_PORT must contain a valid UTF-8 TCP port")
+        }
+    }
 }
 
 /// Resolve peer port from CLI > config > env > default (9443).
@@ -227,5 +282,19 @@ mod tests {
                 .get(),
             22
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_ssh_port_environment_is_rejected_instead_of_defaulted() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let environment = SshPortEnvironment::from_var(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from_vec(vec![0xff]),
+        )));
+        let error = resolve_ssh_port_from(None, None, environment).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("WR_SSH_PORT must contain a valid UTF-8 TCP port"));
     }
 }

@@ -17,10 +17,11 @@ use http::{Request, StatusCode};
 use http_body_util::Full;
 
 use wr_common::discovery::ManagerDiscovery;
-use wr_common::wruntime::node_service_server::NodeService; // brings register_engine into scope
+use wr_common::process_lifecycle::{LifecycleDriver, ServiceKind};
+use wr_common::wruntime::node_service_server::NodeService; // brings NodeService methods into scope
 use wr_common::wruntime::{
-    BeginEngineDrainRequest, EngineRegistration, GetRoutingTableRequest, HeartbeatRequest,
-    ModuleDescriptor, RegisterEngineRequest,
+    BeginEngineDrainRequest, EngineRegistration, GetProxyRoutingStatusRequest,
+    GetRoutingTableRequest, HeartbeatRequest, ModuleDescriptor, RegisterEngineRequest,
 };
 use wr_proxy::node_service::NodeAgent;
 
@@ -152,7 +153,22 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
         wr_proxy::config::CircuitBreakerConfig::default(),
         "https://127.0.0.1:9443",
     );
-    let agent = Arc::new(NodeAgent::new(discovery, routing));
+    let (_driver, lifecycle) = LifecycleDriver::new(ServiceKind::Proxy, "proxy-activation-1");
+    let agent = Arc::new(NodeAgent::new(
+        discovery,
+        routing.clone(),
+        lifecycle.snapshot(),
+    ));
+
+    let initial_status = agent
+        .get_proxy_routing_status(tonic::Request::new(GetProxyRoutingStatusRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(initial_status.process_instance_id, "proxy-activation-1");
+    assert_eq!(
+        initial_status.installed_routing_table_version,
+        routing.version().await
+    );
 
     let resp = agent
         .register_engine(tonic::Request::new(RegisterEngineRequest {
@@ -209,6 +225,15 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
         readiness.proxy_routing_table_version >= readiness.manager_routing_table_version,
         "first heartbeat must synchronously converge the local proxy"
     );
+    let ready_status = agent
+        .get_proxy_routing_status(tonic::Request::new(GetProxyRoutingStatusRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(ready_status.process_instance_id, "proxy-activation-1");
+    assert_eq!(
+        ready_status.installed_routing_table_version, readiness.proxy_routing_table_version,
+        "read-only routing status must reflect the existing convergence snapshot"
+    );
 
     let mut tasks = wr_common::task_group::TaskGroup::new();
     let heartbeat_agent = Arc::clone(&agent);
@@ -236,6 +261,16 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
     assert!(
         withdrawal.proxy_routing_table_version >= withdrawal.manager_routing_table_version,
         "drain must synchronously converge route withdrawal"
+    );
+    let drained_status = agent
+        .get_proxy_routing_status(tonic::Request::new(GetProxyRoutingStatusRequest {}))
+        .await?
+        .into_inner();
+    assert_eq!(drained_status.process_instance_id, "proxy-activation-1");
+    assert!(
+        drained_status.installed_routing_table_version
+            >= ready_status.installed_routing_table_version,
+        "routing status must never regress as convergence installs newer tables"
     );
     let stale = match agent
         .heartbeat(tonic::Request::new(HeartbeatRequest {

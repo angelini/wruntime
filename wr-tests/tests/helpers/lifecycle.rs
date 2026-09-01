@@ -7,9 +7,10 @@ use tokio::time::{sleep_until, Instant};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Code;
 
+use wr_common::lifecycle_observation::{classify_lifecycle_state, LifecycleStateClassification};
 use wr_common::wruntime::{
-    lifecycle_service_client::LifecycleServiceClient, DrainRequest, GetLifecycleStatusRequest,
-    LifecycleStatus, ProcessLifecycleState, StopRequest,
+    lifecycle_service_client::LifecycleServiceClient, GetLifecycleStatusRequest, LifecycleStatus,
+    ProcessLifecycleState, ServiceKind,
 };
 
 use super::wait::DEFAULT_POLL_INTERVAL;
@@ -33,6 +34,14 @@ pub enum LifecycleWaitError {
         message: String,
     },
     ChildExited(String),
+    ServiceKindMismatch {
+        expected: ServiceKind,
+        observed: i32,
+    },
+    ProcessInstanceMismatch {
+        expected: String,
+        observed: String,
+    },
 }
 
 impl fmt::Display for LifecycleWaitError {
@@ -57,6 +66,14 @@ impl fmt::Display for LifecycleWaitError {
             Self::ChildExited(status) => {
                 write!(f, "supervised child exited while waiting for lifecycle state: {status}")
             }
+            Self::ServiceKindMismatch { expected, observed } => write!(
+                f,
+                "lifecycle service kind mismatch: expected {expected:?}, observed {observed}"
+            ),
+            Self::ProcessInstanceMismatch { expected, observed } => write!(
+                f,
+                "lifecycle process instance mismatch: expected {expected}, observed {observed}"
+            ),
         }
     }
 }
@@ -75,34 +92,16 @@ pub(crate) fn evaluate_state(
 ) -> std::result::Result<StateEvaluation, LifecycleWaitError> {
     let observed = ProcessLifecycleState::try_from(status.state)
         .map_err(|_| LifecycleWaitError::InvalidState(status.state))?;
-    if expected == ProcessLifecycleState::Unspecified {
-        return Err(LifecycleWaitError::InvalidState(expected as i32));
-    }
-    if observed == ProcessLifecycleState::Unspecified {
-        return Err(LifecycleWaitError::InvalidState(status.state));
-    }
-    if expected == ProcessLifecycleState::Ready
-        && matches!(
-            observed,
-            ProcessLifecycleState::Draining | ProcessLifecycleState::Stopping
-        )
-    {
-        return Err(LifecycleWaitError::TerminalBeforeReady(status.clone()));
-    }
-    if state_rank(observed) >= state_rank(expected) {
-        Ok(StateEvaluation::Reached)
-    } else {
-        Ok(StateEvaluation::Pending)
-    }
-}
-
-fn state_rank(state: ProcessLifecycleState) -> u8 {
-    match state {
-        ProcessLifecycleState::Unspecified => 0,
-        ProcessLifecycleState::Starting => 1,
-        ProcessLifecycleState::Ready => 2,
-        ProcessLifecycleState::Draining => 3,
-        ProcessLifecycleState::Stopping => 4,
+    match classify_lifecycle_state(observed, expected) {
+        Ok(LifecycleStateClassification::Matched) => Ok(StateEvaluation::Reached),
+        Ok(LifecycleStateClassification::Pending) => Ok(StateEvaluation::Pending),
+        Ok(LifecycleStateClassification::Terminal) => {
+            Err(LifecycleWaitError::TerminalBeforeReady(status.clone()))
+        }
+        Err(_) if expected == ProcessLifecycleState::Unspecified => {
+            Err(LifecycleWaitError::InvalidState(expected as i32))
+        }
+        Err(_) => Err(LifecycleWaitError::InvalidState(status.state)),
     }
 }
 
@@ -127,48 +126,29 @@ pub async fn query_state(client: &mut LifecycleServiceClient<Channel>) -> Result
         .context("lifecycle response omitted status")
 }
 
-pub async fn request_drain(
-    client: &mut LifecycleServiceClient<Channel>,
-    detail: impl Into<String>,
-) -> Result<LifecycleStatus> {
-    client
-        .drain(DrainRequest {
-            detail: detail.into(),
-        })
-        .await?
-        .into_inner()
-        .status
-        .context("drain response omitted lifecycle status")
-}
-
-pub async fn request_stop(
-    client: &mut LifecycleServiceClient<Channel>,
-    detail: impl Into<String>,
-) -> Result<LifecycleStatus> {
-    client
-        .stop(StopRequest {
-            detail: detail.into(),
-        })
-        .await?
-        .into_inner()
-        .status
-        .context("stop response omitted lifecycle status")
-}
-
 pub async fn wait_for_state(
     client: &mut LifecycleServiceClient<Channel>,
     expected: ProcessLifecycleState,
     deadline: Instant,
 ) -> std::result::Result<LifecycleStatus, LifecycleWaitError> {
-    wait_for_state_inner(client, expected, deadline, None).await
+    wait_for_state_inner(client, expected, deadline, None, None).await
 }
 
 pub async fn wait_for_ready_with_child(
     client: &mut LifecycleServiceClient<Channel>,
     child: &mut Child,
+    expected_kind: ServiceKind,
+    expected_instance: &str,
     deadline: Instant,
 ) -> std::result::Result<LifecycleStatus, LifecycleWaitError> {
-    wait_for_state_inner(client, ProcessLifecycleState::Ready, deadline, Some(child)).await
+    wait_for_state_inner(
+        client,
+        ProcessLifecycleState::Ready,
+        deadline,
+        Some(child),
+        Some((expected_kind, expected_instance)),
+    )
+    .await
 }
 
 fn ensure_child_running(child: &mut Child) -> std::result::Result<(), LifecycleWaitError> {
@@ -184,6 +164,7 @@ async fn wait_for_state_inner(
     expected: ProcessLifecycleState,
     deadline: Instant,
     mut child: Option<&mut Child>,
+    expected_identity: Option<(ServiceKind, &str)>,
 ) -> std::result::Result<LifecycleStatus, LifecycleWaitError> {
     let mut last_observation = None;
     loop {
@@ -224,6 +205,20 @@ async fn wait_for_state_inner(
                         message: "lifecycle response omitted status".to_owned(),
                     });
                 };
+                if let Some((expected_kind, expected_instance)) = expected_identity {
+                    if status.service_kind != expected_kind as i32 {
+                        return Err(LifecycleWaitError::ServiceKindMismatch {
+                            expected: expected_kind,
+                            observed: status.service_kind,
+                        });
+                    }
+                    if status.process_instance_id != expected_instance {
+                        return Err(LifecycleWaitError::ProcessInstanceMismatch {
+                            expected: expected_instance.to_owned(),
+                            observed: status.process_instance_id,
+                        });
+                    }
+                }
                 match evaluate_state(&status, expected)? {
                     StateEvaluation::Reached => return Ok(status),
                     StateEvaluation::Pending => {

@@ -1,10 +1,10 @@
 use std::fmt;
-use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep_until, Instant};
 
+use crate::task_group::{TaskCancellation, TaskExit};
 use crate::wruntime;
 
 /// Maximum UTF-8 byte length accepted for explanatory transition detail.
@@ -21,11 +21,10 @@ pub fn resolve_process_instance_id(default: impl Into<String>) -> String {
         .unwrap_or_else(|| default.into())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessState {
     Starting,
     Ready,
-    Draining,
     Stopping,
 }
 
@@ -40,8 +39,6 @@ pub enum ServiceKind {
 pub enum TransitionReason {
     ProcessStarted,
     StartupComplete,
-    ControlDrainRequested,
-    ControlStopRequested,
     SignalInterrupt,
     SignalTerminate,
     ShutdownOrchestration,
@@ -76,7 +73,6 @@ impl From<ProcessState> for wruntime::ProcessLifecycleState {
         match state {
             ProcessState::Starting => Self::Starting,
             ProcessState::Ready => Self::Ready,
-            ProcessState::Draining => Self::Draining,
             ProcessState::Stopping => Self::Stopping,
         }
     }
@@ -97,8 +93,6 @@ impl From<TransitionReason> for wruntime::LifecycleTransitionReason {
         match reason {
             TransitionReason::ProcessStarted => Self::ProcessStarted,
             TransitionReason::StartupComplete => Self::StartupComplete,
-            TransitionReason::ControlDrainRequested => Self::ControlDrainRequested,
-            TransitionReason::ControlStopRequested => Self::ControlStopRequested,
             TransitionReason::SignalInterrupt => Self::SignalInterrupt,
             TransitionReason::SignalTerminate => Self::SignalTerminate,
             TransitionReason::ShutdownOrchestration => Self::ShutdownOrchestration,
@@ -121,27 +115,25 @@ pub enum TransitionError {
         actual: usize,
         maximum: usize,
     },
+    DriverClosed,
 }
 
 impl fmt::Display for TransitionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Backwards { current, requested } => {
-                write!(
-                    f,
-                    "illegal lifecycle transition from {current:?} to {requested:?}"
-                )
-            }
-            Self::InvalidReason { state, reason } => {
-                write!(
-                    f,
-                    "invalid lifecycle transition reason {reason:?} for {state:?}"
-                )
-            }
+            Self::Backwards { current, requested } => write!(
+                f,
+                "illegal lifecycle transition from {current:?} to {requested:?}"
+            ),
+            Self::InvalidReason { state, reason } => write!(
+                f,
+                "invalid lifecycle transition reason {reason:?} for {state:?}"
+            ),
             Self::DetailTooLong { actual, maximum } => write!(
                 f,
                 "lifecycle transition detail is {actual} bytes; maximum is {maximum}"
             ),
+            Self::DriverClosed => write!(f, "lifecycle driver is no longer running"),
         }
     }
 }
@@ -151,7 +143,7 @@ impl std::error::Error for TransitionError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LifecycleWaitError {
     Deadline { last_observation: LifecycleSnapshot },
-    CoordinatorClosed { last_observation: LifecycleSnapshot },
+    DriverClosed { last_observation: LifecycleSnapshot },
 }
 
 impl fmt::Display for LifecycleWaitError {
@@ -162,9 +154,9 @@ impl fmt::Display for LifecycleWaitError {
                 "lifecycle wait reached its deadline; last state was {:?}",
                 last_observation.state
             ),
-            Self::CoordinatorClosed { last_observation } => write!(
+            Self::DriverClosed { last_observation } => write!(
                 f,
-                "lifecycle coordinator closed; last state was {:?}",
+                "lifecycle driver closed; last state was {:?}",
                 last_observation.state
             ),
         }
@@ -173,25 +165,41 @@ impl fmt::Display for LifecycleWaitError {
 
 impl std::error::Error for LifecycleWaitError {}
 
-struct CoordinatorInner {
-    snapshot: Mutex<LifecycleSnapshot>,
+type IntentResult = Result<LifecycleSnapshot, TransitionError>;
+
+struct LifecycleIntent {
+    requested: ProcessState,
+    reason: TransitionReason,
+    detail: String,
+    acknowledgement: oneshot::Sender<IntentResult>,
+}
+
+/// Sole writer for process lifecycle state. It is deliberately not cloneable;
+/// all callers hold a read-only snapshot handle and submit typed intents.
+pub struct LifecycleDriver {
+    snapshot: LifecycleSnapshot,
     updates: watch::Sender<LifecycleSnapshot>,
+    intents: mpsc::UnboundedReceiver<LifecycleIntent>,
 }
 
-/// Cloneable owner side of the process lifecycle state machine.
+/// Cloneable read-only snapshot side of the lifecycle driver.
 #[derive(Clone)]
-pub struct ProcessLifecycleCoordinator {
-    inner: Arc<CoordinatorInner>,
-}
-
-/// Cloneable read/subscription side of the process lifecycle state machine.
-#[derive(Clone)]
-pub struct ProcessLifecycleHandle {
+pub struct LifecycleSnapshotHandle {
     updates: watch::Receiver<LifecycleSnapshot>,
 }
 
-impl ProcessLifecycleCoordinator {
-    pub fn new(service_kind: ServiceKind, process_instance_id: impl Into<String>) -> Self {
+/// Cloneable intent-delivery side retained only by the process owner.
+#[derive(Clone)]
+pub struct LifecycleHandle {
+    snapshots: LifecycleSnapshotHandle,
+    intents: mpsc::UnboundedSender<LifecycleIntent>,
+}
+
+impl LifecycleDriver {
+    pub fn new(
+        service_kind: ServiceKind,
+        process_instance_id: impl Into<String>,
+    ) -> (Self, LifecycleHandle) {
         let snapshot = LifecycleSnapshot {
             state: ProcessState::Starting,
             service_kind,
@@ -200,78 +208,48 @@ impl ProcessLifecycleCoordinator {
             reason: TransitionReason::ProcessStarted,
             detail: String::new(),
         };
-        let (updates, _) = watch::channel(snapshot.clone());
-        Self {
-            inner: Arc::new(CoordinatorInner {
-                snapshot: Mutex::new(snapshot),
+        let (updates, receiver) = watch::channel(snapshot.clone());
+        let (intent_sender, intents) = mpsc::unbounded_channel();
+        (
+            Self {
+                snapshot,
                 updates,
-            }),
-        }
-    }
-
-    pub fn handle(&self) -> ProcessLifecycleHandle {
-        ProcessLifecycleHandle {
-            updates: self.inner.updates.subscribe(),
-        }
-    }
-
-    pub fn current(&self) -> LifecycleSnapshot {
-        self.inner
-            .snapshot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    pub fn mark_ready(
-        &self,
-        detail: impl Into<String>,
-    ) -> Result<LifecycleSnapshot, TransitionError> {
-        self.transition(
-            ProcessState::Ready,
-            TransitionReason::StartupComplete,
-            detail,
+                intents,
+            },
+            LifecycleHandle {
+                snapshots: LifecycleSnapshotHandle { updates: receiver },
+                intents: intent_sender,
+            },
         )
     }
 
-    pub fn request_drain(
-        &self,
-        reason: TransitionReason,
-        detail: impl Into<String>,
-    ) -> Result<LifecycleSnapshot, TransitionError> {
-        self.transition(ProcessState::Draining, reason, detail)
-    }
-
-    pub fn request_stop(
-        &self,
-        reason: TransitionReason,
-        detail: impl Into<String>,
-    ) -> Result<LifecycleSnapshot, TransitionError> {
-        self.transition(ProcessState::Stopping, reason, detail)
+    pub async fn run(mut self, mut cancellation: TaskCancellation) -> anyhow::Result<TaskExit> {
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
+                intent = self.intents.recv() => {
+                    let Some(intent) = intent else {
+                        return Ok(TaskExit::Completed);
+                    };
+                    let result = self.transition(intent.requested, intent.reason, intent.detail);
+                    let _ = intent.acknowledgement.send(result);
+                }
+            }
+        }
     }
 
     fn transition(
-        &self,
+        &mut self,
         requested: ProcessState,
         reason: TransitionReason,
-        detail: impl Into<String>,
-    ) -> Result<LifecycleSnapshot, TransitionError> {
+        detail: String,
+    ) -> IntentResult {
         let reason_is_valid = match requested {
             ProcessState::Starting => false,
             ProcessState::Ready => reason == TransitionReason::StartupComplete,
-            ProcessState::Draining => matches!(
-                reason,
-                TransitionReason::ControlDrainRequested
-                    | TransitionReason::ControlStopRequested
-                    | TransitionReason::SignalInterrupt
-                    | TransitionReason::SignalTerminate
-                    | TransitionReason::ShutdownOrchestration
-                    | TransitionReason::TaskFailure
-            ),
             ProcessState::Stopping => matches!(
                 reason,
-                TransitionReason::ControlStopRequested
-                    | TransitionReason::SignalInterrupt
+                TransitionReason::SignalInterrupt
                     | TransitionReason::SignalTerminate
                     | TransitionReason::ShutdownOrchestration
                     | TransitionReason::TaskFailure
@@ -283,41 +261,81 @@ impl ProcessLifecycleCoordinator {
                 reason,
             });
         }
-
-        let detail = detail.into();
         if detail.len() > MAX_TRANSITION_DETAIL_BYTES {
             return Err(TransitionError::DetailTooLong {
                 actual: detail.len(),
                 maximum: MAX_TRANSITION_DETAIL_BYTES,
             });
         }
-
-        let mut current = self
-            .inner
-            .snapshot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if requested < current.state {
+        if requested == ProcessState::Ready && self.snapshot.state == ProcessState::Stopping {
             return Err(TransitionError::Backwards {
-                current: current.state,
+                current: self.snapshot.state,
                 requested,
             });
         }
-        if requested == current.state {
-            return Ok(current.clone());
+        if requested == self.snapshot.state {
+            return Ok(self.snapshot.clone());
         }
 
-        current.state = requested;
-        current.transitioned_at = SystemTime::now();
-        current.reason = reason;
-        current.detail = detail;
-        let updated = current.clone();
-        self.inner.updates.send_replace(updated.clone());
-        Ok(updated)
+        self.snapshot.state = requested;
+        self.snapshot.transitioned_at = SystemTime::now();
+        self.snapshot.reason = reason;
+        self.snapshot.detail = detail;
+        self.updates.send_replace(self.snapshot.clone());
+        Ok(self.snapshot.clone())
     }
 }
 
-impl ProcessLifecycleHandle {
+impl LifecycleHandle {
+    pub fn snapshot(&self) -> LifecycleSnapshotHandle {
+        self.snapshots.clone()
+    }
+
+    pub fn current(&self) -> LifecycleSnapshot {
+        self.snapshots.current()
+    }
+
+    pub async fn mark_ready(
+        &self,
+        detail: impl Into<String>,
+    ) -> Result<LifecycleSnapshot, TransitionError> {
+        self.submit(
+            ProcessState::Ready,
+            TransitionReason::StartupComplete,
+            detail.into(),
+        )
+        .await
+    }
+
+    pub async fn request_stop(
+        &self,
+        reason: TransitionReason,
+        detail: impl Into<String>,
+    ) -> Result<LifecycleSnapshot, TransitionError> {
+        self.submit(ProcessState::Stopping, reason, detail.into())
+            .await
+    }
+
+    async fn submit(
+        &self,
+        requested: ProcessState,
+        reason: TransitionReason,
+        detail: String,
+    ) -> IntentResult {
+        let (acknowledgement, response) = oneshot::channel();
+        self.intents
+            .send(LifecycleIntent {
+                requested,
+                reason,
+                detail,
+                acknowledgement,
+            })
+            .map_err(|_| TransitionError::DriverClosed)?;
+        response.await.map_err(|_| TransitionError::DriverClosed)?
+    }
+}
+
+impl LifecycleSnapshotHandle {
     pub fn current(&self) -> LifecycleSnapshot {
         self.updates.borrow().clone()
     }
@@ -326,21 +344,12 @@ impl ProcessLifecycleHandle {
         self.updates.clone()
     }
 
-    /// Wait until startup reaches READY or has already entered a terminal path.
-    pub async fn await_ready_or_terminal(
+    /// Wait until startup reaches READY or shutdown has started.
+    pub async fn await_ready_or_stopping(
         &self,
         deadline: Instant,
     ) -> Result<LifecycleSnapshot, LifecycleWaitError> {
-        self.await_state(deadline, |state| state >= ProcessState::Ready)
-            .await
-    }
-
-    /// DRAINING and STOPPING both satisfy a drain wait because states are monotonic.
-    pub async fn await_drain(
-        &self,
-        deadline: Instant,
-    ) -> Result<LifecycleSnapshot, LifecycleWaitError> {
-        self.await_state(deadline, |state| state >= ProcessState::Draining)
+        self.await_state(deadline, |state| state != ProcessState::Starting)
             .await
     }
 
@@ -368,7 +377,6 @@ impl ProcessLifecycleHandle {
                     last_observation: snapshot,
                 });
             }
-
             tokio::select! {
                 _ = sleep_until(deadline) => {
                     return Err(LifecycleWaitError::Deadline {
@@ -377,7 +385,7 @@ impl ProcessLifecycleHandle {
                 }
                 changed = updates.changed() => {
                     if changed.is_err() {
-                        return Err(LifecycleWaitError::CoordinatorClosed {
+                        return Err(LifecycleWaitError::DriverClosed {
                             last_observation: updates.borrow().clone(),
                         });
                     }
@@ -389,149 +397,102 @@ impl ProcessLifecycleHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
-    use std::thread;
     use std::time::Duration;
 
     use super::*;
+    use crate::task_group::TaskGroup;
 
-    fn coordinator() -> ProcessLifecycleCoordinator {
-        ProcessLifecycleCoordinator::new(ServiceKind::Engine, "engine-test")
+    fn lifecycle() -> (TaskGroup, LifecycleHandle) {
+        let (driver, handle) = LifecycleDriver::new(ServiceKind::Engine, "engine-test");
+        let mut tasks = TaskGroup::new();
+        tasks.spawn("lifecycle-driver", move |cancellation| {
+            driver.run(cancellation)
+        });
+        (tasks, handle)
     }
 
-    #[test]
-    fn legal_transitions_are_monotonic_and_export_typed_status() {
-        let lifecycle = coordinator();
+    #[tokio::test]
+    async fn only_driver_moves_starting_ready_stopping_and_identity_is_stable() {
+        let (mut tasks, lifecycle) = lifecycle();
         assert_eq!(lifecycle.current().state, ProcessState::Starting);
-        lifecycle.mark_ready("modules loaded").unwrap();
-        lifecycle
-            .request_drain(TransitionReason::ControlDrainRequested, "operator request")
-            .unwrap();
+        let ready = lifecycle.mark_ready("modules loaded").await.unwrap();
+        assert_eq!(ready.state, ProcessState::Ready);
         let stopped = lifecycle
-            .request_stop(TransitionReason::ShutdownOrchestration, "tasks joined")
+            .request_stop(TransitionReason::SignalTerminate, "SIGTERM")
+            .await
             .unwrap();
         assert_eq!(stopped.state, ProcessState::Stopping);
-
+        assert_eq!(stopped.process_instance_id, "engine-test");
         let proto = wruntime::LifecycleStatus::from(&stopped);
         assert_eq!(
             proto.state,
             wruntime::ProcessLifecycleState::Stopping as i32
         );
         assert_eq!(proto.process_instance_id, "engine-test");
-    }
-
-    #[test]
-    fn duplicate_drain_and_stop_requests_are_idempotent() {
-        let lifecycle = coordinator();
-        let first = lifecycle
-            .request_drain(TransitionReason::ControlDrainRequested, "first")
-            .unwrap();
-        let duplicate = lifecycle
-            .request_drain(TransitionReason::SignalInterrupt, "duplicate")
-            .unwrap();
-        assert_eq!(duplicate, first);
-
-        let first = lifecycle
-            .request_stop(TransitionReason::ControlStopRequested, "first")
-            .unwrap();
-        let duplicate = lifecycle
-            .request_stop(TransitionReason::SignalTerminate, "duplicate")
-            .unwrap();
-        assert_eq!(duplicate, first);
-    }
-
-    #[test]
-    fn backwards_and_oversized_transitions_are_rejected() {
-        let lifecycle = coordinator();
-        lifecycle
-            .request_drain(TransitionReason::ControlDrainRequested, "")
-            .unwrap();
-        assert!(matches!(
-            lifecycle.mark_ready("too late"),
-            Err(TransitionError::Backwards { .. })
-        ));
-        assert!(matches!(
-            lifecycle.request_stop(
-                TransitionReason::ControlStopRequested,
-                "x".repeat(MAX_TRANSITION_DETAIL_BYTES + 1)
-            ),
-            Err(TransitionError::DetailTooLong { .. })
-        ));
-
-        let invalid_reason = coordinator()
-            .request_drain(TransitionReason::StartupComplete, "not a drain reason")
-            .unwrap_err();
-        assert!(matches!(
-            invalid_reason,
-            TransitionError::InvalidReason {
-                state: ProcessState::Draining,
-                reason: TransitionReason::StartupComplete,
-            }
-        ));
+        let report = tasks
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(report.is_clean(), "{report:?}");
     }
 
     #[tokio::test]
-    async fn readiness_wait_returns_ready_terminal_and_deadline_observations() {
-        let ready = coordinator();
-        let ready_handle = ready.handle();
-        ready.mark_ready("").unwrap();
-        assert_eq!(
-            ready_handle
-                .await_ready_or_terminal(Instant::now() + Duration::from_secs(1))
-                .await
-                .unwrap()
-                .state,
-            ProcessState::Ready
+    async fn duplicate_and_racing_stop_intents_are_idempotent() {
+        let (mut tasks, lifecycle) = lifecycle();
+        lifecycle.mark_ready("").await.unwrap();
+        let (first, second) = tokio::join!(
+            lifecycle.request_stop(TransitionReason::SignalInterrupt, "first"),
+            lifecycle.request_stop(TransitionReason::TaskFailure, "second")
         );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first, second);
+        let report = tasks
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(report.is_clean(), "{report:?}");
+    }
 
-        let stopping = coordinator();
-        let stopping_handle = stopping.handle();
-        stopping
-            .request_stop(TransitionReason::ControlStopRequested, "")
+    #[tokio::test]
+    async fn stopping_before_ready_is_terminal_and_late_ready_is_rejected() {
+        let (mut tasks, lifecycle) = lifecycle();
+        lifecycle
+            .request_stop(TransitionReason::TaskFailure, "startup failed")
+            .await
             .unwrap();
+        assert!(matches!(
+            lifecycle.mark_ready("too late").await,
+            Err(TransitionError::Backwards { .. })
+        ));
         assert_eq!(
-            stopping_handle
-                .await_ready_or_terminal(Instant::now() + Duration::from_secs(1))
+            lifecycle
+                .snapshot()
+                .await_ready_or_stopping(Instant::now() + Duration::from_secs(1))
                 .await
                 .unwrap()
                 .state,
             ProcessState::Stopping
         );
-
-        let waiting = coordinator();
-        let error = waiting
-            .handle()
-            .await_ready_or_terminal(Instant::now())
-            .await
-            .unwrap_err();
-        assert!(matches!(error, LifecycleWaitError::Deadline { .. }));
+        let report = tasks
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(report.is_clean(), "{report:?}");
     }
 
-    #[test]
-    fn concurrent_requests_select_the_furthest_state() {
-        let lifecycle = Arc::new(coordinator());
-        let barrier = Arc::new(Barrier::new(3));
-        let drain = {
-            let lifecycle = Arc::clone(&lifecycle);
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                barrier.wait();
-                let _ = lifecycle.request_drain(TransitionReason::SignalInterrupt, "signal");
-            })
-        };
-        let stop = {
-            let lifecycle = Arc::clone(&lifecycle);
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                barrier.wait();
-                lifecycle
-                    .request_stop(TransitionReason::ControlStopRequested, "control")
-                    .unwrap();
-            })
-        };
-        barrier.wait();
-        drain.join().unwrap();
-        stop.join().unwrap();
-        assert_eq!(lifecycle.current().state, ProcessState::Stopping);
+    #[tokio::test]
+    async fn oversized_detail_is_rejected_without_mutation() {
+        let (mut tasks, lifecycle) = lifecycle();
+        let error = lifecycle
+            .request_stop(
+                TransitionReason::TaskFailure,
+                "x".repeat(MAX_TRANSITION_DETAIL_BYTES + 1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TransitionError::DetailTooLong { .. }));
+        assert_eq!(lifecycle.current().state, ProcessState::Starting);
+        let report = tasks
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(report.is_clean(), "{report:?}");
     }
 }

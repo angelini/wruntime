@@ -30,39 +30,36 @@ export WR_MANAGER="${WR_MANAGER:-https://127.0.0.1:9000}"
 
 RUN_DIR="${WR_EXAMPLE_RUN_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/wr-example.XXXXXX")}"
 CONFIG_DIR="${RUN_DIR}/config"
-WR_DEV_STATE_DIR="${RUN_DIR}/dev-state"
-mkdir -p "${CONFIG_DIR}" "${WR_DEV_STATE_DIR}"
-DEV_STATE_ARGS=(--state-dir "${WR_DEV_STATE_DIR}")
-
-stop_example_supervisor() {
-	./target/debug/wr-cli dev "${DEV_STATE_ARGS[@]}" down
-}
+mkdir -p "${CONFIG_DIR}"
 
 remove_example_run_directory() {
 	rm -rf "$1"
 }
 
+assert_no_example_runtime_residue() {
+	local residue
+	residue=$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 ! -name config -print)
+	if [ -n "$residue" ]; then
+		echo "Unexpected foreground-run residue under ${RUN_DIR}:" >&2
+		printf '%s\n' "$residue" >&2
+		return 1
+	fi
+}
+
 cleanup_example_run() {
 	local primary_status=$?
 	local cleanup_status=0
-	local final_status
+	local final_status=$primary_status
 	trap - EXIT INT TERM
-	echo "==> Shutting down..."
-	if stop_example_supervisor; then
-		cleanup_status=0
-	else
-		cleanup_status=$?
-		echo "Cleanup failed; retained run state: ${RUN_DIR}" >&2
-	fi
+	assert_no_example_runtime_residue || cleanup_status=$?
 	if [ "$cleanup_status" -eq 0 ]; then
-		if remove_example_run_directory "${RUN_DIR}"; then
-			:
-		else
-			cleanup_status=$?
+		remove_example_run_directory "${RUN_DIR}" || cleanup_status=$?
+		if [ "$cleanup_status" -ne 0 ]; then
 			echo "Cleanup failed: run-directory removal=${cleanup_status}:${RUN_DIR}" >&2
 		fi
+	else
+		echo "Cleanup failed; retained example run directory: ${RUN_DIR}" >&2
 	fi
-	final_status=$primary_status
 	if [ "$primary_status" -eq 0 ] && [ "$cleanup_status" -ne 0 ]; then
 		final_status=$cleanup_status
 	elif [ "$primary_status" -ne 0 ] && [ "$cleanup_status" -ne 0 ]; then
@@ -73,6 +70,42 @@ cleanup_example_run() {
 trap cleanup_example_run EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# ── Foreground topology arguments ────────────────────────────────────────────
+DEV_RUN_ARGS=()
+
+configure_dev_run() {
+	local manager_config="$1"
+	DEV_RUN_ARGS=(--manager-config "$manager_config")
+}
+
+add_dev_proxy() {
+	local name="$1" config="$2"
+	DEV_RUN_ARGS+=(--proxy-config "${name}=${config}")
+}
+
+add_dev_engine() {
+	local config="$1"
+	DEV_RUN_ARGS+=(--engine-config "$config")
+}
+
+run_dev_topology() {
+	if [ "${#DEV_RUN_ARGS[@]}" -eq 0 ]; then
+		echo "run_dev_topology requires configure_dev_run" >&2
+		return 2
+	fi
+	./target/debug/wr-cli dev run "${DEV_RUN_ARGS[@]}" -- "$@"
+}
+
+run_example_scenario() {
+	local scenario="$1"
+	shift
+	local scenario_args=("$@")
+	if [ "$INLINE" = true ]; then
+		scenario_args+=(--inline)
+	fi
+	run_dev_topology bash "$scenario" "${scenario_args[@]}"
+}
 
 # ── Generate TLS certificates if missing ─────────────────────────────────────
 if [ ! -f certs/ca.crt ]; then
@@ -140,34 +173,6 @@ clean_manager_state() {
 		"TRUNCATE wr_system.wr_engines, wr_system.wr_routing_rules, wr_system.wr_schemas, wr_system.wr_managers, wr_system.wr_secrets CASCADE"
 }
 
-# ── Start manager + proxy ────────────────────────────────────────────────────
-# Usage: start_manager_proxy <manager_config> <proxy_config>
-start_manager_proxy() {
-	local manager_cfg="$1" proxy_cfg="$2"
-	echo "==> Starting manager + proxy..."
-	./target/debug/wr-cli dev "${DEV_STATE_ARGS[@]}" up \
-		--manager-config "$manager_cfg" \
-		--proxy-config "$proxy_cfg"
-}
-
-# ── Deploy an engine ─────────────────────────────────────────────────────────
-# Usage: deploy_engine <config_path> <label> <port>
-deploy_engine() {
-	local config="$1" label="$2" port="$3"
-	echo "==> Deploying ${label} on :${port}"
-	./target/debug/wr-cli dev "${DEV_STATE_ARGS[@]}" deploy "$config" --skip-build
-}
-
-dev_status() {
-	./target/debug/wr-cli dev "${DEV_STATE_ARGS[@]}" status
-}
-
-# ── Print engine/service lists ───────────────────────────────────────────────
-list_services() {
-	just cli engines list
-	just cli services list
-}
-
 # ── Create S3 bucket ─────────────────────────────────────────────────────────
 # Usage: create_s3_bucket <bucket_name>
 create_s3_bucket() {
@@ -182,8 +187,4 @@ create_s3_bucket() {
 	fi
 	AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${S3_SECRET_KEY}" \
 		aws --endpoint-url "${S3_ENDPOINT}" s3 mb "s3://${bucket}"
-}
-
-wait_for_supervisor() {
-	./target/debug/wr-cli dev "${DEV_STATE_ARGS[@]}" wait
 }

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import subprocess
 import tempfile
 import textwrap
@@ -10,6 +11,7 @@ import unittest
 HELPERS = Path(__file__).with_name("lifecycle_logging.sh")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_HELPERS = REPO_ROOT / "examples" / "helpers.sh"
+DEPLOYMENT_LIFECYCLE = REPO_ROOT / "dev" / "validate-deployment-lifecycle.sh"
 
 
 class LifecycleLoggingTests(unittest.TestCase):
@@ -172,7 +174,6 @@ PY_REDACT
                     f"""
                     WR_EXAMPLE_RUN_DIR={directory}
                     source {EXAMPLE_HELPERS}
-                    stop_example_supervisor() {{ return 0; }}
                     remove_example_run_directory() {{ return 17; }}
                     exit {primary}
                     """
@@ -181,6 +182,76 @@ PY_REDACT
                 self.assertIn("run-directory removal=17", result.stderr)
                 if primary:
                     self.assertIn("Primary run failed with 23", result.stderr)
+
+    def test_deployment_engine_stop_has_one_backend_owner(self):
+        script = DEPLOYMENT_LIFECYCLE.read_text()
+        self.assertEqual(script.count('node stop "$NODE_REMOTE"'), 1)
+        stop_call = script[script.index('node stop "$NODE_REMOTE"') :]
+        stop_call = stop_call.split('"${CLI[@]}" cluster wait', 1)[0]
+        for argument in [
+            "--component engine:engine",
+            '--format "$backend"',
+            '--workdir "$WORKDIR"',
+            '--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY"',
+            '"${NODE_STOP_SSH_ARGS[@]}"',
+            '--json >"$stop_record" 2>"$stop_error"',
+            'assert_node_stop_record "$stop_record" "$backend" engine:engine',
+        ]:
+            self.assertIn(argument, stop_call)
+        for obsolete in [
+            "lifecycle stop",
+            "engine-lifecycle-tunnel",
+            "engine-exit-probe",
+            "systemctl show wr-engine",
+            "status exited --services engine-engine",
+        ]:
+            self.assertNotIn(obsolete, script)
+        self.assertNotIn("--component proxy", script)
+
+    def test_node_stop_record_validation_executes_contract(self):
+        valid = {
+            "component": "engine:engine",
+            "backend": "docker",
+            "target": "engine-engine",
+            "graceful_result": "escalated",
+            "graceful_action": {"status": "succeeded"},
+            "force_action": {"status": "failed", "detail": "transport failed"},
+            "final_state": "running=none,container=container-id",
+            "final_exited": True,
+            "elapsed_ms": 44999,
+            "forced": False,
+        }
+        invalid = [
+            "diagnostic before JSON\n" + json.dumps(valid),
+            json.dumps({**valid, "target": "engine-other"}),
+            json.dumps({**valid, "final_exited": False}),
+            json.dumps({**valid, "elapsed_ms": 45001}),
+            json.dumps({**valid, "forced": True}),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "engine-stop.json"
+            record.write_text(json.dumps(valid))
+            result = self.run_bash(
+                f"""
+                set -Eeuo pipefail
+                PYTHON=(python3)
+                source {HELPERS}
+                assert_node_stop_record {record} docker engine:engine
+                """
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for value in invalid:
+                with self.subTest(value=value):
+                    record.write_text(value)
+                    result = self.run_bash(
+                        f"""
+                        set -uo pipefail
+                        PYTHON=(python3)
+                        source {HELPERS}
+                        assert_node_stop_record {record} docker engine:engine
+                        """
+                    )
+                    self.assertNotEqual(result.returncode, 0)
 
     def test_failure_excerpt_is_bounded(self):
         with tempfile.TemporaryDirectory() as directory:

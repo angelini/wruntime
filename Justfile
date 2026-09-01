@@ -268,9 +268,15 @@ deployment-e2e-python-test:
         dev/deployment-e2e/test_assert_cluster.py \
         dev/deployment-e2e/test_lifecycle_logging.py
 
-# Run focused lifecycle waiter, supervisor ownership, and cleanup accounting fixtures
+# Run focused foreground-runner, example-helper, waiter, and cleanup fixtures
 test-lifecycle-runners:
-    cargo test -p wr-cli cmd::dev_supervisor::tests
+    bash examples/helpers_test.sh
+    bash examples/ecommerce/scenario_test.sh
+    bash examples/scenarios_test.sh
+    cargo test -p wr-cli cmd::foreground_runner::tests -- --test-threads=1
+    cargo test -p wr-cli cmd::foreground_runner::tests::real_signal_interrupts -- --ignored --test-threads=1
+    cargo test -p wr-cli cmd::foreground_runner::tests::real_second_signal_escalates_scenario_cleanup -- --ignored --test-threads=1
+    cargo test -p wr-cli cmd::dev::tests::dev_
     cargo test -p wr-cli cmd::helpers::tests
     cargo test -p wr-cli cmd::cluster::tests::expectation
     cargo test -p wr-cli cmd::managers::tests::manager_deploy_propagates_live_tail_failure

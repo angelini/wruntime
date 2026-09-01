@@ -1,5 +1,3 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -7,11 +5,10 @@ use tokio::sync::Notify;
 use tokio::time::{timeout_at, Instant};
 use tonic::{Request, Response, Status};
 
-use crate::process_lifecycle::{ProcessLifecycleCoordinator, TransitionError, TransitionReason};
-use crate::signal::{apply_shutdown_request, ShutdownRequest};
+use crate::process_lifecycle::LifecycleSnapshotHandle;
 use crate::wruntime::{
-    lifecycle_service_server::LifecycleService, DrainRequest, DrainResponse,
-    GetLifecycleStatusRequest, GetLifecycleStatusResponse, StopRequest, StopResponse,
+    lifecycle_service_server::LifecycleService, GetLifecycleStatusRequest,
+    GetLifecycleStatusResponse,
 };
 
 struct AdmissionState {
@@ -62,7 +59,7 @@ impl AdmissionGate {
         self.state.in_flight.load(Ordering::Acquire)
     }
 
-    /// Enter admitted work. The second open check closes the race with drain.
+    /// Enter admitted work. The second open check closes the race with shutdown.
     pub fn try_enter(&self) -> Option<AdmissionGuard> {
         if !self.is_open() {
             return None;
@@ -108,62 +105,15 @@ impl Drop for AdmissionGuard {
     }
 }
 
-/// Lifecycle operation passed to an admission shutdown hook.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ShutdownOperation {
-    Drain,
-    Stop,
-}
-
-/// Thin tonic adapter over the shared lifecycle coordinator.
-type ShutdownHook = Arc<
-    dyn Fn(ShutdownOperation) -> Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>
-        + Send
-        + Sync,
->;
-
+/// Thin, read-only tonic adapter over the shared lifecycle snapshot handle.
 #[derive(Clone)]
 pub struct LifecycleServiceAdapter {
-    coordinator: ProcessLifecycleCoordinator,
-    admission: Option<AdmissionGate>,
-    shutdown_hook: Option<ShutdownHook>,
+    lifecycle: LifecycleSnapshotHandle,
 }
 
 impl LifecycleServiceAdapter {
-    pub fn new(coordinator: ProcessLifecycleCoordinator, admission: Option<AdmissionGate>) -> Self {
-        Self {
-            coordinator,
-            admission,
-            shutdown_hook: None,
-        }
-    }
-
-    pub fn with_shutdown_hook<F, Fut>(mut self, hook: F) -> Self
-    where
-        F: Fn(ShutdownOperation) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<(), Status>> + Send + 'static,
-    {
-        self.shutdown_hook = Some(Arc::new(move |operation| Box::pin(hook(operation))));
-        self
-    }
-
-    async fn close_admission(&self, operation: ShutdownOperation) -> Result<(), Status> {
-        if let Some(admission) = &self.admission {
-            admission.close();
-        }
-        if let Some(hook) = &self.shutdown_hook {
-            hook(operation).await?;
-        }
-        Ok(())
-    }
-}
-
-fn transition_status(error: TransitionError) -> Status {
-    match error {
-        TransitionError::DetailTooLong { .. } | TransitionError::InvalidReason { .. } => {
-            Status::invalid_argument(error.to_string())
-        }
-        TransitionError::Backwards { .. } => Status::failed_precondition(error.to_string()),
+    pub fn new(lifecycle: LifecycleSnapshotHandle) -> Self {
+        Self { lifecycle }
     }
 }
 
@@ -174,40 +124,7 @@ impl LifecycleService for LifecycleServiceAdapter {
         _request: Request<GetLifecycleStatusRequest>,
     ) -> Result<Response<GetLifecycleStatusResponse>, Status> {
         Ok(Response::new(GetLifecycleStatusResponse {
-            status: Some((&self.coordinator.current()).into()),
-        }))
-    }
-
-    async fn drain(
-        &self,
-        request: Request<DrainRequest>,
-    ) -> Result<Response<DrainResponse>, Status> {
-        let snapshot = apply_shutdown_request(
-            &self.coordinator,
-            ShutdownRequest::drain(
-                TransitionReason::ControlDrainRequested,
-                request.into_inner().detail,
-            ),
-        )
-        .map_err(transition_status)?;
-        self.close_admission(ShutdownOperation::Drain).await?;
-        Ok(Response::new(DrainResponse {
-            status: Some((&snapshot).into()),
-        }))
-    }
-
-    async fn stop(&self, request: Request<StopRequest>) -> Result<Response<StopResponse>, Status> {
-        let snapshot = apply_shutdown_request(
-            &self.coordinator,
-            ShutdownRequest::stop(
-                TransitionReason::ControlStopRequested,
-                request.into_inner().detail,
-            ),
-        )
-        .map_err(transition_status)?;
-        self.close_admission(ShutdownOperation::Stop).await?;
-        Ok(Response::new(StopResponse {
-            status: Some((&snapshot).into()),
+            status: Some((&self.lifecycle.current()).into()),
         }))
     }
 }
@@ -239,69 +156,43 @@ pub fn notify_supervisor(message: &str) -> std::io::Result<()> {
 mod tests {
     use std::time::Duration;
 
+    use crate::process_lifecycle::{LifecycleDriver, ProcessState, ServiceKind, TransitionReason};
+    use crate::task_group::TaskGroup;
+
     use super::*;
 
     #[tokio::test]
-    async fn lifecycle_shutdown_closes_admission_and_runs_hook_before_ack() -> anyhow::Result<()> {
-        use crate::process_lifecycle::ServiceKind;
+    async fn status_rpc_is_read_only() -> anyhow::Result<()> {
+        let (driver, lifecycle) = LifecycleDriver::new(ServiceKind::Proxy, "proxy-test");
+        let mut tasks = TaskGroup::new();
+        tasks.spawn("lifecycle-driver", move |cancellation| {
+            driver.run(cancellation)
+        });
+        lifecycle.mark_ready("test ready").await?;
+        let adapter = LifecycleServiceAdapter::new(lifecycle.snapshot());
 
-        let lifecycle = ProcessLifecycleCoordinator::new(ServiceKind::Proxy, "proxy-test");
-        lifecycle.mark_ready("test ready")?;
-        let gate = AdmissionGate::closed();
-        gate.open();
-        let hook_ran_after_close = Arc::new(AtomicBool::new(false));
-        let hook_observer = Arc::clone(&hook_ran_after_close);
-        let hook_gate = gate.clone();
-        let adapter = LifecycleServiceAdapter::new(lifecycle, Some(gate.clone()))
-            .with_shutdown_hook(move |_| {
-                let hook_observer = Arc::clone(&hook_observer);
-                let hook_gate = hook_gate.clone();
-                async move {
-                    hook_observer.store(!hook_gate.is_open(), Ordering::Release);
-                    Ok(())
-                }
-            });
-
-        let response = adapter
-            .drain(Request::new(DrainRequest {
-                detail: "test drain".into(),
-            }))
+        let first = adapter
+            .get_status(Request::new(GetLifecycleStatusRequest {}))
             .await?
-            .into_inner();
+            .into_inner()
+            .status
+            .expect("status response");
+        let second = adapter
+            .get_status(Request::new(GetLifecycleStatusRequest {}))
+            .await?
+            .into_inner()
+            .status
+            .expect("status response");
+        assert_eq!(first, second);
+        assert_eq!(lifecycle.current().state, ProcessState::Ready);
 
-        assert!(!gate.is_open());
-        assert!(hook_ran_after_close.load(Ordering::Acquire));
-        assert_eq!(
-            response.status.map(|status| status.state),
-            Some(crate::wruntime::ProcessLifecycleState::Draining as i32)
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn lifecycle_shutdown_hook_failure_is_returned_to_caller() -> anyhow::Result<()> {
-        use crate::process_lifecycle::ServiceKind;
-
-        let lifecycle = ProcessLifecycleCoordinator::new(ServiceKind::Proxy, "proxy-test");
-        lifecycle.mark_ready("test ready")?;
-        let adapter =
-            LifecycleServiceAdapter::new(lifecycle.clone(), None).with_shutdown_hook(|_| async {
-                Err(Status::deadline_exceeded("listener shutdown timed out"))
-            });
-
-        let error = adapter
-            .drain(Request::new(DrainRequest {
-                detail: "test drain".into(),
-            }))
-            .await
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("failing shutdown hook was acknowledged"))?;
-
-        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
-        assert_eq!(
-            lifecycle.current().state,
-            crate::process_lifecycle::ProcessState::Draining
-        );
+        lifecycle
+            .request_stop(TransitionReason::TaskFailure, "test complete")
+            .await?;
+        let report = tasks
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(report.is_clean(), "{report:?}");
         Ok(())
     }
 

@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 
 use super::build_helpers::{self, BuildModule};
 use super::config::EngineConfig;
-use super::dev_supervisor::{self, Request};
+use super::foreground_runner::{self, RunSpec};
 const TEST_GUEST_MANIFEST: &str = "wr-tests/guests/build.toml";
 const ECOMMERCE_ENGINE_CONFIGS: &[&str] = &[
     "examples/ecommerce/engine-client.toml",
@@ -23,61 +24,55 @@ const MULTI_NODE_ENGINE_CONFIGS: &[&str] = &["examples/multi-node/node-b/engine-
 
 #[derive(Args)]
 pub struct DevArgs {
-    /// Directory containing the supervisor lock, socket, and diagnostic state
-    #[arg(long, value_name = "DIR", default_value = ".", global = true)]
-    pub state_dir: PathBuf,
-
     #[command(subcommand)]
     pub command: DevCommand,
 }
 
 #[derive(Subcommand)]
 pub enum DevCommand {
-    /// Start manager + proxy for local development
-    Up {
-        /// Path to manager config file
-        #[arg(long, default_value = "examples/config/manager.toml")]
-        manager_config: String,
-        /// Path to proxy config file
-        #[arg(long, default_value = "examples/config/proxy.toml")]
-        proxy_config: String,
-    },
-    /// Start an additional supervisor-owned proxy (for local multi-node runs)
-    StartProxy {
-        /// Stable name for this additional proxy
-        #[arg(long)]
-        name: String,
-        /// Path to proxy config file
-        config: String,
-    },
-    /// Stop all dev processes after ordered drain and reaping
-    Down,
-    /// Block until a supervised child exits unexpectedly
-    Wait,
-    /// Internal persistent supervisor entrypoint
-    #[command(hide = true)]
-    Supervisor,
+    /// Run an already-built local topology in the foreground
+    Run(RunArgs),
     /// Build WASM guests and schemas from build metadata
     Build(BuildArgs),
-    /// Build WASM + schemas and (re)deploy an engine
-    Deploy(DeployArgs),
-    /// Show running dev processes and modules
-    Status,
 }
 
-#[derive(Args)]
-pub struct DeployArgs {
-    /// Path to engine.toml config file
-    config: String,
-    /// Skip WASM and schema compilation (deploy only)
-    #[arg(long)]
-    skip_build: bool,
-    /// Skip protoc schema compilation
-    #[arg(long)]
-    skip_schemas: bool,
-    /// Only build/deploy the named module (repeatable)
-    #[arg(long = "module", value_name = "NAME")]
-    modules: Vec<String>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamedProxyConfig {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+impl FromStr for NamedProxyConfig {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let (name, path) = value
+            .split_once('=')
+            .ok_or_else(|| "proxy config must use NAME=PATH".to_string())?;
+        if name.is_empty() || path.is_empty() || path.contains('=') {
+            return Err("proxy config must use one non-empty NAME=PATH pair".to_string());
+        }
+        Ok(Self {
+            name: name.to_string(),
+            path: PathBuf::from(path),
+        })
+    }
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct RunArgs {
+    /// Path to the single manager config
+    #[arg(long, value_name = "PATH")]
+    manager_config: PathBuf,
+    /// Named proxy config, in NAME=PATH form (repeatable)
+    #[arg(long, value_name = "NAME=PATH", required = true)]
+    proxy_config: Vec<NamedProxyConfig>,
+    /// Engine config path (repeatable; zero engines is valid)
+    #[arg(long, value_name = "PATH")]
+    engine_config: Vec<PathBuf>,
+    /// Optional one-shot scenario command; must follow `--`
+    #[arg(last = true, value_name = "SCENARIO COMMAND")]
+    scenario: Vec<String>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -100,90 +95,22 @@ pub struct BuildArgs {
 }
 
 pub async fn run(args: DevArgs, _manager: Option<&str>) -> Result<()> {
-    let state_dir = args.state_dir;
     match args.command {
-        DevCommand::Up {
-            manager_config,
-            proxy_config,
-        } => print_response(
-            dev_supervisor::send_or_start(
-                &state_dir,
-                Request::Up {
-                    manager_config,
-                    proxy_config,
-                },
-            )
-            .await?,
-        ),
-        DevCommand::StartProxy { name, config } => print_response(
-            dev_supervisor::send_or_start(&state_dir, Request::StartProxy { name, config }).await?,
-        ),
-        DevCommand::Down => print_response(dev_supervisor::down(&state_dir).await?),
-        DevCommand::Wait => print_response(dev_supervisor::wait(&state_dir).await?),
-        DevCommand::Supervisor => dev_supervisor::run_supervisor(state_dir).await,
-        DevCommand::Build(build_args) => build(build_args),
-        DevCommand::Deploy(deploy_args) => deploy(deploy_args, &state_dir).await,
-        DevCommand::Status => {
-            print_response(dev_supervisor::send(&state_dir, Request::Status).await?)
-        }
-    }
-}
-
-fn print_response(response: dev_supervisor::Response) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(&response)?);
-    Ok(())
-}
-
-async fn deploy(args: DeployArgs, state_dir: &Path) -> Result<()> {
-    let config_path = &args.config;
-    let config = EngineConfig::from_file(config_path)?;
-
-    let modules_to_build: Vec<_> = if args.modules.is_empty() {
-        config.modules.iter().collect()
-    } else {
-        config
-            .modules
-            .iter()
-            .filter(|module| args.modules.contains(&module.name))
-            .collect()
-    };
-    if modules_to_build.is_empty() && !args.modules.is_empty() {
-        bail!(
-            "No modules matched: {:?}. Available: {:?}",
-            args.modules,
-            config
-                .modules
-                .iter()
-                .map(|module| &module.name)
-                .collect::<Vec<_>>()
-        );
-    }
-    if !args.skip_build {
-        let build_modules = modules_to_build
-            .iter()
-            .map(|module| BuildModule {
-                name: module.name.clone(),
-                wasm_path: module.wasm_path.clone(),
-                schema_path: module.schema_path.clone().unwrap_or_default(),
-                proto_path: None,
-                cargo_dir: None,
+        DevCommand::Run(run_args) => {
+            foreground_runner::run(RunSpec {
+                manager_config: run_args.manager_config,
+                proxies: run_args
+                    .proxy_config
+                    .into_iter()
+                    .map(|proxy| (proxy.name, proxy.path))
+                    .collect(),
+                engine_configs: run_args.engine_config,
+                scenario: run_args.scenario,
             })
-            .collect::<Vec<_>>();
-        if !args.skip_schemas {
-            build_helpers::compile_schemas(&build_modules)?;
+            .await
         }
-        build_helpers::build_wasm_modules(&build_modules, false)?;
+        DevCommand::Build(build_args) => build(build_args),
     }
-
-    print_response(
-        dev_supervisor::send_or_start(
-            state_dir,
-            Request::DeployEngine {
-                config: config_path.clone(),
-            },
-        )
-        .await?,
-    )
 }
 
 fn build(args: BuildArgs) -> Result<()> {
@@ -360,7 +287,37 @@ mod tests {
     }
 
     #[test]
-    fn dev_args_accept_state_dir_before_subcommand() {
+    fn dev_surface_contains_only_build_and_run() {
+        use clap::{CommandFactory as _, Parser as _};
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            dev: DevArgs,
+        }
+
+        let command = TestCli::command();
+        let subcommands = command
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(subcommands, BTreeSet::from(["build", "run"]));
+        for removed in [
+            "up",
+            "start-proxy",
+            "down",
+            "wait",
+            "deploy",
+            "status",
+            "supervisor",
+        ] {
+            assert!(TestCli::try_parse_from(["test", removed]).is_err());
+        }
+        assert!(TestCli::try_parse_from(["test", "--state-dir", "/tmp/wr-run", "build"]).is_err());
+    }
+
+    #[test]
+    fn dev_run_parses_locked_cardinality_and_preserves_scenario_arguments() {
         use clap::Parser as _;
 
         #[derive(clap::Parser)]
@@ -369,10 +326,54 @@ mod tests {
             dev: DevArgs,
         }
 
-        let parsed =
-            TestCli::try_parse_from(["test", "--state-dir", "/tmp/wr-run", "down"]).unwrap();
-        assert_eq!(parsed.dev.state_dir, PathBuf::from("/tmp/wr-run"));
-        assert!(matches!(parsed.dev.command, DevCommand::Down));
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "run",
+            "--manager-config",
+            "manager.toml",
+            "--proxy-config",
+            "primary=proxy.toml",
+            "--proxy-config",
+            "peer=peer.toml",
+            "--engine-config",
+            "engine.toml",
+            "--",
+            "sh",
+            "-c",
+            "exit 7",
+        ])
+        .unwrap();
+        let DevCommand::Run(run) = parsed.dev.command else {
+            panic!("expected dev run");
+        };
+        assert_eq!(run.manager_config, PathBuf::from("manager.toml"));
+        assert_eq!(run.proxy_config.len(), 2);
+        assert_eq!(run.engine_config, vec![PathBuf::from("engine.toml")]);
+        assert_eq!(run.scenario, ["sh", "-c", "exit 7"]);
+    }
+
+    #[test]
+    fn dev_run_rejects_missing_proxy_and_malformed_name_path() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            dev: DevArgs,
+        }
+
+        assert!(
+            TestCli::try_parse_from(["test", "run", "--manager-config", "manager.toml",]).is_err()
+        );
+        assert!(TestCli::try_parse_from([
+            "test",
+            "run",
+            "--manager-config",
+            "manager.toml",
+            "--proxy-config",
+            "missing-equals",
+        ])
+        .is_err());
     }
 
     #[test]

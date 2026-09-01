@@ -4,12 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wasmtime = { version = "46", features = [
-  "component-model",
+wasmtime = { version = "46", default-features = false, features = [
+  "anyhow",
+  "backtrace",
   "component-model-async",
+  "cranelift",
+  "demangle",
+  "parallel-compilation",
+  "pooling-allocator",
 ] }
-wasmtime-wasi = "46"
-wasmtime-wasi-http = { version = "46", features = ["default-send-request"] }
+wasmtime-wasi = { version = "46", default-features = false, features = ["p2"] }
+wasmtime-wasi-http = { version = "46", default-features = false, features = [
+  "p2",
+] }
+target-lexicon = "0.13"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["transport"] }

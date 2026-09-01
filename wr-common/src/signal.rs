@@ -1,55 +1,31 @@
+use std::future::Future;
+
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::process_lifecycle::{
-    LifecycleSnapshot, ProcessLifecycleCoordinator, TransitionError, TransitionReason,
+    LifecycleHandle, LifecycleSnapshot, TransitionError, TransitionReason,
 };
+use crate::task_group::{TaskGroup, TaskOutcome};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ShutdownRequest {
-    Drain {
-        reason: TransitionReason,
-        detail: String,
-    },
-    Stop {
-        reason: TransitionReason,
-        detail: String,
-    },
+pub struct ShutdownRequest {
+    pub reason: TransitionReason,
+    pub detail: String,
 }
 
 impl ShutdownRequest {
-    pub fn drain(reason: TransitionReason, detail: impl Into<String>) -> Self {
-        Self::Drain {
-            reason,
-            detail: detail.into(),
-        }
-    }
-
     pub fn stop(reason: TransitionReason, detail: impl Into<String>) -> Self {
-        Self::Stop {
+        Self {
             reason,
             detail: detail.into(),
         }
     }
-}
 
-/// Feed either an injected control request or an OS-signal request through the
-/// same monotonic coordinator path.
-pub fn apply_shutdown_request(
-    coordinator: &ProcessLifecycleCoordinator,
-    request: ShutdownRequest,
-) -> Result<LifecycleSnapshot, TransitionError> {
-    match request {
-        ShutdownRequest::Drain { reason, detail } => coordinator.request_drain(reason, detail),
-        ShutdownRequest::Stop { reason, detail } => {
-            match coordinator.request_drain(reason, detail.clone()) {
-                Ok(_) => coordinator.request_stop(reason, detail),
-                Err(TransitionError::Backwards {
-                    current: crate::process_lifecycle::ProcessState::Stopping,
-                    requested: crate::process_lifecycle::ProcessState::Draining,
-                }) => coordinator.request_stop(reason, detail),
-                Err(error) => Err(error),
-            }
-        }
+    pub async fn submit(
+        self,
+        lifecycle: &LifecycleHandle,
+    ) -> Result<LifecycleSnapshot, TransitionError> {
+        lifecycle.request_stop(self.reason, self.detail).await
     }
 }
 
@@ -68,59 +44,80 @@ pub async fn shutdown_signal_request() -> ShutdownRequest {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShutdownCause {
+    Signal,
+    RequiredTask(Option<TaskOutcome>),
+}
+
+/// Wait for the first process-owned shutdown cause and submit exactly one stop
+/// intent through the lifecycle driver. Required task evidence is retained for
+/// the executable's service-specific nonzero result.
+pub async fn wait_for_shutdown_trigger<F>(
+    lifecycle: &LifecycleHandle,
+    tasks: &mut TaskGroup,
+    signal: F,
+) -> Result<ShutdownCause, TransitionError>
+where
+    F: Future<Output = ShutdownRequest>,
+{
+    tokio::select! {
+        request = signal => {
+            request.submit(lifecycle).await?;
+            Ok(ShutdownCause::Signal)
+        }
+        outcome = tasks.next_completion() => {
+            let detail = outcome
+                .as_ref()
+                .map(|outcome| outcome.name.clone())
+                .unwrap_or_else(|| "all required tasks exited".to_string());
+            lifecycle
+                .request_stop(TransitionReason::TaskFailure, detail)
+                .await?;
+            Ok(ShutdownCause::RequiredTask(outcome))
+        }
+    }
+}
+
 pub async fn shutdown_signal_into(
-    coordinator: &ProcessLifecycleCoordinator,
+    lifecycle: &LifecycleHandle,
 ) -> Result<LifecycleSnapshot, TransitionError> {
-    apply_shutdown_request(coordinator, shutdown_signal_request().await)
+    shutdown_signal_request().await.submit(lifecycle).await
 }
 
 /// Compatibility wait for service wiring that remains owned by lifecycle Plan 2.
-/// New code should use [`shutdown_signal_into`].
 pub async fn shutdown_signal() {
     let _ = shutdown_signal_request().await;
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::process_lifecycle::{ProcessState, ServiceKind};
+    use std::time::Duration;
+
+    use crate::process_lifecycle::{LifecycleDriver, ProcessState, ServiceKind, TransitionReason};
+    use crate::task_group::TaskGroup;
 
     use super::*;
 
-    #[test]
-    fn injected_stop_uses_the_coordinator_path() {
-        let coordinator = ProcessLifecycleCoordinator::new(ServiceKind::Proxy, "proxy-test");
-        let stopped = apply_shutdown_request(
-            &coordinator,
-            ShutdownRequest::stop(TransitionReason::ControlStopRequested, "test request"),
-        )
-        .unwrap();
+    #[tokio::test]
+    async fn injected_stop_is_delivered_to_the_driver() {
+        let (driver, lifecycle) = LifecycleDriver::new(ServiceKind::Proxy, "proxy-test");
+        let mut tasks = TaskGroup::new();
+        tasks.spawn("lifecycle-driver", move |cancellation| {
+            driver.run(cancellation)
+        });
 
+        let stopped = ShutdownRequest::stop(TransitionReason::TaskFailure, "test request")
+            .submit(&lifecycle)
+            .await
+            .unwrap();
         assert_eq!(stopped.state, ProcessState::Stopping);
-        assert_eq!(stopped.reason, TransitionReason::ControlStopRequested);
+        assert_eq!(stopped.reason, TransitionReason::TaskFailure);
         assert_eq!(stopped.detail, "test request");
-    }
 
-    #[test]
-    fn injected_drain_does_not_imply_exit() {
-        let coordinator = ProcessLifecycleCoordinator::new(ServiceKind::Manager, "manager-test");
-        let draining = apply_shutdown_request(
-            &coordinator,
-            ShutdownRequest::drain(TransitionReason::ControlDrainRequested, "test drain"),
-        )
-        .unwrap();
-
-        assert_eq!(draining.state, ProcessState::Draining);
-    }
-
-    #[test]
-    fn duplicate_injected_stop_is_idempotent() {
-        let coordinator = ProcessLifecycleCoordinator::new(ServiceKind::Engine, "engine-test");
-        let request =
-            || ShutdownRequest::stop(TransitionReason::ControlStopRequested, "test request");
-
-        let first = apply_shutdown_request(&coordinator, request()).unwrap();
-        let duplicate = apply_shutdown_request(&coordinator, request()).unwrap();
-
-        assert_eq!(duplicate, first);
+        let report = tasks
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(report.is_clean(), "{report:?}");
     }
 }

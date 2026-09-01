@@ -79,73 +79,11 @@ create_s3_bucket stockmarket
 # ── Clean stale manager state ────────────────────────────────────────────
 clean_manager_state
 
-# ── Start manager + proxy ────────────────────────────────────────────────
-start_manager_proxy "$MANAGER_CFG" "$PROXY_CFG"
-
-# ── Deploy exchange engines ──────────────────────────────────────────────
-for ((i = 0; i < NUM_EXCHANGES; i++)); do
-	port=$((EXCHANGE_BASE_PORT + i))
-	deploy_engine "${EXCHANGE_CONFIGS[$i]}" "exchange engine $((i + 1))/${NUM_EXCHANGES}" "$port"
+configure_dev_run "$MANAGER_CFG"
+add_dev_proxy primary "$PROXY_CFG"
+for config in "${EXCHANGE_CONFIGS[@]}"; do
+	add_dev_engine "$config"
 done
-
-# ── Deploy ledger engine ─────────────────────────────────────────────────
-deploy_engine "$LEDGER_CFG" "ledger engine" "$LEDGER_PORT"
-list_services
-dev_status
-
-# ── Deploy simulator engine ──────────────────────────────────────────────
-deploy_engine "$SIMULATOR_CFG" "simulator engine" "$SIMULATOR_PORT"
-list_services
-dev_status
-
-if [ "$INLINE" = true ]; then
-	echo "==> Running simulator inline (10 traders, 20 orders each, 5 symbols, ${NUM_EXCHANGES} exchange(s))..."
-	just cli invoke \
-		--proxy http://127.0.0.1:9001 \
-		--destination http://stockmarket.simulator/stockmarket.SimulatorService/Run \
-		--source loadtest --source-ns stockmarket \
-		--body '{"num_traders": 10, "orders_per_trader": 20, "num_symbols": 5}'
-	exit $?
-fi
-
-# ── Build exchange port list for usage text ──────────────────────────────
-EXCHANGE_PORTS=""
-for ((i = 0; i < NUM_EXCHANGES; i++)); do
-	port=$((EXCHANGE_BASE_PORT + i))
-	if [ $i -eq 0 ]; then
-		EXCHANGE_PORTS=":${port}"
-	else
-		EXCHANGE_PORTS="${EXCHANGE_PORTS} + :${port}"
-	fi
-done
-
-cat <<USAGE
-
-All services running. Press Ctrl-C to stop.
-  Manager   : https://127.0.0.1:9000 (mTLS gRPC)
-  Proxy     : http://127.0.0.1:9001
-  Exchange  : ${EXCHANGE_PORTS} (${NUM_EXCHANGES} engine(s), DB-backed order book)
-  Ledger    : http://127.0.0.1:${LEDGER_PORT} (DB + S3 blobstore)
-  Simulator : http://127.0.0.1:${SIMULATOR_PORT}
-
-Run a simulation (default: 10 traders, 20 orders each, 5 symbols):
-  just cli invoke \\
-    --manager https://127.0.0.1:9000 \\
-    --proxy http://127.0.0.1:9001 \\
-    --destination http://stockmarket.simulator/stockmarket.SimulatorService/Run \\
-    --source loadtest --source-ns stockmarket \\
-    --body ''
-
-Stress test (100 traders, 100 orders each, 10 symbols = 10,000 orders):
-  just cli invoke \\
-    --manager https://127.0.0.1:9000 \\
-    --proxy http://127.0.0.1:9001 \\
-    --destination http://stockmarket.simulator/stockmarket.SimulatorService/Run \\
-    --source loadtest --source-ns stockmarket \\
-    --body '{"num_traders": 100, "orders_per_trader": 100, "num_symbols": 10}'
-
-Inspect metrics:
-  just cli --manager https://127.0.0.1:9000 metrics summary
-USAGE
-
-wait_for_supervisor
+add_dev_engine "$LEDGER_CFG"
+add_dev_engine "$SIMULATOR_CFG"
+run_example_scenario examples/stockmarket/scenario.sh --exchanges "$NUM_EXCHANGES"

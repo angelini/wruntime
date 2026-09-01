@@ -20,7 +20,7 @@ just validate-all --no-deployment-e2e # full local suite with an explicit live-s
 just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e # Pi sandbox
 just validate-all --deployment-e2e    # trusted runner: require both live deployment backends
 just deployment-e2e-python-test       # locked provider/assertion unit tests
-just test-lifecycle-runners            # supervisor/wait/cleanup fixtures
+just test-lifecycle-runners            # foreground runner/barrier/reaping fixtures
 just deployment-e2e-preflight         # non-mutating Proxmox target verification
 just dev-down                # stop dev infrastructure
 ```
@@ -67,14 +67,7 @@ WASM host binding tests require:
 
 Example inline scripts require the built workspace binaries, the same dev
 infrastructure, and Python 3 for small JSON/config rendering and assertions.
-The multi-node smoke test requires Postgres but not RustFS. Each run creates a
-temporary config/state directory and uses one persistent `wr-cli dev`
-supervisor. The supervisor owns every local service child, waits on typed
-lifecycle state, and reaps engines, proxies, then manager before cleanup removes
-the run directory. A primary test failure remains primary; cleanup failure is
-reported separately, makes an otherwise clean run fail, and retains the run
-state. The codegen example uses `wr-cli invoke --json` and Python stdlib JSON
-parsing; no `jq` dependency is required.
+The multi-node smoke test requires Postgres but not RustFS. `just test-lifecycle-runners` uses focused OS-process and local gRPC fixtures for `dev run` argument validation, fixed startup order and within-wave concurrency, READY activation and exit-before-ready tails, the shared routing deadline and scenario gate, zero-descendant one-shot success, unexpected-service scenario-tree cleanup, primary/cleanup/both-failure reporting, recorded-signal spawn guards, subprocess parent-death protection, and a controlled post-boundary exit that proves reap-before-return while retaining terminal evidence. Real SIGINT fixtures run serially and cover interruption during readiness, routing convergence, no-scenario monitoring, plus second-signal scenario escalation. The runner retains every service `Child` and the scenario process group until reaping proves exit; the fixtures also assert that no owned descendant, state socket, lock, or persistent process state remains. Repository example Just recipes build artifacts first, then each run script makes one foreground `dev run` call with its scenario. The codegen example uses `wr-cli invoke --json` and Python stdlib JSON parsing; no `jq` dependency is required.
 
 `just validate-all` is a thin alias for `dev/validate-all.sh`. The script
 orchestrates existing Just recipes for formatting, compile checks, lints, WASM
@@ -126,7 +119,7 @@ service and waits on the exact launcher-issued activation identity and manager s
 deployment and rollback wait on exact `VerifyDeployment` identity and conditions. Post-ready guest invocations run
 once. Expected unhealthy evidence uses `cluster wait` and therefore succeeds
 with a matching JSON snapshot rather than an expected non-zero display gate.
-Engine stop uses lifecycle control followed by a systemd/container-exit expectation under one absolute deadline; each SSH probe consumes the same budget, and failure records the requested process instance plus the last backend or query state.
+Engine stop uses one `wr-cli node stop --json` call. The command maps the engine slot to the generated systemd unit or Docker Compose service and owns graceful action, bounded escalation, and final-exit inspection under one absolute 45-second deadline. The harness validates and retains its structured component/backend/target/action/final-state record, keeps the proxy available while cluster status becomes unhealthy, and performs no lifecycle tunnel or separate backend poll.
 Per-task output, lifecycle state JSON, remote diagnostics, bundle inspections,
 and the final reset result are retained under `WR_VALIDATE_LOG_DIR` (or
 `target/validate-all/<timestamp>/`). Diagnostic collection failures are listed

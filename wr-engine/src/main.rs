@@ -6,6 +6,8 @@ use wr_engine::config::{self, EnvValue};
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -15,10 +17,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use wr_common::lifecycle_service::{notify_supervisor, AdmissionGate};
-use wr_common::process_lifecycle::{
-    ProcessLifecycleCoordinator, ProcessState, ServiceKind, TransitionReason,
-};
-use wr_common::signal::{apply_shutdown_request, shutdown_signal_request};
+use wr_common::process_lifecycle::{LifecycleDriver, ProcessState, ServiceKind, TransitionReason};
+use wr_common::signal::{shutdown_signal_request, wait_for_shutdown_trigger, ShutdownCause};
 use wr_common::task_group::{TaskExit, TaskGroup};
 use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
 use wr_common::wruntime::{
@@ -28,6 +28,149 @@ use wr_common::wruntime::{
 };
 
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
+
+type ShutdownOperation<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+
+trait EngineShutdownOperations {
+    fn fence_claims(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_>;
+    fn withdraw_routes(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_>;
+    fn drain_http(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_>;
+    fn drain_workers(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_>;
+    fn deregister(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_>;
+    fn join_tasks(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_>;
+}
+
+async fn run_engine_shutdown(
+    operations: &mut impl EngineShutdownOperations,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    macro_rules! execute {
+        ($name:literal, $operation:expr) => {
+            if let Err(error) = $operation.await {
+                failures.push(format!("{} failed: {error:#}", $name));
+            }
+        };
+    }
+    execute!("fence claims", operations.fence_claims(deadline));
+    execute!("withdraw routes", operations.withdraw_routes(deadline));
+    execute!("drain HTTP", operations.drain_http(deadline));
+    execute!("drain workers", operations.drain_workers(deadline));
+    execute!("deregister", operations.deregister(deadline));
+    execute!("join tasks", operations.join_tasks(deadline));
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
+    }
+}
+
+async fn drain_http_admission(
+    admission: &AdmissionGate,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    admission.close();
+    admission
+        .wait_for_idle(deadline)
+        .await
+        .map_err(|remaining| {
+            anyhow::anyhow!("engine HTTP drain timed out with {remaining} requests in flight")
+        })
+}
+
+async fn shutdown_engine_tasks(
+    tasks: &mut TaskGroup,
+    deadline: tokio::time::Instant,
+    supervisor_notification: std::io::Result<()>,
+) -> Result<()> {
+    let notification_failure = supervisor_notification
+        .context("failed to notify supervisor that engine is stopping")
+        .err();
+    let report = tasks.shutdown(deadline).await;
+    match (notification_failure, report.is_clean()) {
+        (None, true) => Ok(()),
+        (Some(error), true) => Err(error),
+        (None, false) => anyhow::bail!("engine task shutdown was not clean: {report:?}"),
+        (Some(error), false) => {
+            anyhow::bail!("{error:#}; engine task shutdown was not clean: {report:?}")
+        }
+    }
+}
+
+struct ProductionEngineShutdown<'a> {
+    worker_admission: &'a AdmissionGate,
+    http_admission: &'a AdmissionGate,
+    client: &'a mut NodeServiceClient<tonic::transport::Channel>,
+    engine_id: &'a str,
+    tasks: &'a mut TaskGroup,
+}
+
+impl EngineShutdownOperations for ProductionEngineShutdown<'_> {
+    fn fence_claims(&mut self, _deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+        Box::pin(async move {
+            self.worker_admission.close();
+            Ok(())
+        })
+    }
+
+    fn withdraw_routes(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+        Box::pin(async move {
+            let response = tokio::time::timeout_at(
+                deadline,
+                self.client.begin_engine_drain(BeginEngineDrainRequest {
+                    engine_id: self.engine_id.to_string(),
+                }),
+            )
+            .await
+            .context("engine route withdrawal timed out")?
+            .context("engine route withdrawal failed")?
+            .into_inner();
+            anyhow::ensure!(
+                response.proxy_routing_table_version >= response.manager_routing_table_version,
+                "proxy acknowledged an unconverged engine withdrawal"
+            );
+            Ok(())
+        })
+    }
+
+    fn drain_http(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+        Box::pin(drain_http_admission(self.http_admission, deadline))
+    }
+
+    fn drain_workers(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+        Box::pin(async move {
+            self.worker_admission
+                .wait_for_idle(deadline)
+                .await
+                .map_err(|remaining| {
+                    anyhow::anyhow!("engine worker drain timed out with {remaining} jobs in flight")
+                })
+        })
+    }
+
+    fn deregister(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+        Box::pin(async move {
+            tokio::time::timeout_at(
+                deadline,
+                self.client.deregister_engine(DeregisterEngineRequest {
+                    engine_id: self.engine_id.to_string(),
+                }),
+            )
+            .await
+            .context("engine deregistration timed out")?
+            .context("engine deregistration failed")?;
+            Ok(())
+        })
+    }
+
+    fn join_tasks(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+        Box::pin(shutdown_engine_tasks(
+            self.tasks,
+            deadline,
+            notify_supervisor("STOPPING=1"),
+        ))
+    }
+}
 
 fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
@@ -154,7 +297,7 @@ async fn connect_proxy(address: &str) -> Result<NodeServiceClient<tonic::transpo
 async fn run_service(config_path: &str) -> Result<()> {
     let config = config::EngineConfig::load(config_path)?;
     let engine_id = Uuid::new_v4().to_string();
-    let lifecycle = ProcessLifecycleCoordinator::new(
+    let (lifecycle_driver, lifecycle) = LifecycleDriver::new(
         ServiceKind::Engine,
         wr_common::process_lifecycle::resolve_process_instance_id(engine_id.clone()),
     );
@@ -189,13 +332,15 @@ async fn run_service(config_path: &str) -> Result<()> {
     let registry = registry::ModuleRegistry::new();
     let mut runner = engine::EngineRunner::new(config.clone())?;
     let mut tasks = TaskGroup::new();
+    tasks.spawn("lifecycle-driver", move |cancellation| {
+        lifecycle_driver.run(cancellation)
+    });
     runner.spawn_epoch_ticker(&mut tasks);
     {
         let registry = registry.clone();
         let database = runner.admin_pool();
         let defaults = Arc::new(server::WorkerDefaults::from_modules(&config.modules)?);
         let admission = http_admission.clone();
-        let workers = worker_admission.clone();
         let lifecycle = lifecycle.clone();
         tasks.spawn("engine-http-listener", move |cancellation| {
             server::serve(
@@ -205,9 +350,8 @@ async fn run_service(config_path: &str) -> Result<()> {
                 defaults,
                 server::EngineAdmission {
                     workload: admission,
-                    worker: workers,
                 },
-                lifecycle,
+                lifecycle.snapshot(),
                 cancellation,
             )
         });
@@ -378,7 +522,9 @@ async fn run_service(config_path: &str) -> Result<()> {
 
         http_admission.open();
         worker_admission.open();
-        lifecycle.mark_ready("modules healthy and routing convergence acknowledged")?;
+        lifecycle
+            .mark_ready("modules healthy and routing convergence acknowledged")
+            .await?;
         notify_supervisor("READY=1")?;
         info!(
             engine_id,
@@ -394,7 +540,9 @@ async fn run_service(config_path: &str) -> Result<()> {
         let shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_BUDGET;
         http_admission.close();
         worker_admission.close();
-        let _ = lifecycle.request_stop(TransitionReason::TaskFailure, "engine startup failed");
+        let _ = lifecycle
+            .request_stop(TransitionReason::TaskFailure, "engine startup failed")
+            .await;
         let _ = notify_supervisor("STOPPING=1");
         if let Some(client) = node_client.as_mut() {
             let _ = tokio::time::timeout_at(
@@ -415,7 +563,7 @@ async fn run_service(config_path: &str) -> Result<()> {
         let heartbeat_engine_id = engine_id.clone();
         let heartbeat_registry = registry.clone();
         let heartbeat_modules = config.modules.clone();
-        let lifecycle_handle = lifecycle.handle();
+        let lifecycle_handle = lifecycle.snapshot();
         tasks.spawn("engine-heartbeat", move |mut cancellation| async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3));
             loop {
@@ -423,7 +571,7 @@ async fn run_service(config_path: &str) -> Result<()> {
                     _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
                     _ = interval.tick() => {}
                 }
-                if lifecycle_handle.current().state >= ProcessState::Draining {
+                if lifecycle_handle.current().state == ProcessState::Stopping {
                     continue;
                 }
                 let healthy =
@@ -439,162 +587,47 @@ async fn run_service(config_path: &str) -> Result<()> {
         });
     }
 
-    let mut updates = lifecycle.handle().subscribe();
     let mut failure: Option<anyhow::Error> = None;
-    loop {
-        tokio::select! {
-            request = shutdown_signal_request() => {
-                if let Err(error) = apply_shutdown_request(&lifecycle, request) {
-                    failure = Some(error.into());
-                    let _ = lifecycle.request_stop(
-                        TransitionReason::TaskFailure,
-                        "engine shutdown transition failed",
-                    );
-                }
-                break;
-            }
-            changed = updates.changed() => {
-                if changed.is_err() {
-                    failure = Some(anyhow::anyhow!("lifecycle coordinator closed unexpectedly"));
-                    let _ = lifecycle.request_stop(
-                        TransitionReason::TaskFailure,
-                        "engine lifecycle coordinator closed",
-                    );
-                    break;
-                }
-                if updates.borrow().state >= ProcessState::Draining {
-                    break;
-                }
-            }
-            outcome = tasks.next_completion() => {
-                if let Some(outcome) = outcome {
-                    failure = Some(anyhow::anyhow!("required task {} exited: {:?}", outcome.name, outcome.kind));
-                    let _ = lifecycle.request_stop(TransitionReason::TaskFailure, outcome.name);
-                } else {
-                    failure = Some(anyhow::anyhow!("all required engine tasks exited"));
-                    let _ = lifecycle.request_stop(
-                        TransitionReason::TaskFailure,
-                        "all required engine tasks exited",
-                    );
-                }
-                break;
-            }
+    match wait_for_shutdown_trigger(&lifecycle, &mut tasks, shutdown_signal_request()).await {
+        Ok(ShutdownCause::Signal) => {}
+        Ok(ShutdownCause::RequiredTask(Some(outcome))) => {
+            failure = Some(anyhow::anyhow!(
+                "required task {} exited: {:?}",
+                outcome.name,
+                outcome.kind
+            ));
         }
-    }
-
-    let mut drain_deadline = tokio::time::Instant::now() + SHUTDOWN_BUDGET;
-    worker_admission.close();
-    let withdrawal = tokio::time::timeout_at(
-        drain_deadline,
-        client.begin_engine_drain(BeginEngineDrainRequest {
-            engine_id: engine_id.clone(),
-        }),
-    )
-    .await;
-    match withdrawal {
-        Ok(Ok(response)) => {
-            let response = response.into_inner();
-            if response.proxy_routing_table_version < response.manager_routing_table_version {
-                failure = Some(anyhow::anyhow!(
-                    "proxy acknowledged an unconverged engine withdrawal"
-                ));
-            }
+        Ok(ShutdownCause::RequiredTask(None)) => {
+            failure = Some(anyhow::anyhow!("all required engine tasks exited"));
         }
-        Ok(Err(error)) => {
-            failure = Some(anyhow::anyhow!("engine route withdrawal failed: {error}"));
-        }
-        Err(_) => {
-            failure = Some(anyhow::anyhow!("engine route withdrawal timed out"));
-        }
-    }
-
-    http_admission.close();
-    if let Err(remaining) = http_admission.wait_for_idle(drain_deadline).await {
-        failure.get_or_insert_with(|| {
-            anyhow::anyhow!("engine HTTP drain timed out with {remaining} requests in flight")
-        });
-    }
-    if let Err(remaining) = worker_admission.wait_for_idle(drain_deadline).await {
-        failure.get_or_insert_with(|| {
-            anyhow::anyhow!("engine worker drain timed out with {remaining} jobs in flight")
-        });
-    }
-    match tokio::time::timeout_at(
-        drain_deadline,
-        client.deregister_engine(DeregisterEngineRequest {
-            engine_id: engine_id.clone(),
-        }),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            failure.get_or_insert_with(|| anyhow::anyhow!("engine deregistration failed: {error}"));
-        }
-        Err(_) => {
-            failure.get_or_insert_with(|| anyhow::anyhow!("engine deregistration timed out"));
-        }
-    }
-
-    if failure.is_none() && lifecycle.current().state == ProcessState::Draining {
-        loop {
-            tokio::select! {
-                request = shutdown_signal_request() => {
-                    if let Err(error) = apply_shutdown_request(&lifecycle, request) {
-                        failure = Some(error.into());
-                        let _ = lifecycle.request_stop(
-                            TransitionReason::TaskFailure,
-                            "engine stop transition failed",
-                        );
-                    }
-                    break;
-                }
-                changed = updates.changed() => {
-                    if changed.is_err() || updates.borrow().state == ProcessState::Stopping {
-                        break;
-                    }
-                }
-                outcome = tasks.next_completion() => {
-                    if let Some(outcome) = outcome {
-                        failure = Some(anyhow::anyhow!("required task {} exited while engine was drained: {:?}", outcome.name, outcome.kind));
-                        let _ = lifecycle.request_stop(TransitionReason::TaskFailure, outcome.name);
-                    } else {
-                        failure = Some(anyhow::anyhow!("all required engine tasks exited while drained"));
-                        let _ = lifecycle.request_stop(
-                            TransitionReason::TaskFailure,
-                            "all required engine tasks exited while drained",
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-        // Drain remains observable without implying exit. A subsequent Stop
-        // request begins the separate final control-listener shutdown budget.
-        drain_deadline = tokio::time::Instant::now() + SHUTDOWN_BUDGET;
+        Err(error) => failure = Some(error.into()),
     }
 
     if lifecycle.current().state != ProcessState::Stopping {
-        if let Err(error) = lifecycle.request_stop(
-            if failure.is_some() {
-                TransitionReason::TaskFailure
-            } else {
-                TransitionReason::ShutdownOrchestration
-            },
-            "engine drain complete",
-        ) {
+        if let Err(error) = lifecycle
+            .request_stop(
+                TransitionReason::ShutdownOrchestration,
+                "engine shutdown started",
+            )
+            .await
+        {
             failure.get_or_insert_with(|| error.into());
         }
     }
-    if let Err(error) = notify_supervisor("STOPPING=1") {
-        failure.get_or_insert_with(|| {
-            anyhow::Error::new(error).context("failed to notify supervisor that engine is stopping")
-        });
-    }
-    let report = tasks.shutdown(drain_deadline).await;
-    if !report.is_clean() {
-        failure.get_or_insert_with(|| {
-            anyhow::anyhow!("engine task shutdown was not clean: {report:?}")
+    let drain_deadline = tokio::time::Instant::now() + SHUTDOWN_BUDGET;
+    let mut shutdown = ProductionEngineShutdown {
+        worker_admission: &worker_admission,
+        http_admission: &http_admission,
+        client: &mut client,
+        engine_id: &engine_id,
+        tasks: &mut tasks,
+    };
+    if let Err(shutdown_error) = run_engine_shutdown(&mut shutdown, drain_deadline).await {
+        failure = Some(match failure.take() {
+            Some(primary) => anyhow::anyhow!(
+                "{primary:#}; engine shutdown operations also failed: {shutdown_error:#}"
+            ),
+            None => shutdown_error,
         });
     }
 
@@ -603,5 +636,247 @@ async fn run_service(config_path: &str) -> Result<()> {
         Err(error)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use wr_common::signal::ShutdownRequest;
+
+    #[derive(Default)]
+    struct RecordingShutdown {
+        calls: Vec<(&'static str, tokio::time::Instant)>,
+        fail_at: Option<&'static str>,
+    }
+
+    impl RecordingShutdown {
+        fn record(
+            &mut self,
+            operation: &'static str,
+            deadline: tokio::time::Instant,
+        ) -> ShutdownOperation<'_> {
+            self.calls.push((operation, deadline));
+            let result = if self.fail_at == Some(operation) {
+                Err(anyhow::anyhow!("injected {operation} failure"))
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    impl EngineShutdownOperations for RecordingShutdown {
+        fn fence_claims(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+            self.record("fence_claims", deadline)
+        }
+
+        fn withdraw_routes(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+            self.record("withdraw_routes", deadline)
+        }
+
+        fn drain_http(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+            self.record("drain_http", deadline)
+        }
+
+        fn drain_workers(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+            self.record("drain_workers", deadline)
+        }
+
+        fn deregister(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+            self.record("deregister", deadline)
+        }
+
+        fn join_tasks(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+            self.record("join_tasks", deadline)
+        }
+    }
+
+    struct DeadlineConsumingShutdown {
+        calls: Vec<(&'static str, tokio::time::Instant)>,
+        http_admission: AdmissionGate,
+        tasks: TaskGroup,
+    }
+
+    impl DeadlineConsumingShutdown {
+        fn record(&mut self, operation: &'static str, deadline: tokio::time::Instant) {
+            self.calls.push((operation, deadline));
+        }
+    }
+
+    impl EngineShutdownOperations for DeadlineConsumingShutdown {
+        fn fence_claims(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+            self.record("fence_claims", deadline);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn withdraw_routes(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+            self.record("withdraw_routes", deadline);
+            Box::pin(async move {
+                tokio::time::sleep_until(deadline).await;
+                anyhow::bail!("shared deadline consumed by route withdrawal")
+            })
+        }
+
+        fn drain_http(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+            self.record("drain_http", deadline);
+            Box::pin(drain_http_admission(&self.http_admission, deadline))
+        }
+
+        fn drain_workers(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+            self.record("drain_workers", deadline);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn deregister(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+            self.record("deregister", deadline);
+            Box::pin(async { anyhow::bail!("deregistration deadline expired") })
+        }
+
+        fn join_tasks(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+            self.record("join_tasks", deadline);
+            Box::pin(shutdown_engine_tasks(
+                &mut self.tasks,
+                deadline,
+                Err(std::io::Error::other(
+                    "synthetic STOPPING notification failure",
+                )),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_owned_engine_shutdown_executes_real_sequence_under_one_deadline() -> Result<()>
+    {
+        let (driver, lifecycle) = LifecycleDriver::new(ServiceKind::Engine, "engine-test");
+        let mut tasks = TaskGroup::new();
+        tasks.spawn("lifecycle-driver", move |cancellation| {
+            driver.run(cancellation)
+        });
+        tasks.spawn("engine-required", |mut cancellation| async move {
+            cancellation.cancelled().await;
+            Ok(TaskExit::Cancelled)
+        });
+
+        let cause = wait_for_shutdown_trigger(&lifecycle, &mut tasks, async {
+            ShutdownRequest::stop(TransitionReason::SignalInterrupt, "SIGINT fixture")
+        })
+        .await?;
+        assert_eq!(cause, ShutdownCause::Signal);
+        assert_eq!(lifecycle.current().state, ProcessState::Stopping);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let expected = [
+            "fence_claims",
+            "withdraw_routes",
+            "drain_http",
+            "drain_workers",
+            "deregister",
+            "join_tasks",
+        ];
+        for failed_operation in ["withdraw_routes", "drain_http", "deregister", "join_tasks"] {
+            let mut shutdown = RecordingShutdown {
+                fail_at: Some(failed_operation),
+                ..RecordingShutdown::default()
+            };
+            let error = run_engine_shutdown(&mut shutdown, deadline)
+                .await
+                .expect_err("injected operation failure unexpectedly reported success");
+            assert!(error.to_string().contains(failed_operation));
+            assert_eq!(
+                shutdown
+                    .calls
+                    .iter()
+                    .map(|(operation, _)| *operation)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(
+                shutdown
+                    .calls
+                    .iter()
+                    .all(|(_, observed)| *observed == deadline),
+                "every real shutdown operation must receive the same absolute deadline"
+            );
+        }
+
+        let expired_deadline = tokio::time::Instant::now();
+        let mut expired = RecordingShutdown::default();
+        run_engine_shutdown(&mut expired, expired_deadline).await?;
+        assert_eq!(
+            expired
+                .calls
+                .iter()
+                .map(|(operation, _)| *operation)
+                .collect::<Vec<_>>(),
+            expected,
+            "deadline exhaustion must not skip mandatory cleanup operations"
+        );
+        assert!(expired
+            .calls
+            .iter()
+            .all(|(_, observed)| *observed == expired_deadline));
+
+        let report = tasks.shutdown(deadline).await;
+        assert!(report.is_clean(), "{report:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deadline_consumed_mid_sequence_still_runs_local_cleanup_and_task_shutdown() {
+        let mut owned_tasks = TaskGroup::new();
+        owned_tasks.spawn("non-terminating-owned-task", |_| async {
+            std::future::pending::<()>().await;
+            Ok(TaskExit::Completed)
+        });
+        let http_admission = AdmissionGate::closed();
+        http_admission.open();
+        let in_flight = http_admission
+            .try_enter()
+            .expect("fixture HTTP request was not admitted");
+        let mut shutdown = DeadlineConsumingShutdown {
+            calls: Vec::new(),
+            http_admission,
+            tasks: owned_tasks,
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+        let started = tokio::time::Instant::now();
+        let error = run_engine_shutdown(&mut shutdown, deadline)
+            .await
+            .expect_err("injected deadline exhaustion unexpectedly reported success");
+
+        assert_eq!(
+            shutdown
+                .calls
+                .iter()
+                .map(|(operation, _)| *operation)
+                .collect::<Vec<_>>(),
+            [
+                "fence_claims",
+                "withdraw_routes",
+                "drain_http",
+                "drain_workers",
+                "deregister",
+                "join_tasks",
+            ]
+        );
+        assert!(shutdown
+            .calls
+            .iter()
+            .all(|(_, observed)| *observed == deadline));
+        assert!(!shutdown.http_admission.is_open());
+        assert_eq!(shutdown.http_admission.in_flight(), 1);
+        assert!(shutdown.tasks.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "expired shutdown introduced a replacement grace period"
+        );
+        let evidence = error.to_string();
+        assert!(evidence.contains("shared deadline consumed by route withdrawal"));
+        assert!(evidence.contains("engine HTTP drain timed out with 1 requests in flight"));
+        assert!(evidence.contains("deregistration deadline expired"));
+        assert!(evidence.contains("synthetic STOPPING notification failure"));
+        assert!(evidence.contains("engine task shutdown was not clean"));
+        drop(in_flight);
     }
 }

@@ -658,7 +658,8 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     let readiness = helpers::wait_for_lifecycle_ready(
         &manager_addr,
         Some(&deploy_tls),
-        Some(&expected_instance),
+        wr_common::wruntime::ServiceKind::Manager,
+        &expected_instance,
         Duration::from_secs(60),
     )
     .await;

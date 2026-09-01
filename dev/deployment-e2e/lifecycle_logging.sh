@@ -36,6 +36,46 @@ run_to_log() {
 	fi
 }
 
+assert_node_stop_record() {
+	local record="$1" backend="$2" component="$3"
+	"${PYTHON[@]}" - "$record" "$backend" "$component" <<'PY'
+import json, pathlib, sys
+path, backend, component = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+value = json.loads(path.read_text())
+if component != value.get("component"):
+    raise SystemExit(f"wrong stop component: {value!r}")
+if backend != value.get("backend"):
+    raise SystemExit(f"wrong stop backend: {value!r}")
+kind, separator, slot = component.partition(":")
+if kind != "engine" or not separator or not slot:
+    raise SystemExit(f"invalid expected component: {component!r}")
+expected_target = f"wr-engine-{slot}.service" if backend == "systemd" else f"engine-{slot}"
+if value.get("target") != expected_target:
+    raise SystemExit(f"wrong stop target: {value!r}")
+if value.get("final_exited") is not True:
+    raise SystemExit(f"stop did not prove final exit: {value!r}")
+elapsed = value.get("elapsed_ms")
+if isinstance(elapsed, bool) or not isinstance(elapsed, int) or not 0 <= elapsed <= 45_000:
+    raise SystemExit(f"invalid stop elapsed budget: {value!r}")
+result = value.get("graceful_result")
+if result not in {"already-stopped", "stopped", "escalated"}:
+    raise SystemExit(f"invalid graceful disposition: {value!r}")
+actions = (value.get("graceful_action"), value.get("force_action"))
+for action in actions:
+    if not isinstance(action, dict) or action.get("status") not in {"not-attempted", "succeeded", "failed"}:
+        raise SystemExit(f"invalid stop action evidence: {value!r}")
+force_status = actions[1]["status"]
+if value.get("forced") is not (force_status == "succeeded"):
+    raise SystemExit(f"forced flag contradicts force action: {value!r}")
+if result == "already-stopped" and any(action["status"] != "not-attempted" for action in actions):
+    raise SystemExit(f"already-stopped record contains attempted actions: {value!r}")
+if result == "stopped" and force_status != "not-attempted":
+    raise SystemExit(f"graceful stop record contains force action: {value!r}")
+if result == "escalated" and force_status == "not-attempted":
+    raise SystemExit(f"escalated record omits force action: {value!r}")
+PY
+}
+
 collect_diagnostic() {
 	local name="$1" log="$2" status
 	shift 2

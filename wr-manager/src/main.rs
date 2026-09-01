@@ -19,10 +19,8 @@ use tonic::transport::{Endpoint, Server};
 use tracing::{info, warn};
 use uuid::Uuid;
 use wr_common::lifecycle_service::{notify_supervisor, AdmissionGate, LifecycleServiceAdapter};
-use wr_common::process_lifecycle::{
-    ProcessLifecycleCoordinator, ProcessState, ServiceKind, TransitionReason,
-};
-use wr_common::signal::{apply_shutdown_request, shutdown_signal_request};
+use wr_common::process_lifecycle::{LifecycleDriver, ProcessState, ServiceKind, TransitionReason};
+use wr_common::signal::{shutdown_signal_request, wait_for_shutdown_trigger, ShutdownCause};
 use wr_common::task_group::{TaskExit, TaskGroup};
 use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
 use wr_common::wruntime::lifecycle_service_server::LifecycleServiceServer;
@@ -96,7 +94,7 @@ async fn lifecycle_probe(config_path: &str) -> Result<()> {
 
 async fn run_service(config_path: &str) -> Result<()> {
     let manager_id = Uuid::new_v4().to_string();
-    let lifecycle = ProcessLifecycleCoordinator::new(
+    let (lifecycle_driver, lifecycle) = LifecycleDriver::new(
         ServiceKind::Manager,
         wr_common::process_lifecycle::resolve_process_instance_id(manager_id.clone()),
     );
@@ -183,8 +181,7 @@ async fn run_service(config_path: &str) -> Result<()> {
         Arc::clone(&cluster),
         admission.clone(),
     );
-    let lifecycle_service =
-        LifecycleServiceAdapter::new(lifecycle.clone(), Some(admission.clone()));
+    let lifecycle_service = LifecycleServiceAdapter::new(lifecycle.snapshot());
     let router = server
         .add_service(ManagerServiceServer::new(manager))
         .add_service(LifecycleServiceServer::new(lifecycle_service));
@@ -200,6 +197,9 @@ async fn run_service(config_path: &str) -> Result<()> {
     }
 
     let mut tasks = TaskGroup::new();
+    tasks.spawn("lifecycle-driver", move |cancellation| {
+        lifecycle_driver.run(cancellation)
+    });
     tasks.spawn("manager-grpc", move |cancellation| async move {
         let mut shutdown = cancellation.clone();
         router
@@ -337,115 +337,62 @@ async fn run_service(config_path: &str) -> Result<()> {
 
     let mut failure: Option<anyhow::Error> = None;
     admission.open();
-    if let Err(error) =
-        lifecycle.mark_ready("database, gossip, scheduler, monitor, and gRPC listener ready")
+    if let Err(error) = lifecycle
+        .mark_ready("database, gossip, scheduler, monitor, and gRPC listener ready")
+        .await
     {
         failure = Some(error.into());
-        let _ = lifecycle.request_stop(TransitionReason::TaskFailure, "manager readiness failed");
+        let _ = lifecycle
+            .request_stop(TransitionReason::TaskFailure, "manager readiness failed")
+            .await;
     } else if let Err(error) = notify_supervisor("READY=1") {
         failure = Some(
             anyhow::Error::new(error).context("failed to notify supervisor that manager is ready"),
         );
-        let _ = lifecycle.request_stop(
-            TransitionReason::TaskFailure,
-            "manager supervisor readiness notification failed",
-        );
+        let _ = lifecycle
+            .request_stop(
+                TransitionReason::TaskFailure,
+                "manager supervisor readiness notification failed",
+            )
+            .await;
     } else {
         info!(address = %addr, manager_id, "manager ready");
     }
 
-    let mut updates = lifecycle.handle().subscribe();
     if failure.is_none() {
-        loop {
-            tokio::select! {
-                request = shutdown_signal_request() => {
-                    if let Err(error) = apply_shutdown_request(&lifecycle, request) {
-                        failure = Some(error.into());
-                        let _ = lifecycle.request_stop(
-                            TransitionReason::TaskFailure,
-                            "manager shutdown transition failed",
-                        );
-                    }
-                    break;
-                }
-                changed = updates.changed() => {
-                    if changed.is_err() {
-                        anyhow::bail!("lifecycle coordinator closed unexpectedly");
-                    }
-                    if updates.borrow().state >= ProcessState::Draining {
-                        break;
-                    }
-                }
-                outcome = tasks.next_completion() => {
-                    if let Some(outcome) = outcome {
-                        failure = Some(anyhow::anyhow!("required task {} exited: {:?}", outcome.name, outcome.kind));
-                        let _ = lifecycle.request_stop(TransitionReason::TaskFailure, outcome.name);
-                    } else {
-                        failure = Some(anyhow::anyhow!("all required manager tasks exited"));
-                        let _ = lifecycle.request_stop(
-                            TransitionReason::TaskFailure,
-                            "all required manager tasks exited",
-                        );
-                    }
-                    break;
-                }
+        match wait_for_shutdown_trigger(&lifecycle, &mut tasks, shutdown_signal_request()).await {
+            Ok(ShutdownCause::Signal) => {}
+            Ok(ShutdownCause::RequiredTask(Some(outcome))) => {
+                failure = Some(anyhow::anyhow!(
+                    "required task {} exited: {:?}",
+                    outcome.name,
+                    outcome.kind
+                ));
             }
+            Ok(ShutdownCause::RequiredTask(None)) => {
+                failure = Some(anyhow::anyhow!("all required manager tasks exited"));
+            }
+            Err(error) => failure = Some(error.into()),
         }
     }
 
-    let mut shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_BUDGET;
+    if lifecycle.current().state != ProcessState::Stopping {
+        if let Err(error) = lifecycle
+            .request_stop(
+                TransitionReason::ShutdownOrchestration,
+                "manager shutdown started",
+            )
+            .await
+        {
+            failure.get_or_insert_with(|| error.into());
+        }
+    }
+    let shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_BUDGET;
     admission.close();
     if let Err(remaining) = admission.wait_for_idle(shutdown_deadline).await {
         failure.get_or_insert_with(|| {
             anyhow::anyhow!("manager drain timed out with {remaining} mutations in flight")
         });
-    }
-
-    if failure.is_none() && lifecycle.current().state == ProcessState::Draining {
-        loop {
-            tokio::select! {
-                request = shutdown_signal_request() => {
-                    if let Err(error) = apply_shutdown_request(&lifecycle, request) {
-                        failure = Some(error.into());
-                        let _ = lifecycle.request_stop(
-                            TransitionReason::TaskFailure,
-                            "manager stop transition failed",
-                        );
-                    }
-                    break;
-                }
-                changed = updates.changed() => {
-                    if changed.is_err() || updates.borrow().state == ProcessState::Stopping {
-                        break;
-                    }
-                }
-                outcome = tasks.next_completion() => {
-                    if let Some(outcome) = outcome {
-                        failure = Some(anyhow::anyhow!("required task {} exited while manager was drained: {:?}", outcome.name, outcome.kind));
-                        let _ = lifecycle.request_stop(TransitionReason::TaskFailure, outcome.name);
-                    } else {
-                        failure = Some(anyhow::anyhow!("all required manager tasks exited while drained"));
-                        let _ = lifecycle.request_stop(
-                            TransitionReason::TaskFailure,
-                            "all required manager tasks exited while drained",
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-        // A later Stop request starts its own final-stop budget; the completed
-        // drain operation did not imply process exit.
-        shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_BUDGET;
-    }
-
-    if lifecycle.current().state != ProcessState::Stopping {
-        if let Err(error) = lifecycle.request_stop(
-            TransitionReason::ShutdownOrchestration,
-            "manager drain complete",
-        ) {
-            failure.get_or_insert_with(|| error.into());
-        }
     }
     if let Err(error) = notify_supervisor("STOPPING=1") {
         failure.get_or_insert_with(|| {
@@ -480,6 +427,39 @@ async fn run_service(config_path: &str) -> Result<()> {
     if let Some(error) = failure {
         Err(error)
     } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use wr_common::process_lifecycle::LifecycleDriver;
+    use wr_common::signal::ShutdownRequest;
+
+    #[tokio::test]
+    async fn first_signal_starts_one_quiet_manager_shutdown() -> Result<()> {
+        let (driver, lifecycle) = LifecycleDriver::new(ServiceKind::Manager, "manager-test");
+        let mut tasks = TaskGroup::new();
+        tasks.spawn("lifecycle-driver", move |cancellation| {
+            driver.run(cancellation)
+        });
+        tasks.spawn("manager-required", |mut cancellation| async move {
+            cancellation.cancelled().await;
+            Ok(TaskExit::Cancelled)
+        });
+
+        let cause = wait_for_shutdown_trigger(&lifecycle, &mut tasks, async {
+            ShutdownRequest::stop(TransitionReason::SignalTerminate, "SIGTERM fixture")
+        })
+        .await?;
+        assert_eq!(cause, ShutdownCause::Signal);
+        assert_eq!(lifecycle.current().state, ProcessState::Stopping);
+
+        let report = tasks
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(report.is_clean(), "{report:?}");
         Ok(())
     }
 }

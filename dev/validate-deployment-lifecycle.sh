@@ -119,6 +119,10 @@ NODE_REMOTE="${NODE_USER}@${NODE_HOST}"
 SSH=(timeout -k 5 60 ssh -i "$WRT_DEPLOY_E2E_SSH_KEY" -o ConnectTimeout=5)
 CLI_ARGS=("$ROOT/target/debug/wr-cli" --manager "$MANAGER_ADDR" --ca-cert "$CERT_DIR/ca.crt" --client-cert "$CERT_DIR/${MANAGER_HOST}.crt" --client-key "$CERT_DIR/${MANAGER_HOST}.key")
 CLI=(timeout -k 10 600 "${CLI_ARGS[@]}")
+NODE_STOP_SSH_ARGS=()
+if [ -n "${WRT_DEPLOY_E2E_SSH_PORT:-}" ]; then
+	NODE_STOP_SSH_ARGS=(--ssh-port "$WRT_DEPLOY_E2E_SSH_PORT")
+fi
 
 mkdir -p "$(dirname "$LOCK_FILE")"
 exec 9>"$LOCK_FILE" || {
@@ -319,99 +323,6 @@ PY
 		return "$status"
 	fi
 }
-stop_engine_semantically() {
-	local backend="$1" pass="$2" port tunnel_log state status process_instance stop_state
-	local exit_ready=false
-	port="$(
-		"${PYTHON[@]}" - <<'PY'
-import socket
-with socket.socket() as listener:
-    listener.bind(("127.0.0.1", 0))
-    print(listener.getsockname()[1])
-PY
-	)"
-	tunnel_log="$pass/engine-lifecycle-tunnel.log"
-	ssh -i "$WRT_DEPLOY_E2E_SSH_KEY" -o ConnectTimeout=5 \
-		-o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
-		-N -L "127.0.0.1:${port}:127.0.0.1:9100" "$NODE_REMOTE" >"$tunnel_log" 2>&1 &
-	TUNNEL_PID=$!
-	local ready=false
-	for _ in $(seq 1 20); do
-		if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-			if wait "$TUNNEL_PID"; then state=0; else state=$?; fi
-			TUNNEL_PID=""
-			echo "engine lifecycle tunnel exited before readiness (exit ${state})" >&2
-			return 1
-		fi
-		if "${PYTHON[@]}" - "$port" <<'PY' 2>/dev/null
-import socket, sys
-with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=0.25):
-    pass
-PY
-		then
-			ready=true
-			break
-		fi
-		sleep 0.25
-	done
-	[ "$ready" = true ] || {
-		if stop_tunnel; then :; else
-			status=$?
-			record_tunnel_cleanup_failure "engine lifecycle tunnel readiness failure" "$status"
-		fi
-		echo "engine lifecycle tunnel did not become ready" >&2
-		return 1
-	}
-	"${CLI[@]}" lifecycle stop --endpoint "http://127.0.0.1:${port}" \
-		--detail "deployment lifecycle qualification" >"$pass/engine-stop.json"
-	read -r process_instance stop_state < <(
-		"${PYTHON[@]}" - "$pass/engine-stop.json" <<'PY'
-import json, sys
-value = json.load(open(sys.argv[1]))["observation"]
-print(value["process_instance_id"], value["state"])
-PY
-	)
-	if stop_tunnel; then :; else
-		status=$?
-		record_tunnel_cleanup_failure "engine lifecycle stop" "$status"
-		return "$status"
-	fi
-	local deadline=$((SECONDS + 45)) probe_timeout probe_status
-	local probe_error="$pass/engine-exit-probe.stderr"
-	# Reserve two seconds inside the absolute budget for timeout's one-second
-	# SIGKILL grace and post-probe evidence handling.
-	while probe_timeout="$(remaining_deadline_seconds "$deadline" 5 2)"; do
-		if [ "$backend" = systemd ]; then
-			if state=$(timeout -k 1 "$probe_timeout" "${SSH[@]}" "$NODE_REMOTE" \
-				"sudo systemctl show wr-engine-engine.service --property=ActiveState --value" 2>"$probe_error"); then
-				if [ "$state" = inactive ]; then
-					exit_ready=true
-					break
-				fi
-			else
-				probe_status=$?
-				state="systemd query failure exit $probe_status: $(tail -n 1 "$probe_error")"
-			fi
-		else
-			if state=$(timeout -k 1 "$probe_timeout" "${SSH[@]}" "$NODE_REMOTE" \
-				"cd '$WORKDIR/wr-node/current' && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml ps --all --status exited --services engine-engine" 2>"$probe_error"); then
-				if [ "$state" = engine-engine ]; then
-					exit_ready=true
-					break
-				fi
-			else
-				probe_status=$?
-				state="container query failure exit $probe_status: $(tail -n 1 "$probe_error")"
-			fi
-		fi
-		if remaining_deadline_seconds "$deadline" 5 2 >/dev/null; then sleep 0.5; fi
-	done
-	[ "$exit_ready" = true ] || {
-		echo "engine process $process_instance did not exit after lifecycle state $stop_state; last backend state: ${state:-unknown}" >&2
-		return 1
-	}
-}
-
 assert_db_clean() {
 	local count="" ready=false error_log="$LOG_BASE/postgres-readiness.log"
 	for _ in $(seq 1 30); do
@@ -555,7 +466,19 @@ lifecycle() {
 	[ "$revision_b" -gt "$revision_a" ]
 	invoke_echo "hello-$backend-b" "$pass/invoke-b.json"
 
-	stop_engine_semantically "$backend" "$pass"
+	local stop_record="$pass/engine-stop.json" stop_error="$pass/engine-stop.stderr" stop_status
+	echo "==> $backend node engine stop"
+	if "${CLI[@]}" node stop "$NODE_REMOTE" --component engine:engine --format "$backend" \
+		--workdir "$WORKDIR" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" \
+		"${NODE_STOP_SSH_ARGS[@]}" --json >"$stop_record" 2>"$stop_error"; then
+		:
+	else
+		stop_status=$?
+		echo "$backend node engine stop failed with $stop_status (stderr: $stop_error)" >&2
+		print_failure_excerpt "$stop_error"
+		return "$stop_status"
+	fi
+	assert_node_stop_record "$stop_record" "$backend" engine:engine
 	"${CLI[@]}" cluster wait --node "$NODE_ID" --severity unhealthy \
 		--timeout-secs 30 >"$pass/expect-unhealthy.json"
 	"${PYTHON[@]}" - "$pass/expect-unhealthy.json" "$pass/status-unhealthy.json" <<'PY'

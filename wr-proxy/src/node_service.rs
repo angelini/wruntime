@@ -11,11 +11,13 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use wr_common::discovery::ManagerDiscovery;
+use wr_common::process_lifecycle::LifecycleSnapshotHandle;
 use wr_common::task_group::{TaskCancellation, TaskExit};
 use wr_common::wruntime::{
     node_service_server::NodeService, BeginEngineDrainRequest, BeginEngineDrainResponse,
-    DeregisterEngineRequest, DeregisterEngineResponse, HeartbeatRequest, HeartbeatResponse,
-    ModuleDescriptor, RegisterEngineRequest, RegisterEngineResponse,
+    DeregisterEngineRequest, DeregisterEngineResponse, GetProxyRoutingStatusRequest,
+    GetProxyRoutingStatusResponse, HeartbeatRequest, HeartbeatResponse, ModuleDescriptor,
+    RegisterEngineRequest, RegisterEngineResponse,
 };
 
 use crate::routing::{self, CachedRoutingTable};
@@ -48,14 +50,20 @@ type EngineSlot = Arc<EngineSlotState>;
 pub struct NodeAgent {
     discovery: Arc<ManagerDiscovery>,
     routing: CachedRoutingTable,
+    lifecycle: LifecycleSnapshotHandle,
     engines: Mutex<HashMap<String, EngineSlot>>,
 }
 
 impl NodeAgent {
-    pub fn new(discovery: Arc<ManagerDiscovery>, routing: CachedRoutingTable) -> Self {
+    pub fn new(
+        discovery: Arc<ManagerDiscovery>,
+        routing: CachedRoutingTable,
+        lifecycle: LifecycleSnapshotHandle,
+    ) -> Self {
         Self {
             discovery,
             routing,
+            lifecycle,
             engines: Mutex::new(HashMap::new()),
         }
     }
@@ -173,6 +181,16 @@ impl NodeAgent {
 
 #[tonic::async_trait]
 impl NodeService for NodeAgent {
+    async fn get_proxy_routing_status(
+        &self,
+        _request: Request<GetProxyRoutingStatusRequest>,
+    ) -> Result<Response<GetProxyRoutingStatusResponse>, Status> {
+        Ok(Response::new(GetProxyRoutingStatusResponse {
+            process_instance_id: self.lifecycle.current().process_instance_id,
+            installed_routing_table_version: self.routing.version().await,
+        }))
+    }
+
     async fn register_engine(
         &self,
         request: Request<RegisterEngineRequest>,

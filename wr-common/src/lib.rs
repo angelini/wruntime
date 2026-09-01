@@ -13,6 +13,8 @@ pub mod http_headers;
 pub mod http_pool;
 pub mod identity;
 pub mod lifecycle;
+/// Exact semantic lifecycle-state classification shared by observers.
+pub mod lifecycle_observation;
 #[cfg(any(feature = "signal", test))]
 pub mod lifecycle_service;
 pub mod naming;

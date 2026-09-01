@@ -10,7 +10,7 @@ Use one authority for each information class. Derived documentation explains int
 | Public architecture | [`docs/architecture.md`](../../architecture.md) |
 | Public configuration | [`docs/configuration.md`](../../configuration.md) |
 | Test command behavior | [`Justfile`](../../../Justfile), [`dev/validate-all.sh`](../../../dev/validate-all.sh), and [`docs/testing.md`](../../testing.md) |
-| Local lifecycle CLI and dev supervisor behavior | `wr-cli/src/cmd/{lifecycle,dev,dev_supervisor}.rs`, explained in [`docs/testing.md`](../../testing.md) and [`docs/deployment.md`](../../deployment.md) |
+| Local lifecycle CLI and foreground-runner behavior | `wr-cli/src/cmd/{lifecycle,dev,foreground_runner}.rs`, explained in [`docs/testing.md`](../../testing.md) and [`docs/deployment.md`](../../deployment.md) |
 | Guest scaffold and dependency pins | guest [`module_template.md`](../guest-module-author/module_template.md), checked against actual manifests |
 | Guest API discovery and semantics | guest [`api_guide.md`](../guest-module-author/api_guide.md); exact signatures remain owned by Rust/WIT source |
 | Maintainer change guidance | files in this directory |
@@ -26,7 +26,7 @@ Use one authority for each information class. Derived documentation explains int
 | Engine/manager/proxy configuration | `docs/configuration.md`, example configs, architecture when flow changes, and relevant guest capability guidance |
 | Manager migration | migration policy in configuration/architecture as applicable, repository map, and migration tests |
 | Module migration behavior | `docs/configuration.md`, guest template/constraints, and migration tests/examples |
-| Deployment generation or templates | `docs/deployment.md`, sample deploy config, CLI help/tests, and parity/determinism invariants |
+| Deployment generation, templates, or backend-owned node stop | `docs/deployment.md`, sample deploy config, CLI help/tests, and parity/determinism and final-exit invariants |
 | Executable example | example configs/scripts, guest examples index, README if the advertised workflow changes, and matching validation guidance |
 | Architecture/request flow | `docs/architecture.md`, concise root README/CLAUDE summary, invariants, and any affected public guide |
 | Validation recipe or prerequisites | `Justfile`, `dev/validate-all.sh`, `docs/testing.md`, and maintainer `validation.md` |

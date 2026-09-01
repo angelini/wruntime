@@ -1,5 +1,6 @@
 //! Shared CLI and deployment helpers.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,10 +8,11 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use wr_common::lifecycle_observation::{classify_lifecycle_state, LifecycleStateClassification};
 use wr_common::node::TlsConfig;
 use wr_common::wruntime::{
-    DrainRequest, GetLifecycleStatusRequest, LifecycleStatus, ProcessLifecycleState, ServiceKind,
-    StopRequest,
+    GetLifecycleStatusRequest, GetProxyRoutingStatusRequest, GetProxyRoutingStatusResponse,
+    GetRoutingTableRequest, LifecycleStatus, ProcessLifecycleState, ServiceKind,
 };
 
 use crate::client;
@@ -350,16 +352,6 @@ impl LifecycleObservation {
     }
 }
 
-fn lifecycle_state_rank(state: ProcessLifecycleState) -> Result<u8> {
-    match state {
-        ProcessLifecycleState::Starting => Ok(0),
-        ProcessLifecycleState::Ready => Ok(1),
-        ProcessLifecycleState::Draining => Ok(2),
-        ProcessLifecycleState::Stopping => Ok(3),
-        ProcessLifecycleState::Unspecified => bail!("unspecified lifecycle state has no rank"),
-    }
-}
-
 fn classify_lifecycle_observation(
     observation: LifecycleObservation,
     expected: ProcessLifecycleState,
@@ -369,24 +361,16 @@ fn classify_lifecycle_observation(
         Ok(state) => state,
         Err(error) => return WaitAttempt::Terminal(error),
     };
-    if state == expected {
-        return WaitAttempt::Matched(observation);
+    match classify_lifecycle_state(state, expected) {
+        Ok(LifecycleStateClassification::Matched) => WaitAttempt::Matched(observation),
+        Ok(LifecycleStateClassification::Pending) => WaitAttempt::Pending(evidence.to_string()),
+        Ok(LifecycleStateClassification::Terminal) => WaitAttempt::Terminal(anyhow::anyhow!(
+            "lifecycle process cannot reach expected state {} after observing {}: {evidence}",
+            expected.as_str_name(),
+            state.as_str_name()
+        )),
+        Err(error) => WaitAttempt::Terminal(error.into()),
     }
-    let observed_rank = match lifecycle_state_rank(state) {
-        Ok(rank) => rank,
-        Err(error) => return WaitAttempt::Terminal(error),
-    };
-    let expected_rank = match lifecycle_state_rank(expected) {
-        Ok(rank) => rank,
-        Err(error) => return WaitAttempt::Terminal(error),
-    };
-    if observed_rank > expected_rank {
-        return WaitAttempt::Terminal(anyhow::anyhow!(
-            "lifecycle process passed expected state {}: {evidence}",
-            expected.as_str_name()
-        ));
-    }
-    WaitAttempt::Pending(evidence.to_string())
 }
 
 fn lifecycle_observation(status: LifecycleStatus) -> Result<LifecycleObservation> {
@@ -419,44 +403,6 @@ pub async fn get_lifecycle_status(
         response
             .status
             .ok_or_else(|| anyhow::anyhow!("lifecycle endpoint returned no status"))?,
-    )
-}
-
-pub async fn request_lifecycle_drain(
-    endpoint: &str,
-    tls: Option<&TlsConfig>,
-    detail: &str,
-) -> Result<LifecycleObservation> {
-    let mut lifecycle = client::connect_lifecycle(endpoint, tls).await?;
-    lifecycle_observation(
-        lifecycle
-            .drain(DrainRequest {
-                detail: detail.to_string(),
-            })
-            .await
-            .with_context(|| format!("lifecycle drain RPC failed for {endpoint}"))?
-            .into_inner()
-            .status
-            .ok_or_else(|| anyhow::anyhow!("lifecycle drain returned no status"))?,
-    )
-}
-
-pub async fn request_lifecycle_stop(
-    endpoint: &str,
-    tls: Option<&TlsConfig>,
-    detail: &str,
-) -> Result<LifecycleObservation> {
-    let mut lifecycle = client::connect_lifecycle(endpoint, tls).await?;
-    lifecycle_observation(
-        lifecycle
-            .stop(StopRequest {
-                detail: detail.to_string(),
-            })
-            .await
-            .with_context(|| format!("lifecycle stop RPC failed for {endpoint}"))?
-            .into_inner()
-            .status
-            .ok_or_else(|| anyhow::anyhow!("lifecycle stop returned no status"))?,
     )
 }
 
@@ -538,6 +484,7 @@ pub async fn wait_for_lifecycle_state(
     endpoint: &str,
     tls: Option<&TlsConfig>,
     expected: ProcessLifecycleState,
+    expected_kind: Option<ServiceKind>,
     expected_instance: Option<&str>,
     timeout: Duration,
 ) -> Result<LifecycleObservation> {
@@ -569,6 +516,19 @@ pub async fn wait_for_lifecycle_state(
                 observation.process_instance_id,
                 observation.detail
             );
+            if let Some(expected_kind) = expected_kind {
+                match observation.service_kind_enum() {
+                    Ok(observed_kind) if observed_kind == expected_kind => {}
+                    Ok(observed_kind) => {
+                        return WaitAttempt::Terminal(anyhow::anyhow!(
+                            "lifecycle service kind mismatch at {endpoint}: expected {}, observed {}",
+                            expected_kind.as_str_name(),
+                            observed_kind.as_str_name()
+                        ));
+                    }
+                    Err(error) => return WaitAttempt::Terminal(error),
+                }
+            }
             {
                 let mut pinned = pinned_instance.borrow_mut();
                 if let Some(instance) = pinned.as_deref() {
@@ -591,17 +551,128 @@ pub async fn wait_for_lifecycle_state(
 pub async fn wait_for_lifecycle_ready(
     endpoint: &str,
     tls: Option<&TlsConfig>,
-    expected_instance: Option<&str>,
+    expected_kind: ServiceKind,
+    expected_instance: &str,
     timeout: Duration,
 ) -> Result<LifecycleObservation> {
     wait_for_lifecycle_state(
         endpoint,
         tls,
         ProcessLifecycleState::Ready,
-        expected_instance,
+        Some(expected_kind),
+        Some(expected_instance),
         timeout,
     )
     .await
+}
+
+/// One proxy endpoint and the activation observed from READY on that endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxyRoutingBarrierTarget {
+    pub name: String,
+    pub endpoint: String,
+    pub process_instance_id: String,
+}
+
+/// Read the authoritative routing-table version directly from the manager.
+pub async fn get_manager_routing_table_version(endpoint: &str) -> Result<u64> {
+    let mut manager = client::connect(endpoint).await?;
+    let table = manager
+        .get_routing_table(GetRoutingTableRequest { known_version: 0 })
+        .await
+        .with_context(|| format!("manager routing-table query failed for {endpoint}"))?
+        .into_inner()
+        .table
+        .ok_or_else(|| anyhow::anyhow!("manager returned no routing table for version capture"))?;
+    Ok(table.version)
+}
+
+async fn get_proxy_routing_status(endpoint: &str) -> Result<GetProxyRoutingStatusResponse> {
+    let mut proxy = client::connect_node(endpoint).await?;
+    Ok(proxy
+        .get_proxy_routing_status(GetProxyRoutingStatusRequest {})
+        .await
+        .with_context(|| format!("proxy routing-status query failed for {endpoint}"))?
+        .into_inner())
+}
+
+fn validate_proxy_routing_status(
+    target: &ProxyRoutingBarrierTarget,
+    status: &GetProxyRoutingStatusResponse,
+    previous_version: Option<u64>,
+    target_version: u64,
+) -> Result<bool> {
+    if status.process_instance_id != target.process_instance_id {
+        bail!(
+            "proxy {} routing identity mismatch at {}: expected {}, observed {}",
+            target.name,
+            target.endpoint,
+            target.process_instance_id,
+            status.process_instance_id
+        );
+    }
+    if previous_version.is_some_and(|previous| status.installed_routing_table_version < previous) {
+        bail!(
+            "proxy {} routing version regressed at {}: previous {}, observed {}",
+            target.name,
+            target.endpoint,
+            previous_version.unwrap_or_default(),
+            status.installed_routing_table_version
+        );
+    }
+    Ok(status.installed_routing_table_version >= target_version)
+}
+
+/// Wait for every named proxy to install at least `target_version` under one
+/// absolute deadline shared by all transport calls and poll rounds.
+pub async fn wait_for_proxy_routing_barrier(
+    targets: &[ProxyRoutingBarrierTarget],
+    target_version: u64,
+    timeout: Duration,
+) -> Result<()> {
+    if targets.is_empty() {
+        bail!("routing barrier requires at least one proxy");
+    }
+    let started = tokio::time::Instant::now();
+    let deadline = started + timeout;
+    let mut versions = BTreeMap::<String, u64>::new();
+
+    loop {
+        let mut pending = Vec::new();
+        for target in targets {
+            let status =
+                tokio::time::timeout_at(deadline, get_proxy_routing_status(&target.endpoint))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "proxy {} routing query exceeded the shared barrier deadline",
+                            target.name
+                        )
+                    })??;
+            let previous = versions.get(&target.name).copied();
+            let reached = validate_proxy_routing_status(target, &status, previous, target_version)?;
+            versions.insert(target.name.clone(), status.installed_routing_table_version);
+            if !reached {
+                pending.push(format!(
+                    "{}={}",
+                    target.name, status.installed_routing_table_version
+                ));
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!(
+                "proxy routing barrier timed out after {:?}: target version {}, pending {}",
+                started.elapsed(),
+                target_version,
+                pending.join(", ")
+            );
+        }
+        tokio::time::sleep_until((now + LIFECYCLE_POLL_INTERVAL).min(deadline)).await;
+    }
 }
 
 /// Extract the host portion from a `user@host` remote string.
@@ -785,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_expectation_rejects_states_already_passed() {
+    fn lifecycle_expectation_rejects_states_that_cannot_be_reached_exactly() {
         for (observed, expected) in [
             (
                 ProcessLifecycleState::Ready,
@@ -793,7 +864,7 @@ mod tests {
             ),
             (
                 ProcessLifecycleState::Stopping,
-                ProcessLifecycleState::Draining,
+                ProcessLifecycleState::Ready,
             ),
         ] {
             let observation = LifecycleObservation {
@@ -864,6 +935,52 @@ mod tests {
         .await?;
         assert_eq!(value, "ready");
         assert_eq!(attempts.get(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_routing_barrier_requires_activation_and_monotonic_progress() -> Result<()> {
+        let target = ProxyRoutingBarrierTarget {
+            name: "primary".to_string(),
+            endpoint: "http://127.0.0.1:9002".to_string(),
+            process_instance_id: "proxy-activation".to_string(),
+        };
+        let pending = GetProxyRoutingStatusResponse {
+            process_instance_id: "proxy-activation".to_string(),
+            installed_routing_table_version: 6,
+        };
+        assert!(!validate_proxy_routing_status(&target, &pending, None, 7)?);
+        let reached = GetProxyRoutingStatusResponse {
+            installed_routing_table_version: 7,
+            ..pending.clone()
+        };
+        assert!(validate_proxy_routing_status(
+            &target,
+            &reached,
+            Some(6),
+            7
+        )?);
+
+        let wrong_activation = GetProxyRoutingStatusResponse {
+            process_instance_id: "replacement".to_string(),
+            installed_routing_table_version: 8,
+        };
+        assert!(
+            validate_proxy_routing_status(&target, &wrong_activation, Some(7), 7)
+                .unwrap_err()
+                .to_string()
+                .contains("identity mismatch")
+        );
+        let regressed = GetProxyRoutingStatusResponse {
+            process_instance_id: "proxy-activation".to_string(),
+            installed_routing_table_version: 5,
+        };
+        assert!(
+            validate_proxy_routing_status(&target, &regressed, Some(6), 7)
+                .unwrap_err()
+                .to_string()
+                .contains("regressed")
+        );
         Ok(())
     }
 

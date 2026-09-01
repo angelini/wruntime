@@ -6,6 +6,7 @@ use tonic::transport::{Channel, Endpoint};
 use wr_common::node::TlsConfig;
 use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
 use wr_common::wruntime::manager_service_client::ManagerServiceClient;
+use wr_common::wruntime::node_service_client::NodeServiceClient;
 use wr_common::wruntime::{GetClusterStatusRequest, GetClusterStatusResponse, ListManagersRequest};
 
 /// Global TLS config for CLI → manager connections.
@@ -73,6 +74,15 @@ pub async fn connect_lifecycle(
         .await
         .with_context(|| format!("failed to connect to lifecycle endpoint {addr}"))?;
     Ok(LifecycleServiceClient::new(channel))
+}
+
+/// Connect to the proxy's loopback NodeService without inheriting manager TLS.
+pub async fn connect_node(addr: &str) -> Result<NodeServiceClient<Channel>> {
+    let channel = endpoint_with_tls(addr, None)?
+        .connect()
+        .await
+        .with_context(|| format!("failed to connect to proxy node endpoint {addr}"))?;
+    Ok(NodeServiceClient::new(channel))
 }
 
 /// Fetch one coherent cluster status snapshot from a seed manager.

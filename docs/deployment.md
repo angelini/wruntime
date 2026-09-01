@@ -28,6 +28,7 @@ cargo install cargo-zigbuild
 | `wr-cli node bundle` | Package proxy + engine binaries, WASM modules, and schemas |
 | `wr-cli node deploy` | Push node bundle to a remote host and start services |
 | `wr-cli node rollback` | Activate a retained prior successful bundle as a new revision |
+| `wr-cli node stop` | Stop one deployed engine through its systemd or Docker owner and prove final exit |
 | `wr-cli node inspect-bundle` | Verify and inspect a node bundle without deploying |
 | `wr-cli cluster status` | Show the authoritative cluster-wide runtime snapshot |
 | `wr-cli logs node` | View logs from services on a remote node (systemd or Docker) |
@@ -423,23 +424,51 @@ wr-cli node deploy --node-id node-a node.tar.gz example@localhost \
 
 In QEMU user-mode networking, `10.0.2.2` is the host gateway address reachable from all VMs.
 
-## Local development supervisor
+## Local foreground development
 
-`wr-cli dev --state-dir <dir> up` starts or contacts one persistent supervisor, which owns manager and primary-proxy children and waits for each exact lifecycle endpoint to report `READY`. Before spawning, it rejects an endpoint that already accepts connections; at spawn it supplies a unique activation identity and requires every lifecycle observation to report that identity plus the expected service kind, so a bind-race winner, replaced process, or unrelated responder cannot satisfy readiness. Any service-start operation that fails becomes a terminal supervisor outcome: all owned children receive ordered cleanup, the supervisor exits, and retained failure state blocks reuse. `dev deploy <engine.toml>` asks that same owner to replace the matching engine through lifecycle stop plus confirmed exit before starting it. `dev start-proxy --name <name> <proxy.toml>` adds a named proxy for local multi-node runs. `dev status` reports owned PID, config, process-instance ID, lifecycle state, and exit evidence. `dev wait` is an interruptible client subscription: the supervisor event loop remains available for concurrent status/down requests and performs ordered cleanup before its failure state becomes observable.
+Build guest artifacts separately with `wr-cli dev build`, then run already-built service binaries and an optional one-shot scenario under one foreground owner:
 
-`dev down` is idempotent. It requests lifecycle stop and reaps all engines concurrently, then all proxies, then the manager. Each wave allows the service's 30-second internal budget, a 10-second SIGTERM fallback window, and a final 5-second SIGKILL/reap window. Needing fallback, a failed lifecycle stop, a non-zero exit, or an unreaped child remains non-zero even when later escalation reaps the process. Clean state is removed only after all owned children exit, and `dev down` is not acknowledged until socket, lock, and clean state removal also succeed. Failed or unexpected exit retains `supervisor.json` for diagnosis and blocks restart; an explicit later `dev down` validates the lock owner and each retained child against `/proc` executable/argument identity before removing stale socket, lock, or state metadata. Legacy PID state is rejected rather than imported.
+```bash
+wr-cli dev run \
+  --manager-config path/to/manager.toml \
+  --proxy-config primary=path/to/proxy.toml \
+  --proxy-config peer=path/to/peer-proxy.toml \
+  --engine-config path/to/engine.toml \
+  -- sh path/to/scenario.sh
+```
+
+Exactly one manager and one or more uniquely named proxies are required; engine configs are repeatable and may be omitted. The command starts manager, proxy, and engine waves in that order, with concurrency inside proxy and engine waves. It rejects occupied control endpoints, supplies a unique activation identity to every service, and requires READY to report that identity plus the exact service kind. After engine readiness it captures the manager routing version once and waits under one absolute deadline until every supplied proxy's activation-bound routing status reaches it. Only then is the command after `--` started.
+
+The scenario owns an isolated process group. Scenario completion, service exit, SIGINT, or SIGTERM first terminates that whole group, then cleanup signals and reaps engines concurrently, proxies concurrently, and the manager. Each service gets the existing 30-second internal period, 10-second TERM grace, and 5-second KILL/reap policy period. At that 45-second boundary the owner latches and emits `deadline exceeded, awaiting reap` evidence exactly once, then remains alive in reap-only mode with the sole `Child` handle until exit is actually proven; 45 seconds bounds failure classification, not command return for an uninterruptible OS process. A second signal may escalate. Scenario failure remains the primary result; cleanup failure is also printed and makes an otherwise successful run fail. Service output is prefixed and bounded tails are retained in failure evidence. No socket, lock, PID file, or persistent supervisor state is created.
+
+Repository examples keep artifact construction outside foreground execution: their Just recipes run the matching `dev build` group before invoking a run script, and each run script renders configuration before making one `dev run` call with its scenario.
+
+## Backend-owned remote stop
+
+Stop one deployed engine by its stable bundle slot; arbitrary remote commands and proxy selectors are not accepted:
+
+```bash
+wr-cli node stop deploy@10.0.1.50 \
+  --component engine:inventory \
+  --format systemd \
+  --json
+```
+
+The command derives `wr-engine-<slot>.service` for systemd or `engine-<slot>` for Docker Compose, asks that backend owner to stop the process, and inspects the same backend until exit is proven. It owns one absolute 45-second budget across SSH actions and polls. If graceful exit does not complete with enough budget remaining, it uses the backend's fixed force action and still requires final exit evidence; a timeout or unproved exit is non-zero.
+
+`--json` emits the selected component, backend and derived target, graceful disposition and action evidence, force-action evidence, final backend state, `final_exited`, elapsed milliseconds, and whether force succeeded. The protected deployment qualification retains this record, then keeps the co-located proxy running while `cluster wait` observes the stopped engine's node become unhealthy before rollback.
 
 ## Semantic startup and bounded shutdown
 
 Generated systemd units use `Type=notify`; each process sends `READY=1` only after its semantic startup barriers and sends `STOPPING=1` when final shutdown begins. Units use `SIGTERM`, `TimeoutStopSec=45s`, and final `SIGKILL` only after that external grace period. Generated Compose services use the same binary-native lifecycle probe, `stop_signal: SIGTERM`, and `stop_grace_period: 45s`. Engines depend on the proxy with `condition: service_healthy`, so startup waits for proxy semantic readiness and reverse dependency order stops engines before the proxy.
 
-Each active drain or stop operation has one absolute 30-second internal deadline; route convergence, admission waits, deregistration, and task joins consume that deadline without resetting it. `Drain` may remain observably quiesced without exiting; a later explicit `Stop` starts the separate final control-listener/task-join deadline. The supervisor's 45-second grace leaves 15 seconds after a signal-driven full shutdown for telemetry finalization and process exit; needing the supervisor's final kill is a failed graceful shutdown. Healthchecks execute the service binary with `--lifecycle-probe <config>` and succeed only in `READY`; a successful TCP connection while `STARTING` is not readiness.
+Each signal-driven stop has one absolute 30-second internal deadline; route convergence, admission waits, deregistration, and task joins consume that deadline without resetting it. The foreground runner's 45-second termination-policy boundary leaves 15 seconds after internal shutdown for process exit and escalation; needing SIGKILL or crossing the boundary is a failed graceful shutdown, while the owner still waits to reap before returning. Healthchecks execute the service binary with `--lifecycle-probe <config>` and succeed only in `READY`; a successful TCP connection while `STARTING` is not readiness.
 
 Startup remains tolerant only through bounded, owned retries. A proxy must reach a manager and install an initial routing snapshot before readiness. An engine retries its proxy connection and registration, but startup fails non-zero if those attempts expire, a configured module is unhealthy, or readiness publication cannot converge. The first healthy engine heartbeat is synchronous: the manager returns the routing version containing the atomic readiness update, and the local proxy replies only after installing at least that version. Callers do not need fixed sleeps or manager-health polling.
 
-On engine shutdown, route withdrawal and local proxy convergence happen before HTTP admission closes and before final deregistration. Existing HTTP requests and claimed jobs drain to the shared deadline; new work is rejected deterministically. Proxy drain closes data-plane admission and waits until every data listener has stopped accepting before acknowledging `DRAINING`, while retaining loopback lifecycle/NodeService control until stop. Manager drain rejects new administrative mutations but retains lifecycle, read-only status, and engine drain/deregister operations. Deadline expiry or failed required deregistration is a non-zero process outcome.
+On engine shutdown, route withdrawal and local proxy convergence happen before HTTP admission closes and before final deregistration. Existing HTTP requests and claimed jobs drain to the shared deadline; new work is rejected deterministically. Proxy shutdown closes data-plane admission and every data listener before joining control and background tasks. Manager shutdown rejects new administrative mutations but retains read-only status and required engine drain/deregister operations during teardown. These are internal `STOPPING` phases; deadline expiry or failed required deregistration is a non-zero process outcome.
 
-The CLI `node deploy` and `node rollback` commands use one absolute deadline around `VerifyDeployment`, require the exact node/revision/digest record, and retain every typed condition as timeout evidence. The protected deployment harness likewise places all systemd/container exit probes after lifecycle stop under one absolute deadline; every SSH query consumes that shared budget and the failure reports the pinned process instance plus last backend/query evidence. A ready result is sufficient because engine readiness already proves local proxy route convergence; callers perform no post-ready sleep or invoke retry. Process lifecycle readiness and cluster availability remain distinct contracts.
+The CLI `node deploy` and `node rollback` commands use one absolute deadline around `VerifyDeployment`, require the exact node/revision/digest record, and retain every typed condition as timeout evidence. `node stop` separately owns backend stop and final-exit proof under its single 45-second budget; deployment callers do not open a lifecycle tunnel or poll the backend themselves. A ready result is sufficient because engine readiness already proves local proxy route convergence; callers perform no post-ready sleep or invoke retry. Process lifecycle readiness and cluster availability remain distinct contracts.
 
 ## Pre-compilation
 

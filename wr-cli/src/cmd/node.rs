@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
@@ -36,6 +37,8 @@ pub enum NodeCommand {
     Deploy(DeployArgs),
     /// Activate a retained prior bundle revision as a new desired revision
     Rollback(RollbackArgs),
+    /// Stop one deployed engine and prove backend exit
+    Stop(StopArgs),
     /// Inspect a bundle without deploying
     InspectBundle(StatusArgs),
 }
@@ -128,6 +131,33 @@ pub struct RollbackArgs {
     /// SSH port
     #[arg(long)]
     ssh_port: Option<u16>,
+}
+
+#[derive(Args)]
+pub struct StopArgs {
+    /// Remote host in user@host format
+    remote: String,
+    /// Deployed component selector (only engine:<slot> is supported)
+    #[arg(long)]
+    component: String,
+    /// Deploy config file (default: auto-discover wr-deploy.toml in CWD)
+    #[arg(long)]
+    config: Option<String>,
+    /// Deployment format [default: systemd]
+    #[arg(long)]
+    format: Option<DeployFormat>,
+    /// Base directory used by the deployed node
+    #[arg(long)]
+    workdir: Option<String>,
+    /// SSH private key path
+    #[arg(long)]
+    ssh_key: Option<String>,
+    /// SSH port
+    #[arg(long)]
+    ssh_port: Option<u16>,
+    /// Emit the stable machine-readable stop record
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -267,6 +297,7 @@ pub async fn run(args: NodeArgs, manager: Option<&str>) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("--manager is required for node rollback"))?;
             rollback(rollback_args, mgr).await
         }
+        NodeCommand::Stop(stop_args) => stop(stop_args),
         NodeCommand::InspectBundle(status_args) => status(status_args),
     }
 }
@@ -305,12 +336,7 @@ fn add_engine_artifacts(
             .file_stem()
             .map(|stem| stem.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("engine-{}", i + 1));
-        if engine_slot.is_empty()
-            || engine_slot.len() > 128
-            || !engine_slot
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-            || !engine_slots.insert(engine_slot.clone())
+        if validate_engine_slot(&engine_slot).is_err() || !engine_slots.insert(engine_slot.clone())
         {
             bail!("engine config file stems must be unique URL-safe engine slots");
         }
@@ -1019,6 +1045,643 @@ fn validate_remote_workdir(workdir: &str) -> Result<()> {
         bail!("workdir must be a safe absolute path");
     }
     Ok(())
+}
+
+fn validate_engine_slot(slot: &str) -> Result<()> {
+    if slot.is_empty()
+        || slot.len() > 128
+        || !slot
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("engine slot must be a non-empty URL-safe deployment slot");
+    }
+    Ok(())
+}
+
+fn parse_engine_selector(selector: &str) -> Result<&str> {
+    let Some(slot) = selector.strip_prefix("engine:") else {
+        bail!("component must use the supported engine:<slot> selector");
+    };
+    validate_engine_slot(slot)?;
+    Ok(slot)
+}
+
+const REMOTE_STOP_BUDGET: Duration = Duration::from_secs(45);
+const REMOTE_CALL_CAP: Duration = Duration::from_secs(5);
+const FORCE_ACTION_RESERVE: Duration = Duration::from_secs(3);
+const FINAL_INSPECTION_RESERVE: Duration = Duration::from_secs(3);
+const ESCALATION_RESERVE: Duration = Duration::from_secs(6);
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum GracefulStopDisposition {
+    AlreadyStopped,
+    Stopped,
+    Escalated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum StopActionStatus {
+    NotAttempted,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+struct StopActionEvidence {
+    status: StopActionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+impl StopActionEvidence {
+    fn not_attempted() -> Self {
+        Self {
+            status: StopActionStatus::NotAttempted,
+            detail: None,
+        }
+    }
+
+    fn from_result(result: Result<RemoteOutput>) -> Self {
+        match result {
+            Ok(_) => Self {
+                status: StopActionStatus::Succeeded,
+                detail: None,
+            },
+            Err(error) => Self {
+                status: StopActionStatus::Failed,
+                detail: Some(format!("{error:#}")),
+            },
+        }
+    }
+
+    fn succeeded(&self) -> bool {
+        self.status == StopActionStatus::Succeeded
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, serde::Serialize)]
+struct StopOutcome {
+    component: String,
+    backend: &'static str,
+    target: String,
+    graceful_result: GracefulStopDisposition,
+    graceful_action: StopActionEvidence,
+    force_action: StopActionEvidence,
+    final_state: String,
+    final_exited: bool,
+    elapsed_ms: u64,
+    forced: bool,
+}
+
+#[derive(Debug)]
+struct RemoteOutput {
+    stdout: String,
+}
+
+trait StopExecutor {
+    fn elapsed(&self) -> Duration;
+    fn run(
+        &mut self,
+        ssh_base: &[String],
+        command: &str,
+        timeout: Duration,
+    ) -> Result<RemoteOutput>;
+    fn sleep(&mut self, duration: Duration);
+}
+
+struct SshStopExecutor {
+    started: Instant,
+}
+
+fn gnu_timeout_millis(milliseconds: u128) -> String {
+    format!("{}.{:03}s", milliseconds / 1000, milliseconds % 1000)
+}
+
+impl SshStopExecutor {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+        }
+    }
+}
+
+impl StopExecutor for SshStopExecutor {
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    fn run(
+        &mut self,
+        ssh_base: &[String],
+        command: &str,
+        timeout: Duration,
+    ) -> Result<RemoteOutput> {
+        let timeout_ms = timeout.as_millis();
+        anyhow::ensure!(
+            timeout_ms >= 3,
+            "insufficient remaining budget for a hard-bounded SSH operation"
+        );
+        // GNU timeout's kill-after is additional to its initial timeout. Split
+        // the supplied operation budget so TERM, hard KILL, and Command::output
+        // reaping time all remain inside the caller's absolute deadline.
+        let wait_reserve_ms = (timeout_ms / 4).clamp(1, 50);
+        let child_budget_ms = timeout_ms - wait_reserve_ms;
+        let kill_after_ms = (child_budget_ms / 2).clamp(1, 250);
+        let soft_timeout_ms = child_budget_ms - kill_after_ms;
+        let mut invocation = Command::new("timeout");
+        invocation
+            .arg("-k")
+            .arg(gnu_timeout_millis(kill_after_ms))
+            .arg(gnu_timeout_millis(soft_timeout_ms))
+            .args(ssh_base)
+            .arg(command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = invocation
+            .output()
+            .context("failed to run bounded SSH stop operation")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "bounded SSH stop operation failed with {:?}: {}",
+                output.status.code(),
+                stderr.trim()
+            );
+        }
+        Ok(RemoteOutput {
+            stdout: String::from_utf8(output.stdout)
+                .context("remote stop operation returned non-UTF-8 output")?
+                .trim()
+                .to_string(),
+        })
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+fn remaining_stop_budget(executor: &impl StopExecutor) -> Duration {
+    REMOTE_STOP_BUDGET.saturating_sub(executor.elapsed())
+}
+
+fn bounded_remote_call(
+    executor: &mut impl StopExecutor,
+    ssh_base: &[String],
+    command: &str,
+    reserve: Duration,
+    cap: Duration,
+) -> Result<RemoteOutput> {
+    let available = remaining_stop_budget(executor).saturating_sub(reserve);
+    if available.is_zero() {
+        bail!("remote engine stop exhausted its 45-second deadline");
+    }
+    executor.run(ssh_base, command, available.min(cap))
+}
+
+fn bounded_poll_sleep(executor: &mut impl StopExecutor, reserve: Duration) {
+    let available = remaining_stop_budget(executor).saturating_sub(reserve);
+    if !available.is_zero() {
+        executor.sleep(available.min(STOP_POLL_INTERVAL));
+    }
+}
+
+fn elapsed_millis(executor: &impl StopExecutor) -> u64 {
+    executor.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SystemdState {
+    load: String,
+    active: String,
+}
+
+impl SystemdState {
+    fn exited(&self) -> bool {
+        self.load == "not-found" || matches!(self.active.as_str(), "inactive" | "failed")
+    }
+
+    fn description(&self) -> String {
+        format!("load={},active={}", self.load, self.active)
+    }
+}
+
+fn parse_systemd_state(output: &str) -> Result<SystemdState> {
+    let mut load = None;
+    let mut active = None;
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("LoadState=") {
+            load = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("ActiveState=") {
+            active = Some(value.trim().to_string());
+        }
+    }
+    Ok(SystemdState {
+        load: load.context("systemd inspection omitted LoadState")?,
+        active: active.context("systemd inspection omitted ActiveState")?,
+    })
+}
+
+fn systemd_inspect(
+    executor: &mut impl StopExecutor,
+    ssh_base: &[String],
+    unit: &str,
+    reserve: Duration,
+) -> Result<SystemdState> {
+    let command = format!(
+        "sudo systemctl show --no-pager --property=LoadState --property=ActiveState {unit}"
+    );
+    parse_systemd_state(
+        &bounded_remote_call(executor, ssh_base, &command, reserve, REMOTE_CALL_CAP)?.stdout,
+    )
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DockerState {
+    running: Option<String>,
+    container: Option<String>,
+}
+
+impl DockerState {
+    fn exited(&self) -> bool {
+        self.running.is_none()
+    }
+
+    fn description(&self) -> String {
+        match (&self.running, &self.container) {
+            (Some(running), Some(container)) => {
+                format!("running={running},container={container}")
+            }
+            (None, Some(container)) => format!("running=none,container={container}"),
+            (_, None) => "running=none,container=missing".to_string(),
+        }
+    }
+}
+
+fn parse_docker_state(output: &str) -> Result<DockerState> {
+    let mut running = None;
+    let mut container = None;
+    let mut saw_running = false;
+    let mut saw_container = false;
+    for line in output.lines() {
+        if let Some(value) = line.strip_prefix("running=") {
+            saw_running = true;
+            if !value.trim().is_empty() {
+                running = Some(value.trim().to_string());
+            }
+        } else if let Some(value) = line.strip_prefix("container=") {
+            saw_container = true;
+            if !value.trim().is_empty() {
+                container = Some(value.trim().to_string());
+            }
+        }
+    }
+    anyhow::ensure!(
+        saw_running && saw_container,
+        "Docker inspection omitted running/container evidence"
+    );
+    Ok(DockerState { running, container })
+}
+
+fn docker_compose_prefix(workdir: &str) -> String {
+    format!(
+        "cd {workdir}/wr-node/current && sudo docker compose --project-name {NODE_COMPOSE_PROJECT} -f docker/docker-compose.yml"
+    )
+}
+
+fn docker_inspect(
+    executor: &mut impl StopExecutor,
+    ssh_base: &[String],
+    compose: &str,
+    service: &str,
+    reserve: Duration,
+) -> Result<DockerState> {
+    let command = format!(
+        "running=$({compose} ps -q {service}) && container=$({compose} ps -a -q {service}) && printf 'running=%s\\ncontainer=%s\\n' \"$running\" \"$container\""
+    );
+    parse_docker_state(
+        &bounded_remote_call(executor, ssh_base, &command, reserve, REMOTE_CALL_CAP)?.stdout,
+    )
+}
+
+fn stop_systemd(
+    component: &str,
+    slot: &str,
+    ssh_base: &[String],
+    executor: &mut impl StopExecutor,
+) -> Result<StopOutcome> {
+    let unit = format!("wr-engine-{slot}.service");
+    let initial = systemd_inspect(executor, ssh_base, &unit, ESCALATION_RESERVE)?;
+    if initial.exited() {
+        return Ok(StopOutcome {
+            component: component.to_string(),
+            backend: "systemd",
+            target: unit,
+            graceful_result: GracefulStopDisposition::AlreadyStopped,
+            graceful_action: StopActionEvidence::not_attempted(),
+            force_action: StopActionEvidence::not_attempted(),
+            final_state: initial.description(),
+            final_exited: true,
+            elapsed_ms: elapsed_millis(executor),
+            forced: false,
+        });
+    }
+
+    let stop_command = format!("sudo systemctl stop --no-block {unit}");
+    let graceful_action = StopActionEvidence::from_result(bounded_remote_call(
+        executor,
+        ssh_base,
+        &stop_command,
+        ESCALATION_RESERVE,
+        REMOTE_CALL_CAP,
+    ));
+    let mut last_state = initial.description();
+    while remaining_stop_budget(executor) > ESCALATION_RESERVE {
+        match systemd_inspect(executor, ssh_base, &unit, ESCALATION_RESERVE) {
+            Ok(state) => {
+                last_state = state.description();
+                if state.exited() {
+                    return Ok(StopOutcome {
+                        component: component.to_string(),
+                        backend: "systemd",
+                        target: unit,
+                        graceful_result: GracefulStopDisposition::Stopped,
+                        graceful_action: graceful_action.clone(),
+                        force_action: StopActionEvidence::not_attempted(),
+                        final_state: last_state,
+                        final_exited: true,
+                        elapsed_ms: elapsed_millis(executor),
+                        forced: false,
+                    });
+                }
+            }
+            Err(error) => last_state = format!("inspection-error={error:#}"),
+        }
+        bounded_poll_sleep(executor, ESCALATION_RESERVE);
+    }
+
+    let force_command = format!("sudo systemctl kill --kill-who=all --signal=KILL {unit}");
+    let force_action = StopActionEvidence::from_result(bounded_remote_call(
+        executor,
+        ssh_base,
+        &force_command,
+        FINAL_INSPECTION_RESERVE,
+        FORCE_ACTION_RESERVE,
+    ));
+    while !remaining_stop_budget(executor).is_zero() {
+        match systemd_inspect(executor, ssh_base, &unit, Duration::ZERO) {
+            Ok(state) => {
+                last_state = state.description();
+                if state.exited() {
+                    return Ok(StopOutcome {
+                        component: component.to_string(),
+                        backend: "systemd",
+                        target: unit,
+                        graceful_result: GracefulStopDisposition::Escalated,
+                        graceful_action: graceful_action.clone(),
+                        force_action: force_action.clone(),
+                        final_state: last_state,
+                        final_exited: true,
+                        elapsed_ms: elapsed_millis(executor),
+                        forced: force_action.succeeded(),
+                    });
+                }
+            }
+            Err(error) => last_state = format!("inspection-error={error:#}"),
+        }
+        bounded_poll_sleep(executor, Duration::ZERO);
+    }
+    bail!(
+        "systemd could not prove {unit} exited within 45 seconds (last state: {last_state}; graceful error: {}; force error: {})",
+        graceful_action.detail.as_deref().unwrap_or("none"),
+        force_action.detail.as_deref().unwrap_or("none")
+    )
+}
+
+fn stop_docker(
+    component: &str,
+    slot: &str,
+    workdir: &str,
+    ssh_base: &[String],
+    executor: &mut impl StopExecutor,
+) -> Result<StopOutcome> {
+    let service = format!("engine-{slot}");
+    let compose = docker_compose_prefix(workdir);
+    let initial = docker_inspect(executor, ssh_base, &compose, &service, ESCALATION_RESERVE)?;
+    if initial.exited() {
+        return Ok(StopOutcome {
+            component: component.to_string(),
+            backend: "docker",
+            target: service,
+            graceful_result: GracefulStopDisposition::AlreadyStopped,
+            graceful_action: StopActionEvidence::not_attempted(),
+            force_action: StopActionEvidence::not_attempted(),
+            final_state: initial.description(),
+            final_exited: true,
+            elapsed_ms: elapsed_millis(executor),
+            forced: false,
+        });
+    }
+
+    let available = remaining_stop_budget(executor).saturating_sub(ESCALATION_RESERVE);
+    if available.is_zero() {
+        bail!("remote engine stop exhausted its 45-second deadline before Docker stop");
+    }
+    let operation_budget = available.min(Duration::from_secs(32));
+    let grace_secs = operation_budget
+        .saturating_sub(Duration::from_secs(2))
+        .as_secs()
+        .clamp(1, 30);
+    let stop_command = format!("{compose} stop --timeout {grace_secs} {service}");
+    let graceful_action =
+        StopActionEvidence::from_result(executor.run(ssh_base, &stop_command, operation_budget));
+    let mut last_state = initial.description();
+    if remaining_stop_budget(executor) > ESCALATION_RESERVE {
+        match docker_inspect(executor, ssh_base, &compose, &service, ESCALATION_RESERVE) {
+            Ok(state) => {
+                last_state = state.description();
+                if state.exited() {
+                    return Ok(StopOutcome {
+                        component: component.to_string(),
+                        backend: "docker",
+                        target: service,
+                        graceful_result: GracefulStopDisposition::Stopped,
+                        graceful_action: graceful_action.clone(),
+                        force_action: StopActionEvidence::not_attempted(),
+                        final_state: last_state,
+                        final_exited: true,
+                        elapsed_ms: elapsed_millis(executor),
+                        forced: false,
+                    });
+                }
+            }
+            Err(error) => last_state = format!("inspection-error={error:#}"),
+        }
+    }
+
+    let force_command =
+        format!("{compose} kill -s KILL {service} && {compose} rm --force --stop {service}");
+    let force_action = StopActionEvidence::from_result(bounded_remote_call(
+        executor,
+        ssh_base,
+        &force_command,
+        FINAL_INSPECTION_RESERVE,
+        FORCE_ACTION_RESERVE,
+    ));
+    while !remaining_stop_budget(executor).is_zero() {
+        match docker_inspect(executor, ssh_base, &compose, &service, Duration::ZERO) {
+            Ok(state) => {
+                last_state = state.description();
+                if state.exited() {
+                    return Ok(StopOutcome {
+                        component: component.to_string(),
+                        backend: "docker",
+                        target: service,
+                        graceful_result: GracefulStopDisposition::Escalated,
+                        graceful_action: graceful_action.clone(),
+                        force_action: force_action.clone(),
+                        final_state: last_state,
+                        final_exited: true,
+                        elapsed_ms: elapsed_millis(executor),
+                        forced: force_action.succeeded(),
+                    });
+                }
+            }
+            Err(error) => last_state = format!("inspection-error={error:#}"),
+        }
+        bounded_poll_sleep(executor, Duration::ZERO);
+    }
+    bail!(
+        "Docker could not prove {service} exited within 45 seconds (last state: {last_state}; graceful error: {}; force error: {})",
+        graceful_action.detail.as_deref().unwrap_or("none"),
+        force_action.detail.as_deref().unwrap_or("none")
+    )
+}
+
+fn human_stop_outcome(outcome: &StopOutcome) -> String {
+    format!(
+        "[stop] {} {} ({:?}); graceful-action={:?}; force-action={:?}; final {}; elapsed={}ms; forced={}",
+        outcome.backend,
+        outcome.target,
+        outcome.graceful_result,
+        outcome.graceful_action,
+        outcome.force_action,
+        outcome.final_state,
+        outcome.elapsed_ms,
+        outcome.forced
+    )
+}
+
+fn format_stop_outcome(outcome: &StopOutcome, json: bool) -> Result<String> {
+    if json {
+        Ok(serde_json::to_string(outcome)?)
+    } else {
+        Ok(human_stop_outcome(outcome))
+    }
+}
+
+fn render_stop_outcome(outcome: &StopOutcome, json: bool) -> Result<()> {
+    println!("{}", format_stop_outcome(outcome, json)?);
+    Ok(())
+}
+
+#[derive(Default)]
+struct StopEnvironment {
+    format: Option<String>,
+    workdir: Option<String>,
+    ssh_key: Option<String>,
+    ssh_port: deploy_config::SshPortEnvironment,
+}
+
+impl StopEnvironment {
+    fn from_process() -> Self {
+        let nonempty = |key| std::env::var(key).ok().filter(|value| !value.is_empty());
+        Self {
+            format: nonempty("WR_FORMAT"),
+            workdir: nonempty("WR_WORKDIR"),
+            ssh_key: nonempty("WR_SSH_KEY"),
+            ssh_port: deploy_config::SshPortEnvironment::from_var(std::env::var("WR_SSH_PORT")),
+        }
+    }
+}
+
+struct ResolvedStopContext {
+    remote: String,
+    component: String,
+    slot: String,
+    format: DeployFormat,
+    workdir: String,
+    ssh_key: Option<String>,
+    ssh_port: Option<u16>,
+    json: bool,
+}
+
+fn resolve_stop_context_from(
+    args: StopArgs,
+    deploy_cfg: DeployConfig,
+    environment: StopEnvironment,
+) -> Result<ResolvedStopContext> {
+    let slot = parse_engine_selector(&args.component)?.to_string();
+    let format =
+        deploy_config::resolve_format_from(args.format, deploy_cfg.format, environment.format);
+    let workdir =
+        deploy_config::resolve_string_from(args.workdir, deploy_cfg.workdir, environment.workdir)
+            .unwrap_or_else(|| "/opt/wruntime".to_string());
+    validate_remote_workdir(&workdir)?;
+    let ssh_key =
+        deploy_config::resolve_string_from(args.ssh_key, deploy_cfg.ssh_key, environment.ssh_key);
+    let ssh_port = deploy_config::resolve_ssh_port_from(
+        args.ssh_port,
+        deploy_cfg.ssh_port,
+        environment.ssh_port,
+    )?
+    .map(helpers::DeployPort::get);
+    Ok(ResolvedStopContext {
+        remote: args.remote,
+        component: args.component,
+        slot,
+        format,
+        workdir,
+        ssh_key,
+        ssh_port,
+        json: args.json,
+    })
+}
+
+fn dispatch_stop(
+    context: &ResolvedStopContext,
+    executor: &mut impl StopExecutor,
+) -> Result<StopOutcome> {
+    let ssh_base = helpers::build_ssh_args(
+        &context.remote,
+        context.ssh_key.as_deref(),
+        context.ssh_port,
+    );
+    match context.format {
+        DeployFormat::Systemd => {
+            stop_systemd(&context.component, &context.slot, &ssh_base, executor)
+        }
+        DeployFormat::Docker => stop_docker(
+            &context.component,
+            &context.slot,
+            &context.workdir,
+            &ssh_base,
+            executor,
+        ),
+    }
+}
+
+fn stop(args: StopArgs) -> Result<()> {
+    let config_path = args.config.clone();
+    let deploy_cfg = DeployConfig::load_or_discover(config_path.as_deref())?;
+    let context = resolve_stop_context_from(args, deploy_cfg, StopEnvironment::from_process())?;
+    let mut executor = SshStopExecutor::new();
+    let outcome = dispatch_stop(&context, &mut executor)?;
+    render_stop_outcome(&outcome, context.json)
 }
 
 fn deployment_failure_detail(error: &anyhow::Error) -> String {
@@ -1847,6 +2510,7 @@ fn add_migrations_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_bundle_path(name: &str) -> PathBuf {
@@ -1862,6 +2526,464 @@ mod tests {
             .iter()
             .position(|item| item == &needle)
             .expect("expected item in deploy phase order")
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockStopMode {
+        AlreadyStopped,
+        Graceful,
+        GracefulActionFailsThenExit,
+        RequiresForce,
+        ForceActionFailsThenExit,
+        NeverExits,
+    }
+
+    struct MockStopExecutor {
+        elapsed: Duration,
+        mode: MockStopMode,
+        running: bool,
+        removed: bool,
+        commands: Vec<String>,
+        ssh_bases: Vec<Vec<String>>,
+        max_call_deadline: Duration,
+    }
+
+    impl MockStopExecutor {
+        fn new(mode: MockStopMode) -> Self {
+            Self {
+                elapsed: Duration::ZERO,
+                running: !matches!(mode, MockStopMode::AlreadyStopped),
+                mode,
+                removed: matches!(mode, MockStopMode::AlreadyStopped),
+                commands: Vec::new(),
+                ssh_bases: Vec::new(),
+                max_call_deadline: Duration::ZERO,
+            }
+        }
+    }
+
+    impl StopExecutor for MockStopExecutor {
+        fn elapsed(&self) -> Duration {
+            self.elapsed
+        }
+
+        fn run(
+            &mut self,
+            ssh_base: &[String],
+            command: &str,
+            timeout: Duration,
+        ) -> Result<RemoteOutput> {
+            assert!(!timeout.is_zero());
+            self.max_call_deadline = self.max_call_deadline.max(self.elapsed + timeout);
+            assert!(self.max_call_deadline <= REMOTE_STOP_BUDGET);
+            self.commands.push(command.to_string());
+            self.ssh_bases.push(ssh_base.to_vec());
+
+            let is_docker_stop = command.contains(" stop --timeout ");
+            let is_systemd_stop = command.contains("systemctl stop --no-block");
+            let is_force = command.contains("signal=KILL") || command.contains(" kill -s KILL ");
+            let consumes_full_grace = (is_docker_stop || is_systemd_stop)
+                && matches!(
+                    self.mode,
+                    MockStopMode::RequiresForce
+                        | MockStopMode::ForceActionFailsThenExit
+                        | MockStopMode::NeverExits
+                );
+            let consumed = if consumes_full_grace {
+                timeout
+            } else {
+                Duration::from_millis(100).min(timeout)
+            };
+            self.elapsed += consumed;
+
+            if (is_docker_stop || is_systemd_stop)
+                && matches!(
+                    self.mode,
+                    MockStopMode::Graceful | MockStopMode::GracefulActionFailsThenExit
+                )
+            {
+                self.running = false;
+            }
+            if is_force
+                && matches!(
+                    self.mode,
+                    MockStopMode::RequiresForce | MockStopMode::ForceActionFailsThenExit
+                )
+            {
+                self.running = false;
+                self.removed = command.contains(" rm --force --stop ")
+                    && matches!(self.mode, MockStopMode::RequiresForce);
+            }
+            if ((is_docker_stop || is_systemd_stop)
+                && matches!(self.mode, MockStopMode::GracefulActionFailsThenExit))
+                || (is_force && matches!(self.mode, MockStopMode::ForceActionFailsThenExit))
+            {
+                anyhow::bail!("injected remote action failure");
+            }
+
+            let stdout = if command.contains("systemctl show") {
+                if self.removed {
+                    "LoadState=not-found\nActiveState=inactive".to_string()
+                } else if self.running {
+                    "LoadState=loaded\nActiveState=active".to_string()
+                } else {
+                    "LoadState=loaded\nActiveState=inactive".to_string()
+                }
+            } else if command.contains("running=$(") {
+                let running = if self.running { "container-id" } else { "" };
+                let container = if self.removed { "" } else { "container-id" };
+                format!("running={running}\ncontainer={container}")
+            } else {
+                String::new()
+            };
+            Ok(RemoteOutput { stdout })
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.elapsed += duration;
+        }
+    }
+
+    fn test_ssh_base() -> Vec<String> {
+        helpers::build_ssh_args("deploy@example", Some("/tmp/test-key"), Some(2222))
+    }
+
+    #[test]
+    fn production_executor_hard_kills_a_term_resistant_child_inside_budget() {
+        let mut executor = SshStopExecutor::new();
+        let started = Instant::now();
+        let error = executor
+            .run(
+                &["sh".to_string(), "-c".to_string()],
+                "trap '' TERM; exec sleep 30",
+                Duration::from_millis(300),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("bounded SSH stop operation failed"));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "production fixture did not exercise timeout enforcement: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "TERM-resistant production fixture exceeded its hard bound: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn stop_selector_accepts_only_safe_engine_slots_and_has_no_node_id_surface() {
+        assert_eq!(parse_engine_selector("engine:primary").unwrap(), "primary");
+        for selector in [
+            "proxy",
+            "manager",
+            "engine:",
+            "engine:slot;shutdown",
+            "engine:slot/name",
+            "wr-engine-primary.service",
+        ] {
+            assert!(
+                parse_engine_selector(selector).is_err(),
+                "accepted {selector}"
+            );
+        }
+
+        #[derive(clap::Parser)]
+        struct Fixture {
+            #[command(flatten)]
+            stop: StopArgs,
+        }
+        let parsed = Fixture::try_parse_from([
+            "fixture",
+            "deploy@example",
+            "--component",
+            "engine:primary",
+            "--workdir",
+            "/srv/wruntime",
+            "--ssh-key",
+            "/tmp/key",
+            "--ssh-port",
+            "2222",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(parsed.stop.remote, "deploy@example");
+        assert_eq!(parsed.stop.workdir.as_deref(), Some("/srv/wruntime"));
+        assert!(parsed.stop.json);
+        assert!(Fixture::try_parse_from([
+            "fixture",
+            "deploy@example",
+            "--component",
+            "engine:primary",
+            "--node-id",
+            "node-a",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn stop_context_precedence_reaches_dispatch_and_selected_renderer() {
+        let base_args = || StopArgs {
+            remote: "deploy@example".to_string(),
+            component: "engine:blue".to_string(),
+            config: None,
+            format: None,
+            workdir: None,
+            ssh_key: None,
+            ssh_port: None,
+            json: true,
+        };
+
+        let environment = StopEnvironment {
+            format: Some("docker".to_string()),
+            workdir: Some("/srv/from-env".to_string()),
+            ssh_key: Some("/keys/from-env".to_string()),
+            ssh_port: deploy_config::SshPortEnvironment::Value("2201".to_string()),
+        };
+        let context =
+            resolve_stop_context_from(base_args(), DeployConfig::default(), environment).unwrap();
+        assert_eq!(context.format, DeployFormat::Docker);
+        assert_eq!(context.workdir, "/srv/from-env");
+        let mut executor = MockStopExecutor::new(MockStopMode::AlreadyStopped);
+        let outcome = dispatch_stop(&context, &mut executor).unwrap();
+        assert!(executor.commands[0].contains("cd /srv/from-env/wr-node/current"));
+        assert!(executor.ssh_bases.iter().all(|base| {
+            base == &helpers::build_ssh_args("deploy@example", Some("/keys/from-env"), Some(2201))
+        }));
+        let rendered = format_stop_outcome(&outcome, context.json).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rendered).unwrap()["target"],
+            "engine-blue"
+        );
+
+        let config = DeployConfig {
+            workdir: Some("/srv/from-config".to_string()),
+            ssh_key: Some("/keys/from-config".to_string()),
+            ssh_port: Some(2202),
+            format: Some(DeployFormat::Docker),
+            ..DeployConfig::default()
+        };
+        let context = resolve_stop_context_from(
+            StopArgs {
+                json: false,
+                ..base_args()
+            },
+            config,
+            StopEnvironment {
+                format: Some("systemd".to_string()),
+                workdir: Some("/srv/ignored-env".to_string()),
+                ssh_key: Some("/keys/ignored-env".to_string()),
+                ssh_port: deploy_config::SshPortEnvironment::Value("2299".to_string()),
+            },
+        )
+        .unwrap();
+        let mut executor = MockStopExecutor::new(MockStopMode::AlreadyStopped);
+        let outcome = dispatch_stop(&context, &mut executor).unwrap();
+        assert!(executor.commands[0].contains("cd /srv/from-config/wr-node/current"));
+        assert!(executor.ssh_bases.iter().all(|base| {
+            base == &helpers::build_ssh_args(
+                "deploy@example",
+                Some("/keys/from-config"),
+                Some(2202),
+            )
+        }));
+        assert!(format_stop_outcome(&outcome, context.json)
+            .unwrap()
+            .starts_with("[stop] docker engine-blue"));
+
+        let explicit = StopArgs {
+            format: Some(DeployFormat::Systemd),
+            workdir: Some("/srv/explicit".to_string()),
+            ssh_key: Some("/keys/explicit".to_string()),
+            ssh_port: Some(2203),
+            json: false,
+            ..base_args()
+        };
+        let context = resolve_stop_context_from(
+            explicit,
+            DeployConfig {
+                format: Some(DeployFormat::Docker),
+                workdir: Some("/srv/ignored-config".to_string()),
+                ssh_key: Some("/keys/ignored-config".to_string()),
+                ssh_port: Some(2298),
+                ..DeployConfig::default()
+            },
+            StopEnvironment::default(),
+        )
+        .unwrap();
+        assert_eq!(context.format, DeployFormat::Systemd);
+        assert_eq!(context.workdir, "/srv/explicit");
+        let mut executor = MockStopExecutor::new(MockStopMode::AlreadyStopped);
+        let outcome = dispatch_stop(&context, &mut executor).unwrap();
+        assert_eq!(outcome.target, "wr-engine-blue.service");
+        assert!(executor.ssh_bases.iter().all(|base| {
+            base == &helpers::build_ssh_args("deploy@example", Some("/keys/explicit"), Some(2203))
+        }));
+
+        let defaults = resolve_stop_context_from(
+            base_args(),
+            DeployConfig::default(),
+            StopEnvironment::default(),
+        )
+        .unwrap();
+        assert_eq!(defaults.format, DeployFormat::Systemd);
+        assert_eq!(defaults.workdir, "/opt/wruntime");
+        assert!(defaults.ssh_key.is_none());
+        assert!(defaults.ssh_port.is_none());
+    }
+
+    #[test]
+    fn systemd_stop_reports_graceful_already_stopped_and_escalated_outcomes() {
+        let ssh = test_ssh_base();
+        for (mode, expected, forced) in [
+            (
+                MockStopMode::AlreadyStopped,
+                GracefulStopDisposition::AlreadyStopped,
+                false,
+            ),
+            (
+                MockStopMode::Graceful,
+                GracefulStopDisposition::Stopped,
+                false,
+            ),
+            (
+                MockStopMode::RequiresForce,
+                GracefulStopDisposition::Escalated,
+                true,
+            ),
+        ] {
+            let mut executor = MockStopExecutor::new(mode);
+            let outcome = stop_systemd("engine:blue", "blue", &ssh, &mut executor).unwrap();
+            assert_eq!(outcome.target, "wr-engine-blue.service");
+            assert_eq!(outcome.graceful_result, expected);
+            assert_eq!(outcome.forced, forced);
+            assert!(outcome.final_exited);
+            assert!(executor.max_call_deadline <= REMOTE_STOP_BUDGET);
+            assert!(executor
+                .ssh_bases
+                .iter()
+                .all(|base| base == &test_ssh_base()));
+        }
+    }
+
+    #[test]
+    fn action_failure_followed_by_exit_remains_explicit_for_both_backends() {
+        let ssh = test_ssh_base();
+        for backend in [DeployFormat::Systemd, DeployFormat::Docker] {
+            let run = |mode| {
+                let mut executor = MockStopExecutor::new(mode);
+                let outcome = match backend {
+                    DeployFormat::Systemd => {
+                        stop_systemd("engine:blue", "blue", &ssh, &mut executor)
+                    }
+                    DeployFormat::Docker => {
+                        stop_docker("engine:blue", "blue", "/opt/wruntime", &ssh, &mut executor)
+                    }
+                }
+                .unwrap();
+                (outcome, executor)
+            };
+
+            let (graceful_failed, _) = run(MockStopMode::GracefulActionFailsThenExit);
+            assert_eq!(
+                graceful_failed.graceful_action.status,
+                StopActionStatus::Failed
+            );
+            assert!(graceful_failed.graceful_action.detail.is_some());
+            assert_eq!(
+                graceful_failed.force_action.status,
+                StopActionStatus::NotAttempted
+            );
+            assert!(!graceful_failed.forced);
+            assert!(graceful_failed.final_exited);
+
+            let (force_failed, _) = run(MockStopMode::ForceActionFailsThenExit);
+            assert_eq!(force_failed.force_action.status, StopActionStatus::Failed);
+            assert!(force_failed.force_action.detail.is_some());
+            assert!(!force_failed.forced);
+            assert!(force_failed.final_exited);
+            let json = serde_json::to_value(&force_failed).unwrap();
+            assert_eq!(json["force_action"]["status"], "failed");
+            assert_eq!(json["forced"], false);
+        }
+    }
+
+    #[test]
+    fn docker_stop_uses_custom_release_root_and_one_bounded_deadline() {
+        let ssh = test_ssh_base();
+        let mut executor = MockStopExecutor::new(MockStopMode::RequiresForce);
+        let outcome = stop_docker(
+            "engine:canary",
+            "canary",
+            "/srv/custom",
+            &ssh,
+            &mut executor,
+        )
+        .unwrap();
+        assert_eq!(outcome.target, "engine-canary");
+        assert_eq!(outcome.graceful_result, GracefulStopDisposition::Escalated);
+        assert!(outcome.forced);
+        assert!(executor.max_call_deadline <= REMOTE_STOP_BUDGET);
+        assert!(executor.commands.iter().all(|command| {
+            !command.contains("docker compose")
+                || command.contains("cd /srv/custom/wr-node/current")
+        }));
+        assert!(executor
+            .commands
+            .iter()
+            .any(|command| command.contains("stop --timeout 30 engine-canary")));
+        assert!(executor
+            .commands
+            .iter()
+            .any(|command| command.contains("kill -s KILL engine-canary")));
+    }
+
+    #[test]
+    fn backend_stop_fails_when_final_exit_cannot_be_proved() {
+        let ssh = test_ssh_base();
+        let mut systemd = MockStopExecutor::new(MockStopMode::NeverExits);
+        let error = stop_systemd("engine:x", "x", &ssh, &mut systemd).unwrap_err();
+        assert!(error.to_string().contains("could not prove"));
+        assert!(systemd.elapsed <= REMOTE_STOP_BUDGET);
+        assert!(systemd.max_call_deadline <= REMOTE_STOP_BUDGET);
+
+        let mut docker = MockStopExecutor::new(MockStopMode::NeverExits);
+        let error = stop_docker("engine:x", "x", "/opt/wruntime", &ssh, &mut docker).unwrap_err();
+        assert!(error.to_string().contains("could not prove"));
+        assert!(docker.elapsed <= REMOTE_STOP_BUDGET);
+        assert!(docker.max_call_deadline <= REMOTE_STOP_BUDGET);
+    }
+
+    #[test]
+    fn stop_renderers_share_one_typed_outcome() {
+        let outcome = StopOutcome {
+            component: "engine:primary".to_string(),
+            backend: "systemd",
+            target: "wr-engine-primary.service".to_string(),
+            graceful_result: GracefulStopDisposition::AlreadyStopped,
+            graceful_action: StopActionEvidence::not_attempted(),
+            force_action: StopActionEvidence::not_attempted(),
+            final_state: "load=not-found,active=inactive".to_string(),
+            final_exited: true,
+            elapsed_ms: 42,
+            forced: false,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&format_stop_outcome(&outcome, true).unwrap()).unwrap();
+        assert_eq!(value["component"], "engine:primary");
+        assert_eq!(value["target"], "wr-engine-primary.service");
+        assert_eq!(value["graceful_result"], "already-stopped");
+        assert_eq!(value["final_exited"], true);
+        assert_eq!(value["elapsed_ms"], 42);
+        assert_eq!(value["graceful_action"]["status"], "not-attempted");
+        assert_eq!(value["force_action"]["status"], "not-attempted");
+        assert_eq!(value["forced"], false);
+        let human = format_stop_outcome(&outcome, false).unwrap();
+        assert!(human.contains("wr-engine-primary.service"));
+        assert!(human.contains("AlreadyStopped"));
+        assert!(human.contains("forced=false"));
     }
 
     #[test]

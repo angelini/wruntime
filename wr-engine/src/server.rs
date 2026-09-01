@@ -22,12 +22,11 @@ use tracing::{info, info_span, warn, Instrument};
 
 use crate::registry::{InboundRequest, ModuleRegistry};
 use wr_common::lifecycle_service::{AdmissionGate, AdmissionGuard};
-use wr_common::process_lifecycle::{ProcessLifecycleCoordinator, TransitionReason};
-use wr_common::signal::{apply_shutdown_request, ShutdownRequest};
+use wr_common::process_lifecycle::LifecycleSnapshotHandle;
 use wr_common::task_group::{TaskCancellation, TaskExit};
 use wr_common::wruntime::{
-    DrainRequest, DrainResponse, GetJobStatusRequest, GetJobStatusResponse,
-    GetLifecycleStatusResponse, StopRequest, StopResponse, SubmitJobRequest, SubmitJobResponse,
+    GetJobStatusRequest, GetJobStatusResponse, GetLifecycleStatusResponse, SubmitJobRequest,
+    SubmitJobResponse,
 };
 
 const WORKER_SERVICE_PREFIX: &str = "/wruntime.WorkerService/";
@@ -58,7 +57,6 @@ pub(crate) struct WorkerDefaults {
 #[derive(Clone)]
 pub(crate) struct EngineAdmission {
     pub(crate) workload: AdmissionGate,
-    pub(crate) worker: AdmissionGate,
 }
 
 struct RoutedIdentity(wr_common::identity::ModuleId);
@@ -121,7 +119,7 @@ pub async fn serve(
     db_pool: Option<Arc<Pool>>,
     worker_defaults: Arc<WorkerDefaults>,
     admission: EngineAdmission,
-    lifecycle: ProcessLifecycleCoordinator,
+    lifecycle: LifecycleSnapshotHandle,
     mut cancellation: TaskCancellation,
 ) -> Result<TaskExit> {
     info!(address = %listener.local_addr()?, "inbound server listening");
@@ -149,7 +147,7 @@ pub async fn serve(
                         async move {
                             if request.uri().path().starts_with("/wruntime.LifecycleService/") {
                                 return Ok::<_, Infallible>(
-                                    handle_lifecycle(request, &lifecycle, &admission.worker).await,
+                                    handle_lifecycle(request, &lifecycle).await,
                                 );
                             }
                             let Some(guard) = admission.workload.try_enter() else {
@@ -264,8 +262,7 @@ fn guard_response(
 
 async fn handle_lifecycle(
     request: Request<hyper::body::Incoming>,
-    lifecycle: &ProcessLifecycleCoordinator,
-    worker_admission: &AdmissionGate,
+    lifecycle: &LifecycleSnapshotHandle,
 ) -> wr_engine::EngineResponse {
     if request
         .headers()
@@ -274,61 +271,13 @@ async fn handle_lifecycle(
     {
         return grpc_error(tonic::Code::PermissionDenied);
     }
-    let path = request.uri().path().to_string();
-    let body = match request.into_body().collect().await {
-        Ok(body) => body.to_bytes(),
-        Err(_) => return grpc_error(tonic::Code::Internal),
-    };
 
-    match path.as_str() {
+    match request.uri().path() {
         "/wruntime.LifecycleService/GetStatus" => grpc_success(GetLifecycleStatusResponse {
             status: Some((&lifecycle.current()).into()),
         }),
-        "/wruntime.LifecycleService/Drain" => {
-            let request = match decode_grpc::<DrainRequest>(&body) {
-                Ok(request) => request,
-                Err(code) => return grpc_error(code),
-            };
-            worker_admission.close();
-            match apply_shutdown_request(
-                lifecycle,
-                ShutdownRequest::drain(TransitionReason::ControlDrainRequested, request.detail),
-            ) {
-                Ok(snapshot) => grpc_success(DrainResponse {
-                    status: Some((&snapshot).into()),
-                }),
-                Err(_) => grpc_error(tonic::Code::FailedPrecondition),
-            }
-        }
-        "/wruntime.LifecycleService/Stop" => {
-            let request = match decode_grpc::<StopRequest>(&body) {
-                Ok(request) => request,
-                Err(code) => return grpc_error(code),
-            };
-            worker_admission.close();
-            match apply_shutdown_request(
-                lifecycle,
-                ShutdownRequest::stop(TransitionReason::ControlStopRequested, request.detail),
-            ) {
-                Ok(snapshot) => grpc_success(StopResponse {
-                    status: Some((&snapshot).into()),
-                }),
-                Err(_) => grpc_error(tonic::Code::FailedPrecondition),
-            }
-        }
         _ => grpc_error(tonic::Code::Unimplemented),
     }
-}
-
-fn decode_grpc<M: Message + Default>(body: &[u8]) -> std::result::Result<M, tonic::Code> {
-    if body.len() < 5 || body[0] != 0 {
-        return Err(tonic::Code::InvalidArgument);
-    }
-    let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
-    if body.len() != length + 5 {
-        return Err(tonic::Code::InvalidArgument);
-    }
-    M::decode(&body[5..]).map_err(|_| tonic::Code::InvalidArgument)
 }
 
 fn grpc_success<M: Message>(message: M) -> wr_engine::EngineResponse {
@@ -688,21 +637,23 @@ mod tests {
     use std::collections::HashMap;
 
     #[tokio::test]
-    async fn lifecycle_rpc_remains_available_while_workload_is_closed() -> anyhow::Result<()> {
+    async fn lifecycle_rpc_is_status_only_and_never_mutates_admission() -> anyhow::Result<()> {
+        use wr_common::process_lifecycle::{LifecycleDriver, ServiceKind, TransitionReason};
         use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
-        use wr_common::wruntime::{DrainRequest, GetLifecycleStatusRequest, ProcessLifecycleState};
+        use wr_common::wruntime::{GetLifecycleStatusRequest, ProcessLifecycleState};
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let lifecycle = ProcessLifecycleCoordinator::new(
-            wr_common::process_lifecycle::ServiceKind::Engine,
-            "engine-server-test",
-        );
+        let (driver, lifecycle) = LifecycleDriver::new(ServiceKind::Engine, "engine-server-test");
         let admission = AdmissionGate::closed();
         let worker_admission = AdmissionGate::closed();
         worker_admission.open();
         let worker_admission_observer = worker_admission.clone();
         let mut tasks = wr_common::task_group::TaskGroup::new();
+        tasks.spawn("lifecycle-driver", move |cancellation| {
+            driver.run(cancellation)
+        });
+        let lifecycle_snapshot = lifecycle.snapshot();
         tasks.spawn("test-engine-server", move |cancellation| {
             serve(
                 listener,
@@ -711,9 +662,8 @@ mod tests {
                 Arc::new(WorkerDefaults::default()),
                 EngineAdmission {
                     workload: admission,
-                    worker: worker_admission,
                 },
-                lifecycle,
+                lifecycle_snapshot,
                 cancellation,
             )
         });
@@ -726,20 +676,34 @@ mod tests {
             .status
             .context("status missing")?;
         assert_eq!(starting.state, ProcessLifecycleState::Starting as i32);
-        let draining = client
-            .drain(DrainRequest {
-                detail: "test".into(),
-            })
-            .await?
-            .into_inner()
-            .status
-            .context("drain status missing")?;
-        assert_eq!(draining.state, ProcessLifecycleState::Draining as i32);
         assert!(
-            !worker_admission_observer.is_open(),
-            "drain acknowledgement must synchronously fence worker claims"
+            worker_admission_observer.is_open(),
+            "status observation must not fence worker claims"
         );
 
+        let raw_client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+            .http2_only(true)
+            .build_http::<http_body_util::Full<Bytes>>();
+        for path in [
+            "/wruntime.LifecycleService/Drain",
+            "/wruntime.LifecycleService/Stop",
+        ] {
+            let request = Request::post(format!("http://{address}{path}"))
+                .header(http::header::CONTENT_TYPE, "application/grpc")
+                .body(http_body_util::Full::new(Bytes::from_static(&[
+                    0, 0, 0, 0, 0,
+                ])))?;
+            let response = raw_client.request(request).await?;
+            assert_eq!(
+                response.headers().get("grpc-status"),
+                Some(&http::HeaderValue::from_static("12")),
+                "removed lifecycle control route {path} must be unimplemented"
+            );
+        }
+
+        lifecycle
+            .request_stop(TransitionReason::TaskFailure, "test complete")
+            .await?;
         let report = tasks
             .shutdown(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
             .await;

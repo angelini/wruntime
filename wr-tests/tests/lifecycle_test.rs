@@ -16,9 +16,8 @@ use helpers::lifecycle::{
 };
 use wr_common::wruntime::{
     lifecycle_service_server::{LifecycleService, LifecycleServiceServer},
-    DrainRequest, DrainResponse, GetLifecycleStatusRequest, GetLifecycleStatusResponse,
-    LifecycleStatus, LifecycleTransitionReason, ProcessLifecycleState, ServiceKind, StopRequest,
-    StopResponse,
+    GetLifecycleStatusRequest, GetLifecycleStatusResponse, LifecycleStatus,
+    LifecycleTransitionReason, ProcessLifecycleState, ServiceKind,
 };
 
 #[derive(Clone)]
@@ -35,17 +34,6 @@ impl LifecycleService for FixedLifecycle {
         Ok(Response::new(GetLifecycleStatusResponse {
             status: Some(self.status.clone()),
         }))
-    }
-
-    async fn drain(
-        &self,
-        _request: Request<DrainRequest>,
-    ) -> Result<Response<DrainResponse>, Status> {
-        Err(Status::unimplemented("not needed by helper tests"))
-    }
-
-    async fn stop(&self, _request: Request<StopRequest>) -> Result<Response<StopResponse>, Status> {
-        Err(Status::unimplemented("not needed by helper tests"))
     }
 }
 
@@ -135,6 +123,59 @@ async fn state_wait_preserves_the_last_typed_observation_at_deadline() -> Result
 }
 
 #[tokio::test]
+async fn ready_wait_rejects_wrong_kind_and_activation_identity() -> Result<()> {
+    let mut command = Command::new("sh");
+    command.args(["-c", "sleep 30"]).kill_on_drop(true);
+    let mut child = command.spawn()?;
+
+    let mut wrong_kind = status(ProcessLifecycleState::Ready);
+    wrong_kind.service_kind = ServiceKind::Proxy as i32;
+    let (endpoint, shutdown) = spawn_lifecycle_server(wrong_kind).await?;
+    let mut client = lifecycle_client(endpoint).await?;
+    let error = wait_for_ready_with_child(
+        &mut client,
+        &mut child,
+        ServiceKind::Engine,
+        "helper-test",
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        LifecycleWaitError::ServiceKindMismatch {
+            expected: ServiceKind::Engine,
+            observed,
+        } if observed == ServiceKind::Proxy as i32
+    ));
+    let _ = shutdown.send(());
+
+    let mut wrong_instance = status(ProcessLifecycleState::Ready);
+    wrong_instance.process_instance_id = "other-activation".to_owned();
+    let (endpoint, shutdown) = spawn_lifecycle_server(wrong_instance).await?;
+    let mut client = lifecycle_client(endpoint).await?;
+    let error = wait_for_ready_with_child(
+        &mut client,
+        &mut child,
+        ServiceKind::Engine,
+        "helper-test",
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        LifecycleWaitError::ProcessInstanceMismatch { expected, observed }
+            if expected == "helper-test" && observed == "other-activation"
+    ));
+    let _ = shutdown.send(());
+
+    child.start_kill()?;
+    let _ = child.wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn ready_wait_fails_immediately_when_the_supervised_child_exits() -> Result<()> {
     let mut child = Command::new("sh").args(["-c", "exit 17"]).spawn()?;
     let _ = child.wait().await?;
@@ -143,6 +184,8 @@ async fn ready_wait_fails_immediately_when_the_supervised_child_exits() -> Resul
     let error = wait_for_ready_with_child(
         &mut client,
         &mut child,
+        ServiceKind::Engine,
+        "helper-test",
         Instant::now() + Duration::from_secs(1),
     )
     .await

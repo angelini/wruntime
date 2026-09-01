@@ -494,14 +494,22 @@ pub fn build_manager_binary(target: &str) -> Result<()> {
     Ok(())
 }
 
+fn build_precompile_engine(target: &str) -> Result<Engine> {
+    let mut wt_config = Config::new();
+    wt_config.wasm_component_model(true);
+    wt_config.epoch_interruption(true);
+    wt_config.memory_reservation(4 * (1 << 30));
+    wt_config.memory_guard_size(32 * (1 << 20));
+    wt_config.memory_init_cow(true);
+    wt_config.target(target)?;
+    Ok(Engine::new(&wt_config)?)
+}
+
 /// Pre-compile WASM components to native code for the given target triple.
 /// Uses Cranelift cross-compilation so the build host need not match the target.
 /// Returns the compatibility hash for the compiled artifacts.
 pub fn precompile_components(modules: &[BuildModule], target: &str) -> Result<String> {
-    let mut wt_config = Config::new();
-    wt_config.wasm_component_model(true);
-    wt_config.target(target)?;
-    let engine = Engine::new(&wt_config)?;
+    let engine = build_precompile_engine(target)?;
     let mut hasher = DefaultHasher::new();
     engine.precompile_compatibility_hash().hash(&mut hasher);
     let hash = format!("{:016x}", hasher.finish());
@@ -747,6 +755,59 @@ mod tests {
                 .to_string_lossy()
                 .contains("wr-strip")));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn host_target() -> Option<&'static str> {
+        if cfg!(all(
+            target_arch = "x86_64",
+            target_os = "linux",
+            target_env = "gnu"
+        )) {
+            Some("x86_64-unknown-linux-gnu")
+        } else if cfg!(all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_env = "gnu"
+        )) {
+            Some("aarch64-unknown-linux-gnu")
+        } else {
+            None
+        }
+    }
+
+    fn compatibility_hash(engine: &Engine) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        engine.precompile_compatibility_hash().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn precompile_configuration_matches_the_runtime() {
+        let Some(target) = host_target() else {
+            return;
+        };
+        let precompile = build_precompile_engine(target).unwrap();
+        let runtime =
+            wr_engine::runtime::build_engine(&wr_engine::config::PoolConfig::default()).unwrap();
+        assert_eq!(
+            compatibility_hash(&precompile),
+            compatibility_hash(&runtime)
+        );
+
+        let component = b"\0asm\x0d\0\x01\0";
+        let compiled = precompile.precompile_component(component).unwrap();
+        unsafe { wasmtime::component::Component::deserialize(&runtime, compiled) }.unwrap();
+    }
+
+    #[test]
+    fn precompile_supports_documented_linux_architectures() {
+        let component = b"\0asm\x0d\0\x01\0";
+        for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            build_precompile_engine(target)
+                .unwrap()
+                .precompile_component(component)
+                .unwrap();
+        }
     }
 
     #[test]

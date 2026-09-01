@@ -187,6 +187,7 @@ async fn test_unhealthy_module_excluded_from_routing() -> Result<()> {
     .await?;
 
     let table = synced_routing_table(&mgr_addr).await?;
+    let initial_proxy_version = table.version().await;
     let proxy = start_proxy(table.clone()).await?;
 
     // Module is healthy — routing should work.
@@ -195,7 +196,7 @@ async fn test_unhealthy_module_excluded_from_routing() -> Result<()> {
 
     // Backdate engine heartbeat and wait for monitor to mark unhealthy.
     backdate_engine_heartbeat(&pool, "hc-route-e1", 60).await;
-    wait_for_default_rule_health(
+    let (_, observed_version) = wait_for_default_rule_health(
         &mut mgr,
         "hc-route-e1",
         "hc-route-ns",
@@ -206,8 +207,22 @@ async fn test_unhealthy_module_excluded_from_routing() -> Result<()> {
     )
     .await?;
 
-    // Re-sync the routing table — the rule should now be unhealthy.
+    // Health rows become visible just before their routing-version publication.
+    // If the observation raced that publication, wait for the next typed
+    // manager version before the one-shot proxy sync. Production refresh loops
+    // retry naturally; this fixture must not mistake the intermediate version
+    // for completed convergence.
+    let target_version = if observed_version > initial_proxy_version {
+        observed_version
+    } else {
+        wait_for_routing_table_version_gt(&mut mgr, initial_proxy_version, DEFAULT_WAIT_TIMEOUT)
+            .await?
+    };
     sync_table(&mgr_addr, &table).await?;
+    assert!(
+        table.version().await >= target_version,
+        "proxy routing snapshot did not reach unhealthy publication version {target_version}"
+    );
 
     // Request should get 503 because no healthy instances remain.
     let (status, _) = proxy_get(proxy, "hc-route-ns", "routed-svc", Some("1.0.0")).await?;

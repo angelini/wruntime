@@ -4,21 +4,19 @@ The mTLS `wruntime.ManagerService` is the cluster control plane. Engines use the
 
 ## Process lifecycle
 
-`wruntime.LifecycleService` reports and controls one local process. It is a transport-neutral contract mounted only on each service's trusted control listener. Process stage is monotonic:
+`wruntime.LifecycleService` is a read-only observation contract mounted on each service's trusted control listener. Process stage is monotonic:
 
-`STARTING → READY → DRAINING → STOPPING`
+`STARTING → READY → STOPPING`
 
 `READY` means the owning service crossed its startup barriers and admits its intended work. It does not imply dependency, module, route, or cluster health; those remain `StatusSeverity` evidence from `GetClusterStatus`. `UNSPECIFIED` is invalid wire input, and there is no remotely observable `STOPPED` state after the endpoint disappears.
 
 | RPC | Request | Response | Semantics |
 | --- | --- | --- | --- |
 | `GetStatus` | empty | `LifecycleStatus` | Side-effect-free snapshot containing process state, stable service kind and process instance ID, transition timestamp, typed reason, and explanatory detail. |
-| `Drain` | optional detail | `LifecycleStatus` | Idempotently closes admission and begins bounded quiescence without requesting process exit. |
-| `Stop` | optional detail | `LifecycleStatus` | Idempotently implies drain when necessary and requests full shutdown. |
 
-Transitions never move backward. Duplicate drain or stop requests return the current state. Invalid or unsupported requests return a gRPC status error. Proxy `Drain` closes admission and waits for all data listeners to stop accepting before it acknowledges `DRAINING`; its loopback control endpoint remains available for `Stop`. `LifecycleTransitionReason` is the machine-readable transition key; `detail` is bounded explanatory text and must not be parsed by automation.
+Transitions never move backward. Service-specific route withdrawal, admission closure, draining, deregistration, and task joining are internal `STOPPING` phases. The process owner requests graceful shutdown with SIGTERM or SIGINT; lifecycle RPC clients cannot mutate process state. `LifecycleTransitionReason` is the machine-readable transition key; `detail` is bounded explanatory text and must not be parsed by automation.
 
-`wr-cli lifecycle status|wait|drain|stop --endpoint <url>` exposes this contract for trusted operator and runner use; `--tls` selects the CLI's manager mTLS credentials. Waits pin the first observed process instance and return distinct errors for transport/query failure, instance replacement, terminal-before-ready state, and timeout. These commands never interpret cluster health severity.
+`wr-cli lifecycle status|wait --endpoint <url>` exposes this observation contract; `--tls` selects the CLI's manager mTLS credentials. Waits require the expected service kind and activation identity and return distinct errors for transport/query failure, replacement, terminal-before-ready state, and timeout. These commands never interpret cluster health severity. Local process exit is proven by the foreground owner's `Child` handle; deployed process exit is proven by systemd or Docker through `wr-cli node stop`, not by adding a lifecycle mutation RPC.
 
 ## Engine lifecycle
 
@@ -136,8 +134,9 @@ The `wruntime.NodeService` gRPC service is exposed by `wr-proxy` on its `control
 | `DeregisterEngine` | `DeregisterEngineRequest` | `DeregisterEngineResponse` | Engine removes itself on shutdown |
 | `Heartbeat` | `HeartbeatRequest` | `HeartbeatResponse` | The first post-load heartbeat is forwarded synchronously and acknowledged only after the returned manager version is installed locally; later heartbeats are cached and aggregated every 3 s. |
 | `BeginEngineDrain` | `BeginEngineDrainRequest` | `BeginEngineDrainResponse` | Fences heartbeat publication, withdraws engine route admission through the manager, and returns manager/local-proxy convergence versions without deregistration. |
+| `GetProxyRoutingStatus` | empty | activation ID and installed routing-table version | Read-only local observation used by a foreground process owner to prove that this exact READY proxy activation installed a captured manager version. |
 
-NodeService serializes heartbeat/readiness/drain/deregister forwarding behind a per-engine fence and generation; unrelated engines do not hold one another's manager RPC or convergence path. A periodic flush snapshots the generation and discards it if the per-engine generation changed before the forward fence. Drain removes an engine from periodic publication before the manager route update. Deregistration tombstones it before the manager RPC, so an older flush or later heartbeat cannot recreate serving routes.
+NodeService serializes heartbeat/readiness/drain/deregister forwarding behind a per-engine fence and generation; unrelated engines do not hold one another's manager RPC or convergence path. A periodic flush snapshots the generation and discards it if the per-engine generation changed before the forward fence. Drain removes an engine from periodic publication before the manager route update. Deregistration tombstones it before the manager RPC, so an older flush or later heartbeat cannot recreate serving routes. Routing status reads the same lifecycle activation handle served by `LifecycleService.GetStatus` and the version from the existing installed routing snapshot; it performs no convergence or lifecycle mutation.
 
 This decouples engines from the manager address — engines only need to know their local proxy's loopback control address.
 

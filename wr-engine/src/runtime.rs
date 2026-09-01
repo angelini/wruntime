@@ -25,6 +25,9 @@ use crate::{EngineBodyError, EngineResponse, InboundBody};
 /// configuration used in production.
 pub fn build_engine(pool: &PoolConfig) -> Result<Engine> {
     let mut wt_config = Config::new();
+    // Use the generic build target so cross-compiled components and runtime JIT
+    // compilation share the same compiler flags on every deployment host.
+    wt_config.target(&target_lexicon::HOST.to_string())?;
     wt_config.wasm_component_model(true);
     wt_config.epoch_interruption(true);
     wt_config.memory_reservation(4 * (1 << 30));
