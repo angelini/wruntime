@@ -7,7 +7,7 @@ Every module **must** declare a protobuf schema. Schemas serve two purposes:
 1. **Code generation** — `wr-build` generates service traits and client stubs from the proto definitions, giving modules type-safe RPC interfaces.
 2. **Discovery** — engines upload schemas to the manager on registration. Tools like `wr-cli` can fetch schemas to inspect available RPCs and message types.
 
-The proxy trusts wruntime-generated module, worker, scheduler, and peer traffic and forwards those request bodies without buffering or schema validation. Public traffic entering through the optional external listener is different: each configured route names an `rpc_path`, and the proxy validates the external request body against that RPC's protobuf input type before forwarding it. Modules should still handle malformed internal input gracefully.
+The proxy trusts wruntime-generated module, worker, scheduler, and peer traffic and forwards those request bodies without buffering or schema validation. Public traffic entering through the optional external listener is different: each configured route names an `rpc_path`, and the proxy decodes supported protobuf, canonical protobuf JSON, or flat form input against that RPC's protobuf input type before forwarding normalized wire bytes. Modules should still handle malformed internal input gracefully.
 
 Schemas are compiled `FileDescriptorSet` binaries produced by `protoc`.
 
@@ -50,7 +50,7 @@ When the proxy receives a trusted internal request with `x-wr-destination: http:
 2. Looks up healthy routing rules for that module in the cached routing table.
 3. Selects a candidate via round-robin and streams the request body without inspection.
 
-Generated routers match the canonical path `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`. An external route may expose a REST-style alias in `path`; its required `rpc_path` supplies the canonical generated path. Public ingress strips reserved headers, rewrites the alias to `rpc_path`, resolves the selected module version, lazily caches that version's descriptor set from the manager, buffers the external request body once, and decodes it as the RPC input message. Invalid protobuf is rejected with `400`, bodies over `external.max_request_body_bytes` with `413`, and an unavailable schema fails closed with `503`. Responses are still streamed and are not schema-validated.
+Generated routers match the canonical path `/{proto_package}.{ProtoServiceName}/{ProtoMethodName}`. An external route may expose a REST-style alias in `path`; its required `rpc_path` supplies the canonical generated path. Public ingress strips reserved headers, rewrites the alias to `rpc_path`, resolves the selected module version, and buffers the request under `external.max_request_body_bytes`. It selects protobuf wire, canonical protobuf JSON, or flat URL-encoded form input from `Content-Type`, lazily caches the selected version's descriptor set, decodes the request as that RPC's input message, and forwards normalized protobuf wire bytes. Malformed or schema-incompatible input is rejected with `400`, oversized input with `413`, unsupported media types with `415`, and an unavailable schema with `503`. Responses are still streamed and are not schema-validated or transcoded.
 
 Internal loopback and mTLS peer stacks never include this validation layer, so module-to-module and cross-node continuation traffic retains the streaming fast path.
 

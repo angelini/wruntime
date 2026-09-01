@@ -113,7 +113,7 @@ Omitting the entire `[circuit_breaker]` section keeps circuit breaking enabled w
 
 ### External routes (public API)
 
-Expose a subset of internal protobuf RPCs to external callers on a separate port. All `x-wr-*` headers are stripped from incoming requests before routing, preventing header spoofing. Public request bodies are buffered and validated once against the selected module version's protobuf input schema; internal loopback and mTLS peer traffic remains trusted, streaming, and unvalidated.
+Expose a subset of internal protobuf RPCs to external callers on a separate port. All `x-wr-*` headers are stripped from incoming requests before routing, preventing header spoofing. Public request bodies are buffered, decoded according to `Content-Type`, and validated once against the selected module version's protobuf input schema. The proxy forwards normalized protobuf wire bytes to the guest. Internal loopback and mTLS peer traffic remains trusted, streaming, and unvalidated.
 
 ```toml
 [external]
@@ -135,7 +135,33 @@ module    = "inventory"
 namespace = "ecommerce"
 ```
 
-Omit the `[external]` section to keep all routes internal-only. `path` is the public path or REST-style alias. The required `rpc_path` uses the canonical `/{proto_package}.{Service}/{Method}` form, selects the request message schema, and replaces the public path before forwarding to the generated module router; the query string is preserved. Route patterns are parsed with `matchit` during config load, methods are normalized and validated once as HTTP method tokens, and conflicting patterns fail startup with a config error. An empty `methods` list still means all methods. Invalid protobuf returns `400`, a body over `max_request_body_bytes` returns `413`, and an unavailable descriptor fails closed with `503`.
+Omit the `[external]` section to keep all routes internal-only. `path` is the public path or REST-style alias. The required `rpc_path` uses the canonical `/{proto_package}.{Service}/{Method}` form, selects the request message schema, and replaces the public path before forwarding to the generated module router; the query string is preserved. Route patterns are parsed with `matchit` during config load, methods are normalized and validated once as HTTP method tokens, and conflicting patterns fail startup with a config error. An empty `methods` list still means all methods.
+
+Every configured public route automatically accepts these request representations:
+
+- `application/x-protobuf`: protobuf wire bytes;
+- `application/json`: canonical protobuf JSON;
+- `application/x-www-form-urlencoded`: flat top-level scalar and enum fields. Repeated scalar/enum fields use repeated keys. Keys may use the protobuf source name or JSON name. Integer ranges, enum syntax, booleans, floating-point values, and base64 bytes follow protobuf JSON rules.
+
+Media-type parameters are allowed. JSON and form bodies must be UTF-8; an explicit non-UTF-8 `charset` or a non-identity `Content-Encoding` is unsupported. A non-empty body with a missing, malformed, or unsupported `Content-Type` returns `415`. A zero-byte body without `Content-Type` represents the default protobuf message; an explicitly JSON request must contain valid JSON such as `{}`. Empty protobuf and form bodies are valid default messages.
+
+Forms cannot submit nested messages, maps, groups, dotted/bracketed keys, or multiple members of one `oneof`. Singular duplicates—including one key using the proto name and another using its JSON alias—are rejected. Complex fields may be omitted and retain their protobuf defaults. Query strings and path parameters are not projected into message fields, and `multipart/form-data` is not supported.
+
+For example:
+
+```bash
+curl -X POST http://localhost:8080/items \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"widget","quantity":2}'
+
+curl -X POST http://localhost:8080/items \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data 'name=widget&quantity=2&tag=sale&tag=featured'
+```
+
+After validation, the guest receives `application/x-protobuf` with normalized wire bytes and a corrected `Content-Length`. Request representation metadata invalidated by transcoding is removed. Responses are streamed unchanged: generated service responses remain protobuf unless the guest deliberately returns JSON, HTML, a redirect, or another representation.
+
+Malformed or schema-incompatible protobuf, JSON, or form input returns `400`; a body over `max_request_body_bytes` returns `413`; unsupported representation or content encoding returns `415`; and an unavailable descriptor fails closed with `503`.
 
 ## wr-engine
 

@@ -2,8 +2,8 @@ mod helpers;
 use helpers::{
     manager::{manager_trio, register_test_module_ready, synced_routing_table},
     proxy::{http_client, start_ingress_proxy, ExternalRoute},
-    stubs::spawn_stub_engine,
-    wasm::{invalid_protobuf, minimal_file_descriptor_set},
+    stubs::{spawn_capturing_stub, spawn_stub_engine, CapturedRequest},
+    wasm::{invalid_protobuf, minimal_file_descriptor_set, valid_ping_request},
 };
 
 use std::sync::Arc;
@@ -41,6 +41,37 @@ async fn ingress_fixture(
 
     let ingress_addr = start_ingress_proxy(table, schema_cache, routes).await?;
     Ok((ingress_addr, engine_shutdown))
+}
+
+async fn capturing_ingress_fixture(
+    module: &str,
+    namespace: &str,
+    routes: Vec<ExternalRoute>,
+) -> Result<(
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::mpsc::Receiver<CapturedRequest>,
+)> {
+    let (pool, mgr_addr, mut mgr_c) = manager_trio().await?;
+    let (engine_addr, engine_shutdown, captures) = spawn_capturing_stub().await?;
+    register_test_module_ready(
+        &pool,
+        &mut mgr_c,
+        "e1",
+        &engine_addr,
+        namespace,
+        module,
+        "1.0.0",
+    )
+    .await?;
+
+    let table = synced_routing_table(&mgr_addr).await?;
+    let schema_cache = Arc::new(wr_proxy::schema::SchemaCache::default());
+    schema_cache
+        .insert(namespace, module, "1.0.0", &minimal_file_descriptor_set())
+        .await?;
+    let ingress_addr = start_ingress_proxy(table, schema_cache, routes).await?;
+    Ok((ingress_addr, engine_shutdown, captures))
 }
 
 /// Send a plain HTTP request directly to `addr` (no wruntime headers).
@@ -114,6 +145,7 @@ async fn test_external_route_rejects_invalid_protobuf() -> Result<()> {
             Request::builder()
                 .method("POST")
                 .uri(format!("http://{addr}/items"))
+                .header("content-type", "application/x-protobuf")
                 .body(Full::new(invalid_protobuf()))?,
         )
         .await?;
@@ -133,10 +165,117 @@ async fn test_external_route_rejects_oversized_body() -> Result<()> {
             Request::builder()
                 .method("POST")
                 .uri(format!("http://{addr}/items"))
+                .header("content-type", "application/x-protobuf")
                 .body(Full::new(bytes::Bytes::from(vec![0; 1025])))?,
         )
         .await?;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_external_json_is_transcoded_and_response_is_unchanged() -> Result<()> {
+    let routes = vec![route("/items", &["POST"])];
+    let (addr, _shutdown, mut captures) =
+        capturing_ingress_fixture("inventory", "ecommerce", routes).await?;
+
+    let response = http_client()
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{addr}/items"))
+                .header("content-type", "application/json; charset=UTF-8")
+                .header("content-encoding", "identity")
+                .header("content-digest", "sha-256=:invalid-after-transcoding:")
+                .body(Full::new(bytes::Bytes::from_static(
+                    br#"{"message":"hello"}"#,
+                )))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/vnd.stub+json"
+    );
+    assert_eq!(
+        response.headers().get("set-cookie").unwrap(),
+        "stub=true; HttpOnly"
+    );
+    assert_eq!(response.headers().get("location").unwrap(), "/created/1");
+    let response_body = response.into_body().collect().await?.to_bytes();
+    assert_eq!(response_body, "stub-response");
+
+    let captured = captures
+        .recv()
+        .await
+        .expect("engine should receive request");
+    assert_eq!(captured.path, "/test.PingService/Ping");
+    assert_eq!(
+        captured.content_type.as_deref(),
+        Some("application/x-protobuf")
+    );
+    assert_eq!(captured.content_length.as_deref(), Some("7"));
+    assert_eq!(captured.content_encoding, None);
+    assert_eq!(captured.content_digest, None);
+    assert_eq!(captured.body, valid_ping_request());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_external_form_is_transcoded_to_protobuf() -> Result<()> {
+    let routes = vec![route("/items", &["POST"])];
+    let (addr, _shutdown, mut captures) =
+        capturing_ingress_fixture("inventory", "ecommerce", routes).await?;
+
+    let response = http_client()
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("http://{addr}/items"))
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Full::new(bytes::Bytes::from_static(b"message=hello+world")))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let captured = captures
+        .recv()
+        .await
+        .expect("engine should receive request");
+    assert_eq!(
+        captured.content_type.as_deref(),
+        Some("application/x-protobuf")
+    );
+    assert_eq!(
+        captured.body,
+        bytes::Bytes::from_static(b"\x0a\x0bhello world")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_external_nonempty_body_requires_supported_content_type() -> Result<()> {
+    let routes = vec![route("/items", &["POST"])];
+    let (addr, _shutdown, mut captures) =
+        capturing_ingress_fixture("inventory", "ecommerce", routes).await?;
+
+    for content_type in [None, Some("text/plain")] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(format!("http://{addr}/items"));
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        let response = http_client()
+            .request(request.body(Full::new(valid_ping_request()))?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    assert!(
+        captures.try_recv().is_err(),
+        "rejected bodies must not be forwarded"
+    );
     Ok(())
 }
 

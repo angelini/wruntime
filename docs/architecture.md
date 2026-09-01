@@ -100,7 +100,7 @@ Delivery is **at-least-once** — a manager crash between submit and finalize le
 
 ## Request flow
 
-Public ingress is the guest-module data-plane trust boundary. `IngressLayer` strips reserved headers, authorizes a configured public path and method, and rewrites any REST-style alias to the route's required canonical `rpc_path`. After routing selects an exact healthy module version, `SchemaValidationLayer` lazily loads that version's descriptor set from the manager, buffers the external request body once, and decodes it as the RPC input message before forwarding. Invalid protobuf is rejected at the boundary. The loopback internal stack and mTLS peer stack deliberately omit this layer, so wruntime-generated module, worker, scheduler, and cross-node continuation traffic remains trusted and streams without repeated validation.
+Public ingress is the guest-module data-plane trust boundary. `IngressLayer` strips reserved headers, authorizes a configured public path and method, and rewrites any REST-style alias to the route's required canonical `rpc_path`. After routing selects an exact healthy module version, `SchemaValidationLayer` buffers the bounded external request body, selects protobuf wire, canonical protobuf JSON, or flat URL-encoded form input from `Content-Type`, and lazily loads that version's descriptor set from the manager. It decodes and validates the selected representation as the exact RPC input message, then forwards normalized protobuf wire bytes. Responses are streamed unchanged. The loopback internal stack and mTLS peer stack deliberately omit this layer, so wruntime-generated module, worker, scheduler, and cross-node continuation traffic remains trusted and streams without repeated validation.
 
 ```mermaid
 flowchart TD

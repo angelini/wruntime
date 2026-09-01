@@ -45,7 +45,7 @@ fn default_discovery_max_connections() -> usize {
 pub struct ExternalConfig {
     /// TCP address to bind the external listener, e.g. "0.0.0.0:8080"
     pub listen_address: String,
-    /// Maximum public request body buffered for protobuf validation.
+    /// Maximum public request body buffered for transcoding and schema validation.
     #[serde(default = "default_external_max_request_body_bytes")]
     pub max_request_body_bytes: usize,
     /// Routes accessible to external callers.

@@ -4,11 +4,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
-use http_body_util::Full;
+use http_body_util::{BodyExt as _, Full};
 use hyper::server::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 pub async fn spawn_http1_stub() -> Result<(String, oneshot::Sender<()>)> {
     let (tx, rx) = oneshot::channel::<()>();
@@ -109,6 +109,79 @@ pub async fn spawn_stub_engine() -> Result<(String, oneshot::Sender<()>)> {
         }
     });
     Ok((addr, tx))
+}
+
+#[derive(Debug)]
+pub struct CapturedRequest {
+    pub path: String,
+    pub content_type: Option<String>,
+    pub content_length: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_digest: Option<String>,
+    pub body: Bytes,
+}
+
+async fn capturing_stub(listener: TcpListener, sender: mpsc::Sender<CapturedRequest>) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            break;
+        };
+        let sender = sender.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                let sender = sender.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let body = body.collect().await.unwrap().to_bytes();
+                    let header = |name: &str| {
+                        parts
+                            .headers
+                            .get(name)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned)
+                    };
+                    let _ = sender
+                        .send(CapturedRequest {
+                            path: parts.uri.path().to_owned(),
+                            content_type: header("content-type"),
+                            content_length: header("content-length"),
+                            content_encoding: header("content-encoding"),
+                            content_digest: header("content-digest"),
+                            body,
+                        })
+                        .await;
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::CREATED)
+                            .header("content-type", "application/vnd.stub+json")
+                            .header("set-cookie", "stub=true; HttpOnly")
+                            .header("location", "/created/1")
+                            .body(Full::new(Bytes::from_static(b"stub-response")))
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(io, svc)
+                .await;
+        });
+    }
+}
+
+pub async fn spawn_capturing_stub(
+) -> Result<(String, oneshot::Sender<()>, mpsc::Receiver<CapturedRequest>)> {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (capture_tx, capture_rx) = mpsc::channel(8);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown_rx => {}
+            _ = capturing_stub(listener, capture_tx) => {}
+        }
+    });
+    Ok((addr, shutdown_tx, capture_rx))
 }
 
 /// Spawn an `identified_stub` task; returns the engine's HTTP address and a

@@ -36,6 +36,9 @@ routing_table_ttl_secs = 1
 
 # Optional: expose a subset of routes to external callers on a separate port.
 # All x-wr-* headers are stripped from incoming requests before routing.
+# Every route accepts application/x-protobuf, canonical application/json, and
+# flat application/x-www-form-urlencoded requests. Successful requests reach
+# the guest as protobuf; responses are streamed without transcoding.
 #
 # [external]
 # listen_address = "0.0.0.0:8080"

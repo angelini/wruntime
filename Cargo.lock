@@ -5394,6 +5394,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "matchit 0.9.2",
+ "mime",
  "prost",
  "prost-reflect",
  "prost-types",

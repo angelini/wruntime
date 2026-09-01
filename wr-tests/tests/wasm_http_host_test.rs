@@ -147,6 +147,7 @@ async fn wasm_http_ingress() -> Result<()> {
             http::Request::builder()
                 .method("POST")
                 .uri(format!("http://{ingress_addr}/echo"))
+                .header("content-type", "application/x-protobuf")
                 .body(Full::new(Bytes::from(req_body.encode_to_vec())))?,
         )
         .await?;

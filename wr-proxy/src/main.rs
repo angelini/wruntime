@@ -5,6 +5,7 @@ mod layers;
 pub mod node_service;
 pub mod routing;
 mod schema;
+mod transcoding;
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
