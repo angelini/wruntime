@@ -3,15 +3,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use http::{Request, StatusCode};
+use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
+use http::{HeaderValue, Request, StatusCode};
 use http_body_util::{BodyExt as _, LengthLimitError, Limited};
-use prost_reflect::DynamicMessage;
 use tower::{Layer, Service};
 use tracing::warn;
 use wr_common::http_headers::{WR_MODULE, WR_NAMESPACE, WR_VERSION};
 
 use super::{error_response, ProxyBody, ResBody};
 use crate::schema::SchemaCache;
+use crate::transcoding::{select_request_representation, transcode_request, RequestRepresentation};
 
 pub struct SchemaValidationLayer {
     cache: Arc<SchemaCache>,
@@ -81,6 +82,35 @@ where
             };
             let rpc_path = req.uri().path().to_owned();
 
+            let (mut parts, body) = req.into_parts();
+            let body = match Limited::new(body, max_request_body_bytes).collect().await {
+                Ok(body) => body.to_bytes(),
+                Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
+                    return Ok(error_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request body exceeds external.max_request_body_bytes",
+                    ));
+                }
+                Err(error) => {
+                    warn!(%error, "failed to read public ingress body");
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "failed to read request body",
+                    ));
+                }
+            };
+
+            let representation =
+                match select_request_representation(&parts.headers, body.is_empty()) {
+                    Ok(representation) => representation,
+                    Err(_) => {
+                        return Ok(error_response(
+                            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                            "request body has a missing, malformed, or unsupported media type",
+                        ));
+                    }
+                };
+
             let input = match cache
                 .input_descriptor(&namespace, &module, &version, &rpc_path)
                 .await
@@ -108,29 +138,34 @@ where
                 }
             };
 
-            let (parts, body) = req.into_parts();
-            let body = match Limited::new(body, max_request_body_bytes).collect().await {
-                Ok(body) => body.to_bytes(),
-                Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
-                    return Ok(error_response(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "request body exceeds external.max_request_body_bytes",
-                    ));
-                }
+            let body = match transcode_request(input, representation, &body) {
+                Ok(body) => body,
                 Err(error) => {
-                    warn!(%error, "failed to read public ingress body");
+                    let representation = match representation {
+                        RequestRepresentation::Protobuf => "protobuf",
+                        RequestRepresentation::Json => "JSON",
+                        RequestRepresentation::Form => "form",
+                    };
                     return Ok(error_response(
                         StatusCode::BAD_REQUEST,
-                        "failed to read request body",
+                        &format!("request body failed {representation} schema validation: {error}"),
                     ));
                 }
             };
 
-            if let Err(error) = DynamicMessage::decode(input, body.clone()) {
-                return Ok(error_response(
-                    StatusCode::BAD_REQUEST,
-                    &format!("request body failed protobuf schema validation: {error}"),
-                ));
+            parts.headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/x-protobuf"),
+            );
+            parts.headers.insert(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(&body.len().to_string())
+                    .expect("encoded body length is a valid header value"),
+            );
+            parts.headers.remove(CONTENT_ENCODING);
+            parts.headers.remove(TRANSFER_ENCODING);
+            for header in ["content-md5", "digest", "content-digest"] {
+                parts.headers.remove(header);
             }
 
             inner

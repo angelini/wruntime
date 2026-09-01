@@ -10,9 +10,9 @@ Use executable examples to study integrated patterns, then apply the documented 
 | HTTP-triggered generated client | [ecommerce client](../../../examples/ecommerce/client/src/lib.rs) | [build.rs](../../../examples/ecommerce/client/build.rs), [world](../../../examples/ecommerce/client/wit/world.wit), [engine config](../../../examples/ecommerce/engine-client.toml) |
 | Service that calls another service | [stockmarket exchange](../../../examples/stockmarket/exchange/src/lib.rs) | [build.rs](../../../examples/stockmarket/exchange/build.rs), [schemas](../../../examples/stockmarket/schemas/), [migration](../../../examples/stockmarket/exchange/migrations/V1__create_tables.sql) |
 | Client/simulator orchestration | [stockmarket simulator](../../../examples/stockmarket/simulator/src/lib.rs) | [build.rs](../../../examples/stockmarket/simulator/build.rs), [engine config](../../../examples/stockmarket/engine-simulator.toml) |
-| Service router plus manual JSON ingress | [codegen coordinator](../../../examples/codegen/coordinator/src/lib.rs) | [nested generator](../../../examples/codegen/coordinator/build.rs), [migration](../../../examples/codegen/coordinator/migrations/V1__create_tables.sql) |
+| Service router plus guest-owned JSON request/response handling | [codegen coordinator](../../../examples/codegen/coordinator/src/lib.rs) | [nested generator](../../../examples/codegen/coordinator/build.rs), [migration](../../../examples/codegen/coordinator/migrations/V1__create_tables.sql) |
 
-Run scripts: [ecommerce](../../../examples/ecommerce/run.sh), [stockmarket](../../../examples/stockmarket/run.sh), [codegen](../../../examples/codegen/run.sh), and the cross-node [Echo topology](../../../examples/multi-node/run.sh).
+Run scripts: [ecommerce](../../../examples/ecommerce/run.sh), [stockmarket](../../../examples/stockmarket/run.sh), [codegen](../../../examples/codegen/run.sh), and the cross-node [Echo topology](../../../examples/multi-node/run.sh). Configured public aliases always transcode supported request bodies to protobuf and leave responses unchanged; the codegen coordinator's older manual JSON route script is not evidence for that alias contract.
 
 ## Workers and capabilities
 

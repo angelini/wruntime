@@ -34,7 +34,8 @@ flowchart LR
 
 The proxy streams internal and cross-node request and response bodies without
 buffering. Public ingress is a separate trust boundary: it strips reserved
-headers and buffers one bounded request body for protobuf schema validation.
+headers, buffers one bounded request body, and transcodes supported protobuf,
+canonical protobuf JSON, or flat form input to validated protobuf wire bytes.
 
 ## Scope
 
@@ -45,7 +46,7 @@ Wruntime currently provides:
 - multi-node peer routing over mTLS and active-active managers with PostgreSQL
   persistence and gossip-based liveness;
 - protobuf service modules plus durable, at-least-once workers and schedules;
-- optional public ingress with schema validation and deny-by-default,
+- optional public ingress with request transcoding, schema validation, and deny-by-default,
   allowlisted external HTTP egress;
 - guest capabilities for PostgreSQL, S3-compatible blob storage, tracing,
   Anthropic Claude, namespace-scoped secrets/environment values, and ephemeral
