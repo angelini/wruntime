@@ -268,8 +268,13 @@ deployment-e2e-python-test:
         dev/deployment-e2e/test_assert_cluster.py \
         dev/deployment-e2e/test_lifecycle_logging.py
 
+# Test same-host exclusion for fixed-port local E2E runners
+test-local-e2e-lock:
+    bash dev/test-local-e2e-lock.sh
+
 # Run focused lifecycle waiter, supervisor ownership, and cleanup accounting fixtures
 test-lifecycle-runners:
+    just test-local-e2e-lock
     cargo test -p wr-cli cmd::dev_supervisor::tests
     cargo test -p wr-cli cmd::helpers::tests
     cargo test -p wr-cli cmd::cluster::tests::expectation

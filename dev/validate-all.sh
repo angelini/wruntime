@@ -9,6 +9,8 @@ set -u -o pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT" || exit 1
+# shellcheck source=dev/local-e2e-lock.sh
+source "$ROOT/dev/local-e2e-lock.sh"
 
 RUN_E2E=true
 RUN_CODEGEN_E2E=auto
@@ -16,7 +18,7 @@ RUN_DEPLOYMENT_E2E="unset"
 E2E_ONLY=false
 START_DEV=true
 SKIPPED_CODEGEN_E2E=false
-LOG_ROOT="${WR_VALIDATE_LOG_DIR:-target/validate-all/$(date +%Y%m%d-%H%M%S)}"
+LOG_ROOT="${WR_VALIDATE_LOG_DIR:-target/validate-all/$(date +%Y%m%d-%H%M%S)-$$}"
 TAIL_LINES=40
 WARN_MATCH_LIMIT=40
 WARN_PATTERN='(^|[^[:alnum:]_])(WARN|WARNING)([^[:alnum:]_]|$)|level="?warn(ing)?"?|"level":"warn(ing)?"'
@@ -36,8 +38,9 @@ Options:
   -h, --help        Show this help.
 
 Environment:
-  ANTHROPIC_API_KEY   Enables codegen E2E in default auto mode.
-  WR_VALIDATE_LOG_DIR Override the log directory (default: target/validate-all/<timestamp>).
+  ANTHROPIC_API_KEY       Enables codegen E2E in default auto mode.
+  WRT_LOCAL_E2E_LOCK_FILE Override the same-host local E2E lock path.
+  WR_VALIDATE_LOG_DIR     Override the log directory (default: target/validate-all/<timestamp>-<pid>).
 
 Exactly one deployment E2E flag is required. --no-e2e may be combined with
 --deployment-e2e; --e2e-only runs whichever E2E stages were explicitly enabled.
@@ -298,8 +301,11 @@ fi
 if [ "$RUN_E2E" = true ]; then
 	require_cmd aws
 fi
+if [ "$RUN_E2E" = true ] || [ "$RUN_DEPLOYMENT_E2E" = true ]; then
+	require_cmd flock
+fi
 if [ "$RUN_DEPLOYMENT_E2E" = true ]; then
-	for command in uv flock ssh scp timeout cargo-zigbuild; do
+	for command in uv ssh scp timeout cargo-zigbuild; do
 		require_cmd "$command"
 	done
 fi
@@ -345,6 +351,10 @@ fi
 
 if [ "$RUN_E2E" = true ]; then
 	section "semantic lifecycle E2E examples"
+	if ! wrt_acquire_local_e2e_lock "validate-all semantic lifecycle E2E stage"; then
+		append_result "local E2E host lock" FAILED "" "another fixed-port E2E run is active"
+		finish_failure 1
+	fi
 	run_cmd "reset example db for multi-node" "just dev-reset-db"
 	run_cmd "multi-node cross-node echo" "just multi-node-inline"
 
