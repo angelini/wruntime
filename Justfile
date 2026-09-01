@@ -268,8 +268,13 @@ deployment-e2e-python-test:
         dev/deployment-e2e/test_assert_cluster.py \
         dev/deployment-e2e/test_lifecycle_logging.py
 
+# Test same-host exclusion for fixed-port local E2E runners
+test-local-e2e-lock:
+    bash dev/test-local-e2e-lock.sh
+
 # Run focused foreground-runner, example-helper, waiter, and cleanup fixtures
 test-lifecycle-runners:
+    just test-local-e2e-lock
     bash examples/helpers_test.sh
     bash examples/ecommerce/scenario_test.sh
     bash examples/scenarios_test.sh

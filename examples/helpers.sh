@@ -18,6 +18,9 @@ export INLINE
 # ── Repo root ────────────────────────────────────────────────────────────────
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+# shellcheck source=dev/local-e2e-lock.sh
+source "$REPO_ROOT/dev/local-e2e-lock.sh"
+wrt_acquire_local_e2e_lock "example runner: $0"
 
 # ── Environment defaults ─────────────────────────────────────────────────────
 DB_URL="${DB_URL:-${WRT_EXAMPLE_DB_URL:-postgres://postgres@localhost:5433/wruntime_example}}"

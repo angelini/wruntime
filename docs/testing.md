@@ -20,6 +20,7 @@ just validate-all --no-deployment-e2e # full local suite with an explicit live-s
 just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e # Pi sandbox
 just validate-all --deployment-e2e    # trusted runner: require both live deployment backends
 just deployment-e2e-python-test       # locked provider/assertion unit tests
+just test-local-e2e-lock              # same-host fixed-port exclusion fixture
 just test-lifecycle-runners            # foreground runner/barrier/reaping fixtures
 just deployment-e2e-preflight         # non-mutating Proxmox target verification
 just dev-down                # stop dev infrastructure
@@ -74,8 +75,14 @@ orchestrates existing Just recipes for formatting, compile checks, lints, WASM
 guest builds, Rust tests, and semantic-lifecycle fixed-port E2E examples. All guests are built
 through one sequential `just build-wasm-guests` invocation so independent
 Cargo processes never contend on the shared target during that stage. E2E
-examples run sequentially because they share ports and example resources. Logs
-and `summary.txt` are written under `target/validate-all/<timestamp>/`; terminal
+examples run sequentially because they share ports and example resources. The
+runner holds a non-blocking, per-user host lock before resetting those resources;
+individual example scripts acquire the same lock, so conflicting runs from
+another worktree fail before starting services or mutating the example database.
+The lock defaults to `${XDG_RUNTIME_DIR:-/tmp}/wruntime-local-e2e-<uid>.lock` and
+can be overridden with `WRT_LOCAL_E2E_LOCK_FILE`. Kernel `flock` ownership makes
+stale lock files harmless after a runner exits. Logs and `summary.txt` are
+written under `target/validate-all/<timestamp>-<pid>/`; terminal
 failure output is capped for agent-friendly context use. Codegen E2E runs only
 when `ANTHROPIC_API_KEY` is set by default; use `--codegen-e2e` to require it
 or `--no-codegen-e2e` to always skip it.
@@ -93,7 +100,9 @@ in Pi. Outside Pi, `--no-e2e` affects only fixed-port local examples, so it may
 be combined with `--deployment-e2e`. `--e2e-only` still requires an explicit
 deployment choice and runs the enabled E2E stages.
 
-Live deployment requires `uv`, `cargo-zigbuild`, `flock`, SSH, and `psql`.
+Fixed-port local E2Es require `flock`. Live deployment additionally requires
+`uv`, `cargo-zigbuild`, SSH, and `psql`; its protected-target lock remains
+separate from the local example lock.
 Python dependencies and the Python 3.12 toolchain request are owned by the
 nested `dev/deployment-e2e` project through `pyproject.toml`, `.python-version`,
 and the checked-in `uv.lock`. Recipes and the lifecycle harness use
