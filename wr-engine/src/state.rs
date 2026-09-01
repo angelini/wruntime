@@ -54,6 +54,7 @@ impl WasiHttpHooks for ModuleHttpHooks {
         config: OutgoingRequestConfig,
     ) -> HttpResult<HostFutureIncomingResponse> {
         let original_uri = request.uri().to_string();
+        let telemetry_uri = wr_common::uri::uri_for_telemetry(&original_uri);
 
         // If the guest set an outbound parent (via `start-root`), parent to
         // that span so all outbound calls share one trace. Otherwise start a
@@ -64,11 +65,11 @@ impl WasiHttpHooks for ModuleHttpHooks {
         let outbound_span = tracing::info_span!(
             parent: &parent,
             "engine.outbound_request",
-            otel.name = format!("{} {}", request.method(), &original_uri),
+            otel.name = format!("{} {}", request.method(), telemetry_uri),
             wr.source = %self.module_name,
-            wr.destination = %original_uri,
+            wr.destination = %telemetry_uri,
             http.request.method = %request.method(),
-            url.full = %original_uri,
+            url.full = %telemetry_uri,
             http.response.status_code = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
         );
@@ -106,9 +107,9 @@ impl WasiHttpHooks for ModuleHttpHooks {
             .parse()
             .map_err(|_| ErrorCode::InternalError(None))?;
         tracing::debug!(
-            original = %original_uri,
+            original = %telemetry_uri,
             proxy_uri = %self.proxy_uri,
-            rewritten = %new_uri,
+            rewritten = %wr_common::uri::uri_for_telemetry(&new_uri.to_string()),
             "outgoing request rewrite"
         );
         *request.uri_mut() = new_uri;

@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjectPath;
+use object_store::signer::Signer;
 use object_store::{Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutPayload};
 
 use crate::config::{BlobstoreConfig, BlobstoreLimits};
@@ -17,6 +19,7 @@ pub struct BlobstoreRuntime {
     access_key_id: String,
     secret_access_key: String,
     allowed_buckets: HashSet<String>,
+    signed_url_max_ttl_secs: Option<u32>,
     buckets: Mutex<HashMap<String, Arc<AmazonS3>>>,
 }
 
@@ -28,6 +31,7 @@ impl BlobstoreRuntime {
             access_key_id: config.access_key_id.clone(),
             secret_access_key: config.secret_access_key.clone(),
             allowed_buckets: config.allowed_buckets.iter().cloned().collect(),
+            signed_url_max_ttl_secs: config.signed_urls.map(|policy| policy.max_ttl_secs),
             buckets: Mutex::new(HashMap::new()),
         })
     }
@@ -72,7 +76,7 @@ wasmtime::component::bindgen!({
 });
 
 pub use wruntime::blobstore::store::BlobError;
-use wruntime::blobstore::store::{Host, ObjectMeta};
+use wruntime::blobstore::store::{DownloadUrl, Host, ObjectMeta};
 
 // ── Namespace isolation helpers ───────────────────────────────────────────────
 
@@ -220,6 +224,49 @@ impl Host for ModuleState {
             etag: meta.e_tag.unwrap_or_default(),
         })
     }
+
+    async fn create_download_url(
+        &mut self,
+        bucket: String,
+        key: String,
+        expires_in_seconds: u32,
+    ) -> Result<DownloadUrl, BlobError> {
+        let (store, path, max_ttl_secs) = {
+            let cap = self.blobstore()?;
+            let store = cap.runtime.bucket(&bucket)?;
+            let path = ObjectPath::from(scoped_key(&cap.prefix, &key)?);
+            (store, path, cap.runtime.signed_url_max_ttl_secs)
+        };
+        let max_ttl_secs = max_ttl_secs.ok_or_else(|| {
+            BlobError::AccessDenied("signed download URLs are not configured".into())
+        })?;
+        if expires_in_seconds == 0 || expires_in_seconds > max_ttl_secs {
+            return Err(BlobError::AccessDenied(format!(
+                "requested signed URL lifetime must be in 1..={max_ttl_secs} seconds"
+            )));
+        }
+
+        let issued_at = SystemTime::now();
+        let expires_at = issued_at
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| BlobError::Io(format!("system clock is before Unix epoch: {error}")))?
+            .as_secs()
+            .checked_add(u64::from(expires_in_seconds))
+            .ok_or_else(|| BlobError::Io("signed URL expiry overflows Unix time".into()))?;
+        let url = store
+            .signed_url(
+                http::Method::GET,
+                &path,
+                Duration::from_secs(u64::from(expires_in_seconds)),
+            )
+            .await
+            .map_err(map_os_err)?;
+
+        Ok(DownloadUrl {
+            url: url.to_string(),
+            expires_at,
+        })
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -240,8 +287,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::config::BlobstoreConfig;
-    use crate::state::ModuleState;
+    use crate::config::{BlobstoreConfig, BlobstoreSignedUrlsConfig};
+    use crate::state::{BlobAccess, ModuleServices, ModuleState};
 
     fn proxy_uri() -> hyper::Uri {
         "http://127.0.0.1:9001".parse().unwrap()
@@ -261,7 +308,28 @@ mod tests {
             region: "us-east-1".into(),
             max_object_size: 16 * 1024 * 1024,
             max_list_objects: 1000,
+            signed_urls: None,
         }
+    }
+
+    fn blobstore_state(config: BlobstoreConfig) -> ModuleState {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let runtime = Arc::new(BlobstoreRuntime::new(&config).expect("blobstore runtime"));
+        ModuleState::new(
+            "test".into(),
+            "test-ns".into(),
+            proxy_uri(),
+            test_http_pool(),
+            ModuleServices {
+                blobstore: Some(BlobAccess {
+                    runtime,
+                    prefix: Arc::from("wr/test-ns/"),
+                    limits: BlobstoreLimits::default(),
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("state")
     }
 
     // ── normalize_key tests ────────────────────────────────────────────────────
@@ -470,5 +538,80 @@ mod tests {
         .expect("state");
         let result = Host::head_object(&mut state, "b".into(), "k".into()).await;
         assert!(matches!(result, Err(BlobError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn test_create_download_url_requires_opt_in() {
+        let mut state = blobstore_state(test_config());
+        let result =
+            Host::create_download_url(&mut state, "my-bucket".into(), "missing.txt".into(), 60)
+                .await;
+        assert!(matches!(
+            result,
+            Err(BlobError::AccessDenied(message)) if message.contains("not configured")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_create_download_url_signs_scoped_get_without_object_request() {
+        let mut config = test_config();
+        config.signed_urls = Some(BlobstoreSignedUrlsConfig {
+            max_ttl_secs: 900,
+            allow_http: true,
+        });
+        let mut state = blobstore_state(config);
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let link = Host::create_download_url(
+            &mut state,
+            "my-bucket".into(),
+            "missing/report.pdf".into(),
+            300,
+        )
+        .await
+        .expect("signing a missing key must not perform an object request");
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let parsed = reqwest::Url::parse(&link.url).expect("signed URL");
+        assert_eq!(parsed.scheme(), "http");
+        assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+        assert_eq!(parsed.port(), Some(8900));
+        assert!(parsed
+            .path()
+            .contains("/my-bucket/wr/test-ns/missing/report.pdf"));
+        assert_eq!(
+            parsed
+                .query_pairs()
+                .find(|(name, _)| name == "X-Amz-Expires")
+                .map(|(_, value)| value.into_owned())
+                .as_deref(),
+            Some("300")
+        );
+        assert!((before + 300..=after + 300).contains(&link.expires_at));
+    }
+
+    #[tokio::test]
+    async fn test_create_download_url_enforces_scope_bucket_and_ttl() {
+        let mut config = test_config();
+        config.signed_urls = Some(BlobstoreSignedUrlsConfig {
+            max_ttl_secs: 900,
+            allow_http: true,
+        });
+        for (bucket, key, ttl) in [
+            ("my-bucket", "key", 0),
+            ("my-bucket", "key", 901),
+            ("other-bucket", "key", 60),
+            ("my-bucket", "../../other/secret", 60),
+        ] {
+            let mut state = blobstore_state(config.clone());
+            let result =
+                Host::create_download_url(&mut state, bucket.into(), key.into(), ttl).await;
+            assert!(matches!(result, Err(BlobError::AccessDenied(_))));
+        }
     }
 }

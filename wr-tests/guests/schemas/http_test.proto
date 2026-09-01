@@ -3,6 +3,7 @@ package test;
 
 service HttpTestService {
   rpc Egress (EgressRequest) returns (EgressResponse);
+  rpc GetUrl (GetUrlRequest) returns (GetUrlResponse);
   rpc Echo   (EchoRequest)   returns (EchoResponse);
 }
 
@@ -14,6 +15,14 @@ message EgressRequest {
 message EgressResponse {
   uint32 status = 1;
   string body   = 2;
+}
+
+message GetUrlRequest {
+  string url = 1;
+}
+message GetUrlResponse {
+  uint32 status = 1;
+  bytes body = 2;
 }
 
 message EchoRequest {

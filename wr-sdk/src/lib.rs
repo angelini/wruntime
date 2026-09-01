@@ -77,7 +77,7 @@ pub mod log;
 pub mod prelude;
 pub mod tracing;
 
-pub use blobstore::{bucket, Bucket, BucketName, ObjectKey, ObjectPrefix};
+pub use blobstore::{bucket, Bucket, BucketName, DownloadUrl, ObjectKey, ObjectPrefix};
 pub use tracing::{Attribute, AttributeValue, IntoAttributeValue};
 
 /// Error type returned by generated service handler traits.

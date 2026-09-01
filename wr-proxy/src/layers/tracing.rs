@@ -38,13 +38,16 @@ where
 
     fn call(&mut self, req: Request<ProxyBody>) -> Self::Future {
         let method = req.method().as_str().to_string();
-        let path = req
-            .uri()
-            .path_and_query()
-            .map(|pq| pq.as_str().to_string())
-            .unwrap_or_else(|| "/".to_string());
+        let path = wr_common::uri::uri_for_telemetry(
+            req.uri()
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/"),
+        )
+        .to_string();
         let source = header_str(req.headers(), WR_SOURCE).to_string();
-        let dest = header_str(req.headers(), WR_DESTINATION).to_string();
+        let dest = wr_common::uri::uri_for_telemetry(header_str(req.headers(), WR_DESTINATION))
+            .to_string();
 
         let span = info_span!(
             "proxy.request",

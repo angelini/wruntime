@@ -74,6 +74,7 @@ Available functions:
 | `delete-object(bucket, key)` | Remove an object; returns `NotFound` when it is missing |
 | `list-objects(bucket, prefix)` | List objects matching a prefix |
 | `head-object(bucket, key)` | Get object metadata (size, etag, last-modified) |
+| `create-download-url(bucket, key, expires-in-seconds)` | Create a short-lived, GET-only bearer URL for a namespace-scoped object |
 
 Prefer the scoped `wr_sdk::blobstore::bucket` facade. Raw access remains available via `wr_sdk::bindings::wruntime::blobstore::store` as an escape hatch.
 
@@ -105,7 +106,24 @@ fn list_reports() -> Vec<String> {
         .map(|meta| meta.key)
         .collect()
 }
+
+let link = bucket("reports")
+    .expect("valid bucket")
+    .create_download_url(
+        "daily/report.pdf",
+        std::time::Duration::from_secs(300),
+    )
+    .expect("signing failed");
 ```
+
+A download URL is a transferable temporary credential. Any holder can replay or
+forward it until expiry; it is not bound to a recipient namespace and cannot be
+individually revoked. The URL always signs `GET` for the caller-derived namespace
+prefix and does not check that the object exists. Deleting the key makes later GETs
+return not found, while overwriting it changes what the still-valid link returns.
+Use immutable/content-addressed keys when stable bytes matter, and never log the
+full URL. Actual download audit is owned by the object-store access log; wruntime
+cannot identify the final bearer.
 
 ### Limits and errors
 
@@ -113,6 +131,7 @@ fn list_reports() -> Vec<String> {
 
 - `max_object_size` (default **16 MiB**) caps both `put_object` uploads and `get_object` downloads. An oversized download is aborted mid-stream — never fully buffered — and returns `BlobError::TooLarge`.
 - `max_list_objects` (default **1000**) caps `list_objects`; exceeding it returns `BlobError::TooLarge` rather than silently truncating.
+- `create-download-url` is disabled unless `[blobstore.signed_urls]` is configured. Zero and over-cap lifetimes return `BlobError::AccessDenied`; credential/signing failures return `BlobError::Io`. Direct downloads stream through ordinary HTTP and are not subject to `max_object_size`.
 
 See [configuration.md](configuration.md#blobstore) for the config keys.
 

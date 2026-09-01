@@ -30,3 +30,4 @@ pub mod task_group;
 pub mod telemetry;
 #[cfg(feature = "tls")]
 pub mod tls;
+pub mod uri;

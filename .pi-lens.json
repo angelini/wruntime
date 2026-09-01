@@ -1,8 +1,0 @@
-{
-  "ignore": [
-    "**/target/**",
-    "certs/**",
-    "**/.venv/**",
-    "dev/observability/data/**"
-  ]
-}

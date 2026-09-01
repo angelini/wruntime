@@ -396,6 +396,11 @@ region            = "us-east-1"   # optional; this is the default
 max_object_size   = 16777216      # optional; bytes, default 16 MiB
 max_list_objects  = 1000          # optional; default 1000
 
+# Optional: enable short-lived, GET-only bearer URLs.
+[blobstore.signed_urls]
+max_ttl_secs = 900                # required; 1..=604800, 300-900 recommended
+allow_http   = false              # optional; insecure local-development override
+
 [[module]]
 name        = "report-service"
 namespace   = "example"
@@ -411,6 +416,13 @@ Key behaviors:
 - **Delete semantics:** deleting a missing object returns `blob-error::not-found`.
 - **`max_object_size`** (default **16 MiB**) is enforced on both `put-object` (checked before upload) and `get-object` (the download is aborted mid-stream once the running total would exceed the limit — an oversized object is never fully buffered). Exceeding it returns `blob-error::too-large`.
 - **`max_list_objects`** (default **1000**) caps a single `list-objects` call; exceeding it returns `blob-error::too-large` rather than silently truncating.
+- **Signed downloads are opt-in.** Without `[blobstore.signed_urls]`, ordinary object calls continue to work and URL creation returns `blob-error::access-denied`. `max_ttl_secs` must be `1..=604800` (SigV4's seven-day ceiling); production deployments should normally use 300-900 seconds. Guests must request `1..=max_ttl_secs`; requests are rejected rather than clamped.
+- **Endpoint and TLS policy.** Signed URLs reuse exactly `[blobstore].endpoint`; there is no separate public/signing endpoint and wruntime never rewrites its signed authority or path. When signing is enabled, the endpoint must be an absolute `http` or `https` URL with an authority and no userinfo, query, or fragment. HTTPS is required unless `allow_http = true`; HTTP bearer URLs can be intercepted and the override is only for local test/development stores.
+- **Recipient topology and egress.** Every recipient proxy must separately allow the endpoint's exact hostname in `[egress].allowed_domains`. Wruntime does not broaden egress automatically. The endpoint must be reachable unchanged from every recipient node; a loopback endpoint works only when each node has an equivalent local endpoint backed by the same store.
+- **Bearer behavior.** A signed URL is GET-only but transferable and replayable until expiry. It is not recipient-bound or individually revocable. Signing performs no existence check. Delete makes subsequent GETs return not found; overwrite changes the bytes returned under the still-valid key. Use immutable/content-addressed keys when stable content matters and treat the full URL as a temporary credential.
+- **Streaming distinction.** `max_object_size` applies to buffered host `put-object`/`get-object` calls, not to direct HTTP downloads made by a URL holder.
+
+Object-store access logs are the audit source for actual GETs; wruntime cannot identify the final holder of a bearer URL.
 
 ### Resource limits
 

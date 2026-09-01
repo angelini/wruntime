@@ -216,12 +216,18 @@ fn route_destination(
     };
 
     let Some((namespace, module)) = host.split_once('.') else {
-        return RouteOutcome::Reject(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "destination host '{host}' is missing a namespace (expected '{{namespace}}.{{module}}')"
+        return match classify_external_host(host, egress_allowed_domains) {
+            Ok(host) => RouteOutcome::External {
+                host,
+                dest_uri: uri,
+            },
+            Err(_) => RouteOutcome::Reject(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "destination host '{host}' is missing a namespace (expected '{{namespace}}.{{module}}')"
+                ),
             ),
-        );
+        };
     };
 
     if module.contains('.') {
@@ -446,6 +452,15 @@ mod tests {
                 &table,
                 &["*.openai.com".into()],
                 uri("http://api.openai.com/v1"),
+                &unpinned()
+            ),
+            RouteOutcome::External { .. }
+        ));
+        assert!(matches!(
+            route_destination(
+                &table,
+                &["localhost".into()],
+                uri("http://localhost:8900/object"),
                 &unpinned()
             ),
             RouteOutcome::External { .. }

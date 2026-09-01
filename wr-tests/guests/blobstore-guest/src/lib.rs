@@ -79,6 +79,20 @@ impl proto::BlobstoreTestService for Component {
         })
     }
 
+    fn create_download_url(
+        &self,
+        req: proto::CreateDownloadUrlRequest,
+    ) -> Result<proto::CreateDownloadUrlResponse, ServiceError> {
+        let link = bucket(&req.bucket)?.create_download_url(
+            &req.key,
+            std::time::Duration::from_secs(u64::from(req.expires_in_seconds)),
+        )?;
+        Ok(proto::CreateDownloadUrlResponse {
+            url: link.url,
+            expires_at: link.expires_at,
+        })
+    }
+
     fn round_trip(
         &self,
         req: proto::RoundTripRequest,

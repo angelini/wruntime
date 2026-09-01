@@ -1,5 +1,5 @@
 
-þ
+•
 http_test.prototest"U
 EgressRequest
 	authority (	R	authority
@@ -7,11 +7,17 @@
 body (Rbody"<
 EgressResponse
 status (Rstatus
-body (	Rbody"'
+body (	Rbody"!
+GetUrlRequest
+url (	Rurl"<
+GetUrlResponse
+status (Rstatus
+body (Rbody"'
 EchoRequest
 message (	Rmessage"(
 EchoResponse
-message (	Rmessage2u
+message (	Rmessage2ª
 HttpTestService3
-Egress.test.EgressRequest.test.EgressResponse-
+Egress.test.EgressRequest.test.EgressResponse3
+GetUrl.test.GetUrlRequest.test.GetUrlResponse-
 Echo.test.EchoRequest.test.EchoResponsebproto3

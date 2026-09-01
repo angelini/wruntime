@@ -1,14 +1,24 @@
 mod helpers;
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
+use http::{Method, Request, StatusCode};
+use http_body_util::{BodyExt, Full};
 use prost::Message;
+use wr_engine::blobstore::BlobstoreRuntime;
 
 use helpers::{
-    blobstore::{blobstore_client, blobstore_state, blobstore_state_with_limits},
+    blobstore::{
+        blobstore_client, blobstore_state, blobstore_state_for_namespace,
+        blobstore_state_with_limits,
+    },
     proto,
+    proxy::{http_client, http_pool, start_egress_proxy, EgressConfig, TEST_SELF_PEER},
     wasm::{GuestHarness, TestGuest},
 };
 
@@ -20,6 +30,78 @@ fn unique_prefix(test_name: &str) -> String {
         .as_nanos();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("wasm-test/{test_name}/{ts}-{n}")
+}
+
+async fn put_blob(
+    harness: &GuestHarness,
+    blobstore: Arc<BlobstoreRuntime>,
+    key: &str,
+    data: &[u8],
+) -> Result<()> {
+    let response = harness
+        .dispatch(
+            blobstore_state(blobstore),
+            "/Put",
+            proto::PutRequest {
+                bucket: "test-bucket".into(),
+                key: key.into(),
+                data: data.to_vec(),
+            },
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+async fn issue_download_url(
+    harness: &GuestHarness,
+    blobstore: Arc<BlobstoreRuntime>,
+    key: &str,
+    expires_in_seconds: u32,
+) -> Result<proto::CreateDownloadUrlResponse> {
+    let response = harness
+        .dispatch(
+            blobstore_state(blobstore),
+            "/CreateDownloadUrl",
+            proto::CreateDownloadUrlRequest {
+                bucket: "test-bucket".into(),
+                key: key.into(),
+                expires_in_seconds,
+            },
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(proto::CreateDownloadUrlResponse::decode(
+        response.into_body(),
+    )?)
+}
+
+async fn egress_signed_request(
+    proxy_addr: SocketAddr,
+    method: Method,
+    destination: &str,
+    body: &[u8],
+) -> Result<(StatusCode, Vec<u8>)> {
+    let request = Request::builder()
+        .method(method)
+        .uri(format!("http://{proxy_addr}/"))
+        .header("x-wr-destination", destination)
+        .header("x-wr-source", "signed-url-test")
+        .body(Full::new(Bytes::copy_from_slice(body)))
+        .map_err(|_| anyhow!("failed to build signed URL test request"))?;
+    let response = http_client()
+        .request(request)
+        .await
+        .map_err(|_| anyhow!("signed URL test request failed"))?;
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|_| anyhow!("failed to collect signed URL test response"))?
+        .to_bytes()
+        .to_vec();
+    Ok((status, body))
 }
 
 #[tokio::test]
@@ -51,6 +133,211 @@ async fn wasm_blobstore_put_get() -> Result<()> {
 
     let body = proto::GetResponse::decode(resp.into_body())?;
     assert_eq!(body.data, b"hello wasm blobstore");
+    Ok(())
+}
+
+#[tokio::test]
+async fn wasm_blobstore_create_download_url_for_namespace_scoped_missing_key() -> Result<()> {
+    let Some(harness) = GuestHarness::load(TestGuest::Blobstore).await? else {
+        return Ok(());
+    };
+    let requested_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let response = harness
+        .dispatch(
+            blobstore_state(blobstore_client()),
+            "/CreateDownloadUrl",
+            proto::CreateDownloadUrlRequest {
+                bucket: "test-bucket".into(),
+                key: unique_prefix("signed-missing"),
+                expires_in_seconds: 300,
+            },
+        )
+        .await?;
+    assert_eq!(response.status(), 200);
+    let link = proto::CreateDownloadUrlResponse::decode(response.into_body())?;
+    let uri: http::Uri = link
+        .url
+        .parse()
+        .map_err(|_| anyhow!("signer returned an invalid URL"))?;
+    let configured_endpoint: http::Uri = std::env::var("WRT_TEST_S3_ENDPOINT")?.parse()?;
+    assert_eq!(uri.scheme_str(), configured_endpoint.scheme_str());
+    assert_eq!(uri.authority(), configured_endpoint.authority());
+    assert!(uri.path().contains("/test-bucket/wr/test-ns/wasm-test/"));
+    assert!(uri.query().is_some_and(|query| {
+        query
+            .split('&')
+            .any(|part| part.eq_ignore_ascii_case("X-Amz-Expires=300"))
+    }));
+    let completed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    assert!((requested_at + 300..=completed_at + 300).contains(&link.expires_at));
+    Ok(())
+}
+
+#[tokio::test]
+async fn wasm_blobstore_signed_url_downloads_through_egress_across_namespaces() -> Result<()> {
+    let Some(blob_harness) = GuestHarness::load(TestGuest::Blobstore).await? else {
+        return Ok(());
+    };
+    let Some(http_harness) = GuestHarness::load(TestGuest::Http).await? else {
+        return Ok(());
+    };
+    let blobstore = blobstore_client();
+    let key = unique_prefix("signed-cross-namespace");
+    let expected = b"direct bearer download".to_vec();
+
+    let put = blob_harness
+        .dispatch(
+            blobstore_state(blobstore.clone()),
+            "/Put",
+            proto::PutRequest {
+                bucket: "test-bucket".into(),
+                key: key.clone(),
+                data: expected.clone(),
+            },
+        )
+        .await?;
+    assert_eq!(put.status(), 200);
+
+    let issued = blob_harness
+        .dispatch(
+            blobstore_state(blobstore.clone()),
+            "/CreateDownloadUrl",
+            proto::CreateDownloadUrlRequest {
+                bucket: "test-bucket".into(),
+                key: key.clone(),
+                expires_in_seconds: 300,
+            },
+        )
+        .await?;
+    assert_eq!(issued.status(), 200);
+    let link = proto::CreateDownloadUrlResponse::decode(issued.into_body())?;
+    let signed_uri: http::Uri = link
+        .url
+        .parse()
+        .map_err(|_| anyhow!("signer returned an invalid URL"))?;
+    let signed_host = signed_uri
+        .host()
+        .ok_or_else(|| anyhow!("signed URL has no hostname"))?
+        .to_string();
+
+    let table = wr_proxy::routing::new_routing_table(Default::default(), TEST_SELF_PEER);
+    let proxy_addr = start_egress_proxy(
+        Some(EgressConfig {
+            allowed_domains: vec![signed_host],
+        }),
+        table,
+    )
+    .await?;
+    let recipient = wr_engine::state::ModuleState::new(
+        "http-recipient".into(),
+        "recipient-ns".into(),
+        format!("http://{proxy_addr}").parse()?,
+        http_pool(),
+        Default::default(),
+    )?;
+    let fetched = http_harness
+        .dispatch(recipient, "/GetUrl", proto::GetUrlRequest { url: link.url })
+        .await?;
+    assert_eq!(fetched.status(), 200);
+    let fetched = proto::GetUrlResponse::decode(fetched.into_body())?;
+    assert_eq!(fetched.status, 200);
+    assert_eq!(fetched.body, expected);
+
+    let isolated = blob_harness
+        .dispatch(
+            blobstore_state_for_namespace(blobstore, "recipient-ns"),
+            "/Get",
+            proto::GetRequest {
+                bucket: "test-bucket".into(),
+                key,
+            },
+        )
+        .await?;
+    assert_eq!(isolated.status(), 404);
+    Ok(())
+}
+
+#[tokio::test]
+async fn wasm_blobstore_signed_url_enforces_signature_expiry_and_key_mutations() -> Result<()> {
+    let Some(harness) = GuestHarness::load(TestGuest::Blobstore).await? else {
+        return Ok(());
+    };
+    let blobstore = blobstore_client();
+    let key = unique_prefix("signed-bearer-behavior");
+    put_blob(&harness, blobstore.clone(), &key, b"original").await?;
+    let link = issue_download_url(&harness, blobstore.clone(), &key, 60).await?;
+    let signed_uri: http::Uri = link
+        .url
+        .parse()
+        .map_err(|_| anyhow!("signer returned an invalid URL"))?;
+    let signed_host = signed_uri
+        .host()
+        .ok_or_else(|| anyhow!("signed URL has no hostname"))?
+        .to_string();
+    let table = wr_proxy::routing::new_routing_table(Default::default(), TEST_SELF_PEER);
+    let proxy_addr = start_egress_proxy(
+        Some(EgressConfig {
+            allowed_domains: vec![signed_host],
+        }),
+        table,
+    )
+    .await?;
+
+    for _ in 0..2 {
+        let (status, body) = egress_signed_request(proxy_addr, Method::GET, &link.url, &[]).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"original");
+    }
+
+    let (status, _) =
+        egress_signed_request(proxy_addr, Method::PUT, &link.url, b"tampered").await?;
+    assert!(!status.is_success(), "a GET signature must reject PUT");
+
+    let (base, query) = link
+        .url
+        .split_once('?')
+        .ok_or_else(|| anyhow!("signed URL has no query"))?;
+    let tampered_path = format!("{base}-tampered?{query}");
+    let (status, _) = egress_signed_request(proxy_addr, Method::GET, &tampered_path, &[]).await?;
+    assert!(
+        !status.is_success(),
+        "a signature must reject path tampering"
+    );
+    let tampered_query = format!("{}&unrelated-secret=tampered", link.url);
+    let (status, _) = egress_signed_request(proxy_addr, Method::GET, &tampered_query, &[]).await?;
+    assert!(
+        !status.is_success(),
+        "a signature must reject query tampering"
+    );
+
+    put_blob(&harness, blobstore.clone(), &key, b"overwritten").await?;
+    let (status, body) = egress_signed_request(proxy_addr, Method::GET, &link.url, &[]).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"overwritten");
+
+    let deleted = harness
+        .dispatch(
+            blobstore_state(blobstore.clone()),
+            "/Delete",
+            proto::DeleteRequest {
+                bucket: "test-bucket".into(),
+                key: key.clone(),
+            },
+        )
+        .await?;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let (status, _) = egress_signed_request(proxy_addr, Method::GET, &link.url, &[]).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let expiry_key = unique_prefix("signed-expiry");
+    put_blob(&harness, blobstore.clone(), &expiry_key, b"expires").await?;
+    let expiring = issue_download_url(&harness, blobstore, &expiry_key, 1).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (status, _) = egress_signed_request(proxy_addr, Method::GET, &expiring.url, &[]).await?;
+    assert!(
+        !status.is_success(),
+        "an expired signature must be rejected"
+    );
     Ok(())
 }
 

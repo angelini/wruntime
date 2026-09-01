@@ -23,6 +23,13 @@ interface store {
         etag: string,
     }
 
+    record download-url {
+        /// Bearer URL. Treat as a temporary credential and do not log it.
+        url: string,
+        /// Seconds since Unix epoch (UTC), matching the accepted requested lifetime.
+        expires-at: u64,
+    }
+
     /// Upload bytes to an object. Creates or overwrites.
     put-object: func(bucket: string, key: string, data: list<u8>) -> result<_, blob-error>;
 
@@ -37,6 +44,13 @@ interface store {
 
     /// Return metadata for an object without downloading its body.
     head-object: func(bucket: string, key: string) -> result<object-meta, blob-error>;
+
+    /// Create a GET-only URL for an object in the caller's namespace scope.
+    create-download-url: func(
+        bucket: string,
+        key: string,
+        expires-in-seconds: u32,
+    ) -> result<download-url, blob-error>;
 }
 
 /// The world the host exposes to every WASM module that opts in to blobstore access.

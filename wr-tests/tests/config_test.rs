@@ -1007,3 +1007,89 @@ fn test_engine_requires_blobstore_allowlist() {
         .expect("missing blobstore allowlist must fail parsing");
     assert!(err.to_string().contains("allowed_buckets"));
 }
+
+fn signed_blobstore_toml(endpoint: &str, signed_urls: &str) -> String {
+    format!(
+        "{}\n[blobstore]\nendpoint = {endpoint:?}\naccess_key_id = \"key\"\nsecret_access_key = \"secret\"\nallowed_buckets = [\"reports\"]\n{signed_urls}",
+        engine_toml("127.0.0.1:9100", "")
+    )
+}
+
+#[test]
+fn test_engine_blobstore_signed_urls_disabled_by_absence() {
+    let cfg: EngineConfig = toml::from_str(&signed_blobstore_toml("http://127.0.0.1:8900", ""))
+        .expect("configuration should parse");
+    cfg.validate()
+        .expect("ordinary HTTP blobstore remains valid without signed URLs");
+    assert!(cfg.blobstore.unwrap().signed_urls.is_none());
+}
+
+#[test]
+fn test_engine_accepts_signed_url_https_and_explicit_local_http() {
+    for (endpoint, table) in [
+        (
+            "https://objects.example",
+            "[blobstore.signed_urls]\nmax_ttl_secs = 900\n",
+        ),
+        (
+            "http://127.0.0.1:8900",
+            "[blobstore.signed_urls]\nmax_ttl_secs = 900\nallow_http = true\n",
+        ),
+    ] {
+        let cfg: EngineConfig = toml::from_str(&signed_blobstore_toml(endpoint, table)).unwrap();
+        cfg.validate().unwrap_or_else(|error| {
+            panic!("signed URL endpoint {endpoint} should validate: {error:#}")
+        });
+    }
+}
+
+#[test]
+fn test_engine_rejects_invalid_signed_url_endpoints() {
+    for (endpoint, expected) in [
+        ("relative/path", "valid absolute URL"),
+        ("https://", "valid absolute URL"),
+        ("ftp://objects.example", "absolute http or https"),
+        (
+            "https://user:pass@objects.example",
+            "must not contain userinfo",
+        ),
+        (
+            "https://objects.example?token=secret",
+            "must not contain a query",
+        ),
+        (
+            "https://objects.example#fragment",
+            "must not contain a fragment",
+        ),
+        (
+            "http://objects.example",
+            "must use https for signed URLs unless",
+        ),
+    ] {
+        let cfg: EngineConfig = toml::from_str(&signed_blobstore_toml(
+            endpoint,
+            "[blobstore.signed_urls]\nmax_ttl_secs = 900\n",
+        ))
+        .unwrap();
+        let error = cfg
+            .validate()
+            .expect_err("invalid signed URL endpoint must be rejected");
+        assert!(
+            format!("{error:#}").contains(expected),
+            "endpoint {endpoint}: unexpected error: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn test_engine_rejects_signed_url_ttl_outside_sigv4_range() {
+    for max_ttl_secs in [0, 604_801] {
+        let table = format!("[blobstore.signed_urls]\nmax_ttl_secs = {max_ttl_secs}\n");
+        let cfg: EngineConfig =
+            toml::from_str(&signed_blobstore_toml("https://objects.example", &table)).unwrap();
+        let error = cfg
+            .validate()
+            .expect_err("invalid signed URL TTL must be rejected");
+        assert!(format!("{error:#}").contains("must be in 1..=604800"));
+    }
+}

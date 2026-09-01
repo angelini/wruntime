@@ -87,9 +87,17 @@ let reports = wr_sdk::blobstore::bucket("reports")?;
 reports.put("daily/result.json", payload)?;
 let saved = reports.get("daily/result.json")?;
 let daily = reports.list("daily/")?;
+let link = reports.create_download_url(
+    "daily/result.json",
+    std::time::Duration::from_secs(300),
+)?;
 ```
 
-`Bucket::put`, `get`, `delete`, `head`, and `list` validate and normalize each key or prefix. The engine independently enforces the non-empty bucket allowlist, namespace key isolation, object-size limits, and list-count limits. Object operations are fully buffered from the guest perspective. Use the raw store binding only when the facade does not expose the needed operation or for intentional protocol tests.
+`Bucket::put`, `get`, `delete`, `head`, `list`, and `create_download_url` validate and normalize each key or prefix. The engine independently enforces the non-empty bucket allowlist, namespace key isolation, object-size/list-count limits, and the operator's signed-URL lifetime maximum. Object operations are fully buffered from the guest perspective; a direct URL download instead streams through ordinary outbound HTTP and is not subject to the blobstore `max_object_size` limit.
+
+Treat `link.url` as a temporary credential: do not log or persist it. Any holder can replay or forward it until `link.expires_at`; it is not bound to a recipient and cannot be individually revoked. Signing is GET-only, performs no existence check, and authorizes the named key rather than an immutable version. Deleting the key makes the URL return not found; overwriting changes the bytes it returns. Prefer immutable/content-addressed keys when stable content matters. The recipient proxy must allow the configured blobstore endpoint hostname for external egress.
+
+Use the raw store binding only when the facade does not expose the needed operation or for intentional protocol tests.
 
 ## Tracing
 

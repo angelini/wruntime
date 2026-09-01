@@ -25,6 +25,7 @@ Read these rules before writing a guest. Exact APIs live in Rust/WIT source; see
 - `ServiceGuest::init` runs once before first request. Health requests are intercepted by the SDK; override `health_check()` only for meaningful guest health.
 - Guests are single-threaded and cannot spawn processes or open raw `std::net` sockets. Use generated clients or WASI/SDK HTTP. `std::fs` requires the tempdir capability.
 - Outbound HTTP is intercepted for module routing. External hosts must match the proxy's `[egress].allowed_domains` policy. Request bodies and capability resources remain host-limited.
+- Blobstore signed download URLs are transferable, replayable temporary credentials, not recipient-bound grants. Never log or persist the full URL; use immutable/content-addressed object keys when a link must keep referring to identical bytes.
 
 ## Data and resource semantics
 

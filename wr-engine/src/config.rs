@@ -167,6 +167,18 @@ pub struct BlobstoreConfig {
     /// Max objects returned by a single list-objects call. Defaults to 1000.
     #[serde(default = "default_max_list_objects")]
     pub max_list_objects: usize,
+    /// Opt-in policy for issuing short-lived, GET-only bearer URLs.
+    pub signed_urls: Option<BlobstoreSignedUrlsConfig>,
+}
+
+/// Policy for S3-compatible signed download URLs.
+#[derive(Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobstoreSignedUrlsConfig {
+    /// Maximum lifetime a guest may request, in seconds.
+    pub max_ttl_secs: u32,
+    /// Permit an HTTP endpoint. Insecure; intended only for local test/development stores.
+    #[serde(default)]
+    pub allow_http: bool,
 }
 
 fn default_bs_region() -> String {
@@ -559,6 +571,42 @@ impl EngineConfig {
                     .all(|bucket| !bucket.trim().is_empty()),
                 "blobstore.allowed_buckets must not contain empty bucket names",
             );
+            if let Some(policy) = blobstore.signed_urls {
+                v.check(
+                    (1..=604_800).contains(&policy.max_ttl_secs),
+                    "blobstore.signed_urls.max_ttl_secs must be in 1..=604800",
+                );
+                match reqwest::Url::parse(&blobstore.endpoint) {
+                    Ok(endpoint) => {
+                        v.check(
+                            matches!(endpoint.scheme(), "http" | "https") && endpoint.has_host(),
+                            "blobstore.endpoint must be an absolute http or https URL with an authority when signed URLs are enabled",
+                        );
+                        v.check(
+                            endpoint.username().is_empty() && endpoint.password().is_none(),
+                            "blobstore.endpoint must not contain userinfo when signed URLs are enabled",
+                        );
+                        v.check(
+                            endpoint.query().is_none(),
+                            "blobstore.endpoint must not contain a query when signed URLs are enabled",
+                        );
+                        v.check(
+                            endpoint.fragment().is_none(),
+                            "blobstore.endpoint must not contain a fragment when signed URLs are enabled",
+                        );
+                        v.check(
+                            endpoint.scheme() == "https" || policy.allow_http,
+                            "blobstore.endpoint must use https for signed URLs unless blobstore.signed_urls.allow_http = true",
+                        );
+                    }
+                    Err(error) => v.check(
+                        false,
+                        format!(
+                            "blobstore.endpoint must be a valid absolute URL when signed URLs are enabled: {error}"
+                        ),
+                    ),
+                }
+            }
         }
         if let Some(llm) = &self.llm {
             v.check(

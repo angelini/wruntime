@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use wr_engine::blobstore::BlobstoreRuntime;
-use wr_engine::config::BlobstoreConfig;
+use wr_engine::config::{BlobstoreConfig, BlobstoreSignedUrlsConfig};
 
 use super::db::{ModuleServices, ModuleState};
 use super::proxy::http_pool;
@@ -22,21 +22,32 @@ pub fn blobstore_client() -> Arc<BlobstoreRuntime> {
         region: "us-east-1".into(),
         max_object_size: 16 * 1024 * 1024,
         max_list_objects: 1000,
+        signed_urls: Some(BlobstoreSignedUrlsConfig {
+            max_ttl_secs: 900,
+            allow_http: true,
+        }),
     };
     Arc::new(BlobstoreRuntime::new(&config).expect("BlobstoreRuntime"))
 }
 
 /// Build a `ModuleState` with a blobstore client for WASM guest tests.
 pub fn blobstore_state(blobstore: Arc<BlobstoreRuntime>) -> ModuleState {
+    blobstore_state_for_namespace(blobstore, "test-ns")
+}
+
+pub fn blobstore_state_for_namespace(
+    blobstore: Arc<BlobstoreRuntime>,
+    namespace: &str,
+) -> ModuleState {
     ModuleState::new(
         "blobstore-test".into(),
-        "test-ns".into(),
+        namespace.into(),
         "http://127.0.0.1:9001".parse().unwrap(),
         http_pool(),
         ModuleServices {
             blobstore: Some(wr_engine::state::BlobAccess {
                 runtime: blobstore,
-                prefix: Arc::from("wr/test-ns/"),
+                prefix: Arc::from(format!("wr/{namespace}/")),
                 limits: Default::default(),
             }),
             ..Default::default()

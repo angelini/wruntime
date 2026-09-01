@@ -34,6 +34,30 @@ impl proto::HttpTestService for Component {
         }
     }
 
+    fn get_url(&self, req: proto::GetUrlRequest) -> Result<proto::GetUrlResponse, ServiceError> {
+        let rest = req.url.strip_prefix("http://").ok_or_else(|| {
+            ServiceError::bad_request("test GET URL must use the local HTTP S3 endpoint")
+        })?;
+        let path_start = rest.find('/').unwrap_or(rest.len());
+        let authority = wr_sdk::http::Authority::parse(&rest[..path_start])?;
+        let path = wr_sdk::http::PathAndQuery::parse(if path_start == rest.len() {
+            "/"
+        } else {
+            &rest[path_start..]
+        })?;
+        let response = wr_sdk::http::http_request_typed(&wr_sdk::http::TypedHttpRequest {
+            authority,
+            path,
+            method: wr_sdk::http::Method::Get,
+            headers: &[],
+            body: &[],
+        })?;
+        Ok(proto::GetUrlResponse {
+            status: u32::from(response.status),
+            body: response.body,
+        })
+    }
+
     fn echo(&self, req: proto::EchoRequest) -> Result<proto::EchoResponse, ServiceError> {
         Ok(proto::EchoResponse {
             message: format!("echo:{}", req.message),

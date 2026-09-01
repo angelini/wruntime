@@ -1,5 +1,5 @@
 
-œ
+´
 blobstore_test.prototest"J
 
 PutRequest
@@ -35,7 +35,15 @@ ObjectMeta
 key (	Rkey
 size (Rsize#
 last_modified (RlastModified
-etag (	Retag"P
+etag (	Retag"r
+CreateDownloadUrlRequest
+bucket (	Rbucket
+key (	Rkey,
+expires_in_seconds (RexpiresInSeconds"L
+CreateDownloadUrlResponse
+url (	Rurl
+
+expires_at (R	expiresAt"P
 RoundTripRequest
 bucket (	Rbucket
 key (	Rkey
@@ -49,13 +57,14 @@ ObjectMeta
 NotFoundResponse
 
 error_kind (	R	errorKind#
-error_message (	RerrorMessage2¸
+error_message (	RerrorMessage2Ž
 BlobstoreTestService*
 Put.test.PutRequest.test.PutResponse*
 Get.test.GetRequest.test.GetResponse3
 Delete.test.DeleteRequest.test.DeleteResponse<
 DeleteMissing.test.DeleteRequest.test.NotFoundResponse-
 List.test.ListRequest.test.ListResponse-
-Head.test.HeadRequest.test.HeadResponse<
+Head.test.HeadRequest.test.HeadResponseT
+CreateDownloadUrl.test.CreateDownloadUrlRequest.test.CreateDownloadUrlResponse<
 	RoundTrip.test.RoundTripRequest.test.RoundTripResponse9
 NotFound.test.NotFoundRequest.test.NotFoundResponsebproto3

@@ -135,6 +135,8 @@ flowchart TD
     external -.->|"response streams back"| caller
 ```
 
+Outbound routing preserves the complete request URI and `x-wr-destination`, including any query required for authentication. Engine and proxy telemetry use a shared query-redacted representation for span names and destination/path attributes, so signed bearer parameters and ordinary query secrets are not recorded while routing and signature verification still see the untouched URI.
+
 The engine does not collect network request or guest response bodies at dispatch. A response-body owner retains the guest task, `Store<ModuleState>`, and owned instance permit through body completion. Normal end joins the task; a body error, timeout, or client drop cancels it so those resources cannot remain detached. Health checks drain their responses. Worker requests enter through the same body type from their already-buffered protobuf payload, and worker responses are deliberately collected only at the job-result persistence boundary.
 
 ## Request headers (`x-wr-*`)

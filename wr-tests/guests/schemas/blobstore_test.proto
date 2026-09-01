@@ -8,6 +8,7 @@ service BlobstoreTestService {
   rpc DeleteMissing (DeleteRequest) returns (NotFoundResponse);
   rpc List     (ListRequest)     returns (ListResponse);
   rpc Head     (HeadRequest)     returns (HeadResponse);
+  rpc CreateDownloadUrl (CreateDownloadUrlRequest) returns (CreateDownloadUrlResponse);
   rpc RoundTrip (RoundTripRequest) returns (RoundTripResponse);
   rpc NotFound (NotFoundRequest) returns (NotFoundResponse);
 }
@@ -56,6 +57,16 @@ message HeadResponse {
   uint64 size          = 2;
   int64  last_modified = 3;
   string etag          = 4;
+}
+
+message CreateDownloadUrlRequest {
+  string bucket             = 1;
+  string key                = 2;
+  uint32 expires_in_seconds = 3;
+}
+message CreateDownloadUrlResponse {
+  string url       = 1;
+  uint64 expires_at = 2;
 }
 
 message RoundTripRequest {

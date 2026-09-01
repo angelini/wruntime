@@ -1,6 +1,8 @@
 pub use crate::bindings::wruntime::blobstore::store as raw;
 pub use raw::{BlobError, ObjectMeta};
 
+use std::time::Duration;
+
 use crate::ServiceError;
 
 fn normalize_path(value: &str, allow_empty: bool) -> Result<String, ServiceError> {
@@ -83,6 +85,25 @@ impl BucketName {
     }
 }
 
+/// A short-lived, GET-only bearer URL for an object.
+///
+/// Treat `url` as a temporary credential: do not log or persist it. This type's
+/// `Debug` implementation deliberately omits the URL value.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DownloadUrl {
+    pub url: String,
+    pub expires_at: u64,
+}
+
+impl std::fmt::Debug for DownloadUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DownloadUrl")
+            .field("url", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Bucket {
     name: BucketName,
@@ -92,6 +113,21 @@ pub fn bucket(name: &str) -> Result<Bucket, ServiceError> {
     Ok(Bucket {
         name: BucketName::parse(name)?,
     })
+}
+
+fn download_url_lifetime_seconds(expires_in: Duration) -> Result<u32, ServiceError> {
+    if expires_in.is_zero() {
+        return Err(ServiceError::bad_request(
+            "signed download URL lifetime must be positive",
+        ));
+    }
+    if expires_in.subsec_nanos() != 0 {
+        return Err(ServiceError::bad_request(
+            "signed download URL lifetime must be a whole number of seconds",
+        ));
+    }
+    u32::try_from(expires_in.as_secs())
+        .map_err(|_| ServiceError::bad_request("signed download URL lifetime exceeds u32 seconds"))
 }
 
 impl Bucket {
@@ -124,6 +160,24 @@ impl Bucket {
         let key = ObjectKey::parse(key)?;
         raw::head_object(self.name.as_str(), key.as_str()).map_err(Into::into)
     }
+
+    /// Create a short-lived, GET-only bearer URL for an object.
+    ///
+    /// The engine signs only the caller's namespace-scoped key and enforces its
+    /// configured maximum lifetime. Treat the returned URL as a temporary credential.
+    pub fn create_download_url(
+        &self,
+        key: &str,
+        expires_in: Duration,
+    ) -> Result<DownloadUrl, ServiceError> {
+        let key = ObjectKey::parse(key)?;
+        let expires_in_seconds = download_url_lifetime_seconds(expires_in)?;
+        let link = raw::create_download_url(self.name.as_str(), key.as_str(), expires_in_seconds)?;
+        Ok(DownloadUrl {
+            url: link.url,
+            expires_at: link.expires_at,
+        })
+    }
 }
 
 impl From<BlobError> for ServiceError {
@@ -144,6 +198,29 @@ impl From<BlobError> for ServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_url_lifetime_and_debug_are_safe() {
+        assert_eq!(
+            download_url_lifetime_seconds(Duration::from_secs(300))
+                .unwrap_or_else(|_| panic!("valid duration")),
+            300
+        );
+        assert!(download_url_lifetime_seconds(Duration::ZERO).is_err());
+        assert!(download_url_lifetime_seconds(Duration::from_millis(1500)).is_err());
+        assert!(
+            download_url_lifetime_seconds(Duration::from_secs(u64::from(u32::MAX) + 1)).is_err()
+        );
+
+        let link = DownloadUrl {
+            url: "https://objects.example/key?X-Amz-Signature=secret".into(),
+            expires_at: 123,
+        };
+        let debug = format!("{link:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("X-Amz"));
+    }
 
     #[test]
     fn typed_blob_names_validate_and_normalize() {
