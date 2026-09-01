@@ -1866,7 +1866,10 @@ mod tests {
         let command = vec![
             "sh".to_string(),
             "-c".to_string(),
-            format!("sleep 30 & echo $! > {}; wait", pid_file.display()),
+            "sleep 30 & pid=$!; printf '%s\\n' \"$pid\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; wait"
+                .to_string(),
+            "scenario-fixture".to_string(),
+            pid_file.to_string_lossy().into_owned(),
         ];
         let mut scenario = ScenarioProcess::spawn(&command).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -1986,7 +1989,10 @@ mod tests {
             vec![
                 "sh".to_string(),
                 "-c".to_string(),
-                format!("sleep 30 & echo $! > {}; wait", pid_file.display()),
+                "sleep 30 & pid=$!; printf '%s\\n' \"$pid\" > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; wait"
+                    .to_string(),
+                "scenario-fixture".to_string(),
+                pid_file.to_string_lossy().into_owned(),
             ],
             &signals,
         )

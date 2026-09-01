@@ -67,7 +67,7 @@ tidy-examples: fmt-examples lint-examples
 # ── Test ──────────────────────────────────────────────────────────────────────
 
 # Run all tests
-test:
+test: build-test-guests
     WRT_TEST_DB_URL={{db_url_test}} \
     WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
     WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
@@ -75,7 +75,7 @@ test:
     cargo test --timings
 
 # Run integration tests only
-test-integration:
+test-integration: build-test-guests
     WRT_TEST_DB_URL={{db_url_test}} \
     WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
     WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
@@ -83,7 +83,7 @@ test-integration:
     cargo test -p wr-tests
 
 # Run a single test by name
-test-one name:
+test-one name: build-test-guests
     WRT_TEST_DB_URL={{db_url_test}} \
     WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
     WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \

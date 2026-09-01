@@ -8,9 +8,9 @@ Common recipes:
 just dev-up                  # start Postgres, Grafana/LGTM, and RustFS S3
 just multi-node              # run the local two-node topology until Ctrl-C
 just multi-node-inline       # start, verify, and stop the local topology
-just test                    # all tests with test DB/S3 env vars set
-just test-integration        # wr-tests crate only
-just test-one <test_name>    # single test by name
+just test                    # build test guests, then run all tests
+just test-integration        # build test guests, then run wr-tests
+just test-one <test_name>    # build test guests, then run one named test
 just build-wasm-guests       # build every WASM guest sequentially
 just test-wasm               # build WASM guests, then run host binding tests
 just clean-wasm-cache        # remove only the shared Cargo guest cache
@@ -27,8 +27,10 @@ just dev-down                # stop dev infrastructure
 ```
 
 `just test`, `just test-integration`, `just test-one`, and `just test-wasm`
-set the `WRT_TEST_DB_URL` and `WRT_TEST_S3_*` variables expected by
-integration tests. Run `just dev-up` first when using those full recipes.
+first rebuild the test WASM guest artifacts incrementally, then set the
+`WRT_TEST_DB_URL` and `WRT_TEST_S3_*` variables expected by integration tests.
+This prevents changed guest sources or schemas from running against stale staged
+components. Run `just dev-up` first when using those full recipes.
 
 `just bench-proxy-routing [iterations] [warmup] [concurrency]` runs only the proxy-to-stub benchmark. It creates one HTTP/2 client, warms its connection before measurement, and reuses it for sequential and concurrent requests. The default dimensions are `500 10 20`; explicit positional values are preserved. `just bench [iterations] [warmup] [concurrency]` applies the same dimension contract to the full benchmark test target. `cargo test -p wr-proxy --features count-allocations direct_selection_core_is_allocation_free_for_eight_candidates` runs the vetted `allocation-counter` gate after a warm routing-core call; selector parsing is checked separately because `semver::VersionReq` parsing is not part of that zero-allocation selection boundary.
 

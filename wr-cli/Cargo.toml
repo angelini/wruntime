@@ -36,9 +36,10 @@ wr-common = { path = "../wr-common", features = ["discovery", "signal", "tls"] }
 wasmtime = { version = "46", default-features = false, features = [
   "all-arch",
   "anyhow",
-  "component-model-async",
+  "component-model",
   "cranelift",
   "parallel-compilation",
+  "runtime",
 ] }
 tokio-postgres = "0.7"
 libc = "0.2"
