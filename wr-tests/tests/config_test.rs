@@ -78,8 +78,9 @@ fn test_manager_config_valid() {
         url = "postgres://localhost/test"
 
         [cluster]
-        cluster_id            = "default"
-        gossip_listen_address = "0.0.0.0:9010"
+        manager_heartbeat_interval_secs       = 2
+        manager_liveness_threshold_secs       = 8
+        manager_stale_row_reap_threshold_secs = 120
     "#;
     let cfg = load_config_from_toml("manager-valid", toml, ManagerConfig::load);
     assert_eq!(cfg.listen_address, "0.0.0.0:9000");
@@ -88,9 +89,24 @@ fn test_manager_config_valid() {
     assert_eq!(cfg.local_proxy_address, "http://127.0.0.1:9001");
     assert_eq!(cfg.database.url, "postgres://localhost/test");
     assert_eq!(cfg.database.max_connections, 10);
-    assert_eq!(cfg.cluster.cluster_id, "default");
-    assert_eq!(cfg.cluster.gossip_listen_address, "0.0.0.0:9010");
-    assert_eq!(cfg.cluster.gossip_interval_ms, 500);
+    assert_eq!(cfg.cluster.manager_heartbeat_interval_secs, 2);
+    assert_eq!(cfg.cluster.manager_liveness_threshold_secs, 8);
+    assert_eq!(cfg.cluster.manager_stale_row_reap_threshold_secs, 120);
+}
+
+#[test]
+fn test_manager_config_rejects_removed_cluster_fields() {
+    for removed_field in ["cluster_id = \"legacy\"", "gossip_interval_ms = 500"] {
+        let toml = include_str!("../../examples/config/manager.toml").replacen(
+            "[cluster]",
+            &format!("[cluster]\n{removed_field}"),
+            1,
+        );
+        let error = toml::from_str::<RawManagerConfig>(&toml)
+            .err()
+            .expect("removed cluster fields must not be silently accepted");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
 }
 
 #[test]
@@ -122,12 +138,13 @@ fn test_manager_config_default_heartbeat() {
         url = "postgres://localhost/test"
 
         [cluster]
-        cluster_id            = "default"
-        gossip_listen_address = "0.0.0.0:9010"
     "#;
     let cfg = load_config_from_toml("manager-default-heartbeat", toml, ManagerConfig::load);
     assert_eq!(cfg.engine_heartbeat_timeout_secs, 10);
     assert_eq!(cfg.module_heartbeat_timeout_secs.get(), 10);
+    assert_eq!(cfg.cluster.manager_heartbeat_interval_secs, 1);
+    assert_eq!(cfg.cluster.manager_liveness_threshold_secs, 5);
+    assert_eq!(cfg.cluster.manager_stale_row_reap_threshold_secs, 300);
 }
 
 #[test]
@@ -148,6 +165,7 @@ fn test_proxy_config_valid() {
 
         [database]
         url = "postgres://localhost/test"
+        manager_liveness_threshold_secs = 8
 
         [cache]
         routing_table_ttl_secs = 5
@@ -156,6 +174,7 @@ fn test_proxy_config_valid() {
     assert_eq!(cfg.listen_address, "127.0.0.1:9001");
     assert_eq!(cfg.control_address, "127.0.0.1:9002");
     assert_eq!(cfg.cache.routing_table_ttl_secs, 5);
+    assert_eq!(cfg.database.manager_liveness_threshold_secs, 8);
     assert_eq!(cfg.node.peer_port().unwrap(), 9443);
 }
 
@@ -180,6 +199,7 @@ fn test_proxy_config_defaults() {
     "#;
     let cfg: ProxyConfig = toml::from_str(toml).unwrap();
     assert_eq!(cfg.cache.routing_table_ttl_secs, 2);
+    assert_eq!(cfg.database.manager_liveness_threshold_secs, 5);
     assert_eq!(cfg.node.peer_port().unwrap(), 9443);
     assert_eq!(cfg.circuit_breaker.failure_threshold, 5);
     assert_eq!(cfg.circuit_breaker.open_duration_secs, 30);
@@ -218,6 +238,15 @@ fn test_engine_config_rejects_malformed_node_proxy_address() {
     let toml = engine_toml("127.0.0.1:9100", "").replace("http://127.0.0.1:9001", "127.0.0.1:9001");
     let cfg: EngineConfig = toml::from_str(&toml).unwrap();
     assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn test_proxy_config_rejects_zero_manager_liveness_threshold() {
+    let mut cfg: ProxyConfig =
+        toml::from_str(&proxy_toml("127.0.0.1:9001", "127.0.0.1:9002")).unwrap();
+    cfg.database.manager_liveness_threshold_secs = 0;
+    let error = cfg.validate().unwrap_err().to_string();
+    assert!(error.contains("database.manager_liveness_threshold_secs must be > 0"));
 }
 
 #[test]

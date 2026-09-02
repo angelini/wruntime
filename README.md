@@ -44,7 +44,7 @@ Wruntime currently provides:
 - logical service discovery, semantic-version routing, load balancing, circuit
   breaking, and OpenTelemetry tracing;
 - multi-node peer routing over mTLS and active-active managers with PostgreSQL
-  persistence and gossip-based liveness;
+  persistence and lease-based liveness;
 - protobuf service modules plus durable, at-least-once workers and schedules;
 - optional public ingress with request transcoding, schema validation, and deny-by-default,
   allowlisted external HTTP egress;

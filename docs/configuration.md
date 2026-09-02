@@ -51,10 +51,10 @@ url             = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 10
 
 [cluster]
-cluster_id            = "default"           # all managers in the same cluster must match
-gossip_listen_address = "0.0.0.0:9010"      # UDP address for chitchat gossip
 # advertise_grpc_address = "https://manager-1:9000" # optional; defaults to listen_address
-# gossip_interval_ms = 500                           # optional; default 500
+manager_heartbeat_interval_secs       = 1
+manager_liveness_threshold_secs       = 5
+manager_stale_row_reap_threshold_secs = 300
 
 # scheduler_lease_secs       = 30    # optional; lease before another manager may reclaim
 # scheduler_retry_base_secs  = 5     # optional; base backoff, doubles per failure
@@ -109,7 +109,7 @@ The `[database]` section is required. The manager persists engines, routing rule
 and schemas to Postgres. Embedded SQL migrations run automatically on startup via
 refinery, serialized across active-active managers by a Postgres advisory lock.
 
-The `[cluster]` section is required. Multiple managers can run active-active against the same Postgres database. Each manager registers itself in the `wr_managers` table, heartbeats every 15 seconds, and participates in a chitchat gossip mesh for failure detection. Chitchat is now load-bearing for manager liveness — `gossip_listen_address` must be a reachable UDP address; a manager fails to start (fail-fast) if gossip cannot bind. Concurrent writes are serialized via Postgres row locks. Set `advertise_grpc_address` when the manager is behind a load balancer or NAT.
+The `[cluster]` section is required. Multiple managers can run active-active against the same Postgres database, which defines the cluster boundary. PostgreSQL manager leases are the sole liveness signal, and freshness uses database-server `NOW()` so host clock skew does not split the live set. Defaults are a 1-second heartbeat, 5-second live threshold, and 300-second stale-row reap threshold. The heartbeat must be positive, the live threshold must exceed it, and row reaping must be at least ten times the live threshold. The long reap window keeps a briefly dead manager visible as stale status evidence without returning it from `ListManagers`; cleanup runs in a separate owned task every 60 seconds so it cannot delay self-heartbeats. Set `advertise_grpc_address` when the manager is behind a load balancer or NAT.
 
 The manager also runs a Postgres-backed claim/lease job scheduler that submits scheduled jobs through `local_proxy_address` (the local proxy loopback) using the same routing/mTLS path as normal traffic; delivery is **at-least-once** (jobs must be idempotent). `local_proxy_address` is **required** — startup fails if it is unset or empty. `scheduler_lease_secs` must exceed the worst-case per-tick submission time, or a schedule can be reclaimed by another manager while still legitimately in flight. Schedule `interval_secs`, `timeout_secs`, and `max_attempts` are required non-zero unsigned values; malformed negatives fail TOML/protobuf parsing and zero fails manager validation.
 
@@ -164,7 +164,8 @@ key_path     = "certs/127.0.0.1.key"
 ca_cert_path = "certs/ca.crt"
 
 [database]
-url = "postgres://postgres@localhost:5433/wruntime_example"
+url                             = "postgres://postgres@localhost:5433/wruntime_example"
+manager_liveness_threshold_secs = 5 # must match manager cluster configuration
 
 [cache]
 routing_table_ttl_secs = 5   # how often to poll the manager for routing updates
@@ -176,7 +177,7 @@ allowed_domains = ["api.github.com", "*.openai.com"]
 
 `listen_address`, `control_address`, `node.proxy_address`, and `node.control_address` must use the documented loopback boundary. `node.peer_address` is a required explicit `https://host:port` URL advertised to other nodes; the proxy binds that port on all interfaces. The runtime rejects the obsolete derived `peer_port` shape so a loopback data-plane URL cannot accidentally become a cross-node advertisement.
 
-`control_address` exposes a gRPC `NodeService` that engines on the same node use for registration and heartbeats instead of connecting directly to the manager. This decouples engines from the manager address and enables local-first orchestration.
+`control_address` exposes a gRPC `NodeService` that engines on the same node use for registration and heartbeats instead of connecting directly to the manager. This decouples engines from the manager address and enables local-first orchestration. The proxy normally discovers managers through `ListManagers`, but preserves a direct-PostgreSQL bootstrap/fallback path. `database.manager_liveness_threshold_secs` is validated as positive, defaults to 5, and must match every manager's `cluster.manager_liveness_threshold_secs` so both paths use one cluster-wide lease contract.
 
 The proxy is a streaming header-based router — it inspects only HTTP headers for routing decisions and streams request and response bodies through without buffering. It connects to the manager at startup, then polls for routing table updates in the background.
 
@@ -684,7 +685,7 @@ When a module on Node A calls a module whose routing rule has `peer_address = "h
 
 ### Manager high availability
 
-Run multiple managers against the same Postgres database for active-active HA. The shared database provides bootstrap peer discovery; managers then use chitchat for live membership. Each manager needs a unique `gossip_listen_address` that is both bindable locally and reachable over UDP by its peers, and must set `advertise_grpc_address` to its externally reachable gRPC address:
+Run multiple managers against the same Postgres database for active-active HA. The shared database is both the control plane and the manager liveness authority. Every manager must use the same lease settings and set `advertise_grpc_address` to its externally reachable gRPC address:
 
 ```toml
 # manager-1.toml
@@ -695,9 +696,10 @@ local_proxy_address  = "http://127.0.0.1:9001"
 url = "postgres://postgres@db-host:5432/wruntime"
 
 [cluster]
-cluster_id             = "prod"
-gossip_listen_address  = "10.0.1.10:9010"
-advertise_grpc_address = "https://manager-1:9000"
+advertise_grpc_address                = "https://manager-1:9000"
+manager_heartbeat_interval_secs       = 1
+manager_liveness_threshold_secs       = 5
+manager_stale_row_reap_threshold_secs = 300
 
 # manager-2.toml
 listen_address       = "0.0.0.0:9000"
@@ -707,9 +709,10 @@ local_proxy_address  = "http://127.0.0.1:9001"
 url = "postgres://postgres@db-host:5432/wruntime"
 
 [cluster]
-cluster_id             = "prod"
-gossip_listen_address  = "10.0.1.11:9010"
-advertise_grpc_address = "https://manager-2:9000"
+advertise_grpc_address                = "https://manager-2:9000"
+manager_heartbeat_interval_secs       = 1
+manager_liveness_threshold_secs       = 5
+manager_stale_row_reap_threshold_secs = 300
 ```
 
 Proxies and engines can point at any single manager — they all share the same Postgres state. For production, use a load balancer or DNS round-robin in front of the managers.
@@ -749,9 +752,9 @@ wr-cli cluster status --fail-on unknown  # strict: unknown/not-reported is non-z
 
 `jobs` never falls back to the ordinary manager address or runtime mTLS files. Every jobs subcommand supports `--format table|json`. List emits one page and its `next_cursor`; reuse the cursor only with identical filters. Inspect reports payload/result lengths by default and writes exact bytes only to explicit create-new output paths (`--force` replaces). Retry is dead-only, requires `--yes`, and is never automatically replayed after an uncertain response. The CLI rejects unknown status values, missing or malformed required timestamps, inconsistent lifecycle counters/claim fields, and inconsistent summary totals instead of rendering plausible output. Payloads and successful results are limited to 1 MiB each, combined job identity/source/type metadata to 64 KiB, and error text to 1 MiB; the admin transport ceiling is 4 MiB.
 
-`cluster status` uses one `GetClusterStatus` RPC and never requires direct PostgreSQL access. The default is display-only; only an explicit `--fail-on` turns reported state into an exit gate. Query and mTLS failures are always non-zero. Engine/module freshness uses the manager's configured `engine_heartbeat_timeout_secs` and `module_heartbeat_timeout_secs`. Manager DB heartbeat evidence uses the existing 60-second manager liveness backstop, while chitchat remains authoritative after its startup convergence window. Proxy routing-sync age, circuit state, and host resource usage are not configured status inputs and render as unknown/not reported.
+`cluster status` uses one `GetClusterStatus` RPC and never requires direct PostgreSQL access. The default is display-only; only an explicit `--fail-on` turns reported state into an exit gate. Query and mTLS failures are always non-zero. Engine/module freshness uses the manager's configured `engine_heartbeat_timeout_secs` and `module_heartbeat_timeout_secs`. Manager membership is live while its PostgreSQL lease is within `cluster.manager_liveness_threshold_secs`; stale retained rows are dead and report `STALE_MANAGER_HEARTBEAT`. Proxy routing-sync age, circuit state, and host resource usage are not configured status inputs and render as unknown/not reported. JSON status schema version 2 reflects the lease-only manager evidence.
 
-Proxies and narrow discovery clients continue to use `ListManagers`, which reconciles the DB-fresh set against chitchat; direct `wr_managers` reads are a bootstrap-only fallback when no manager RPC is reachable.
+Proxies and narrow discovery clients continue to use lease-filtered `ListManagers`; direct `wr_managers` reads are a bootstrap-only fallback when no manager RPC is reachable and use the matching proxy-side threshold.
 
 ### Remote deployment via CLI
 
@@ -774,7 +777,7 @@ wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10 \
 wr-cli managers inspect-bundle wr-manager-bundle.tar.gz
 ```
 
-The same bundle can be deployed to multiple managers against the same shared database. At deploy time the CLI resolves a unique routable gossip address (or accepts `--gossip-address`) and the exact advertised gRPC address; `--seed-node` is reserved and does not alter runtime manager configuration. Deploy fails closed unless its mTLS `ListManagers` readiness check returns a non-empty runtime manager ID at that exact advertised address. See the [disposable first-deployment and two-manager acceptance procedure](deployment.md#disposable-first-deployment-and-two-manager-acceptance) for systemd/Docker coverage, non-default certificates, failure handling, and cross-seed verification. With a `wr-deploy.toml`, deploy can reduce to the positional arguments:
+The same bundle can be deployed to multiple managers against the same shared database. At deploy time the CLI resolves the exact advertised gRPC address. Deploy fails closed unless its mTLS `ListManagers` readiness check returns a non-empty runtime manager ID at that exact advertised address. See the [disposable first-deployment and two-manager acceptance procedure](deployment.md#disposable-first-deployment-and-two-manager-acceptance) for systemd/Docker coverage, non-default certificates, failure handling, and cross-seed verification. With a `wr-deploy.toml`, deploy can reduce to the positional arguments:
 
 ```bash
 wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10

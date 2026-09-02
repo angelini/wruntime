@@ -2,8 +2,8 @@ mod helpers;
 use helpers::{
     db::manager_pool,
     manager::{
-        manager_trio, register_test_module_raw, register_test_module_ready, start_manager_cluster,
-        sync_table, synced_routing_table,
+        manager_trio, register_test_module_raw, register_test_module_ready, start_manager,
+        start_manager_cluster, sync_table, synced_routing_table,
     },
     proxy::{http_client, proxy_get, start_proxy},
     stubs::spawn_stub_engine,
@@ -145,8 +145,12 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
 
     // ManagerDiscovery resolves managers from wr_managers — register the test
     // manager (plaintext, no TLS) so the NodeAgent can forward to it.
-    wr_manager::db::register_manager(&pool, "proxy-test-mgr", &mgr_addr, "127.0.0.1:0").await?;
-    let discovery = Arc::new(ManagerDiscovery::new(pool.clone(), None));
+    wr_manager::db::register_manager(&pool, "proxy-test-mgr", &mgr_addr).await?;
+    let discovery = Arc::new(ManagerDiscovery::new(
+        pool.clone(),
+        None,
+        wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
+    ));
     discovery.refresh().await;
 
     let routing = wr_proxy::routing::new_routing_table(
@@ -321,10 +325,14 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
 #[tokio::test]
 async fn test_discovery_refreshes_via_list_managers() -> Result<()> {
     let pool = manager_pool().await;
-    // A real manager (holds a ClusterHandle + published metadata) registered in wr_managers.
+    // A real manager registered in the shared PostgreSQL lease table.
     let managers = start_manager_cluster(pool.clone(), 1, 30).await?;
 
-    let discovery = Arc::new(ManagerDiscovery::new(pool.clone(), None));
+    let discovery = Arc::new(ManagerDiscovery::new(
+        pool.clone(),
+        None,
+        wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
+    ));
     discovery.refresh().await; // cold-start DB seed → ListManagers RPC → cache
 
     // A client can be obtained, i.e. the cache was populated with a reachable addr.
@@ -335,18 +343,68 @@ async fn test_discovery_refreshes_via_list_managers() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_discovery_evicts_cached_affinity_after_lease_becomes_stale() -> Result<()> {
+    let pool = manager_pool().await;
+    let manager_addr = start_manager(pool.clone()).await?;
+    wr_manager::db::register_manager(&pool, "cached-mgr", &manager_addr).await?;
+    let discovery = ManagerDiscovery::new(
+        pool.clone(),
+        None,
+        wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
+    );
+    discovery.refresh().await;
+    assert!(discovery.get_client().await.is_ok());
+
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE wr_managers SET last_heartbeat = NOW() - INTERVAL '10 seconds' WHERE manager_id = $1",
+            &[&"cached-mgr"],
+        )
+        .await?;
+    discovery.refresh().await;
+
+    assert!(
+        discovery.get_client().await.is_err(),
+        "successful empty lease evidence must evict cached and affinity-pinned managers"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_discovery_direct_db_fallback_uses_configured_lease_threshold() -> Result<()> {
+    let pool = manager_pool().await;
+    let manager_addr = start_manager(pool.clone()).await?;
+    wr_manager::db::register_manager(&pool, "stale-mgr", &manager_addr).await?;
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE wr_managers SET last_heartbeat = NOW() - INTERVAL '2 seconds' WHERE manager_id = $1",
+            &[&"stale-mgr"],
+        )
+        .await?;
+
+    let discovery = ManagerDiscovery::new(pool, None, 1);
+    discovery.refresh().await;
+
+    assert!(
+        discovery.get_client().await.is_err(),
+        "a row stale under the configured threshold must not bootstrap discovery"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_discovery_falls_back_to_db_when_no_manager_reachable() -> Result<()> {
     let pool = manager_pool().await;
     // A fresh wr_managers row whose grpc_address has no server behind it.
-    wr_manager::db::register_manager(
-        &pool,
-        "unreachable-mgr",
-        "http://127.0.0.1:1",
-        "127.0.0.1:0",
-    )
-    .await?;
+    wr_manager::db::register_manager(&pool, "unreachable-mgr", "http://127.0.0.1:1").await?;
 
-    let discovery = Arc::new(ManagerDiscovery::new(pool.clone(), None));
+    let discovery = Arc::new(ManagerDiscovery::new(
+        pool.clone(),
+        None,
+        wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
+    ));
     discovery.refresh().await; // cold-start DB seed; ListManagers unreachable → DB fallback keeps the row
 
     assert!(discovery.get_client().await.is_err());

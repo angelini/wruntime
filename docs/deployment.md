@@ -102,8 +102,6 @@ proxy_config = "examples/config/proxy.toml"
 db_url     = "postgres://postgres@10.0.1.1:5432/wruntime"
 secret_key = "<64-hex-character-key>"
 ssh_key    = "~/.ssh/deploy_key"
-seed_nodes = ["10.0.1.11:9010", "10.0.1.12:9010"] # reserved; not emitted into manager runtime TOML
-gossip_address = "10.0.1.10:9010" # optional manager UDP bind/advertise address
 cert_dir   = "./certs"    # CA + node certs from `wr-cli cert`
 peer_port  = 9443         # mTLS peer listener port
 # ssh_port     = 22
@@ -113,8 +111,6 @@ peer_port  = 9443         # mTLS peer listener port
 All fields are optional. Fields that only apply to specific commands (e.g. `secret_key` for managers) are silently ignored when unused. CLI flags always override the config file.
 
 `proxy_config` applies to `wr-cli node bundle`: when set (or passed as `--proxy-config` / `WR_PROXY_CONFIG`), the node bundle uses that source proxy TOML, templates deploy-varying database/node/TLS values, and preserves proxy runtime sections such as `[circuit_breaker]`, `[egress]`, and `[external]`. When omitted, the CLI keeps generating a minimal proxy config from the engine node settings.
-
-`seed_nodes` is reserved deployment metadata. The deploy flow does not write it into runtime `manager.toml` because the runtime manager config has no such field. Managers discover fresh peers through the shared database, then use each peer's deployed, routable gossip address to form the chitchat mesh.
 
 **Environment variables** are also supported for all deploy-related fields:
 
@@ -128,7 +124,6 @@ All fields are optional. Fields that only apply to specific commands (e.g. `secr
 | `--target` | `WR_TARGET` | `x86_64-unknown-linux-gnu` |
 | `--proxy-config` | `WR_PROXY_CONFIG` | — |
 | `--advertise-address` | `WR_ADVERTISE_ADDRESS` | derived from remote host |
-| `--gossip-address` | `WR_GOSSIP_ADDRESS` | resolved remote IP + bundled gossip port |
 | `--manager` | `WR_MANAGER` | — |
 | `--cert-dir` | `WR_CERT_DIR` | — |
 | `--peer-port` | `WR_PEER_PORT` | `9443` |
@@ -146,9 +141,8 @@ Config files use placeholders that are resolved at deploy time:
 | `{secret_key}` | `--secret-key` / `WR_SECRET_KEY` / config | manager systemd unit / Dockerfile |
 | `{peer_port}` | `--peer-port` / `WR_PEER_PORT` / config (default: 9443) | explicit proxy/engine `peer_address` templates |
 | `{advertise_address}` | `--advertise-address` / `WR_ADVERTISE_ADDRESS` (auto-derived from remote host if omitted) | manager config (`advertise_grpc_address`) |
-| `{gossip_address}` | `--gossip-address` / `WR_GOSSIP_ADDRESS` / config (resolved remote IP plus bundled port if omitted) | manager config (`gossip_listen_address`) |
 
-Unresolved placeholders cause deployment to fail. A supplied manager gossip address must be a socket address and retain the gossip port recorded by the bundle. Each manager needs a unique address that is both bindable on its host and reachable over UDP by every other manager. Manager Docker deployments use host networking so this address has the same meaning for systemd and Docker.
+Unresolved placeholders cause deployment to fail. Manager Docker deployments retain host networking for systemd parity and direct listener addressing.
 
 ### Manager deploy readiness contract
 
@@ -317,7 +311,7 @@ wr-cli node deploy --node-id node-a node-a.tar.gz deploy@10.0.1.50 \
 
 Use this procedure only with disposable hosts, database, and CA. It exercises a failed first start, a systemd manager, a Docker manager, a non-default certificate directory, and cross-seed identity/address convergence.
 
-1. Provision clean Linux hosts `${HOST_A}` and `${HOST_B}` plus an empty shared PostgreSQL database `${DB_URL}` reachable from both. Host A must use systemd; Host B must have Docker Compose. Configure passwordless sudo. Allow runtime manager gRPC TCP port 9000, operator-admin TCP port 9020 from the operator network, and gossip UDP port 9010 between hosts. Resolve routable addresses `${IP_A}` and `${IP_B}`; each host must be able to bind its own IP. Use the same bundle/`cluster_id`, database, secret key, and trust roots on both hosts.
+1. Provision clean Linux hosts `${HOST_A}` and `${HOST_B}` plus an empty shared PostgreSQL database `${DB_URL}` reachable from both. Host A must use systemd; Host B must have Docker Compose. Configure passwordless sudo. Allow runtime manager gRPC TCP port 9000 and operator-admin TCP port 9020 from the operator network. Resolve routable addresses `${IP_A}` and `${IP_B}`. Use the same bundle, database, manager lease thresholds, secret key, and trust roots on both hosts.
 2. Generate a disposable CA and host certificates in a deliberately non-default directory. The certificate SAN must cover the IP used by deploy's readiness poll:
 
    ```bash
@@ -348,8 +342,7 @@ Use this procedure only with disposable hosts, database, and CA. It exercises a 
    ```bash
    if wr-cli managers deploy manager.tar.gz "${USER}@${HOST_A}" \
      --format systemd --db-url "${BAD_DB_URL}" --secret-key "${SECRET_KEY}" \
-     --advertise-address "https://${IP_A}:9000" \
-     --gossip-address "${IP_A}:9010" --cert-dir "$CERT_DIR"; then
+     --advertise-address "https://${IP_A}:9000" --cert-dir "$CERT_DIR"; then
      echo "invalid deployment unexpectedly succeeded" >&2
      exit 1
    else
@@ -363,8 +356,7 @@ Use this procedure only with disposable hosts, database, and CA. It exercises a 
    ```bash
    wr-cli managers deploy manager.tar.gz "${USER}@${HOST_A}" \
      --format systemd --db-url "${DB_URL}" --secret-key "${SECRET_KEY}" \
-     --advertise-address "https://${IP_A}:9000" \
-     --gossip-address "${IP_A}:9010" --cert-dir "$CERT_DIR"
+     --advertise-address "https://${IP_A}:9000" --cert-dir "$CERT_DIR"
    ```
 
 6. Query Host A and record `${MANAGER_A_ID}` from the exact ID/address pair:
@@ -381,8 +373,7 @@ Use this procedure only with disposable hosts, database, and CA. It exercises a 
    ```bash
    wr-cli managers deploy manager.tar.gz "${USER}@${HOST_B}" \
      --format docker --db-url "${DB_URL}" --secret-key "${SECRET_KEY}" \
-     --advertise-address "https://${IP_B}:9000" \
-     --gossip-address "${IP_B}:9010" --cert-dir "$CERT_DIR"
+     --advertise-address "https://${IP_B}:9000" --cert-dir "$CERT_DIR"
    ```
 
 8. Query through both seeds. Each result must contain exactly `${MANAGER_A_ID}` at `https://${IP_A}:9000` and `${MANAGER_B_ID}` at `https://${IP_B}:9000`:
@@ -419,7 +410,7 @@ Docker deployments use Linux host networking so proxy/engine loopback trust boun
 
 ## TLS certificates
 
-Manager runtime gRPC, the dedicated manager operator-admin listener, cross-node peer-proxy traffic, and manager-to-engine job administration use mTLS. Local engine-to-proxy data-plane and control-plane traffic use plain HTTP on loopback listeners; manager liveness gossip uses its separate UDP listener. Job administration deliberately uses two dedicated trust roots in addition to the runtime CA: the manager job-admin listener accepts only operator-admin CA clients, while engine listeners authorize every client certificate issued by the delegation CA. Issue that CA only to manager delegation identities; never cross-issue runtime, operator-admin, or delegation credentials.
+Manager runtime gRPC, the dedicated manager operator-admin listener, cross-node peer-proxy traffic, and manager-to-engine job administration use mTLS. Local engine-to-proxy data-plane and control-plane traffic use plain HTTP on loopback listeners. Manager liveness is the PostgreSQL lease and adds no network listener. Job administration deliberately uses two dedicated trust roots in addition to the runtime CA: the manager job-admin listener accepts only operator-admin CA clients, while engine listeners authorize every client certificate issued by the delegation CA. Issue that CA only to manager delegation identities; never cross-issue runtime, operator-admin, or delegation credentials.
 
 Generate certificates for all three mTLS trust domains before deployment:
 
@@ -477,8 +468,7 @@ wr-cli managers deploy manager.tar.gz example@localhost \
     --ssh-port 2201 \
     --db-url "postgres://postgres@localhost:5432/wruntime" \
     --secret-key "<64-char-hex-key>" \
-    --advertise-address "https://10.0.2.2:9000" \
-    --gossip-address "10.0.2.15:9010"
+    --advertise-address "https://10.0.2.2:9000"
 
 wr-cli node deploy --node-id node-a node.tar.gz example@localhost \
     --ssh-port 2202 \
@@ -560,9 +550,9 @@ wr-cli cluster status --fail-on unhealthy
 wr-cli cluster wait --node node-a --severity unhealthy --timeout-secs 30
 ```
 
-The default table prints aggregate counts and problem rows; `--detail` expands healthy and unknown records. JSON always emits the complete typed snapshot DTO with `schema_version: 1`, raw observation/heartbeat/deployment timestamps, server-computed ages, desired and actual identities, routing version, route evidence, and stable condition codes. Human `detail` text is explanatory; automation must use severity and code.
+The default table prints aggregate counts and problem rows; `--detail` expands healthy and unknown records. JSON always emits the complete typed snapshot DTO with `schema_version: 2`, raw observation/heartbeat/deployment timestamps, server-computed ages, desired and actual identities, routing version, route evidence, and stable condition codes. Human `detail` text is explanatory; automation must use severity and code.
 
-A healthy rollout reports the exact current node revision and digest with one authoritative fresh registration per desired slot, fresh module heartbeats, and healthy routes. Common failures are `REVISION_MISMATCH` for an old activated revision and `STALE_ENGINE_HEARTBEAT`/`STALE_MODULE_HEARTBEAT` for expired observations. A service remains available but becomes degraded with `PARTIAL_ROUTE_AVAILABILITY` when only some desired routes are healthy; zero healthy desired routes is unhealthy. Manager DB/gossip convergence and disagreement use `BOOTSTRAP_CONVERGING`, `GOSSIP_DEAD`, and `MANAGER_DB_GOSSIP_DISAGREEMENT` with separately stamped DB and gossip observation times.
+A healthy rollout reports the exact current node revision and digest with one authoritative fresh registration per desired slot, fresh module heartbeats, and healthy routes. Common failures are `REVISION_MISMATCH` for an old activated revision and `STALE_ENGINE_HEARTBEAT`/`STALE_MODULE_HEARTBEAT` for expired observations. A service remains available but becomes degraded with `PARTIAL_ROUTE_AVAILABILITY` when only some desired routes are healthy; zero healthy desired routes is unhealthy. A retained manager row whose lease is older than the configured live threshold is dead with `STALE_MANAGER_HEARTBEAT`; the database observation timestamp is the authoritative clock evidence.
 
 No direct proxy or host scrape occurs. Routing-sync age, circuit-breaker state, CPU, and memory therefore remain `SIGNAL_NOT_REPORTED`; stale/unmanaged registrations remain visible but cannot satisfy a desired revision. The default command never acts as a monitoring gate. `--fail-on degraded` and `--fail-on unhealthy` retain display-gate behavior. For scripts, `cluster wait` returns zero only when a non-empty filtered target reaches the exact requested severity and writes the matching typed snapshot; timeout, transport/query failure, malformed evidence, and an empty/impossible filter remain distinct non-zero outcomes. Lifecycle state expectations use the separate `wr-cli lifecycle` command.
 

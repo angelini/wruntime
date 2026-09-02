@@ -8,7 +8,8 @@ flowchart TB
         direction TB
         subgraph manager_cluster["Manager cluster"]
             direction LR
-            manager_1["wr-manager 1"] <-->|"UDP gossip"| manager_2["wr-manager 2"]
+            manager_1["wr-manager 1"]
+            manager_2["wr-manager 2"]
             manager_api["Manager gRPC API served by each manager<br/>registry, routes, schedules, deployment state"]
             manager_1 --- manager_api
             manager_2 --- manager_api
@@ -47,7 +48,7 @@ flowchart TB
 
 | Binary | Default port | Role |
 | -------- | ------------- | ------ |
-| `wr-manager` | `9000` (runtime gRPC) + `9010` (gossip) + configured job-admin gRPC port | Registry — engines register here, proxies sync routing tables from here. Runs active-active behind shared Postgres; chitchat gossip provides manager-to-manager liveness detection. The separate operator-admin mTLS listener serves only `JobAdminService`. On registration the manager resolves the engine's requested secrets and per-namespace DB credentials, then persists the engine, its schemas, and one initially-unhealthy default routing rule per schema-bearing module in a single transaction — a failed registration leaves no routing rules. |
+| `wr-manager` | `9000` (runtime gRPC) + configured job-admin gRPC port | Registry — engines register here, proxies sync routing tables from here. Runs active-active behind shared Postgres; a PostgreSQL heartbeat lease provides manager liveness. The separate operator-admin mTLS listener serves only `JobAdminService`. On registration the manager resolves the engine's requested secrets and per-namespace DB credentials, then persists the engine, its schemas, and one initially-unhealthy default routing rule per schema-bearing module in a single transaction — a failed registration leaves no routing rules. |
 | `wr-proxy` | `9001` (HTTP) + `9002` (gRPC control plane) | Streaming header-based router — intercepts and routes inter-module traffic; forwards cross-node requests to peer proxies; request and response bodies flow through without buffering. The control plane (`NodeService`) handles engine registration and heartbeats |
 | `wr-engine` | `9100` (HTTP), configured job-admin gRPC port when DB-enabled | Loads WASM modules, runs them, and receives forwarded requests. Database-enabled engines also expose delegation-CA-authorized queue administration over mTLS; issuance policy reserves that CA for manager identities. |
 
@@ -63,11 +64,11 @@ Queue administration preserves that ownership. An operator-admin client calls `J
 
 ## Service lifecycle and readiness
 
-Every service exposes the monotonic process stages `STARTING → READY → STOPPING` through the read-only `LifecycleService`. Lifecycle is a process-stage contract, not cluster availability: a manager can be `READY` while gossip evidence is degraded, and route/module health remains in `GetClusterStatus`. Process owners initiate graceful shutdown with SIGTERM or SIGINT; route withdrawal and draining remain internal stop phases rather than lifecycle RPC states.
+Every service exposes the monotonic process stages `STARTING → READY → STOPPING` through the read-only `LifecycleService`. Lifecycle is a process-stage contract, not cluster availability: manager lease and route/module health remain in `GetClusterStatus`. Process owners initiate graceful shutdown with SIGTERM or SIGINT; route withdrawal and draining remain internal stop phases rather than lifecycle RPC states.
 
 Readiness barriers are service-specific:
 
-- A manager becomes ready after configuration, runtime TLS, operator-admin server TLS, and job-admin delegation-client TLS validation, database bootstrap and migrations, manager registration, gossip bind and metadata publication, scheduler/route-monitor ownership, and successful binds of both mTLS gRPC listeners.
+- A manager becomes ready after configuration, runtime TLS, operator-admin server TLS, and job-admin delegation-client TLS validation, database bootstrap and migrations, manager lease registration, scheduler/route-monitor/lease-heartbeat ownership, and successful binds of both mTLS gRPC listeners.
 - A proxy becomes ready after manager discovery succeeds, an initial routing snapshot is installed, and its loopback control, internal, peer mTLS, and optional external listeners are all bound.
 - An engine binds its loopback control/workload listener with workload admission closed and, when database-enabled, binds its delegation-CA-authorized job-admin listener with queue admission unavailable. It then registers the listener metadata, provisions schemas, runs job migrations, opens queue administration, runs module migrations, builds pools, starts owned recovery/worker/module work, loads and health-checks every configured module, and publishes one synchronous readiness heartbeat. The manager atomically records that publication and returns a routing version; the proxy does not acknowledge it until its local routing snapshot contains at least that version. Only then does the engine open workload and worker admission and enter `READY`.
 
@@ -91,14 +92,14 @@ Cancellation or forward-deadline expiry before commit irreversibly fences forwar
 
 Multiple `wr-manager` instances can run simultaneously for high availability. All managers share the same Postgres database — concurrent writes are serialized via `SELECT ... FOR UPDATE NOWAIT` on a lock sentinel row. Each manager:
 
-1. Registers itself in the `wr_managers` table on startup (UUID, gRPC address, gossip address).
-2. Heartbeats every 15 seconds; cleans up stale managers (60 s timeout).
-3. Participates in a [chitchat](https://docs.rs/chitchat) gossip mesh (UDP), publishing its own `grpc_address`/`gossip_address` into gossip node state. Chitchat's phi-accrual failure detector is the **primary** manager liveness mechanism — `gossip_listen_address` is required and must be reachable, or the manager fails to start.
-4. Deregisters itself on graceful shutdown.
+1. Registers its UUID and advertised gRPC address in `wr_managers` on startup.
+2. Renews its PostgreSQL lease at `cluster.manager_heartbeat_interval_secs`.
+3. Treats rows older than `cluster.manager_liveness_threshold_secs` as dead for discovery and status, using PostgreSQL `NOW()` as the common clock.
+4. Reaps rows only after the much longer `cluster.manager_stale_row_reap_threshold_secs` on an independently owned 60-second task, so cleanup lock contention cannot suspend self-renewal, and deregisters itself on graceful shutdown.
 
-`ListManagers` returns a per-manager reconciliation of the DB-heartbeat-fresh set against chitchat — peers chitchat has marked dead are dropped immediately; peers gossip has never seen are included only during a short bootstrap convergence window after a manager starts, then excluded. Proxies discover managers via `ListManagers` (chitchat-reconciled), bootstrapping and falling back to a direct `wr_managers` query only when no manager RPC is reachable. The Postgres 60s heartbeat cleanup (`cleanup_stale_managers`) remains as a secondary safety-net backstop.
+`ListManagers` returns exactly the database-lease-fresh rows. Proxies normally use that RPC and preserve direct `wr_managers` bootstrap/fallback when no manager RPC is reachable. Their `database.manager_liveness_threshold_secs` must match the manager cluster value so both paths implement one cluster-wide lease contract. A manager that cannot reach PostgreSQL cannot serve the control plane and correctly stops renewing its lease.
 
-`GetClusterStatus` is the authoritative composed operator view. A contacted manager captures all PostgreSQL evidence—current and historical desired revisions, registrations, engine/module heartbeat times, persisted routes, manager records, and routing version—in one repeatable-read transaction, then composes a separately timestamped gossip observation. It reuses deployment verification rather than inferring intent from routes or ephemeral engine IDs. Aggregate severity is derived, never persisted. Previous revisions and unmanaged engines remain visible evidence but cannot satisfy desired readiness. Unsupported direct proxy/host signals remain explicitly unknown/not reported.
+`GetClusterStatus` is the authoritative composed operator view. A contacted manager captures all PostgreSQL evidence—current and historical desired revisions, registrations, engine/module heartbeat times, persisted routes, manager records, manager lease freshness, and routing version—in one repeatable-read transaction. It reuses deployment verification rather than inferring intent from routes or ephemeral engine IDs. Aggregate severity is derived, never persisted. Previous revisions and unmanaged engines remain visible evidence but cannot satisfy desired readiness. Unsupported direct proxy/host signals remain explicitly unknown/not reported.
 
 ## Scheduler (routed job control plane)
 

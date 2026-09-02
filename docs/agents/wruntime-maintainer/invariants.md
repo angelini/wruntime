@@ -35,9 +35,9 @@ For each change, **preserve** the contract, **inspect** the listed implementatio
 - **Inspect:** ingress sanitization, engine outbound interception, proxy forwarding, and tests for header spoofing.
 - **Prove:** ingress, egress, namespace, and proxy tests.
 
-- **Preserve:** loopback engine/proxy listeners may use plain HTTP only on their documented boundary; manager gRPC and peer-proxy traffic use mTLS with identity validation; manager liveness gossip uses its separately configured UDP listener.
-- **Inspect:** manager/proxy/engine listener setup, TLS helpers/config, peer clients, and chitchat gossip setup.
-- **Prove:** config, cross-node, multi-manager, and certificate/identity tests.
+- **Preserve:** loopback engine/proxy listeners may use plain HTTP only on their documented boundary; manager gRPC and peer-proxy traffic use mTLS with identity validation. Manager liveness is derived only from PostgreSQL leases using server-side time; manager and proxy discovery thresholds are one cluster-wide contract, stale-row retention remains substantially longer than live membership, and cleanup cannot suspend self-renewal.
+- **Inspect:** manager/proxy/engine listener setup, TLS helpers/config, manager lease registration/heartbeat/reaping, and manager discovery fallback.
+- **Prove:** config, proxy discovery, cross-node, multi-manager, migration, and certificate/identity tests.
 
 ## Database, secrets, and capabilities
 

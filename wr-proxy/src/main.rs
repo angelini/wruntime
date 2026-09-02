@@ -201,7 +201,11 @@ async fn run_service(config_path: &str) -> Result<()> {
     .context("failed to create discovery pool")?;
     let manager_tls = wr_common::tls::build_tonic_client_tls(&config.node.tls)
         .context("failed to build manager TLS config")?;
-    let discovery = Arc::new(ManagerDiscovery::new(db_pool, Some(manager_tls)));
+    let discovery = Arc::new(ManagerDiscovery::new(
+        db_pool,
+        Some(manager_tls),
+        config.database.manager_liveness_threshold_secs,
+    ));
     discovery.refresh().await;
     {
         let mut client = discovery

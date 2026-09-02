@@ -447,6 +447,9 @@ fn add_proxy_config(
         }),
         database: Some(super::config::ProxyDatabaseConfig {
             url: "{db_url}".to_string(),
+            manager_liveness_threshold_secs: Some(
+                wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
+            ),
             extra: super::config::empty_extra_fields(),
         }),
         cache: Some(super::config::ProxyCacheConfig {

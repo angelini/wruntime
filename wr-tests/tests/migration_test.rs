@@ -131,6 +131,23 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
         "expected lifecycle state constraints"
     );
 
+    let gossip_column_absent: bool = client
+        .query_one(
+            "SELECT NOT EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_managers'
+                  AND column_name = 'gossip_address'
+            )",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(
+        gossip_column_absent,
+        "latest manager migration must remove gossip_address"
+    );
+
     Ok(())
 }
 

@@ -4,6 +4,10 @@ use std::num::NonZeroU64;
 use anyhow::Result;
 use serde::Deserialize;
 use wr_common::node::TlsConfig;
+use wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS;
+
+pub const DEFAULT_MANAGER_HEARTBEAT_INTERVAL_SECS: u64 = 1;
+pub const DEFAULT_MANAGER_STALE_ROW_REAP_THRESHOLD_SECS: u64 = 300;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeartbeatTimeoutSecs(NonZeroU64);
@@ -68,22 +72,33 @@ pub struct ManagerConfig {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
-    /// Unique cluster identifier. All managers in the same cluster must match.
-    pub cluster_id: String,
-    /// UDP address for chitchat gossip, e.g. "0.0.0.0:9010"
-    pub gossip_listen_address: String,
     /// This manager's gRPC address as reachable by proxies.
     /// Defaults to listen_address if not set.
     #[serde(default)]
     pub advertise_grpc_address: Option<String>,
-    /// Gossip interval in milliseconds. Defaults to 500.
-    #[serde(default = "default_gossip_interval_ms")]
-    pub gossip_interval_ms: u64,
+    /// How often this manager renews its PostgreSQL lease.
+    #[serde(default = "default_manager_heartbeat_interval_secs")]
+    pub manager_heartbeat_interval_secs: u64,
+    /// How long a manager lease remains live for discovery and status.
+    #[serde(default = "default_manager_liveness_threshold_secs")]
+    pub manager_liveness_threshold_secs: u64,
+    /// How old a dead manager row must be before it is reaped.
+    #[serde(default = "default_manager_stale_row_reap_threshold_secs")]
+    pub manager_stale_row_reap_threshold_secs: u64,
 }
 
-fn default_gossip_interval_ms() -> u64 {
-    500
+fn default_manager_heartbeat_interval_secs() -> u64 {
+    DEFAULT_MANAGER_HEARTBEAT_INTERVAL_SECS
+}
+
+fn default_manager_liveness_threshold_secs() -> u64 {
+    DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS
+}
+
+fn default_manager_stale_row_reap_threshold_secs() -> u64 {
+    DEFAULT_MANAGER_STALE_ROW_REAP_THRESHOLD_SECS
 }
 
 #[derive(Deserialize, Clone)]
@@ -188,12 +203,21 @@ impl RawManagerConfig {
             "database.max_connections must be > 0",
         );
         v.check(
-            !self.cluster.cluster_id.is_empty(),
-            "cluster.cluster_id is required",
+            self.cluster.manager_heartbeat_interval_secs > 0,
+            "cluster.manager_heartbeat_interval_secs must be > 0",
         );
         v.check(
-            !self.cluster.gossip_listen_address.is_empty(),
-            "cluster.gossip_listen_address is required",
+            self.cluster.manager_liveness_threshold_secs
+                > self.cluster.manager_heartbeat_interval_secs,
+            "cluster.manager_liveness_threshold_secs must be greater than manager_heartbeat_interval_secs",
+        );
+        v.check(
+            self.cluster.manager_stale_row_reap_threshold_secs
+                >= self
+                    .cluster
+                    .manager_liveness_threshold_secs
+                    .saturating_mul(10),
+            "cluster.manager_stale_row_reap_threshold_secs must be at least 10 times manager_liveness_threshold_secs",
         );
         v.check(!self.tls.cert_path.is_empty(), "tls.cert_path is required");
         v.check(!self.tls.key_path.is_empty(), "tls.key_path is required");
@@ -351,10 +375,11 @@ mod tests {
                 max_connections: 10,
             },
             cluster: ClusterConfig {
-                cluster_id: "test".into(),
-                gossip_listen_address: "127.0.0.1:9010".into(),
                 advertise_grpc_address: None,
-                gossip_interval_ms: 500,
+                manager_heartbeat_interval_secs: DEFAULT_MANAGER_HEARTBEAT_INTERVAL_SECS,
+                manager_liveness_threshold_secs: DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
+                manager_stale_row_reap_threshold_secs:
+                    DEFAULT_MANAGER_STALE_ROW_REAP_THRESHOLD_SECS,
             },
             tls: TlsConfig {
                 cert_path: "cert".into(),
@@ -417,6 +442,22 @@ mod tests {
         let mut viewer = mapping('b', "viewer", PrincipalRole::Viewer);
         viewer.node_id = Some("node-a".into());
         assert!(config(vec![viewer]).validate_inner().is_err());
+    }
+
+    #[test]
+    fn manager_lease_intervals_are_ordered_and_positive() {
+        let mut invalid = config(vec![]);
+        invalid.cluster.manager_heartbeat_interval_secs = 0;
+        invalid.cluster.manager_liveness_threshold_secs = 1;
+        invalid.cluster.manager_stale_row_reap_threshold_secs = 9;
+        let error = invalid.validate_inner().unwrap_err().to_string();
+        assert!(error.contains("manager_heartbeat_interval_secs must be > 0"));
+        assert!(error.contains("must be at least 10 times"));
+
+        let mut invalid = config(vec![]);
+        invalid.cluster.manager_liveness_threshold_secs =
+            invalid.cluster.manager_heartbeat_interval_secs;
+        assert!(invalid.validate_inner().is_err());
     }
 
     #[test]

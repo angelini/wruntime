@@ -38,12 +38,9 @@ use wr_common::wruntime::{
 };
 
 use crate::auth::PrincipalPolicy;
-use crate::cluster::{ClusterHandle, ManagerLiveness};
 use crate::crypto::SecretCrypto;
 use crate::db;
 
-/// A genuine liveness discrepancy surfaced by reconciliation: a manager the DB
-/// still considers fresh that chitchat has affirmatively marked dead.
 fn proto_timestamp(value: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
     prost_types::Timestamp {
         seconds: value.timestamp(),
@@ -62,111 +59,60 @@ fn deployment_condition(code: String, detail: String) -> DeploymentCondition {
     }
 }
 
-pub struct ReconcileWarning {
-    pub manager_id: String,
-}
-
-/// Per-manager reconciliation of the DB-fresh set against chitchat, keyed on
-/// `manager_id`. Pure (no I/O, no clock) so it is unit-testable without gossip
-/// timing. `within_window` is the caller's `ClusterHandle::within_convergence_window()`.
-pub fn reconcile_managers(
-    db_records: &HashMap<String, db::ManagerRecord>,
-    live: &HashMap<String, ManagerLiveness>,
-    dead: &HashSet<String>,
-    within_window: bool,
-    self_id: &str,
-) -> (Vec<ManagerInfo>, Vec<ReconcileWarning>) {
-    let mut managers = Vec::new();
-    let mut warnings = Vec::new();
-
-    // Stable, deterministic order over the union of DB and gossip ids.
-    let mut ids: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    ids.extend(db_records.keys().map(String::as_str));
-    ids.extend(live.keys().map(String::as_str));
-
-    for id in ids {
-        let db = db_records.get(id);
-
-        // Chitchat affirmatively dead → exclude immediately, regardless of DB
-        // freshness or cluster size. A DB-fresh row that gossip says is dead is
-        // the ONLY genuine discrepancy worth a warning;
-        // never warn about self.
-        if dead.contains(id) {
-            if db.is_some() && id != self_id {
-                warnings.push(ReconcileWarning {
-                    manager_id: id.to_string(),
-                });
-            }
-            continue;
-        }
-
-        // Live in gossip → include, preferring gossip addresses and filling any
-        // blank field from the DB record for this manager_id.
-        if let Some(l) = live.get(id) {
-            let grpc_address = if !l.grpc_address.is_empty() {
-                l.grpc_address.clone()
-            } else {
-                db.map(|d| d.grpc_address.clone()).unwrap_or_default()
-            };
-            let gossip_address = if !l.gossip_address.is_empty() {
-                l.gossip_address.clone()
-            } else {
-                db.map(|d| d.gossip_address.clone()).unwrap_or_default()
-            };
-            managers.push(ManagerInfo {
-                manager_id: id.to_string(),
-                grpc_address,
-                gossip_address,
-            });
-            continue;
-        }
-
-        // DB-fresh but never observed in gossip (neither live nor dead):
-        // include during the bootstrap window, else trust chitchat and drop
-        // (no warn — ordinary post-window state).
-        if let Some(d) = db {
-            if within_window {
-                managers.push(ManagerInfo {
-                    manager_id: id.to_string(),
-                    grpc_address: d.grpc_address.clone(),
-                    gossip_address: d.gossip_address.clone(),
-                });
-            }
-        }
-    }
-
-    (managers, warnings)
+/// Project the database-fresh manager lease rows into the public contract.
+/// The query already applies the configured freshness threshold with PostgreSQL
+/// `NOW()` and returns deterministic manager-id order.
+pub fn reconcile_managers(db_records: &[db::ManagerRecord]) -> Vec<ManagerInfo> {
+    db_records
+        .iter()
+        .map(|record| ManagerInfo {
+            manager_id: record.manager_id.clone(),
+            grpc_address: record.grpc_address.clone(),
+        })
+        .collect()
 }
 
 pub struct Manager {
     pool: Pool,
     crypto: Arc<SecretCrypto>,
-    cluster: Arc<ClusterHandle>,
+    manager_liveness_threshold_secs: u64,
     engine_heartbeat_timeout_secs: f64,
     module_heartbeat_timeout_secs: f64,
     admission: AdmissionGate,
 }
 
 impl Manager {
-    pub fn new(pool: Pool, crypto: Arc<SecretCrypto>, cluster: Arc<ClusterHandle>) -> Self {
+    pub fn new(pool: Pool, crypto: Arc<SecretCrypto>) -> Self {
         let admission = AdmissionGate::closed();
         admission.open();
-        Self::with_admission(pool, crypto, cluster, admission)
+        Self::with_admission(
+            pool,
+            crypto,
+            wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
+            admission,
+        )
     }
 
     pub fn with_admission(
         pool: Pool,
         crypto: Arc<SecretCrypto>,
-        cluster: Arc<ClusterHandle>,
+        manager_liveness_threshold_secs: u64,
         admission: AdmissionGate,
     ) -> Self {
-        Self::with_heartbeat_timeouts(pool, crypto, cluster, 10.0, 10.0, admission)
+        Self::with_heartbeat_timeouts(
+            pool,
+            crypto,
+            manager_liveness_threshold_secs,
+            10.0,
+            10.0,
+            admission,
+        )
     }
 
     pub fn with_heartbeat_timeouts(
         pool: Pool,
         crypto: Arc<SecretCrypto>,
-        cluster: Arc<ClusterHandle>,
+        manager_liveness_threshold_secs: u64,
         engine_heartbeat_timeout_secs: f64,
         module_heartbeat_timeout_secs: f64,
         admission: AdmissionGate,
@@ -174,7 +120,7 @@ impl Manager {
         Self {
             pool,
             crypto,
-            cluster,
+            manager_liveness_threshold_secs,
             engine_heartbeat_timeout_secs,
             module_heartbeat_timeout_secs,
             admission,
@@ -562,46 +508,21 @@ impl ManagerService for Manager {
         &self,
         _request: Request<ListManagersRequest>,
     ) -> Result<Response<ListManagersResponse>, Status> {
-        let db_records: HashMap<String, db::ManagerRecord> = db::list_managers(&self.pool)
-            .await?
-            .into_iter()
-            .map(|r| (r.manager_id.clone(), r))
-            .collect();
-
-        let live: HashMap<String, ManagerLiveness> = self
-            .cluster
-            .live_managers()
-            .await
-            .into_iter()
-            .map(|m| (m.manager_id.clone(), m))
-            .collect();
-        let dead = self.cluster.dead_manager_ids().await;
-        let within_window = self.cluster.within_convergence_window();
-        let self_id = self.cluster.self_id();
-
-        let (managers, warnings) =
-            reconcile_managers(&db_records, &live, &dead, within_window, &self_id);
-
-        for w in warnings {
-            warn!(
-                manager_id = %w.manager_id,
-                "manager is DB-fresh but chitchat reports it dead; excluding from ListManagers",
-            );
-        }
-
-        Ok(Response::new(ListManagersResponse { managers }))
+        let db_records =
+            db::list_managers(&self.pool, self.manager_liveness_threshold_secs).await?;
+        Ok(Response::new(ListManagersResponse {
+            managers: reconcile_managers(&db_records),
+        }))
     }
 
     async fn get_cluster_status(
         &self,
         _request: Request<GetClusterStatusRequest>,
     ) -> Result<Response<GetClusterStatusResponse>, Status> {
-        let membership = self.cluster.membership_snapshot().await;
         let snapshot = db::get_cluster_status_snapshot(&self.pool).await?;
         let response = crate::status::compose(
             snapshot,
-            membership,
-            self.cluster.within_convergence_window(),
+            self.manager_liveness_threshold_secs as f64,
             self.engine_heartbeat_timeout_secs,
             self.module_heartbeat_timeout_secs,
         )?;
@@ -865,8 +786,8 @@ impl ManagerService for Manager {
 /// delegates every mutation to one transactional operation state machine.
 pub struct OperatorApi {
     pool: Pool,
-    cluster: Arc<ClusterHandle>,
     policy: PrincipalPolicy,
+    manager_liveness_threshold_secs: f64,
     engine_heartbeat_timeout_secs: f64,
     module_heartbeat_timeout_secs: f64,
 }
@@ -874,15 +795,15 @@ pub struct OperatorApi {
 impl OperatorApi {
     pub fn new(
         pool: Pool,
-        cluster: Arc<ClusterHandle>,
         policy: PrincipalPolicy,
+        manager_liveness_threshold_secs: f64,
         engine_heartbeat_timeout_secs: f64,
         module_heartbeat_timeout_secs: f64,
     ) -> Self {
         Self {
             pool,
-            cluster,
             policy,
+            manager_liveness_threshold_secs,
             engine_heartbeat_timeout_secs,
             module_heartbeat_timeout_secs,
         }
@@ -1054,7 +975,6 @@ impl OperatorService for OperatorApi {
     ) -> Result<Response<GetOperatorStatusResponse>, Status> {
         self.policy.authorize_read(&mut request)?;
         let filter = request.into_inner();
-        let membership = self.cluster.membership_snapshot().await;
         let snapshot = db::get_cluster_status_snapshot(&self.pool).await?;
         let mut active_operations = snapshot.active_operations.clone();
         let mut observations = snapshot.observations.clone();
@@ -1072,8 +992,7 @@ impl OperatorService for OperatorApi {
         let mut agent_attestations = snapshot.agent_attestations.clone();
         let mut cluster = crate::status::compose(
             snapshot,
-            membership,
-            self.cluster.within_convergence_window(),
+            self.manager_liveness_threshold_secs,
             self.engine_heartbeat_timeout_secs,
             self.module_heartbeat_timeout_secs,
         )?;
@@ -1367,24 +1286,6 @@ impl NodeAgentService for NodeAgentApi {
 mod reconcile_tests {
     use super::*;
 
-    fn rec(id: &str, grpc: &str, gossip: &str) -> db::ManagerRecord {
-        db::ManagerRecord {
-            manager_id: id.to_string(),
-            grpc_address: grpc.to_string(),
-            gossip_address: gossip.to_string(),
-        }
-    }
-    fn live(id: &str, grpc: &str, gossip: &str) -> ManagerLiveness {
-        ManagerLiveness {
-            manager_id: id.to_string(),
-            grpc_address: grpc.to_string(),
-            gossip_address: gossip.to_string(),
-        }
-    }
-    fn map<T>(items: Vec<(&str, T)>) -> HashMap<String, T> {
-        items.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
-    }
-
     #[test]
     fn schedule_timestamp_preserves_seconds_and_nanos() {
         let value = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
@@ -1393,102 +1294,23 @@ mod reconcile_tests {
         assert_eq!(timestamp.nanos, 123_456_789);
     }
 
-    // 2-manager: peer is chitchat-dead while still DB-fresh (the N1 case).
     #[test]
-    fn dead_peer_excluded_and_warned() {
-        let db = map(vec![
-            ("self", rec("self", "https://self:9000", "self:9010")),
-            ("peer", rec("peer", "https://peer:9000", "peer:9010")),
-        ]);
-        let live = map(vec![(
-            "self",
-            live("self", "https://self:9000", "self:9010"),
-        )]);
-        let dead: HashSet<String> = ["peer".to_string()].into_iter().collect();
+    fn database_records_project_in_query_order() {
+        let records = vec![
+            db::ManagerRecord {
+                manager_id: "manager-a".into(),
+                grpc_address: "https://manager-a:9000".into(),
+            },
+            db::ManagerRecord {
+                manager_id: "manager-b".into(),
+                grpc_address: "https://manager-b:9000".into(),
+            },
+        ];
 
-        let (managers, warnings) = reconcile_managers(&db, &live, &dead, true, "self");
+        let managers = reconcile_managers(&records);
 
-        let ids: Vec<_> = managers.iter().map(|m| m.manager_id.as_str()).collect();
-        assert_eq!(ids, vec!["self"]);
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].manager_id, "peer");
-    }
-
-    // Single manager (live = just self, no dead) → self included, no warn.
-    #[test]
-    fn single_manager_self_only_no_warn() {
-        let db = map(vec![(
-            "self",
-            rec("self", "https://self:9000", "self:9010"),
-        )]);
-        let live = map(vec![(
-            "self",
-            live("self", "https://self:9000", "self:9010"),
-        )]);
-        let dead: HashSet<String> = HashSet::new();
-
-        let (managers, warnings) = reconcile_managers(&db, &live, &dead, true, "self");
-
-        assert_eq!(managers.len(), 1);
-        assert_eq!(managers[0].manager_id, "self");
-        assert_eq!(managers[0].gossip_address, "self:9010");
-        assert!(warnings.is_empty());
-    }
-
-    // DB-fresh peer unknown to gossip, within window → included (bootstrap).
-    #[test]
-    fn db_fresh_unknown_within_window_included() {
-        let db = map(vec![
-            ("self", rec("self", "https://self:9000", "self:9010")),
-            ("peer", rec("peer", "https://peer:9000", "peer:9010")),
-        ]);
-        let live = map(vec![(
-            "self",
-            live("self", "https://self:9000", "self:9010"),
-        )]);
-        let dead: HashSet<String> = HashSet::new();
-
-        let (managers, warnings) = reconcile_managers(&db, &live, &dead, true, "self");
-
-        let ids: Vec<_> = managers.iter().map(|m| m.manager_id.as_str()).collect();
-        assert_eq!(ids, vec!["peer", "self"]); // BTreeSet order
-        assert!(warnings.is_empty());
-    }
-
-    // DB-fresh peer unknown to gossip, window elapsed → excluded, no warn.
-    #[test]
-    fn db_fresh_unknown_after_window_excluded() {
-        let db = map(vec![
-            ("self", rec("self", "https://self:9000", "self:9010")),
-            ("peer", rec("peer", "https://peer:9000", "peer:9010")),
-        ]);
-        let live = map(vec![(
-            "self",
-            live("self", "https://self:9000", "self:9010"),
-        )]);
-        let dead: HashSet<String> = HashSet::new();
-
-        let (managers, warnings) = reconcile_managers(&db, &live, &dead, false, "self");
-
-        let ids: Vec<_> = managers.iter().map(|m| m.manager_id.as_str()).collect();
-        assert_eq!(ids, vec!["self"]);
-        assert!(warnings.is_empty());
-    }
-
-    // Live peer missing grpc_address in gossip but present in DB → filled from DB.
-    #[test]
-    fn live_missing_grpc_filled_from_db() {
-        let db = map(vec![(
-            "peer",
-            rec("peer", "https://peer:9000", "peer:9010"),
-        )]);
-        let live = map(vec![("peer", live("peer", "", ""))]);
-        let dead: HashSet<String> = HashSet::new();
-
-        let (managers, _warnings) = reconcile_managers(&db, &live, &dead, false, "self");
-
-        assert_eq!(managers.len(), 1);
-        assert_eq!(managers[0].grpc_address, "https://peer:9000");
-        assert_eq!(managers[0].gossip_address, "peer:9010");
+        assert_eq!(managers.len(), 2);
+        assert_eq!(managers[0].manager_id, "manager-a");
+        assert_eq!(managers[1].grpc_address, "https://manager-b:9000");
     }
 }

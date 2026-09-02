@@ -12,7 +12,8 @@ key_path     = "certs/127.0.0.1.key"
 ca_cert_path = "certs/ca.crt"
 
 [database]
-url = "postgres://postgres@127.0.0.1:5432/wruntime_deployment_e2e"
+url                             = "postgres://postgres@127.0.0.1:5432/wruntime_deployment_e2e"
+manager_liveness_threshold_secs = 5
 
 [cache]
 routing_table_ttl_secs = 1

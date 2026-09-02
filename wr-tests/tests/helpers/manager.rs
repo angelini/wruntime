@@ -30,25 +30,6 @@ fn test_secret_crypto() -> Arc<wr_manager::crypto::SecretCrypto> {
     )
 }
 
-async fn test_cluster_handle() -> Result<std::sync::Arc<wr_manager::cluster::ClusterHandle>> {
-    let gossip_port = {
-        let tmp = TcpListener::bind("127.0.0.1:0").await?;
-        tmp.local_addr()?.port()
-    };
-    let listen: std::net::SocketAddr = format!("127.0.0.1:{gossip_port}").parse()?;
-    Ok(std::sync::Arc::new(
-        wr_manager::cluster::ClusterHandle::new(
-            &uuid::Uuid::new_v4().to_string(),
-            "test-cluster",
-            listen,
-            vec![],
-            std::time::Duration::from_millis(100),
-            chitchat::FailureDetectorConfig::default(),
-        )
-        .await?,
-    ))
-}
-
 pub struct AuthorizedManager {
     pub endpoint: String,
     pub pki: Arc<RoleTestPki>,
@@ -132,7 +113,6 @@ pub async fn start_authorized_manager(pool: deadpool_postgres::Pool) -> Result<A
     ];
     let policy = wr_manager::auth::PrincipalPolicy::new(&mappings);
     let crypto = test_secret_crypto();
-    let cluster = test_cluster_handle().await?;
     let tls = ServerTlsConfig::new()
         .identity(Identity::from_pem(
             pki.server.cert_pem.clone(),
@@ -146,12 +126,11 @@ pub async fn start_authorized_manager(pool: deadpool_postgres::Pool) -> Result<A
             .add_service(ManagerServiceServer::new(Manager::new(
                 pool.clone(),
                 crypto,
-                cluster.clone(),
             )))
             .add_service(OperatorServiceServer::new(OperatorApi::new(
                 pool.clone(),
-                cluster,
                 policy.clone(),
+                wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS as f64,
                 30.0,
                 30.0,
             )))
@@ -174,12 +153,9 @@ pub async fn start_manager(pool: deadpool_postgres::Pool) -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let crypto = test_secret_crypto();
-    let cluster = test_cluster_handle().await?;
     tokio::spawn(
         Server::builder()
-            .add_service(ManagerServiceServer::new(Manager::new(
-                pool, crypto, cluster,
-            )))
+            .add_service(ManagerServiceServer::new(Manager::new(pool, crypto)))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
     );
     Ok(format!("http://{addr}"))
@@ -409,13 +385,11 @@ pub async fn start_manager_with_monitor(
     let crypto = test_secret_crypto();
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let cluster = test_cluster_handle().await?;
     tokio::spawn(
         Server::builder()
             .add_service(ManagerServiceServer::new(Manager::new(
                 pool.clone(),
                 crypto,
-                cluster,
             )))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
     );
@@ -450,10 +424,8 @@ pub async fn backdate_engine_heartbeat(
 pub struct ClusteredManager {
     /// gRPC address of this manager.
     pub addr: String,
-    /// This manager's chitchat node id (== manager_id).
+    /// This manager's PostgreSQL lease identity.
     pub manager_id: String,
-    /// The live cluster handle (test hook to simulate death via `initiate_shutdown`).
-    pub cluster: std::sync::Arc<wr_manager::cluster::ClusterHandle>,
     grpc_task: tokio::task::JoinHandle<()>,
 }
 
@@ -462,95 +434,31 @@ impl ClusteredManager {
     /// shared database, as a takeover fixture.
     pub fn abort_service(&self) {
         self.grpc_task.abort();
-        let _ = self.cluster.initiate_shutdown();
     }
 }
 
-/// Start `count` managers with chitchat gossip, all sharing the same Postgres.
-/// Chitchat is the primary manager liveness signal — engine heartbeats are in Postgres.
+/// Start `count` managers sharing the same PostgreSQL control plane.
 pub async fn start_manager_cluster(
     pool: deadpool_postgres::Pool,
     count: usize,
     heartbeat_timeout_secs: u64,
 ) -> Result<Vec<ClusteredManager>> {
-    start_manager_cluster_inner(
-        pool,
-        count,
-        heartbeat_timeout_secs,
-        chitchat::FailureDetectorConfig::default(),
-    )
-    .await
-}
-
-/// Like `start_manager_cluster` but with a short failure detector so a killed
-/// peer is detected dead by chitchat within a couple of seconds (deterministic,
-/// bounded — used by tests that must observe a real chitchat death).
-pub async fn start_manager_cluster_fast_death(
-    pool: deadpool_postgres::Pool,
-    count: usize,
-    heartbeat_timeout_secs: u64,
-) -> Result<Vec<ClusteredManager>> {
-    let fd = chitchat::FailureDetectorConfig {
-        phi_threshold: 8.0,
-        sampling_window_size: 10,
-        max_interval: std::time::Duration::from_millis(500),
-        initial_interval: std::time::Duration::from_millis(200),
-        dead_node_grace_period: std::time::Duration::from_secs(10),
-    };
-    start_manager_cluster_inner(pool, count, heartbeat_timeout_secs, fd).await
-}
-
-async fn start_manager_cluster_inner(
-    pool: deadpool_postgres::Pool,
-    count: usize,
-    heartbeat_timeout_secs: u64,
-    failure_detector: chitchat::FailureDetectorConfig,
-) -> Result<Vec<ClusteredManager>> {
     let mut managers = Vec::with_capacity(count);
-    let mut gossip_addrs: Vec<String> = Vec::new();
 
     for _ in 0..count {
         let manager_id = uuid::Uuid::new_v4().to_string();
-
-        // Bind gRPC listener
         let grpc_listener = TcpListener::bind("127.0.0.1:0").await?;
         let grpc_addr = grpc_listener.local_addr()?;
         let grpc_url = format!("http://{grpc_addr}");
 
-        // Bind gossip UDP port (pick a free TCP port and use it for UDP)
-        let gossip_port = {
-            let tmp = TcpListener::bind("127.0.0.1:0").await?;
-            tmp.local_addr()?.port()
-        };
-        let gossip_listen: std::net::SocketAddr = format!("127.0.0.1:{gossip_port}").parse()?;
-        let gossip_addr_str = gossip_listen.to_string();
-
-        // Register in wr_managers
-        wr_manager::db::register_manager(&pool, &manager_id, &grpc_url, &gossip_addr_str)
+        wr_manager::db::register_manager(&pool, &manager_id, &grpc_url)
             .await
             .map_err(|e| anyhow::anyhow!("register_manager: {e}"))?;
 
-        let cluster = std::sync::Arc::new(
-            wr_manager::cluster::ClusterHandle::new(
-                &manager_id,
-                "test-cluster",
-                gossip_listen,
-                gossip_addrs.clone(),
-                std::time::Duration::from_millis(100),
-                failure_detector.clone(),
-            )
-            .await?,
-        );
-        cluster.publish_metadata(&grpc_url, &gossip_addr_str).await;
+        let manager = Manager::new(pool.clone(), test_secret_crypto());
 
-        gossip_addrs.push(gossip_addr_str);
-
-        let crypto = test_secret_crypto();
-
-        let manager = Manager::new(pool.clone(), crypto, cluster.clone());
-
-        // Start gRPC server and retain its owner so takeover tests can prove a
-        // real serving process disappeared without changing shared state.
+        // Retain the request-serving owner so takeover tests can stop one
+        // manager without altering its shared PostgreSQL lease row.
         let grpc_task = tokio::spawn(async move {
             if let Err(error) = Server::builder()
                 .add_service(ManagerServiceServer::new(manager))
@@ -563,7 +471,6 @@ async fn start_manager_cluster_inner(
             }
         });
 
-        // Start heartbeat monitor (reads Postgres, no gossip)
         tokio::spawn(wr_manager::state::monitor_heartbeats(
             pool.clone(),
             heartbeat_timeout_secs,
@@ -574,7 +481,6 @@ async fn start_manager_cluster_inner(
         managers.push(ClusteredManager {
             addr: grpc_url,
             manager_id,
-            cluster,
             grpc_task,
         });
     }

@@ -1286,7 +1286,6 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
         .await?
         .into_inner();
     assert!(healthy_status.database_observed_at.is_some());
-    assert!(healthy_status.gossip_observed_at.is_some());
     assert!(healthy_status.response_at.is_some());
     assert!(healthy_status.routing_table_version > 0);
     let node = healthy_status

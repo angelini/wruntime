@@ -56,7 +56,6 @@ wasmtime = { version = "46", default-features = false, features = [
 wasmtime-wasi-http = { version = "46", default-features = false, features = [
   "p2",
 ] }
-chitchat = "0.11"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 

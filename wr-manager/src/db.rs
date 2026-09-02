@@ -5,6 +5,8 @@ use tokio_retry::RetryIf;
 use tonic::Status;
 
 use wr_common::identity::NamespaceFilter;
+use wr_common::lifecycle_service::AdmissionGate;
+use wr_common::task_group::{TaskCancellation, TaskExit};
 use wr_common::wruntime::{
     BeginDeploymentRequest, DeploymentRecord, DeploymentState, EngineRegistration,
     ModuleDescriptor, NodeAgentAttestation, NodeAgentPolicy, NodeOperation, RoutingRule,
@@ -710,7 +712,6 @@ pub struct StatusRouteRecord {
 pub struct StatusManagerRecord {
     pub manager_id: String,
     pub grpc_address: String,
-    pub gossip_address: String,
     pub registered_at: chrono::DateTime<chrono::Utc>,
     pub last_heartbeat: chrono::DateTime<chrono::Utc>,
 }
@@ -1264,7 +1265,7 @@ where
 
     let managers = txn
         .query(
-            "SELECT manager_id, grpc_address, gossip_address, registered_at, last_heartbeat
+            "SELECT manager_id, grpc_address, registered_at, last_heartbeat
              FROM wr_managers ORDER BY manager_id",
             &[],
         )
@@ -1274,7 +1275,6 @@ where
         .map(|row| StatusManagerRecord {
             manager_id: row.get("manager_id"),
             grpc_address: row.get("grpc_address"),
-            gossip_address: row.get("gossip_address"),
             registered_at: row.get("registered_at"),
             last_heartbeat: row.get("last_heartbeat"),
         })
@@ -1946,7 +1946,6 @@ pub async fn get_secrets(
 pub struct ManagerRecord {
     pub manager_id: String,
     pub grpc_address: String,
-    pub gossip_address: String,
 }
 
 /// Register (or re-register) this manager in the cluster.
@@ -1954,18 +1953,16 @@ pub async fn register_manager(
     pool: &Pool,
     manager_id: &str,
     grpc_address: &str,
-    gossip_address: &str,
 ) -> Result<(), Status> {
     let client = pool.get().await.internal()?;
     client
         .execute(
-            "INSERT INTO wr_managers (manager_id, grpc_address, gossip_address)
-             VALUES ($1, $2, $3)
+            "INSERT INTO wr_managers (manager_id, grpc_address)
+             VALUES ($1, $2)
              ON CONFLICT (manager_id) DO UPDATE
                SET grpc_address = EXCLUDED.grpc_address,
-                   gossip_address = EXCLUDED.gossip_address,
                    last_heartbeat = NOW()",
-            &[&manager_id, &grpc_address, &gossip_address],
+            &[&manager_id, &grpc_address],
         )
         .await
         .internal()?;
@@ -1986,13 +1983,18 @@ pub async fn deregister_manager(pool: &Pool, manager_id: &str) -> Result<(), Sta
 }
 
 /// List all managers that have heartbeated within the given threshold.
-pub async fn list_managers(pool: &Pool) -> Result<Vec<ManagerRecord>, Status> {
+pub async fn list_managers(
+    pool: &Pool,
+    liveness_threshold_secs: u64,
+) -> Result<Vec<ManagerRecord>, Status> {
     let client = pool.get().await.internal()?;
+    let threshold_secs = liveness_threshold_secs as f64;
     let rows = client
         .query(
-            "SELECT manager_id, grpc_address, gossip_address FROM wr_managers
-             WHERE last_heartbeat > NOW() - INTERVAL '60 seconds'",
-            &[],
+            "SELECT manager_id, grpc_address FROM wr_managers
+             WHERE last_heartbeat > NOW() - make_interval(secs => $1::double precision)
+             ORDER BY manager_id",
+            &[&threshold_secs],
         )
         .await
         .internal()?;
@@ -2001,7 +2003,6 @@ pub async fn list_managers(pool: &Pool) -> Result<Vec<ManagerRecord>, Status> {
         .map(|r| ManagerRecord {
             manager_id: r.get(0),
             grpc_address: r.get(1),
-            gossip_address: r.get(2),
         })
         .collect())
 }
@@ -2019,8 +2020,56 @@ pub async fn heartbeat_manager(pool: &Pool, manager_id: &str) -> Result<(), Stat
     Ok(())
 }
 
+/// Renew this manager's lease independently of cluster-wide stale-row cleanup.
+pub async fn run_manager_heartbeat_owned(
+    pool: Pool,
+    manager_id: String,
+    interval: std::time::Duration,
+    admission: AdmissionGate,
+    mut cancellation: TaskCancellation,
+) -> anyhow::Result<TaskExit> {
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
+            _ = ticker.tick() => {}
+        }
+        if !admission.is_open() {
+            continue;
+        }
+        tokio::select! {
+            _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
+            result = heartbeat_manager(&pool, &manager_id) => {
+                result.map_err(|error| anyhow::anyhow!("manager heartbeat failed: {error}"))?;
+            }
+        }
+    }
+}
+
+/// Reap long-stale manager rows on an independently owned, slower cadence.
+pub async fn run_stale_manager_reaper_owned(
+    pool: Pool,
+    stale_threshold_secs: u64,
+    interval: std::time::Duration,
+    mut cancellation: TaskCancellation,
+) -> anyhow::Result<TaskExit> {
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
+            _ = ticker.tick() => {}
+        }
+        tokio::select! {
+            _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
+            result = cleanup_stale_managers(&pool, stale_threshold_secs) => {
+                result.map_err(|error| anyhow::anyhow!("stale manager cleanup failed: {error}"))?;
+            }
+        }
+    }
+}
+
 /// Remove managers that haven't heartbeated within the threshold. Returns count deleted.
-pub async fn cleanup_stale_managers(pool: &Pool, stale_threshold_secs: i64) -> Result<u64, Status> {
+pub async fn cleanup_stale_managers(pool: &Pool, stale_threshold_secs: u64) -> Result<u64, Status> {
     let client = pool.get().await.internal()?;
     let deleted = client
         .execute(

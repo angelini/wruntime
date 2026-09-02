@@ -568,7 +568,6 @@ impl<'a> From<&'a DeploymentRecord> for DeploymentDto<'a> {
 struct ManagerDto<'a> {
     manager_id: &'a str,
     grpc_address: &'a str,
-    gossip_address: &'a str,
     severity: &'static str,
     membership: &'static str,
     registered_at: Option<TimestampDto>,
@@ -582,7 +581,6 @@ impl<'a> From<&'a ManagerStatus> for ManagerDto<'a> {
         Self {
             manager_id: &value.manager_id,
             grpc_address: &value.grpc_address,
-            gossip_address: &value.gossip_address,
             severity: severity_name(value.severity),
             membership: match ManagerMembershipState::try_from(value.membership)
                 .unwrap_or(ManagerMembershipState::Unknown)
@@ -765,7 +763,6 @@ struct ClusterDto<'a> {
     severity: &'static str,
     response_at: Option<TimestampDto>,
     database_observed_at: Option<TimestampDto>,
-    gossip_observed_at: Option<TimestampDto>,
     routing_table_version: u64,
     managers: Vec<ManagerDto<'a>>,
     nodes: Vec<NodeDto<'a>>,
@@ -777,11 +774,10 @@ struct ClusterDto<'a> {
 impl<'a> From<&'a GetClusterStatusResponse> for ClusterDto<'a> {
     fn from(value: &'a GetClusterStatusResponse) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             severity: severity_name(value.severity),
             response_at: value.response_at.as_ref().map(TimestampDto::from),
             database_observed_at: value.database_observed_at.as_ref().map(TimestampDto::from),
-            gossip_observed_at: value.gossip_observed_at.as_ref().map(TimestampDto::from),
             routing_table_version: value.routing_table_version,
             managers: value.managers.iter().map(ManagerDto::from).collect(),
             nodes: value.nodes.iter().map(NodeDto::from).collect(),
@@ -827,7 +823,7 @@ mod tests {
     fn json_schema_and_table_are_stable() {
         let value = response(StatusSeverity::Healthy);
         let json = serde_json::to_value(ClusterDto::from(&value)).unwrap();
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], 2);
         assert_eq!(json["severity"], "healthy");
         assert!(render_table(&value, false).contains("No problems reported"));
     }

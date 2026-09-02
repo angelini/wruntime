@@ -1,3 +1,6 @@
+/// Default freshness threshold for the PostgreSQL manager lease.
+pub const DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS: u64 = 5;
+
 /// Generated protobuf types and gRPC client/server stubs for all
 /// inter-service communication in wruntime.
 pub mod wruntime {

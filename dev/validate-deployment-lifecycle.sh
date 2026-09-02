@@ -463,7 +463,7 @@ lifecycle() {
 		"${CLI[@]}" managers deploy "$MANAGER_BUNDLE" "$MANAGER_REMOTE" --format "$backend" \
 		--db-url "$WRT_DEPLOY_E2E_DB_URL" --secret-key "$WRT_SECRET_ENCRYPTION_KEY" \
 		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR" \
-		--advertise-address "$MANAGER_ADDR" --gossip-address "${MANAGER_HOST}:9010"
+		--advertise-address "$MANAGER_ADDR"
 	status_json "$pass/manager-status.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/manager-status.json" manager --address "$MANAGER_ADDR" >"$pass/manager-assert.json"
 	job_admin queues --format json >"$pass/job-queues-empty.json"

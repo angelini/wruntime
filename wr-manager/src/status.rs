@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use wr_common::wruntime::{
     DeploymentCondition, EngineStatus, GetClusterStatusResponse, ManagerMembershipState,
@@ -6,10 +6,7 @@ use wr_common::wruntime::{
     StatusSeverity,
 };
 
-use crate::cluster::MembershipSnapshot;
 use crate::db::{self, ClusterStatusSnapshot};
-
-const MANAGER_HEARTBEAT_TIMEOUT_SECS: f64 = 60.0;
 
 fn timestamp(value: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
     prost_types::Timestamp {
@@ -87,132 +84,49 @@ fn deployment_condition(
 
 fn compose_managers(
     snapshot: &ClusterStatusSnapshot,
-    membership: &MembershipSnapshot,
-    within_convergence_window: bool,
+    manager_liveness_threshold_secs: f64,
 ) -> Vec<ManagerStatus> {
-    let db_records: HashMap<_, _> = snapshot
+    snapshot
         .managers
         .iter()
-        .map(|manager| (manager.manager_id.as_str(), manager))
-        .collect();
-    let live: HashMap<_, _> = membership
-        .live
-        .iter()
-        .map(|manager| (manager.manager_id.as_str(), manager))
-        .collect();
-    let mut ids = BTreeSet::new();
-    ids.extend(db_records.keys().copied());
-    ids.extend(live.keys().copied());
-    ids.extend(membership.dead.iter().map(String::as_str));
-
-    ids.into_iter()
-        .map(|manager_id| {
-            let db = db_records.get(manager_id).copied();
-            let gossip = live.get(manager_id).copied();
-            let membership_state = if membership.dead.contains(manager_id) {
-                ManagerMembershipState::Dead
-            } else if gossip.is_some() {
-                ManagerMembershipState::Live
+        .map(|manager| {
+            let heartbeat_age_millis = snapshot
+                .observed_at
+                .signed_duration_since(manager.last_heartbeat)
+                .num_milliseconds() as f64;
+            let fresh = heartbeat_age_millis < manager_liveness_threshold_secs * 1000.0;
+            let (membership, severity, conditions) = if fresh {
+                (
+                    ManagerMembershipState::Live,
+                    StatusSeverity::Healthy,
+                    Vec::new(),
+                )
             } else {
-                ManagerMembershipState::Unknown
-            };
-            let mut conditions = Vec::new();
-            let severity = match membership_state {
-                ManagerMembershipState::Dead => {
-                    conditions.push(condition(
-                        "GOSSIP_DEAD",
+                (
+                    ManagerMembershipState::Dead,
+                    StatusSeverity::Unhealthy,
+                    vec![condition(
+                        "STALE_MANAGER_HEARTBEAT",
                         StatusSeverity::Unhealthy,
-                        "gossip has affirmatively marked this manager dead",
-                        manager_id,
-                        "live",
-                        "dead",
-                    ));
-                    if db.is_some() {
-                        conditions.push(condition(
-                            "MANAGER_DB_GOSSIP_DISAGREEMENT",
-                            StatusSeverity::Unhealthy,
-                            "manager remains registered in PostgreSQL while gossip reports it dead",
-                            manager_id,
-                            "live in both signals",
-                            "database present; gossip dead",
-                        ));
-                    }
-                    StatusSeverity::Unhealthy
-                }
-                ManagerMembershipState::Live if db.is_none() => {
-                    conditions.push(condition(
-                        "MANAGER_DB_GOSSIP_DISAGREEMENT",
-                        StatusSeverity::Degraded,
-                        "manager is live in gossip but has no PostgreSQL membership record",
-                        manager_id,
-                        "present in both signals",
-                        "gossip only",
-                    ));
-                    StatusSeverity::Degraded
-                }
-                ManagerMembershipState::Live => {
-                    let record = db.expect("live DB membership checked above");
-                    if is_fresh(
-                        snapshot.observed_at,
-                        record.last_heartbeat,
-                        MANAGER_HEARTBEAT_TIMEOUT_SECS,
-                    ) {
-                        StatusSeverity::Healthy
-                    } else {
-                        conditions.push(condition(
-                            "MANAGER_DB_GOSSIP_DISAGREEMENT",
-                            StatusSeverity::Degraded,
-                            "manager is live in gossip but its database heartbeat is stale",
-                            manager_id,
-                            "fresh in both signals",
-                            "gossip live; database stale",
-                        ));
-                        StatusSeverity::Degraded
-                    }
-                }
-                ManagerMembershipState::Unknown if within_convergence_window => {
-                    conditions.push(condition(
-                        "BOOTSTRAP_CONVERGING",
-                        StatusSeverity::Degraded,
-                        "database membership has not yet appeared in gossip during the convergence window",
-                        manager_id,
-                        "gossip observation",
-                        "database only",
-                    ));
-                    StatusSeverity::Degraded
-                }
-                ManagerMembershipState::Unknown => {
-                    conditions.push(condition(
-                        "MANAGER_DB_GOSSIP_DISAGREEMENT",
-                        StatusSeverity::Unhealthy,
-                        "database membership is absent from authoritative gossip after convergence",
-                        manager_id,
-                        "live gossip membership",
-                        "database only",
-                    ));
-                    StatusSeverity::Unhealthy
-                }
+                        "manager PostgreSQL lease is stale",
+                        &manager.manager_id,
+                        format!("heartbeat within {manager_liveness_threshold_secs} seconds"),
+                        format!(
+                            "heartbeat age {} seconds",
+                            age_seconds(snapshot.observed_at, manager.last_heartbeat)
+                        ),
+                    )],
+                )
             };
 
             ManagerStatus {
-                manager_id: manager_id.to_string(),
-                grpc_address: gossip
-                    .map(|item| item.grpc_address.clone())
-                    .filter(|value| !value.is_empty())
-                    .or_else(|| db.map(|item| item.grpc_address.clone()))
-                    .unwrap_or_default(),
-                gossip_address: gossip
-                    .map(|item| item.gossip_address.clone())
-                    .filter(|value| !value.is_empty())
-                    .or_else(|| db.map(|item| item.gossip_address.clone()))
-                    .unwrap_or_default(),
+                manager_id: manager.manager_id.clone(),
+                grpc_address: manager.grpc_address.clone(),
                 severity: severity as i32,
-                membership: membership_state as i32,
-                registered_at: db.map(|item| timestamp(item.registered_at)),
-                last_heartbeat: db.map(|item| timestamp(item.last_heartbeat)),
-                heartbeat_age_seconds: db
-                    .map(|item| age_seconds(snapshot.observed_at, item.last_heartbeat))
-                    .unwrap_or_default(),
+                membership: membership as i32,
+                registered_at: Some(timestamp(manager.registered_at)),
+                last_heartbeat: Some(timestamp(manager.last_heartbeat)),
+                heartbeat_age_seconds: age_seconds(snapshot.observed_at, manager.last_heartbeat),
                 conditions,
             }
         })
@@ -665,8 +579,7 @@ fn compose_services(
 
 pub fn compose(
     snapshot: ClusterStatusSnapshot,
-    membership: MembershipSnapshot,
-    within_convergence_window: bool,
+    manager_liveness_threshold_secs: f64,
     engine_timeout_secs: f64,
     module_timeout_secs: f64,
 ) -> Result<GetClusterStatusResponse, tonic::Status> {
@@ -676,7 +589,7 @@ pub fn compose(
         .filter(|item| item.record.revision == item.current_revision)
         .map(|item| (item.record.node_id.clone(), item.record.clone()))
         .collect::<BTreeMap<_, _>>();
-    let managers = compose_managers(&snapshot, &membership, within_convergence_window);
+    let managers = compose_managers(&snapshot, manager_liveness_threshold_secs);
     let engines = compose_engines(
         &snapshot,
         &current,
@@ -723,7 +636,6 @@ pub fn compose(
     Ok(GetClusterStatusResponse {
         response_at: Some(timestamp(chrono::Utc::now())),
         database_observed_at: Some(timestamp(snapshot.observed_at)),
-        gossip_observed_at: Some(timestamp(membership.observed_at)),
         routing_table_version: snapshot.routing_version,
         severity: severity as i32,
         managers,

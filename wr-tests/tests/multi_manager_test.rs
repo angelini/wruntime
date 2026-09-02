@@ -3,7 +3,6 @@ use helpers::{
     db::manager_pool,
     manager::{
         get_default_rule_health, manager_client, register_test_module_ready, start_manager_cluster,
-        start_manager_cluster_fast_death,
     },
     proxy::TEST_SELF_PEER,
     wait::{
@@ -25,8 +24,8 @@ use wr_common::wruntime::{
 
 // ── Multi-manager integration tests ──────────────────────────────────────────
 //
-// These tests verify DB-based health monitoring across multiple managers
-// sharing the same Postgres. Chitchat is used only for manager liveness.
+// These tests verify PostgreSQL-backed health and manager lease visibility
+// across multiple managers sharing the same control plane.
 
 #[tokio::test]
 async fn test_operation_survives_manager_loss_and_reconciles_without_repeating_effect() {
@@ -269,7 +268,7 @@ async fn test_heartbeat_visible_across_managers() {
     .await
     .unwrap();
 
-    // No gossip wait needed — DB writes are immediately visible.
+    // Shared database writes are immediately visible.
 
     // Manager-2 can see the healthy rule via the shared DB.
     let mut c2 = manager_client(&managers[1].addr).await.unwrap();
@@ -448,20 +447,15 @@ async fn test_manager_self_registration() {
     // Query wr_managers directly — should have 2 rows
     let client = pool.get().await.unwrap();
     let rows = client
-        .query(
-            "SELECT manager_id, grpc_address, gossip_address FROM wr_managers",
-            &[],
-        )
+        .query("SELECT manager_id, grpc_address FROM wr_managers", &[])
         .await
         .unwrap();
     assert_eq!(rows.len(), 2, "two managers should be registered");
 
-    // Both should have non-empty addresses
+    // Both should have non-empty runtime addresses.
     for row in &rows {
         let grpc: String = row.get(1);
-        let gossip: String = row.get(2);
         assert!(grpc.starts_with("http://"), "grpc_address should be a URL");
-        assert!(!gossip.is_empty(), "gossip_address should be non-empty");
     }
 }
 
@@ -571,7 +565,6 @@ async fn test_single_manager_list_managers_returns_self() {
     assert_eq!(infos.len(), 1);
     assert_eq!(infos[0].manager_id, managers[0].manager_id);
     assert!(!infos[0].grpc_address.is_empty());
-    assert!(!infos[0].gossip_address.is_empty());
 }
 
 #[tokio::test]
@@ -604,25 +597,157 @@ async fn test_list_managers_converges_with_expected_identities_and_addresses_fro
 }
 
 #[tokio::test]
-async fn test_dead_peer_excluded_from_list_managers() {
+async fn test_blocked_stale_reaper_does_not_suspend_self_heartbeat() {
     let pool = manager_pool().await;
-    let managers = start_manager_cluster_fast_death(pool.clone(), 2, 30)
+    wr_manager::db::register_manager(&pool, "live-manager", "http://127.0.0.1:9000")
         .await
         .unwrap();
+    wr_manager::db::register_manager(&pool, "stale-manager", "http://127.0.0.1:9001")
+        .await
+        .unwrap();
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE wr_managers SET last_heartbeat = NOW() - INTERVAL '10 seconds' WHERE manager_id = $1",
+            &[&"stale-manager"],
+        )
+        .await
+        .unwrap();
+
+    let mut blocker = pool.get().await.unwrap();
+    let transaction = blocker.transaction().await.unwrap();
+    transaction
+        .query_one(
+            "SELECT manager_id FROM wr_managers WHERE manager_id = $1 FOR UPDATE",
+            &[&"stale-manager"],
+        )
+        .await
+        .unwrap();
+    let before: f64 = pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT EXTRACT(EPOCH FROM last_heartbeat)::double precision FROM wr_managers WHERE manager_id = $1",
+            &[&"live-manager"],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    let admission = wr_common::lifecycle_service::AdmissionGate::closed();
+    admission.open();
+    let mut tasks = wr_common::task_group::TaskGroup::new();
+    let heartbeat_pool = pool.clone();
+    tasks.spawn("test-manager-heartbeat", move |cancellation| {
+        wr_manager::db::run_manager_heartbeat_owned(
+            heartbeat_pool,
+            "live-manager".into(),
+            Duration::from_millis(20),
+            admission,
+            cancellation,
+        )
+    });
+    let reaper_pool = pool.clone();
+    tasks.spawn("test-manager-reaper", move |cancellation| {
+        wr_manager::db::run_stale_manager_reaper_owned(
+            reaper_pool,
+            1,
+            Duration::from_millis(10),
+            cancellation,
+        )
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let after: f64 = pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT EXTRACT(EPOCH FROM last_heartbeat)::double precision FROM wr_managers WHERE manager_id = $1",
+            &[&"live-manager"],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        after > before,
+        "self heartbeat must advance while stale-row cleanup is lock-blocked"
+    );
+
+    transaction.rollback().await.unwrap();
+    let report = tasks
+        .shutdown(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(report.is_clean(), "{report:?}");
+}
+
+#[tokio::test]
+async fn test_stale_manager_lease_is_unlisted_without_reaping_row() {
+    let pool = manager_pool().await;
+    let managers = start_manager_cluster(pool.clone(), 2, 30).await.unwrap();
     let survivor = &managers[0];
     let victim = &managers[1];
     let mut c = manager_client(&survivor.addr).await.unwrap();
 
-    // Wait for gossip to converge: survivor reports both managers.
     wait_for_manager_count(&mut c, 2, Duration::from_secs(10))
         .await
         .unwrap();
 
-    // Kill the victim's gossip (its DB row stays fresh, well inside 60s).
-    victim.cluster.initiate_shutdown().unwrap();
-
-    // Survivor must drop the victim via the chitchat-dead path, faster than 60s.
-    wait_for_manager_absent(&mut c, &victim.manager_id, Duration::from_secs(20))
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE wr_managers SET last_heartbeat = NOW() - INTERVAL '10 seconds' WHERE manager_id = $1",
+            &[&victim.manager_id],
+        )
         .await
         .unwrap();
+
+    wait_for_manager_absent(&mut c, &victim.manager_id, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let status = c
+        .get_cluster_status(GetClusterStatusRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let victim_status = status
+        .managers
+        .iter()
+        .find(|manager| manager.manager_id == victim.manager_id)
+        .expect("stale manager row remains visible in composed status");
+    assert_eq!(
+        victim_status.membership,
+        wr_common::wruntime::ManagerMembershipState::Dead as i32
+    );
+    assert_eq!(victim_status.conditions[0].code, "STALE_MANAGER_HEARTBEAT");
+
+    let retained: bool = pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM wr_managers WHERE manager_id = $1)",
+            &[&victim.manager_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(retained, "stale liveness must not immediately reap the row");
+    assert_eq!(
+        wr_manager::db::cleanup_stale_managers(&pool, 300)
+            .await
+            .unwrap(),
+        0,
+        "the long reap threshold must retain a row already excluded from liveness"
+    );
+    assert_eq!(
+        wr_manager::db::cleanup_stale_managers(&pool, 5)
+            .await
+            .unwrap(),
+        1,
+        "reaping uses its own configured threshold"
+    );
 }

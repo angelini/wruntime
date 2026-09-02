@@ -261,8 +261,13 @@ message ListSecretsResponse { repeated SecretEntry secrets = 1; }
 
 // ── Manager discovery ─────────────────────────────────────────────────────
 
-message ListManagersRequest  {}
-message ManagerInfo          { string manager_id = 1; string grpc_address = 2; string gossip_address = 3; }
+message ListManagersRequest {}
+message ManagerInfo {
+  reserved 3;
+  reserved "gossip_address";
+  string manager_id = 1;
+  string grpc_address = 2;
+}
 message ListManagersResponse { repeated ManagerInfo managers = 1; }
 
 // ── Explainable cluster status ────────────────────────────────────────────
@@ -283,9 +288,10 @@ enum ManagerMembershipState {
 }
 
 message ManagerStatus {
+  reserved 3;
+  reserved "gossip_address";
   string manager_id = 1;
   string grpc_address = 2;
-  string gossip_address = 3;
   StatusSeverity severity = 4;
   ManagerMembershipState membership = 5;
   optional google.protobuf.Timestamp registered_at = 6;
@@ -345,9 +351,10 @@ message NodeStatus {
 
 message GetClusterStatusRequest {}
 message GetClusterStatusResponse {
+  reserved 3;
+  reserved "gossip_observed_at";
   optional google.protobuf.Timestamp response_at = 1;
   optional google.protobuf.Timestamp database_observed_at = 2;
-  optional google.protobuf.Timestamp gossip_observed_at = 3;
   uint64 routing_table_version = 4;
   StatusSeverity severity = 5;
   repeated ManagerStatus managers = 6;

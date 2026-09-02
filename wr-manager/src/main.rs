@@ -1,5 +1,4 @@
 pub mod auth;
-pub mod cluster;
 pub mod config;
 pub mod crypto;
 pub mod db;
@@ -12,14 +11,13 @@ pub mod service;
 pub mod state;
 pub mod status;
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Endpoint, Server};
-use tracing::{info, warn};
+use tracing::info;
 use uuid::Uuid;
 use wr_common::lifecycle_service::{
     notify_supervisor, query_ready_status, AdmissionGate, LifecycleServiceAdapter,
@@ -35,6 +33,7 @@ use wr_common::wruntime::node_agent_service_server::NodeAgentServiceServer;
 use wr_common::wruntime::operator_service_server::OperatorServiceServer;
 
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
+const STALE_MANAGER_REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -148,16 +147,6 @@ async fn run_service(config_path: &str) -> Result<()> {
                 config.listen_address.replace("0.0.0.0", "127.0.0.1")
             )
         });
-    let gossip_address = config.cluster.gossip_listen_address.clone();
-    let peers = db::list_managers(&db_pool)
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to list managers: {error}"))?;
-    let seed_addrs = peers
-        .iter()
-        .filter(|peer| peer.manager_id != manager_id)
-        .map(|peer| peer.gossip_address.clone())
-        .collect();
-    let gossip_listen = config.cluster.gossip_listen_address.parse()?;
     let crypto = Arc::new(crypto::SecretCrypto::from_env()?);
     let incoming = TcpIncoming::bind(addr).context("failed to bind manager gRPC listener")?;
     let job_admin_incoming = TcpIncoming::bind(job_admin_addr)
@@ -172,35 +161,17 @@ async fn run_service(config_path: &str) -> Result<()> {
         .tls_config(tls)
         .context("failed to apply TLS config")?;
 
-    // Start gossip only after all other fallible boot prerequisites have
-    // completed. From this point onward, every failure path explicitly
-    // terminates gossip and removes the manager registration.
-    let cluster = Arc::new(
-        cluster::ClusterHandle::new(
-            &manager_id,
-            &config.cluster.cluster_id,
-            gossip_listen,
-            seed_addrs,
-            Duration::from_millis(config.cluster.gossip_interval_ms),
-            chitchat::FailureDetectorConfig::default(),
-        )
-        .await?,
-    );
-    cluster
-        .publish_metadata(&grpc_address, &gossip_address)
-        .await;
-
     let manager = service::Manager::with_admission(
         db_pool.clone(),
         crypto,
-        Arc::clone(&cluster),
+        config.cluster.manager_liveness_threshold_secs,
         admission.clone(),
     );
     let principal_policy = auth::PrincipalPolicy::new(&config.operator_principals);
     let operator_service = service::OperatorApi::new(
         db_pool.clone(),
-        Arc::clone(&cluster),
         principal_policy.clone(),
+        config.cluster.manager_liveness_threshold_secs as f64,
         config.engine_heartbeat_timeout_secs as f64,
         config.module_heartbeat_timeout_secs.get() as f64,
     );
@@ -225,15 +196,9 @@ async fn run_service(config_path: &str) -> Result<()> {
                 .max_encoding_message_size(wr_common::lifecycle::MAX_JOB_ADMIN_MESSAGE_BYTES),
         );
 
-    if let Err(error) =
-        db::register_manager(&db_pool, &manager_id, &grpc_address, &gossip_address).await
-    {
-        if let Err(shutdown_error) = cluster.initiate_shutdown() {
-            warn!(%shutdown_error, "failed to stop gossip after manager registration failure");
-        }
-        let _ = tokio::time::timeout(SHUTDOWN_BUDGET, cluster.wait_for_termination()).await;
-        return Err(anyhow::anyhow!("failed to register manager: {error}"));
-    }
+    db::register_manager(&db_pool, &manager_id, &grpc_address)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to register manager: {error}"))?;
 
     let mut tasks = TaskGroup::new();
     tasks.spawn("manager-grpc", move |cancellation| async move {
@@ -267,82 +232,22 @@ async fn run_service(config_path: &str) -> Result<()> {
         let pool = db_pool.clone();
         let id = manager_id.clone();
         let admission = admission.clone();
-        tasks.spawn(
-            "manager-self-heartbeat",
-            move |mut cancellation| async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(15));
-                loop {
-                    tokio::select! {
-                        _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
-                        _ = interval.tick() => {}
-                    }
-                    if !admission.is_open() {
-                        continue;
-                    }
-                    db::heartbeat_manager(&pool, &id)
-                        .await
-                        .map_err(|error| anyhow::anyhow!("manager heartbeat failed: {error}"))?;
-                    db::cleanup_stale_managers(&pool, 60)
-                        .await
-                        .map_err(|error| {
-                            anyhow::anyhow!("stale manager cleanup failed: {error}")
-                        })?;
-                }
-            },
-        );
+        let interval = Duration::from_secs(config.cluster.manager_heartbeat_interval_secs);
+        tasks.spawn("manager-self-heartbeat", move |cancellation| {
+            db::run_manager_heartbeat_owned(pool, id, interval, admission, cancellation)
+        });
     }
 
     {
-        let cluster = Arc::clone(&cluster);
-        tasks.spawn(
-            "manager-membership-watcher",
-            move |mut cancellation| async move {
-                let mut watcher = cluster.live_nodes_watcher().await;
-                let mut known: HashSet<String> = watcher
-                    .borrow_and_update()
-                    .keys()
-                    .map(|id| id.node_id.to_string())
-                    .collect();
-                loop {
-                    tokio::select! {
-                        _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
-                        changed = watcher.changed() => {
-                            if changed.is_err() {
-                                anyhow::bail!("membership watcher closed unexpectedly");
-                            }
-                        }
-                    }
-                    let current: HashSet<String> = watcher
-                        .borrow()
-                        .keys()
-                        .map(|id| id.node_id.to_string())
-                        .collect();
-                    for id in current.difference(&known) {
-                        info!(manager_id = %id, "manager joined cluster");
-                    }
-                    for id in known.difference(&current) {
-                        info!(manager_id = %id, "manager left cluster");
-                    }
-                    known = current;
-                }
-            },
-        );
-    }
-
-    {
-        let cluster = Arc::clone(&cluster);
-        tasks.spawn("manager-gossip", move |mut cancellation| async move {
-            tokio::select! {
-                result = cluster.wait_for_termination() => {
-                    result?;
-                    Ok(TaskExit::Completed)
-                }
-                _ = cancellation.cancelled() => {
-                    cluster.initiate_shutdown()?;
-                    cluster.wait_for_termination().await?;
-                    Ok(TaskExit::Cancelled)
-                }
-            }
+        let pool = db_pool.clone();
+        let stale_threshold_secs = config.cluster.manager_stale_row_reap_threshold_secs;
+        tasks.spawn("manager-stale-row-reaper", move |cancellation| {
+            db::run_stale_manager_reaper_owned(
+                pool,
+                stale_threshold_secs,
+                STALE_MANAGER_REAP_INTERVAL,
+                cancellation,
+            )
         });
     }
 
@@ -396,7 +301,7 @@ async fn run_service(config_path: &str) -> Result<()> {
     if failure.is_none() {
         admission.open();
         if let Err(error) =
-            lifecycle.mark_ready("database, gossip, scheduler, monitor, and gRPC services ready")
+            lifecycle.mark_ready("database, scheduler, monitor, and gRPC services ready")
         {
             failure = Some(error.into());
             let _ =

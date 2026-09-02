@@ -236,6 +236,8 @@ pub struct ProxyNodeConfig {
 #[derive(Deserialize, Serialize, Clone)]
 pub struct ProxyDatabaseConfig {
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager_liveness_threshold_secs: Option<u64>,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
@@ -284,15 +286,16 @@ pub struct ManagerDatabaseConfig {
 }
 
 #[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
-    pub cluster_id: String,
-    pub gossip_listen_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advertise_grpc_address: Option<String>,
-    #[serde(default, skip_serializing)]
-    pub seed_nodes: Vec<String>,
-    #[serde(flatten)]
-    pub extra: ExtraFields,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager_heartbeat_interval_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager_liveness_threshold_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager_stale_row_reap_threshold_secs: Option<u64>,
 }
 
 impl ManagerConfig {
@@ -312,9 +315,7 @@ impl ManagerConfig {
     pub fn to_bundle_config(&self) -> Self {
         let mut config = self.clone();
         config.database.url = "{db_url}".to_string();
-        config.cluster.gossip_listen_address = "{gossip_address}".to_string();
         config.cluster.advertise_grpc_address = Some("{advertise_address}".to_string());
-        config.cluster.seed_nodes.clear();
         let mut tls = config.tls.take().unwrap_or(CliTlsConfig {
             cert_path: String::new(),
             key_path: String::new(),
@@ -633,7 +634,7 @@ wasm_path = "target/wasm32-wasip2/debug/client.wasm"
     }
 
     #[test]
-    fn manager_bundle_transform_preserves_runtime_fields_and_drops_seed_nodes() {
+    fn manager_bundle_transform_preserves_runtime_fields() {
         let source = r#"
 listen_address = "127.0.0.1:9000"
 local_proxy_address = "http://127.0.0.1:9001"
@@ -649,11 +650,10 @@ max_connections = 20
 statement_timeout_secs = 5
 
 [cluster]
-cluster_id = "local"
-gossip_listen_address = "127.0.0.1:9010"
 advertise_grpc_address = "https://127.0.0.1:9000"
-gossip_interval_ms = 500
-seed_nodes = ["10.0.0.2:9010"]
+manager_heartbeat_interval_secs = 1
+manager_liveness_threshold_secs = 5
+manager_stale_row_reap_threshold_secs = 300
 
 [tls]
 cert_path = "certs/source.crt"
@@ -680,10 +680,6 @@ ca_cert_path = "certs/source-delegate-ca.crt"
         let bundle = parse_manager_bundle_toml(&config);
 
         assert_eq!(bundle["database"]["url"].as_str(), Some("{db_url}"));
-        assert_eq!(
-            bundle["cluster"]["gossip_listen_address"].as_str(),
-            Some("{gossip_address}")
-        );
         assert_eq!(
             bundle["cluster"]["advertise_grpc_address"].as_str(),
             Some("{advertise_address}")
@@ -726,10 +722,17 @@ ca_cert_path = "certs/source-delegate-ca.crt"
         assert_eq!(bundle["scheduler_retry_tick_secs"].as_integer(), Some(3));
         assert_eq!(bundle["scheduler_lease_secs"].as_integer(), Some(60));
         assert_eq!(
-            bundle["cluster"]["gossip_interval_ms"].as_integer(),
-            Some(500)
+            bundle["cluster"]["manager_heartbeat_interval_secs"].as_integer(),
+            Some(1)
         );
-        assert!(bundle["cluster"].get("seed_nodes").is_none());
+        assert_eq!(
+            bundle["cluster"]["manager_liveness_threshold_secs"].as_integer(),
+            Some(5)
+        );
+        assert_eq!(
+            bundle["cluster"]["manager_stale_row_reap_threshold_secs"].as_integer(),
+            Some(300)
+        );
     }
 
     #[test]
@@ -741,6 +744,7 @@ control_address = "127.0.0.1:9002"
 [database]
 url = "postgres://localhost/source"
 max_connections = 12
+manager_liveness_threshold_secs = 7
 
 [node]
 proxy_address = "http://127.0.0.1:9001"
@@ -773,6 +777,10 @@ allowed_hosts = ["api.example.com"]
 
         assert_eq!(bundle["database"]["url"].as_str(), Some("{db_url}"));
         assert_eq!(bundle["database"]["max_connections"].as_integer(), Some(12));
+        assert_eq!(
+            bundle["database"]["manager_liveness_threshold_secs"].as_integer(),
+            Some(7)
+        );
         assert_eq!(
             bundle["node"]["proxy_address"].as_str(),
             Some("http://127.0.0.1:9001")
@@ -865,11 +873,10 @@ peer_address = "https://127.0.0.1:9443"
             max_connections = 12
 
             [cluster]
-            cluster_id = "prod"
-            gossip_listen_address = "0.0.0.0:9010"
             advertise_grpc_address = "https://127.0.0.1:9000"
-            gossip_interval_ms = 750
-            seed_nodes = ["10.0.0.2:9010"]
+            manager_heartbeat_interval_secs = 2
+            manager_liveness_threshold_secs = 8
+            manager_stale_row_reap_threshold_secs = 120
         "#;
 
         let bundle_toml = toml::from_str::<ManagerConfig>(source)
@@ -881,11 +888,9 @@ peer_address = "https://127.0.0.1:9443"
             &bundle_toml,
             &[
                 ("db_url", "postgres://postgres@db/wruntime"),
-                ("gossip_address", "10.0.0.10:9010"),
                 ("advertise_address", "https://manager.example:9000"),
             ],
         );
-        assert!(!resolved.contains("seed_nodes"));
 
         let cfg =
             runtime_config_from_toml("generated-manager", &resolved, RuntimeManagerConfig::load);
@@ -894,8 +899,9 @@ peer_address = "https://127.0.0.1:9443"
         assert_eq!(cfg.scheduler_lease_secs, 60);
         assert_eq!(cfg.scheduler_retry_base_secs, 7);
         assert_eq!(cfg.scheduler_retry_cap_secs, 70);
-        assert_eq!(cfg.cluster.gossip_listen_address, "10.0.0.10:9010");
-        assert_eq!(cfg.cluster.gossip_interval_ms, 750);
+        assert_eq!(cfg.cluster.manager_heartbeat_interval_secs, 2);
+        assert_eq!(cfg.cluster.manager_liveness_threshold_secs, 8);
+        assert_eq!(cfg.cluster.manager_stale_row_reap_threshold_secs, 120);
     }
 
     #[test]
@@ -917,6 +923,7 @@ peer_address = "https://127.0.0.1:9443"
             [database]
             url = "postgres://postgres@localhost/source"
             max_connections = 4
+            manager_liveness_threshold_secs = 8
 
             [cache]
             routing_table_ttl_secs = 3
@@ -958,6 +965,7 @@ peer_address = "https://127.0.0.1:9443"
         assert_eq!(cfg.listen_address, "127.0.0.1:9001");
         assert_eq!(cfg.control_address, "127.0.0.1:9002");
         assert_eq!(cfg.database.max_connections, 4);
+        assert_eq!(cfg.database.manager_liveness_threshold_secs, 8);
         assert_eq!(cfg.cache.routing_table_ttl_secs, 3);
         assert_eq!(cfg.circuit_breaker.failure_threshold, 7);
         assert_eq!(cfg.circuit_breaker.open_duration_secs, 45);

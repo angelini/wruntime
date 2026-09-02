@@ -13,18 +13,20 @@ use crate::wruntime::manager_service_client::ManagerServiceClient;
 use crate::wruntime::ListManagersRequest;
 
 struct AffinityState {
+    endpoint: String,
     client: ManagerServiceClient<Channel>,
     established_at: Instant,
 }
 
-/// Discovers managers via a reachable manager's ListManagers RPC
-/// (chitchat-reconciled), bootstrapping/falling back to the wr_managers
-/// Postgres table when no manager is reachable.
+/// Discovers managers via a reachable manager's `ListManagers` RPC,
+/// bootstrapping/falling back to the `wr_managers` PostgreSQL lease table when
+/// no manager is reachable.
 pub struct ManagerDiscovery {
     pool: Pool,
     managers: RwLock<Vec<String>>,
     affinity: RwLock<Option<AffinityState>>,
     tls_config: Option<ClientTlsConfig>,
+    manager_liveness_threshold_secs: u64,
     rpc_failures: AtomicU32,
 }
 
@@ -32,20 +34,26 @@ impl ManagerDiscovery {
     const AFFINITY_DURATION: Duration = Duration::from_secs(120);
     const MAX_QUIET_FAILURES: u32 = 3;
 
-    pub fn new(pool: Pool, tls_config: Option<ClientTlsConfig>) -> Self {
+    pub fn new(
+        pool: Pool,
+        tls_config: Option<ClientTlsConfig>,
+        manager_liveness_threshold_secs: u64,
+    ) -> Self {
         Self {
             pool,
             managers: RwLock::new(Vec::new()),
             affinity: RwLock::new(None),
             tls_config,
+            manager_liveness_threshold_secs,
             rpc_failures: AtomicU32::new(0),
         }
     }
 
     /// Refresh the cached manager list. Bootstrap from the `wr_managers` table on
-    /// cold start, then prefer the chitchat-reconciled `ListManagers` view via a
-    /// reachable manager. Fall back to a direct DB query ONLY when no manager RPC
-    /// is reachable (or it returns empty). Keeps the previous cache on error.
+    /// cold start, then prefer the lease-filtered `ListManagers` view via a
+    /// reachable manager. Fall back to a direct DB query only when no manager RPC
+    /// is reachable. Successful empty results authoritatively clear cached state;
+    /// transport/query errors preserve it.
     pub async fn refresh(&self) {
         // Cold start: seed from DB so `get_client` has a target to connect to.
         if self.managers.read().await.is_empty() {
@@ -58,8 +66,8 @@ impl ManagerDiscovery {
             return;
         }
 
-        // Fallback trigger = no manager client reachable / ListManagers failed or
-        // empty (NOT chitchat live-node counts). Warn only on repeated failures.
+        // Fallback trigger = no manager client reachable / ListManagers failed.
+        // Warn only on repeated failures.
         let failures = self.rpc_failures.fetch_add(1, Ordering::Relaxed) + 1;
         if failures >= Self::MAX_QUIET_FAILURES {
             warn!(
@@ -70,8 +78,8 @@ impl ManagerDiscovery {
         self.refresh_from_db_fallback().await;
     }
 
-    /// Refresh the cache from a reachable manager's `ListManagers`. Returns true iff
-    /// the cache was replaced with a non-empty reconciled result.
+    /// Refresh the cache from a reachable manager's `ListManagers`. Returns true
+    /// when the RPC succeeded, including an authoritative empty live set.
     async fn refresh_from_managers(&self) -> bool {
         let mut client = match self.get_client().await {
             Ok(c) => c,
@@ -93,21 +101,15 @@ impl ManagerDiscovery {
             .map(|m| m.grpc_address)
             .filter(|a| !a.is_empty())
             .collect();
-        if addrs.is_empty() {
-            return false;
-        }
-        *self.managers.write().await = addrs;
+        self.replace_managers(addrs).await;
         true
     }
 
-    /// Direct `wr_managers` query — bootstrap/fallback path only. Keeps the previous
-    /// cache when the query errors or returns empty.
+    /// Direct `wr_managers` query — bootstrap/fallback path only. A successful
+    /// query replaces the cache even when no lease is fresh; errors preserve it.
     async fn refresh_from_db_fallback(&self) {
         match self.query_managers().await {
-            Ok(addrs) if !addrs.is_empty() => {
-                *self.managers.write().await = addrs;
-            }
-            Ok(_) => {}
+            Ok(addrs) => self.replace_managers(addrs).await,
             Err(e) => {
                 warn!(error = %e, "manager discovery DB fallback query failed");
             }
@@ -129,9 +131,10 @@ impl ManagerDiscovery {
         }
 
         // Affinity expired or absent — establish new connection
-        let client = self.connect_new().await?;
+        let (endpoint, client) = self.connect_new().await?;
 
         *self.affinity.write().await = Some(AffinityState {
+            endpoint,
             client: client.clone(),
             established_at: Instant::now(),
         });
@@ -142,6 +145,17 @@ impl ManagerDiscovery {
     /// Clear the sticky affinity so the next `get_client` call picks a fresh manager.
     pub async fn clear_affinity(&self) {
         *self.affinity.write().await = None;
+    }
+
+    async fn replace_managers(&self, managers: Vec<String>) {
+        let mut affinity = self.affinity.write().await;
+        if affinity
+            .as_ref()
+            .is_some_and(|state| !managers.contains(&state.endpoint))
+        {
+            *affinity = None;
+        }
+        *self.managers.write().await = managers;
     }
 
     /// Run the refresh loop as an owned, cancellation-aware service task.
@@ -161,7 +175,7 @@ impl ManagerDiscovery {
         }
     }
 
-    async fn connect_new(&self) -> Result<ManagerServiceClient<Channel>, tonic::Status> {
+    async fn connect_new(&self) -> Result<(String, ManagerServiceClient<Channel>), tonic::Status> {
         let managers = self.managers.read().await;
         if managers.is_empty() {
             return Err(tonic::Status::unavailable(
@@ -188,7 +202,7 @@ impl ManagerDiscovery {
                 None => ManagerServiceClient::connect(addr.clone()).await,
             };
             match result {
-                Ok(client) => return Ok(client),
+                Ok(client) => return Ok((addr.clone(), client)),
                 Err(e) => {
                     warn!(address = %addr, error = %e, "manager connection failed, trying next");
                     last_err = Some(e.to_string());
@@ -207,10 +221,12 @@ impl ManagerDiscovery {
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let client = self.pool.get().await?;
+        let threshold_secs = self.manager_liveness_threshold_secs as f64;
         let rows = client
             .query(
-                "SELECT grpc_address FROM wr_managers WHERE last_heartbeat > NOW() - INTERVAL '60 seconds'",
-                &[],
+                "SELECT grpc_address FROM wr_managers
+                 WHERE last_heartbeat > NOW() - make_interval(secs => $1::double precision)",
+                &[&threshold_secs],
             )
             .await
             .map_err(|e| {

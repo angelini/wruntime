@@ -34,6 +34,14 @@ pub struct DatabaseConfig {
     /// Maximum number of pooled connections. Defaults to 2.
     #[serde(default = "default_discovery_max_connections")]
     pub max_connections: usize,
+    /// Manager lease freshness used by direct-PostgreSQL discovery fallback.
+    /// Must match every manager's configured cluster liveness threshold.
+    #[serde(default = "default_manager_liveness_threshold_secs")]
+    pub manager_liveness_threshold_secs: u64,
+}
+
+fn default_manager_liveness_threshold_secs() -> u64 {
+    wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS
 }
 
 fn default_discovery_max_connections() -> usize {
@@ -339,6 +347,10 @@ impl ProxyConfig {
             "node.control_address must be an absolute loopback HTTP URL",
         );
         v.check(!self.database.url.is_empty(), "database.url is required");
+        v.check(
+            self.database.manager_liveness_threshold_secs > 0,
+            "database.manager_liveness_threshold_secs must be > 0",
+        );
         if let Err(error) = self.node.peer_address() {
             v.check(false, format!("invalid node configuration: {error}"));
         }

@@ -36,7 +36,7 @@ def healthy_status(revision=3, digest="sha256:a", version="1.0.0", source=0):
         "deployment": {"node_id": "wr-e2e-node", "revision": revision, "bundle_digest": digest, "engine_slot": "engine"},
     }
     return {
-        "schema_version": 1, "severity": "healthy",
+        "schema_version": 2, "severity": "healthy",
         "managers": [{"manager_id": "manager-id", "grpc_address": "https://192.0.2.10:9000"}],
         "nodes": [{"node_id": "wr-e2e-node", "severity": "healthy", "desired_deployment": desired, "deployment_history": [desired], "engines": [engine], "conditions": []}],
         "engines": [engine],

@@ -26,6 +26,7 @@ url             = "postgres://postgres@127.0.0.1:5432/wruntime_deployment_e2e"
 max_connections = 10
 
 [cluster]
-cluster_id             = "deployment-e2e"
-gossip_listen_address  = "0.0.0.0:9010"
-advertise_grpc_address = "https://127.0.0.1:9000"
+advertise_grpc_address                = "https://127.0.0.1:9000"
+manager_heartbeat_interval_secs       = 1
+manager_liveness_threshold_secs       = 5
+manager_stale_row_reap_threshold_secs = 300

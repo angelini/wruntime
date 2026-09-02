@@ -87,7 +87,7 @@ Job payloads and successful results are each bounded to 1 MiB at persistence; co
 | --- | --- | --- | --- |
 | `GetClusterStatus` | empty | `GetClusterStatusResponse` | Returns one manager-composed snapshot of manager membership, desired node revisions and history, engine/module heartbeat evidence, persisted routes/services, aggregate severity, and stable conditions. |
 
-The manager reads deployment history, registrations, engine/module heartbeats, routes, manager records, and the routing-table version in one read-only `REPEATABLE READ` PostgreSQL transaction. Gossip cannot join that transaction, so the response reports separate `database_observed_at`, `gossip_observed_at`, and `response_at` timestamps. Records and conditions are sorted deterministically. The response never stores or returns resolved secret values or deployment configuration payloads.
+The manager reads deployment history, registrations, engine/module heartbeats, routes, manager lease records, and the routing-table version in one read-only `REPEATABLE READ` PostgreSQL transaction. The response reports `database_observed_at` from PostgreSQL and `response_at`; manager freshness is evaluated against that database observation rather than a process clock. Records and conditions are sorted deterministically. The response never stores or returns resolved secret values or deployment configuration payloads.
 
 `StatusSeverity` has the ordered known states `healthy < degraded < unhealthy`, plus `unknown`. Unknown evidence is not interpreted as healthy, but unsupported signals do not silently worsen supported deployment/routing status: aggregate reduction ignores `unknown` when at least one known signal exists. An all-unknown view remains `unknown`.
 
@@ -96,12 +96,12 @@ Aggregation rules are:
 - a node is healthy only when the current desired `DeploymentRecord` passes the same verifier used by `VerifyDeployment`; a previous healthy revision and unmanaged registration never satisfy current readiness;
 - an engine is authoritative only when its node/revision/digest/slot matches the current desired inventory; fresh non-authoritative engines are `degraded` with `UNMANAGED_ENGINE`;
 - a service is healthy when all desired routes are healthy, degraded when at least one but not all desired routes are healthy, and unhealthy when no desired route is healthy;
-- gossip-dead managers are unhealthy; DB/gossip disagreement is explicit, while DB-only membership during the startup convergence window is degraded with `BOOTSTRAP_CONVERGING`;
+- managers with a database heartbeat inside the configured lease threshold are live and healthy; retained stale rows are dead and unhealthy with `STALE_MANAGER_HEARTBEAT`;
 - proxy routing-sync age, circuit-breaker state, and host CPU/memory are currently `SIGNAL_NOT_REPORTED`. Manually inserted routes have persisted health but may use `MANUAL_ROUTE_REASON_UNAVAILABLE` because heartbeat causality is not stored.
 
-Additional stable cluster codes include `GOSSIP_DEAD`, `MANAGER_DB_GOSSIP_DISAGREEMENT`, `BOOTSTRAP_CONVERGING`, `UNMANAGED_ENGINE`, `NO_HEALTHY_ROUTE`, `PARTIAL_ROUTE_AVAILABILITY`, `MANUAL_ROUTE_REASON_UNAVAILABLE`, and `SIGNAL_NOT_REPORTED`. Consumers must branch on code/severity and use raw timestamps, ages, desired/actual revisions, and affected identities as evidence rather than parsing `detail`.
+Additional stable cluster codes include `STALE_MANAGER_HEARTBEAT`, `UNMANAGED_ENGINE`, `NO_HEALTHY_ROUTE`, `PARTIAL_ROUTE_AVAILABILITY`, `MANUAL_ROUTE_REASON_UNAVAILABLE`, and `SIGNAL_NOT_REPORTED`. Consumers must branch on code/severity and use raw timestamps, ages, desired/actual revisions, and affected identities as evidence rather than parsing `detail`.
 
-`wr-cli cluster status` performs exactly this RPC; it does not join `ListManagers`, `ListEngines`, and `GetRoutingTable` client-side. `--output json` emits the versioned CLI DTO (`schema_version: 1`) with complete typed records; field meanings and condition codes are stable automation surfaces. Table output defaults to the summary and problem rows, while `--detail` includes healthy and unknown records. `--node` and `--service namespace.module[@version]` filter presentation. The default command is display-only; `--fail-on` remains a display gate.
+`wr-cli cluster status` performs exactly this RPC; it does not join `ListManagers`, `ListEngines`, and `GetRoutingTable` client-side. `--output json` emits the versioned CLI DTO (`schema_version: 2`) with complete typed records; field meanings and condition codes are stable automation surfaces. Table output defaults to the summary and problem rows, while `--detail` includes healthy and unknown records. `--node` and `--service namespace.module[@version]` filter presentation. The default command is display-only; `--fail-on` remains a display gate.
 
 `wr-cli cluster wait --severity healthy|degraded|unhealthy|unknown` is the expectation surface for automation. It returns zero only when the exact severity is observed for a present filtered node/service (or the cluster when unfiltered) and emits an `outcome: observed` object containing the matching snapshot. Empty targets, malformed filters or wire severity enums, transport/query failure, and timeout are non-zero and cannot satisfy an expected unhealthy check.
 
@@ -113,7 +113,7 @@ Typical condition evidence:
 | Revision mismatch | node is `unhealthy` with `REVISION_MISMATCH`, including desired revision plus stale actual registration metadata |
 | Stale heartbeat | node/engine are `unhealthy` with `STALE_ENGINE_HEARTBEAT` and raw heartbeat time/age |
 | Partial service availability | service is `degraded` with `PARTIAL_ROUTE_AVAILABILITY` and healthy/desired route counts |
-| Manager disagreement | `BOOTSTRAP_CONVERGING`, `GOSSIP_DEAD`, or `MANAGER_DB_GOSSIP_DISAGREEMENT` records both DB and gossip observations |
+| Stale manager lease | manager is `dead` and `unhealthy` with `STALE_MANAGER_HEARTBEAT`, raw heartbeat time, age, and database observation |
 
 ## Routing table
 
@@ -152,15 +152,16 @@ The `healthy` field is managed entirely by the manager — it is always set to `
 
 | RPC | Request | Response | Description |
 | --- | --- | --- | --- |
-| `ListManagers` | — | `[ManagerInfo]` | Reconciles DB-fresh registrations with chitchat liveness. Gossip-live managers are included, gossip-dead managers are excluded immediately, and DB-fresh managers not yet observed by gossip are included only during the startup convergence window. Use for peer discovery from any seed manager—no client database access required. |
+| `ListManagers` | — | `[ManagerInfo]` | Returns manager rows whose PostgreSQL heartbeat lease is fresh under the configured threshold, evaluated with server-side `NOW()`. Use for peer discovery from any manager—no client database access required. |
 
 A `ManagerInfo` has the fields:
 
 ```protobuf
 message ManagerInfo {
-  string manager_id     = 1; // UUID assigned at startup
-  string grpc_address   = 2; // externally reachable mTLS gRPC endpoint
-  string gossip_address = 3; // chitchat UDP address
+  reserved 3;
+  reserved "gossip_address";
+  string manager_id   = 1; // UUID assigned at startup
+  string grpc_address = 2; // externally reachable mTLS gRPC endpoint
 }
 ```
 

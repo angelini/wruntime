@@ -78,9 +78,6 @@ pub struct DeployArgs {
     /// Postgres database URL
     #[arg(long)]
     db_url: Option<String>,
-    /// Gossip seed node addresses (repeatable, e.g. 10.0.1.11:9010)
-    #[arg(long = "seed-node", value_name = "ADDR")]
-    seed_nodes: Vec<String>,
     /// SSH private key path
     #[arg(long)]
     ssh_key: Option<String>,
@@ -96,9 +93,6 @@ pub struct DeployArgs {
     /// Manager's externally-reachable gRPC address (derived from remote host if omitted)
     #[arg(long)]
     advertise_address: Option<String>,
-    /// Routable UDP bind/advertise address for manager gossip (derived if omitted)
-    #[arg(long)]
-    gossip_address: Option<String>,
 }
 
 #[derive(Args)]
@@ -115,8 +109,6 @@ struct ManagerManifest {
     workdir: String,
     image_prefix: String,
     listen_address: String,
-    gossip_listen_address: String,
-    cluster_id: String,
     template_vars: Vec<String>,
     checksums: BTreeMap<String, String>,
 }
@@ -254,7 +246,6 @@ fn bundle(args: BundleArgs) -> Result<()> {
 
     // Docker artifacts
     helpers::extract_port(&config.listen_address)?;
-    helpers::extract_port(&config.cluster.gossip_listen_address)?;
 
     let dockerfile = DockerfileSpec {
         workdir: &workdir,
@@ -295,13 +286,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         workdir: workdir.clone(),
         image_prefix: image_prefix.clone(),
         listen_address: config.listen_address.clone(),
-        gossip_listen_address: config.cluster.gossip_listen_address.clone(),
-        cluster_id: config.cluster.cluster_id.clone(),
-        template_vars: vec![
-            "db_url".to_string(),
-            "gossip_address".to_string(),
-            "advertise_address".to_string(),
-        ],
+        template_vars: vec!["db_url".to_string(), "advertise_address".to_string()],
         checksums: checksums.into_iter().collect(),
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
@@ -319,8 +304,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
     println!("Bundle contents:");
     println!("  target:     {}", target);
     println!("  workdir:    {}", workdir);
-    println!("  listen:     {}", config.listen_address);
-    println!("  cluster_id: {}", config.cluster.cluster_id);
+    println!("  listen:  {}", config.listen_address);
     println!();
     println!("Deploy with:");
     println!("  wr-cli managers deploy {output} <user@host>");
@@ -333,12 +317,10 @@ fn bundle(args: BundleArgs) -> Result<()> {
 fn resolve_manager_config_template(
     config_template: &str,
     db_url: &str,
-    gossip_address: &str,
     advertise_address: &str,
 ) -> Result<String> {
     let mut vars = HashMap::new();
     vars.insert("db_url", db_url);
-    vars.insert("gossip_address", gossip_address);
     vars.insert("advertise_address", advertise_address);
     helpers::resolve_template(config_template, &vars)
         .context("failed to resolve template in manager.toml")
@@ -495,11 +477,6 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port)?
         .map(helpers::DeployPort::get);
     let cert_dir = deploy_config::resolve_cert_dir(&args.cert_dir, deploy_cfg.cert_dir);
-    let configured_gossip_address = deploy_config::resolve_string(
-        args.gossip_address,
-        deploy_cfg.gossip_address,
-        "WR_GOSSIP_ADDRESS",
-    );
 
     let manifest: ManagerManifest = bundle::read_manifest(&args.bundle)?;
     verify_manager_bundle(&args.bundle, &manifest)?;
@@ -513,26 +490,8 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         deploy_config::resolve_string(args.advertise_address, None, "WR_ADVERTISE_ADDRESS")
             .unwrap_or_else(|| manager_addr.clone());
 
-    let gossip_port = helpers::extract_port(&manifest.gossip_listen_address)?.get();
-    let gossip_address =
-        configured_gossip_address.unwrap_or_else(|| remote_socket_address(&remote_ip, gossip_port));
-    let parsed_gossip = gossip_address
-        .parse::<std::net::SocketAddr>()
-        .with_context(|| format!("invalid manager gossip address '{gossip_address}'"))?;
-    if parsed_gossip.port() != gossip_port {
-        bail!(
-            "manager gossip address port must match the bundled port {gossip_port}, got {}",
-            parsed_gossip.port()
-        );
-    }
-
     let config_template = bundle::read_file_from_tarball(&args.bundle, "manager.toml")?;
-    let resolved = resolve_manager_config_template(
-        &config_template,
-        &db_url,
-        &gossip_address,
-        &advertise_address,
-    )?;
+    let resolved = resolve_manager_config_template(&config_template, &db_url, &advertise_address)?;
 
     // Generate an activation identity before installing service artifacts. The
     // launched manager must report this exact token, so neither a stale process
@@ -924,14 +883,11 @@ fn status(args: StatusArgs) -> Result<()> {
     println!("  target:     {}", manifest.target);
     println!("  workdir:    {}", manifest.workdir);
     println!("  listen:     {}", manifest.listen_address);
-    println!("  gossip:     {}", manifest.gossip_listen_address);
-    println!("  cluster_id: {}", manifest.cluster_id);
     println!();
     println!("Templates:");
     for var in &manifest.template_vars {
         let source = match var.as_str() {
             "db_url" => "--db-url flag / WR_DB_URL / wr-deploy.toml",
-            "gossip_address" => "--gossip-address / WR_GOSSIP_ADDRESS / wr-deploy.toml",
             "advertise_address" => "--advertise-address / WR_ADVERTISE_ADDRESS",
             _ => "unknown",
         };
@@ -987,8 +943,6 @@ mod tests {
             workdir: "/opt/wruntime".into(),
             image_prefix: "wr".into(),
             listen_address: "0.0.0.0:9000".into(),
-            gossip_listen_address: "0.0.0.0:9010".into(),
-            cluster_id: "test".into(),
             template_vars: vec!["db_url".into()],
             checksums: BTreeMap::from([(
                 "wr-manager/bin/wr-manager".into(),
@@ -1070,8 +1024,6 @@ mod tests {
             workdir: "/opt/wruntime".into(),
             image_prefix: "wr".into(),
             listen_address: "0.0.0.0:9000".into(),
-            gossip_listen_address: "0.0.0.0:9010".into(),
-            cluster_id: "test".into(),
             template_vars: vec![],
             checksums: BTreeMap::from([("z".into(), "2".into()), ("a".into(), "1".into())]),
         };
@@ -1080,18 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn manager_deploy_resolution_does_not_inject_seed_nodes() {
-        let deploy_cfg: DeployConfig = toml::from_str(
-            r#"
-seed_nodes = ["10.0.0.2:9010"]
-"#,
-        )
-        .unwrap();
-        assert_eq!(
-            deploy_cfg.seed_nodes.as_ref().unwrap(),
-            &vec!["10.0.0.2:9010".to_string()]
-        );
-
+    fn manager_deploy_resolution_sets_database_and_advertised_address() {
         let template = r#"
 listen_address = "127.0.0.1:9000"
 local_proxy_address = "http://127.0.0.1:9001"
@@ -1100,26 +1041,18 @@ local_proxy_address = "http://127.0.0.1:9001"
 url = "{db_url}"
 
 [cluster]
-cluster_id = "local"
-gossip_listen_address = "{gossip_address}"
 advertise_grpc_address = "{advertise_address}"
 "#;
         let resolved = resolve_manager_config_template(
             template,
             "postgres://postgres@localhost/wruntime",
-            "10.0.0.1:9010",
             "https://10.0.0.1:9000",
         )
         .unwrap();
         let value: toml::Value = toml::from_str(&resolved).unwrap();
-        assert!(value["cluster"].get("seed_nodes").is_none());
         assert_eq!(
             value["database"]["url"].as_str(),
             Some("postgres://postgres@localhost/wruntime")
-        );
-        assert_eq!(
-            value["cluster"]["gossip_listen_address"].as_str(),
-            Some("10.0.0.1:9010")
         );
         assert_eq!(
             value["cluster"]["advertise_grpc_address"].as_str(),
@@ -1159,8 +1092,6 @@ advertise_grpc_address = "{advertise_address}"
         );
         assert!(manager_systemd_start_command().contains("enable wr-manager.service"));
         assert!(manager_systemd_start_command().contains("restart wr-manager.service"));
-        let cfg: DeployConfig = toml::from_str(r#"seed_nodes = ["10.0.0.2:9010"]"#).unwrap();
-        assert_eq!(cfg.seed_nodes.as_ref().unwrap().len(), 1);
         assert_eq!(phases, manager_deploy_phase_order(&DeployFormat::Systemd));
     }
 
