@@ -4937,8 +4937,10 @@ name = "wr-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "flate2",
+ "http",
  "libc",
  "prost",
  "prost-reflect",
@@ -4988,6 +4990,7 @@ dependencies = [
  "rustls-pemfile",
  "semver",
  "serde",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-postgres",

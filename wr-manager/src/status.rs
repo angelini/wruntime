@@ -232,14 +232,25 @@ fn compose_engines(
             let registration = &record.registration;
             let metadata = registration.deployment.as_ref();
             let authoritative = metadata.is_some_and(|metadata| {
-                current.get(&metadata.node_id).is_some_and(|deployment| {
-                    deployment.revision == metadata.revision
+                let inventory_matches = snapshot.deployments.iter().any(|candidate| {
+                    let deployment = &candidate.record;
+                    deployment.node_id == metadata.node_id
+                        && deployment.revision == metadata.revision
                         && deployment.bundle_digest == metadata.bundle_digest
                         && deployment
                             .expected_engines
                             .iter()
                             .any(|expected| expected.engine_slot == metadata.engine_slot)
-                })
+                });
+                inventory_matches
+                    && (current
+                        .get(&metadata.node_id)
+                        .is_some_and(|deployment| deployment.revision == metadata.revision)
+                        || snapshot.slot_authorities.iter().any(|authority| {
+                            authority.node_id == metadata.node_id
+                                && authority.engine_slot == metadata.engine_slot
+                                && authority.revision == metadata.revision
+                        }))
             });
             let engine_fresh = is_fresh(
                 snapshot.observed_at,
@@ -414,30 +425,44 @@ fn compose_nodes(
         .into_iter()
         .map(|(node_id, mut deployments)| {
             deployments.sort_by_key(|deployment| std::cmp::Reverse(deployment.revision));
-            let current_revision = snapshot
+            let authority = snapshot
                 .deployments
                 .iter()
                 .find(|item| item.record.node_id == node_id)
-                .map(|item| item.current_revision)
                 .expect("node history came from snapshot");
+            let current_revision = authority.current_revision;
+            let target_revision = authority.target_revision;
             let desired = deployments
                 .iter()
                 .find(|deployment| deployment.revision == current_revision)
-                .cloned()
-                .ok_or_else(|| {
-                    tonic::Status::internal(format!(
-                        "node {node_id} current revision {current_revision} has no history row"
-                    ))
-                })?;
-            let mut conditions = db::deployment_conditions_from_snapshot(
-                snapshot,
-                &desired,
-                engine_timeout_secs,
-                module_timeout_secs,
-            )?
-            .into_iter()
-            .map(|item| deployment_condition(&node_id, current_revision, item))
-            .collect::<Vec<_>>();
+                .cloned();
+            let target = target_revision.and_then(|revision| {
+                deployments
+                    .iter()
+                    .find(|deployment| deployment.revision == revision)
+                    .cloned()
+            });
+            let condition_deployment = desired.as_ref().or(target.as_ref());
+            let mut conditions = if let Some(deployment) = condition_deployment {
+                db::deployment_conditions_from_snapshot(
+                    snapshot,
+                    deployment,
+                    engine_timeout_secs,
+                    module_timeout_secs,
+                )?
+                .into_iter()
+                .map(|item| deployment_condition(&node_id, deployment.revision, item))
+                .collect::<Vec<_>>()
+            } else {
+                vec![deployment_condition(
+                    &node_id,
+                    current_revision,
+                    (
+                        "NO_COMMITTED_DEPLOYMENT".into(),
+                        "node has no committed or staged deployment".into(),
+                    ),
+                )]
+            };
             conditions.sort_by(|left, right| {
                 (&left.code, &left.affected_identity).cmp(&(&right.code, &right.affected_identity))
             });
@@ -459,10 +484,11 @@ fn compose_nodes(
             Ok(NodeStatus {
                 node_id,
                 severity: severity as i32,
-                desired_deployment: Some(desired),
+                desired_deployment: desired,
                 deployment_history: deployments,
                 engines: node_engines,
                 conditions,
+                target_deployment: target,
             })
         })
         .collect()
@@ -643,7 +669,11 @@ pub fn compose(
     let current = snapshot
         .deployments
         .iter()
-        .filter(|item| item.record.revision == item.current_revision)
+        .filter(|item| {
+            item.record.revision == item.current_revision
+                || (item.current_revision == 0
+                    && item.target_revision == Some(item.record.revision))
+        })
         .map(|item| (item.record.node_id.clone(), item.record.clone()))
         .collect::<BTreeMap<_, _>>();
     let managers = compose_managers(&snapshot, &membership, within_convergence_window);
@@ -799,6 +829,7 @@ mod tests {
             module_heartbeats: Vec::new(),
             routes,
             managers: Vec::new(),
+            slot_authorities: Vec::new(),
         };
 
         let services = compose_services(&snapshot, &current, &engines);

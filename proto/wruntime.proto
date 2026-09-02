@@ -324,10 +324,11 @@ message ServiceStatus {
 message NodeStatus {
   string node_id = 1;
   StatusSeverity severity = 2;
-  DeploymentRecord desired_deployment = 3;
+  DeploymentRecord desired_deployment = 3; // committed serving deployment
   repeated DeploymentRecord deployment_history = 4;
   repeated EngineStatus engines = 5;
   repeated DeploymentCondition conditions = 6;
+  DeploymentRecord target_deployment = 7; // optional staged deployment
 }
 
 message GetClusterStatusRequest {}
@@ -342,6 +343,196 @@ message GetClusterStatusResponse {
   repeated EngineStatus engines = 8; // includes managed and unmanaged registrations
   repeated ServiceStatus services = 9;
   repeated DeploymentCondition conditions = 10; // cluster-wide/unsupported signals
+}
+
+// ── Durable operator operations ──────────────────────────────────────────
+
+// Operator actions are durable deployment/node intent. They never identify a
+// PID and never mutate LifecycleService directly.
+enum NodeOperationAction {
+  NODE_OPERATION_ACTION_UNSPECIFIED = 0;
+  NODE_OPERATION_ACTION_INITIAL_APPLY = 1;
+  NODE_OPERATION_ACTION_DRAIN = 2;
+  NODE_OPERATION_ACTION_RESTART = 3;
+  NODE_OPERATION_ACTION_ROLLING_UPGRADE = 4;
+  NODE_OPERATION_ACTION_SCALE = 5;
+  NODE_OPERATION_ACTION_ROLLBACK = 6;
+}
+
+enum NodeOperationState {
+  NODE_OPERATION_STATE_UNSPECIFIED = 0;
+  NODE_OPERATION_STATE_QUEUED = 1;
+  NODE_OPERATION_STATE_RUNNING = 2;
+  NODE_OPERATION_STATE_PAUSED = 3;
+  NODE_OPERATION_STATE_SUCCEEDED = 4;
+  NODE_OPERATION_STATE_FAILED = 5;
+  NODE_OPERATION_STATE_CANCELLED = 6;
+}
+
+enum NodeOperationStepKind {
+  NODE_OPERATION_STEP_KIND_UNSPECIFIED = 0;
+  NODE_OPERATION_STEP_KIND_VERIFY_RELEASE = 1;
+  NODE_OPERATION_STEP_KIND_STOP_SLOT = 2;
+  NODE_OPERATION_STEP_KIND_SELECT_RELEASE = 3;
+  NODE_OPERATION_STEP_KIND_START_SLOT = 4;
+  NODE_OPERATION_STEP_KIND_VERIFY_READY = 5;
+}
+
+enum BackendProcessState {
+  BACKEND_PROCESS_STATE_UNSPECIFIED = 0;
+  BACKEND_PROCESS_STATE_RUNNING = 1;
+  BACKEND_PROCESS_STATE_EXITED = 2;
+}
+
+message RolloutPolicy {
+  uint32 max_unavailable = 1;
+  string canary_slot = 2;
+  bool pause_after_canary = 3;
+  bool allow_downtime = 4;
+  uint64 deadline_seconds = 5;
+}
+
+message OperationSlotProgress {
+  string engine_slot = 1;
+  uint64 authoritative_revision = 2;
+  NodeOperationStepKind next_step = 3;
+  uint32 completed_steps = 4;
+  bool complete = 5;
+  repeated DeploymentCondition conditions = 6;
+}
+
+message NodeOperation {
+  string operation_id = 1;
+  string node_id = 2;
+  string request_token = 3;
+  string actor = 4;
+  NodeOperationAction action = 5;
+  NodeOperationState state = 6;
+  RolloutPolicy policy = 7;
+  uint64 source_revision = 8;
+  uint64 target_revision = 9;
+  string bundle_digest = 10;
+  repeated OperationSlotProgress slots = 11;
+  bool committed = 12;
+  uint64 lease_epoch = 13;
+  optional google.protobuf.Timestamp lease_expires_at = 14;
+  optional google.protobuf.Timestamp created_at = 15;
+  optional google.protobuf.Timestamp updated_at = 16;
+  repeated DeploymentCondition conditions = 17;
+}
+
+message OperationEvent {
+  uint64 sequence = 1;
+  string operation_id = 2;
+  string actor = 3;
+  string event_code = 4;
+  string detail = 5;
+  uint64 lease_epoch = 6;
+  optional google.protobuf.Timestamp created_at = 7;
+}
+
+message SubmitOperationRequest {
+  string node_id = 1;
+  string request_token = 2;
+  NodeOperationAction action = 3;
+  repeated string engine_slots = 4;
+  uint64 target_revision = 5;
+  string bundle_digest = 6;
+  RolloutPolicy policy = 7;
+}
+message SubmitOperationResponse { NodeOperation operation = 1; }
+message GetOperationRequest { string operation_id = 1; }
+message GetOperationResponse {
+  NodeOperation operation = 1;
+  repeated OperationEvent events = 2;
+}
+message ListOperationsRequest {
+  string node_id = 1;
+  bool include_terminal = 2;
+}
+message ListOperationsResponse { repeated NodeOperation operations = 1; }
+message ResumeOperationRequest { string operation_id = 1; }
+message ResumeOperationResponse { NodeOperation operation = 1; }
+message CancelOperationRequest { string operation_id = 1; }
+message CancelOperationResponse { NodeOperation operation = 1; }
+message GetOperatorStatusRequest {
+  string node_id = 1;
+  string engine_slot = 2;
+}
+message SlotObservation {
+  string node_id = 1;
+  string engine_slot = 2;
+  LifecycleStatus lifecycle = 3;
+  BackendProcessState backend_state = 4;
+  string backend_instance_id = 5;
+  uint64 observed_revision = 6;
+  optional google.protobuf.Timestamp observed_at = 7;
+}
+message GetOperatorStatusResponse {
+  GetClusterStatusResponse cluster = 1;
+  repeated NodeOperation active_operations = 2;
+  repeated SlotObservation observations = 3;
+}
+
+message ClaimOperationRequest { string node_id = 1; }
+message AgentInstruction {
+  string operation_id = 1;
+  string node_id = 2;
+  string engine_slot = 3;
+  uint64 lease_epoch = 4;
+  NodeOperationStepKind step = 5;
+  uint64 revision = 6;
+  string bundle_digest = 7;
+  optional google.protobuf.Timestamp operation_deadline = 8;
+}
+message ClaimOperationResponse {
+  AgentInstruction instruction = 1;
+  uint64 lease_seconds = 2;
+}
+message RenewOperationLeaseRequest {
+  string node_id = 1;
+  string operation_id = 2;
+  uint64 lease_epoch = 3;
+}
+message RenewOperationLeaseResponse {
+  optional google.protobuf.Timestamp lease_expires_at = 1;
+}
+message ReportNodeObservationRequest {
+  string node_id = 1;
+  string engine_slot = 2;
+  LifecycleStatus lifecycle = 3;
+  BackendProcessState backend_state = 4;
+  string backend_instance_id = 5;
+  uint64 observed_revision = 6;
+  optional google.protobuf.Timestamp observed_at = 7;
+}
+message ReportNodeObservationResponse {}
+message ReportStepResultRequest {
+  string node_id = 1;
+  string operation_id = 2;
+  string engine_slot = 3;
+  uint64 lease_epoch = 4;
+  NodeOperationStepKind step = 5;
+  bool succeeded = 6;
+  string condition_code = 7;
+  string detail = 8;
+}
+message ReportStepResultResponse { NodeOperation operation = 1; }
+
+service OperatorService {
+  rpc GetStatus(GetOperatorStatusRequest) returns (GetOperatorStatusResponse);
+  rpc SubmitOperation(SubmitOperationRequest) returns (SubmitOperationResponse);
+  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
+  rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);
+  rpc ResumeOperation(ResumeOperationRequest) returns (ResumeOperationResponse);
+  rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);
+}
+
+service NodeAgentService {
+  rpc ClaimOperation(ClaimOperationRequest) returns (ClaimOperationResponse);
+  rpc RenewOperationLease(RenewOperationLeaseRequest) returns (RenewOperationLeaseResponse);
+  rpc ReportObservation(ReportNodeObservationRequest) returns (ReportNodeObservationResponse);
+  rpc ReportStepResult(ReportStepResultRequest) returns (ReportStepResultResponse);
 }
 
 // ── Schemas ───────────────────────────────────────────────────────────────

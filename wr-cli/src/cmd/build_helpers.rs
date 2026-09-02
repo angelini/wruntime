@@ -544,6 +544,8 @@ pub fn build_host_binaries(target: &str) -> Result<()> {
             "wr-proxy",
             "-p",
             "wr-engine",
+            "-p",
+            "wr-cli",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

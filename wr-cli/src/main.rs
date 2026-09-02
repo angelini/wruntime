@@ -80,6 +80,8 @@ enum Commands {
     Secrets(cmd::secrets::SecretsArgs),
     /// Remote node deployment and lifecycle (bundle, deploy, rollback, stop, inspect-bundle)
     Node(cmd::node::NodeArgs),
+    /// Inspect, resume, or cancel durable node operations
+    Operations(cmd::operations::OperationsArgs),
     /// Query a trusted process lifecycle endpoint
     Lifecycle(cmd::lifecycle::LifecycleArgs),
     /// View logs from remote services
@@ -121,6 +123,9 @@ async fn main() -> Result<()> {
         }
         Commands::Secrets(args) => cmd::secrets::run(args, require_manager(&cli.manager)?).await,
         Commands::Node(args) => cmd::node::run(args, cli.manager.as_deref()).await,
+        Commands::Operations(args) => {
+            cmd::operations::run(args, require_manager(&cli.manager)?).await
+        }
         Commands::Lifecycle(args) => cmd::lifecycle::run(args).await,
         Commands::Logs(args) => cmd::logs::run(args).await,
         Commands::Cert(args) => cmd::cert::run(args),

@@ -11,7 +11,8 @@ use flate2::Compression;
 use sha2::{Digest, Sha256};
 use wr_common::wruntime::{
     BeginDeploymentRequest, BeginRollbackRequest, CompleteDeploymentRequest, DeploymentState,
-    ExpectedEngine, ModuleIdentity, VerifyDeploymentRequest,
+    ExpectedEngine, ModuleIdentity, NodeOperationAction, RolloutPolicy, SubmitOperationRequest,
+    VerifyDeploymentRequest,
 };
 
 use super::build_helpers::{self, BuildModule};
@@ -37,8 +38,14 @@ pub enum NodeCommand {
     Deploy(DeployArgs),
     /// Activate a retained prior bundle revision as a new desired revision
     Rollback(RollbackArgs),
+    /// Submit a rolling upgrade for an already verified, pre-staged release.
+    Upgrade(RolloutArgs),
+    /// Submit an inventory-changing rollout for an already verified, pre-staged release.
+    Scale(RolloutArgs),
     /// Stop one deployed engine and prove backend exit
     Stop(StopArgs),
+    /// Run the node-local fenced lifecycle executor.
+    Agent(super::node_agent::AgentArgs),
     /// Inspect a bundle without deploying
     InspectBundle(StatusArgs),
 }
@@ -131,6 +138,39 @@ pub struct RollbackArgs {
     /// SSH port
     #[arg(long)]
     ssh_port: Option<u16>,
+}
+
+#[derive(Args)]
+pub struct RolloutArgs {
+    #[arg(long)]
+    node_id: String,
+    /// Manager-assigned staged deployment revision.
+    #[arg(long)]
+    target_revision: u64,
+    /// Verified immutable release digest (`sha256:...`).
+    #[arg(long)]
+    bundle_digest: String,
+    /// Stable target slots from the staged manifest.
+    #[arg(long = "slot", required = true)]
+    slots: Vec<String>,
+    #[arg(long)]
+    request_token: Option<String>,
+    #[arg(long, default_value_t = 1)]
+    max_unavailable: u32,
+    #[arg(long)]
+    canary: Option<String>,
+    #[arg(long)]
+    pause_after_canary: bool,
+    #[arg(long)]
+    allow_downtime: bool,
+    #[arg(long, default_value_t = 1800)]
+    deadline: u64,
+    #[arg(long, default_value_t = 1800)]
+    wait_timeout: u64,
+    #[arg(long)]
+    no_wait: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -297,9 +337,70 @@ pub async fn run(args: NodeArgs, manager: Option<&str>) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("--manager is required for node rollback"))?;
             rollback(rollback_args, mgr).await
         }
+        NodeCommand::Upgrade(rollout_args) => {
+            let manager =
+                manager.ok_or_else(|| anyhow::anyhow!("--manager is required for node upgrade"))?;
+            submit_rollout(rollout_args, manager, NodeOperationAction::RollingUpgrade).await
+        }
+        NodeCommand::Scale(rollout_args) => {
+            let manager =
+                manager.ok_or_else(|| anyhow::anyhow!("--manager is required for node scale"))?;
+            submit_rollout(rollout_args, manager, NodeOperationAction::Scale).await
+        }
         NodeCommand::Stop(stop_args) => stop(stop_args),
+        NodeCommand::Agent(agent_args) => super::node_agent::run(agent_args).await,
         NodeCommand::InspectBundle(status_args) => status(status_args),
     }
+}
+
+async fn submit_rollout(
+    mut args: RolloutArgs,
+    manager: &str,
+    action: NodeOperationAction,
+) -> Result<()> {
+    args.slots.sort();
+    args.slots.dedup();
+    if args.slots.is_empty() {
+        bail!("at least one --slot is required");
+    }
+    let token = args
+        .request_token
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let canary = args.canary.unwrap_or_else(|| args.slots[0].clone());
+    let operation = client::connect_operator(manager)
+        .await?
+        .submit_operation(SubmitOperationRequest {
+            node_id: args.node_id,
+            request_token: token.clone(),
+            action: action as i32,
+            engine_slots: args.slots,
+            target_revision: args.target_revision,
+            bundle_digest: args.bundle_digest,
+            policy: Some(RolloutPolicy {
+                max_unavailable: args.max_unavailable,
+                canary_slot: canary,
+                pause_after_canary: args.pause_after_canary,
+                allow_downtime: args.allow_downtime,
+                deadline_seconds: args.deadline,
+            }),
+        })
+        .await?
+        .into_inner()
+        .operation
+        .context("SubmitOperation omitted operation")?;
+    if !args.json {
+        println!("Request token: {token}");
+    }
+    if args.no_wait {
+        return super::operations::render_operation(&operation, args.json);
+    }
+    super::operations::wait_for_terminal(
+        manager,
+        operation,
+        Duration::from_secs(args.wait_timeout),
+        args.json,
+    )
+    .await
 }
 
 // --- bundle helpers ---
@@ -579,14 +680,21 @@ fn add_deployment_artifacts(
         proxy_unit.to_systemd().as_bytes(),
         0o644,
     )?;
+    bundle::tar_add_bytes_checked(
+        tar,
+        checksums,
+        "wr-node/systemd/wr-node-agent.service",
+        service_gen::node_agent_systemd_unit(workdir).as_bytes(),
+        0o644,
+    )?;
 
     for (i, engine_name) in engine_names.iter().enumerate() {
         let cfg_name = &config_names[i + 1];
         let engine_unit = ServiceUnit {
             description: &format!("wruntime engine ({engine_name})"),
-            binary_path: &format!("{workdir}/wr-node/current/bin/wr-engine"),
-            config_path: &format!("{workdir}/wr-node/current/config/{cfg_name}"),
-            working_directory: &format!("{workdir}/wr-node/current"),
+            binary_path: &format!("{workdir}/wr-node/slots/{engine_name}/bin/wr-engine"),
+            config_path: &format!("{workdir}/wr-node/slots/{engine_name}/config/{cfg_name}"),
+            working_directory: &format!("{workdir}/wr-node/slots/{engine_name}"),
             env_vars: vec![],
             no_otel,
             after: vec!["wr-proxy.service"],
@@ -822,7 +930,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
 
     // Add host binaries
     let target_dir = format!("target/{}/release", target);
-    for bin_name in &["wr-proxy", "wr-engine"] {
+    for bin_name in &["wr-proxy", "wr-engine", "wr-cli"] {
         let src = PathBuf::from(&target_dir).join(bin_name);
         if !src.exists() {
             bail!(
@@ -830,7 +938,11 @@ fn bundle(args: BundleArgs) -> Result<()> {
                 src.display()
             );
         }
-        let archive_path = format!("wr-node/bin/{bin_name}");
+        let archive_path = if *bin_name == "wr-cli" {
+            "wr-node/agent/wr-cli".to_string()
+        } else {
+            format!("wr-node/bin/{bin_name}")
+        };
         bundle::tar_add_file(&mut tar, &mut checksums, &archive_path, &src, 0o755)?;
     }
 
@@ -1024,14 +1136,23 @@ fn release_dir(workdir: &str, revision: u64) -> String {
     format!("{workdir}/wr-node/releases/{revision}")
 }
 
-fn activate_release_command(workdir: &str, revision: u64) -> String {
+fn activate_release_command(workdir: &str, revision: u64, slots: &[String]) -> String {
     let staging = staging_release_dir(workdir, revision);
     let release = release_dir(workdir, revision);
     let root = format!("{workdir}/wr-node");
+    let slot_links = slots
+        .iter()
+        .map(|slot| {
+            format!(
+                "sudo rm -f {root}/slots/.{slot}-{revision}.tmp && sudo ln -s ../releases/{revision} {root}/slots/.{slot}-{revision}.tmp && sudo mv -Tf {root}/slots/.{slot}-{revision}.tmp {root}/slots/{slot}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" && ");
     format!(
         "test -d {staging} && test ! -e {release} && sudo mv {staging} {release} && \
-         sudo rm -f {root}/.current-{revision}.tmp && sudo ln -s releases/{revision} {root}/.current-{revision}.tmp && \
-         sudo mv -Tf {root}/.current-{revision}.tmp {root}/current"
+         sudo mkdir -p {root}/slots && sudo rm -f {root}/.current-{revision}.tmp && sudo ln -s releases/{revision} {root}/.current-{revision}.tmp && \
+         sudo mv -Tf {root}/.current-{revision}.tmp {root}/current && {slot_links}"
     )
 }
 
@@ -2014,7 +2135,11 @@ async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
             NodeDeployPhase::FirstStart => {
                 helpers::run_ssh(
                     &ssh_base,
-                    &activate_release_command(&manifest.workdir, deployment.revision),
+                    &activate_release_command(
+                        &manifest.workdir,
+                        deployment.revision,
+                        &manifest.engines.iter().map(|engine| engine.engine_slot.clone()).collect::<Vec<_>>(),
+                    ),
                 )
                 .context("failed to atomically activate staged release")?;
                 match format {
@@ -2220,12 +2345,13 @@ async fn prepare_release(
     let root = format!("{}/wr-node", manifest.workdir);
     let bundle_dir = format!("{root}/bundles/{}", manifest.bundle_digest);
     let staging = staging_release_dir(&manifest.workdir, revision);
+    let digest = &manifest.bundle_digest;
     print!("[deploy]  staging immutable release ... ");
     helpers::scp_file(bundle, remote, "/tmp/wr-bundle.tar.gz", ssh_key, ssh_port)?;
     helpers::run_ssh(
         ssh_base,
         &format!(
-            "sudo mkdir -p {root}/bundles {root}/releases && test ! -e {staging} && test ! -e {root}/releases/{revision} && (test -d {bundle_dir} || (sudo mkdir {bundle_dir}.tmp && sudo tar xzf /tmp/wr-bundle.tar.gz -C {bundle_dir}.tmp --strip-components=1 && sudo mv {bundle_dir}.tmp {bundle_dir})) && sudo cp -a {bundle_dir} {staging} && sudo chown -R $(id -u):$(id -g) {staging} && sudo rm -f /tmp/wr-bundle.tar.gz"
+            "sudo mkdir -p {root}/bundles {root}/releases && test ! -e {staging} && test ! -e {root}/releases/{revision} && (test -d {bundle_dir} || (sudo mkdir {bundle_dir}.tmp && sudo tar xzf /tmp/wr-bundle.tar.gz -C {bundle_dir}.tmp --strip-components=1 && sudo mv {bundle_dir}.tmp {bundle_dir})) && sudo cp -a {bundle_dir} {staging} && printf '%s\\n' '{digest}' | sudo tee {staging}/bundle.sha256 >/dev/null && sudo chown -R $(id -u):$(id -g) {staging} && sudo rm -f /tmp/wr-bundle.tar.gz"
         ),
     )?;
     println!("OK");
@@ -2358,6 +2484,11 @@ async fn rollback(args: RollbackArgs, manager: &str) -> Result<()> {
             ssh_port,
         )?;
 
+        let slots = deployment
+            .expected_engines
+            .iter()
+            .map(|engine| engine.engine_slot.clone())
+            .collect::<Vec<_>>();
         if matches!(format, DeployFormat::Systemd) {
             helpers::run_ssh(
                 &ssh_base,
@@ -2366,15 +2497,10 @@ async fn rollback(args: RollbackArgs, manager: &str) -> Result<()> {
         }
         helpers::run_ssh(
             &ssh_base,
-            &activate_release_command(&workdir, deployment.revision),
+            &activate_release_command(&workdir, deployment.revision, &slots),
         )?;
         match format {
             DeployFormat::Systemd => {
-                let slots = deployment
-                    .expected_engines
-                    .iter()
-                    .map(|engine| engine.engine_slot.clone())
-                    .collect::<Vec<_>>();
                 helpers::run_ssh(&ssh_base, &node_systemd_start_command(&slots))?;
             }
             DeployFormat::Docker => {
@@ -3071,7 +3197,7 @@ mod tests {
 
     #[test]
     fn activation_switches_current_atomically() {
-        let command = activate_release_command("/opt/wruntime", 7);
+        let command = activate_release_command("/opt/wruntime", 7, &["blue".into()]);
         assert!(command.contains("releases/.7.tmp"));
         assert!(command.contains("releases/7"));
         assert!(command.contains("mv -Tf"));

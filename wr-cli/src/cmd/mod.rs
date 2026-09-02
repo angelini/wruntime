@@ -15,6 +15,8 @@ pub mod logs;
 pub mod managers;
 pub mod metrics;
 pub mod node;
+pub mod node_agent;
+pub mod operations;
 pub mod schedules;
 pub mod secrets;
 pub mod service_gen;

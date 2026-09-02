@@ -44,9 +44,23 @@ gossip_listen_address = "0.0.0.0:9010"      # UDP address for chitchat gossip
 # scheduler_lease_secs       = 30    # optional; lease before another manager may reclaim
 # scheduler_retry_base_secs  = 5     # optional; base backoff, doubles per failure
 # scheduler_retry_cap_secs   = 300   # optional; max backoff cap
+
+# Explicit authorization for OperatorService/NodeAgentService. Fingerprints are
+# SHA-256 over the complete DER leaf certificate. Rotation uses another entry
+# with the same principal, role, and node binding.
+[[operator_principals]]
+fingerprint = "sha256:<64-lowercase-hex>"
+principal = "production-operators"
+role = "operator"
+
+[[operator_principals]]
+fingerprint = "sha256:<64-lowercase-hex>"
+principal = "node-a-agent"
+role = "node-agent"
+node_id = "node-a"
 ```
 
-The `[tls]` section is required. All gRPC clients must present a certificate signed by the same CA.
+The `[tls]` section is required. All gRPC clients must present a certificate signed by the same CA. CA validity is transport authentication only and does not authorize the role-gated operator services. `operator_principals` accepts `viewer`, `operator`, and `node-agent`; viewers can read, operators can mutate, and every node agent must bind to exactly one `node_id`. Fingerprints are unique. Several fingerprints may rotate one principal only when role and node binding are identical. An empty map denies every new operator/agent RPC while leaving the existing `ManagerService` behavior unchanged.
 
 The `[database]` section is required. The manager persists engines, routing rules,
 and schemas to Postgres. Embedded SQL migrations run automatically on startup via
@@ -55,6 +69,31 @@ refinery, serialized across active-active managers by a Postgres advisory lock.
 The `[cluster]` section is required. Multiple managers can run active-active against the same Postgres database. Each manager registers itself in the `wr_managers` table, heartbeats every 15 seconds, and participates in a chitchat gossip mesh for failure detection. Chitchat is now load-bearing for manager liveness — `gossip_listen_address` must be a reachable UDP address; a manager fails to start (fail-fast) if gossip cannot bind. Concurrent writes are serialized via Postgres row locks. Set `advertise_grpc_address` when the manager is behind a load balancer or NAT.
 
 The manager also runs a Postgres-backed claim/lease job scheduler that submits scheduled jobs through `local_proxy_address` (the local proxy loopback) using the same routing/mTLS path as normal traffic; delivery is **at-least-once** (jobs must be idempotent). `local_proxy_address` is **required** — startup fails if it is unset or empty. `scheduler_lease_secs` must exceed the worst-case per-tick submission time, or a schedule can be reclaimed by another manager while still legitimately in flight. Schedule `interval_secs`, `timeout_secs`, and `max_attempts` are required non-zero unsigned values; malformed negatives fail TOML/protobuf parsing and zero fails manager validation.
+
+### Node lifecycle agent
+
+`wr-cli node agent --config /opt/wruntime/wr-agent/agent.toml` runs the outbound-only node executor. It has no listener and accepts only manager-derived typed steps. Example:
+
+```toml
+node_id = "node-a"
+manager = "https://manager.example:9000"
+deployment_root = "/opt/wruntime"
+backend = "systemd" # or "docker"
+poll_seconds = 5
+# Docker additionally requires compose_file and compose_project.
+
+[tls]
+cert_path = "/opt/wruntime/wr-agent/agent.crt"
+key_path = "/opt/wruntime/wr-agent/agent.key"
+ca_cert_path = "/opt/wruntime/wr-agent/ca.crt"
+
+[slots.blue]
+lifecycle_address = "http://127.0.0.1:9100"
+[slots.green]
+lifecycle_address = "http://127.0.0.1:9110"
+```
+
+`deployment_root` must be absolute, slot identities are restricted to safe stable names, and lifecycle addresses must be loopback. The agent reports observations every five seconds; manager status treats old or absent evidence as unknown rather than inventing `STOPPED`. Systemd targets fixed `wr-engine-<slot>.service` units. Docker targets fixed `engine-<slot>` Compose services in the configured project. Release verification requires `wr-node/releases/<revision>/bundle.sha256`, and selection atomically updates only `wr-node/slots/<slot>`.
 
 ## wr-proxy
 

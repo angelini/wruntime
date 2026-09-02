@@ -10,9 +10,17 @@ use hyper_util::rt::TokioExecutor;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use sha2::{Digest, Sha256};
 use tokio_rustls::TlsAcceptor;
 
 use crate::node::TlsConfig;
+
+/// Return the stable lowercase SHA-256 fingerprint used by manager principal
+/// mappings. The digest covers the complete DER certificate, not a subject
+/// name that a different trusted certificate could reuse.
+pub fn certificate_fingerprint_sha256(certificate_der: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(certificate_der))
+}
 
 // ---------------------------------------------------------------------------
 // Certificate loading helpers
@@ -220,4 +228,17 @@ pub fn build_tonic_client_tls(tls: &TlsConfig) -> Result<tonic::transport::Clien
     Ok(tonic::transport::ClientTlsConfig::new()
         .identity(identity)
         .ca_certificate(ca))
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_is_stable_lowercase_sha256() {
+        assert_eq!(
+            certificate_fingerprint_sha256(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }

@@ -1,8 +1,10 @@
+pub mod auth;
 pub mod cluster;
 pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod migrate;
+pub mod operations;
 pub mod pool;
 pub mod scheduler;
 pub mod service;
@@ -27,6 +29,8 @@ use wr_common::task_group::{TaskExit, TaskGroup};
 use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
 use wr_common::wruntime::lifecycle_service_server::LifecycleServiceServer;
 use wr_common::wruntime::manager_service_server::ManagerServiceServer;
+use wr_common::wruntime::node_agent_service_server::NodeAgentServiceServer;
+use wr_common::wruntime::operator_service_server::OperatorServiceServer;
 
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
 
@@ -174,9 +178,20 @@ async fn run_service(config_path: &str) -> Result<()> {
         Arc::clone(&cluster),
         admission.clone(),
     );
+    let principal_policy = auth::PrincipalPolicy::new(&config.operator_principals);
+    let operator_service = service::OperatorApi::new(
+        db_pool.clone(),
+        Arc::clone(&cluster),
+        principal_policy.clone(),
+        config.engine_heartbeat_timeout_secs as f64,
+        config.module_heartbeat_timeout_secs.get() as f64,
+    );
+    let agent_service = service::NodeAgentApi::new(db_pool.clone(), principal_policy);
     let lifecycle_service = LifecycleServiceAdapter::new(lifecycle.snapshot());
     let router = server
         .add_service(ManagerServiceServer::new(manager))
+        .add_service(OperatorServiceServer::new(operator_service))
+        .add_service(NodeAgentServiceServer::new(agent_service))
         .add_service(LifecycleServiceServer::new(lifecycle_service));
 
     if let Err(error) =

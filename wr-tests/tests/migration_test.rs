@@ -10,7 +10,12 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
                     AND to_regclass('wr_routing_rules') IS NOT NULL
                     AND to_regclass('wr_schemas') IS NOT NULL
                     AND to_regclass('wr_nodes') IS NOT NULL
-                    AND to_regclass('wr_node_deployments') IS NOT NULL",
+                    AND to_regclass('wr_node_deployments') IS NOT NULL
+                    AND to_regclass('wr_node_operations') IS NOT NULL
+                    AND to_regclass('wr_node_operation_slots') IS NOT NULL
+                    AND to_regclass('wr_node_operation_events') IS NOT NULL
+                    AND to_regclass('wr_node_slot_authority') IS NOT NULL
+                    AND to_regclass('wr_node_slot_observations') IS NOT NULL",
             &[],
         )
         .await?
@@ -35,6 +40,26 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
     assert!(
         latest_constraint_exists,
         "expected latest manager schema constraint"
+    );
+
+    let lifecycle_columns_exist: bool = client
+        .query_one(
+            "SELECT EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_nodes' AND column_name = 'target_revision'
+            ) AND EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_engines' AND column_name = 'deployment_engine_slot'
+            )",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(
+        lifecycle_columns_exist,
+        "expected lifecycle authority columns"
     );
 
     Ok(())

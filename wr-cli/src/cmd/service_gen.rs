@@ -75,6 +75,15 @@ impl ServiceUnit<'_> {
     }
 }
 
+/// Render the independently installed host node-agent unit. The executor is
+/// outside revision-specific engine releases so a rollout cannot replace its
+/// own active control process.
+pub fn node_agent_systemd_unit(workdir: &str) -> String {
+    format!(
+        "[Unit]\nDescription=wruntime node lifecycle agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser={{run_user}}\nGroup={{run_group}}\nWorkingDirectory={workdir}/wr-agent\nExecStart={workdir}/wr-agent/wr-cli node agent --config {workdir}/wr-agent/agent.toml\nRestart=on-failure\nRestartSec=5\nKillSignal=SIGTERM\nTimeoutStopSec=45s\nSendSIGKILL=yes\n\n[Install]\nWantedBy=multi-user.target\n"
+    )
+}
+
 /// Render a Dockerfile for a service binary.
 pub struct DockerfileSpec<'a> {
     pub workdir: &'a str,

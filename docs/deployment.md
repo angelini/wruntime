@@ -28,7 +28,12 @@ cargo install cargo-zigbuild
 | `wr-cli node bundle` | Package proxy + engine binaries, WASM modules, and schemas |
 | `wr-cli node deploy` | Push node bundle to a remote host and start services |
 | `wr-cli node rollback` | Activate a retained prior successful bundle as a new revision |
-| `wr-cli node stop` | Stop one deployed engine through its systemd or Docker owner and prove final exit |
+| `wr-cli node agent --config …` | Run the node-bound fenced lifecycle executor |
+| `wr-cli node upgrade` / `node scale` | Submit a staged target revision to the durable rollout state machine |
+| `wr-cli engines status` | Compose lifecycle, availability, revision authority, backend evidence, and active operation status |
+| `wr-cli engines drain` / `engines restart` | Submit one durable stable-slot lifecycle operation |
+| `wr-cli operations get/list/resume/cancel` | Inspect and administer durable operation history |
+| `wr-cli node stop` | Legacy backend diagnostic stop; operator automation uses `engines drain` |
 | `wr-cli node inspect-bundle` | Verify and inspect a node bundle without deploying |
 | `wr-cli cluster status` | Show the authoritative cluster-wide runtime snapshot |
 | `wr-cli logs node` | View logs from services on a remote node (systemd or Docker) |
@@ -57,6 +62,8 @@ wr-node/
 ├── bin/
 │   ├── wr-proxy
 │   └── wr-engine
+├── agent/
+│   └── wr-cli                    # independently installed host agent binary
 ├── config/
 │   ├── proxy.toml               # template generated or sourced from --proxy-config; {db_url}, {host}
 │   └── engine.toml              # template with {db_url}
@@ -70,6 +77,7 @@ wr-node/
 │       └── V1__create_tables.sql
 ├── systemd/
 │   ├── wr-proxy.service
+│   ├── wr-node-agent.service
 │   ├── wr-engine-order-service.service
 │   └── 99-wruntime.conf         # sysctl tuning
 ├── docker/
@@ -215,6 +223,34 @@ wr-cli node rollback deploy@10.0.1.1 --node-id node-a --to 3 \
 ```
 
 Rollback verifies that the retained bundle and source release exist, reads the recorded systemd/Docker backend, allocates a new revision, copies the historical desired inventory/digest, injects the new revision metadata, force-restarts/recreates services, and runs the same exact readiness verification. Revisions never move backward. Bundles and releases are retained indefinitely in this initial lifecycle; garbage collection and automatic rollback are intentionally out of scope. An interrupted CLI can leave a pending/active attempt, which history records truthfully rather than inferring remote failure.
+
+## Operator lifecycle operations
+
+Destructive commands address stable `node_id` plus engine slot, never ephemeral `engine_id`:
+
+```bash
+wr-cli engines status --node-id node-a --slot blue --json
+wr-cli engines drain --node-id node-a --slot blue --request-token incident-42
+wr-cli engines restart --node-id node-a --slot blue --wait-timeout 300
+wr-cli operations list --node-id node-a --include-terminal --json
+wr-cli operations resume <operation-id>
+wr-cli operations cancel <operation-id>
+```
+
+Drain defaults to a two-minute durable deadline and restart to five minutes. Waiting is default. `--wait-timeout` limits only the CLI; timeout is nonzero and prints the operation ID and last observation while durable work continues. `--no-wait` returns after submission. Omitting `--request-token` generates and prints a UUID. Reusing the same actor/token/payload follows the same operation; conflicting reuse fails.
+
+Upgrade and scale consume a manager-assigned staged revision whose digest and exact slot inventory already match the verified immutable deployment snapshot:
+
+```bash
+wr-cli node upgrade --node-id node-a --target-revision 8 \
+  --bundle-digest sha256:<digest> --slot blue --slot green
+wr-cli node scale --node-id node-a --target-revision 9 \
+  --bundle-digest sha256:<digest> --slot blue --slot green --slot amber
+```
+
+The default is `max_unavailable=1`, lexical first-slot canary, automatic continuation, and a 30-minute operation deadline. `--canary`, `--pause-after-canary`, and `--allow-downtime` make deviations explicit. A paused canary or expired lease requires `operations resume`. Cancellation is accepted only before commit; committed work is corrected by a separately authorized rollback revision. The CLI never performs process effects after operation submission.
+
+The host agent verifies `bundle.sha256`, confines paths below `deployment_root`, atomically selects `wr-node/slots/<slot>`, and invokes only the fixed systemd unit or Compose service for that slot. It has no network listener. A stop remains bounded by the existing 45-second backend-owner contract; the engine's 30-second signal shutdown performs route withdrawal and deregistration. Successful drain/restart requires backend exit evidence, while lifecycle endpoint disappearance alone is never success.
 
 ## Multi-node cluster setup
 

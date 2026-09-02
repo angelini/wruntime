@@ -12,21 +12,29 @@ use wr_common::identity::{
 use wr_common::lifecycle_service::{AdmissionGate, AdmissionGuard};
 use wr_common::naming::namespace_role;
 use wr_common::wruntime::{
-    manager_service_server::ManagerService, BeginDeploymentRequest, BeginDeploymentResponse,
+    manager_service_server::ManagerService, node_agent_service_server::NodeAgentService,
+    operator_service_server::OperatorService, BeginDeploymentRequest, BeginDeploymentResponse,
     BeginEngineDrainRequest, BeginEngineDrainResponse, BeginRollbackRequest, BeginRollbackResponse,
+    CancelOperationRequest, CancelOperationResponse, ClaimOperationRequest, ClaimOperationResponse,
     CompleteDeploymentRequest, CompleteDeploymentResponse, DeleteRoutingRuleRequest,
     DeleteRoutingRuleResponse, DeleteScheduleRequest, DeleteScheduleResponse, DeleteSecretRequest,
     DeleteSecretResponse, DeploymentCondition, DeregisterEngineRequest, DeregisterEngineResponse,
-    GetClusterStatusRequest, GetClusterStatusResponse, GetRoutingTableRequest,
+    GetClusterStatusRequest, GetClusterStatusResponse, GetOperationRequest, GetOperationResponse,
+    GetOperatorStatusRequest, GetOperatorStatusResponse, GetRoutingTableRequest,
     GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse, HeartbeatRequest,
     HeartbeatResponse, ListEnginesRequest, ListEnginesResponse, ListManagersRequest,
-    ListManagersResponse, ListSchedulesRequest, ListSchedulesResponse, ListSecretsRequest,
-    ListSecretsResponse, ManagerInfo, NamespaceDbCredential, NamespaceSecrets,
-    RegisterEngineRequest, RegisterEngineResponse, RoutingRule, Schedule, SecretEntry,
-    SetSecretRequest, SetSecretResponse, UpsertRoutingRuleResponse, UpsertScheduleRequest,
+    ListManagersResponse, ListOperationsRequest, ListOperationsResponse, ListSchedulesRequest,
+    ListSchedulesResponse, ListSecretsRequest, ListSecretsResponse, ManagerInfo,
+    NamespaceDbCredential, NamespaceSecrets, NodeOperationAction, RegisterEngineRequest,
+    RegisterEngineResponse, RenewOperationLeaseRequest, RenewOperationLeaseResponse,
+    ReportNodeObservationRequest, ReportNodeObservationResponse, ReportStepResultRequest,
+    ReportStepResultResponse, ResumeOperationRequest, ResumeOperationResponse, RoutingRule,
+    Schedule, SecretEntry, SetSecretRequest, SetSecretResponse, SubmitOperationRequest,
+    SubmitOperationResponse, UpsertRoutingRuleResponse, UpsertScheduleRequest,
     UpsertScheduleResponse, VerifyDeploymentRequest, VerifyDeploymentResponse,
 };
 
+use crate::auth::PrincipalPolicy;
 use crate::cluster::{ClusterHandle, ManagerLiveness};
 use crate::crypto::SecretCrypto;
 use crate::db;
@@ -969,6 +977,300 @@ impl ManagerService for Manager {
             })
             .collect();
         Ok(Response::new(ListSchedulesResponse { schedules }))
+    }
+}
+
+/// Role-gated durable operator API. It composes existing status evidence and
+/// delegates every mutation to one transactional operation state machine.
+pub struct OperatorApi {
+    pool: Pool,
+    cluster: Arc<ClusterHandle>,
+    policy: PrincipalPolicy,
+    engine_heartbeat_timeout_secs: f64,
+    module_heartbeat_timeout_secs: f64,
+}
+
+impl OperatorApi {
+    pub fn new(
+        pool: Pool,
+        cluster: Arc<ClusterHandle>,
+        policy: PrincipalPolicy,
+        engine_heartbeat_timeout_secs: f64,
+        module_heartbeat_timeout_secs: f64,
+    ) -> Self {
+        Self {
+            pool,
+            cluster,
+            policy,
+            engine_heartbeat_timeout_secs,
+            module_heartbeat_timeout_secs,
+        }
+    }
+
+    fn validate_submission(request: &mut SubmitOperationRequest) -> Result<(), Status> {
+        Namespace::parse(&request.node_id)
+            .map_err(|_| Status::invalid_argument("node_id must be a valid stable identity"))?;
+        if !Manager::valid_deployment_token(&request.request_token) {
+            return Err(Status::invalid_argument(
+                "request_token must be 1..=128 URL-safe characters",
+            ));
+        }
+        let action = NodeOperationAction::try_from(request.action)
+            .unwrap_or(NodeOperationAction::Unspecified);
+        if action == NodeOperationAction::Unspecified {
+            return Err(Status::invalid_argument("operation action is required"));
+        }
+        request.engine_slots.sort();
+        if request.engine_slots.is_empty()
+            || request
+                .engine_slots
+                .iter()
+                .any(|slot| !Manager::valid_deployment_token(slot))
+            || request
+                .engine_slots
+                .windows(2)
+                .any(|pair| pair[0] == pair[1])
+        {
+            return Err(Status::invalid_argument(
+                "engine_slots must contain unique URL-safe stable slot identities",
+            ));
+        }
+        let deployment_action = matches!(
+            action,
+            NodeOperationAction::InitialApply
+                | NodeOperationAction::RollingUpgrade
+                | NodeOperationAction::Scale
+                | NodeOperationAction::Rollback
+        );
+        if deployment_action
+            && (request.target_revision == 0
+                || !Manager::valid_bundle_digest(&request.bundle_digest))
+        {
+            return Err(Status::invalid_argument(
+                "deployment operations require target_revision and sha256 bundle_digest",
+            ));
+        }
+        let policy = request
+            .policy
+            .get_or_insert_with(|| wr_common::wruntime::RolloutPolicy {
+                max_unavailable: 1,
+                canary_slot: request.engine_slots[0].clone(),
+                pause_after_canary: false,
+                allow_downtime: false,
+                deadline_seconds: match action {
+                    NodeOperationAction::Drain => 120,
+                    NodeOperationAction::Restart => 300,
+                    _ => 1800,
+                },
+            });
+        if policy.max_unavailable == 0
+            || policy.max_unavailable as usize > request.engine_slots.len()
+            || policy.deadline_seconds == 0
+        {
+            return Err(Status::invalid_argument(
+                "policy requires a positive bounded max_unavailable and deadline_seconds",
+            ));
+        }
+        if !policy.canary_slot.is_empty() && !request.engine_slots.contains(&policy.canary_slot) {
+            return Err(Status::invalid_argument(
+                "canary_slot is not in engine_slots",
+            ));
+        }
+        if deployment_action
+            && request.engine_slots.len() <= policy.max_unavailable as usize
+            && !policy.allow_downtime
+        {
+            return Err(Status::failed_precondition(
+                "operation cannot retain one authoritative slot; allow_downtime is required",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[tonic::async_trait]
+impl OperatorService for OperatorApi {
+    async fn get_status(
+        &self,
+        mut request: Request<GetOperatorStatusRequest>,
+    ) -> Result<Response<GetOperatorStatusResponse>, Status> {
+        self.policy.authorize_read(&mut request)?;
+        let filter = request.into_inner();
+        let membership = self.cluster.membership_snapshot().await;
+        let snapshot = db::get_cluster_status_snapshot(&self.pool).await?;
+        let mut cluster = crate::status::compose(
+            snapshot,
+            membership,
+            self.cluster.within_convergence_window(),
+            self.engine_heartbeat_timeout_secs,
+            self.module_heartbeat_timeout_secs,
+        )?;
+        if !filter.node_id.is_empty() {
+            cluster.nodes.retain(|node| node.node_id == filter.node_id);
+            cluster.engines.retain(|engine| {
+                engine.deployment.as_ref().is_some_and(|deployment| {
+                    deployment.node_id == filter.node_id
+                        && (filter.engine_slot.is_empty()
+                            || deployment.engine_slot == filter.engine_slot)
+                })
+            });
+            if cluster.nodes.is_empty() {
+                return Err(Status::not_found("selected node or slot was not found"));
+            }
+        }
+        let active_operations = crate::operations::list(&self.pool, &filter.node_id, false).await?;
+        let observations =
+            crate::operations::observations(&self.pool, &filter.node_id, &filter.engine_slot)
+                .await?;
+        Ok(Response::new(GetOperatorStatusResponse {
+            cluster: Some(cluster),
+            active_operations,
+            observations,
+        }))
+    }
+
+    async fn submit_operation(
+        &self,
+        mut request: Request<SubmitOperationRequest>,
+    ) -> Result<Response<SubmitOperationResponse>, Status> {
+        let principal = self.policy.authorize_operator(&mut request)?;
+        let mut request = request.into_inner();
+        Self::validate_submission(&mut request)?;
+        let operation = crate::operations::submit(&self.pool, &principal.name, &request).await?;
+        Ok(Response::new(SubmitOperationResponse {
+            operation: Some(operation),
+        }))
+    }
+
+    async fn get_operation(
+        &self,
+        mut request: Request<GetOperationRequest>,
+    ) -> Result<Response<GetOperationResponse>, Status> {
+        self.policy.authorize_read(&mut request)?;
+        let operation_id = request.into_inner().operation_id;
+        let operation = crate::operations::get(&self.pool, &operation_id).await?;
+        let events = crate::operations::events(&self.pool, &operation_id).await?;
+        Ok(Response::new(GetOperationResponse {
+            operation: Some(operation),
+            events,
+        }))
+    }
+
+    async fn list_operations(
+        &self,
+        mut request: Request<ListOperationsRequest>,
+    ) -> Result<Response<ListOperationsResponse>, Status> {
+        self.policy.authorize_read(&mut request)?;
+        let request = request.into_inner();
+        let operations =
+            crate::operations::list(&self.pool, &request.node_id, request.include_terminal).await?;
+        Ok(Response::new(ListOperationsResponse { operations }))
+    }
+
+    async fn resume_operation(
+        &self,
+        mut request: Request<ResumeOperationRequest>,
+    ) -> Result<Response<ResumeOperationResponse>, Status> {
+        let principal = self.policy.authorize_operator(&mut request)?;
+        let operation = crate::operations::resume(
+            &self.pool,
+            &request.into_inner().operation_id,
+            &principal.name,
+        )
+        .await?;
+        Ok(Response::new(ResumeOperationResponse {
+            operation: Some(operation),
+        }))
+    }
+
+    async fn cancel_operation(
+        &self,
+        mut request: Request<CancelOperationRequest>,
+    ) -> Result<Response<CancelOperationResponse>, Status> {
+        let principal = self.policy.authorize_operator(&mut request)?;
+        let operation = crate::operations::cancel(
+            &self.pool,
+            &request.into_inner().operation_id,
+            &principal.name,
+        )
+        .await?;
+        Ok(Response::new(CancelOperationResponse {
+            operation: Some(operation),
+        }))
+    }
+}
+
+/// Pull-based node executor protocol. Certificate mapping fixes one agent to
+/// one node before any lease or observation is accepted.
+pub struct NodeAgentApi {
+    pool: Pool,
+    policy: PrincipalPolicy,
+}
+
+impl NodeAgentApi {
+    pub fn new(pool: Pool, policy: PrincipalPolicy) -> Self {
+        Self { pool, policy }
+    }
+}
+
+#[tonic::async_trait]
+impl NodeAgentService for NodeAgentApi {
+    async fn claim_operation(
+        &self,
+        mut request: Request<ClaimOperationRequest>,
+    ) -> Result<Response<ClaimOperationResponse>, Status> {
+        let node_id = request.get_ref().node_id.clone();
+        let principal = self.policy.authorize_agent(&mut request, &node_id)?;
+        let response = crate::operations::claim(&self.pool, &node_id, &principal.name)
+            .await?
+            .unwrap_or(ClaimOperationResponse {
+                instruction: None,
+                lease_seconds: 0,
+            });
+        Ok(Response::new(response))
+    }
+
+    async fn renew_operation_lease(
+        &self,
+        mut request: Request<RenewOperationLeaseRequest>,
+    ) -> Result<Response<RenewOperationLeaseResponse>, Status> {
+        let node_id = request.get_ref().node_id.clone();
+        let principal = self.policy.authorize_agent(&mut request, &node_id)?;
+        let request = request.into_inner();
+        let lease_expires_at = crate::operations::renew(
+            &self.pool,
+            &request.node_id,
+            &request.operation_id,
+            request.lease_epoch,
+            &principal.name,
+        )
+        .await?;
+        Ok(Response::new(RenewOperationLeaseResponse {
+            lease_expires_at: Some(lease_expires_at),
+        }))
+    }
+
+    async fn report_observation(
+        &self,
+        mut request: Request<ReportNodeObservationRequest>,
+    ) -> Result<Response<ReportNodeObservationResponse>, Status> {
+        let node_id = request.get_ref().node_id.clone();
+        self.policy.authorize_agent(&mut request, &node_id)?;
+        crate::operations::report_observation(&self.pool, request.get_ref()).await?;
+        Ok(Response::new(ReportNodeObservationResponse {}))
+    }
+
+    async fn report_step_result(
+        &self,
+        mut request: Request<ReportStepResultRequest>,
+    ) -> Result<Response<ReportStepResultResponse>, Status> {
+        let node_id = request.get_ref().node_id.clone();
+        let principal = self.policy.authorize_agent(&mut request, &node_id)?;
+        let operation =
+            crate::operations::report_step(&self.pool, request.get_ref(), &principal.name).await?;
+        Ok(Response::new(ReportStepResultResponse {
+            operation: Some(operation),
+        }))
     }
 }
 

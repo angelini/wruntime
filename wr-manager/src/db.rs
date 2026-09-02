@@ -110,15 +110,37 @@ pub async fn register_engine_and_routes(
     acquire_global_lock_wait(&txn).await?;
 
     let registration_bytes = reg.encode_to_vec();
+    let deployment_node_id = reg.deployment.as_ref().map(|value| value.node_id.as_str());
+    let deployment_revision = reg
+        .deployment
+        .as_ref()
+        .map(|value| i64::try_from(value.revision))
+        .transpose()
+        .map_err(|_| Status::invalid_argument("deployment revision is too large"))?;
+    let deployment_bundle_digest = reg
+        .deployment
+        .as_ref()
+        .map(|value| value.bundle_digest.as_str());
+    let deployment_engine_slot = reg
+        .deployment
+        .as_ref()
+        .map(|value| value.engine_slot.as_str());
 
     txn.execute(
-        "INSERT INTO wr_engines (engine_id, address, proxy_address, peer_address, registration)
-         VALUES ($1, $2, $3, $4, $5)
+        "INSERT INTO wr_engines
+           (engine_id, address, proxy_address, peer_address, registration,
+            deployment_node_id, deployment_revision, deployment_bundle_digest,
+            deployment_engine_slot)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (engine_id) DO UPDATE
            SET address = EXCLUDED.address,
                proxy_address = EXCLUDED.proxy_address,
                peer_address = EXCLUDED.peer_address,
                registration = EXCLUDED.registration,
+               deployment_node_id = EXCLUDED.deployment_node_id,
+               deployment_revision = EXCLUDED.deployment_revision,
+               deployment_bundle_digest = EXCLUDED.deployment_bundle_digest,
+               deployment_engine_slot = EXCLUDED.deployment_engine_slot,
                updated_at = NOW(),
                last_heartbeat = NOW(),
                draining = FALSE",
@@ -128,6 +150,10 @@ pub async fn register_engine_and_routes(
             &reg.proxy_address,
             &reg.peer_address,
             &registration_bytes,
+            &deployment_node_id,
+            &deployment_revision,
+            &deployment_bundle_digest,
+            &deployment_engine_slot,
         ],
     )
     .await
@@ -287,7 +313,7 @@ pub async fn register_engine_and_routes(
              FROM wr_nodes n
              WHERE d.node_id = $1 AND d.revision = $2 AND d.bundle_digest = $3
                AND d.state = 'pending' AND n.node_id = d.node_id
-               AND n.current_revision = d.revision",
+               AND (n.current_revision = d.revision OR n.target_revision = d.revision)",
             &[
                 &metadata.node_id,
                 &i64::try_from(metadata.revision)
@@ -350,20 +376,48 @@ pub async fn publish_engine_readiness(
     let txn = client.transaction().await.internal()?;
     let mut version = acquire_global_lock_wait(&txn).await?;
 
-    let updated = txn
-        .execute(
-            "UPDATE wr_engines
-             SET last_heartbeat = NOW(), updated_at = NOW()
-             WHERE engine_id = $1 AND draining = FALSE",
+    let engine = txn
+        .query_opt(
+            "SELECT e.draining,
+                    e.deployment_node_id IS NULL
+                    OR e.deployment_revision = n.current_revision
+                    OR (
+                        e.deployment_revision = n.target_revision
+                        AND NOT EXISTS (
+                            SELECT 1 FROM wr_node_operations o
+                            WHERE o.node_id = e.deployment_node_id
+                              AND o.state IN ('queued', 'running', 'paused')
+                        )
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM wr_node_slot_authority a
+                        WHERE a.node_id = e.deployment_node_id
+                          AND a.engine_slot = e.deployment_engine_slot
+                          AND a.revision = e.deployment_revision
+                          AND a.authoritative
+                    ) AS authoritative
+             FROM wr_engines e
+             LEFT JOIN wr_nodes n ON n.node_id = e.deployment_node_id
+             WHERE e.engine_id = $1",
             &[&engine_id],
         )
         .await
-        .internal()?;
-    if updated == 0 {
+        .internal()?
+        .ok_or_else(|| {
+            Status::failed_precondition(format!("engine {engine_id} is not registered"))
+        })?;
+    if engine.get::<_, bool>("draining") {
         return Err(Status::failed_precondition(format!(
-            "engine {engine_id} is not registered or is draining"
+            "engine {engine_id} is draining"
         )));
     }
+    let authoritative: bool = engine.get("authoritative");
+    txn.execute(
+        "UPDATE wr_engines SET last_heartbeat = NOW(), updated_at = NOW() WHERE engine_id = $1",
+        &[&engine_id],
+    )
+    .await
+    .internal()?;
 
     let mut namespaces = Vec::with_capacity(modules.len());
     let mut names = Vec::with_capacity(modules.len());
@@ -383,8 +437,8 @@ pub async fn publish_engine_readiness(
         versions.push(module.version.clone());
     }
 
-    let changed = txn
-        .execute(
+    let changed = if authoritative {
+        txn.execute(
             "UPDATE wr_routing_rules r
              SET healthy = TRUE, updated_at = NOW()
              WHERE r.engine_id = $1 AND r.healthy = FALSE
@@ -396,7 +450,16 @@ pub async fn publish_engine_readiness(
             &[&engine_id, &namespaces, &names, &versions],
         )
         .await
-        .internal()?;
+        .internal()?
+    } else {
+        txn.execute(
+            "UPDATE wr_routing_rules SET healthy = FALSE, updated_at = NOW()
+             WHERE engine_id = $1 AND healthy = TRUE",
+            &[&engine_id],
+        )
+        .await
+        .internal()?
+    };
     if changed > 0 {
         version = increment_version(&txn).await?;
     }
@@ -472,6 +535,7 @@ pub async fn update_route_health(
              WHERE r.healthy = TRUE
                AND NOT EXISTS (
                  SELECT 1 FROM wr_engines e
+                 LEFT JOIN wr_nodes n ON n.node_id = e.deployment_node_id
                  JOIN wr_module_heartbeats m
                    ON m.engine_id   = e.engine_id
                   AND m.namespace   = r.destination_namespace
@@ -479,6 +543,22 @@ pub async fn update_route_health(
                   AND m.version     = r.destination_version
                  WHERE e.engine_id = r.engine_id
                    AND e.draining = FALSE
+                   AND (
+                     e.deployment_node_id IS NULL
+                     OR e.deployment_revision = n.current_revision
+                     OR (e.deployment_revision = n.target_revision AND NOT EXISTS (
+                       SELECT 1 FROM wr_node_operations o
+                       WHERE o.node_id = e.deployment_node_id
+                         AND o.state IN ('queued', 'running', 'paused')
+                     ))
+                     OR EXISTS (
+                       SELECT 1 FROM wr_node_slot_authority a
+                       WHERE a.node_id = e.deployment_node_id
+                         AND a.engine_slot = e.deployment_engine_slot
+                         AND a.revision = e.deployment_revision
+                         AND a.authoritative
+                     )
+                   )
                    AND e.last_heartbeat >= NOW() - make_interval(secs => $1::double precision)
                    AND m.last_healthy   >= NOW() - make_interval(secs => $2::double precision)
                )
@@ -495,6 +575,7 @@ pub async fn update_route_health(
              WHERE r.healthy = FALSE
                AND EXISTS (
                  SELECT 1 FROM wr_engines e
+                 LEFT JOIN wr_nodes n ON n.node_id = e.deployment_node_id
                  JOIN wr_module_heartbeats m
                    ON m.engine_id   = e.engine_id
                   AND m.namespace   = r.destination_namespace
@@ -502,6 +583,22 @@ pub async fn update_route_health(
                   AND m.version     = r.destination_version
                  WHERE e.engine_id = r.engine_id
                    AND e.draining = FALSE
+                   AND (
+                     e.deployment_node_id IS NULL
+                     OR e.deployment_revision = n.current_revision
+                     OR (e.deployment_revision = n.target_revision AND NOT EXISTS (
+                       SELECT 1 FROM wr_node_operations o
+                       WHERE o.node_id = e.deployment_node_id
+                         AND o.state IN ('queued', 'running', 'paused')
+                     ))
+                     OR EXISTS (
+                       SELECT 1 FROM wr_node_slot_authority a
+                       WHERE a.node_id = e.deployment_node_id
+                         AND a.engine_slot = e.deployment_engine_slot
+                         AND a.revision = e.deployment_revision
+                         AND a.authoritative
+                     )
+                   )
                    AND e.last_heartbeat >= NOW() - make_interval(secs => $1::double precision)
                    AND m.last_healthy   >= NOW() - make_interval(secs => $2::double precision)
                )
@@ -548,6 +645,7 @@ pub async fn list_engines(pool: &Pool) -> Result<Vec<EngineRegistration>, Status
 pub struct StatusDeploymentRecord {
     pub record: DeploymentRecord,
     pub current_revision: u64,
+    pub target_revision: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -582,6 +680,13 @@ pub struct StatusManagerRecord {
 }
 
 #[derive(Clone, Debug)]
+pub struct StatusSlotAuthority {
+    pub node_id: String,
+    pub engine_slot: String,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug)]
 pub struct ClusterStatusSnapshot {
     pub observed_at: chrono::DateTime<chrono::Utc>,
     pub routing_version: u64,
@@ -590,6 +695,7 @@ pub struct ClusterStatusSnapshot {
     pub module_heartbeats: Vec<StatusModuleHeartbeat>,
     pub routes: Vec<StatusRouteRecord>,
     pub managers: Vec<StatusManagerRecord>,
+    pub slot_authorities: Vec<StatusSlotAuthority>,
 }
 
 fn deployment_revision(value: u64) -> Result<i64, Status> {
@@ -681,12 +787,13 @@ pub async fn begin_deployment(
 
     // An attempt token is idempotent. Check again after acquiring the node lock
     // so a concurrent retry cannot allocate a second revision.
-    txn.query_one(
-        "SELECT current_revision FROM wr_nodes WHERE node_id = $1 FOR UPDATE",
-        &[&request.node_id],
-    )
-    .await
-    .internal()?;
+    let node = txn
+        .query_one(
+            "SELECT current_revision, target_revision FROM wr_nodes WHERE node_id = $1 FOR UPDATE",
+            &[&request.node_id],
+        )
+        .await
+        .internal()?;
     if let Some(row) = txn
         .query_opt(
             "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, created_at, activated_at, completed_at
@@ -708,21 +815,28 @@ pub async fn begin_deployment(
         txn.commit().await.internal()?;
         return Ok(existing);
     }
+    if let Some(target_revision) = node.get::<_, Option<i64>>("target_revision") {
+        return Err(Status::failed_precondition(format!(
+            "node '{}' already has staged target revision {target_revision}",
+            request.node_id
+        )));
+    }
 
     let revision: i64 = txn
         .query_one(
-            "UPDATE wr_nodes
-             SET current_revision = (
-                 SELECT COALESCE(MAX(revision), 0) + 1
-                 FROM wr_node_deployments
-                 WHERE node_id = $1
-             ), updated_at = NOW()
-             WHERE node_id = $1 RETURNING current_revision",
+            "SELECT COALESCE(MAX(revision), 0) + 1
+             FROM wr_node_deployments WHERE node_id = $1",
             &[&request.node_id],
         )
         .await
         .internal()?
         .get(0);
+    txn.execute(
+        "UPDATE wr_nodes SET target_revision = $2, updated_at = NOW() WHERE node_id = $1",
+        &[&request.node_id, &revision],
+    )
+    .await
+    .internal()?;
     let snapshot = DeploymentRecord {
         node_id: String::new(),
         revision: 0,
@@ -801,21 +915,20 @@ pub async fn complete_deployment(
             "deployment {node_id}/{revision} is not pending or active"
         )));
     }
-    if !succeeded {
-        // Preserve the prior serving deployment when the current attempt fails.
-        // The current-revision guard prevents an older failure from replacing a
-        // newer concurrent attempt.
+    if succeeded {
         txn.execute(
-            "UPDATE wr_nodes n
-             SET current_revision = previous.revision, updated_at = NOW()
-             FROM (
-                 SELECT revision
-                 FROM wr_node_deployments
-                 WHERE node_id = $1 AND revision < $2 AND state = 'succeeded'
-                 ORDER BY revision DESC
-                 LIMIT 1
-             ) previous
-             WHERE n.node_id = $1 AND n.current_revision = $2",
+            "UPDATE wr_nodes SET current_revision = $2, target_revision = NULL, updated_at = NOW()
+             WHERE node_id = $1 AND target_revision = $2",
+            &[&node_id, &database_revision],
+        )
+        .await
+        .internal()?;
+    } else {
+        // The committed serving revision never moved at begin; failure only
+        // clears this exact staged target after its slots have been reconciled.
+        txn.execute(
+            "UPDATE wr_nodes SET target_revision = NULL, updated_at = NOW()
+             WHERE node_id = $1 AND target_revision = $2",
             &[&node_id, &database_revision],
         )
         .await
@@ -849,7 +962,8 @@ pub async fn get_cluster_status_snapshot(pool: &Pool) -> Result<ClusterStatusSna
         .query(
             "SELECT d.node_id, d.revision, d.attempt_token, d.bundle_digest,
                     d.expected_inventory, d.state, d.failure_detail, d.source_revision,
-                    d.created_at, d.activated_at, d.completed_at, n.current_revision
+                    d.created_at, d.activated_at, d.completed_at, n.current_revision,
+                    n.target_revision
              FROM wr_node_deployments d
              JOIN wr_nodes n ON n.node_id = d.node_id
              ORDER BY d.node_id, d.revision DESC",
@@ -863,6 +977,9 @@ pub async fn get_cluster_status_snapshot(pool: &Pool) -> Result<ClusterStatusSna
             Ok(StatusDeploymentRecord {
                 record: deployment_row(row)?.record,
                 current_revision: row.get::<_, i64>("current_revision") as u64,
+                target_revision: row
+                    .get::<_, Option<i64>>("target_revision")
+                    .map(|revision| revision as u64),
             })
         })
         .collect::<Result<Vec<_>, Status>>()?;
@@ -954,6 +1071,22 @@ pub async fn get_cluster_status_snapshot(pool: &Pool) -> Result<ClusterStatusSna
         })
         .collect();
 
+    let slot_authorities = txn
+        .query(
+            "SELECT node_id, engine_slot, revision FROM wr_node_slot_authority
+             WHERE authoritative ORDER BY node_id, engine_slot",
+            &[],
+        )
+        .await
+        .internal()?
+        .iter()
+        .map(|row| StatusSlotAuthority {
+            node_id: row.get("node_id"),
+            engine_slot: row.get("engine_slot"),
+            revision: row.get::<_, i64>("revision") as u64,
+        })
+        .collect();
+
     txn.commit().await.internal()?;
     Ok(ClusterStatusSnapshot {
         observed_at,
@@ -963,6 +1096,7 @@ pub async fn get_cluster_status_snapshot(pool: &Pool) -> Result<ClusterStatusSna
         module_heartbeats,
         routes,
         managers,
+        slot_authorities,
     })
 }
 
@@ -991,12 +1125,17 @@ pub fn deployment_conditions_from_snapshot(
         .find(|candidate| candidate.record.node_id == deployment.node_id)
         .map(|candidate| candidate.current_revision)
         .ok_or_else(|| Status::not_found(format!("node '{}' not found", deployment.node_id)))?;
-    if current_revision != deployment.revision {
+    let target_revision = snapshot
+        .deployments
+        .iter()
+        .find(|candidate| candidate.record.node_id == deployment.node_id)
+        .and_then(|candidate| candidate.target_revision);
+    if current_revision != deployment.revision && target_revision != Some(deployment.revision) {
         return Ok(vec![(
-            "SUPERSEDED_REVISION".into(),
+            "NON_AUTHORITATIVE_REVISION".into(),
             format!(
-                "revision {} is not the current desired revision {}",
-                deployment.revision, current_revision
+                "revision {} is neither committed revision {} nor staged target {:?}",
+                deployment.revision, current_revision, target_revision
             ),
         )]);
     }
@@ -1245,18 +1384,19 @@ pub async fn begin_rollback(
     let selected = deployment_row(&selected_row)?.record;
     let revision: i64 = txn
         .query_one(
-            "UPDATE wr_nodes
-             SET current_revision = (
-                 SELECT COALESCE(MAX(revision), 0) + 1
-                 FROM wr_node_deployments
-                 WHERE node_id = $1
-             ), updated_at = NOW()
-             WHERE node_id = $1 RETURNING current_revision",
+            "SELECT COALESCE(MAX(revision), 0) + 1
+             FROM wr_node_deployments WHERE node_id = $1",
             &[&node_id],
         )
         .await
         .internal()?
         .get(0);
+    txn.execute(
+        "UPDATE wr_nodes SET target_revision = $2, updated_at = NOW() WHERE node_id = $1",
+        &[&node_id, &revision],
+    )
+    .await
+    .internal()?;
     let snapshot = DeploymentRecord {
         node_id: String::new(),
         revision: 0,

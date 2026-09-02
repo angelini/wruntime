@@ -6,7 +6,9 @@ use tonic::transport::{Channel, Endpoint};
 use wr_common::node::TlsConfig;
 use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
 use wr_common::wruntime::manager_service_client::ManagerServiceClient;
+use wr_common::wruntime::node_agent_service_client::NodeAgentServiceClient;
 use wr_common::wruntime::node_service_client::NodeServiceClient;
+use wr_common::wruntime::operator_service_client::OperatorServiceClient;
 use wr_common::wruntime::{GetClusterStatusRequest, GetClusterStatusResponse, ListManagersRequest};
 
 /// Global TLS config for CLI → manager connections.
@@ -56,6 +58,27 @@ async fn connect_inner(
 /// Uses the global TLS config if set via [`set_tls_config`].
 pub async fn connect(addr: &str) -> Result<ManagerServiceClient<Channel>> {
     connect_inner(addr, None).await
+}
+
+/// Connect to the role-gated operator API with the configured mTLS identity.
+pub async fn connect_operator(addr: &str) -> Result<OperatorServiceClient<Channel>> {
+    let channel = endpoint(addr, None)?
+        .connect()
+        .await
+        .context("failed to connect to manager operator service")?;
+    Ok(OperatorServiceClient::new(channel))
+}
+
+/// Connect to the pull-based node-agent API with the configured mTLS identity.
+pub async fn connect_node_agent_with_tls(
+    addr: &str,
+    tls: Option<&TlsConfig>,
+) -> Result<NodeAgentServiceClient<Channel>> {
+    let channel = endpoint_with_tls(addr, tls)?
+        .connect()
+        .await
+        .context("failed to connect to manager node-agent service")?;
+    Ok(NodeAgentServiceClient::new(channel))
 }
 
 /// Return the process-global CLI TLS credentials, when initialized.

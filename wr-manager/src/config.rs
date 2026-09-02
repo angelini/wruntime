@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 
 use anyhow::Result;
@@ -11,6 +12,26 @@ impl HeartbeatTimeoutSecs {
     pub fn get(self) -> u64 {
         self.0.get()
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrincipalRole {
+    Viewer,
+    Operator,
+    NodeAgent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct PrincipalMapping {
+    /// `sha256:<64 lowercase hex>` over the complete DER client certificate.
+    pub fingerprint: String,
+    /// Stable audit identity. Certificate rotation may map several fingerprints
+    /// to the same principal with identical role/node binding.
+    pub principal: String,
+    pub role: PrincipalRole,
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -38,6 +59,8 @@ pub struct ManagerConfig {
     pub cluster: ClusterConfig,
     /// TLS certificate configuration for the gRPC listener.
     pub tls: TlsConfig,
+    /// Explicit identities allowed to use OperatorService/NodeAgentService.
+    pub operator_principals: Vec<PrincipalMapping>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -103,6 +126,8 @@ pub struct RawManagerConfig {
     pub database: DatabaseConfig,
     pub cluster: ClusterConfig,
     pub tls: TlsConfig,
+    #[serde(default)]
+    pub operator_principals: Vec<PrincipalMapping>,
 }
 
 impl wr_common::config::Validatable for RawManagerConfig {
@@ -163,6 +188,41 @@ impl RawManagerConfig {
             "tls.ca_cert_path is required",
         );
 
+        let mut fingerprints = HashSet::new();
+        let mut principals: HashMap<&str, (PrincipalRole, Option<&str>)> = HashMap::new();
+        for mapping in &self.operator_principals {
+            let valid_fingerprint = mapping.fingerprint.len() == 71
+                && mapping.fingerprint.starts_with("sha256:")
+                && mapping.fingerprint[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+            v.check(
+                valid_fingerprint,
+                "operator principal fingerprint must be sha256:<64 lowercase hex>",
+            );
+            v.check(
+                !mapping.principal.trim().is_empty(),
+                "operator principal name is required",
+            );
+            v.check(
+                fingerprints.insert(mapping.fingerprint.as_str()),
+                "operator principal fingerprints must be unique",
+            );
+            let node = mapping.node_id.as_deref();
+            v.check(
+                matches!(mapping.role, PrincipalRole::NodeAgent) == node.is_some(),
+                "node-agent principals require exactly one node_id and other roles must not set node_id",
+            );
+            if let Some((role, existing_node)) = principals.get(mapping.principal.as_str()) {
+                v.check(
+                    *role == mapping.role && *existing_node == node,
+                    "all fingerprints for one principal must have the same role and node_id",
+                );
+            } else {
+                principals.insert(mapping.principal.as_str(), (mapping.role, node));
+            }
+        }
+
         v.finish()
     }
 }
@@ -189,6 +249,7 @@ impl TryFrom<RawManagerConfig> for ManagerConfig {
             database: raw.database,
             cluster: raw.cluster,
             tls: raw.tls,
+            operator_principals: raw.operator_principals,
         })
     }
 }
@@ -197,5 +258,88 @@ impl ManagerConfig {
     pub fn load(path: &str) -> Result<Self> {
         let raw: RawManagerConfig = wr_common::config::load(path)?;
         raw.try_into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mapping(fingerprint: char, principal: &str, role: PrincipalRole) -> PrincipalMapping {
+        PrincipalMapping {
+            fingerprint: format!("sha256:{}", fingerprint.to_string().repeat(64)),
+            principal: principal.into(),
+            role,
+            node_id: (role == PrincipalRole::NodeAgent).then(|| "node-a".into()),
+        }
+    }
+
+    fn config(operator_principals: Vec<PrincipalMapping>) -> RawManagerConfig {
+        RawManagerConfig {
+            listen_address: "127.0.0.1:9000".into(),
+            engine_heartbeat_timeout_secs: 10,
+            module_heartbeat_timeout_secs: None,
+            local_proxy_address: "http://127.0.0.1:9001".into(),
+            scheduler_lease_secs: 30,
+            scheduler_retry_base_secs: 5,
+            scheduler_retry_cap_secs: 300,
+            database: DatabaseConfig {
+                url: "postgres://localhost/wruntime".into(),
+                max_connections: 10,
+            },
+            cluster: ClusterConfig {
+                cluster_id: "test".into(),
+                gossip_listen_address: "127.0.0.1:9010".into(),
+                advertise_grpc_address: None,
+                gossip_interval_ms: 500,
+            },
+            tls: TlsConfig {
+                cert_path: "cert".into(),
+                key_path: "key".into(),
+                ca_cert_path: "ca".into(),
+            },
+            operator_principals,
+        }
+    }
+
+    #[test]
+    fn certificate_rotation_with_same_binding_is_valid() {
+        let result = config(vec![
+            mapping('a', "operator-a", PrincipalRole::Operator),
+            mapping('b', "operator-a", PrincipalRole::Operator),
+        ])
+        .validate_inner();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn duplicate_fingerprint_is_rejected() {
+        let result = config(vec![
+            mapping('a', "operator-a", PrincipalRole::Operator),
+            mapping('a', "operator-b", PrincipalRole::Viewer),
+        ])
+        .validate_inner();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn conflicting_rotation_binding_is_rejected() {
+        let result = config(vec![
+            mapping('a', "principal", PrincipalRole::Operator),
+            mapping('b', "principal", PrincipalRole::Viewer),
+        ])
+        .validate_inner();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn node_agent_requires_exact_node_binding() {
+        let mut unbound = mapping('a', "agent", PrincipalRole::NodeAgent);
+        unbound.node_id = None;
+        assert!(config(vec![unbound]).validate_inner().is_err());
+
+        let mut viewer = mapping('b', "viewer", PrincipalRole::Viewer);
+        viewer.node_id = Some("node-a".into());
+        assert!(config(vec![viewer]).validate_inner().is_err());
     }
 }

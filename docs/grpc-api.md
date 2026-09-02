@@ -39,7 +39,24 @@ Transitions never move backward. Service-specific route withdrawal, admission cl
 | `CompleteDeployment` | node ID, revision, outcome | `DeploymentRecord` | Records terminal failure, or records success only after the manager re-verifies exact readiness. |
 | `BeginRollback` | node ID, historical successful revision (or zero for previous), token | `DeploymentRecord` | Copies the selected immutable desired snapshot into a new monotonic revision and reports `source_revision`. |
 
-Verification uses one repeatable-read manager snapshot and only the current desired revision. Stable codes include `SUPERSEDED_REVISION`, `MISSING_ENGINE`, `REVISION_MISMATCH`, `DIGEST_MISMATCH`, `DUPLICATE_ENGINE_SLOT`, `MISSING_MODULE`, `STALE_ENGINE_HEARTBEAT`, `MISSING_MODULE_HEARTBEAT`, `STALE_MODULE_HEARTBEAT`, `MISSING_ROUTE`, and `UNHEALTHY_ROUTE`. `DeploymentCondition.code`, `severity`, and evidence fields are the machine-readable contract; `detail` is explanatory text and may improve without a wire-contract change. CLI deployment success is defined by an empty condition set, not by `ListEngines` visibility.
+Beginning a deployment stages `wr_nodes.target_revision`; it does not replace the committed `current_revision`. Verification accepts the committed source and the one staged target during overlap. `CompleteDeployment` atomically commits a successful target or clears the exact failed target. Stable codes include `NON_AUTHORITATIVE_REVISION`, `MISSING_ENGINE`, `REVISION_MISMATCH`, `DIGEST_MISMATCH`, `DUPLICATE_ENGINE_SLOT`, `MISSING_MODULE`, `STALE_ENGINE_HEARTBEAT`, `MISSING_MODULE_HEARTBEAT`, `STALE_MODULE_HEARTBEAT`, `MISSING_ROUTE`, and `UNHEALTHY_ROUTE`. `NodeStatus.desired_deployment` is the committed serving snapshot and `target_deployment` is the optional staged snapshot. Condition code/severity and evidence fields are machine-readable; `detail` remains explanatory.
+
+## OperatorService and NodeAgentService
+
+These dedicated manager-mTLS services are the destructive operator boundary. A valid CA chain alone grants no role: the leaf certificate's lowercase `sha256:` DER fingerprint must map to one configured principal.
+
+| Service/RPC | Roles | Semantics |
+| --- | --- | --- |
+| `OperatorService.GetStatus/GetOperation/ListOperations` | `viewer`, `operator` | Side-effect-free composed status and append-only operation history. Lifecycle observation, backend running/exited evidence, and availability remain separate fields. |
+| `OperatorService.SubmitOperation` | `operator` | Idempotently records one immutable action/policy under `(actor, request_token)`. Actions are initial apply, drain, restart, rolling upgrade, scale, and rollback. |
+| `OperatorService.ResumeOperation/CancelOperation` | `operator` | Resume only paused work; cancel only uncommitted queued/paused work. A committed rollout requires a new rollback operation. |
+| `NodeAgentService.ClaimOperation` | node-bound `node-agent` | Returns one manager-derived typed step and monotonically increasing lease epoch. It never returns shell text or a PID. |
+| `RenewOperationLease/ReportStepResult` | same node-bound agent | Fences stale executors by node, operation, step, actor, epoch, and unexpired lease. Expiry pauses durably and requires explicit resume. |
+| `ReportObservation` | same node-bound agent | Stores exact lifecycle observation separately from backend process evidence; endpoint absence never synthesizes lifecycle `STOPPED`. |
+
+One nonterminal operation is allowed per node. Operations and events survive client, agent, and manager restarts. The step vocabulary is constrained to release verification, graceful slot stop, atomic release selection, slot start, and exact READY verification. Drain is a durable request for the backend owner to send SIGTERM and prove exit; it does not expose `BeginEngineDrain` as an operator RPC. The engine still performs route withdrawal, convergence, quiescence, and deregistration internally during `STOPPING`.
+
+A rollout uses committed/staged overlap and per-slot authority. Target registration may be observed while non-authoritative, but route publication requires committed or explicitly cut-over slot authority. The default policy is one unavailable slot, a lexical canary, automatic continuation, and a 30-minute deadline. `pause_after_canary` records a paused operation; downtime-sensitive inventory requires explicit `allow_downtime`.
 
 ## Cluster status snapshot
 

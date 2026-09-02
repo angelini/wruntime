@@ -1266,14 +1266,31 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
         .deployment
         .unwrap();
     assert_eq!(second.revision, 3);
-    let superseded = client
+    let committed_during_overlap = client
         .verify_deployment(VerifyDeploymentRequest {
             node_id: "node-a".into(),
             revision: 1,
         })
         .await?
         .into_inner();
-    assert_eq!(superseded.conditions[0].code, "SUPERSEDED_REVISION");
+    assert!(
+        committed_during_overlap.ready,
+        "the committed source remains authoritative while revision 3 is staged"
+    );
+    let overlap_status = client
+        .get_cluster_status(GetClusterStatusRequest {})
+        .await?
+        .into_inner();
+    let overlap_node = overlap_status
+        .nodes
+        .iter()
+        .find(|node| node.node_id == "node-a")
+        .expect("overlap node");
+    assert_eq!(
+        overlap_node.desired_deployment.as_ref().unwrap().revision,
+        1
+    );
+    assert_eq!(overlap_node.target_deployment.as_ref().unwrap().revision, 3);
     activate(
         &mut client,
         &pool,
@@ -1336,11 +1353,17 @@ async fn test_concurrent_deployment_revision_allocation_is_unique() -> Result<()
         left.begin_deployment(request("concurrent-left")),
         right.begin_deployment(request("concurrent-right")),
     );
-    let mut revisions = vec![
-        left?.into_inner().deployment.unwrap().revision,
-        right?.into_inner().deployment.unwrap().revision,
-    ];
-    revisions.sort_unstable();
-    assert_eq!(revisions, vec![1, 2]);
+    let outcomes = [left, right];
+    let successes = outcomes.iter().filter(|result| result.is_ok()).count();
+    let conflicts = outcomes
+        .iter()
+        .filter(|result| {
+            result
+                .as_ref()
+                .is_err_and(|status| status.code() == tonic::Code::FailedPrecondition)
+        })
+        .count();
+    assert_eq!(successes, 1, "only one staged target is allowed");
+    assert_eq!(conflicts, 1);
     Ok(())
 }

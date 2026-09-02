@@ -1,8 +1,10 @@
+pub mod auth;
 pub mod cluster;
 pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod migrate;
+pub mod operations;
 pub mod pool;
 pub mod scheduler;
 pub mod service;
