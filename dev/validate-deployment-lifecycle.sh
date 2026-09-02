@@ -242,6 +242,34 @@ status_json() {
 	local output="$1"
 	"${CLI[@]}" cluster status --node "$NODE_ID" --output json >"$output"
 }
+job_admin() {
+	"${CLI[@]}" \
+		--job-admin-manager "https://${MANAGER_HOST}:9020" \
+		--job-admin-ca-cert "$CERT_DIR/job-admin-operator/ca.crt" \
+		--job-admin-client-cert "$CERT_DIR/job-admin-operator/operator.crt" \
+		--job-admin-client-key "$CERT_DIR/job-admin-operator/operator.key" \
+		jobs "$@"
+}
+assert_job_summary() {
+	"${PYTHON[@]}" - "$1" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["total"] == 0, value
+assert value["depth"] == 0, value
+PY
+}
+assert_job_queues() {
+	"${PYTHON[@]}" - "$1" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value == [{
+    "availability": "available",
+    "fresh_delegates": 1,
+    "job_queue_id": "deployment-jobs",
+    "total_delegates": 1,
+}], value
+PY
+}
 revision_from() {
 	"${PYTHON[@]}" - "$1" "$NODE_ID" <<'PY'
 import json,sys
@@ -397,6 +425,12 @@ chmod 700 "$CERT_DIR"
 run_logged cert-init target/debug/wr-cli cert init-ca --output "$CERT_DIR"
 run_logged cert-manager target/debug/wr-cli cert generate "$MANAGER_HOST" --ca-dir "$CERT_DIR" --ip "$MANAGER_HOST"
 run_logged cert-node target/debug/wr-cli cert generate "$NODE_HOST" --ca-dir "$CERT_DIR" --ip "$NODE_HOST"
+run_logged job-admin-operator-cert-init target/debug/wr-cli cert init-ca --output "$CERT_DIR/job-admin-operator"
+run_logged job-admin-operator-cert-manager target/debug/wr-cli cert generate "$MANAGER_HOST" --ca-dir "$CERT_DIR/job-admin-operator" --ip "$MANAGER_HOST"
+run_logged job-admin-operator-cert-client target/debug/wr-cli cert generate operator --ca-dir "$CERT_DIR/job-admin-operator"
+run_logged job-admin-delegation-cert-init target/debug/wr-cli cert init-ca --output "$CERT_DIR/job-admin-delegation"
+run_logged job-admin-delegation-cert-manager target/debug/wr-cli cert generate manager --ca-dir "$CERT_DIR/job-admin-delegation"
+run_logged job-admin-delegation-cert-node target/debug/wr-cli cert generate "$NODE_HOST" --ca-dir "$CERT_DIR/job-admin-delegation" --ip "$NODE_HOST"
 run_logged manager-bundle target/debug/wr-cli managers bundle --manager-config wr-tests/deployment/manager.toml --output "$MANAGER_BUNDLE"
 run_logged manager-inspect target/debug/wr-cli managers inspect-bundle "$MANAGER_BUNDLE"
 cp wr-tests/deployment/engine-a.toml "$RUN_DIR/engine.toml"
@@ -432,12 +466,26 @@ lifecycle() {
 		--advertise-address "$MANAGER_ADDR" --gossip-address "${MANAGER_HOST}:9010"
 	status_json "$pass/manager-status.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/manager-status.json" manager --address "$MANAGER_ADDR" >"$pass/manager-assert.json"
+	job_admin queues --format json >"$pass/job-queues-empty.json"
+	if "${CLI[@]}" \
+		--job-admin-manager "https://${MANAGER_HOST}:9020" \
+		--job-admin-ca-cert "$CERT_DIR/ca.crt" \
+		--job-admin-client-cert "$CERT_DIR/${MANAGER_HOST}.crt" \
+		--job-admin-client-key "$CERT_DIR/${MANAGER_HOST}.key" \
+		jobs queues --format json >"$pass/job-runtime-trust-unexpected.json" 2>&1; then
+		echo "runtime credential unexpectedly reached the operator job-admin listener" >&2
+		return 1
+	fi
 
 	run_to_log "$backend node A deploy" "$pass/deploy-a.log" \
 		"${CLI[@]}" node deploy --node-id "$NODE_ID" "$BUNDLE_A" "$NODE_REMOTE" --format "$backend" \
 		--db-url "$WRT_DEPLOY_E2E_DB_URL" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
 	status_json "$pass/status-a.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-a.json" desired --node-id "$NODE_ID" --digest "$DIGEST_A" --version 1.0.0 >"$pass/assert-a.json"
+	job_admin queues --format json >"$pass/job-queues-a.json"
+	assert_job_queues "$pass/job-queues-a.json"
+	job_admin summary --queue deployment-jobs --format json >"$pass/job-summary-a.json"
+	assert_job_summary "$pass/job-summary-a.json"
 	local revision_a revision_b
 	revision_a="$(revision_from "$pass/status-a.json")"
 	invoke_echo "hello-$backend-a" "$pass/invoke-a.json"

@@ -1139,3 +1139,595 @@ async fn test_worker_pool_preserves_payload_and_job_type() {
 
     WorkerPoolHarness::respond(inbound, 200, "ok");
 }
+
+#[tokio::test]
+async fn job_admin_list_page_summary_and_inspect_are_queue_scoped() {
+    let Some(harness) = WorkerPoolHarness::new(
+        "job_admin_list_page_summary_and_inspect_are_queue_scoped",
+        "admin-worker",
+    )
+    .await
+    else {
+        return;
+    };
+    let first = harness
+        .insert_job_with_source("/jobs.Run/First", b"payload-1", 60, 3, "source", "caller")
+        .await
+        .unwrap();
+    let second = harness
+        .insert_job_with_source("/jobs.Run/Second", b"payload-2", 60, 3, "source", "caller")
+        .await
+        .unwrap();
+    let third = harness
+        .insert_job_with_source("/jobs.Run/Third", b"payload-3", 60, 3, "source", "caller")
+        .await
+        .unwrap();
+
+    let filter = wr_engine::job_admin_queue::JobFilter {
+        worker_namespace: Some(harness.namespace.clone()),
+        worker_name: Some(harness.name.clone()),
+        worker_version: Some(harness.version.clone()),
+        source_namespace: Some("source".into()),
+        source_module: Some("caller".into()),
+        ..Default::default()
+    };
+    let page = wr_engine::job_admin_queue::list_jobs(&harness.pool, &filter, None, 2, "")
+        .await
+        .unwrap();
+    assert_eq!(page.jobs.len(), 2);
+    let cursor = page.next_cursor.expect("two of three rows need a cursor");
+    let inserted_between = harness
+        .insert_job_with_source(
+            "/jobs.Run/InsertedBetweenPages",
+            b"payload-4",
+            60,
+            3,
+            "source",
+            "caller",
+        )
+        .await
+        .unwrap();
+    let continuation =
+        wr_engine::job_admin_queue::list_jobs(&harness.pool, &filter, None, 2, &cursor)
+            .await
+            .unwrap();
+    assert_eq!(continuation.jobs.len(), 1);
+    let ids = page
+        .jobs
+        .iter()
+        .chain(&continuation.jobs)
+        .map(|job| job.job_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.contains(first.as_str()));
+    assert!(ids.contains(second.as_str()));
+    assert!(ids.contains(third.as_str()));
+    assert!(!ids.contains(inserted_between.as_str()));
+
+    let summary = wr_engine::job_admin_queue::summarize_jobs(&harness.pool, &filter)
+        .await
+        .unwrap();
+    assert_eq!(summary.pending, 4);
+    assert_eq!(summary.total, 4);
+    assert!(summary.oldest_pending_at.is_some());
+
+    let detail = wr_engine::job_admin_queue::get_job(&harness.pool, &first)
+        .await
+        .unwrap();
+    assert_eq!(detail.payload, b"payload-1");
+    assert_eq!(detail.summary.source_namespace, "source");
+    assert_eq!(detail.summary.source_module, "caller");
+
+    let by_type = wr_engine::job_admin_queue::list_jobs(
+        &harness.pool,
+        &wr_engine::job_admin_queue::JobFilter {
+            worker_namespace: Some(harness.namespace.clone()),
+            job_type: Some("/jobs.Run/First".into()),
+            created_at_from: Some(detail.summary.created_at),
+            ..Default::default()
+        },
+        Some(wr_common::lifecycle::JobState::Pending),
+        50,
+        "",
+    )
+    .await
+    .unwrap();
+    assert_eq!(by_type.jobs.len(), 1);
+    assert_eq!(by_type.jobs[0].job_id, first);
+    let exclusive_before = wr_engine::job_admin_queue::list_jobs(
+        &harness.pool,
+        &wr_engine::job_admin_queue::JobFilter {
+            worker_namespace: Some(harness.namespace.clone()),
+            job_type: Some("/jobs.Run/First".into()),
+            created_at_before: Some(detail.summary.created_at),
+            ..Default::default()
+        },
+        None,
+        50,
+        "",
+    )
+    .await
+    .unwrap();
+    assert!(exclusive_before.jobs.is_empty());
+
+    let empty = wr_engine::job_admin_queue::summarize_jobs(
+        &harness.pool,
+        &wr_engine::job_admin_queue::JobFilter {
+            worker_namespace: Some("missing-job-admin-namespace".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(empty.total, 0);
+    assert!(empty.oldest_pending_at.is_none());
+
+    let malformed =
+        wr_engine::job_admin_queue::list_jobs(&harness.pool, &filter, None, 2, "not-base64").await;
+    assert!(matches!(
+        malformed,
+        Err(wr_engine::job_admin_queue::JobAdminError::Invalid(_))
+    ));
+    assert!(
+        wr_engine::job_admin_queue::list_jobs(&harness.pool, &filter, None, 201, "")
+            .await
+            .is_err()
+    );
+
+    let mismatch = wr_engine::job_admin_queue::list_jobs(
+        &harness.pool,
+        &wr_engine::job_admin_queue::JobFilter {
+            worker_namespace: Some(harness.namespace.clone()),
+            ..Default::default()
+        },
+        None,
+        2,
+        &cursor,
+    )
+    .await;
+    assert!(matches!(
+        mismatch,
+        Err(wr_engine::job_admin_queue::JobAdminError::Invalid(_))
+    ));
+}
+
+#[tokio::test]
+async fn job_admin_status_cursor_reflects_mutation_between_pages_without_duplicates() {
+    let Some(harness) = WorkerPoolHarness::new(
+        "job_admin_status_cursor_reflects_mutation_between_pages_without_duplicates",
+        "cursor-mutation-worker",
+    )
+    .await
+    else {
+        return;
+    };
+    for index in 0..4 {
+        harness
+            .insert_job(
+                &format!("/jobs.Run/CursorMutation{index}"),
+                b"payload",
+                60,
+                2,
+            )
+            .await
+            .unwrap();
+    }
+    let filter = wr_engine::job_admin_queue::JobFilter {
+        worker_namespace: Some(harness.namespace.clone()),
+        ..Default::default()
+    };
+    let first_page = wr_engine::job_admin_queue::list_jobs(
+        &harness.pool,
+        &filter,
+        Some(wr_common::lifecycle::JobState::Pending),
+        2,
+        "",
+    )
+    .await
+    .unwrap();
+    let cursor = first_page.next_cursor.as_deref().unwrap();
+    let all_before = wr_engine::job_admin_queue::list_jobs(
+        &harness.pool,
+        &filter,
+        Some(wr_common::lifecycle::JobState::Pending),
+        50,
+        "",
+    )
+    .await
+    .unwrap();
+    let victim = all_before.jobs.last().unwrap().job_id.clone();
+    let claim = wr_engine::worker::claim_job(
+        &harness.pool,
+        &harness.namespace,
+        &harness.name,
+        &harness.version,
+        "engine-cursor-mutation",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(claim.job_id, victim);
+
+    let continuation = wr_engine::job_admin_queue::list_jobs(
+        &harness.pool,
+        &filter,
+        Some(wr_common::lifecycle::JobState::Pending),
+        2,
+        cursor,
+    )
+    .await
+    .unwrap();
+    assert_eq!(continuation.jobs.len(), 1);
+    assert!(continuation.jobs.iter().all(|job| job.job_id != victim));
+    assert!(first_page.jobs.iter().all(|first| continuation
+        .jobs
+        .iter()
+        .all(|later| later.job_id != first.job_id)));
+}
+
+#[tokio::test]
+async fn job_admin_maps_all_states_and_rejects_malformed_persisted_details() {
+    let Some(harness) = WorkerPoolHarness::new(
+        "job_admin_maps_all_states_and_rejects_malformed_persisted_details",
+        "state-worker",
+    )
+    .await
+    else {
+        return;
+    };
+    let complete_id = harness
+        .insert_job("/jobs.Run/Complete", b"complete", 60, 1)
+        .await
+        .unwrap();
+    let dead_id = harness
+        .insert_job("/jobs.Run/Dead", b"dead", 60, 1)
+        .await
+        .unwrap();
+    let running_id = harness
+        .insert_job("/jobs.Run/Running", b"running", 60, 1)
+        .await
+        .unwrap();
+
+    let complete_claim = wr_engine::worker::claim_job(
+        &harness.pool,
+        &harness.namespace,
+        &harness.name,
+        &harness.version,
+        "engine-complete",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(complete_claim.job_id, complete_id);
+    wr_engine::worker::complete_job(
+        &harness.pool,
+        &complete_id,
+        complete_claim.claim_id,
+        b"result",
+    )
+    .await
+    .unwrap();
+
+    let dead_claim = wr_engine::worker::claim_job(
+        &harness.pool,
+        &harness.namespace,
+        &harness.name,
+        &harness.version,
+        "engine-dead",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(dead_claim.job_id, dead_id);
+    wr_engine::worker::fail_job(&harness.pool, &dead_id, dead_claim.claim_id, "failed")
+        .await
+        .unwrap();
+
+    let running_claim = wr_engine::worker::claim_job(
+        &harness.pool,
+        &harness.namespace,
+        &harness.name,
+        &harness.version,
+        "engine-running",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(running_claim.job_id, running_id);
+
+    let filter = wr_engine::job_admin_queue::JobFilter {
+        worker_namespace: Some(harness.namespace.clone()),
+        ..Default::default()
+    };
+    let summary = wr_engine::job_admin_queue::summarize_jobs(&harness.pool, &filter)
+        .await
+        .unwrap();
+    assert_eq!(summary.pending, 0);
+    assert_eq!(summary.running, 1);
+    assert_eq!(summary.complete, 1);
+    assert_eq!(summary.dead, 1);
+    assert_eq!(summary.total, 3);
+    assert!(summary.oldest_pending_at.is_none());
+
+    for (status, expected_id) in [
+        (wr_common::lifecycle::JobState::Running, &running_id),
+        (wr_common::lifecycle::JobState::Complete, &complete_id),
+        (wr_common::lifecycle::JobState::Dead, &dead_id),
+    ] {
+        let page =
+            wr_engine::job_admin_queue::list_jobs(&harness.pool, &filter, Some(status), 50, "")
+                .await
+                .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(&page.jobs[0].job_id, expected_id);
+    }
+
+    assert!(matches!(
+        wr_engine::job_admin_queue::retry_dead_job(&harness.pool, "missing-job").await,
+        Err(wr_engine::job_admin_queue::JobAdminError::NotFound)
+    ));
+    for job_id in [&complete_id, &running_id] {
+        assert!(matches!(
+            wr_engine::job_admin_queue::retry_dead_job(&harness.pool, job_id).await,
+            Err(wr_engine::job_admin_queue::JobAdminError::FailedPrecondition(_))
+        ));
+    }
+
+    harness
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE wr__jobs.jobs SET result = NULL WHERE job_id = $1",
+            &[&complete_id],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        wr_engine::job_admin_queue::get_job(&harness.pool, &complete_id).await,
+        Err(wr_engine::job_admin_queue::JobAdminError::Database(_))
+    ));
+}
+
+#[tokio::test]
+async fn job_blob_and_metadata_size_limits_are_enforced_at_persistence() {
+    let Some(harness) = WorkerPoolHarness::new(
+        "job_blob_and_metadata_size_limits_are_enforced_at_persistence",
+        "size-worker",
+    )
+    .await
+    else {
+        return;
+    };
+    let oversized_payload = vec![0_u8; wr_common::lifecycle::MAX_JOB_BLOB_BYTES + 1];
+    assert!(harness
+        .insert_job("/jobs.Run/Oversized", &oversized_payload, 60, 1)
+        .await
+        .is_err());
+    let oversized_type = "x".repeat(wr_common::lifecycle::MAX_JOB_METADATA_BYTES + 1);
+    assert!(harness
+        .insert_job(&oversized_type, b"payload", 60, 1)
+        .await
+        .is_err());
+
+    let job_id = harness
+        .insert_job("/jobs.Run/ResultLimit", b"payload", 60, 1)
+        .await
+        .unwrap();
+    let claim = wr_engine::worker::claim_job(
+        &harness.pool,
+        &harness.namespace,
+        &harness.name,
+        &harness.version,
+        "engine-size",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(claim.job_id, job_id);
+    let oversized_result = vec![0_u8; wr_common::lifecycle::MAX_JOB_BLOB_BYTES + 1];
+    assert!(wr_engine::worker::complete_job(
+        &harness.pool,
+        &job_id,
+        claim.claim_id,
+        &oversized_result,
+    )
+    .await
+    .is_err());
+    let oversized_error = "x".repeat(wr_common::lifecycle::MAX_JOB_ERROR_BYTES + 1);
+    assert!(
+        wr_engine::worker::fail_job(&harness.pool, &job_id, claim.claim_id, &oversized_error,)
+            .await
+            .is_err()
+    );
+
+    let boundary_payload = vec![7_u8; wr_common::lifecycle::MAX_JOB_BLOB_BYTES];
+    let boundary_id = harness
+        .insert_job("/jobs.Run/Boundary", &boundary_payload, 60, 1)
+        .await
+        .unwrap();
+    let boundary_detail = wr_engine::job_admin_queue::get_job(&harness.pool, &boundary_id)
+        .await
+        .unwrap();
+    assert_eq!(boundary_detail.payload.len(), boundary_payload.len());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn job_admin_retry_notifies_a_sleeping_worker() {
+    let Some(mut harness) = WorkerPoolHarness::new(
+        "job_admin_retry_notifies_a_sleeping_worker",
+        "retry-notify-worker",
+    )
+    .await
+    else {
+        return;
+    };
+    let job_id = harness
+        .insert_job("/jobs.Run/RetryNotify", b"payload", 60, 1)
+        .await
+        .unwrap();
+    let claim = wr_engine::worker::claim_job(
+        &harness.pool,
+        &harness.namespace,
+        &harness.name,
+        &harness.version,
+        "engine-old",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    wr_engine::worker::fail_job(&harness.pool, &job_id, claim.claim_id, "last failure")
+        .await
+        .unwrap();
+
+    harness.spawn(1, Duration::from_secs(60), Duration::from_secs(10));
+    harness
+        .wait_for_listener(Duration::from_secs(5))
+        .await
+        .unwrap();
+    wr_engine::job_admin_queue::retry_dead_job(&harness.pool, &job_id)
+        .await
+        .unwrap();
+
+    let inbound = harness
+        .recv_dispatch(Duration::from_secs(5))
+        .await
+        .expect("retry notification must wake the worker before its 60-second poll");
+    assert_eq!(inbound.request.uri().path(), "/jobs.Run/RetryNotify");
+    WorkerPoolHarness::respond(inbound, 200, "ok");
+}
+
+#[tokio::test]
+async fn job_admin_retry_and_worker_claim_serialize_safely() {
+    let Some(harness) = WorkerPoolHarness::new(
+        "job_admin_retry_and_worker_claim_serialize_safely",
+        "retry-claim-worker",
+    )
+    .await
+    else {
+        return;
+    };
+    let job_id = harness
+        .insert_job("/jobs.Run/RetryClaim", b"payload", 60, 1)
+        .await
+        .unwrap();
+    let old_claim = wr_engine::worker::claim_job(
+        &harness.pool,
+        &harness.namespace,
+        &harness.name,
+        &harness.version,
+        "engine-old",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    wr_engine::worker::fail_job(&harness.pool, &job_id, old_claim.claim_id, "failed")
+        .await
+        .unwrap();
+
+    let (retried, concurrent_claim) = tokio::join!(
+        wr_engine::job_admin_queue::retry_dead_job(&harness.pool, &job_id),
+        wr_engine::worker::claim_job(
+            &harness.pool,
+            &harness.namespace,
+            &harness.name,
+            &harness.version,
+            "engine-new",
+        ),
+    );
+    retried.unwrap();
+    let claim = match concurrent_claim.unwrap() {
+        Some(claim) => claim,
+        None => wr_engine::worker::claim_job(
+            &harness.pool,
+            &harness.namespace,
+            &harness.name,
+            &harness.version,
+            "engine-new",
+        )
+        .await
+        .unwrap()
+        .expect("retried row must remain claimable"),
+    };
+    assert_eq!(claim.job_id, job_id);
+    let detail = wr_engine::job_admin_queue::get_job(&harness.pool, &job_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        detail.summary.status,
+        wr_common::lifecycle::JobState::Running
+    );
+    assert_eq!(detail.summary.attempt, 1);
+    assert_eq!(detail.claimed_by, "engine-new");
+}
+
+#[tokio::test]
+async fn job_admin_retry_is_dead_only_fresh_and_concurrency_safe() {
+    let Some(harness) = WorkerPoolHarness::new(
+        "job_admin_retry_is_dead_only_fresh_and_concurrency_safe",
+        "retry-worker",
+    )
+    .await
+    else {
+        return;
+    };
+    let job_id = harness
+        .insert_job("/jobs.Run/Retry", b"payload", 60, 1)
+        .await
+        .unwrap();
+    let old_claim = wr_engine::worker::claim_job(
+        &harness.pool,
+        &harness.namespace,
+        &harness.name,
+        &harness.version,
+        "engine-old",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    wr_engine::worker::fail_job(&harness.pool, &job_id, old_claim.claim_id, "last failure")
+        .await
+        .unwrap();
+
+    let (left, right) = tokio::join!(
+        wr_engine::job_admin_queue::retry_dead_job(&harness.pool, &job_id),
+        wr_engine::job_admin_queue::retry_dead_job(&harness.pool, &job_id),
+    );
+    let (success, failure) = match (left, right) {
+        (Ok(success), Err(failure)) | (Err(failure), Ok(success)) => (success, failure),
+        other => panic!("expected one retry success and one failure: {other:?}"),
+    };
+    assert_eq!(
+        success.summary.status,
+        wr_common::lifecycle::JobState::Pending
+    );
+    assert_eq!(success.summary.attempt, 0);
+    assert_eq!(success.last_error, "last failure");
+    assert!(success.result.is_empty());
+    assert!(success.claimed_at.is_none());
+    assert!(success.lease_expires_at.is_none());
+    assert!(success.completed_at.is_none());
+    assert!(matches!(
+        failure,
+        wr_engine::job_admin_queue::JobAdminError::FailedPrecondition(_)
+    ));
+
+    let new_claim = wr_engine::worker::claim_job(
+        &harness.pool,
+        &harness.namespace,
+        &harness.name,
+        &harness.version,
+        "engine-new",
+    )
+    .await
+    .unwrap()
+    .expect("retried job must be claimable");
+    assert_eq!(new_claim.job_id, job_id);
+    assert_eq!(
+        wr_engine::worker::complete_job(&harness.pool, &job_id, old_claim.claim_id, b"stale")
+            .await
+            .unwrap(),
+        wr_engine::worker::Finalization::Stale
+    );
+}

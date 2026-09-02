@@ -35,6 +35,8 @@ pub struct EngineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<DatabaseConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_admin: Option<JobAdminConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<toml::Value>,
     #[serde(rename = "module", default, skip_serializing_if = "Vec::is_empty")]
     pub modules: Vec<ModuleConfig>,
@@ -72,6 +74,14 @@ pub struct DeploymentConfig {
     pub engine_slot: String,
     #[serde(flatten)]
     pub extra: ExtraFields,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct JobAdminConfig {
+    pub listen_address: String,
+    pub advertise_address: String,
+    pub queue_id: String,
+    pub tls: CliTlsConfig,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -178,9 +188,16 @@ impl EngineConfig {
             config.node = Some(bundled_node);
         }
 
-        // Template database URL
+        // Template database URL and the manager-routable engine admin address.
         if let Some(ref mut db) = config.database {
             db.url = "{db_url}".to_string();
+        }
+        if let Some(ref mut job_admin) = config.job_admin {
+            let port = super::helpers::extract_port(&job_admin.advertise_address)?;
+            job_admin.advertise_address = format!("https://{{host}}:{}", port.get());
+            job_admin.tls.cert_path = "certs/job-admin-delegation/node.crt".to_string();
+            job_admin.tls.key_path = "certs/job-admin-delegation/node.key".to_string();
+            job_admin.tls.ca_cert_path = "certs/job-admin-delegation/ca.crt".to_string();
         }
 
         Ok(config)
@@ -243,6 +260,16 @@ pub struct ManagerConfig {
     pub cluster: ClusterConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<CliTlsConfig>,
+    pub job_admin: ManagerJobAdminConfig,
+    pub job_admin_delegation_tls: CliTlsConfig,
+    #[serde(flatten)]
+    pub extra: ExtraFields,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ManagerJobAdminConfig {
+    pub listen_address: String,
+    pub tls: CliTlsConfig,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
@@ -298,6 +325,15 @@ impl ManagerConfig {
         tls.key_path = "certs/manager.key".to_string();
         tls.ca_cert_path = "certs/ca.crt".to_string();
         config.tls = Some(tls);
+        config.job_admin.tls.cert_path = "certs/job-admin-operator/manager.crt".to_string();
+        config.job_admin.tls.key_path = "certs/job-admin-operator/manager.key".to_string();
+        config.job_admin.tls.ca_cert_path = "certs/job-admin-operator/ca.crt".to_string();
+        config.job_admin_delegation_tls.cert_path =
+            "certs/job-admin-delegation/manager.crt".to_string();
+        config.job_admin_delegation_tls.key_path =
+            "certs/job-admin-delegation/manager.key".to_string();
+        config.job_admin_delegation_tls.ca_cert_path =
+            "certs/job-admin-delegation/ca.crt".to_string();
         config
     }
 }
@@ -624,6 +660,20 @@ cert_path = "certs/source.crt"
 key_path = "certs/source.key"
 ca_cert_path = "certs/source-ca.crt"
 server_name = "manager.local"
+
+[job_admin]
+listen_address = "0.0.0.0:9020"
+
+[job_admin.tls]
+cert_path = "certs/source-operator-server.crt"
+key_path = "certs/source-operator-server.key"
+ca_cert_path = "certs/source-operator-ca.crt"
+server_name = "jobs.manager.local"
+
+[job_admin_delegation_tls]
+cert_path = "certs/source-delegate.crt"
+key_path = "certs/source-delegate.key"
+ca_cert_path = "certs/source-delegate-ca.crt"
 "#;
 
         let config: ManagerConfig = toml::from_str(source).unwrap();
@@ -648,6 +698,22 @@ server_name = "manager.local"
         );
         assert_eq!(bundle["tls"]["ca_cert_path"].as_str(), Some("certs/ca.crt"));
         assert_eq!(bundle["tls"]["server_name"].as_str(), Some("manager.local"));
+        assert_eq!(
+            bundle["job_admin"]["listen_address"].as_str(),
+            Some("0.0.0.0:9020")
+        );
+        assert_eq!(
+            bundle["job_admin"]["tls"]["cert_path"].as_str(),
+            Some("certs/job-admin-operator/manager.crt")
+        );
+        assert_eq!(
+            bundle["job_admin"]["tls"]["server_name"].as_str(),
+            Some("jobs.manager.local")
+        );
+        assert_eq!(
+            bundle["job_admin_delegation_tls"]["cert_path"].as_str(),
+            Some("certs/job-admin-delegation/manager.crt")
+        );
         assert_eq!(
             bundle["local_proxy_address"].as_str(),
             Some("http://127.0.0.1:9001")
@@ -780,6 +846,19 @@ peer_address = "https://127.0.0.1:9443"
             cert_path = "certs/source-manager.crt"
             key_path = "certs/source-manager.key"
             ca_cert_path = "certs/source-ca.crt"
+
+            [job_admin]
+            listen_address = "0.0.0.0:9020"
+
+            [job_admin.tls]
+            cert_path = "certs/source-operator-server.crt"
+            key_path = "certs/source-operator-server.key"
+            ca_cert_path = "certs/source-operator-ca.crt"
+
+            [job_admin_delegation_tls]
+            cert_path = "certs/source-delegate.crt"
+            key_path = "certs/source-delegate.key"
+            ca_cert_path = "certs/source-delegate-ca.crt"
 
             [database]
             url = "postgres://postgres@localhost/source"

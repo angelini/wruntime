@@ -28,7 +28,7 @@ Transitions never move backward. Service-specific route withdrawal, admission cl
 | `BeginEngineDrain` | `{ engine_id }` | manager/proxy routing versions | Idempotently fences later heartbeat publication, makes the engine's routes non-serving without deleting registration, and returns manager/local-proxy convergence evidence. Final deregistration remains separate. |
 | `ListEngines` | — | `[EngineRegistration]` | Returns all currently registered engines |
 
-`EngineRegistration.deployment`, when present, carries the stable node ID, manager-assigned revision, immutable `sha256:` bundle digest, and stable engine slot. `engine_id` remains a process identity and must not be used to infer deployment history.
+`EngineRegistration.deployment`, when present, carries the stable node ID, manager-assigned revision, immutable `sha256:` bundle digest, and stable engine slot. `engine_id` remains a process identity and must not be used to infer deployment history. Database-enabled engines also register `job_queue_id` and `job_admin_address` as an all-or-nothing pair. The queue ID identifies one physical `wr__jobs` database; engines sharing that database must use the same ID, and engines using different databases must not.
 
 ## Deployment lifecycle
 
@@ -60,6 +60,26 @@ These dedicated manager-mTLS services are the destructive operator boundary. A v
 One forward/restoration operation is allowed per node; committed cleanup remains visible and may be superseded by rollback. Operations, absolute deadlines, phases, and append-only events survive client, agent, and manager restarts. Typed steps cover proxy and engine release verification, backend stop/start/inspection, atomic selection, lifecycle/route verification, authority switching, source restoration, and manager-derived cleanup. The manager derives advancement from coherent evidence, so a lost acknowledgement or manager takeover reconciles actual state without repeating a backend effect.
 
 Drain asks the backend adapter to send SIGTERM and prove deregistration plus exit; it never exposes `BeginEngineDrain` to operators. Before commit, cancellation or deadline expiry fences forward effects and completes source restoration without the expired forward deadline. Rollouts use staged/committed overlap and exact slot authority; target registration remains non-serving until the manager switches that slot. Defaults are `max_unavailable=1`, lexical canary, automatic continuation, 120 seconds for drain, 300 seconds for restart, and 1800 seconds for deploy/upgrade/scale/rollback. `pause_after_canary` is durable, and one-slot or zero-capacity transitions require explicit `allow_downtime`.
+
+## JobAdminService and EngineJobAdminService
+
+`JobAdminService` is mounted only on the manager's dedicated operator-admin mTLS listener. That listener serves no `ManagerService`, `OperatorService`, `NodeAgentService`, or lifecycle methods and trusts only certificates issued by the operator-admin CA; ordinary runtime credentials cannot complete its TLS handshake. Authorization is CA membership, so the operator-admin CA must issue no general runtime clients. The manager never connects to `wr__jobs`; it selects a fresh, non-draining registered engine for the explicit queue and delegates over `EngineJobAdminService`. Engine delegation uses a different CA and manager client identity, so an operator certificate cannot invoke an engine directly. Routing headers are never authorization.
+
+| RPC | Result | Semantics |
+| --- | --- | --- |
+| `ListJobQueues` | queue ID, availability, fresh/total delegates | Registration-only discovery; does not query queue databases. Unpaged discovery is bounded to 10,000 queue IDs and returns `resource_exhausted` above that ceiling. |
+| `ListJobs` | metadata rows and optional `next_cursor` | One newest-first keyset page. Default 50, maximum 200. Payload, result, error text, claim ID, and claimant are omitted. |
+| `GetJobQueueSummary` | observed time, four state counts, total, pending depth, oldest pending | One database statement under the same non-status filters. |
+| `GetJob` | full authorized detail | Includes payload/result, `last_error`, timeout, claimant/lease, and lifecycle timestamps, but never the internal `claim_id` fence. |
+| `RetryJob` | updated detail | Locks one job, accepts only `dead`, resets attempt to zero and terminal/claim artifacts, preserves `last_error`, and notifies its worker before commit. |
+
+Every operation requires `job_queue_id`. Filters support hierarchical worker namespace/name/version and source namespace/module, plus job type and inclusive `created_at_from`/exclusive `created_at_before`; unscoped child filters and empty/inverted time ranges are `invalid_argument`. List may additionally filter one closed `JobState`. Cursors are opaque, versioned, bound to normalized filters, and provide non-snapshot traversal: concurrent inserts or status changes can change later pages, especially for mutable status filters.
+
+Stable status mapping is `invalid_argument` for malformed scope/filter/cursor, `not_found` for an unknown queue or job, `failed_precondition` for retrying a non-dead job, `unavailable` for no fresh queue delegate/readiness, and `internal` for redacted database failures. Safe reads may select the next fresh delegate only when connection establishment fails before dispatch. `RetryJob` is never replayed; a timeout or connection loss after dispatch returns `unavailable` with “outcome unknown; inspect before retrying”.
+
+`EngineJobAdminService.CheckJobQueue` is the manager-intended identity/readiness probe. Transport authorization is CA-wide: any client certificate issued by the delegation CA can call this listener, so that CA must issue only manager delegation identities. Engine methods reject a queue mismatch and remain unavailable until embedded job migrations complete. The listener is bound before registration and is owned and joined with the engine process. Shutdown closes job-admin admission, rejects new RPCs, and drains admitted RPCs under the shared absolute shutdown deadline before route withdrawal and deregistration.
+
+Job payloads and successful results are each bounded to 1 MiB at persistence; combined identity/source/type metadata is bounded to 64 KiB and stored error text to 1 MiB. Submission body collection, worker response collection, engine delegation decoding/encoding, manager forwarding, and CLI decoding use one compatible contract. The unary admin ceiling is 4 MiB so an inspection containing both maximum payload and result remains transportable through both gRPC hops. Oversize submission or persistence is rejected rather than producing an inspectable row that cannot cross the control plane.
 
 ## Cluster status snapshot
 

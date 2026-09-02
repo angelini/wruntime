@@ -3,6 +3,7 @@ pub mod cluster;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod job_admin;
 pub mod migrate;
 pub mod operations;
 pub mod pool;

@@ -62,6 +62,8 @@ pub async fn register_module_raw(
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;

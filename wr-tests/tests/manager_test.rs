@@ -61,6 +61,8 @@ async fn test_register_and_list_engines() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -73,6 +75,62 @@ async fn test_register_and_list_engines() -> Result<()> {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].engine_id, "e1");
     assert_eq!(list[0].modules[0].name, "inventory-service");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn job_admin_registration_is_atomic_validated_and_persisted() -> Result<()> {
+    let (pool, _addr, mut client) = manager_trio().await?;
+    let registration = EngineRegistration {
+        engine_id: "job-engine".into(),
+        address: "http://127.0.0.1:9190".into(),
+        proxy_address: TEST_SELF_PEER.into(),
+        peer_address: TEST_SELF_PEER.into(),
+        modules: vec![],
+        secrets: vec![],
+        db_namespaces: vec![],
+        deployment: None,
+        job_queue_id: "primary-jobs".into(),
+        job_admin_address: "https://127.0.0.1:9150".into(),
+    };
+    client
+        .register_engine(RegisterEngineRequest {
+            registration: Some(registration.clone()),
+        })
+        .await?;
+
+    let listed = client
+        .list_engines(ListEnginesRequest {})
+        .await?
+        .into_inner()
+        .engines;
+    assert_eq!(listed[0].job_queue_id, "primary-jobs");
+    assert_eq!(listed[0].job_admin_address, "https://127.0.0.1:9150");
+    let delegates = wr_manager::db::list_job_admin_delegates(&pool, 30).await?;
+    assert_eq!(delegates.len(), 1);
+    assert!(delegates[0].fresh);
+    assert_eq!(delegates[0].engine_id, "job-engine");
+
+    for (queue_id, address) in [
+        ("primary-jobs", ""),
+        ("", "https://127.0.0.1:9151"),
+        ("Invalid_Queue", "https://127.0.0.1:9151"),
+        ("other-jobs", "http://127.0.0.1:9151"),
+        ("other-jobs", "https://0.0.0.0:9151"),
+    ] {
+        let mut malformed = registration.clone();
+        malformed.engine_id = format!("bad-{}", malformed.engine_id);
+        malformed.job_queue_id = queue_id.into();
+        malformed.job_admin_address = address.into();
+        let status = client
+            .register_engine(RegisterEngineRequest {
+                registration: Some(malformed),
+            })
+            .await
+            .expect_err("malformed job delegate must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
 
     Ok(())
 }
@@ -91,6 +149,8 @@ async fn test_deregister_engine() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -124,6 +184,8 @@ async fn test_heartbeat() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -156,6 +218,8 @@ async fn test_readiness_and_drain_are_atomic_versioned_and_fenced() -> Result<()
                 secrets: vec![],
                 db_namespaces: vec![],
                 deployment: None,
+                job_queue_id: String::new(),
+                job_admin_address: String::new(),
             }),
         })
         .await?;
@@ -327,6 +391,8 @@ async fn test_get_schema_after_registration() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -430,6 +496,8 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -450,6 +518,8 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -500,6 +570,8 @@ async fn test_get_schema_cross_namespace_isolation() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -551,6 +623,8 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -582,6 +656,8 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -634,6 +710,8 @@ async fn test_get_schema_multi_module_engine() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -681,6 +759,8 @@ async fn test_register_engine_creates_default_routing_rule() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -742,6 +822,8 @@ async fn test_register_engine_dedups_duplicate_module_instances() -> Result<()> 
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -781,6 +863,8 @@ async fn test_register_engine_missing_schema_rejected_no_writes() -> Result<()> 
                 secrets: vec![],
                 db_namespaces: vec![],
                 deployment: None,
+                job_queue_id: String::new(),
+                job_admin_address: String::new(),
             }),
         })
         .await
@@ -836,6 +920,8 @@ async fn test_register_engine_missing_secret_leaves_no_routes() -> Result<()> {
                 }],
                 db_namespaces: vec![],
                 deployment: None,
+                job_queue_id: String::new(),
+                job_admin_address: String::new(),
             }),
         })
         .await
@@ -891,6 +977,8 @@ async fn test_reregister_removes_dropped_module_route_and_heartbeat() -> Result<
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -912,6 +1000,8 @@ async fn test_reregister_removes_dropped_module_route_and_heartbeat() -> Result<
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -984,6 +1074,8 @@ async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Re
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -1005,6 +1097,8 @@ async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Re
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -1140,6 +1234,8 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
                         bundle_digest: digest.into(),
                         engine_slot: "primary".into(),
                     }),
+                    job_queue_id: String::new(),
+                    job_admin_address: String::new(),
                 }),
             })
             .await?;

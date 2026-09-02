@@ -8,11 +8,14 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_retry::strategy::{ExponentialBackoff, FixedInterval};
 use tokio_retry::Retry;
+use tonic::transport::server::TcpIncoming;
+use tonic::transport::Server;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -20,6 +23,7 @@ use wr_common::lifecycle_service::{notify_supervisor, query_ready_status, Admiss
 use wr_common::process_lifecycle::{LifecycleOwner, ProcessState, ServiceKind, TransitionReason};
 use wr_common::signal::{shutdown_signal_request, wait_for_shutdown_trigger, ShutdownCause};
 use wr_common::task_group::{TaskExit, TaskGroup};
+use wr_common::wruntime::engine_job_admin_service_server::EngineJobAdminServiceServer;
 use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
 use wr_common::wruntime::{
     node_service_client::NodeServiceClient, BeginEngineDrainRequest, DeregisterEngineRequest,
@@ -78,6 +82,23 @@ async fn drain_http_admission(
         })
 }
 
+async fn drain_job_admin_admission(
+    admission: &AdmissionGate,
+    ready: &AtomicBool,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    admission.close();
+    ready.store(false, Ordering::Release);
+    admission
+        .wait_for_idle(deadline)
+        .await
+        .map_err(|remaining| {
+            anyhow::anyhow!(
+                "engine job-admin drain timed out with {remaining} operations in flight"
+            )
+        })
+}
+
 async fn shutdown_engine_tasks(
     tasks: &mut TaskGroup,
     deadline: tokio::time::Instant,
@@ -100,16 +121,19 @@ async fn shutdown_engine_tasks(
 struct ProductionEngineShutdown<'a> {
     worker_admission: &'a AdmissionGate,
     http_admission: &'a AdmissionGate,
+    job_admin_admission: &'a AdmissionGate,
+    job_admin_ready: &'a AtomicBool,
     client: &'a mut NodeServiceClient<tonic::transport::Channel>,
     engine_id: &'a str,
     tasks: &'a mut TaskGroup,
 }
 
 impl EngineShutdownOperations for ProductionEngineShutdown<'_> {
-    fn fence_claims(&mut self, _deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
+    fn fence_claims(&mut self, deadline: tokio::time::Instant) -> ShutdownOperation<'_> {
         Box::pin(async move {
             self.worker_admission.close();
-            Ok(())
+            drain_job_admin_admission(self.job_admin_admission, self.job_admin_ready, deadline)
+                .await
         })
     }
 
@@ -287,6 +311,13 @@ async fn connect_proxy(address: &str) -> Result<NodeServiceClient<tonic::transpo
 
 async fn run_service(config_path: &str) -> Result<()> {
     let config = config::EngineConfig::load(config_path)?;
+    if let Some(job_admin) = &config.job_admin {
+        wr_common::tls::ensure_disjoint_ca_roots(&[
+            ("runtime node", &config.node.tls),
+            ("engine job-admin delegation", &job_admin.tls),
+        ])
+        .context("engine runtime and job-admin trust domains must use distinct CA certificates")?;
+    }
     let engine_id = Uuid::new_v4().to_string();
     let mut lifecycle = LifecycleOwner::new(
         ServiceKind::Engine,
@@ -294,6 +325,7 @@ async fn run_service(config_path: &str) -> Result<()> {
     );
     let http_admission = AdmissionGate::closed();
     let worker_admission = AdmissionGate::closed();
+    let job_admin_admission = AdmissionGate::closed();
 
     let listen_address = config.listen_address.trim_start_matches("http://");
     let socket_address: std::net::SocketAddr = listen_address
@@ -323,11 +355,46 @@ async fn run_service(config_path: &str) -> Result<()> {
     let registry = registry::ModuleRegistry::new();
     let mut runner = engine::EngineRunner::new(config.clone())?;
     let mut tasks = TaskGroup::new();
+    let job_admin_ready = Arc::new(AtomicBool::new(false));
+    if let Some(job_admin) = &config.job_admin {
+        let incoming = TcpIncoming::bind(job_admin.listen_address.parse()?)
+            .context("failed to bind engine job-admin listener")?;
+        let tls = wr_common::tls::build_tonic_server_tls(&job_admin.tls)
+            .context("failed to build engine job-admin TLS configuration")?;
+        let pool = runner
+            .admin_pool()
+            .context("job-admin listener requires an engine database pool")?;
+        let api = wr_engine::job_admin::EngineJobAdminApi::new(
+            job_admin.queue_id.clone(),
+            pool,
+            Arc::clone(&job_admin_ready),
+            job_admin_admission.clone(),
+        );
+        let router = Server::builder().tls_config(tls)?.add_service(
+            EngineJobAdminServiceServer::new(api)
+                .max_encoding_message_size(wr_common::lifecycle::MAX_JOB_ADMIN_MESSAGE_BYTES),
+        );
+        tasks.spawn("engine-job-admin", move |cancellation| async move {
+            let mut shutdown = cancellation.clone();
+            router
+                .serve_with_incoming_shutdown(incoming, async move {
+                    shutdown.cancelled().await;
+                })
+                .await?;
+            Ok(if cancellation.is_cancelled() {
+                TaskExit::Cancelled
+            } else {
+                TaskExit::Completed
+            })
+        });
+    }
     runner.spawn_epoch_ticker(&mut tasks);
     {
         let registry = registry.clone();
         let database = runner.admin_pool();
-        let defaults = Arc::new(server::WorkerDefaults::from_modules(&config.modules)?);
+        let defaults = Arc::new(wr_engine::worker_http::WorkerDefaults::from_modules(
+            &config.modules,
+        )?);
         let admission = http_admission.clone();
         let lifecycle_snapshot = lifecycle.snapshot();
         tasks.spawn("engine-http-listener", move |cancellation| {
@@ -417,6 +484,16 @@ async fn run_service(config_path: &str) -> Result<()> {
                 secrets: secret_requests,
                 db_namespaces,
                 deployment,
+                job_queue_id: config
+                    .job_admin
+                    .as_ref()
+                    .map(|value| value.queue_id.clone())
+                    .unwrap_or_default(),
+                job_admin_address: config
+                    .job_admin
+                    .as_ref()
+                    .map(|value| value.advertise_address.clone())
+                    .unwrap_or_default(),
             }),
         };
         let registration_response = Retry::start(
@@ -437,6 +514,8 @@ async fn run_service(config_path: &str) -> Result<()> {
             .provision_schemas(&registration_response.db_credentials)
             .await?;
         runner.run_job_migrations().await?;
+        job_admin_ready.store(true, Ordering::Release);
+        job_admin_admission.open();
         runner.run_migrations().await?;
         runner.build_namespace_pools(&registration_response.db_credentials)?;
         runner.start_recovery_coordinator(&mut tasks)?;
@@ -526,6 +605,9 @@ async fn run_service(config_path: &str) -> Result<()> {
         let shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_BUDGET;
         http_admission.close();
         worker_admission.close();
+        let job_admin_drain =
+            drain_job_admin_admission(&job_admin_admission, &job_admin_ready, shutdown_deadline)
+                .await;
         let _ = lifecycle.request_stop(TransitionReason::TaskFailure, "engine startup failed");
         let _ = notify_supervisor("STOPPING=1");
         if let Some(client) = node_client.as_mut() {
@@ -538,7 +620,13 @@ async fn run_service(config_path: &str) -> Result<()> {
             .await;
         }
         let report = tasks.shutdown(shutdown_deadline).await;
-        return Err(error).context(format!("engine startup failed; task shutdown: {report:?}"));
+        let error = error.context(format!("engine startup failed; task shutdown: {report:?}"));
+        return match job_admin_drain {
+            Ok(()) => Err(error),
+            Err(drain_error) => Err(error).context(format!(
+                "job-admin startup-failure drain also failed: {drain_error:#}"
+            )),
+        };
     }
 
     let mut client = node_client.context("proxy client missing after startup")?;
@@ -599,6 +687,8 @@ async fn run_service(config_path: &str) -> Result<()> {
     let mut shutdown = ProductionEngineShutdown {
         worker_admission: &worker_admission,
         http_admission: &http_admission,
+        job_admin_admission: &job_admin_admission,
+        job_admin_ready: &job_admin_ready,
         client: &mut client,
         engine_id: &engine_id,
         tasks: &mut tasks,
@@ -724,6 +814,39 @@ mod lifecycle_tests {
                 )),
             ))
         }
+    }
+
+    #[tokio::test]
+    async fn startup_failure_drains_in_flight_job_admin_before_deregister_step() -> Result<()> {
+        let admission = AdmissionGate::closed();
+        admission.open();
+        let guard = admission.try_enter().expect("admin request admitted");
+        let ready = Arc::new(AtomicBool::new(true));
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cleanup_admission = admission.clone();
+        let cleanup_ready = Arc::clone(&ready);
+        let cleanup_events = Arc::clone(&events);
+        let cleanup = tokio::spawn(async move {
+            drain_job_admin_admission(
+                &cleanup_admission,
+                &cleanup_ready,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            cleanup_events.lock().unwrap().push("deregister");
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!admission.is_open());
+        assert!(!ready.load(Ordering::Acquire));
+        assert!(events.lock().unwrap().is_empty());
+        assert!(!cleanup.is_finished());
+
+        drop(guard);
+        cleanup.await?;
+        assert_eq!(*events.lock().unwrap(), ["deregister"]);
+        Ok(())
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
 wr-cli = { path = "../wr-cli" }
+refinery = { version = "0.9", features = ["tokio-postgres"] }
 wr-common = { path = "../wr-common", features = [
   "http-pool",
   "pool",

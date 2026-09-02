@@ -89,14 +89,22 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
                 WHERE table_schema = current_schema()
                   AND table_name = 'wr_node_deployments' AND column_name = 'allocated_by'
                   AND is_nullable = 'NO'
-            )",
+            ) AND EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_engines' AND column_name = 'job_queue_id'
+            ) AND EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_engines' AND column_name = 'job_admin_address'
+            ) AND to_regclass('idx_wr_engines_job_admin_delegates') IS NOT NULL",
             &[],
         )
         .await?
         .get(0);
     assert!(
         lifecycle_columns_exist,
-        "expected lifecycle authority, fencing, and evidence columns"
+        "expected lifecycle authority, fencing, evidence, and job-admin delegation columns"
     );
 
     let lifecycle_constraints_exist: bool = client

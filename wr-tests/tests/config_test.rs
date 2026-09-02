@@ -61,6 +61,19 @@ fn test_manager_config_valid() {
         key_path     = "certs/mgr.key"
         ca_cert_path = "certs/ca.crt"
 
+        [job_admin]
+        listen_address = "0.0.0.0:9020"
+
+        [job_admin.tls]
+        cert_path    = "certs/operator-server.crt"
+        key_path     = "certs/operator-server.key"
+        ca_cert_path = "certs/operator-ca.crt"
+
+        [job_admin_delegation_tls]
+        cert_path    = "certs/delegate.crt"
+        key_path     = "certs/delegate.key"
+        ca_cert_path = "certs/delegate-ca.crt"
+
         [database]
         url = "postgres://localhost/test"
 
@@ -91,6 +104,19 @@ fn test_manager_config_default_heartbeat() {
         cert_path    = "certs/mgr.crt"
         key_path     = "certs/mgr.key"
         ca_cert_path = "certs/ca.crt"
+
+        [job_admin]
+        listen_address = "0.0.0.0:9020"
+
+        [job_admin.tls]
+        cert_path    = "certs/operator-server.crt"
+        key_path     = "certs/operator-server.key"
+        ca_cert_path = "certs/operator-ca.crt"
+
+        [job_admin_delegation_tls]
+        cert_path    = "certs/delegate.crt"
+        key_path     = "certs/delegate.key"
+        ca_cert_path = "certs/delegate-ca.crt"
 
         [database]
         url = "postgres://localhost/test"

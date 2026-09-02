@@ -6,8 +6,8 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use wr_common::identity::{
-    EngineHttpUrl, EngineId, ModuleId, Namespace, NamespaceFilter, PeerHttpsUrl, ProxyHttpUrl,
-    RouteKey, RuleId,
+    EngineHttpUrl, EngineId, JobQueueId, ModuleId, Namespace, NamespaceFilter, PeerHttpsUrl,
+    ProxyHttpUrl, RouteKey, RuleId,
 };
 use wr_common::lifecycle_service::{AdmissionGate, AdmissionGuard};
 use wr_common::naming::namespace_role;
@@ -399,6 +399,30 @@ impl ManagerService for Manager {
             .and_then(|_| ProxyHttpUrl::parse(&reg.proxy_address))
             .and_then(|_| PeerHttpsUrl::parse(&reg.peer_address))
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        match (
+            reg.job_queue_id.is_empty(),
+            reg.job_admin_address.is_empty(),
+        ) {
+            (true, true) => {}
+            (false, false) => {
+                JobQueueId::parse(&reg.job_queue_id)
+                    .and_then(|_| PeerHttpsUrl::parse(&reg.job_admin_address))
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                let admin_uri: http::Uri = reg.job_admin_address.parse().map_err(|error| {
+                    Status::invalid_argument(format!("invalid job admin address: {error}"))
+                })?;
+                if matches!(admin_uri.host(), Some("0.0.0.0" | "::" | "[::]")) {
+                    return Err(Status::invalid_argument(
+                        "job_admin_address must not advertise an unspecified host",
+                    ));
+                }
+            }
+            _ => {
+                return Err(Status::invalid_argument(
+                    "job_queue_id and job_admin_address must be provided together",
+                ));
+            }
+        }
 
         // Validate modules — proto_schema is only required on the first
         // descriptor for a given (namespace, name, version) tuple; additional

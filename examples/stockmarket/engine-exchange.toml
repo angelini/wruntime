@@ -14,6 +14,16 @@ ca_cert_path = "certs/ca.crt"
 url             = "postgres://user:pass@localhost:5432/stockmarket"
 max_connections = 100
 
+[job_admin]
+listen_address    = "127.0.0.1:9150"
+advertise_address = "https://127.0.0.1:9150"
+queue_id          = "stockmarket-jobs"
+
+[job_admin.tls]
+cert_path    = "certs/job-admin-delegation/127.0.0.1.crt"
+key_path     = "certs/job-admin-delegation/127.0.0.1.key"
+ca_cert_path = "certs/job-admin-delegation/ca.crt"
+
 [[module]]
 name            = "exchange"
 namespace       = "stockmarket"

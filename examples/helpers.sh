@@ -117,6 +117,19 @@ if [ ! -f certs/ca.crt ]; then
 	./target/debug/wr-cli cert generate 127.0.0.1 --ca-dir certs/
 	./target/debug/wr-cli cert generate manager --ca-dir certs/
 fi
+if [ ! -f certs/job-admin-operator/ca.crt ]; then
+	echo "==> Generating operator job-admin TLS certificates..."
+	./target/debug/wr-cli cert init-ca --output certs/job-admin-operator/
+	./target/debug/wr-cli cert generate 127.0.0.1 --ca-dir certs/job-admin-operator/
+	./target/debug/wr-cli cert generate manager --ca-dir certs/job-admin-operator/
+	./target/debug/wr-cli cert generate operator --ca-dir certs/job-admin-operator/
+fi
+if [ ! -f certs/job-admin-delegation/ca.crt ]; then
+	echo "==> Generating job-admin delegation TLS certificates..."
+	./target/debug/wr-cli cert init-ca --output certs/job-admin-delegation/
+	./target/debug/wr-cli cert generate 127.0.0.1 --ca-dir certs/job-admin-delegation/
+	./target/debug/wr-cli cert generate manager --ca-dir certs/job-admin-delegation/
+fi
 
 # ── Config rendering ─────────────────────────────────────────────────────────
 render_config() {

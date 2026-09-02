@@ -34,6 +34,29 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
         .with_context(|| format!("failed to parse certificates from {path}"))
 }
 
+/// Reject any CA certificate shared across separately authorized trust domains.
+/// CA bundles are compared by complete DER fingerprint rather than path so a
+/// copied or renamed trust anchor cannot collapse the boundary.
+pub fn ensure_disjoint_ca_roots(domains: &[(&str, &TlsConfig)]) -> Result<()> {
+    let mut owners = std::collections::HashMap::new();
+    for (domain, tls) in domains {
+        let certificates = load_certs(&tls.ca_cert_path)?;
+        anyhow::ensure!(
+            !certificates.is_empty(),
+            "{domain} CA bundle contains no certificates"
+        );
+        for certificate in certificates {
+            let fingerprint = certificate_fingerprint_sha256(certificate.as_ref());
+            if let Some(existing) = owners.insert(fingerprint, *domain) {
+                anyhow::bail!(
+                    "TLS trust domains '{existing}' and '{domain}' share a CA certificate"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     let file = std::fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
     let mut reader = std::io::BufReader::new(file);

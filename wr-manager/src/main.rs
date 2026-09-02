@@ -3,6 +3,7 @@ pub mod cluster;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod job_admin;
 pub mod migrate;
 pub mod operations;
 pub mod pool;
@@ -26,6 +27,7 @@ use wr_common::lifecycle_service::{
 use wr_common::process_lifecycle::{LifecycleOwner, ProcessState, ServiceKind, TransitionReason};
 use wr_common::signal::{shutdown_signal_request, wait_for_shutdown_trigger, ShutdownCause};
 use wr_common::task_group::{TaskExit, TaskGroup};
+use wr_common::wruntime::job_admin_service_server::JobAdminServiceServer;
 use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
 use wr_common::wruntime::lifecycle_service_server::LifecycleServiceServer;
 use wr_common::wruntime::manager_service_server::ManagerServiceServer;
@@ -98,6 +100,16 @@ async fn run_service(config_path: &str) -> Result<()> {
     let admission = AdmissionGate::closed();
     let config = config::ManagerConfig::load(config_path)?;
     let addr = config.listen_address.parse()?;
+    let job_admin_addr = config.job_admin.listen_address.parse()?;
+    wr_common::tls::ensure_disjoint_ca_roots(&[
+        ("runtime manager", &config.tls),
+        ("operator job administration", &config.job_admin.tls),
+        (
+            "engine job-admin delegation",
+            &config.job_admin_delegation_tls,
+        ),
+    ])
+    .context("manager TLS trust domains must use distinct CA certificates")?;
 
     let database_url = wr_common::pool::redact_database_url(&config.database.url);
     {
@@ -148,8 +160,14 @@ async fn run_service(config_path: &str) -> Result<()> {
     let gossip_listen = config.cluster.gossip_listen_address.parse()?;
     let crypto = Arc::new(crypto::SecretCrypto::from_env()?);
     let incoming = TcpIncoming::bind(addr).context("failed to bind manager gRPC listener")?;
+    let job_admin_incoming = TcpIncoming::bind(job_admin_addr)
+        .context("failed to bind manager job-admin gRPC listener")?;
     let tls = wr_common::tls::build_tonic_server_tls(&config.tls)
         .map_err(|error| anyhow::anyhow!("failed to build TLS config: {error}"))?;
+    let job_admin_tls = wr_common::tls::build_tonic_server_tls(&config.job_admin.tls)
+        .context("failed to build operator job-admin TLS configuration")?;
+    wr_common::tls::build_tonic_client_tls(&config.job_admin_delegation_tls)
+        .context("failed to build job-admin delegation TLS configuration")?;
     let mut server = Server::builder()
         .tls_config(tls)
         .context("failed to apply TLS config")?;
@@ -186,6 +204,12 @@ async fn run_service(config_path: &str) -> Result<()> {
         config.engine_heartbeat_timeout_secs as f64,
         config.module_heartbeat_timeout_secs.get() as f64,
     );
+    let job_admin_service = job_admin::JobAdminApi::new(
+        db_pool.clone(),
+        config.engine_heartbeat_timeout_secs,
+        config.job_admin_delegation_tls.clone(),
+        admission.clone(),
+    );
     let agent_service = service::NodeAgentApi::new(db_pool.clone(), principal_policy);
     let lifecycle_service = LifecycleServiceAdapter::new(lifecycle.snapshot());
     let router = server
@@ -193,6 +217,13 @@ async fn run_service(config_path: &str) -> Result<()> {
         .add_service(OperatorServiceServer::new(operator_service))
         .add_service(NodeAgentServiceServer::new(agent_service))
         .add_service(LifecycleServiceServer::new(lifecycle_service));
+    let job_admin_router = Server::builder()
+        .tls_config(job_admin_tls)
+        .context("failed to apply operator job-admin TLS config")?
+        .add_service(
+            JobAdminServiceServer::new(job_admin_service)
+                .max_encoding_message_size(wr_common::lifecycle::MAX_JOB_ADMIN_MESSAGE_BYTES),
+        );
 
     if let Err(error) =
         db::register_manager(&db_pool, &manager_id, &grpc_address, &gossip_address).await
@@ -209,6 +240,19 @@ async fn run_service(config_path: &str) -> Result<()> {
         let mut shutdown = cancellation.clone();
         router
             .serve_with_incoming_shutdown(incoming, async move {
+                shutdown.cancelled().await;
+            })
+            .await?;
+        Ok(if cancellation.is_cancelled() {
+            TaskExit::Cancelled
+        } else {
+            TaskExit::Completed
+        })
+    });
+    tasks.spawn("manager-job-admin-grpc", move |cancellation| async move {
+        let mut shutdown = cancellation.clone();
+        job_admin_router
+            .serve_with_incoming_shutdown(job_admin_incoming, async move {
                 shutdown.cancelled().await;
             })
             .await?;
@@ -341,22 +385,38 @@ async fn run_service(config_path: &str) -> Result<()> {
     }
 
     let mut failure: Option<anyhow::Error> = None;
-    admission.open();
-    if let Err(error) =
-        lifecycle.mark_ready("database, gossip, scheduler, monitor, and gRPC listener ready")
-    {
-        failure = Some(error.into());
-        let _ = lifecycle.request_stop(TransitionReason::TaskFailure, "manager readiness failed");
-    } else if let Err(error) = notify_supervisor("READY=1") {
-        failure = Some(
-            anyhow::Error::new(error).context("failed to notify supervisor that manager is ready"),
-        );
-        let _ = lifecycle.request_stop(
-            TransitionReason::TaskFailure,
-            "manager supervisor readiness notification failed",
-        );
-    } else {
-        info!(address = %addr, manager_id, "manager ready");
+    if let Some(outcome) = tasks.try_next_completion() {
+        failure = Some(anyhow::anyhow!(
+            "required task {} exited during manager startup: {:?}",
+            outcome.name,
+            outcome.kind
+        ));
+        let _ = lifecycle.request_stop(TransitionReason::TaskFailure, "manager startup failed");
+    }
+    if failure.is_none() {
+        admission.open();
+        if let Err(error) =
+            lifecycle.mark_ready("database, gossip, scheduler, monitor, and gRPC services ready")
+        {
+            failure = Some(error.into());
+            let _ =
+                lifecycle.request_stop(TransitionReason::TaskFailure, "manager readiness failed");
+        }
+    }
+    if failure.is_none() {
+        if let Err(error) = notify_supervisor("READY=1") {
+            failure = Some(
+                anyhow::Error::new(error)
+                    .context("failed to notify supervisor that manager is ready"),
+            );
+            let _ = lifecycle.request_stop(
+                TransitionReason::TaskFailure,
+                "manager supervisor readiness notification failed",
+            );
+        }
+    }
+    if failure.is_none() {
+        info!(address = %addr, job_admin_address = %job_admin_addr, manager_id, "manager ready");
     }
 
     if failure.is_none() {

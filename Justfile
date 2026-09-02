@@ -27,6 +27,13 @@ certs:
     just cli cert init-ca --output certs/
     just cli cert generate 127.0.0.1 --ca-dir certs/
     just cli cert generate manager --ca-dir certs/
+    just cli cert init-ca --output certs/job-admin-operator/
+    just cli cert generate 127.0.0.1 --ca-dir certs/job-admin-operator/
+    just cli cert generate manager --ca-dir certs/job-admin-operator/
+    just cli cert generate operator --ca-dir certs/job-admin-operator/
+    just cli cert init-ca --output certs/job-admin-delegation/
+    just cli cert generate 127.0.0.1 --ca-dir certs/job-admin-delegation/
+    just cli cert generate manager --ca-dir certs/job-admin-delegation/
 
 # ── Lint & Format ─────────────────────────────────────────────────────────────
 

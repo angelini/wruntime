@@ -11,6 +11,7 @@ pub mod engines;
 mod foreground_runner;
 pub mod helpers;
 pub mod invoke;
+pub mod jobs;
 pub mod lifecycle;
 pub mod logs;
 pub mod managers;

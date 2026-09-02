@@ -131,8 +131,8 @@ pub async fn register_engine_and_routes(
         "INSERT INTO wr_engines
            (engine_id, address, proxy_address, peer_address, registration,
             deployment_node_id, deployment_revision, deployment_bundle_digest,
-            deployment_engine_slot)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            deployment_engine_slot, job_queue_id, job_admin_address)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULLIF($10, ''), NULLIF($11, ''))
          ON CONFLICT (engine_id) DO UPDATE
            SET address = EXCLUDED.address,
                proxy_address = EXCLUDED.proxy_address,
@@ -142,6 +142,8 @@ pub async fn register_engine_and_routes(
                deployment_revision = EXCLUDED.deployment_revision,
                deployment_bundle_digest = EXCLUDED.deployment_bundle_digest,
                deployment_engine_slot = EXCLUDED.deployment_engine_slot,
+               job_queue_id = EXCLUDED.job_queue_id,
+               job_admin_address = EXCLUDED.job_admin_address,
                updated_at = NOW(),
                last_heartbeat = NOW(),
                draining = FALSE",
@@ -155,6 +157,8 @@ pub async fn register_engine_and_routes(
             &deployment_revision,
             &deployment_bundle_digest,
             &deployment_engine_slot,
+            &reg.job_queue_id,
+            &reg.job_admin_address,
         ],
     )
     .await
@@ -630,6 +634,45 @@ pub async fn list_engines(pool: &Pool) -> Result<Vec<EngineRegistration>, Status
                 .map_err(|e| Status::internal(format!("failed to decode registration: {e}")))
         })
         .collect()
+}
+
+#[derive(Clone, Debug)]
+pub struct JobAdminDelegate {
+    pub job_queue_id: String,
+    pub engine_id: String,
+    pub address: String,
+    pub fresh: bool,
+}
+
+/// List all queue delegates, including stale registrations, in deterministic
+/// queue/engine order. Freshness is computed by PostgreSQL at one observation.
+pub async fn list_job_admin_delegates(
+    pool: &Pool,
+    heartbeat_timeout_secs: u64,
+) -> Result<Vec<JobAdminDelegate>, Status> {
+    let timeout = i64::try_from(heartbeat_timeout_secs)
+        .map_err(|_| Status::internal("heartbeat timeout is too large"))?;
+    let client = pool.get().await.internal()?;
+    let rows = client
+        .query(
+            "SELECT job_queue_id, engine_id, job_admin_address, \
+                    (NOT draining AND last_heartbeat >= statement_timestamp() - $1::bigint * interval '1 second') AS fresh \
+             FROM wr_engines \
+             WHERE job_queue_id IS NOT NULL AND job_admin_address IS NOT NULL \
+             ORDER BY job_queue_id, engine_id",
+            &[&timeout],
+        )
+        .await
+        .internal()?;
+    Ok(rows
+        .into_iter()
+        .map(|row| JobAdminDelegate {
+            job_queue_id: row.get(0),
+            engine_id: row.get(1),
+            address: row.get(2),
+            fresh: row.get(3),
+        })
+        .collect())
 }
 
 // ── Desired node deployment operations ──────────────────────────────────────

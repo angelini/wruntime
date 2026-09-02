@@ -73,6 +73,55 @@ pub struct TestPki {
 }
 
 /// Generate a CA + node cert entirely in memory. No files on disk.
+pub struct TestPkiFiles {
+    _directory: tempfile::TempDir,
+    pub tls: wr_common::node::TlsConfig,
+}
+
+/// Generate a standalone CA and one localhost certificate as PEM files.
+/// The certificate is suitable for both sides of mTLS in transport tests.
+pub fn generate_test_pki_files(name: &str) -> TestPkiFiles {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
+    use std::net::IpAddr;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut ca_params = CertificateParams::new(vec![]).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, format!("{name}-ca"));
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_issuer = rcgen::Issuer::from_params(&ca_params, ca_key);
+
+    let mut leaf_params = CertificateParams::new(vec![]).unwrap();
+    leaf_params.subject_alt_names = vec![
+        SanType::DnsName("localhost".try_into().unwrap()),
+        SanType::IpAddress(IpAddr::from([127, 0, 0, 1])),
+    ];
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, name);
+    let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer).unwrap();
+
+    let ca_path = directory.path().join("ca.crt");
+    let cert_path = directory.path().join("client.crt");
+    let key_path = directory.path().join("client.key");
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+    std::fs::write(&cert_path, leaf_cert.pem()).unwrap();
+    std::fs::write(&key_path, leaf_key.serialize_pem()).unwrap();
+
+    TestPkiFiles {
+        tls: wr_common::node::TlsConfig {
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: key_path.to_string_lossy().into_owned(),
+            ca_cert_path: ca_path.to_string_lossy().into_owned(),
+        },
+        _directory: directory,
+    }
+}
+
 pub fn generate_test_pki() -> TestPki {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
     use std::net::IpAddr;

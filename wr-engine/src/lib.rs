@@ -7,6 +7,8 @@ use wasmtime_wasi_http::p2::body::HyperIncomingBody;
 pub mod blobstore;
 pub mod config;
 pub mod db;
+pub mod job_admin;
+pub mod job_admin_queue;
 pub mod job_migration;
 pub mod llm;
 pub mod migration;
@@ -17,6 +19,7 @@ pub mod startup_db;
 pub mod state;
 pub mod tracing;
 pub mod worker;
+pub mod worker_http;
 
 pub type InboundBody = HyperIncomingBody;
 pub type ResponseBody = UnsyncBoxBody<Bytes, EngineBodyError>;

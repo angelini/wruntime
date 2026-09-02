@@ -57,6 +57,8 @@ async fn staged_registration_remains_non_serving_without_exact_slot_authority() 
             secrets: vec![],
             peer_address: TEST_SELF_PEER.into(),
             db_namespaces: vec![],
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
             deployment: Some(DeploymentMetadata {
                 node_id: deployment.node_id,
                 revision: deployment.revision,
@@ -99,6 +101,8 @@ async fn route_health_publication_participates_in_operation_evidence_lock() -> R
             secrets: vec![],
             peer_address: TEST_SELF_PEER.into(),
             db_namespaces: vec![],
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
             deployment: None,
         },
     )
@@ -419,6 +423,8 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -532,6 +538,8 @@ async fn test_engine_stale_marks_all_module_routes_unhealthy() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -720,6 +728,8 @@ async fn test_malformed_module_entry_skipped_not_fatal() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;

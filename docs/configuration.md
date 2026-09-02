@@ -31,6 +31,21 @@ cert_path    = "certs/manager.crt"
 key_path     = "certs/manager.key"
 ca_cert_path = "certs/ca.crt"
 
+# Dedicated JobAdminService listener. Its CA issues only operator-admin clients.
+[job_admin]
+listen_address = "0.0.0.0:9020"
+
+[job_admin.tls]
+cert_path    = "certs/job-admin-operator/manager.crt"
+key_path     = "certs/job-admin-operator/manager.key"
+ca_cert_path = "certs/job-admin-operator/ca.crt"
+
+# Manager client identity for the separate engine-delegation trust domain.
+[job_admin_delegation_tls]
+cert_path    = "certs/job-admin-delegation/manager.crt"
+key_path     = "certs/job-admin-delegation/manager.key"
+ca_cert_path = "certs/job-admin-delegation/ca.crt"
+
 [database]
 url             = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 10
@@ -60,7 +75,35 @@ role = "node-agent"
 node_id = "node-a"
 ```
 
-The `[tls]` section is required. All gRPC clients must present a certificate signed by the same CA. CA validity is transport authentication only and does not authorize the role-gated operator services. `operator_principals` accepts `viewer`, `operator`, and `node-agent`; viewers can read, operators can mutate, and every node agent must bind to exactly one `node_id`. Fingerprints are unique. Several fingerprints may rotate one principal only when role and node binding are identical. An empty map denies every new operator/agent RPC while leaving the existing `ManagerService` behavior unchanged.
+The `[tls]`, `[job_admin]`, and `[job_admin_delegation_tls]` sections are required. Runtime clients on `listen_address` present certificates from the runtime CA. `operator_principals` applies only to `OperatorService` and `NodeAgentService` on that runtime listener; it accepts `viewer`, `operator`, and `node-agent`, and an empty map denies those role-gated RPCs while leaving existing `ManagerService` behavior unchanged. The distinct `job_admin.listen_address` serves only `JobAdminService` and accepts every client certificate issued by its operator-admin CA; that CA must issue no ordinary runtime certificate. `[job_admin_delegation_tls]` is neither a runtime nor operator credential: it is the manager's client identity and CA used to reach engine `EngineJobAdminService` listeners. Engine transport authorization is CA-wide, so issue the delegation CA only to manager identities. Startup binds both listener sockets and validates all three TLS configurations before readiness.
+
+Job commands require an explicit dedicated address and credential set; they never fall back to `--manager`, `WR_MANAGER`, or the ordinary `WR_*` TLS paths:
+
+```bash
+export WR_JOB_ADMIN_MANAGER=https://manager.example:9020
+export WR_JOB_ADMIN_CA_CERT=certs/job-admin-operator/ca.crt
+export WR_JOB_ADMIN_CLIENT_CERT=certs/job-admin-operator/operator.crt
+export WR_JOB_ADMIN_CLIENT_KEY=certs/job-admin-operator/operator.key
+
+wr-cli jobs queues
+wr-cli jobs list --queue ecommerce-jobs --status dead --page-size 50
+wr-cli jobs summary --queue ecommerce-jobs --worker-namespace shop
+wr-cli jobs inspect --queue ecommerce-jobs JOB_ID --payload-out payload.bin
+wr-cli jobs retry --queue ecommerce-jobs JOB_ID --yes
+```
+
+The equivalent global flags are `--job-admin-manager`, `--job-admin-ca-cert`, `--job-admin-client-cert`, and `--job-admin-client-key`. Every subcommand accepts `--format table|json`. `list` emits one page and a continuation cursor; provide that cursor with identical filters to continue. `inspect` prints only byte lengths unless explicit output files are supplied, uses create-new writes, and requires `--force` to overwrite.
+
+For fingerprint-mapped runtime roles, issue a dedicated leaf from the runtime CA and hash the complete DER certificate exactly as the manager does:
+
+```bash
+wr-cli cert generate lifecycle-operator --ca-dir certs/
+printf 'sha256:'
+openssl x509 -in certs/lifecycle-operator.crt -outform DER \
+  | sha256sum | cut -d' ' -f1
+```
+
+Place that `sha256:<hex>` value in `operator_principals`, then provision the matching `.crt`/`.key` and runtime `ca.crt` only to that viewer, operator, or node agent. Generate a distinct leaf per principal/host; node-agent entries also require the matching `node_id`. During rotation, add the new fingerprint with the same role and node binding before replacing the files, then remove the old fingerprint after rollout.
 
 The `[database]` section is required. The manager persists engines, routing rules,
 and schemas to Postgres. Embedded SQL migrations run automatically on startup via
@@ -297,6 +340,17 @@ max_connections                  = 20 # default per-module contribution
 statement_timeout_secs           = 30 # applied to every guest statement
 idle_in_transaction_timeout_secs = 60 # terminates idle transactions
 
+# Required with [database]. Use the same queue_id for engines sharing this DB.
+[job_admin]
+listen_address    = "0.0.0.0:9150"
+advertise_address = "https://node-a.example:9150"
+queue_id          = "primary-jobs"
+
+[job_admin.tls]
+cert_path    = "certs/job-admin-delegation/node.crt"
+key_path     = "certs/job-admin-delegation/node.key"
+ca_cert_path = "certs/job-admin-delegation/ca.crt"
+
 [[module]]
 name               = "inventory"
 namespace          = "ecommerce"
@@ -307,7 +361,7 @@ database           = true
 db_max_connections = 10 # this module contributes 10 instead of 20
 ```
 
-`max_connections` defaults to **20**, `statement_timeout_secs` to **30**, and `idle_in_transaction_timeout_secs` to **60**; all three and every effective module contribution must be positive. Namespace capacity overflow fails config validation. Guest pools authenticate with the manager-issued namespace role and clean each recycled session before module-specific setup reapplies `search_path` and both timeouts. The per-module `search_path` selects the default schema for unqualified SQL; it is not an authorization boundary. Fully qualified access to another module schema in the same namespace is allowed, while other namespace roles and all guest roles remain denied access to unrelated schemas, `wr__jobs`, and `wr_system`. Module schemas remain admin-owned; namespace roles receive grants but cannot drop a schema.
+`max_connections` defaults to **20**, `statement_timeout_secs` to **30**, and `idle_in_transaction_timeout_secs` to **60**; all three and every effective module contribution must be positive. `[database]` and `[job_admin]` are an all-or-nothing pair. The job-admin bind must be a distinct socket, the advertised address must be an explicit-port HTTPS URL with a non-unspecified host, and `queue_id` uses the same lowercase/hyphen stable-name rules as namespaces. Engines on different physical databases must use different IDs; duplicate IDs across different databases cannot be detected from registration and can route an operation to the wrong queue. Namespace capacity overflow fails config validation. Guest pools authenticate with the manager-issued namespace role and clean each recycled session before module-specific setup reapplies `search_path` and both timeouts. The per-module `search_path` selects the default schema for unqualified SQL; it is not an authorization boundary. Fully qualified access to another module schema in the same namespace is allowed, while other namespace roles and all guest roles remain denied access to unrelated schemas, `wr__jobs`, and `wr_system`. Module schemas remain admin-owned; namespace roles receive grants but cannot drop a schema.
 
 ### Database telemetry
 
@@ -489,7 +543,7 @@ A resource frees its slot when the guest drops it, so long-lived requests should
 
 ### Outbound HTTP body limit
 
-`max_outbound_body_bytes` (top-level engine key, default **16 MiB**) bounds the size of an outbound HTTP request body a guest may send. The body is buffered incrementally up to this bound; a request whose body exceeds it is aborted (never fully buffered) and the guest's outbound call fails with an `HttpRequestBodySize` error. Response bodies are not affected (they stream through).
+`max_outbound_body_bytes` (top-level engine key, default **16 MiB**) bounds the size of a general outbound HTTP request body a guest may send. The body is buffered incrementally up to this bound; a request whose body exceeds it is aborted (never fully buffered) and the guest's outbound call fails with an `HttpRequestBodySize` error. The job API limits payloads to 1 MiB and combined identity/source/type metadata to 64 KiB, leaving protobuf headroom beneath the 2 MiB encoded submission ceiling and the default outbound-body ceiling. A nonzero `max_outbound_body_bytes` must be at least 2 MiB so it cannot admit ordinary HTTP while making a maximum legal SDK job submission unrouteable; zero remains the explicit deny-all setting. Response bodies are not affected (they stream through).
 
 ```toml
 listen_address          = "127.0.0.1:9100"
@@ -662,7 +716,7 @@ Proxies and engines can point at any single manager — they all share the same 
 
 ### CLI access
 
-The CLI requires a manager address and does **not** require database access. Manager connections use mTLS; the certificate flags default to `--ca-cert certs/ca.crt`, `--client-cert certs/127.0.0.1.crt`, and `--client-key certs/127.0.0.1.key` (or the corresponding `WR_CA_CERT`, `WR_CLIENT_CERT`, and `WR_CLIENT_KEY` variables):
+The CLI does **not** require database access. Ordinary manager commands use runtime mTLS; the certificate flags default to `--ca-cert certs/ca.crt`, `--client-cert certs/127.0.0.1.crt`, and `--client-key certs/127.0.0.1.key` (or the corresponding `WR_CA_CERT`, `WR_CLIENT_CERT`, and `WR_CLIENT_KEY` variables). Job commands use the separate required `WR_JOB_ADMIN_*`/`--job-admin-*` connection described above:
 
 ```bash
 # Via flag
@@ -676,11 +730,24 @@ wr-cli engines list
 wr-cli --manager https://manager-1:9000 cluster status
 wr-cli --manager https://manager-1:9000 cluster status --output json
 
+# Operator-admin queue administration (one bounded list page per invocation)
+export WR_JOB_ADMIN_MANAGER=https://manager-1:9020
+export WR_JOB_ADMIN_CA_CERT=certs/job-admin-operator/ca.crt
+export WR_JOB_ADMIN_CLIENT_CERT=certs/job-admin-operator/operator.crt
+export WR_JOB_ADMIN_CLIENT_KEY=certs/job-admin-operator/operator.key
+wr-cli jobs queues
+wr-cli jobs list --queue primary-jobs --status dead --page-size 50
+wr-cli jobs summary --queue primary-jobs --worker-namespace ecommerce
+wr-cli jobs inspect --queue primary-jobs JOB_ID --payload-out payload.bin
+wr-cli jobs retry --queue primary-jobs JOB_ID --yes
+
 # Focus and automation policies
 wr-cli cluster status --node node-a --detail
 wr-cli cluster status --service ecommerce.inventory@1.0.0 --fail-on unhealthy
 wr-cli cluster status --fail-on unknown  # strict: unknown/not-reported is non-zero
 ```
+
+`jobs` never falls back to the ordinary manager address or runtime mTLS files. Every jobs subcommand supports `--format table|json`. List emits one page and its `next_cursor`; reuse the cursor only with identical filters. Inspect reports payload/result lengths by default and writes exact bytes only to explicit create-new output paths (`--force` replaces). Retry is dead-only, requires `--yes`, and is never automatically replayed after an uncertain response. The CLI rejects unknown status values, missing or malformed required timestamps, inconsistent lifecycle counters/claim fields, and inconsistent summary totals instead of rendering plausible output. Payloads and successful results are limited to 1 MiB each, combined job identity/source/type metadata to 64 KiB, and error text to 1 MiB; the admin transport ceiling is 4 MiB.
 
 `cluster status` uses one `GetClusterStatus` RPC and never requires direct PostgreSQL access. The default is display-only; only an explicit `--fail-on` turns reported state into an exit gate. Query and mTLS failures are always non-zero. Engine/module freshness uses the manager's configured `engine_heartbeat_timeout_secs` and `module_heartbeat_timeout_secs`. Manager DB heartbeat evidence uses the existing 60-second manager liveness backstop, while chitchat remains authoritative after its startup convergence window. Proxy routing-sync age, circuit state, and host resource usage are not configured status inputs and render as unknown/not reported.
 

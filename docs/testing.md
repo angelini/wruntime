@@ -23,13 +23,16 @@ just deployment-e2e-python-test       # locked provider/assertion unit tests
 just test-local-e2e-lock              # same-host fixed-port exclusion fixture
 just test-lifecycle-runners            # foreground runner/barrier/reaping fixtures
 just test-one migration_test          # real DB migration history and constraints
+just test-one job_migration_test      # embedded queue schema and inventory indexes
+just test-one worker_test             # queue queries, cursor, summary, retry races
 just test-one operation_test          # manager evidence/authority/restoration transactions
-just test-one manager_test            # real role-gated manager mTLS boundary
+just test-one manager_test            # role-gated mTLS and job delegate registration
 just test-one multi_manager_test      # shared-DB manager loss/takeover behavior
 just test-one node_agent_operation_test # deterministic agent lease/recovery/effect tests
 just test-one lifecycle_test          # signal-driven lifecycle and retained Child proof
 just test-one proxy_test
 just test-one version_test
+cargo test -p wr-cli cmd::jobs        # jobs validation, redaction, binary export policy
 just deployment-e2e-preflight         # non-mutating Proxmox target verification
 just dev-down                # stop dev infrastructure
 ```
@@ -41,6 +44,8 @@ This prevents changed guest sources or schemas from running against stale staged
 components. Run `just dev-up` first when using those full recipes.
 
 `just bench-proxy-routing [iterations] [warmup] [concurrency]` runs only the proxy-to-stub benchmark. It creates one HTTP/2 client, warms its connection before measurement, and reuses it for sequential and concurrent requests. The default dimensions are `500 10 20`; explicit positional values are preserved. `just bench [iterations] [warmup] [concurrency]` applies the same dimension contract to the full benchmark test target. `cargo test -p wr-proxy --features count-allocations direct_selection_core_is_allocation_free_for_eight_candidates` runs the vetted `allocation-counter` gate after a warm routing-core call; selector parsing is checked separately because `semver::VersionReq` parsing is not part of that zero-allocation selection boundary.
+
+Job-administration DB tests require Postgres and exercise V3 inventory indexes, the V4 dead-state repair/constraint, filter-bound keyset pages (including malformed/mismatched cursors and insertion between pages), empty and all-state summaries, inspection lifecycle validation, persistence size boundaries, retry state/race behavior, and sleeping-worker notification. Transport/security qualification additionally proves that the three CA roots are disjoint, only an operator-admin CA client can call the manager's dedicated `JobAdminService` listener, that listener exposes no ordinary manager services, runtime credentials fail against it, the engine accepts delegation-CA clients (with issuance restricted to manager identities), operator-admin credentials fail directly against an engine, maximum-size inspection crosses both gRPC hops, reads fail over only before dispatch, mutations qualify only one deterministic delegate, and retry is not replayed after uncertain transport. Changes to generated certificate mounts or advertised admin addresses require the protected systemd and Docker deployment stage. That stage deploys database-enabled engines with the admin listener and delegation mounts, rejects runtime trust on the operator listener, discovers the registered queue, and delegates a summary request to the engine for each backend.
 
 Direct `cargo test -p wr-tests` runs are allowed for quick local checks.
 DB-backed tests use `WRT_TEST_DB_URL` and skip through the shared helper policy when it is absent. A skip is useful for unrelated local work but is **unmet evidence**, not a passing result, when migration or durable manager semantics changed. S3-backed tests use `WRT_TEST_S3_ENDPOINT`,

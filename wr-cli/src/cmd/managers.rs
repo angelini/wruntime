@@ -344,6 +344,14 @@ fn resolve_manager_config_template(
         .context("failed to resolve template in manager.toml")
 }
 
+fn operator_admin_certificate_sources(cert_dir: &str, host: &str) -> [String; 3] {
+    [
+        format!("{cert_dir}/job-admin-operator/ca.crt"),
+        format!("{cert_dir}/job-admin-operator/{host}.crt"),
+        format!("{cert_dir}/job-admin-operator/{host}.key"),
+    ]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagerDeployPhase {
     PrepareBundle,
@@ -613,6 +621,55 @@ async fn deploy(args: DeployArgs) -> Result<()> {
                     helpers::run_ssh(
                         &ssh_base,
                         &format!("sudo mkdir -p {remote_cert_dir} && sudo mv {tmp_path} {remote_cert_dir}/{remote_name}"),
+                    )?;
+                }
+                let remote_operator_dir = format!("{remote_cert_dir}/job-admin-operator");
+                let [operator_ca, operator_cert, operator_key] =
+                    operator_admin_certificate_sources(&cert_dir, host);
+                for (local, remote_name) in [
+                    (operator_ca, "ca.crt"),
+                    (operator_cert, "manager.crt"),
+                    (operator_key, "manager.key"),
+                ] {
+                    if !Path::new(&local).exists() {
+                        bail!("Operator job-admin certificate file not found: {local}. Run `just certs` or provision the operator-admin PKI first.");
+                    }
+                    let tmp_path = format!("/tmp/job-admin-operator-{remote_name}");
+                    helpers::scp_file(
+                        &local,
+                        &args.remote,
+                        &tmp_path,
+                        ssh_key.as_deref(),
+                        ssh_port,
+                    )
+                    .with_context(|| format!("failed to upload {local}"))?;
+                    helpers::run_ssh(
+                        &ssh_base,
+                        &format!("sudo mkdir -p {remote_operator_dir} && sudo mv {tmp_path} {remote_operator_dir}/{remote_name}"),
+                    )?;
+                }
+                let delegation_dir = format!("{cert_dir}/job-admin-delegation");
+                let remote_delegation_dir = format!("{remote_cert_dir}/job-admin-delegation");
+                for (local, remote_name) in [
+                    (format!("{delegation_dir}/ca.crt"), "ca.crt"),
+                    (format!("{delegation_dir}/manager.crt"), "manager.crt"),
+                    (format!("{delegation_dir}/manager.key"), "manager.key"),
+                ] {
+                    if !Path::new(&local).exists() {
+                        bail!("Job-admin delegation certificate file not found: {local}. Run `just certs` or provision the delegation PKI first.");
+                    }
+                    let tmp_path = format!("/tmp/job-admin-{remote_name}");
+                    helpers::scp_file(
+                        &local,
+                        &args.remote,
+                        &tmp_path,
+                        ssh_key.as_deref(),
+                        ssh_port,
+                    )
+                    .with_context(|| format!("failed to upload {local}"))?;
+                    helpers::run_ssh(
+                        &ssh_base,
+                        &format!("sudo mkdir -p {remote_delegation_dir} && sudo mv {tmp_path} {remote_delegation_dir}/{remote_name}"),
                     )?;
                 }
                 println!("OK");
@@ -895,6 +952,23 @@ fn status(args: StatusArgs) -> Result<()> {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn protected_script_generates_manager_operator_certificate_under_provisioned_host_name() {
+        assert_eq!(
+            operator_admin_certificate_sources("certs", "manager.example"),
+            [
+                "certs/job-admin-operator/ca.crt",
+                "certs/job-admin-operator/manager.example.crt",
+                "certs/job-admin-operator/manager.example.key",
+            ]
+        );
+        assert!(
+            include_str!("../../../dev/validate-deployment-lifecycle.sh").contains(
+                "cert generate \"$MANAGER_HOST\" --ca-dir \"$CERT_DIR/job-admin-operator\""
+            )
+        );
+    }
 
     fn manager_test_bundle(payload: &[u8], declared_payload: &[u8]) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

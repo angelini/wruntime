@@ -197,6 +197,8 @@ async fn register_ready(
             secrets: vec![],
             peer_address: "https://127.0.0.1:9443".into(),
             db_namespaces: vec![],
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
             deployment: Some(DeploymentMetadata {
                 node_id: deployment.node_id.clone(),
                 revision: deployment.revision,

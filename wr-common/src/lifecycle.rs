@@ -4,6 +4,20 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 
+/// Maximum persisted payload or successful result bytes for one worker job.
+pub const MAX_JOB_BLOB_BYTES: usize = 1024 * 1024;
+/// Maximum persisted last-error text bytes.
+pub const MAX_JOB_ERROR_BYTES: usize = 1024 * 1024;
+/// Maximum combined encoded identity/source/type metadata accepted at submission.
+pub const MAX_JOB_METADATA_BYTES: usize = 64 * 1024;
+/// Maximum encoded SubmitJob request body, including protobuf overhead.
+pub const MAX_JOB_SUBMIT_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum queue entries returned by unpaged discovery.
+pub const MAX_JOB_QUEUE_DISCOVERY_ENTRIES: usize = 10_000;
+/// Maximum unary job-admin message. A detail can include payload, result, error,
+/// metadata, and protobuf overhead simultaneously.
+pub const MAX_JOB_ADMIN_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobState {
     Pending,

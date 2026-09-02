@@ -3,13 +3,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use deadpool_postgres::Pool;
-use http_body_util::BodyExt as _;
+use http_body_util::{BodyExt as _, Limited};
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use crate::{InboundRequest, ModuleTx};
 use wr_common::lifecycle::{
-    AttemptCount, JobState, JobTimeoutSecs, MaxAttempts, WorkerConcurrency,
+    AttemptCount, JobState, JobTimeoutSecs, MaxAttempts, WorkerConcurrency, MAX_JOB_BLOB_BYTES,
+    MAX_JOB_ERROR_BYTES, MAX_JOB_METADATA_BYTES,
 };
 use wr_common::lifecycle_service::AdmissionGate;
 use wr_common::task_group::{TaskCancellation, TaskExit, TaskGroup};
@@ -28,6 +29,25 @@ pub async fn insert_job(
     source_namespace: &str,
     source_module: &str,
 ) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        payload.len() <= MAX_JOB_BLOB_BYTES,
+        "job payload exceeds {MAX_JOB_BLOB_BYTES} bytes"
+    );
+    let metadata_bytes = [
+        namespace,
+        name,
+        version,
+        job_type,
+        source_namespace,
+        source_module,
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, value| total.checked_add(value.len()))
+    .ok_or_else(|| anyhow::anyhow!("job metadata length overflow"))?;
+    anyhow::ensure!(
+        metadata_bytes <= MAX_JOB_METADATA_BYTES,
+        "job metadata exceeds {MAX_JOB_METADATA_BYTES} bytes"
+    );
     let client = pool.get().await?;
     let job_id = uuid::Uuid::new_v4().to_string();
     let timeout = JobTimeoutSecs::new(if timeout_secs == 0 { 300 } else { timeout_secs })?;
@@ -164,6 +184,10 @@ pub async fn complete_job(
     claim_id: uuid::Uuid,
     result: &[u8],
 ) -> anyhow::Result<Finalization> {
+    anyhow::ensure!(
+        result.len() <= MAX_JOB_BLOB_BYTES,
+        "job result exceeds {MAX_JOB_BLOB_BYTES} bytes"
+    );
     let client = pool.get().await?;
     let rows = client
         .execute(
@@ -184,6 +208,11 @@ pub async fn fail_job(
     claim_id: uuid::Uuid,
     error_msg: &str,
 ) -> anyhow::Result<Finalization> {
+    anyhow::ensure!(!error_msg.is_empty(), "job error must not be empty");
+    anyhow::ensure!(
+        error_msg.len() <= MAX_JOB_ERROR_BYTES,
+        "job error exceeds {MAX_JOB_ERROR_BYTES} bytes"
+    );
     let client = pool.get().await?;
     let rows = client
         .execute(
@@ -206,6 +235,7 @@ pub async fn fail_job(
 /// `SKIP LOCKED` keeps multiple engine coordinators safe and non-blocking.
 pub async fn recover_stale_jobs(pool: &Pool) -> anyhow::Result<u64> {
     let client = pool.get().await?;
+    let retained_error_chars = i32::try_from(MAX_JOB_ERROR_BYTES / 4 - 32)?;
     let count = client
         .execute(
             "WITH expired AS ( \
@@ -215,14 +245,14 @@ pub async fn recover_stale_jobs(pool: &Pool) -> anyhow::Result<u64> {
              ) \
              UPDATE wr__jobs.jobs AS jobs SET \
                status = CASE WHEN jobs.attempt < jobs.max_attempts THEN 'pending' ELSE 'dead' END, \
-               error_message = COALESCE(jobs.error_message, '') || ' [stale recovery]', \
+               error_message = LEFT(COALESCE(jobs.error_message, ''), $1) || ' [stale recovery]', \
                claimed_at = NULL, claimed_by = NULL, claim_id = NULL, lease_expires_at = NULL, \
                updated_at = now() \
              FROM expired \
              WHERE jobs.job_id = expired.job_id \
                AND jobs.status = 'running' \
                AND jobs.claim_id = expired.claim_id",
-            &[],
+            &[&retained_error_chars],
         )
         .await?;
     Ok(count)
@@ -272,7 +302,7 @@ pub struct WorkerPoolConfig {
 const LONG_IDENTITY_WORKER_CHANNEL: &str = "wr_jobs_long_identity";
 const MAX_POSTGRES_CHANNEL_BYTES: usize = 63;
 
-fn worker_channel(namespace: &str, name: &str, version: &str) -> String {
+pub(crate) fn worker_channel(namespace: &str, name: &str, version: &str) -> String {
     let channel = if version.is_empty() {
         format!("wr_jobs_{namespace}_{name}_unversioned")
     } else {
@@ -488,8 +518,7 @@ async fn dispatch_job(pool: &Pool, tx: &ModuleTx, job: ClaimedJob, job_timeout: 
             .await
             .map_err(|_| "module dropped response".to_string())?;
         let status = response.status();
-        let body = response
-            .into_body()
+        let body = Limited::new(response.into_body(), MAX_JOB_BLOB_BYTES)
             .collect()
             .await
             .map_err(|error| format!("response body: {error}"))?
@@ -508,7 +537,9 @@ async fn dispatch_job(pool: &Pool, tx: &ModuleTx, job: ClaimedJob, job_timeout: 
         }
         Ok(Ok((status, body))) => {
             let status = status.as_u16();
-            let body = String::from_utf8_lossy(&body);
+            let error_body_limit = MAX_JOB_ERROR_BYTES / 4;
+            let body = &body[..body.len().min(error_body_limit)];
+            let body = String::from_utf8_lossy(body);
             let msg = format!("HTTP {status}: {body}");
             warn!(job_id = %job_id, status, "job failed");
             finalize_failure(pool, &job_id, claim_id, &msg).await;

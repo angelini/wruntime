@@ -64,6 +64,7 @@ macro_rules! name_type {
 
 name_type!(Namespace, "namespace");
 name_type!(ModuleName, "module name");
+name_type!(JobQueueId, "job queue id");
 
 macro_rules! opaque_id_type {
     ($name:ident, $label:literal) => {
@@ -229,6 +230,8 @@ mod tests {
         assert!(ModuleName::parse("a.b").is_err());
         assert!(Namespace::parse("Foo").is_err());
         assert!(Namespace::parse("a".repeat(25)).is_err());
+        assert!(JobQueueId::parse("primary-jobs").is_ok());
+        assert!(JobQueueId::parse("Primary_Jobs").is_err());
     }
     #[test]
     fn borrowed_and_owned_route_validation_match() {

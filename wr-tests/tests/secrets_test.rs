@@ -159,6 +159,8 @@ async fn test_set_secret_upsert_overwrites() -> Result<()> {
                 }],
                 db_namespaces: vec![],
                 deployment: None,
+                job_queue_id: String::new(),
+                job_admin_address: String::new(),
             }),
         })
         .await?
@@ -281,6 +283,8 @@ async fn test_register_engine_with_secrets() -> Result<()> {
                 ],
                 db_namespaces: vec![],
                 deployment: None,
+                job_queue_id: String::new(),
+                job_admin_address: String::new(),
             }),
         })
         .await?
@@ -324,6 +328,8 @@ async fn test_register_engine_with_missing_secret_fails() -> Result<()> {
                 }],
                 db_namespaces: vec![],
                 deployment: None,
+                job_queue_id: String::new(),
+                job_admin_address: String::new(),
             }),
         })
         .await;
@@ -358,6 +364,8 @@ async fn test_register_engine_no_secrets_succeeds() -> Result<()> {
                 secrets: vec![],
                 db_namespaces: vec![],
                 deployment: None,
+                job_queue_id: String::new(),
+                job_admin_address: String::new(),
             }),
         })
         .await?
@@ -423,6 +431,8 @@ async fn test_secrets_across_namespaces() -> Result<()> {
                 ],
                 db_namespaces: vec![],
                 deployment: None,
+                job_queue_id: String::new(),
+                job_admin_address: String::new(),
             }),
         })
         .await?
@@ -502,6 +512,8 @@ async fn test_secret_deleted_then_registration_fails() -> Result<()> {
                 }],
                 db_namespaces: vec![],
                 deployment: None,
+                job_queue_id: String::new(),
+                job_admin_address: String::new(),
             }),
         })
         .await;
@@ -536,6 +548,8 @@ async fn test_concurrent_db_credential_registration_same_password() -> Result<()
                         secrets: vec![],
                         db_namespaces: vec![ns],
                         deployment: None,
+                        job_queue_id: String::new(),
+                        job_admin_address: String::new(),
                     }),
                 })
                 .await
@@ -572,6 +586,8 @@ async fn test_concurrent_db_credential_registration_same_password() -> Result<()
                 secrets: vec![],
                 db_namespaces: vec![namespace.into()],
                 deployment: None,
+                job_queue_id: String::new(),
+                job_admin_address: String::new(),
             }),
         })
         .await?
@@ -597,6 +613,8 @@ async fn test_db_credential_reregistration_returns_same_password() -> Result<()>
                 secrets: vec![],
                 db_namespaces: vec![namespace.into()],
                 deployment: None,
+                job_queue_id: String::new(),
+                job_admin_address: String::new(),
             }),
         })
         .await?
@@ -613,6 +631,8 @@ async fn test_db_credential_reregistration_returns_same_password() -> Result<()>
                 secrets: vec![],
                 db_namespaces: vec![namespace.into()],
                 deployment: None,
+                job_queue_id: String::new(),
+                job_admin_address: String::new(),
             }),
         })
         .await?

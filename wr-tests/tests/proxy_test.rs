@@ -186,6 +186,8 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
                 secrets: vec![],
                 db_namespaces: vec![],
                 deployment: None,
+                job_queue_id: String::new(),
+                job_admin_address: String::new(),
             }),
         }))
         .await?

@@ -987,6 +987,14 @@ fn bundle(args: BundleArgs) -> Result<()> {
 
 // --- deploy ---
 
+fn delegation_certificate_sources(cert_dir: &str, host: &str) -> [String; 3] {
+    [
+        format!("{cert_dir}/job-admin-delegation/ca.crt"),
+        format!("{cert_dir}/job-admin-delegation/{host}.crt"),
+        format!("{cert_dir}/job-admin-delegation/{host}.key"),
+    ]
+}
+
 fn staging_release_dir(workdir: &str, revision: u64) -> String {
     format!("{workdir}/wr-node/releases/.{revision}.tmp")
 }
@@ -1032,8 +1040,18 @@ fn validate_deploy_listener_ports(configs: &[(String, String)], peer_port: u16) 
             if let Some(address) = config.get(field).and_then(toml::Value::as_str) {
                 let port = helpers::extract_port(address)?.get();
                 if !ports.insert(port) {
-                    bail!("deployed peer port conflicts with a listener in bundled config {name}");
+                    bail!("deployed listener port conflicts in bundled config {name}");
                 }
+            }
+        }
+        if let Some(address) = config
+            .get("job_admin")
+            .and_then(|value| value.get("listen_address"))
+            .and_then(toml::Value::as_str)
+        {
+            let port = helpers::extract_port(address)?.get();
+            if !ports.insert(port) {
+                bail!("deployed job-admin listener port conflicts in bundled config {name}");
             }
         }
     }
@@ -1133,6 +1151,29 @@ fn materialize_resolved_release(
         std::fs::copy(&source, &target)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
+    }
+    if configs
+        .iter()
+        .any(|(_, config)| config.contains("[job_admin]"))
+    {
+        let delegation_dir = release.join("certs/job-admin-delegation");
+        std::fs::create_dir_all(&delegation_dir)?;
+        let [delegation_ca, delegation_cert, delegation_key] =
+            delegation_certificate_sources(cert_dir, host_name);
+        for (source, name, mode) in [
+            (delegation_ca, "ca.crt", 0o644),
+            (delegation_cert, "node.crt", 0o644),
+            (delegation_key, "node.key", 0o600),
+        ] {
+            anyhow::ensure!(
+                Path::new(&source).is_file(),
+                "job-admin delegation certificate file not found: {source}"
+            );
+            let target = delegation_dir.join(name);
+            std::fs::copy(&source, &target)?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
+        }
     }
     let run_user = helpers::extract_remote_user(remote).unwrap_or("root");
     let systemd = release.join("systemd");
@@ -1682,6 +1723,23 @@ fn add_migrations_dir(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn protected_script_generates_node_delegation_certificate_under_provisioned_host_name() {
+        assert_eq!(
+            delegation_certificate_sources("certs", "node.example"),
+            [
+                "certs/job-admin-delegation/ca.crt",
+                "certs/job-admin-delegation/node.example.crt",
+                "certs/job-admin-delegation/node.example.key",
+            ]
+        );
+        assert!(
+            include_str!("../../../dev/validate-deployment-lifecycle.sh").contains(
+                "cert generate \"$NODE_HOST\" --ca-dir \"$CERT_DIR/job-admin-delegation\""
+            )
+        );
+    }
 
     fn temp_bundle_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()

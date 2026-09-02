@@ -140,6 +140,8 @@ async fn test_deregister_waits_for_lock() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -330,6 +332,8 @@ async fn test_deregister_no_rules_no_version_bump() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;
@@ -371,6 +375,8 @@ async fn test_deregister_with_rules_bumps_version() -> Result<()> {
             secrets: vec![],
             db_namespaces: vec![],
             deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }),
     })
     .await?;

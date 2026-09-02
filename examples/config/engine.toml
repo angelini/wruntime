@@ -17,6 +17,17 @@ max_connections = 20                                                    # defaul
 # statement_timeout_secs              = 30   # per-statement timeout for guest queries (default: 30)
 # idle_in_transaction_timeout_secs    = 60   # kill idle-in-transaction sessions (default: 60)
 
+# Required whenever [database] is configured.
+[job_admin]
+listen_address    = "127.0.0.1:9150"
+advertise_address = "https://127.0.0.1:9150"
+queue_id          = "example-jobs"
+
+[job_admin.tls]
+cert_path    = "certs/job-admin-delegation/127.0.0.1.crt"
+key_path     = "certs/job-admin-delegation/127.0.0.1.key"
+ca_cert_path = "certs/job-admin-delegation/ca.crt"
+
 # Optional — remove this section if no modules need LLM inference.
 # [llm]
 # provider         = "anthropic"

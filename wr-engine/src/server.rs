@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,41 +17,18 @@ use prost::Message;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
-use tracing::{info, info_span, warn, Instrument};
+use tracing::{info, info_span, Instrument};
 
 use crate::registry::{InboundRequest, ModuleRegistry};
 use wr_common::lifecycle_service::{AdmissionGate, AdmissionGuard};
 use wr_common::process_lifecycle::LifecycleSnapshotHandle;
 use wr_common::task_group::{TaskCancellation, TaskExit};
-use wr_common::wruntime::{
-    GetJobStatusRequest, GetJobStatusResponse, GetLifecycleStatusResponse, SubmitJobRequest,
-    SubmitJobResponse,
+use wr_common::wruntime::GetLifecycleStatusResponse;
+use wr_engine::worker_http::{
+    canonical_worker_path, handle_worker_http_request as handle_worker_grpc, WorkerDefaults,
 };
 
 const WORKER_SERVICE_PREFIX: &str = "/wruntime.WorkerService/";
-const SUBMIT_JOB_PATH: &str = "/wruntime.WorkerService/SubmitJob";
-const GET_JOB_STATUS_PATH: &str = "/wruntime.WorkerService/GetJobStatus";
-const SHORT_SUBMIT_JOB_PATH: &str = "/SubmitJob";
-const SHORT_GET_JOB_STATUS_PATH: &str = "/GetJobStatus";
-
-fn canonical_worker_path(path: &str) -> Option<&'static str> {
-    match path {
-        SUBMIT_JOB_PATH | SHORT_SUBMIT_JOB_PATH => Some(SUBMIT_JOB_PATH),
-        GET_JOB_STATUS_PATH | SHORT_GET_JOB_STATUS_PATH => Some(GET_JOB_STATUS_PATH),
-        _ => None,
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct WorkerPolicy {
-    max_attempts: u32,
-    timeout_secs: u32,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct WorkerDefaults {
-    policies: HashMap<wr_common::identity::ModuleId, WorkerPolicy>,
-}
 
 #[derive(Clone)]
 pub(crate) struct EngineAdmission {
@@ -75,39 +51,6 @@ impl RoutedIdentity {
         wr_common::identity::ModuleId::parse(namespace, module, version)
             .map(Self)
             .map_err(|error| format!("invalid routed identity: {error}"))
-    }
-}
-
-impl WorkerDefaults {
-    pub(crate) fn from_modules(
-        modules: &[wr_engine::config::ModuleConfig],
-    ) -> anyhow::Result<Self> {
-        let mut policies = HashMap::new();
-        for module in modules {
-            if module.mode == wr_engine::config::ModuleMode::Worker {
-                let id = wr_common::identity::ModuleId::parse(
-                    &module.namespace,
-                    &module.name,
-                    &module.version,
-                )?;
-                policies.insert(
-                    id,
-                    WorkerPolicy {
-                        max_attempts: module.worker_max_attempts,
-                        timeout_secs: u32::try_from(module.worker_job_timeout_secs)
-                            .unwrap_or(u32::MAX),
-                    },
-                );
-            }
-        }
-        Ok(Self { policies })
-    }
-
-    fn policy_for(&self, id: &wr_common::identity::ModuleId) -> WorkerPolicy {
-        self.policies.get(id).copied().unwrap_or(WorkerPolicy {
-            max_attempts: 3,
-            timeout_secs: 300,
-        })
     }
 }
 
@@ -340,15 +283,7 @@ async fn handle(
     if request_path.starts_with(WORKER_SERVICE_PREFIX)
         || canonical_worker_path(request_path).is_some()
     {
-        let path = request_path.to_owned();
-        return handle_worker_grpc(
-            req,
-            &path,
-            routed.ok().map(|identity| identity.0),
-            db_pool,
-            worker_defaults,
-        )
-        .await;
+        return handle_worker_grpc(req, db_pool, worker_defaults).await;
     }
 
     let routed = match routed {
@@ -416,225 +351,16 @@ fn err(status: StatusCode, msg: &str) -> wr_engine::EngineResponse {
         .unwrap()
 }
 
-fn worker_err(status: StatusCode, msg: &str) -> wr_engine::EngineResponse {
-    let body = json!({ "error": msg });
-    Response::builder()
-        .status(status)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(wr_engine::response_full(Bytes::from(body.to_string())))
-        .unwrap()
-}
-
-async fn handle_worker_grpc(
-    req: Request<hyper::body::Incoming>,
-    path: &str,
-    routed: Option<wr_common::identity::ModuleId>,
-    db_pool: Option<Arc<Pool>>,
-    worker_defaults: Arc<WorkerDefaults>,
-) -> wr_engine::EngineResponse {
-    let routed_version = routed.as_ref().map(|id| id.version.to_string());
-    let routed_namespace = routed.as_ref().map(|id| id.route.namespace.as_str());
-    let routed_module = routed.as_ref().map(|id| id.route.module.as_str());
-    let body = match BodyExt::collect(req.into_body()).await {
-        Ok(c) => c.to_bytes(),
-        Err(e) => {
-            warn!(error = %e, "worker grpc body read error");
-            return worker_err(StatusCode::BAD_REQUEST, "failed to read body");
-        }
-    };
-
-    handle_worker_grpc_bytes(
-        path,
-        body,
-        db_pool,
-        routed_namespace,
-        routed_module,
-        routed_version.as_deref(),
-        worker_defaults.as_ref(),
-    )
-    .await
-}
-
-async fn handle_worker_grpc_bytes(
-    path: &str,
-    body: Bytes,
-    db_pool: Option<Arc<Pool>>,
-    routed_namespace: Option<&str>,
-    routed_module: Option<&str>,
-    routed_version: Option<&str>,
-    worker_defaults: &WorkerDefaults,
-) -> wr_engine::EngineResponse {
-    let path = match canonical_worker_path(path) {
-        Some(path) => path,
-        None => return worker_err(StatusCode::NOT_FOUND, "unknown worker endpoint"),
-    };
-
-    let pool = match db_pool {
-        Some(p) => p,
-        None => return worker_err(StatusCode::SERVICE_UNAVAILABLE, "no database configured"),
-    };
-
-    match path {
-        SUBMIT_JOB_PATH => {
-            handle_submit_job(
-                &pool,
-                &body,
-                routed_namespace,
-                routed_module,
-                routed_version,
-                worker_defaults,
-            )
-            .await
-        }
-        GET_JOB_STATUS_PATH => handle_get_job_status(&pool, &body).await,
-        _ => unreachable!("worker endpoint path checked above"),
-    }
-}
-
-async fn handle_submit_job(
-    pool: &Pool,
-    body: &[u8],
-    routed_namespace: Option<&str>,
-    routed_module: Option<&str>,
-    routed_version: Option<&str>,
-    worker_defaults: &WorkerDefaults,
-) -> wr_engine::EngineResponse {
-    let req = match SubmitJobRequest::decode(body) {
-        Ok(r) => r,
-        Err(e) => return worker_err(StatusCode::BAD_REQUEST, &format!("decode: {e}")),
-    };
-
-    let (routed_namespace, routed_module) = match (routed_namespace, routed_module) {
-        (Some(namespace), Some(module)) => (namespace, module),
-        _ => {
-            return worker_err(
-                StatusCode::BAD_REQUEST,
-                "missing routed worker identity headers",
-            )
-        }
-    };
-    if req.worker_namespace != routed_namespace || req.worker_name != routed_module {
-        return worker_err(
-            StatusCode::BAD_REQUEST,
-            "SubmitJobRequest worker identity does not match routed destination",
-        );
-    }
-
-    if !req.worker_version.is_empty() {
-        if let Some(routed_version) = routed_version {
-            if routed_version != req.worker_version {
-                return worker_err(
-                    StatusCode::BAD_REQUEST,
-                    "x-wr-version does not match SubmitJobRequest.worker_version",
-                );
-            }
-        }
-    }
-
-    let defaults_version = if req.worker_version.is_empty() {
-        routed_version.unwrap_or_default()
-    } else {
-        &req.worker_version
-    };
-
-    let policy = wr_common::identity::ModuleId::parse(
-        &req.worker_namespace,
-        &req.worker_name,
-        defaults_version,
-    )
-    .ok()
-    .map(|id| worker_defaults.policy_for(&id))
-    .unwrap_or(WorkerPolicy {
-        max_attempts: 3,
-        timeout_secs: 300,
-    });
-    let max_attempts = if req.max_attempts > 0 {
-        req.max_attempts
-    } else {
-        policy.max_attempts
-    };
-    let timeout_secs = if req.timeout_secs > 0 {
-        req.timeout_secs
-    } else {
-        policy.timeout_secs
-    };
-
-    match wr_engine::worker::insert_job(
-        pool,
-        &req.worker_namespace,
-        &req.worker_name,
-        &req.worker_version,
-        &req.job_type,
-        &req.payload,
-        timeout_secs,
-        max_attempts,
-        "", // source_namespace (not available on this path)
-        "", // source_module (not available on this path)
-    )
-    .await
-    {
-        Ok(job_id) => {
-            let resp = SubmitJobResponse { job_id };
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/x-protobuf")
-                .body(wr_engine::response_full(Bytes::from(resp.encode_to_vec())))
-                .unwrap()
-        }
-        Err(e) => {
-            warn!(error = %e, "submit job failed");
-            worker_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("insert: {e}"))
-        }
-    }
-}
-
-async fn handle_get_job_status(pool: &Pool, body: &[u8]) -> wr_engine::EngineResponse {
-    let req = match GetJobStatusRequest::decode(body) {
-        Ok(r) => r,
-        Err(e) => return worker_err(StatusCode::BAD_REQUEST, &format!("decode: {e}")),
-    };
-
-    match wr_engine::worker::get_job_status(pool, &req.job_id).await {
-        Ok(Some(status)) => {
-            let resp = GetJobStatusResponse {
-                job_id: status.job_id,
-                status: match status.status {
-                    wr_common::lifecycle::JobState::Pending => {
-                        wr_common::wruntime::JobState::Pending as i32
-                    }
-                    wr_common::lifecycle::JobState::Running => {
-                        wr_common::wruntime::JobState::Running as i32
-                    }
-                    wr_common::lifecycle::JobState::Complete => {
-                        wr_common::wruntime::JobState::Complete as i32
-                    }
-                    wr_common::lifecycle::JobState::Dead => {
-                        wr_common::wruntime::JobState::Dead as i32
-                    }
-                },
-                result: status.result,
-                error_message: status.error_message,
-                attempt: status.attempt.get(),
-                max_attempts: status.max_attempts.get(),
-            };
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/x-protobuf")
-                .body(wr_engine::response_full(Bytes::from(resp.encode_to_vec())))
-                .unwrap()
-        }
-        Ok(None) => worker_err(StatusCode::NOT_FOUND, "job not found"),
-        Err(e) => {
-            warn!(error = %e, "get job status failed");
-            worker_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("query: {e}"))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use wr_common::wruntime::{SubmitJobRequest, SubmitJobResponse};
+    use wr_engine::worker_http::{
+        handle_worker_grpc_bytes, worker_error as worker_err, GET_JOB_STATUS_PATH, SUBMIT_JOB_PATH,
+    };
+
+    const SHORT_SUBMIT_JOB_PATH: &str = "/SubmitJob";
+    const SHORT_GET_JOB_STATUS_PATH: &str = "/GetJobStatus";
 
     #[tokio::test]
     async fn lifecycle_rpc_is_status_only_and_never_mutates_admission() -> anyhow::Result<()> {
@@ -820,15 +546,11 @@ mod tests {
             return;
         };
         let ns = unique_prefix();
-        let defaults = WorkerDefaults {
-            policies: HashMap::from([(
-                wr_common::identity::ModuleId::parse(&ns, "mod", "1.0.0").unwrap(),
-                WorkerPolicy {
-                    max_attempts: 7,
-                    timeout_secs: 47,
-                },
-            )]),
-        };
+        let defaults = WorkerDefaults::with_policy(
+            wr_common::identity::ModuleId::parse(&ns, "mod", "1.0.0").unwrap(),
+            7,
+            47,
+        );
         let resp = handle_worker_grpc_bytes(
             SUBMIT_JOB_PATH,
             submit_body(&ns, "mod", "", 0),
@@ -936,15 +658,11 @@ mod tests {
             return;
         };
         let ns = unique_prefix();
-        let defaults = WorkerDefaults {
-            policies: HashMap::from([(
-                wr_common::identity::ModuleId::parse(&ns, "mod", "1.0.0").unwrap(),
-                WorkerPolicy {
-                    max_attempts: 7,
-                    timeout_secs: 300,
-                },
-            )]),
-        };
+        let defaults = WorkerDefaults::with_policy(
+            wr_common::identity::ModuleId::parse(&ns, "mod", "1.0.0").unwrap(),
+            7,
+            300,
+        );
 
         let resp = handle_worker_grpc_bytes(
             SUBMIT_JOB_PATH,

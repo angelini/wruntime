@@ -14,6 +14,16 @@ ca_cert_path = "certs/ca.crt"
 url             = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 100
 
+[job_admin]
+listen_address    = "127.0.0.1:9151"
+advertise_address = "https://127.0.0.1:9151"
+queue_id          = "ecommerce-jobs"
+
+[job_admin.tls]
+cert_path    = "certs/job-admin-delegation/127.0.0.1.crt"
+key_path     = "certs/job-admin-delegation/127.0.0.1.key"
+ca_cert_path = "certs/job-admin-delegation/ca.crt"
+
 [[module]]
 name            = "inventory"
 namespace       = "ecommerce"

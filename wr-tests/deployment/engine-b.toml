@@ -10,6 +10,19 @@ cert_path    = "certs/127.0.0.1.crt"
 key_path     = "certs/127.0.0.1.key"
 ca_cert_path = "certs/ca.crt"
 
+[database]
+url = "postgres://postgres@127.0.0.1:5432/wruntime_deployment_e2e"
+
+[job_admin]
+listen_address    = "0.0.0.0:9150"
+advertise_address = "https://127.0.0.1:9150"
+queue_id          = "deployment-jobs"
+
+[job_admin.tls]
+cert_path    = "certs/job-admin-delegation/node.crt"
+key_path     = "certs/job-admin-delegation/node.key"
+ca_cert_path = "certs/job-admin-delegation/ca.crt"
+
 [[module]]
 name        = "echo"
 namespace   = "deployment"

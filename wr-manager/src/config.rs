@@ -57,8 +57,12 @@ pub struct ManagerConfig {
     pub database: DatabaseConfig,
     /// Cluster configuration for multi-manager HA.
     pub cluster: ClusterConfig,
-    /// TLS certificate configuration for the gRPC listener.
+    /// TLS certificate configuration for the runtime gRPC listener.
     pub tls: TlsConfig,
+    /// Dedicated operator job-administration listener and trust root.
+    pub job_admin: JobAdminConfig,
+    /// Client identity and delegation CA used only for manager-to-engine job administration.
+    pub job_admin_delegation_tls: TlsConfig,
     /// Explicit identities allowed to use OperatorService/NodeAgentService.
     pub operator_principals: Vec<PrincipalMapping>,
 }
@@ -80,6 +84,14 @@ pub struct ClusterConfig {
 
 fn default_gossip_interval_ms() -> u64 {
     500
+}
+
+#[derive(Deserialize, Clone)]
+pub struct JobAdminConfig {
+    /// Dedicated operator-facing gRPC bind address.
+    pub listen_address: String,
+    /// Server identity and operator-admin client CA.
+    pub tls: TlsConfig,
 }
 
 #[derive(Deserialize, Clone)]
@@ -126,6 +138,8 @@ pub struct RawManagerConfig {
     pub database: DatabaseConfig,
     pub cluster: ClusterConfig,
     pub tls: TlsConfig,
+    pub job_admin: JobAdminConfig,
+    pub job_admin_delegation_tls: TlsConfig,
     #[serde(default)]
     pub operator_principals: Vec<PrincipalMapping>,
 }
@@ -186,6 +200,53 @@ impl RawManagerConfig {
         v.check(
             !self.tls.ca_cert_path.is_empty(),
             "tls.ca_cert_path is required",
+        );
+        v.check(
+            !self.job_admin.listen_address.is_empty(),
+            "job_admin.listen_address is required",
+        );
+        match self
+            .job_admin
+            .listen_address
+            .parse::<std::net::SocketAddr>()
+        {
+            Ok(job_admin) => {
+                v.check(
+                    job_admin.port() > 0,
+                    "job_admin.listen_address port must be > 0",
+                );
+                if let Ok(runtime) = self.listen_address.parse::<std::net::SocketAddr>() {
+                    v.check(
+                        runtime != job_admin,
+                        "job_admin.listen_address must not conflict with listen_address",
+                    );
+                }
+            }
+            Err(_) => v.check(false, "job_admin.listen_address must be a socket address"),
+        }
+        v.check(
+            !self.job_admin.tls.cert_path.is_empty(),
+            "job_admin.tls.cert_path is required",
+        );
+        v.check(
+            !self.job_admin.tls.key_path.is_empty(),
+            "job_admin.tls.key_path is required",
+        );
+        v.check(
+            !self.job_admin.tls.ca_cert_path.is_empty(),
+            "job_admin.tls.ca_cert_path is required",
+        );
+        v.check(
+            !self.job_admin_delegation_tls.cert_path.is_empty(),
+            "job_admin_delegation_tls.cert_path is required",
+        );
+        v.check(
+            !self.job_admin_delegation_tls.key_path.is_empty(),
+            "job_admin_delegation_tls.key_path is required",
+        );
+        v.check(
+            !self.job_admin_delegation_tls.ca_cert_path.is_empty(),
+            "job_admin_delegation_tls.ca_cert_path is required",
         );
 
         let mut fingerprints = HashSet::new();
@@ -249,6 +310,8 @@ impl TryFrom<RawManagerConfig> for ManagerConfig {
             database: raw.database,
             cluster: raw.cluster,
             tls: raw.tls,
+            job_admin: raw.job_admin,
+            job_admin_delegation_tls: raw.job_admin_delegation_tls,
             operator_principals: raw.operator_principals,
         })
     }
@@ -298,6 +361,19 @@ mod tests {
                 key_path: "key".into(),
                 ca_cert_path: "ca".into(),
             },
+            job_admin: JobAdminConfig {
+                listen_address: "127.0.0.1:9020".into(),
+                tls: TlsConfig {
+                    cert_path: "operator-server-cert".into(),
+                    key_path: "operator-server-key".into(),
+                    ca_cert_path: "operator-ca".into(),
+                },
+            },
+            job_admin_delegation_tls: TlsConfig {
+                cert_path: "delegate-cert".into(),
+                key_path: "delegate-key".into(),
+                ca_cert_path: "delegate-ca".into(),
+            },
             operator_principals,
         }
     }
@@ -341,5 +417,18 @@ mod tests {
         let mut viewer = mapping('b', "viewer", PrincipalRole::Viewer);
         viewer.node_id = Some("node-a".into());
         assert!(config(vec![viewer]).validate_inner().is_err());
+    }
+
+    #[test]
+    fn job_admin_listener_is_dedicated_and_fully_configured() {
+        let mut conflicting = config(vec![]);
+        conflicting.job_admin.listen_address = conflicting.listen_address.clone();
+        let error = conflicting.validate_inner().unwrap_err().to_string();
+        assert!(error.contains("must not conflict"));
+
+        let mut incomplete = config(vec![]);
+        incomplete.job_admin.tls.ca_cert_path.clear();
+        let error = incomplete.validate_inner().unwrap_err().to_string();
+        assert!(error.contains("job_admin.tls.ca_cert_path"));
     }
 }

@@ -8,6 +8,19 @@ cert_path    = "certs/manager.crt"
 key_path     = "certs/manager.key"
 ca_cert_path = "certs/ca.crt"
 
+[job_admin]
+listen_address = "0.0.0.0:9020"
+
+[job_admin.tls]
+cert_path    = "certs/job-admin-operator/manager.crt"
+key_path     = "certs/job-admin-operator/manager.key"
+ca_cert_path = "certs/job-admin-operator/ca.crt"
+
+[job_admin_delegation_tls]
+cert_path    = "certs/job-admin-delegation/manager.crt"
+key_path     = "certs/job-admin-delegation/manager.key"
+ca_cert_path = "certs/job-admin-delegation/ca.crt"
+
 [database]
 url             = "postgres://postgres@127.0.0.1:5432/wruntime_deployment_e2e"
 max_connections = 10

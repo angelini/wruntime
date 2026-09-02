@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tonic::transport::{Channel, Endpoint};
 use wr_common::node::TlsConfig;
+use wr_common::wruntime::job_admin_service_client::JobAdminServiceClient;
 use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
 use wr_common::wruntime::manager_service_client::ManagerServiceClient;
 use wr_common::wruntime::node_agent_service_client::NodeAgentServiceClient;
@@ -67,6 +68,20 @@ pub async fn connect_operator(addr: &str) -> Result<OperatorServiceClient<Channe
         .await
         .context("failed to connect to manager operator service")?;
     Ok(OperatorServiceClient::new(channel))
+}
+
+/// Connect to the dedicated operator job-administration listener with caller-owned TLS.
+pub async fn connect_job_admin(
+    addr: &str,
+    tls: &TlsConfig,
+) -> Result<JobAdminServiceClient<Channel>> {
+    let channel = endpoint_with_tls(addr, Some(tls))?
+        .connect()
+        .await
+        .context("failed to connect to manager job administration service")?;
+    Ok(JobAdminServiceClient::new(channel)
+        .max_decoding_message_size(wr_common::lifecycle::MAX_JOB_ADMIN_MESSAGE_BYTES)
+        .max_encoding_message_size(wr_common::lifecycle::MAX_JOB_ADMIN_MESSAGE_BYTES))
 }
 
 /// Connect to the pull-based node-agent API with the configured mTLS identity.

@@ -25,6 +25,15 @@ flowchart TB
         root_wit -.->|"usage or semantics change"| api_guide["Guest API guide"]
     end
 
+    subgraph deployment_config["Deployment configuration fanout"]
+        direction LR
+        runtime_toml["Source manager/proxy/engine TOML"] --> cli_bundle["wr-cli bundle transformers"]
+        cli_bundle --> templates["Placeholder-bearing bundle configs"]
+        templates --> resolved["Deployment-resolved runtime configs"]
+        runtime_toml --> examples["Maintained examples and test fixtures"]
+        runtime_toml --> certs["Certificate paths and deploy provisioning"]
+    end
+
     subgraph guest_schema["Guest schema fanout"]
         direction LR
         guest_proto["Canonical source<br/>guest, example, or test .proto"] --> generators["prost-build<br/>and wr-build"]
@@ -45,6 +54,7 @@ flowchart TB
 - SDK, WIT, build-generator, or host-binding changes require focused `just test-wasm-one <target>` where possible and full `just test-wasm` before completion.
 - Update the guest API guide when preferred usage or guest-visible semantics change. Exact signatures stay in Rust/WIT source.
 - Manager migrations under `wr-manager/migrations/` modify control-plane state. Module migrations are trusted guest-owned SQL, run at engine startup with target-database admin credentials and the module schema as the default `search_path`, and use a separate history/cancellation-safe locking policy.
+- Runtime listener, advertise-address, queue-identity, or TLS-path changes must fan out through `wr-cli` bundle transforms, deploy-time placeholder resolution and certificate provisioning, checked-in deployment fixtures, and runnable example TOML. Generated configs must still pass the owning runtime parser.
 
 ## Review checklist
 

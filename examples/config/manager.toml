@@ -7,6 +7,22 @@ cert_path    = "certs/manager.crt"
 key_path     = "certs/manager.key"
 ca_cert_path = "certs/ca.crt"
 
+# Dedicated operator-facing queue administration. This listener trusts only
+# the operator-admin CA and serves only JobAdminService.
+[job_admin]
+listen_address = "0.0.0.0:9020"
+
+[job_admin.tls]
+cert_path    = "certs/job-admin-operator/manager.crt"
+key_path     = "certs/job-admin-operator/manager.key"
+ca_cert_path = "certs/job-admin-operator/ca.crt"
+
+# Delegation identity for queue operations. This CA must issue only manager identities.
+[job_admin_delegation_tls]
+cert_path    = "certs/job-admin-delegation/manager.crt"
+key_path     = "certs/job-admin-delegation/manager.key"
+ca_cert_path = "certs/job-admin-delegation/ca.crt"
+
 [database]
 url             = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 10

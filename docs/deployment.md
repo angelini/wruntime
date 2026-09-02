@@ -6,7 +6,7 @@ Maintainers changing deployment generation or lifecycle behavior must run the
 protected lifecycle qualification described in [Testing](testing.md) and the
 [maintainer validation matrix](agents/wruntime-maintainer/validation.md). The
 public deployment workflow below is not a substitute for that disposable-VM
-systemd/Docker validation.
+systemd/Docker validation. The protected fixture deploys database-enabled engines and exercises job administration on both backends: generated delegation certificate mounts and advertised engine admin addresses must start successfully, runtime credentials must fail on the operator listener, queue discovery must report one fresh delegate, and a manager-mediated queue summary must reach the engine.
 
 ## Prerequisites
 
@@ -289,7 +289,7 @@ wr-cli node agent install --node-id node-b node-b.tar.gz deploy@10.0.1.51
 wr-cli node deploy --node-id node-b node-b.tar.gz deploy@10.0.1.51 --request-token node-b-initial
 ```
 
-Each node's proxy/engine internal listeners and `[node]` data/control URLs bind loopback. Only the proxy's explicitly advertised `[node].peer_address` mTLS listener is reachable across nodes; `--peer-port` fills that target-specific URL in a staged release.
+Each node's proxy/engine internal listeners and `[node]` data/control URLs bind loopback. The proxy's explicitly advertised `[node].peer_address` mTLS listener is reachable across nodes; a database-enabled engine also exposes its configured `job_admin.advertise_address` directly to managers over delegation mTLS. `--peer-port` fills the proxy target-specific URL, while the job-admin port comes from each engine config and is checked for bundle-wide conflicts.
 
 Without the config file, pass all values explicitly:
 
@@ -317,7 +317,7 @@ wr-cli node deploy --node-id node-a node-a.tar.gz deploy@10.0.1.50 \
 
 Use this procedure only with disposable hosts, database, and CA. It exercises a failed first start, a systemd manager, a Docker manager, a non-default certificate directory, and cross-seed identity/address convergence.
 
-1. Provision clean Linux hosts `${HOST_A}` and `${HOST_B}` plus an empty shared PostgreSQL database `${DB_URL}` reachable from both. Host A must use systemd; Host B must have Docker Compose. Configure passwordless sudo. Allow manager gRPC TCP port 9000 and gossip UDP port 9010 between hosts. Resolve routable addresses `${IP_A}` and `${IP_B}`; each host must be able to bind its own IP. Use the same bundle/`cluster_id`, database, secret key, and CA on both hosts.
+1. Provision clean Linux hosts `${HOST_A}` and `${HOST_B}` plus an empty shared PostgreSQL database `${DB_URL}` reachable from both. Host A must use systemd; Host B must have Docker Compose. Configure passwordless sudo. Allow runtime manager gRPC TCP port 9000, operator-admin TCP port 9020 from the operator network, and gossip UDP port 9010 between hosts. Resolve routable addresses `${IP_A}` and `${IP_B}`; each host must be able to bind its own IP. Use the same bundle/`cluster_id`, database, secret key, and trust roots on both hosts.
 2. Generate a disposable CA and host certificates in a deliberately non-default directory. The certificate SAN must cover the IP used by deploy's readiness poll:
 
    ```bash
@@ -325,6 +325,14 @@ Use this procedure only with disposable hosts, database, and CA. It exercises a 
    wr-cli cert init-ca --output "$CERT_DIR"
    wr-cli cert generate "${HOST_A}" --ca-dir "$CERT_DIR" --ip "${IP_A}"
    wr-cli cert generate "${HOST_B}" --ca-dir "$CERT_DIR" --ip "${IP_B}"
+   wr-cli cert init-ca --output "$CERT_DIR/job-admin-operator"
+   wr-cli cert generate "${HOST_A}" --ca-dir "$CERT_DIR/job-admin-operator" --ip "${IP_A}"
+   wr-cli cert generate "${HOST_B}" --ca-dir "$CERT_DIR/job-admin-operator" --ip "${IP_B}"
+   wr-cli cert generate operator --ca-dir "$CERT_DIR/job-admin-operator"
+   wr-cli cert init-ca --output "$CERT_DIR/job-admin-delegation"
+   wr-cli cert generate manager --ca-dir "$CERT_DIR/job-admin-delegation"
+   # Database-enabled nodes additionally need one host/SAN certificate from
+   # this delegation CA for each advertised engine-admin address.
    ```
 
 3. Build one reusable manager bundle:
@@ -411,23 +419,36 @@ Docker deployments use Linux host networking so proxy/engine loopback trust boun
 
 ## TLS certificates
 
-Manager gRPC and cross-node peer-proxy traffic use mTLS. Local engine-to-proxy data-plane and engine-to-proxy control-plane traffic use plain HTTP on loopback listeners; manager liveness gossip uses its separate UDP listener. Generate certificates for the mTLS boundaries before deployment:
+Manager runtime gRPC, the dedicated manager operator-admin listener, cross-node peer-proxy traffic, and manager-to-engine job administration use mTLS. Local engine-to-proxy data-plane and control-plane traffic use plain HTTP on loopback listeners; manager liveness gossip uses its separate UDP listener. Job administration deliberately uses two dedicated trust roots in addition to the runtime CA: the manager job-admin listener accepts only operator-admin CA clients, while engine listeners authorize every client certificate issued by the delegation CA. Issue that CA only to manager delegation identities; never cross-issue runtime, operator-admin, or delegation credentials.
+
+Generate certificates for all three mTLS trust domains before deployment:
 
 ```bash
 # 1. Create a CA (once per cluster)
 wr-cli cert init-ca --output ./certs/
 
 # 2. Generate per-node certificates (hostname must match the deploy target IP)
-wr-cli cert generate 10.0.1.1 --ca-dir ./certs/    # manager
-wr-cli cert generate 10.0.1.50 --ca-dir ./certs/   # node A
-wr-cli cert generate 10.0.1.51 --ca-dir ./certs/   # node B
+wr-cli cert generate 10.0.1.1 --ip 10.0.1.1 --ca-dir ./certs/    # manager
+wr-cli cert generate 10.0.1.50 --ip 10.0.1.50 --ca-dir ./certs/   # node A
+wr-cli cert generate 10.0.1.51 --ip 10.0.1.51 --ca-dir ./certs/   # node B
+
+# Separate operator-to-manager job-admin CA, server identity, and client.
+wr-cli cert init-ca --output ./certs/job-admin-operator/
+wr-cli cert generate 10.0.1.1 --ip 10.0.1.1 --ca-dir ./certs/job-admin-operator/
+wr-cli cert generate operator --ca-dir ./certs/job-admin-operator/
+
+# Separate manager-to-engine job-admin delegation CA.
+wr-cli cert init-ca --output ./certs/job-admin-delegation/
+wr-cli cert generate manager --ca-dir ./certs/job-admin-delegation/
+wr-cli cert generate 10.0.1.50 --ip 10.0.1.50 --ca-dir ./certs/job-admin-delegation/
+wr-cli cert generate 10.0.1.51 --ip 10.0.1.51 --ca-dir ./certs/job-admin-delegation/
 ```
 
-During `managers deploy`, pass `--cert-dir <dir>` (or set `cert_dir` in `wr-deploy.toml`). The command provisions `ca.crt`, `<host>.crt`, and `<host>.key` for the remote manager and uses those same local files explicitly for its readiness connection. Docker mounts the provisioned remote certificate directory read-only into the manager container.
+During `managers deploy`, pass `--cert-dir <dir>` (or set `cert_dir` in `wr-deploy.toml`). The command provisions runtime `ca.crt`, `<host>.crt`, and `<host>.key` for the remote manager and uses those same local files explicitly for its readiness connection. It also requires and provisions `job-admin-operator/{ca.crt,<host>.crt,<host>.key}` as the dedicated listener's `manager.crt`/`manager.key`, plus `job-admin-delegation/{ca.crt,manager.crt,manager.key}` for delegation. Docker mounts the provisioned remote certificate directory read-only into the manager container. Operator client keys remain caller-owned and are never copied to managers.
 
-During `node deploy`, the same option stages files inside an inactive revision release. Digest-covered release metadata supplies per-slot config and lifecycle mapping; the agent later changes only the manager-authorized slot selectors.
+During `node deploy`, the same option stages files inside an inactive revision release. Digest-covered release metadata supplies per-slot config and lifecycle mapping; the agent later changes only the manager-authorized slot selectors. If any bundled engine has `[job_admin]`, deploy additionally requires `job-admin-delegation/{ca.crt,<host>.crt,<host>.key}` and installs them under the release-relative `certs/job-admin-delegation/` directory as `ca.crt`, `node.crt`, and `node.key`.
 
-For local development, run `just certs` to generate a CA and localhost certificates.
+For local development, run `just certs` to generate the runtime, operator-admin, and delegation CAs plus localhost certificates. Permit ordinary runtime clients to reach manager TCP 9000, permit operator clients to reach only the dedicated manager job-admin TCP port (9020 in maintained examples), permit managers to reach every advertised engine job-admin TCP port (9150/9151 in maintained local examples), and deny engine admin ports from general operator/client networks. Queue IDs are deployment invariants: replicas sharing one database use one ID; different databases use different IDs. Rotate all three trust domains independently, keeping overlap in the appropriate root only.
 
 ## Remote host requirements
 

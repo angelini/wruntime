@@ -9,6 +9,7 @@ Start focused, then run the broader requirement for the change class.
 | Proxy routing/version/circuit breaker | relevant `proxy_test`, `version_test`, `concurrent_routing_test`, `cross_node_test`, and `circuit_breaker_test` targets |
 | Manager lifecycle/readiness/clustering | relevant `manager_test`, `health_test`, and `multi_manager_test` targets |
 | Worker/scheduler/schedules | relevant `worker_test`, `scheduler_test`, and `schedules_test` targets |
+| Job administration | `job_migration_test`, `worker_test`, `manager_test`, job-admin transport/mTLS tests, `cargo test -p wr-cli cmd::jobs`; protected deployment qualification when listeners/certificate mounts/generation change |
 | WIT, SDK, build generator, or host binding | `just test-wasm-one <target>`, then `just test-wasm` |
 | Guest example | `just build-<example>`, guest format/lint, then its inline recipe |
 | Migration | migration tests plus tests for the owning manager or engine/module subsystem |

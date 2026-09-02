@@ -70,9 +70,9 @@ Wruntime is a Cargo workspace implementing a distributed WASI Preview 2 runtime:
 
 | Service | Default listeners | Role |
 | --- | --- | --- |
-| `wr-manager` | 9000 mTLS gRPC, 9010 gossip | Registry, routing, schemas, schedules, secrets, heartbeats |
+| `wr-manager` | 9000 runtime mTLS gRPC, 9010 gossip, configured operator-admin mTLS gRPC | Registry, routing, schemas, schedules, secrets, heartbeats, queue-admin delegation |
 | `wr-proxy` | 9001 loopback HTTP, 9002 loopback control, 9443 mTLS peer | Streaming header-based routing and circuit breaking |
-| `wr-engine` | 9100 loopback HTTP | WASM component execution and host capabilities |
+| `wr-engine` | 9100 loopback HTTP + configured manager-only job-admin mTLS | WASM component execution and host capabilities |
 | `wr-cli node agent` | no listener | Node-bound fenced systemd/Compose lifecycle executor |
 
 Modules use `(namespace, name, version)` identity and call `http://namespace.module/{package}.{Service}/{Method}`. The engine intercepts outbound HTTP and supplies internal routing metadata; the proxy resolves a healthy local/peer destination and streams the body; the destination engine dispatches to a module instance.
@@ -81,7 +81,7 @@ Engine startup registers unhealthy routes, provisions namespace resources, appli
 
 Destructive operator lifecycle uses fingerprint-mapped manager mTLS roles, durable operations and append-only events, and a pull-based node-bound agent with fenced lease epochs. The agent executes only typed per-slot systemd/Compose effects; source/proxy headers are never authorization. Committed and staged revisions may overlap with explicit per-slot route authority.
 
-Manager gRPC and peer-proxy cross-node traffic use mTLS; manager liveness uses chitchat UDP gossip on its separately configured listener. Loopback engine/proxy traffic is plain HTTP only on documented listeners. Source routing metadata is not authorization. Guest DB pools use namespace roles without access to `wr__jobs` or `wr_system`; module schemas remain admin-owned.
+Manager runtime gRPC, its separately trusted operator-admin gRPC listener, manager-to-engine job administration, and peer-proxy cross-node traffic use separate documented mTLS domains; manager liveness uses chitchat UDP gossip on its separately configured listener. Loopback engine/proxy traffic is plain HTTP only on documented listeners. Source routing metadata is not authorization. Guest DB pools use namespace roles without access to `wr__jobs` or `wr_system`; module schemas remain admin-owned.
 
 Host interfaces are canonical under `wit/` and implemented asynchronously in `wr-engine`; guest calls remain synchronous from the guest perspective. Do not use `block_in_place` or `block_on` in host implementations.
 

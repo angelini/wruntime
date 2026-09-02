@@ -65,6 +65,11 @@ pub struct JobOptions {
 const SUBMIT_JOB_PATH: &str = "/wruntime.WorkerService/SubmitJob";
 const GET_JOB_STATUS_PATH: &str = "/wruntime.WorkerService/GetJobStatus";
 
+/// Maximum payload accepted by the runtime job queue.
+pub const MAX_JOB_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Maximum protobuf-encoded submission body accepted by the runtime.
+pub const MAX_JOB_SUBMIT_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+
 /// Submit a job to a worker module's engine-managed queue.
 ///
 /// `engine_authority` is the worker's `namespace.name` (e.g. `"codegen.worker"`).
@@ -133,6 +138,11 @@ pub fn submit_job_with_typed_options(
         ))
     })?;
 
+    if payload.len() > MAX_JOB_PAYLOAD_BYTES {
+        return Err(HttpError::InvalidRequest(format!(
+            "job payload exceeds {MAX_JOB_PAYLOAD_BYTES} bytes"
+        )));
+    }
     let body = encode_submit_job_request(
         namespace,
         name,
@@ -145,6 +155,11 @@ pub fn submit_job_with_typed_options(
             .map(MaxAttempts::get)
             .unwrap_or_default(),
     );
+    if body.len() > MAX_JOB_SUBMIT_MESSAGE_BYTES {
+        return Err(HttpError::InvalidRequest(format!(
+            "encoded job submission exceeds {MAX_JOB_SUBMIT_MESSAGE_BYTES} bytes"
+        )));
+    }
     let headers = submit_job_headers(worker_version);
     let resp = crate::http::http_request(&HttpRequest {
         authority: engine_authority,
@@ -453,6 +468,30 @@ mod tests {
         assert!(JobTimeout::new(Duration::from_millis(1_500)).is_err());
         assert!(matches!(
             submit_job_with_options("ns.worker", "1.0.0", "/Run", &[], -1, 3),
+            Err(HttpError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn maximum_job_payload_fits_the_encoded_submission_contract() {
+        let payload = vec![0_u8; MAX_JOB_PAYLOAD_BYTES];
+        let body = encode_submit_job_request(
+            "namespace",
+            "worker",
+            "1.0.0",
+            "/jobs.Run/Boundary",
+            &payload,
+            60,
+            3,
+        );
+        assert!(body.len() <= MAX_JOB_SUBMIT_MESSAGE_BYTES);
+        assert!(matches!(
+            submit_job(
+                "namespace.worker",
+                "1.0.0",
+                "/jobs.Run/Oversized",
+                &vec![0_u8; MAX_JOB_PAYLOAD_BYTES + 1],
+            ),
             Err(HttpError::InvalidRequest(_))
         ));
     }

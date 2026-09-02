@@ -4,8 +4,8 @@ use std::fmt;
 use anyhow::Result;
 use serde::de::{value::MapAccessDeserializer, Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use wr_common::identity::ModuleId;
-use wr_common::node::{is_loopback_addr, NodeConfig};
+use wr_common::identity::{JobQueueId, ModuleId, PeerHttpsUrl};
+use wr_common::node::{is_loopback_addr, NodeConfig, TlsConfig};
 
 #[derive(Deserialize, Clone)]
 pub struct EngineConfig {
@@ -28,6 +28,8 @@ pub struct EngineConfig {
     pub modules: Vec<ModuleConfig>,
     /// Optional PostgreSQL settings for per-namespace guest connection pools.
     pub database: Option<DatabaseConfig>,
+    /// Delegation-CA-authorized job administration listener. Required with `[database]`.
+    pub job_admin: Option<JobAdminConfig>,
     /// Optional S3-compatible blobstore shared across blobstore-enabled modules.
     pub blobstore: Option<BlobstoreConfig>,
     /// Optional LLM provider for inference-enabled modules.
@@ -106,6 +108,18 @@ pub struct DeploymentMetadata {
     pub revision: u64,
     pub bundle_digest: String,
     pub engine_slot: String,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct JobAdminConfig {
+    /// Socket address bound by the engine's dedicated mTLS gRPC service.
+    pub listen_address: String,
+    /// Routable HTTPS address registered with the manager.
+    pub advertise_address: String,
+    /// Stable identity of this physical `wr__jobs` database.
+    pub queue_id: String,
+    /// Server identity and delegation CA. Operator certificates are not trusted here.
+    pub tls: TlsConfig,
 }
 
 #[derive(Deserialize, Clone)]
@@ -544,7 +558,71 @@ impl EngineConfig {
             self.pool.epoch_tick_interval_ms > 0,
             "pool.epoch_tick_interval_ms must be > 0",
         );
+        v.check(
+            self.max_outbound_body_bytes == 0
+                || self.max_outbound_body_bytes
+                    >= wr_common::lifecycle::MAX_JOB_SUBMIT_MESSAGE_BYTES,
+            format!(
+                "max_outbound_body_bytes must be 0 or at least {} to carry a maximum encoded job submission",
+                wr_common::lifecycle::MAX_JOB_SUBMIT_MESSAGE_BYTES
+            ),
+        );
 
+        v.check(
+            self.database.is_some() == self.job_admin.is_some(),
+            "[database] and [job_admin] must be configured together",
+        );
+        if let Some(job_admin) = &self.job_admin {
+            if let Err(error) = JobQueueId::parse(&job_admin.queue_id) {
+                v.check(false, format!("invalid job_admin.queue_id: {error}"));
+            }
+            if let Err(error) = PeerHttpsUrl::parse(&job_admin.advertise_address) {
+                v.check(
+                    false,
+                    format!("invalid job_admin.advertise_address: {error}"),
+                );
+            }
+            match job_admin.listen_address.parse::<std::net::SocketAddr>() {
+                Ok(address) => {
+                    v.check(
+                        address.port() > 0,
+                        "job_admin.listen_address port must be > 0",
+                    );
+                    if let Ok(workload) = self
+                        .listen_address
+                        .trim_start_matches("http://")
+                        .parse::<std::net::SocketAddr>()
+                    {
+                        v.check(
+                            address != workload,
+                            "job_admin.listen_address must not conflict with listen_address",
+                        );
+                    }
+                }
+                Err(error) => v.check(
+                    false,
+                    format!("job_admin.listen_address must be a socket address: {error}"),
+                ),
+            }
+            if let Ok(uri) = job_admin.advertise_address.parse::<http::Uri>() {
+                v.check(
+                    !matches!(uri.host(), Some("0.0.0.0" | "::" | "[::]")),
+                    "job_admin.advertise_address must not advertise an unspecified host",
+                );
+            }
+            v.check(
+                !job_admin.tls.cert_path.is_empty(),
+                "job_admin.tls.cert_path is required",
+            );
+            v.check(
+                !job_admin.tls.key_path.is_empty(),
+                "job_admin.tls.key_path is required",
+            );
+            v.check(
+                !job_admin.tls.ca_cert_path.is_empty(),
+                "job_admin.tls.ca_cert_path is required",
+            );
+        }
         if let Some(database) = &self.database {
             v.check(
                 database.max_connections > 0,
@@ -783,9 +861,55 @@ ca_cert_path = "ca.crt"
 [database]
 url = "postgres://localhost/test"
 {database_fields}
+[job_admin]
+listen_address = "127.0.0.1:9150"
+advertise_address = "https://127.0.0.1:9150"
+queue_id = "test-jobs"
+[job_admin.tls]
+cert_path = "delegate.crt"
+key_path = "delegate.key"
+ca_cert_path = "delegate-ca.crt"
 "#
         ))
         .expect("engine config")
+    }
+
+    #[test]
+    fn database_requires_a_valid_dedicated_job_admin_listener() {
+        engine_with_database("")
+            .validate()
+            .expect("database and job-admin config should validate together");
+
+        let missing: EngineConfig = toml::from_str(
+            r#"
+listen_address = "127.0.0.1:9100"
+[node]
+proxy_address = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_address = "https://127.0.0.1:9443"
+[node.tls]
+cert_path = "c.crt"
+key_path = "c.key"
+ca_cert_path = "ca.crt"
+[database]
+url = "postgres://localhost/test"
+"#,
+        )
+        .unwrap();
+        assert!(missing.validate().is_err());
+
+        let mut invalid = engine_with_database("");
+        let admin = invalid.job_admin.as_mut().unwrap();
+        admin.queue_id = "Invalid_Queue".into();
+        admin.advertise_address = "http://127.0.0.1:9150".into();
+        admin.listen_address = "127.0.0.1:9100".into();
+        let error = invalid
+            .validate()
+            .expect_err("invalid admin boundary must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("job_admin.queue_id"));
+        assert!(message.contains("job_admin.advertise_address"));
+        assert!(message.contains("must not conflict"));
     }
 
     #[test]
@@ -800,6 +924,18 @@ url = "postgres://localhost/test"
                 .expect_err("zero database setting must fail");
             assert!(error.to_string().contains("must be > 0"), "{error:#}");
         }
+    }
+
+    #[test]
+    fn nonzero_outbound_ceiling_must_carry_a_maximum_job_submission() {
+        let mut config = engine_with_database("");
+        config.max_outbound_body_bytes = wr_common::lifecycle::MAX_JOB_SUBMIT_MESSAGE_BYTES - 1;
+        let error = config
+            .validate()
+            .expect_err("partial job-submission capacity must fail");
+        assert!(error.to_string().contains("max_outbound_body_bytes"));
+        config.max_outbound_body_bytes = 0;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -825,6 +961,14 @@ url = "postgres://localhost/test"
 max_connections = 0
 statement_timeout_secs = 0
 idle_in_transaction_timeout_secs = 0
+[job_admin]
+listen_address = "127.0.0.1:9150"
+advertise_address = "https://127.0.0.1:9150"
+queue_id = "test-jobs"
+[job_admin.tls]
+cert_path = "delegate.crt"
+key_path = "delegate.key"
+ca_cert_path = "delegate-ca.crt"
 [llm]
 provider = "anthropic"
 api_key_env = "TEST_KEY"
