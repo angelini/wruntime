@@ -18,14 +18,15 @@ use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Endpoint, Server};
 use tracing::{info, warn};
 use uuid::Uuid;
-use wr_common::lifecycle_service::{notify_supervisor, AdmissionGate, LifecycleServiceAdapter};
-use wr_common::process_lifecycle::{LifecycleDriver, ProcessState, ServiceKind, TransitionReason};
+use wr_common::lifecycle_service::{
+    notify_supervisor, query_ready_status, AdmissionGate, LifecycleServiceAdapter,
+};
+use wr_common::process_lifecycle::{LifecycleOwner, ProcessState, ServiceKind, TransitionReason};
 use wr_common::signal::{shutdown_signal_request, wait_for_shutdown_trigger, ShutdownCause};
 use wr_common::task_group::{TaskExit, TaskGroup};
 use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
 use wr_common::wruntime::lifecycle_service_server::LifecycleServiceServer;
 use wr_common::wruntime::manager_service_server::ManagerServiceServer;
-use wr_common::wruntime::{GetLifecycleStatusRequest, ProcessLifecycleState};
 
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
 
@@ -79,22 +80,14 @@ async fn lifecycle_probe(config_path: &str) -> Result<()> {
         .tls_config(tls)?
         .connect()
         .await?;
-    let status = LifecycleServiceClient::new(channel)
-        .get_status(GetLifecycleStatusRequest {})
-        .await?
-        .into_inner()
-        .status
-        .context("lifecycle response omitted status")?;
-    anyhow::ensure!(
-        status.state == ProcessLifecycleState::Ready as i32,
-        "manager lifecycle state is not READY"
-    );
+    let mut client = LifecycleServiceClient::new(channel);
+    query_ready_status(&mut client, wr_common::wruntime::ServiceKind::Manager).await?;
     Ok(())
 }
 
 async fn run_service(config_path: &str) -> Result<()> {
     let manager_id = Uuid::new_v4().to_string();
-    let (lifecycle_driver, lifecycle) = LifecycleDriver::new(
+    let mut lifecycle = LifecycleOwner::new(
         ServiceKind::Manager,
         wr_common::process_lifecycle::resolve_process_instance_id(manager_id.clone()),
     );
@@ -197,9 +190,6 @@ async fn run_service(config_path: &str) -> Result<()> {
     }
 
     let mut tasks = TaskGroup::new();
-    tasks.spawn("lifecycle-driver", move |cancellation| {
-        lifecycle_driver.run(cancellation)
-    });
     tasks.spawn("manager-grpc", move |cancellation| async move {
         let mut shutdown = cancellation.clone();
         router
@@ -337,30 +327,26 @@ async fn run_service(config_path: &str) -> Result<()> {
 
     let mut failure: Option<anyhow::Error> = None;
     admission.open();
-    if let Err(error) = lifecycle
-        .mark_ready("database, gossip, scheduler, monitor, and gRPC listener ready")
-        .await
+    if let Err(error) =
+        lifecycle.mark_ready("database, gossip, scheduler, monitor, and gRPC listener ready")
     {
         failure = Some(error.into());
-        let _ = lifecycle
-            .request_stop(TransitionReason::TaskFailure, "manager readiness failed")
-            .await;
+        let _ = lifecycle.request_stop(TransitionReason::TaskFailure, "manager readiness failed");
     } else if let Err(error) = notify_supervisor("READY=1") {
         failure = Some(
             anyhow::Error::new(error).context("failed to notify supervisor that manager is ready"),
         );
-        let _ = lifecycle
-            .request_stop(
-                TransitionReason::TaskFailure,
-                "manager supervisor readiness notification failed",
-            )
-            .await;
+        let _ = lifecycle.request_stop(
+            TransitionReason::TaskFailure,
+            "manager supervisor readiness notification failed",
+        );
     } else {
         info!(address = %addr, manager_id, "manager ready");
     }
 
     if failure.is_none() {
-        match wait_for_shutdown_trigger(&lifecycle, &mut tasks, shutdown_signal_request()).await {
+        match wait_for_shutdown_trigger(&mut lifecycle, &mut tasks, shutdown_signal_request()).await
+        {
             Ok(ShutdownCause::Signal) => {}
             Ok(ShutdownCause::RequiredTask(Some(outcome))) => {
                 failure = Some(anyhow::anyhow!(
@@ -377,13 +363,10 @@ async fn run_service(config_path: &str) -> Result<()> {
     }
 
     if lifecycle.current().state != ProcessState::Stopping {
-        if let Err(error) = lifecycle
-            .request_stop(
-                TransitionReason::ShutdownOrchestration,
-                "manager shutdown started",
-            )
-            .await
-        {
+        if let Err(error) = lifecycle.request_stop(
+            TransitionReason::ShutdownOrchestration,
+            "manager shutdown started",
+        ) {
             failure.get_or_insert_with(|| error.into());
         }
     }
@@ -434,22 +417,18 @@ async fn run_service(config_path: &str) -> Result<()> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    use wr_common::process_lifecycle::LifecycleDriver;
     use wr_common::signal::ShutdownRequest;
 
     #[tokio::test]
     async fn first_signal_starts_one_quiet_manager_shutdown() -> Result<()> {
-        let (driver, lifecycle) = LifecycleDriver::new(ServiceKind::Manager, "manager-test");
+        let mut lifecycle = LifecycleOwner::new(ServiceKind::Manager, "manager-test");
         let mut tasks = TaskGroup::new();
-        tasks.spawn("lifecycle-driver", move |cancellation| {
-            driver.run(cancellation)
-        });
         tasks.spawn("manager-required", |mut cancellation| async move {
             cancellation.cancelled().await;
             Ok(TaskExit::Cancelled)
         });
 
-        let cause = wait_for_shutdown_trigger(&lifecycle, &mut tasks, async {
+        let cause = wait_for_shutdown_trigger(&mut lifecycle, &mut tasks, async {
             ShutdownRequest::stop(TransitionReason::SignalTerminate, "SIGTERM fixture")
         })
         .await?;

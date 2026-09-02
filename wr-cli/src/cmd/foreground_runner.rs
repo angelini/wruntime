@@ -59,7 +59,7 @@ fn record_error(errors: &mut Vec<String>, error: impl Into<String>) {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ServiceRole {
+enum ServiceRole {
     Manager,
     Proxy,
     Engine,
@@ -92,10 +92,10 @@ impl ServiceRole {
 }
 
 #[derive(Clone, Debug)]
-pub struct ServiceSpec {
-    pub name: String,
-    pub role: ServiceRole,
-    pub config: PathBuf,
+struct ServiceSpec {
+    name: String,
+    role: ServiceRole,
+    config: PathBuf,
     command_override: Option<Vec<String>>,
     endpoint_override: Option<String>,
     process_instance_id_override: Option<String>,
@@ -103,15 +103,15 @@ pub struct ServiceSpec {
 }
 
 #[derive(Clone, Debug)]
-pub struct RunSpec {
-    pub manager_config: PathBuf,
-    pub proxies: Vec<(String, PathBuf)>,
-    pub engine_configs: Vec<PathBuf>,
-    pub scenario: Vec<String>,
+pub(super) struct RunSpec {
+    pub(super) manager_config: PathBuf,
+    pub(super) proxies: Vec<(String, PathBuf)>,
+    pub(super) engine_configs: Vec<PathBuf>,
+    pub(super) scenario: Vec<String>,
 }
 
 impl RunSpec {
-    pub fn validate(self) -> Result<Self> {
+    fn validate(self) -> Result<Self> {
         if self.proxies.is_empty() {
             bail!("dev run requires one or more --proxy-config NAME=PATH arguments");
         }
@@ -243,7 +243,7 @@ where
     })
 }
 
-pub struct ManagedProcess {
+struct ManagedProcess {
     name: String,
     role: ServiceRole,
     config: PathBuf,
@@ -257,7 +257,7 @@ pub struct ManagedProcess {
 }
 
 impl ManagedProcess {
-    pub async fn spawn(spec: ServiceSpec) -> Result<Self> {
+    async fn spawn(spec: ServiceSpec) -> Result<Self> {
         let config = std::fs::canonicalize(&spec.config)
             .with_context(|| format!("service config not found: {}", spec.config.display()))?;
         let (endpoint, manager_tls) = match spec.endpoint_override {
@@ -459,7 +459,7 @@ impl ManagedProcess {
         Ok(None)
     }
 
-    pub async fn stop_and_reap(self, escalation: Arc<AtomicUsize>) -> Result<()> {
+    async fn stop_and_reap(self, escalation: Arc<AtomicUsize>) -> Result<()> {
         self.stop_and_reap_with_budgets(escalation, STOP_BUDGETS, StopPolicyHooks::default())
             .await
     }
@@ -918,7 +918,7 @@ impl Drop for SignalTracker {
     }
 }
 
-pub struct ProcessGroup {
+struct ProcessGroup {
     manager: Option<ManagedProcess>,
     proxies: Vec<ManagedProcess>,
     engines: Vec<ManagedProcess>,
@@ -1175,7 +1175,7 @@ async fn monitor_active(
     finish_owned(group, scenario, signals, primary).await
 }
 
-pub async fn run(spec: RunSpec) -> Result<()> {
+pub(super) async fn run(spec: RunSpec) -> Result<()> {
     let spec = spec.validate()?;
     let signals = SignalTracker::start()?;
     let mut group = ProcessGroup::new();

@@ -17,7 +17,7 @@ use http::{Request, StatusCode};
 use http_body_util::Full;
 
 use wr_common::discovery::ManagerDiscovery;
-use wr_common::process_lifecycle::{LifecycleDriver, ServiceKind};
+use wr_common::process_lifecycle::{LifecycleOwner, ServiceKind};
 use wr_common::wruntime::node_service_server::NodeService; // brings NodeService methods into scope
 use wr_common::wruntime::{
     BeginEngineDrainRequest, EngineRegistration, GetProxyRoutingStatusRequest,
@@ -153,7 +153,7 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
         wr_proxy::config::CircuitBreakerConfig::default(),
         "https://127.0.0.1:9443",
     );
-    let (_driver, lifecycle) = LifecycleDriver::new(ServiceKind::Proxy, "proxy-activation-1");
+    let lifecycle = LifecycleOwner::new(ServiceKind::Proxy, "proxy-activation-1");
     let agent = Arc::new(NodeAgent::new(
         discovery,
         routing.clone(),

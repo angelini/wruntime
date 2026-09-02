@@ -1,5 +1,4 @@
 use std::fmt;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::process::Child;
@@ -7,7 +6,10 @@ use tokio::time::{sleep_until, Instant};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Code;
 
-use wr_common::lifecycle_observation::{classify_lifecycle_state, LifecycleStateClassification};
+use wr_common::lifecycle_observation::{
+    classify_lifecycle_state, validate_lifecycle_status, LifecycleStateClassification,
+    LifecycleStatusValidationError,
+};
 use wr_common::wruntime::{
     lifecycle_service_client::LifecycleServiceClient, GetLifecycleStatusRequest, LifecycleStatus,
     ProcessLifecycleState, ServiceKind,
@@ -29,6 +31,10 @@ pub enum LifecycleWaitError {
     },
     TerminalBeforeReady(LifecycleStatus),
     InvalidState(i32),
+    InvalidStatus {
+        error: LifecycleStatusValidationError,
+        status: LifecycleStatus,
+    },
     Rpc {
         code: Code,
         message: String,
@@ -60,6 +66,9 @@ impl fmt::Display for LifecycleWaitError {
                 ProcessLifecycleState::try_from(status.state).ok()
             ),
             Self::InvalidState(state) => write!(f, "invalid lifecycle state value {state}"),
+            Self::InvalidStatus { error, status } => {
+                write!(f, "invalid lifecycle status ({error}): {status:?}")
+            }
             Self::Rpc { code, message } => {
                 write!(f, "lifecycle RPC failed with {code}: {message}")
             }
@@ -90,16 +99,20 @@ pub(crate) fn evaluate_state(
     status: &LifecycleStatus,
     expected: ProcessLifecycleState,
 ) -> std::result::Result<StateEvaluation, LifecycleWaitError> {
-    let observed = ProcessLifecycleState::try_from(status.state)
-        .map_err(|_| LifecycleWaitError::InvalidState(status.state))?;
+    if expected == ProcessLifecycleState::Unspecified {
+        return Err(LifecycleWaitError::InvalidState(expected as i32));
+    }
+    let observed = validate_lifecycle_status(status)
+        .map_err(|error| LifecycleWaitError::InvalidStatus {
+            error,
+            status: status.clone(),
+        })?
+        .state;
     match classify_lifecycle_state(observed, expected) {
         Ok(LifecycleStateClassification::Matched) => Ok(StateEvaluation::Reached),
         Ok(LifecycleStateClassification::Pending) => Ok(StateEvaluation::Pending),
         Ok(LifecycleStateClassification::Terminal) => {
             Err(LifecycleWaitError::TerminalBeforeReady(status.clone()))
-        }
-        Err(_) if expected == ProcessLifecycleState::Unspecified => {
-            Err(LifecycleWaitError::InvalidState(expected as i32))
         }
         Err(_) => Err(LifecycleWaitError::InvalidState(status.state)),
     }
@@ -115,15 +128,6 @@ pub async fn lifecycle_client(
     let endpoint = Endpoint::from_shared(endpoint.as_ref().to_owned())
         .context("invalid lifecycle endpoint")?;
     Ok(LifecycleServiceClient::new(endpoint.connect_lazy()))
-}
-
-pub async fn query_state(client: &mut LifecycleServiceClient<Channel>) -> Result<LifecycleStatus> {
-    client
-        .get_status(GetLifecycleStatusRequest {})
-        .await?
-        .into_inner()
-        .status
-        .context("lifecycle response omitted status")
 }
 
 pub async fn wait_for_state(
@@ -205,8 +209,14 @@ async fn wait_for_state_inner(
                         message: "lifecycle response omitted status".to_owned(),
                     });
                 };
+                let validated = validate_lifecycle_status(&status).map_err(|error| {
+                    LifecycleWaitError::InvalidStatus {
+                        error,
+                        status: status.clone(),
+                    }
+                })?;
                 if let Some((expected_kind, expected_instance)) = expected_identity {
-                    if status.service_kind != expected_kind as i32 {
+                    if validated.service_kind != expected_kind {
                         return Err(LifecycleWaitError::ServiceKindMismatch {
                             expected: expected_kind,
                             observed: status.service_kind,
@@ -261,8 +271,4 @@ async fn wait_for_state_inner(
             });
         }
     }
-}
-
-pub fn deadline_after(timeout: Duration) -> Instant {
-    Instant::now() + timeout
 }

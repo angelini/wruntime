@@ -638,21 +638,18 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_rpc_is_status_only_and_never_mutates_admission() -> anyhow::Result<()> {
-        use wr_common::process_lifecycle::{LifecycleDriver, ServiceKind, TransitionReason};
+        use wr_common::process_lifecycle::{LifecycleOwner, ServiceKind, TransitionReason};
         use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
         use wr_common::wruntime::{GetLifecycleStatusRequest, ProcessLifecycleState};
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let (driver, lifecycle) = LifecycleDriver::new(ServiceKind::Engine, "engine-server-test");
+        let mut lifecycle = LifecycleOwner::new(ServiceKind::Engine, "engine-server-test");
         let admission = AdmissionGate::closed();
         let worker_admission = AdmissionGate::closed();
         worker_admission.open();
         let worker_admission_observer = worker_admission.clone();
         let mut tasks = wr_common::task_group::TaskGroup::new();
-        tasks.spawn("lifecycle-driver", move |cancellation| {
-            driver.run(cancellation)
-        });
         let lifecycle_snapshot = lifecycle.snapshot();
         tasks.spawn("test-engine-server", move |cancellation| {
             serve(
@@ -701,9 +698,7 @@ mod tests {
             );
         }
 
-        lifecycle
-            .request_stop(TransitionReason::TaskFailure, "test complete")
-            .await?;
+        lifecycle.request_stop(TransitionReason::TaskFailure, "test complete")?;
         let report = tasks
             .shutdown(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
             .await;

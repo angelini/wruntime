@@ -3,7 +3,7 @@ use std::future::Future;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::process_lifecycle::{
-    LifecycleHandle, LifecycleSnapshot, TransitionError, TransitionReason,
+    LifecycleOwner, LifecycleSnapshot, TransitionError, TransitionReason,
 };
 use crate::task_group::{TaskGroup, TaskOutcome};
 
@@ -21,11 +21,11 @@ impl ShutdownRequest {
         }
     }
 
-    pub async fn submit(
+    pub fn submit(
         self,
-        lifecycle: &LifecycleHandle,
+        lifecycle: &mut LifecycleOwner,
     ) -> Result<LifecycleSnapshot, TransitionError> {
-        lifecycle.request_stop(self.reason, self.detail).await
+        lifecycle.request_stop(self.reason, self.detail)
     }
 }
 
@@ -50,11 +50,11 @@ pub enum ShutdownCause {
     RequiredTask(Option<TaskOutcome>),
 }
 
-/// Wait for the first process-owned shutdown cause and submit exactly one stop
-/// intent through the lifecycle driver. Required task evidence is retained for
-/// the executable's service-specific nonzero result.
+/// Wait for the first process-owned shutdown cause and synchronously publish
+/// STOPPING before returning to the executable's shutdown operations. Required
+/// task evidence remains retained by `TaskGroup` for the final report.
 pub async fn wait_for_shutdown_trigger<F>(
-    lifecycle: &LifecycleHandle,
+    lifecycle: &mut LifecycleOwner,
     tasks: &mut TaskGroup,
     signal: F,
 ) -> Result<ShutdownCause, TransitionError>
@@ -63,7 +63,7 @@ where
 {
     tokio::select! {
         request = signal => {
-            request.submit(lifecycle).await?;
+            request.submit(lifecycle)?;
             Ok(ShutdownCause::Signal)
         }
         outcome = tasks.next_completion() => {
@@ -71,53 +71,62 @@ where
                 .as_ref()
                 .map(|outcome| outcome.name.clone())
                 .unwrap_or_else(|| "all required tasks exited".to_string());
-            lifecycle
-                .request_stop(TransitionReason::TaskFailure, detail)
-                .await?;
+            lifecycle.request_stop(TransitionReason::TaskFailure, detail)?;
             Ok(ShutdownCause::RequiredTask(outcome))
         }
     }
-}
-
-pub async fn shutdown_signal_into(
-    lifecycle: &LifecycleHandle,
-) -> Result<LifecycleSnapshot, TransitionError> {
-    shutdown_signal_request().await.submit(lifecycle).await
-}
-
-/// Compatibility wait for service wiring that remains owned by lifecycle Plan 2.
-pub async fn shutdown_signal() {
-    let _ = shutdown_signal_request().await;
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use crate::process_lifecycle::{LifecycleDriver, ProcessState, ServiceKind, TransitionReason};
-    use crate::task_group::TaskGroup;
+    use crate::process_lifecycle::{LifecycleOwner, ProcessState, ServiceKind, TransitionReason};
 
     use super::*;
 
-    #[tokio::test]
-    async fn injected_stop_is_delivered_to_the_driver() {
-        let (driver, lifecycle) = LifecycleDriver::new(ServiceKind::Proxy, "proxy-test");
-        let mut tasks = TaskGroup::new();
-        tasks.spawn("lifecycle-driver", move |cancellation| {
-            driver.run(cancellation)
-        });
-
+    #[test]
+    fn injected_stop_is_published_synchronously() {
+        let mut lifecycle = LifecycleOwner::new(ServiceKind::Proxy, "proxy-test");
         let stopped = ShutdownRequest::stop(TransitionReason::TaskFailure, "test request")
-            .submit(&lifecycle)
-            .await
+            .submit(&mut lifecycle)
             .unwrap();
         assert_eq!(stopped.state, ProcessState::Stopping);
         assert_eq!(stopped.reason, TransitionReason::TaskFailure);
         assert_eq!(stopped.detail, "test request");
+        assert_eq!(lifecycle.snapshot().current(), stopped);
+    }
+
+    #[tokio::test]
+    async fn required_task_failure_is_published_and_retained_for_shutdown() {
+        let mut lifecycle = LifecycleOwner::new(ServiceKind::Engine, "engine-test");
+        let mut tasks = TaskGroup::new();
+        tasks.spawn("engine-required", |_| async {
+            anyhow::bail!("required task fixture failed")
+        });
+
+        let cause = wait_for_shutdown_trigger(
+            &mut lifecycle,
+            &mut tasks,
+            std::future::pending::<ShutdownRequest>(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            cause,
+            ShutdownCause::RequiredTask(Some(ref outcome)) if outcome.name == "engine-required"
+        ));
+        let stopped = lifecycle.current();
+        assert_eq!(stopped.state, ProcessState::Stopping);
+        assert_eq!(stopped.reason, TransitionReason::TaskFailure);
+        assert_eq!(stopped.detail, "engine-required");
 
         let report = tasks
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(1))
             .await;
-        assert!(report.is_clean(), "{report:?}");
+        assert!(!report.is_clean(), "observed failure must remain in report");
+        assert!(report
+            .failures()
+            .any(|outcome| outcome.name == "engine-required"));
     }
 }

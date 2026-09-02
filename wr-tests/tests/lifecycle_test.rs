@@ -90,7 +90,37 @@ fn typed_state_evaluation_accepts_ready_and_rejects_terminal_or_invalid_state() 
             &status(ProcessLifecycleState::Unspecified),
             ProcessLifecycleState::Ready
         ),
-        Err(LifecycleWaitError::InvalidState(0))
+        Err(LifecycleWaitError::InvalidStatus {
+            error:
+                wr_common::lifecycle_observation::LifecycleStatusValidationError::UnspecifiedState,
+            status: LifecycleStatus { state: 0, .. },
+        })
+    ));
+}
+
+#[test]
+fn typed_state_evaluation_rejects_malformed_kind_and_empty_instance() {
+    let mut malformed_kind = status(ProcessLifecycleState::Ready);
+    malformed_kind.service_kind = 99;
+    assert!(matches!(
+        evaluate_state(&malformed_kind, ProcessLifecycleState::Ready),
+        Err(LifecycleWaitError::InvalidStatus {
+            error:
+                wr_common::lifecycle_observation::LifecycleStatusValidationError::UnknownServiceKind(
+                    99
+                ),
+            ..
+        })
+    ));
+
+    let mut empty_instance = status(ProcessLifecycleState::Ready);
+    empty_instance.process_instance_id.clear();
+    assert!(matches!(
+        evaluate_state(&empty_instance, ProcessLifecycleState::Ready),
+        Err(LifecycleWaitError::InvalidStatus {
+            error: wr_common::lifecycle_observation::LifecycleStatusValidationError::EmptyProcessInstance,
+            ..
+        })
     ));
 }
 

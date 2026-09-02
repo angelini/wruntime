@@ -1,14 +1,18 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use anyhow::Context;
 use tokio::sync::Notify;
 use tokio::time::{timeout_at, Instant};
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
+use crate::lifecycle_observation::validate_lifecycle_status;
 use crate::process_lifecycle::LifecycleSnapshotHandle;
 use crate::wruntime::{
-    lifecycle_service_server::LifecycleService, GetLifecycleStatusRequest,
-    GetLifecycleStatusResponse,
+    lifecycle_service_client::LifecycleServiceClient, lifecycle_service_server::LifecycleService,
+    GetLifecycleStatusRequest, GetLifecycleStatusResponse, LifecycleStatus, ProcessLifecycleState,
+    ServiceKind,
 };
 
 struct AdmissionState {
@@ -129,6 +133,39 @@ impl LifecycleService for LifecycleServiceAdapter {
     }
 }
 
+/// Query READY from an already-connected lifecycle client. Endpoint selection,
+/// TLS policy, and channel construction deliberately remain service-local.
+pub async fn query_ready_status(
+    client: &mut LifecycleServiceClient<Channel>,
+    expected_kind: ServiceKind,
+) -> anyhow::Result<LifecycleStatus> {
+    let status = client
+        .get_status(GetLifecycleStatusRequest {})
+        .await?
+        .into_inner()
+        .status;
+    validate_ready_status(status, expected_kind)
+}
+
+fn validate_ready_status(
+    status: Option<LifecycleStatus>,
+    expected_kind: ServiceKind,
+) -> anyhow::Result<LifecycleStatus> {
+    let status = status.context("lifecycle response omitted status")?;
+    let validated = validate_lifecycle_status(&status)?;
+    anyhow::ensure!(
+        validated.state == ProcessLifecycleState::Ready,
+        "lifecycle state is not READY"
+    );
+    anyhow::ensure!(
+        validated.service_kind == expected_kind,
+        "lifecycle service kind mismatch: expected {}, observed {}",
+        expected_kind.as_str_name(),
+        validated.service_kind.as_str_name()
+    );
+    Ok(status)
+}
+
 /// Notify a systemd-style supervisor when `NOTIFY_SOCKET` is present.
 pub fn notify_supervisor(message: &str) -> std::io::Result<()> {
     use std::os::unix::net::UnixDatagram;
@@ -156,19 +193,25 @@ pub fn notify_supervisor(message: &str) -> std::io::Result<()> {
 mod tests {
     use std::time::Duration;
 
-    use crate::process_lifecycle::{LifecycleDriver, ProcessState, ServiceKind, TransitionReason};
-    use crate::task_group::TaskGroup;
+    use crate::process_lifecycle::{
+        LifecycleOwner, ProcessState, ServiceKind as ProcessServiceKind,
+    };
 
     use super::*;
 
+    fn wire_status(state: i32, kind: i32, instance: &str) -> LifecycleStatus {
+        LifecycleStatus {
+            state,
+            service_kind: kind,
+            process_instance_id: instance.to_string(),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
     async fn status_rpc_is_read_only() -> anyhow::Result<()> {
-        let (driver, lifecycle) = LifecycleDriver::new(ServiceKind::Proxy, "proxy-test");
-        let mut tasks = TaskGroup::new();
-        tasks.spawn("lifecycle-driver", move |cancellation| {
-            driver.run(cancellation)
-        });
-        lifecycle.mark_ready("test ready").await?;
+        let mut lifecycle = LifecycleOwner::new(ProcessServiceKind::Proxy, "proxy-test");
+        lifecycle.mark_ready("test ready")?;
         let adapter = LifecycleServiceAdapter::new(lifecycle.snapshot());
 
         let first = adapter
@@ -185,15 +228,81 @@ mod tests {
             .expect("status response");
         assert_eq!(first, second);
         assert_eq!(lifecycle.current().state, ProcessState::Ready);
-
-        lifecycle
-            .request_stop(TransitionReason::TaskFailure, "test complete")
-            .await?;
-        let report = tasks
-            .shutdown(Instant::now() + Duration::from_secs(1))
-            .await;
-        assert!(report.is_clean(), "{report:?}");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn ready_probe_queries_an_already_connected_client() -> anyhow::Result<()> {
+        use tonic::transport::server::TcpIncoming;
+        use tonic::transport::Server;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let incoming = TcpIncoming::from(listener);
+        let mut lifecycle = LifecycleOwner::new(ProcessServiceKind::Proxy, "proxy-probe");
+        lifecycle.mark_ready("probe ready")?;
+        let service = crate::wruntime::lifecycle_service_server::LifecycleServiceServer::new(
+            LifecycleServiceAdapter::new(lifecycle.snapshot()),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut client = LifecycleServiceClient::connect(format!("http://{address}")).await?;
+        let status = query_ready_status(&mut client, ServiceKind::Proxy).await?;
+        assert_eq!(status.process_instance_id, "proxy-probe");
+        assert_eq!(status.detail, "probe ready");
+
+        let _ = shutdown_tx.send(());
+        server.await??;
+        Ok(())
+    }
+
+    #[test]
+    fn ready_probe_validation_accepts_only_valid_ready_expected_kind() {
+        let ready = wire_status(
+            ProcessLifecycleState::Ready as i32,
+            ServiceKind::Proxy as i32,
+            "proxy-1",
+        );
+        assert_eq!(
+            validate_ready_status(Some(ready.clone()), ServiceKind::Proxy).unwrap(),
+            ready
+        );
+
+        let rejected = [
+            None,
+            Some(wire_status(99, ServiceKind::Proxy as i32, "proxy-1")),
+            Some(wire_status(
+                ProcessLifecycleState::Ready as i32,
+                ServiceKind::Proxy as i32,
+                "",
+            )),
+            Some(wire_status(
+                ProcessLifecycleState::Starting as i32,
+                ServiceKind::Proxy as i32,
+                "proxy-1",
+            )),
+            Some(wire_status(
+                ProcessLifecycleState::Stopping as i32,
+                ServiceKind::Proxy as i32,
+                "proxy-1",
+            )),
+            Some(wire_status(
+                ProcessLifecycleState::Ready as i32,
+                ServiceKind::Engine as i32,
+                "proxy-1",
+            )),
+        ];
+        for status in rejected {
+            assert!(validate_ready_status(status, ServiceKind::Proxy).is_err());
+        }
     }
 
     #[tokio::test]

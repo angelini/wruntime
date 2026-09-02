@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use wr_common::lifecycle_observation::{classify_lifecycle_state, LifecycleStateClassification};
+use wr_common::lifecycle_observation::{
+    classify_lifecycle_state, validate_lifecycle_status, LifecycleStateClassification,
+};
 use wr_common::node::TlsConfig;
 use wr_common::wruntime::{
     GetLifecycleStatusRequest, GetProxyRoutingStatusRequest, GetProxyRoutingStatusResponse,
@@ -374,19 +376,14 @@ fn classify_lifecycle_observation(
 }
 
 fn lifecycle_observation(status: LifecycleStatus) -> Result<LifecycleObservation> {
-    let observation = LifecycleObservation {
+    validate_lifecycle_status(&status)?;
+    Ok(LifecycleObservation {
         state: status.state,
         service_kind: status.service_kind,
         process_instance_id: status.process_instance_id,
         reason: status.reason,
         detail: status.detail,
-    };
-    observation.state_enum()?;
-    observation.service_kind_enum()?;
-    if observation.process_instance_id.is_empty() {
-        bail!("lifecycle endpoint returned an empty process instance ID");
-    }
-    Ok(observation)
+    })
 }
 
 pub async fn get_lifecycle_status(
@@ -841,17 +838,32 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_observation_preserves_typed_identity_and_state() -> Result<()> {
+    fn lifecycle_observation_preserves_typed_identity_state_and_json_shape() -> Result<()> {
         let observation = lifecycle_observation(LifecycleStatus {
             state: ProcessLifecycleState::Ready as i32,
             service_kind: ServiceKind::Manager as i32,
             process_instance_id: "manager-instance".to_string(),
+            reason: 5,
             detail: "startup complete".to_string(),
             ..Default::default()
         })?;
         assert_eq!(observation.state_enum()?, ProcessLifecycleState::Ready);
         assert_eq!(observation.process_instance_id, "manager-instance");
         assert_eq!(observation.detail, "startup complete");
+        assert_eq!(
+            serde_json::to_value(&observation)?,
+            serde_json::json!({
+                "state": ProcessLifecycleState::Ready as i32,
+                "service_kind": ServiceKind::Manager as i32,
+                "process_instance_id": "manager-instance",
+                "reason": 5,
+                "detail": "startup complete"
+            })
+        );
+        assert!(!serde_json::to_value(&observation)?
+            .as_object()
+            .expect("serialized lifecycle observation object")
+            .contains_key("transitioned_at"));
         Ok(())
     }
 

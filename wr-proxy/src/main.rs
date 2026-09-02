@@ -29,14 +29,15 @@ use layers::{
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
 use wr_common::discovery::ManagerDiscovery;
-use wr_common::lifecycle_service::{notify_supervisor, AdmissionGate, LifecycleServiceAdapter};
-use wr_common::process_lifecycle::{LifecycleDriver, ProcessState, ServiceKind, TransitionReason};
+use wr_common::lifecycle_service::{
+    notify_supervisor, query_ready_status, AdmissionGate, LifecycleServiceAdapter,
+};
+use wr_common::process_lifecycle::{LifecycleOwner, ProcessState, ServiceKind, TransitionReason};
 use wr_common::signal::{shutdown_signal_request, ShutdownCause, ShutdownRequest};
 use wr_common::task_group::{TaskCancellation, TaskExit, TaskGroup};
 use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
 use wr_common::wruntime::lifecycle_service_server::LifecycleServiceServer;
 use wr_common::wruntime::node_service_server::NodeServiceServer;
-use wr_common::wruntime::{GetLifecycleStatusRequest, ProcessLifecycleState};
 
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
 
@@ -96,29 +97,39 @@ impl ProxyTaskScopes {
 }
 
 async fn wait_for_proxy_shutdown_trigger<F>(
-    lifecycle: &wr_common::process_lifecycle::LifecycleHandle,
+    lifecycle: &mut LifecycleOwner,
     scopes: &mut ProxyTaskScopes,
     signal: F,
 ) -> std::result::Result<ShutdownCause, wr_common::process_lifecycle::TransitionError>
 where
     F: Future<Output = ShutdownRequest>,
 {
+    if scopes.background.is_empty() && scopes.data_plane.is_empty() {
+        lifecycle.request_stop(
+            TransitionReason::TaskFailure,
+            "all required proxy tasks exited",
+        )?;
+        return Ok(ShutdownCause::RequiredTask(None));
+    }
+
     let cause = tokio::select! {
         request = signal => {
-            request.submit(lifecycle).await?;
+            request.submit(lifecycle)?;
             return Ok(ShutdownCause::Signal);
         }
-        outcome = scopes.background.next_completion() => ShutdownCause::RequiredTask(outcome),
-        outcome = scopes.data_plane.next_completion() => ShutdownCause::RequiredTask(outcome),
+        outcome = scopes.background.next_completion(), if !scopes.background.is_empty() => {
+            ShutdownCause::RequiredTask(outcome)
+        }
+        outcome = scopes.data_plane.next_completion(), if !scopes.data_plane.is_empty() => {
+            ShutdownCause::RequiredTask(outcome)
+        }
     };
     let detail = match &cause {
         ShutdownCause::RequiredTask(Some(outcome)) => outcome.name.clone(),
         ShutdownCause::RequiredTask(None) => "all required proxy tasks exited".to_string(),
         ShutdownCause::Signal => unreachable!(),
     };
-    lifecycle
-        .request_stop(TransitionReason::TaskFailure, detail)
-        .await?;
+    lifecycle.request_stop(TransitionReason::TaskFailure, detail)?;
     Ok(cause)
 }
 
@@ -148,17 +159,8 @@ async fn main() -> Result<()> {
 async fn lifecycle_probe(config_path: &str) -> Result<()> {
     let config = config::ProxyConfig::load(config_path)?;
     let control = config.control_address.as_str();
-    let status = LifecycleServiceClient::connect(format!("http://{control}"))
-        .await?
-        .get_status(GetLifecycleStatusRequest {})
-        .await?
-        .into_inner()
-        .status
-        .context("lifecycle response omitted status")?;
-    anyhow::ensure!(
-        status.state == ProcessLifecycleState::Ready as i32,
-        "proxy lifecycle state is not READY"
-    );
+    let mut client = LifecycleServiceClient::connect(format!("http://{control}")).await?;
+    query_ready_status(&mut client, wr_common::wruntime::ServiceKind::Proxy).await?;
     Ok(())
 }
 
@@ -171,7 +173,7 @@ async fn run_service(config_path: &str) -> Result<()> {
             .unwrap_or_default()
             .as_nanos()
     );
-    let (lifecycle_driver, lifecycle) = LifecycleDriver::new(
+    let mut lifecycle = LifecycleOwner::new(
         ServiceKind::Proxy,
         wr_common::process_lifecycle::resolve_process_instance_id(process_id),
     );
@@ -276,9 +278,6 @@ async fn run_service(config_path: &str) -> Result<()> {
         .add_service(LifecycleServiceServer::new(lifecycle_service));
 
     let mut scopes = ProxyTaskScopes::new(admission.clone());
-    scopes.spawn_background("lifecycle-driver", move |cancellation| {
-        lifecycle_driver.run(cancellation)
-    });
     {
         let discovery = Arc::clone(&discovery);
         scopes.spawn_background("proxy-manager-discovery", move |cancellation| {
@@ -343,29 +342,28 @@ async fn run_service(config_path: &str) -> Result<()> {
     admission.open();
     if let Err(error) = lifecycle
         .mark_ready("manager discovery, routing snapshot, control, and data listeners ready")
-        .await
     {
         failure = Some(error.into());
-        let _ = lifecycle
-            .request_stop(TransitionReason::TaskFailure, "proxy readiness failed")
-            .await;
+        let _ = lifecycle.request_stop(TransitionReason::TaskFailure, "proxy readiness failed");
     } else if let Err(error) = notify_supervisor("READY=1") {
         failure = Some(
             anyhow::Error::new(error).context("failed to notify supervisor that proxy is ready"),
         );
-        let _ = lifecycle
-            .request_stop(
-                TransitionReason::TaskFailure,
-                "proxy supervisor readiness notification failed",
-            )
-            .await;
+        let _ = lifecycle.request_stop(
+            TransitionReason::TaskFailure,
+            "proxy supervisor readiness notification failed",
+        );
     } else {
         info!(internal = %config.listen_address, peer = %peer_bind, control = %control_address, "proxy ready");
     }
 
     if failure.is_none() {
-        match wait_for_proxy_shutdown_trigger(&lifecycle, &mut scopes, shutdown_signal_request())
-            .await
+        match wait_for_proxy_shutdown_trigger(
+            &mut lifecycle,
+            &mut scopes,
+            shutdown_signal_request(),
+        )
+        .await
         {
             Ok(ShutdownCause::Signal) => {}
             Ok(ShutdownCause::RequiredTask(Some(outcome))) => {
@@ -383,13 +381,10 @@ async fn run_service(config_path: &str) -> Result<()> {
     }
 
     if lifecycle.current().state != ProcessState::Stopping {
-        if let Err(error) = lifecycle
-            .request_stop(
-                TransitionReason::ShutdownOrchestration,
-                "proxy shutdown started",
-            )
-            .await
-        {
+        if let Err(error) = lifecycle.request_stop(
+            TransitionReason::ShutdownOrchestration,
+            "proxy shutdown started",
+        ) {
             failure.get_or_insert_with(|| error.into());
         }
     }
@@ -582,19 +577,16 @@ mod lifecycle_tests {
     use super::*;
 
     #[tokio::test]
-    async fn required_task_failure_starts_nonzero_proxy_shutdown() -> anyhow::Result<()> {
-        let (driver, lifecycle) = LifecycleDriver::new(ServiceKind::Proxy, "proxy-test");
+    async fn data_only_task_failure_is_not_preempted_by_empty_background() -> anyhow::Result<()> {
+        let mut lifecycle = LifecycleOwner::new(ServiceKind::Proxy, "proxy-test");
         let admission = AdmissionGate::closed();
         let mut scopes = ProxyTaskScopes::new(admission);
-        scopes.spawn_background("lifecycle-driver", move |cancellation| {
-            driver.run(cancellation)
-        });
         scopes.spawn_data_plane("proxy-required", |_| async {
             anyhow::bail!("proxy required task fixture failed")
         });
 
         let cause = wait_for_proxy_shutdown_trigger(
-            &lifecycle,
+            &mut lifecycle,
             &mut scopes,
             std::future::pending::<ShutdownRequest>(),
         )
@@ -618,6 +610,56 @@ mod lifecycle_tests {
             .shutdown_background(tokio::time::Instant::now() + Duration::from_secs(1))
             .await;
         assert!(report.is_clean(), "{report:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn background_only_task_failure_is_not_preempted_by_empty_data_plane(
+    ) -> anyhow::Result<()> {
+        let mut lifecycle = LifecycleOwner::new(ServiceKind::Proxy, "proxy-test");
+        let mut scopes = ProxyTaskScopes::new(AdmissionGate::closed());
+        scopes.spawn_background("proxy-background-required", |_| async {
+            anyhow::bail!("proxy background fixture failed")
+        });
+
+        let cause = wait_for_proxy_shutdown_trigger(
+            &mut lifecycle,
+            &mut scopes,
+            std::future::pending::<ShutdownRequest>(),
+        )
+        .await?;
+        assert!(matches!(
+            cause,
+            ShutdownCause::RequiredTask(Some(ref outcome))
+                if outcome.name == "proxy-background-required"
+        ));
+        assert_eq!(lifecycle.current().reason, TransitionReason::TaskFailure);
+
+        let report = scopes
+            .shutdown_background(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(!report.is_clean(), "observed failure must remain in report");
+        assert!(report
+            .failures()
+            .any(|outcome| outcome.name == "proxy-background-required"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn both_empty_groups_report_all_required_tasks_exited() -> anyhow::Result<()> {
+        let mut lifecycle = LifecycleOwner::new(ServiceKind::Proxy, "proxy-test");
+        let mut scopes = ProxyTaskScopes::new(AdmissionGate::closed());
+
+        let cause = wait_for_proxy_shutdown_trigger(
+            &mut lifecycle,
+            &mut scopes,
+            std::future::pending::<ShutdownRequest>(),
+        )
+        .await?;
+        assert_eq!(cause, ShutdownCause::RequiredTask(None));
+        let stopped = lifecycle.current();
+        assert_eq!(stopped.reason, TransitionReason::TaskFailure);
+        assert_eq!(stopped.detail, "all required proxy tasks exited");
         Ok(())
     }
 
