@@ -2,14 +2,22 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use tokio::net::TcpListener;
-use tonic::transport::Server;
+use tonic::transport::{
+    Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
+};
 
 use wr_common::wruntime::{
     manager_service_client::ManagerServiceClient, manager_service_server::ManagerServiceServer,
+    node_agent_service_client::NodeAgentServiceClient,
+    node_agent_service_server::NodeAgentServiceServer,
+    operator_service_client::OperatorServiceClient, operator_service_server::OperatorServiceServer,
     EngineRegistration, GetRoutingTableRequest, HeartbeatRequest, ModuleDescriptor,
     RegisterEngineRequest,
 };
-use wr_manager::service::Manager;
+use wr_manager::config::{PrincipalMapping, PrincipalRole};
+use wr_manager::service::{Manager, NodeAgentApi, OperatorApi};
+
+use super::pki::{generate_role_test_pki, RoleTestPki, TonicTestIdentity};
 
 use super::db::manager_pool;
 use super::proxy::{register_module_raw, EngineSpec, ModuleSpec, TEST_SELF_PEER};
@@ -39,6 +47,126 @@ async fn test_cluster_handle() -> Result<std::sync::Arc<wr_manager::cluster::Clu
         )
         .await?,
     ))
+}
+
+pub struct AuthorizedManager {
+    pub endpoint: String,
+    pub pki: Arc<RoleTestPki>,
+    server_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AuthorizedManager {
+    fn drop(&mut self) {
+        self.server_task.abort();
+    }
+}
+
+impl AuthorizedManager {
+    async fn channel(&self, identity: Option<&TonicTestIdentity>) -> Result<Channel> {
+        let mut tls = ClientTlsConfig::new()
+            .domain_name("localhost")
+            .ca_certificate(Certificate::from_pem(self.pki.ca_pem.clone()));
+        if let Some(identity) = identity {
+            tls = tls.identity(Identity::from_pem(
+                identity.cert_pem.clone(),
+                identity.key_pem.clone(),
+            ));
+        }
+        Ok(Endpoint::from_shared(self.endpoint.clone())?
+            .tls_config(tls)?
+            .connect()
+            .await?)
+    }
+
+    pub async fn operator_client(
+        &self,
+        identity: Option<&TonicTestIdentity>,
+    ) -> Result<OperatorServiceClient<Channel>> {
+        Ok(OperatorServiceClient::new(self.channel(identity).await?))
+    }
+
+    pub async fn agent_client(
+        &self,
+        identity: Option<&TonicTestIdentity>,
+    ) -> Result<NodeAgentServiceClient<Channel>> {
+        Ok(NodeAgentServiceClient::new(self.channel(identity).await?))
+    }
+}
+
+/// Start all role-gated manager services on one real mTLS listener.
+pub async fn start_authorized_manager(pool: deadpool_postgres::Pool) -> Result<AuthorizedManager> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let pki = Arc::new(generate_role_test_pki());
+    let mappings = vec![
+        PrincipalMapping {
+            fingerprint: pki.viewer.fingerprint.clone(),
+            principal: "viewer-a".into(),
+            role: PrincipalRole::Viewer,
+            node_id: None,
+        },
+        PrincipalMapping {
+            fingerprint: pki.operator.fingerprint.clone(),
+            principal: "operator-a".into(),
+            role: PrincipalRole::Operator,
+            node_id: None,
+        },
+        PrincipalMapping {
+            fingerprint: pki.operator_rotated.fingerprint.clone(),
+            principal: "operator-a".into(),
+            role: PrincipalRole::Operator,
+            node_id: None,
+        },
+        PrincipalMapping {
+            fingerprint: pki.agent_a.fingerprint.clone(),
+            principal: "agent-a".into(),
+            role: PrincipalRole::NodeAgent,
+            node_id: Some("node-a".into()),
+        },
+        PrincipalMapping {
+            fingerprint: pki.agent_b.fingerprint.clone(),
+            principal: "agent-b".into(),
+            role: PrincipalRole::NodeAgent,
+            node_id: Some("node-b".into()),
+        },
+    ];
+    let policy = wr_manager::auth::PrincipalPolicy::new(&mappings);
+    let crypto = test_secret_crypto();
+    let cluster = test_cluster_handle().await?;
+    let tls = ServerTlsConfig::new()
+        .identity(Identity::from_pem(
+            pki.server.cert_pem.clone(),
+            pki.server.key_pem.clone(),
+        ))
+        .client_ca_root(Certificate::from_pem(pki.ca_pem.clone()));
+    let server_task = tokio::spawn(async move {
+        if let Err(error) = Server::builder()
+            .tls_config(tls)
+            .expect("test TLS configuration is valid")
+            .add_service(ManagerServiceServer::new(Manager::new(
+                pool.clone(),
+                crypto,
+                cluster.clone(),
+            )))
+            .add_service(OperatorServiceServer::new(OperatorApi::new(
+                pool.clone(),
+                cluster,
+                policy.clone(),
+                30.0,
+                30.0,
+            )))
+            .add_service(NodeAgentServiceServer::new(NodeAgentApi::new(pool, policy)))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+        {
+            panic!("authorized manager test server failed: {error}");
+        }
+    });
+    Ok(AuthorizedManager {
+        endpoint: format!("https://localhost:{}", addr.port()),
+        pki,
+        server_task,
+    })
 }
 
 /// Start an in-process wr-manager on a random port; returns its gRPC address.
@@ -326,6 +454,16 @@ pub struct ClusteredManager {
     pub manager_id: String,
     /// The live cluster handle (test hook to simulate death via `initiate_shutdown`).
     pub cluster: std::sync::Arc<wr_manager::cluster::ClusterHandle>,
+    grpc_task: tokio::task::JoinHandle<()>,
+}
+
+impl ClusteredManager {
+    /// Abruptly stop this manager's request-serving process while preserving the
+    /// shared database, as a takeover fixture.
+    pub fn abort_service(&self) {
+        self.grpc_task.abort();
+        let _ = self.cluster.initiate_shutdown();
+    }
 }
 
 /// Start `count` managers with chitchat gossip, all sharing the same Postgres.
@@ -411,14 +549,19 @@ async fn start_manager_cluster_inner(
 
         let manager = Manager::new(pool.clone(), crypto, cluster.clone());
 
-        // Start gRPC server
-        tokio::spawn(
-            Server::builder()
+        // Start gRPC server and retain its owner so takeover tests can prove a
+        // real serving process disappeared without changing shared state.
+        let grpc_task = tokio::spawn(async move {
+            if let Err(error) = Server::builder()
                 .add_service(ManagerServiceServer::new(manager))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
                     grpc_listener,
-                )),
-        );
+                ))
+                .await
+            {
+                panic!("clustered manager test server failed: {error}");
+            }
+        });
 
         // Start heartbeat monitor (reads Postgres, no gossip)
         tokio::spawn(wr_manager::state::monitor_heartbeats(
@@ -432,6 +575,7 @@ async fn start_manager_cluster_inner(
             addr: grpc_url,
             manager_id,
             cluster,
+            grpc_task,
         });
     }
 

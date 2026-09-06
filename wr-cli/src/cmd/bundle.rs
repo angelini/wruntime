@@ -91,8 +91,9 @@ pub fn read_manifest<T: DeserializeOwned>(path: &str) -> Result<T> {
         .context("manifest.json not found or invalid in bundle")
 }
 
-/// Read a single file from a gzipped tarball by matching the end of the archive path.
-pub fn read_file_from_tarball(path: &str, target_file: &str) -> Result<String> {
+/// Read exact bytes for one file from a gzipped tarball by matching the end of
+/// its archive path.
+pub fn read_bytes_from_tarball(path: &str, target_file: &str) -> Result<Vec<u8>> {
     let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
     let decoder = GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
@@ -101,13 +102,19 @@ pub fn read_file_from_tarball(path: &str, target_file: &str) -> Result<String> {
         let mut entry = entry?;
         let entry_path = entry.path()?.to_string_lossy().to_string();
         if entry_path.ends_with(target_file) {
-            let mut content = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut content)?;
+            let mut content = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut content)?;
             return Ok(content);
         }
     }
 
     bail!("{target_file} not found in bundle")
+}
+
+/// Read one UTF-8 file from a gzipped tarball.
+pub fn read_file_from_tarball(path: &str, target_file: &str) -> Result<String> {
+    String::from_utf8(read_bytes_from_tarball(path, target_file)?)
+        .with_context(|| format!("{target_file} is not UTF-8"))
 }
 
 /// Read files from the tarball whose archive path contains `dir_prefix` and ends with `suffix`.

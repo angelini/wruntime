@@ -242,15 +242,19 @@ fn compose_engines(
                             .iter()
                             .any(|expected| expected.engine_slot == metadata.engine_slot)
                 });
+                let selected = snapshot.slot_authorities.iter().find(|authority| {
+                    authority.node_id == metadata.node_id
+                        && authority.engine_slot == metadata.engine_slot
+                });
                 inventory_matches
-                    && (current
-                        .get(&metadata.node_id)
-                        .is_some_and(|deployment| deployment.revision == metadata.revision)
-                        || snapshot.slot_authorities.iter().any(|authority| {
-                            authority.node_id == metadata.node_id
-                                && authority.engine_slot == metadata.engine_slot
-                                && authority.revision == metadata.revision
-                        }))
+                    && selected.map_or_else(
+                        || {
+                            current
+                                .get(&metadata.node_id)
+                                .is_some_and(|deployment| deployment.revision == metadata.revision)
+                        },
+                        |authority| authority.revision == metadata.revision,
+                    )
             });
             let engine_fresh = is_fresh(
                 snapshot.observed_at,
@@ -669,11 +673,7 @@ pub fn compose(
     let current = snapshot
         .deployments
         .iter()
-        .filter(|item| {
-            item.record.revision == item.current_revision
-                || (item.current_revision == 0
-                    && item.target_revision == Some(item.record.revision))
-        })
+        .filter(|item| item.record.revision == item.current_revision)
         .map(|item| (item.record.node_id.clone(), item.record.clone()))
         .collect::<BTreeMap<_, _>>();
     let managers = compose_managers(&snapshot, &membership, within_convergence_window);
@@ -830,6 +830,10 @@ mod tests {
             routes,
             managers: Vec::new(),
             slot_authorities: Vec::new(),
+            active_operations: Vec::new(),
+            observations: Vec::new(),
+            agent_attestations: Vec::new(),
+            agent_policies: Vec::new(),
         };
 
         let services = compose_services(&snapshot, &current, &engines);

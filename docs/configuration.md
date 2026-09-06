@@ -72,28 +72,31 @@ The manager also runs a Postgres-backed claim/lease job scheduler that submits s
 
 ### Node lifecycle agent
 
-`wr-cli node agent --config /opt/wruntime/wr-agent/agent.toml` runs the outbound-only node executor. It has no listener and accepts only manager-derived typed steps. Example:
+`wr-cli node agent install|update` deterministically installs the outbound-only, root-owned host executor from the node bundle and waits for a fresh exact mTLS attestation. `wr-cli node agent run --config /opt/wruntime/wr-agent/agent.toml` is the generated systemd unit's process entry point, not a normal interactive workflow. The strict canonical policy contains no static slot inventory:
 
 ```toml
-node_id = "node-a"
-manager = "https://manager.example:9000"
-deployment_root = "/opt/wruntime"
-backend = "systemd" # or "docker"
-poll_seconds = 5
-# Docker additionally requires compose_file and compose_project.
-
-[tls]
-cert_path = "/opt/wruntime/wr-agent/agent.crt"
-key_path = "/opt/wruntime/wr-agent/agent.key"
-ca_cert_path = "/opt/wruntime/wr-agent/ca.crt"
-
-[slots.blue]
-lifecycle_address = "http://127.0.0.1:9100"
-[slots.green]
-lifecycle_address = "http://127.0.0.1:9110"
+policy-version = 1
+node-id = "node-a"
+manager-endpoint = "https://manager.example:9000"
+client-cert-path = "/opt/wruntime/wr-agent/certs/agent.crt"
+client-key-path = "/opt/wruntime/wr-agent/certs/agent.key"
+ca-cert-path = "/opt/wruntime/wr-agent/certs/ca.crt"
+deployment-root = "/opt/wruntime"
+runtime-dir = "/run/wruntime"
+backend = "systemd"
+compose-project = ""
+systemctl-path = "/usr/bin/systemctl"
+docker-path = ""
+poll-interval-seconds = 5
+renew-interval-seconds = 5
+retention-count = 3
+protocol-version = "operator-engine-lifecycle-v1"
+capabilities = ["continuous-lease-v1", "manager-authorized-retention-v1", "release-metadata-v1", "typed-backend-v1"]
 ```
 
-`deployment_root` must be absolute, slot identities are restricted to safe stable names, and lifecycle addresses must be loopback. The agent reports observations every five seconds; manager status treats old or absent evidence as unknown rather than inventing `STOPPED`. Systemd targets fixed `wr-engine-<slot>.service` units. Docker targets fixed `engine-<slot>` Compose services in the configured project. Release verification requires `wr-node/releases/<revision>/bundle.sha256`, and selection atomically updates only `wr-node/slots/<slot>`.
+For Docker, set `backend = "docker"`, an absolute `docker-path`, and one stable `compose-project`, and leave `systemctl-path` empty. Every path and backend executable is validated; the config and credentials are root-owned and owner-only. The manager recomputes the canonical config digest and requires exact protocol equality, binary digest, backend, capabilities, and retention before the activation can claim work. A mismatch is remediated by rerunning the explicit install/update command; it is never treated as backward compatibility.
+
+Slot/lifecycle/backend mappings come only from each revision's digest-covered release metadata. Systemd targets fixed `wr-engine-<slot>.service` units and Docker targets fixed `engine-<slot>` services. Selection atomically updates only `wr-node/slots/<slot>`; there is no node-wide engine `current`. Inspection errors are reported as unknown/query errors, never as exited, and every observation/result is fenced by activation and lease epoch. Retention deletion is restricted to the manager-provided revision/digest allow-list.
 
 ## wr-proxy
 
@@ -685,7 +688,7 @@ Proxies and narrow discovery clients continue to use `ListManagers`, which recon
 
 ### Remote deployment via CLI
 
-The CLI provides `wr-cli managers` and `wr-cli node` command groups for deploying to remote hosts via SSH. Both support systemd and Docker deployment formats. Bundles are **host-agnostic** — they contain template placeholders like `{host}` and `{db_url}` that are resolved at deploy time.
+The CLI provides `wr-cli managers` and `wr-cli node` command groups for deterministic bundle deployment to systemd and Docker hosts. SSH is a narrow transport for bootstrap, inactive byte staging, node-agent install/update, and diagnostics; it is not a workload process executor. After staging and finalization, deploy/upgrade/scale/rollback submit manager-owned durable operations and the continuously fenced node agent performs every proxy/engine backend effect. Bundles are **host-agnostic** and resolve placeholders such as `{host}` and `{db_url}` before their immutable release digest is finalized.
 
 Both bundle and deploy commands auto-discover a `wr-deploy.toml` file in the current directory (or accept `--config <path>`). This file provides defaults for flags like `target`, `db_url`, `format`, etc. — see [deployment.md](deployment.md) for the full config reference.
 
@@ -716,14 +719,17 @@ wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10
 # 1. Build a host-agnostic node bundle (one build for all nodes)
 wr-cli node bundle --engine-config examples/codegen/engine.toml
 
-# 2. Deploy to each node (resolves {host}, {db_url})
+# 2. Install or update the independently managed host agent, then deploy.
 export WR_MANAGER=https://10.0.1.10:9000
-
+wr-cli node agent install --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.20
 wr-cli node deploy --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.20 \
-  --db-url "postgres://postgres@10.0.1.10:5432/wruntime"
+  --db-url "postgres://postgres@10.0.1.10:5432/wruntime" \
+  --request-token node-a-initial
 
+wr-cli node agent install --node-id node-b wr-node-bundle.tar.gz deploy@10.0.1.30
 wr-cli node deploy --node-id node-b wr-node-bundle.tar.gz deploy@10.0.1.30 \
-  --db-url "postgres://postgres@10.0.1.10:5432/wruntime"
+  --db-url "postgres://postgres@10.0.1.10:5432/wruntime" \
+  --request-token node-b-initial
 ```
 
-Use `--skip-build` to reuse compiled artifacts when only rebuilding the bundle metadata.
+Use `upgrade`, `scale`, and `rollback` for later bundle-oriented changes. Their durable deadline is distinct from caller `--wait-timeout`; `--no-wait` returns after submission. Use `--max-unavailable`, `--canary`, `--pause-after-canary`, and explicit `--allow-downtime` as required by capacity. `--skip-build` reuses compiled artifacts only while rebuilding deterministic bundle metadata.

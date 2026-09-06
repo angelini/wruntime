@@ -50,6 +50,24 @@ pub struct DeployConfig {
     pub cert_dir: Option<String>,
     /// mTLS peer listener port (default: 9443)
     pub peer_port: Option<u16>,
+    /// Local node-agent client certificate used only during explicit install/update.
+    pub agent_cert: Option<String>,
+    /// Local node-agent private key used only during explicit install/update.
+    pub agent_key: Option<String>,
+    /// Local CA certificate installed for the node agent.
+    pub agent_ca_cert: Option<String>,
+    /// Absolute host systemctl binary path attested by the agent.
+    pub agent_systemctl_path: Option<String>,
+    /// Absolute host Docker CLI path attested by the agent.
+    pub agent_docker_path: Option<String>,
+    /// Stable Docker Compose project identity used by the host agent.
+    pub agent_compose_project: Option<String>,
+    /// Agent manager polling interval in seconds.
+    pub agent_poll_seconds: Option<u64>,
+    /// Agent lease-renewal interval in seconds.
+    pub agent_renew_seconds: Option<u64>,
+    /// Number of historical successful releases retained after commit.
+    pub agent_retention_count: Option<u32>,
 }
 
 impl DeployConfig {

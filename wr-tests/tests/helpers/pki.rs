@@ -1,5 +1,71 @@
 use std::sync::OnceLock;
 
+#[derive(Clone)]
+pub struct TonicTestIdentity {
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub fingerprint: String,
+}
+
+pub struct RoleTestPki {
+    pub ca_pem: String,
+    pub server: TonicTestIdentity,
+    pub viewer: TonicTestIdentity,
+    pub operator: TonicTestIdentity,
+    pub operator_rotated: TonicTestIdentity,
+    pub agent_a: TonicTestIdentity,
+    pub agent_b: TonicTestIdentity,
+    pub unknown: TonicTestIdentity,
+}
+
+/// Generate a CA, one localhost server identity, and distinct mTLS role
+/// identities. Fingerprints are over the exact DER presented to tonic.
+pub fn generate_role_test_pki() -> RoleTestPki {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
+    use std::net::IpAddr;
+
+    let mut ca_params = CertificateParams::new(vec![]).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "role-test-ca");
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_pem = ca_cert.pem();
+    let issuer = rcgen::Issuer::from_params(&ca_params, ca_key);
+
+    let identity = |name: &str, server: bool| {
+        let mut params = CertificateParams::new(vec![]).unwrap();
+        if server {
+            params.subject_alt_names = vec![
+                SanType::DnsName("localhost".try_into().unwrap()),
+                SanType::IpAddress(IpAddr::from([127, 0, 0, 1])),
+            ];
+        }
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        TonicTestIdentity {
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+            fingerprint: wr_common::tls::certificate_fingerprint_sha256(cert.der().as_ref()),
+        }
+    };
+
+    RoleTestPki {
+        ca_pem,
+        server: identity("manager", true),
+        viewer: identity("viewer", false),
+        operator: identity("operator", false),
+        operator_rotated: identity("operator-rotated", false),
+        agent_a: identity("agent-a", false),
+        agent_b: identity("agent-b", false),
+        unknown: identity("unknown", false),
+    }
+}
+
 pub struct TestPki {
     pub ca_cert_der: Vec<rustls::pki_types::CertificateDer<'static>>,
     pub node_cert_der: Vec<rustls::pki_types::CertificateDer<'static>>,

@@ -59,6 +59,8 @@ struct OperationDto<'a> {
     source_revision: u64,
     target_revision: u64,
     bundle_digest: &'a str,
+    resolved_release_digest: &'a str,
+    phase: &'static str,
     lease_epoch: u64,
     affected_slots: Vec<&'a str>,
     conditions: Vec<&'a str>,
@@ -89,6 +91,19 @@ fn state_name(value: i32) -> &'static str {
     }
 }
 
+fn phase_name(value: i32) -> &'static str {
+    use wr_common::wruntime::NodeOperationPhase as Phase;
+    match Phase::try_from(value).unwrap_or(Phase::Unspecified) {
+        Phase::Forward => "forward",
+        Phase::RestoringSource => "restoring-source",
+        Phase::Committing => "committing",
+        Phase::CommittedCleanup => "committed-cleanup",
+        Phase::Complete => "complete",
+        Phase::Superseded => "superseded",
+        Phase::Unspecified => "unspecified",
+    }
+}
+
 fn dto(operation: &NodeOperation) -> OperationDto<'_> {
     OperationDto {
         operation_id: &operation.operation_id,
@@ -101,6 +116,8 @@ fn dto(operation: &NodeOperation) -> OperationDto<'_> {
         source_revision: operation.source_revision,
         target_revision: operation.target_revision,
         bundle_digest: &operation.bundle_digest,
+        resolved_release_digest: &operation.resolved_release_digest,
+        phase: phase_name(operation.phase),
         lease_epoch: operation.lease_epoch,
         affected_slots: operation
             .slots
@@ -125,10 +142,11 @@ pub(crate) fn render_operation(operation: &NodeOperation, json: bool) -> Result<
         println!("{}", serde_json::to_string_pretty(&dto(operation))?);
     } else {
         println!(
-            "Operation {}  {}  {}  node={}  committed={}",
+            "Operation {}  {}  {}  phase={}  node={}  committed={}",
             operation.operation_id,
             action_name(operation.action),
             state_name(operation.state),
+            phase_name(operation.phase),
             operation.node_id,
             operation.committed
         );

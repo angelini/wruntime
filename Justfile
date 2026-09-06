@@ -82,13 +82,18 @@ test-integration: build-test-guests
     WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
     cargo test -p wr-tests
 
-# Run a single test by name
+# Run one integration-test target when its file exists, otherwise filter by test name
 test-one name: build-test-guests
+    @if [ -f "wr-tests/tests/{{name}}.rs" ]; then \
+        test_args='-p wr-tests --test {{name}}'; \
+    else \
+        test_args='{{name}}'; \
+    fi; \
     WRT_TEST_DB_URL={{db_url_test}} \
     WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
     WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
     WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-    cargo test {{name}}
+    cargo test $test_args
 
 # ── Run services ──────────────────────────────────────────────────────────────
 
@@ -287,7 +292,6 @@ test-lifecycle-runners:
     cargo test -p wr-cli cmd::managers::tests::manager_deploy_propagates_live_tail_failure
     cargo test -p wr-cli cmd::managers::tests::manager_activation_identity_is_installed_in_every_backend
     cargo test -p wr-cli cmd::managers::tests::manager_docker_deploy_sequence_resolves_artifacts_before_compose_start
-    cargo test -p wr-cli cmd::node::tests::node_deploy_propagates_live_tail_failure
     cargo test -p wr-common process_lifecycle::tests
     just deployment-e2e-python-test
 

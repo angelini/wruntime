@@ -371,7 +371,7 @@ collect_diagnostics() {
 		collect_diagnostic "manager compose" "$out/manager-compose.txt" \
 			"${SSH[@]}" "$MANAGER_REMOTE" "cd '$WORKDIR/wr-manager' && sudo docker compose --project-name wruntime-manager -f docker/docker-compose.yml ps -a && sudo docker compose --project-name wruntime-manager -f docker/docker-compose.yml logs --no-color --tail 300"
 		collect_diagnostic "node compose" "$out/node-compose.txt" \
-			"${SSH[@]}" "$NODE_REMOTE" "cd '$WORKDIR/wr-node/current' && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml ps -a && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml images && sudo docker compose --project-name wruntime-node -f docker/docker-compose.yml logs --no-color --tail 300"
+			"${SSH[@]}" "$NODE_REMOTE" "for compose in '$WORKDIR'/wr-node/releases/*/docker/docker-compose.yml; do test -f \"\$compose\" || continue; sudo docker compose --project-name wruntime-node -f \"\$compose\" ps -a; sudo docker compose --project-name wruntime-node -f \"\$compose\" images; sudo docker compose --project-name wruntime-node -f \"\$compose\" logs --no-color --tail 300; done"
 	fi
 }
 
@@ -442,43 +442,62 @@ lifecycle() {
 	revision_a="$(revision_from "$pass/status-a.json")"
 	invoke_echo "hello-$backend-a" "$pass/invoke-a.json"
 
-	local failed_status
-	if "${CLI[@]}" node deploy --node-id "$NODE_ID" "$BUNDLE_B" "$NODE_REMOTE" --format "$backend" \
-		--db-url "$WRT_DEPLOY_E2E_DB_URL" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$RUN_DIR/missing-certs" >"$pass/failed-attempt.log" 2>&1; then
+	local failed_status retry_token="$backend-finalized-retry" staged_revision
+	if "${CLI[@]}" node upgrade --node-id "$NODE_ID" "$BUNDLE_B" "$NODE_REMOTE" --format "$backend" \
+		--request-token "$retry_token" --exit-after-finalization --db-url "$WRT_DEPLOY_E2E_DB_URL" \
+		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR" >"$pass/interrupted-after-finalization.log" 2>&1; then
 		failed_status=0
 	else
 		failed_status=$?
 	fi
 	[ "$failed_status" -ne 0 ] || {
-		echo "intentionally invalid deployment unexpectedly succeeded" >&2
+		echo "post-finalization fault hook unexpectedly submitted an operation" >&2
 		return 1
 	}
-	status_json "$pass/status-failed.json"
-	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-failed.json" failed --node-id "$NODE_ID" --serving-digest "$DIGEST_A" --failed-digest "$DIGEST_B" --after-revision "$revision_a" >"$pass/assert-failed.json"
-	invoke_echo "hello-$backend-after-failure" "$pass/invoke-after-failure.json"
+	status_json "$pass/status-finalized-only.json"
+	staged_revision="$("${PYTHON[@]}" - "$pass/status-finalized-only.json" "$NODE_ID" "$DIGEST_B" <<'PY'
+import json, sys
+value, node_id, digest = json.load(open(sys.argv[1])), sys.argv[2], sys.argv[3]
+node = next(item for item in value["nodes"] if item["node_id"] == node_id)
+target = node.get("target_deployment") or {}
+if target.get("bundle_digest") != digest or not target.get("resolved_release_digest"):
+    raise SystemExit("fault hook did not leave one finalized exact target")
+print(target["revision"])
+PY
+)"
 
-	run_to_log "$backend node B deploy" "$pass/deploy-b.log" \
-		"${CLI[@]}" node deploy --node-id "$NODE_ID" "$BUNDLE_B" "$NODE_REMOTE" --format "$backend" \
-		--db-url "$WRT_DEPLOY_E2E_DB_URL" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
+	run_to_log "$backend node B same-token retry" "$pass/upgrade-b.log" \
+		"${CLI[@]}" node upgrade --node-id "$NODE_ID" "$BUNDLE_B" "$NODE_REMOTE" --format "$backend" \
+		--request-token "$retry_token" --db-url "$WRT_DEPLOY_E2E_DB_URL" \
+		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
 	status_json "$pass/status-b.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-b.json" desired --node-id "$NODE_ID" --digest "$DIGEST_B" --version 2.0.0 >"$pass/assert-b.json"
 	revision_b="$(revision_from "$pass/status-b.json")"
-	[ "$revision_b" -gt "$revision_a" ]
+	[ "$revision_b" -eq "$staged_revision" ]
+	"${CLI[@]}" operations list --node-id "$NODE_ID" --include-terminal --json >"$pass/operations-after-retry.json"
+	"${PYTHON[@]}" - "$pass/operations-after-retry.json" "$retry_token" "$staged_revision" "$DIGEST_B" <<'PY' >"$pass/assert-single-retry-operation.json"
+import json, sys
+operations, token, revision, digest = json.load(open(sys.argv[1])), sys.argv[2], int(sys.argv[3]), sys.argv[4]
+matches = [item for item in operations if item.get("request_token") == token]
+if len(matches) != 1:
+    raise SystemExit(f"expected exactly one same-token operation, observed {len(matches)}")
+operation = matches[0]
+if operation.get("target_revision") != revision or operation.get("bundle_digest") != digest or not operation.get("resolved_release_digest"):
+    raise SystemExit("same-token retry changed the finalized target identity")
+print(json.dumps({"operation_id": operation["operation_id"], "revision": revision}, sort_keys=True))
+PY
 	invoke_echo "hello-$backend-b" "$pass/invoke-b.json"
 
-	local stop_record="$pass/engine-stop.json" stop_error="$pass/engine-stop.stderr" stop_status
-	echo "==> $backend node engine stop"
-	if "${CLI[@]}" node stop "$NODE_REMOTE" --component engine:engine --format "$backend" \
-		--workdir "$WORKDIR" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" \
-		"${NODE_STOP_SSH_ARGS[@]}" --json >"$stop_record" 2>"$stop_error"; then
-		:
-	else
-		stop_status=$?
-		echo "$backend node engine stop failed with $stop_status (stderr: $stop_error)" >&2
-		print_failure_excerpt "$stop_error"
-		return "$stop_status"
-	fi
-	assert_node_stop_record "$stop_record" "$backend" engine:engine
+	run_to_log "$backend node B scale" "$pass/scale-b.log" \
+		"${CLI[@]}" node scale --node-id "$NODE_ID" "$BUNDLE_B" "$NODE_REMOTE" --format "$backend" \
+		--db-url "$WRT_DEPLOY_E2E_DB_URL" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
+	status_json "$pass/status-scale.json"
+	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-scale.json" desired --node-id "$NODE_ID" --digest "$DIGEST_B" --version 2.0.0 >"$pass/assert-scale.json"
+	invoke_echo "hello-$backend-scale" "$pass/invoke-scale.json"
+
+	run_to_log "$backend durable engine drain" "$pass/drain.log" \
+		"${CLI[@]}" engines drain --node-id "$NODE_ID" --slot engine \
+		--request-token "$backend-drain" --wait-timeout 300 --json
 	"${CLI[@]}" cluster wait --node "$NODE_ID" --severity unhealthy \
 		--timeout-secs 30 >"$pass/expect-unhealthy.json"
 	"${PYTHON[@]}" - "$pass/expect-unhealthy.json" "$pass/status-unhealthy.json" <<'PY'
@@ -486,7 +505,8 @@ import json, pathlib, sys
 value = json.load(open(sys.argv[1]))
 pathlib.Path(sys.argv[2]).write_text(json.dumps(value["snapshot"], indent=2) + "\n")
 PY
-	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-unhealthy.json" unhealthy --node-id "$NODE_ID" >"$pass/assert-unhealthy.json"
+	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-unhealthy.json" unhealthy \
+		--node-id "$NODE_ID" >"$pass/assert-unhealthy.json"
 
 	run_to_log "$backend node rollback" "$pass/rollback.log" \
 		"${CLI[@]}" node rollback "$NODE_REMOTE" --node-id "$NODE_ID" --to "$revision_a" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY"

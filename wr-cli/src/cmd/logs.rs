@@ -148,17 +148,24 @@ pub fn build_docker_logs_command(
     tail: u32,
     follow: bool,
 ) -> String {
-    let compose = format!("{workdir}/wr-node/current/docker/docker-compose.yml");
-    let mut cmd =
-        format!("sudo docker compose --project-name wruntime-node -f {compose} logs --tail {tail}");
-    if follow {
-        cmd.push_str(" -f");
+    let follow_flag = if follow { " -f" } else { "" };
+    match service {
+        Some("proxy") | Some("wr-proxy") => format!(
+            "revision=$(sed -n 's/^revision = //p' {workdir}/wr-node/proxy.selection) && test -n \"$revision\" && sudo docker compose --project-name wruntime-node -f {workdir}/wr-node/releases/$revision/docker/docker-compose.yml logs --tail {tail}{follow_flag} proxy"
+        ),
+        Some(service) => {
+            let slot = service
+                .strip_prefix("engine-")
+                .or_else(|| service.strip_prefix("wr-engine-"))
+                .unwrap_or(service);
+            format!(
+                "revision=$(sed -n 's/^revision = //p' {workdir}/wr-node/slots/{slot}.selection) && test -n \"$revision\" && sudo docker compose --project-name wruntime-node -f {workdir}/wr-node/releases/$revision/docker/docker-compose.yml logs --tail {tail}{follow_flag} engine-{slot}"
+            )
+        }
+        None => format!(
+            "for selection in {workdir}/wr-node/proxy.selection {workdir}/wr-node/slots/*.selection; do test -f \"$selection\" || continue; revision=$(sed -n 's/^revision = //p' \"$selection\"); case \"$selection\" in */proxy.selection) component=proxy;; *) slot=$(basename \"$selection\" .selection); component=engine-$slot;; esac; sudo docker compose --project-name wruntime-node -f {workdir}/wr-node/releases/$revision/docker/docker-compose.yml logs --tail {tail}{follow_flag} \"$component\"; done"
+        ),
     }
-    if let Some(s) = service {
-        cmd.push(' ');
-        cmd.push_str(s);
-    }
-    cmd
 }
 
 #[cfg(test)]
@@ -168,9 +175,13 @@ mod tests {
     #[test]
     fn docker_logs_use_privileged_isolated_compose_project() {
         let command = build_docker_logs_command("/opt/wruntime", Some("engine-echo"), 50, true);
-        assert!(command.starts_with("sudo docker compose"));
+        assert!(command.contains("sudo docker compose"));
         assert!(command.contains("--project-name wruntime-node"));
-        assert!(command.contains("/opt/wruntime/wr-node/current/docker/docker-compose.yml"));
+        assert!(command.contains("/opt/wruntime/wr-node/slots/echo.selection"));
+        assert!(
+            command.contains("/opt/wruntime/wr-node/releases/$revision/docker/docker-compose.yml")
+        );
+        assert!(!command.contains("wr-node/current"));
         assert!(command.contains("--tail 50 -f engine-echo"));
     }
 }

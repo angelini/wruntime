@@ -1,26 +1,30 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use sha2::{Digest, Sha256};
+use wr_common::agent_policy::AGENT_PROTOCOL_VERSION;
 use wr_common::wruntime::{
-    BeginDeploymentRequest, BeginRollbackRequest, CompleteDeploymentRequest, DeploymentState,
-    ExpectedEngine, ModuleIdentity, NodeOperationAction, RolloutPolicy, SubmitOperationRequest,
-    VerifyDeploymentRequest,
+    AbandonDeploymentRequest, BeginDeploymentRequest, BeginRollbackRequest, ExpectedEngine,
+    FinalizeDeploymentRequest, ModuleIdentity, NodeOperationAction, RolloutPolicy,
+    SubmitOperationRequest,
 };
 
 use super::build_helpers::{self, BuildModule};
 use super::bundle;
+use super::bundle_integrity::{
+    build_resolved_manifest, deterministic_bundle_digest, verify_bundle_archive,
+    write_resolved_identity, BundleManifest as Manifest, ManifestEngine, ManifestModule,
+    ResolvedReleaseManifest,
+};
 use super::config::{EngineConfig, ProxyConfig};
 use super::deploy_config::{self, DeployConfig, DeployFormat};
 use super::helpers;
-use super::schedules::SchedulesFile;
+use super::node_backend::{ReleaseMetadata, ReleaseSlot};
 use super::service_gen::{self, DockerfileSpec, ServiceUnit};
 use crate::client;
 
@@ -39,11 +43,11 @@ pub enum NodeCommand {
     /// Activate a retained prior bundle revision as a new desired revision
     Rollback(RollbackArgs),
     /// Submit a rolling upgrade for an already verified, pre-staged release.
-    Upgrade(RolloutArgs),
+    Upgrade(DeployArgs),
     /// Submit an inventory-changing rollout for an already verified, pre-staged release.
-    Scale(RolloutArgs),
-    /// Stop one deployed engine and prove backend exit
-    Stop(StopArgs),
+    Scale(DeployArgs),
+    /// Safely abandon an unsubmitted inactive allocation and its exact bytes.
+    Abandon(AbandonArgs),
     /// Run the node-local fenced lifecycle executor.
     Agent(super::node_agent::AgentArgs),
     /// Inspect a bundle without deploying
@@ -114,6 +118,28 @@ pub struct DeployArgs {
     /// mTLS peer listener port (default: 9443)
     #[arg(long)]
     peer_port: Option<u16>,
+    /// Stable idempotency token spanning allocation, staging, and submission.
+    #[arg(long)]
+    request_token: Option<String>,
+    #[arg(long, default_value_t = 1)]
+    max_unavailable: u32,
+    #[arg(long)]
+    canary: Option<String>,
+    #[arg(long)]
+    pause_after_canary: bool,
+    #[arg(long)]
+    allow_downtime: bool,
+    #[arg(long, default_value_t = 1800)]
+    deadline: u64,
+    #[arg(long, default_value_t = 1800)]
+    wait_timeout: u64,
+    #[arg(long)]
+    no_wait: bool,
+    #[arg(long)]
+    json: bool,
+    /// Deterministic test hook: exit after remote finalization and before submission.
+    #[arg(long, hide = true)]
+    exit_after_finalization: bool,
 }
 
 #[derive(Args)]
@@ -138,21 +164,6 @@ pub struct RollbackArgs {
     /// SSH port
     #[arg(long)]
     ssh_port: Option<u16>,
-}
-
-#[derive(Args)]
-pub struct RolloutArgs {
-    #[arg(long)]
-    node_id: String,
-    /// Manager-assigned staged deployment revision.
-    #[arg(long)]
-    target_revision: u64,
-    /// Verified immutable release digest (`sha256:...`).
-    #[arg(long)]
-    bundle_digest: String,
-    /// Stable target slots from the staged manifest.
-    #[arg(long = "slot", required = true)]
-    slots: Vec<String>,
     #[arg(long)]
     request_token: Option<String>,
     #[arg(long, default_value_t = 1)]
@@ -171,33 +182,25 @@ pub struct RolloutArgs {
     no_wait: bool,
     #[arg(long)]
     json: bool,
+    #[arg(long, hide = true)]
+    exit_after_finalization: bool,
 }
 
 #[derive(Args)]
-pub struct StopArgs {
-    /// Remote host in user@host format
+pub struct AbandonArgs {
     remote: String,
-    /// Deployed component selector (only engine:<slot> is supported)
     #[arg(long)]
-    component: String,
-    /// Deploy config file (default: auto-discover wr-deploy.toml in CWD)
+    node_id: String,
+    #[arg(long)]
+    request_token: String,
     #[arg(long)]
     config: Option<String>,
-    /// Deployment format [default: systemd]
-    #[arg(long)]
-    format: Option<DeployFormat>,
-    /// Base directory used by the deployed node
-    #[arg(long)]
-    workdir: Option<String>,
-    /// SSH private key path
+    #[arg(long, default_value = "/opt/wruntime")]
+    workdir: String,
     #[arg(long)]
     ssh_key: Option<String>,
-    /// SSH port
     #[arg(long)]
     ssh_port: Option<u16>,
-    /// Emit the stable machine-readable stop record
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Args)]
@@ -208,117 +211,8 @@ pub struct StatusArgs {
 
 // --- Manifest ---
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Manifest {
-    target: String,
-    bundle_digest: String,
-    engines: Vec<ManifestEngine>,
-    workdir: String,
-    image_prefix: String,
-    modules: Vec<ManifestModule>,
-    configs: Vec<String>,
-    template_vars: Vec<String>,
-    checksums: BTreeMap<String, String>,
-    /// Wasmtime compatibility hash for pre-compiled `.cwasm` artifacts.
-    /// Engine verifies this at startup before deserializing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    precompile_hash: Option<String>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct ManifestEngine {
-    engine_slot: String,
-    modules: Vec<ManifestModule>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct ManifestModule {
-    name: String,
-    namespace: String,
-    version: String,
-    /// Whether this module has a protobuf schema and is registered with the manager.
-    #[serde(default)]
-    has_schema: bool,
-}
-
-fn deterministic_bundle_digest(
-    target: &str,
-    workdir: &str,
-    image_prefix: &str,
-    engines: &[ManifestEngine],
-    checksums: &BTreeMap<String, String>,
-    precompile_hash: &Option<String>,
-) -> Result<String> {
-    let checksums: Vec<_> = checksums.iter().collect();
-    let mut engines = engines.to_vec();
-    engines.sort_by(|left, right| left.engine_slot.cmp(&right.engine_slot));
-    for engine in &mut engines {
-        engine.modules.sort_by(|left, right| {
-            (&left.namespace, &left.name, &left.version).cmp(&(
-                &right.namespace,
-                &right.name,
-                &right.version,
-            ))
-        });
-    }
-    let canonical = serde_json::json!({
-        "target": target,
-        "workdir": workdir,
-        "image_prefix": image_prefix,
-        "engines": engines,
-        "checksums": checksums,
-        "precompile_hash": precompile_hash,
-    });
-    Ok(format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&canonical)?)
-    ))
-}
-
 fn verify_bundle(bundle_path: &str, manifest: &Manifest) -> Result<()> {
-    let actual: BTreeMap<_, _> = bundle::read_payload_checksums(bundle_path)?
-        .into_iter()
-        .collect();
-    if actual != manifest.checksums {
-        let missing: Vec<_> = manifest
-            .checksums
-            .keys()
-            .filter(|path| !actual.contains_key(*path))
-            .cloned()
-            .collect();
-        let changed: Vec<_> = manifest
-            .checksums
-            .iter()
-            .filter(|(path, checksum)| actual.get(*path) != Some(*checksum))
-            .map(|(path, _)| path.clone())
-            .collect();
-        let unexpected: Vec<_> = actual
-            .keys()
-            .filter(|path| !manifest.checksums.contains_key(*path))
-            .cloned()
-            .collect();
-        bail!(
-            "bundle payload checksums do not match manifest (missing: {}; changed: {}; unexpected: {})",
-            missing.join(", "),
-            changed.join(", "),
-            unexpected.join(", ")
-        );
-    }
-    let digest = deterministic_bundle_digest(
-        &manifest.target,
-        &manifest.workdir,
-        &manifest.image_prefix,
-        &manifest.engines,
-        &manifest.checksums,
-        &manifest.precompile_hash,
-    )?;
-    if digest != manifest.bundle_digest {
-        bail!(
-            "bundle digest mismatch: manifest declares {}, computed {digest}",
-            manifest.bundle_digest
-        );
-    }
-    Ok(())
+    verify_bundle_archive(bundle_path, manifest)
 }
 
 // --- Entry point ---
@@ -327,80 +221,33 @@ pub async fn run(args: NodeArgs, manager: Option<&str>) -> Result<()> {
     match args.command {
         NodeCommand::Bundle(bundle_args) => bundle(bundle_args),
         NodeCommand::Deploy(deploy_args) => {
-            let mgr = manager.ok_or_else(|| {
-                anyhow::anyhow!("--manager is required for node deploy (needed for verification)")
-            })?;
-            deploy(deploy_args, mgr).await
+            let mgr =
+                manager.ok_or_else(|| anyhow::anyhow!("--manager is required for node deploy"))?;
+            durable_deploy(deploy_args, mgr, NodeOperationAction::InitialApply).await
         }
         NodeCommand::Rollback(rollback_args) => {
             let mgr = manager
                 .ok_or_else(|| anyhow::anyhow!("--manager is required for node rollback"))?;
-            rollback(rollback_args, mgr).await
+            durable_rollback(rollback_args, mgr).await
         }
-        NodeCommand::Upgrade(rollout_args) => {
+        NodeCommand::Upgrade(deploy_args) => {
             let manager =
                 manager.ok_or_else(|| anyhow::anyhow!("--manager is required for node upgrade"))?;
-            submit_rollout(rollout_args, manager, NodeOperationAction::RollingUpgrade).await
+            durable_deploy(deploy_args, manager, NodeOperationAction::RollingUpgrade).await
         }
-        NodeCommand::Scale(rollout_args) => {
+        NodeCommand::Scale(deploy_args) => {
             let manager =
                 manager.ok_or_else(|| anyhow::anyhow!("--manager is required for node scale"))?;
-            submit_rollout(rollout_args, manager, NodeOperationAction::Scale).await
+            durable_deploy(deploy_args, manager, NodeOperationAction::Scale).await
         }
-        NodeCommand::Stop(stop_args) => stop(stop_args),
-        NodeCommand::Agent(agent_args) => super::node_agent::run(agent_args).await,
+        NodeCommand::Abandon(abandon_args) => {
+            let manager =
+                manager.ok_or_else(|| anyhow::anyhow!("--manager is required for node abandon"))?;
+            abandon(abandon_args, manager).await
+        }
+        NodeCommand::Agent(agent_args) => super::node_agent::run(agent_args, manager).await,
         NodeCommand::InspectBundle(status_args) => status(status_args),
     }
-}
-
-async fn submit_rollout(
-    mut args: RolloutArgs,
-    manager: &str,
-    action: NodeOperationAction,
-) -> Result<()> {
-    args.slots.sort();
-    args.slots.dedup();
-    if args.slots.is_empty() {
-        bail!("at least one --slot is required");
-    }
-    let token = args
-        .request_token
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let canary = args.canary.unwrap_or_else(|| args.slots[0].clone());
-    let operation = client::connect_operator(manager)
-        .await?
-        .submit_operation(SubmitOperationRequest {
-            node_id: args.node_id,
-            request_token: token.clone(),
-            action: action as i32,
-            engine_slots: args.slots,
-            target_revision: args.target_revision,
-            bundle_digest: args.bundle_digest,
-            policy: Some(RolloutPolicy {
-                max_unavailable: args.max_unavailable,
-                canary_slot: canary,
-                pause_after_canary: args.pause_after_canary,
-                allow_downtime: args.allow_downtime,
-                deadline_seconds: args.deadline,
-            }),
-        })
-        .await?
-        .into_inner()
-        .operation
-        .context("SubmitOperation omitted operation")?;
-    if !args.json {
-        println!("Request token: {token}");
-    }
-    if args.no_wait {
-        return super::operations::render_operation(&operation, args.json);
-    }
-    super::operations::wait_for_terminal(
-        manager,
-        operation,
-        Duration::from_secs(args.wait_timeout),
-        args.json,
-    )
-    .await
 }
 
 // --- bundle helpers ---
@@ -625,6 +472,8 @@ struct DeployArtifactParams<'a> {
     workdir: &'a str,
     config_names: &'a [String],
     engine_names: &'a [String],
+    engine_listen_ports: &'a [u16],
+    proxy_port: u16,
     no_otel: bool,
 }
 
@@ -652,9 +501,44 @@ fn add_deployment_artifacts(
         workdir,
         config_names,
         engine_names,
+        engine_listen_ports,
+        proxy_port,
         ..
     } = params;
     let no_otel = params.no_otel;
+    if engine_names.len() != engine_listen_ports.len()
+        || config_names.len() != engine_names.len() + 1
+    {
+        bail!("release service metadata inputs are inconsistent");
+    }
+    let mut release_slots = engine_names
+        .iter()
+        .zip(engine_listen_ports.iter())
+        .enumerate()
+        .map(|(index, (slot, port))| ReleaseSlot {
+            engine_slot: slot.clone(),
+            systemd_unit: format!("wr-engine-{slot}.service"),
+            docker_service: format!("engine-{slot}"),
+            lifecycle_address: format!("http://127.0.0.1:{port}"),
+            config_path: format!("config/{}", config_names[index + 1]),
+        })
+        .collect::<Vec<_>>();
+    release_slots.sort_by(|left, right| left.engine_slot.cmp(&right.engine_slot));
+    let release_metadata = ReleaseMetadata {
+        format_version: 1,
+        proxy_lifecycle_address: format!("http://127.0.0.1:{proxy_port}"),
+        proxy_systemd_unit: "wr-proxy.service".to_string(),
+        proxy_docker_service: "proxy".to_string(),
+        slots: release_slots,
+    };
+    release_metadata.validate()?;
+    bundle::tar_add_bytes_checked(
+        tar,
+        checksums,
+        "wr-node/release-metadata.json",
+        serde_json::to_vec_pretty(&release_metadata)?.as_slice(),
+        0o644,
+    )?;
     let has_schema_artifacts = checksums
         .keys()
         .any(|path| path.starts_with("wr-node/schemas/"));
@@ -665,9 +549,9 @@ fn add_deployment_artifacts(
     // Systemd units
     let proxy_unit = ServiceUnit {
         description: "wruntime proxy",
-        binary_path: &format!("{workdir}/wr-node/current/bin/wr-proxy"),
-        config_path: &format!("{workdir}/wr-node/current/config/{}", config_names[0]),
-        working_directory: &format!("{workdir}/wr-node/current"),
+        binary_path: &format!("{workdir}/wr-node/proxy/bin/wr-proxy"),
+        config_path: &format!("{workdir}/wr-node/proxy/config/{}", config_names[0]),
+        working_directory: &format!("{workdir}/wr-node/proxy"),
         env_vars: vec![],
         no_otel,
         after: vec![],
@@ -683,7 +567,7 @@ fn add_deployment_artifacts(
     bundle::tar_add_bytes_checked(
         tar,
         checksums,
-        "wr-node/systemd/wr-node-agent.service",
+        "wr-node/agent/wr-node-agent.service",
         service_gen::node_agent_systemd_unit(workdir).as_bytes(),
         0o644,
     )?;
@@ -832,6 +716,158 @@ fn add_deployment_artifacts(
 
 // --- bundle ---
 
+struct NodeBundleAssembly<'a> {
+    output: &'a Path,
+    target: &'a str,
+    host_binary_dir: &'a Path,
+    workdir: &'a str,
+    image_prefix: &'a str,
+    peer_port: u16,
+    no_otel: bool,
+    source_proxy_config: Option<&'a ProxyConfig>,
+    engine_configs: &'a [(String, EngineConfig)],
+    precompile_hash: Option<String>,
+}
+
+/// The single production bundle assembly path. Production resolves/builds its
+/// inputs before this seam; determinism tests provide complete disposable
+/// inputs and execute this exact archive/config/unit/metadata path twice.
+fn assemble_node_bundle(input: NodeBundleAssembly<'_>) -> Result<Manifest> {
+    let output_file = fs::File::create(input.output)
+        .with_context(|| format!("failed to create output file: {}", input.output.display()))?;
+    let enc = GzEncoder::new(output_file, Compression::default());
+    let mut tar = tar::Builder::new(enc);
+    let mut checksums: HashMap<String, String> = HashMap::new();
+    let mut manifest_modules: Vec<ManifestModule> = Vec::new();
+    let mut config_names: Vec<String> = Vec::new();
+
+    for bin_name in &["wr-proxy", "wr-engine", "wr-cli"] {
+        let src = input.host_binary_dir.join(bin_name);
+        if !src.exists() {
+            bail!(
+                "Binary not found: {}. Did cross-compilation succeed?",
+                src.display()
+            );
+        }
+        let archive_path = if *bin_name == "wr-cli" {
+            "wr-node/agent/wr-cli".to_string()
+        } else {
+            format!("wr-node/bin/{bin_name}")
+        };
+        bundle::tar_add_file(&mut tar, &mut checksums, &archive_path, &src, 0o755)?;
+    }
+    bundle::tar_add_bytes_checked(
+        &mut tar,
+        &mut checksums,
+        "wr-node/agent/protocol-version",
+        format!("{AGENT_PROTOCOL_VERSION}\n").as_bytes(),
+        0o644,
+    )?;
+
+    let (proxy_port, control_port, artifact_peer_port) = add_proxy_config(
+        &mut tar,
+        &mut checksums,
+        &mut config_names,
+        input.engine_configs,
+        input.source_proxy_config,
+        input.peer_port,
+    )?;
+    let (engine_names, engine_listen_ports) = add_engine_artifacts(
+        &mut tar,
+        &mut checksums,
+        &mut config_names,
+        &mut manifest_modules,
+        input.engine_configs,
+    )?;
+    let mut host_ports = std::collections::HashSet::new();
+    for port in std::iter::once(proxy_port)
+        .chain(std::iter::once(control_port))
+        .chain(std::iter::once(artifact_peer_port))
+        .chain(engine_listen_ports.iter().copied())
+    {
+        if !host_ports.insert(port) {
+            bail!("proxy, control, peer, and engine listener ports must be unique on a node");
+        }
+    }
+
+    let template_vars = vec![
+        "host".to_string(),
+        "db_url".to_string(),
+        "peer_port".to_string(),
+        "node_id".to_string(),
+        "revision".to_string(),
+        "bundle_digest".to_string(),
+    ];
+    add_deployment_artifacts(
+        &mut tar,
+        &mut checksums,
+        &DeployArtifactParams {
+            workdir: input.workdir,
+            config_names: &config_names,
+            engine_names: &engine_names,
+            engine_listen_ports: &engine_listen_ports,
+            proxy_port,
+            no_otel: input.no_otel,
+        },
+    )?;
+
+    let engines: Vec<ManifestEngine> = engine_names
+        .iter()
+        .zip(input.engine_configs)
+        .map(|(slot, (_, config))| {
+            let mut seen = std::collections::HashSet::new();
+            ManifestEngine {
+                engine_slot: slot.clone(),
+                modules: config
+                    .modules
+                    .iter()
+                    .filter(|module| {
+                        seen.insert((&module.namespace, &module.name, &module.version))
+                    })
+                    .map(|module| ManifestModule {
+                        name: module.name.clone(),
+                        namespace: module.namespace.clone(),
+                        version: module.version.clone(),
+                        has_schema: module
+                            .schema_path
+                            .as_deref()
+                            .is_some_and(|path| !path.is_empty()),
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    let manifest_checksums: BTreeMap<_, _> = checksums.into_iter().collect();
+    let bundle_digest = deterministic_bundle_digest(
+        input.target,
+        input.workdir,
+        input.image_prefix,
+        &engines,
+        &manifest_checksums,
+        &input.precompile_hash,
+    )?;
+    let manifest = Manifest {
+        target: input.target.to_string(),
+        bundle_digest,
+        engines,
+        workdir: input.workdir.to_string(),
+        image_prefix: input.image_prefix.to_string(),
+        modules: manifest_modules,
+        configs: config_names,
+        template_vars,
+        checksums: manifest_checksums,
+        precompile_hash: input.precompile_hash,
+    };
+    bundle::tar_add_bytes(
+        &mut tar,
+        "wr-node/manifest.json",
+        serde_json::to_string_pretty(&manifest)?.as_bytes(),
+        0o644,
+    )?;
+    tar.into_inner()?.finish()?;
+    Ok(manifest)
+}
+
 fn bundle(args: BundleArgs) -> Result<()> {
     if args.engine_configs.is_empty() {
         bail!("At least one --engine-config is required");
@@ -913,152 +949,24 @@ fn bundle(args: BundleArgs) -> Result<()> {
         build_helpers::build_host_binaries(&target)?;
     }
 
-    // Step 5: Assemble the bundle
+    // Step 5: Assemble the bundle through the shared production seam.
     let output = args
         .output
         .unwrap_or_else(|| "wr-node-bundle.tar.gz".to_string());
     println!("[bundle]  assembling tarball ...");
-
-    let output_file = fs::File::create(&output)
-        .with_context(|| format!("failed to create output file: {output}"))?;
-    let enc = GzEncoder::new(output_file, Compression::default());
-    let mut tar = tar::Builder::new(enc);
-
-    let mut checksums: HashMap<String, String> = HashMap::new();
-    let mut manifest_modules: Vec<ManifestModule> = Vec::new();
-    let mut config_names: Vec<String> = Vec::new();
-
-    // Add host binaries
-    let target_dir = format!("target/{}/release", target);
-    for bin_name in &["wr-proxy", "wr-engine", "wr-cli"] {
-        let src = PathBuf::from(&target_dir).join(bin_name);
-        if !src.exists() {
-            bail!(
-                "Binary not found: {}. Did cross-compilation succeed?",
-                src.display()
-            );
-        }
-        let archive_path = if *bin_name == "wr-cli" {
-            "wr-node/agent/wr-cli".to_string()
-        } else {
-            format!("wr-node/bin/{bin_name}")
-        };
-        bundle::tar_add_file(&mut tar, &mut checksums, &archive_path, &src, 0o755)?;
-    }
-
-    // Add proxy config template (generated from engine node config or source proxy config)
-    let (proxy_port, control_port, artifact_peer_port) = add_proxy_config(
-        &mut tar,
-        &mut checksums,
-        &mut config_names,
-        &all_engine_configs,
-        source_proxy_config.as_ref(),
+    let target_dir = PathBuf::from(format!("target/{target}/release"));
+    let manifest = assemble_node_bundle(NodeBundleAssembly {
+        output: Path::new(&output),
+        target: &target,
+        host_binary_dir: &target_dir,
+        workdir: &workdir,
+        image_prefix: &image_prefix,
         peer_port,
-    )?;
-
-    // Add engine configs + collect modules and artifacts
-    let (engine_names, engine_listen_ports) = add_engine_artifacts(
-        &mut tar,
-        &mut checksums,
-        &mut config_names,
-        &mut manifest_modules,
-        &all_engine_configs,
-    )?;
-    let mut host_ports = std::collections::HashSet::new();
-    for port in std::iter::once(proxy_port)
-        .chain(std::iter::once(control_port))
-        .chain(std::iter::once(artifact_peer_port))
-        .chain(engine_listen_ports.iter().copied())
-    {
-        if !host_ports.insert(port) {
-            bail!("proxy, control, peer, and engine listener ports must be unique on a node");
-        }
-    }
-
-    // Determine which template variables this bundle requires
-    let template_vars = vec![
-        "host".to_string(),
-        "db_url".to_string(),
-        "peer_port".to_string(),
-        "node_id".to_string(),
-        "revision".to_string(),
-        "bundle_digest".to_string(),
-    ];
-
-    // Generate and add deployment artifacts (systemd + docker)
-    add_deployment_artifacts(
-        &mut tar,
-        &mut checksums,
-        &DeployArtifactParams {
-            workdir: &workdir,
-            config_names: &config_names,
-            engine_names: &engine_names,
-            no_otel,
-        },
-    )?;
-
-    // Record the exact per-slot inventory; this includes modules without a
-    // protobuf schema because readiness must reflect the desired engine, not
-    // only manager-registered HTTP services.
-    let engines: Vec<ManifestEngine> = engine_names
-        .iter()
-        .zip(&all_engine_configs)
-        .map(|(slot, (_, config))| {
-            let mut seen = std::collections::HashSet::new();
-            ManifestEngine {
-                engine_slot: slot.clone(),
-                modules: config
-                    .modules
-                    .iter()
-                    .filter(|module| {
-                        seen.insert((&module.namespace, &module.name, &module.version))
-                    })
-                    .map(|module| ManifestModule {
-                        name: module.name.clone(),
-                        namespace: module.namespace.clone(),
-                        version: module.version.clone(),
-                        has_schema: module
-                            .schema_path
-                            .as_deref()
-                            .is_some_and(|path| !path.is_empty()),
-                    })
-                    .collect(),
-            }
-        })
-        .collect();
-    let manifest_checksums: BTreeMap<_, _> = checksums.into_iter().collect();
-    let bundle_digest = deterministic_bundle_digest(
-        &target,
-        &workdir,
-        &image_prefix,
-        &engines,
-        &manifest_checksums,
-        &precompile_hash,
-    )?;
-
-    // Generate manifest. The digest intentionally excludes target-specific
-    // resolved values and certificates, which are not immutable bundle input.
-    let manifest = Manifest {
-        target: target.clone(),
-        bundle_digest,
-        engines,
-        workdir: workdir.clone(),
-        image_prefix: image_prefix.clone(),
-        modules: manifest_modules,
-        configs: config_names,
-        template_vars,
-        checksums: manifest_checksums,
+        no_otel,
+        source_proxy_config: source_proxy_config.as_ref(),
+        engine_configs: &all_engine_configs,
         precompile_hash,
-    };
-    let manifest_json = serde_json::to_string_pretty(&manifest)?;
-    bundle::tar_add_bytes(
-        &mut tar,
-        "wr-node/manifest.json",
-        manifest_json.as_bytes(),
-        0o644,
-    )?;
-
-    tar.into_inner()?.finish()?;
+    })?;
     println!("[bundle]  wrote {output}");
 
     // Print summary
@@ -1079,81 +987,12 @@ fn bundle(args: BundleArgs) -> Result<()> {
 
 // --- deploy ---
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NodeDeployPhase {
-    PrepareBundle,
-    UploadResolvedConfigs,
-    ProvisionTls,
-    CaptureFirstStartTimestamp,
-    FirstStart,
-}
-
-const NODE_DEPLOY_PHASE_ORDER: [NodeDeployPhase; 5] = [
-    NodeDeployPhase::PrepareBundle,
-    NodeDeployPhase::UploadResolvedConfigs,
-    NodeDeployPhase::ProvisionTls,
-    NodeDeployPhase::CaptureFirstStartTimestamp,
-    NodeDeployPhase::FirstStart,
-];
-
-fn node_deploy_phase_order(_format: &DeployFormat) -> &'static [NodeDeployPhase] {
-    &NODE_DEPLOY_PHASE_ORDER
-}
-
-fn node_service_names(engine_slots: &[String]) -> Vec<String> {
-    let mut service_names = vec!["wr-proxy.service".to_string()];
-    service_names.extend(
-        engine_slots
-            .iter()
-            .map(|slot| format!("wr-engine-{slot}.service")),
-    );
-    service_names
-}
-
-fn node_systemd_start_command(engine_slots: &[String]) -> String {
-    let services = node_service_names(engine_slots).join(" ");
-    format!(
-        "sudo systemctl daemon-reload && sudo systemctl enable {services} && sudo systemctl restart {services} && \
-         for unit in $(systemctl list-unit-files --no-legend 'wr-engine-*.service' | awk '{{print $1}}'); do \
-         case ' {services} ' in *\" $unit \"*) ;; *) sudo systemctl disable --now \"$unit\"; sudo rm -f \"/etc/systemd/system/$unit\" ;; esac; done; \
-         sudo systemctl daemon-reload"
-    )
-}
-
-const NODE_COMPOSE_PROJECT: &str = "wruntime-node";
-
-fn node_docker_start_command(workdir: &str) -> String {
-    format!(
-        "cd {workdir}/wr-node/current && sudo docker compose --project-name {NODE_COMPOSE_PROJECT} -f docker/docker-compose.yml up -d --build --force-recreate --remove-orphans"
-    )
-}
-
 fn staging_release_dir(workdir: &str, revision: u64) -> String {
     format!("{workdir}/wr-node/releases/.{revision}.tmp")
 }
 
 fn release_dir(workdir: &str, revision: u64) -> String {
     format!("{workdir}/wr-node/releases/{revision}")
-}
-
-fn activate_release_command(workdir: &str, revision: u64, slots: &[String]) -> String {
-    let staging = staging_release_dir(workdir, revision);
-    let release = release_dir(workdir, revision);
-    let root = format!("{workdir}/wr-node");
-    let slot_links = slots
-        .iter()
-        .map(|slot| {
-            format!(
-                "sudo rm -f {root}/slots/.{slot}-{revision}.tmp && sudo ln -s ../releases/{revision} {root}/slots/.{slot}-{revision}.tmp && sudo mv -Tf {root}/slots/.{slot}-{revision}.tmp {root}/slots/{slot}"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" && ");
-    format!(
-        "test -d {staging} && test ! -e {release} && sudo mv {staging} {release} && \
-         sudo mkdir -p {root}/slots && sudo rm -f {root}/.current-{revision}.tmp && sudo ln -s releases/{revision} {root}/.current-{revision}.tmp && \
-         sudo mv -Tf {root}/.current-{revision}.tmp {root}/current && {slot_links}"
-    )
 }
 
 fn validate_remote_workdir(workdir: &str) -> Result<()> {
@@ -1178,650 +1017,6 @@ fn validate_engine_slot(slot: &str) -> Result<()> {
         bail!("engine slot must be a non-empty URL-safe deployment slot");
     }
     Ok(())
-}
-
-fn parse_engine_selector(selector: &str) -> Result<&str> {
-    let Some(slot) = selector.strip_prefix("engine:") else {
-        bail!("component must use the supported engine:<slot> selector");
-    };
-    validate_engine_slot(slot)?;
-    Ok(slot)
-}
-
-const REMOTE_STOP_BUDGET: Duration = Duration::from_secs(45);
-const REMOTE_CALL_CAP: Duration = Duration::from_secs(5);
-const FORCE_ACTION_RESERVE: Duration = Duration::from_secs(3);
-const FINAL_INSPECTION_RESERVE: Duration = Duration::from_secs(3);
-const ESCALATION_RESERVE: Duration = Duration::from_secs(6);
-const STOP_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum GracefulStopDisposition {
-    AlreadyStopped,
-    Stopped,
-    Escalated,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum StopActionStatus {
-    NotAttempted,
-    Succeeded,
-    Failed,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-struct StopActionEvidence {
-    status: StopActionStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
-}
-
-impl StopActionEvidence {
-    fn not_attempted() -> Self {
-        Self {
-            status: StopActionStatus::NotAttempted,
-            detail: None,
-        }
-    }
-
-    fn from_result(result: Result<RemoteOutput>) -> Self {
-        match result {
-            Ok(_) => Self {
-                status: StopActionStatus::Succeeded,
-                detail: None,
-            },
-            Err(error) => Self {
-                status: StopActionStatus::Failed,
-                detail: Some(format!("{error:#}")),
-            },
-        }
-    }
-
-    fn succeeded(&self) -> bool {
-        self.status == StopActionStatus::Succeeded
-    }
-}
-
-#[derive(Debug, Eq, PartialEq, serde::Serialize)]
-struct StopOutcome {
-    component: String,
-    backend: &'static str,
-    target: String,
-    graceful_result: GracefulStopDisposition,
-    graceful_action: StopActionEvidence,
-    force_action: StopActionEvidence,
-    final_state: String,
-    final_exited: bool,
-    elapsed_ms: u64,
-    forced: bool,
-}
-
-#[derive(Debug)]
-struct RemoteOutput {
-    stdout: String,
-}
-
-trait StopExecutor {
-    fn elapsed(&self) -> Duration;
-    fn run(
-        &mut self,
-        ssh_base: &[String],
-        command: &str,
-        timeout: Duration,
-    ) -> Result<RemoteOutput>;
-    fn sleep(&mut self, duration: Duration);
-}
-
-struct SshStopExecutor {
-    started: Instant,
-}
-
-fn gnu_timeout_millis(milliseconds: u128) -> String {
-    format!("{}.{:03}s", milliseconds / 1000, milliseconds % 1000)
-}
-
-impl SshStopExecutor {
-    fn new() -> Self {
-        Self {
-            started: Instant::now(),
-        }
-    }
-}
-
-impl StopExecutor for SshStopExecutor {
-    fn elapsed(&self) -> Duration {
-        self.started.elapsed()
-    }
-
-    fn run(
-        &mut self,
-        ssh_base: &[String],
-        command: &str,
-        timeout: Duration,
-    ) -> Result<RemoteOutput> {
-        let timeout_ms = timeout.as_millis();
-        anyhow::ensure!(
-            timeout_ms >= 3,
-            "insufficient remaining budget for a hard-bounded SSH operation"
-        );
-        // GNU timeout's kill-after is additional to its initial timeout. Split
-        // the supplied operation budget so TERM, hard KILL, and Command::output
-        // reaping time all remain inside the caller's absolute deadline.
-        let wait_reserve_ms = (timeout_ms / 4).clamp(1, 50);
-        let child_budget_ms = timeout_ms - wait_reserve_ms;
-        let kill_after_ms = (child_budget_ms / 2).clamp(1, 250);
-        let soft_timeout_ms = child_budget_ms - kill_after_ms;
-        let mut invocation = Command::new("timeout");
-        invocation
-            .arg("-k")
-            .arg(gnu_timeout_millis(kill_after_ms))
-            .arg(gnu_timeout_millis(soft_timeout_ms))
-            .args(ssh_base)
-            .arg(command)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let output = invocation
-            .output()
-            .context("failed to run bounded SSH stop operation")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "bounded SSH stop operation failed with {:?}: {}",
-                output.status.code(),
-                stderr.trim()
-            );
-        }
-        Ok(RemoteOutput {
-            stdout: String::from_utf8(output.stdout)
-                .context("remote stop operation returned non-UTF-8 output")?
-                .trim()
-                .to_string(),
-        })
-    }
-
-    fn sleep(&mut self, duration: Duration) {
-        std::thread::sleep(duration);
-    }
-}
-
-fn remaining_stop_budget(executor: &impl StopExecutor) -> Duration {
-    REMOTE_STOP_BUDGET.saturating_sub(executor.elapsed())
-}
-
-fn bounded_remote_call(
-    executor: &mut impl StopExecutor,
-    ssh_base: &[String],
-    command: &str,
-    reserve: Duration,
-    cap: Duration,
-) -> Result<RemoteOutput> {
-    let available = remaining_stop_budget(executor).saturating_sub(reserve);
-    if available.is_zero() {
-        bail!("remote engine stop exhausted its 45-second deadline");
-    }
-    executor.run(ssh_base, command, available.min(cap))
-}
-
-fn bounded_poll_sleep(executor: &mut impl StopExecutor, reserve: Duration) {
-    let available = remaining_stop_budget(executor).saturating_sub(reserve);
-    if !available.is_zero() {
-        executor.sleep(available.min(STOP_POLL_INTERVAL));
-    }
-}
-
-fn elapsed_millis(executor: &impl StopExecutor) -> u64 {
-    executor.elapsed().as_millis().min(u64::MAX as u128) as u64
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct SystemdState {
-    load: String,
-    active: String,
-}
-
-impl SystemdState {
-    fn exited(&self) -> bool {
-        self.load == "not-found" || matches!(self.active.as_str(), "inactive" | "failed")
-    }
-
-    fn description(&self) -> String {
-        format!("load={},active={}", self.load, self.active)
-    }
-}
-
-fn parse_systemd_state(output: &str) -> Result<SystemdState> {
-    let mut load = None;
-    let mut active = None;
-    for line in output.lines() {
-        if let Some(value) = line.strip_prefix("LoadState=") {
-            load = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("ActiveState=") {
-            active = Some(value.trim().to_string());
-        }
-    }
-    Ok(SystemdState {
-        load: load.context("systemd inspection omitted LoadState")?,
-        active: active.context("systemd inspection omitted ActiveState")?,
-    })
-}
-
-fn systemd_inspect(
-    executor: &mut impl StopExecutor,
-    ssh_base: &[String],
-    unit: &str,
-    reserve: Duration,
-) -> Result<SystemdState> {
-    let command = format!(
-        "sudo systemctl show --no-pager --property=LoadState --property=ActiveState {unit}"
-    );
-    parse_systemd_state(
-        &bounded_remote_call(executor, ssh_base, &command, reserve, REMOTE_CALL_CAP)?.stdout,
-    )
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct DockerState {
-    running: Option<String>,
-    container: Option<String>,
-}
-
-impl DockerState {
-    fn exited(&self) -> bool {
-        self.running.is_none()
-    }
-
-    fn description(&self) -> String {
-        match (&self.running, &self.container) {
-            (Some(running), Some(container)) => {
-                format!("running={running},container={container}")
-            }
-            (None, Some(container)) => format!("running=none,container={container}"),
-            (_, None) => "running=none,container=missing".to_string(),
-        }
-    }
-}
-
-fn parse_docker_state(output: &str) -> Result<DockerState> {
-    let mut running = None;
-    let mut container = None;
-    let mut saw_running = false;
-    let mut saw_container = false;
-    for line in output.lines() {
-        if let Some(value) = line.strip_prefix("running=") {
-            saw_running = true;
-            if !value.trim().is_empty() {
-                running = Some(value.trim().to_string());
-            }
-        } else if let Some(value) = line.strip_prefix("container=") {
-            saw_container = true;
-            if !value.trim().is_empty() {
-                container = Some(value.trim().to_string());
-            }
-        }
-    }
-    anyhow::ensure!(
-        saw_running && saw_container,
-        "Docker inspection omitted running/container evidence"
-    );
-    Ok(DockerState { running, container })
-}
-
-fn docker_compose_prefix(workdir: &str) -> String {
-    format!(
-        "cd {workdir}/wr-node/current && sudo docker compose --project-name {NODE_COMPOSE_PROJECT} -f docker/docker-compose.yml"
-    )
-}
-
-fn docker_inspect(
-    executor: &mut impl StopExecutor,
-    ssh_base: &[String],
-    compose: &str,
-    service: &str,
-    reserve: Duration,
-) -> Result<DockerState> {
-    let command = format!(
-        "running=$({compose} ps -q {service}) && container=$({compose} ps -a -q {service}) && printf 'running=%s\\ncontainer=%s\\n' \"$running\" \"$container\""
-    );
-    parse_docker_state(
-        &bounded_remote_call(executor, ssh_base, &command, reserve, REMOTE_CALL_CAP)?.stdout,
-    )
-}
-
-fn stop_systemd(
-    component: &str,
-    slot: &str,
-    ssh_base: &[String],
-    executor: &mut impl StopExecutor,
-) -> Result<StopOutcome> {
-    let unit = format!("wr-engine-{slot}.service");
-    let initial = systemd_inspect(executor, ssh_base, &unit, ESCALATION_RESERVE)?;
-    if initial.exited() {
-        return Ok(StopOutcome {
-            component: component.to_string(),
-            backend: "systemd",
-            target: unit,
-            graceful_result: GracefulStopDisposition::AlreadyStopped,
-            graceful_action: StopActionEvidence::not_attempted(),
-            force_action: StopActionEvidence::not_attempted(),
-            final_state: initial.description(),
-            final_exited: true,
-            elapsed_ms: elapsed_millis(executor),
-            forced: false,
-        });
-    }
-
-    let stop_command = format!("sudo systemctl stop --no-block {unit}");
-    let graceful_action = StopActionEvidence::from_result(bounded_remote_call(
-        executor,
-        ssh_base,
-        &stop_command,
-        ESCALATION_RESERVE,
-        REMOTE_CALL_CAP,
-    ));
-    let mut last_state = initial.description();
-    while remaining_stop_budget(executor) > ESCALATION_RESERVE {
-        match systemd_inspect(executor, ssh_base, &unit, ESCALATION_RESERVE) {
-            Ok(state) => {
-                last_state = state.description();
-                if state.exited() {
-                    return Ok(StopOutcome {
-                        component: component.to_string(),
-                        backend: "systemd",
-                        target: unit,
-                        graceful_result: GracefulStopDisposition::Stopped,
-                        graceful_action: graceful_action.clone(),
-                        force_action: StopActionEvidence::not_attempted(),
-                        final_state: last_state,
-                        final_exited: true,
-                        elapsed_ms: elapsed_millis(executor),
-                        forced: false,
-                    });
-                }
-            }
-            Err(error) => last_state = format!("inspection-error={error:#}"),
-        }
-        bounded_poll_sleep(executor, ESCALATION_RESERVE);
-    }
-
-    let force_command = format!("sudo systemctl kill --kill-who=all --signal=KILL {unit}");
-    let force_action = StopActionEvidence::from_result(bounded_remote_call(
-        executor,
-        ssh_base,
-        &force_command,
-        FINAL_INSPECTION_RESERVE,
-        FORCE_ACTION_RESERVE,
-    ));
-    while !remaining_stop_budget(executor).is_zero() {
-        match systemd_inspect(executor, ssh_base, &unit, Duration::ZERO) {
-            Ok(state) => {
-                last_state = state.description();
-                if state.exited() {
-                    return Ok(StopOutcome {
-                        component: component.to_string(),
-                        backend: "systemd",
-                        target: unit,
-                        graceful_result: GracefulStopDisposition::Escalated,
-                        graceful_action: graceful_action.clone(),
-                        force_action: force_action.clone(),
-                        final_state: last_state,
-                        final_exited: true,
-                        elapsed_ms: elapsed_millis(executor),
-                        forced: force_action.succeeded(),
-                    });
-                }
-            }
-            Err(error) => last_state = format!("inspection-error={error:#}"),
-        }
-        bounded_poll_sleep(executor, Duration::ZERO);
-    }
-    bail!(
-        "systemd could not prove {unit} exited within 45 seconds (last state: {last_state}; graceful error: {}; force error: {})",
-        graceful_action.detail.as_deref().unwrap_or("none"),
-        force_action.detail.as_deref().unwrap_or("none")
-    )
-}
-
-fn stop_docker(
-    component: &str,
-    slot: &str,
-    workdir: &str,
-    ssh_base: &[String],
-    executor: &mut impl StopExecutor,
-) -> Result<StopOutcome> {
-    let service = format!("engine-{slot}");
-    let compose = docker_compose_prefix(workdir);
-    let initial = docker_inspect(executor, ssh_base, &compose, &service, ESCALATION_RESERVE)?;
-    if initial.exited() {
-        return Ok(StopOutcome {
-            component: component.to_string(),
-            backend: "docker",
-            target: service,
-            graceful_result: GracefulStopDisposition::AlreadyStopped,
-            graceful_action: StopActionEvidence::not_attempted(),
-            force_action: StopActionEvidence::not_attempted(),
-            final_state: initial.description(),
-            final_exited: true,
-            elapsed_ms: elapsed_millis(executor),
-            forced: false,
-        });
-    }
-
-    let available = remaining_stop_budget(executor).saturating_sub(ESCALATION_RESERVE);
-    if available.is_zero() {
-        bail!("remote engine stop exhausted its 45-second deadline before Docker stop");
-    }
-    let operation_budget = available.min(Duration::from_secs(32));
-    let grace_secs = operation_budget
-        .saturating_sub(Duration::from_secs(2))
-        .as_secs()
-        .clamp(1, 30);
-    let stop_command = format!("{compose} stop --timeout {grace_secs} {service}");
-    let graceful_action =
-        StopActionEvidence::from_result(executor.run(ssh_base, &stop_command, operation_budget));
-    let mut last_state = initial.description();
-    if remaining_stop_budget(executor) > ESCALATION_RESERVE {
-        match docker_inspect(executor, ssh_base, &compose, &service, ESCALATION_RESERVE) {
-            Ok(state) => {
-                last_state = state.description();
-                if state.exited() {
-                    return Ok(StopOutcome {
-                        component: component.to_string(),
-                        backend: "docker",
-                        target: service,
-                        graceful_result: GracefulStopDisposition::Stopped,
-                        graceful_action: graceful_action.clone(),
-                        force_action: StopActionEvidence::not_attempted(),
-                        final_state: last_state,
-                        final_exited: true,
-                        elapsed_ms: elapsed_millis(executor),
-                        forced: false,
-                    });
-                }
-            }
-            Err(error) => last_state = format!("inspection-error={error:#}"),
-        }
-    }
-
-    let force_command =
-        format!("{compose} kill -s KILL {service} && {compose} rm --force --stop {service}");
-    let force_action = StopActionEvidence::from_result(bounded_remote_call(
-        executor,
-        ssh_base,
-        &force_command,
-        FINAL_INSPECTION_RESERVE,
-        FORCE_ACTION_RESERVE,
-    ));
-    while !remaining_stop_budget(executor).is_zero() {
-        match docker_inspect(executor, ssh_base, &compose, &service, Duration::ZERO) {
-            Ok(state) => {
-                last_state = state.description();
-                if state.exited() {
-                    return Ok(StopOutcome {
-                        component: component.to_string(),
-                        backend: "docker",
-                        target: service,
-                        graceful_result: GracefulStopDisposition::Escalated,
-                        graceful_action: graceful_action.clone(),
-                        force_action: force_action.clone(),
-                        final_state: last_state,
-                        final_exited: true,
-                        elapsed_ms: elapsed_millis(executor),
-                        forced: force_action.succeeded(),
-                    });
-                }
-            }
-            Err(error) => last_state = format!("inspection-error={error:#}"),
-        }
-        bounded_poll_sleep(executor, Duration::ZERO);
-    }
-    bail!(
-        "Docker could not prove {service} exited within 45 seconds (last state: {last_state}; graceful error: {}; force error: {})",
-        graceful_action.detail.as_deref().unwrap_or("none"),
-        force_action.detail.as_deref().unwrap_or("none")
-    )
-}
-
-fn human_stop_outcome(outcome: &StopOutcome) -> String {
-    format!(
-        "[stop] {} {} ({:?}); graceful-action={:?}; force-action={:?}; final {}; elapsed={}ms; forced={}",
-        outcome.backend,
-        outcome.target,
-        outcome.graceful_result,
-        outcome.graceful_action,
-        outcome.force_action,
-        outcome.final_state,
-        outcome.elapsed_ms,
-        outcome.forced
-    )
-}
-
-fn format_stop_outcome(outcome: &StopOutcome, json: bool) -> Result<String> {
-    if json {
-        Ok(serde_json::to_string(outcome)?)
-    } else {
-        Ok(human_stop_outcome(outcome))
-    }
-}
-
-fn render_stop_outcome(outcome: &StopOutcome, json: bool) -> Result<()> {
-    println!("{}", format_stop_outcome(outcome, json)?);
-    Ok(())
-}
-
-#[derive(Default)]
-struct StopEnvironment {
-    format: Option<String>,
-    workdir: Option<String>,
-    ssh_key: Option<String>,
-    ssh_port: deploy_config::SshPortEnvironment,
-}
-
-impl StopEnvironment {
-    fn from_process() -> Self {
-        let nonempty = |key| std::env::var(key).ok().filter(|value| !value.is_empty());
-        Self {
-            format: nonempty("WR_FORMAT"),
-            workdir: nonempty("WR_WORKDIR"),
-            ssh_key: nonempty("WR_SSH_KEY"),
-            ssh_port: deploy_config::SshPortEnvironment::from_var(std::env::var("WR_SSH_PORT")),
-        }
-    }
-}
-
-struct ResolvedStopContext {
-    remote: String,
-    component: String,
-    slot: String,
-    format: DeployFormat,
-    workdir: String,
-    ssh_key: Option<String>,
-    ssh_port: Option<u16>,
-    json: bool,
-}
-
-fn resolve_stop_context_from(
-    args: StopArgs,
-    deploy_cfg: DeployConfig,
-    environment: StopEnvironment,
-) -> Result<ResolvedStopContext> {
-    let slot = parse_engine_selector(&args.component)?.to_string();
-    let format =
-        deploy_config::resolve_format_from(args.format, deploy_cfg.format, environment.format);
-    let workdir =
-        deploy_config::resolve_string_from(args.workdir, deploy_cfg.workdir, environment.workdir)
-            .unwrap_or_else(|| "/opt/wruntime".to_string());
-    validate_remote_workdir(&workdir)?;
-    let ssh_key =
-        deploy_config::resolve_string_from(args.ssh_key, deploy_cfg.ssh_key, environment.ssh_key);
-    let ssh_port = deploy_config::resolve_ssh_port_from(
-        args.ssh_port,
-        deploy_cfg.ssh_port,
-        environment.ssh_port,
-    )?
-    .map(helpers::DeployPort::get);
-    Ok(ResolvedStopContext {
-        remote: args.remote,
-        component: args.component,
-        slot,
-        format,
-        workdir,
-        ssh_key,
-        ssh_port,
-        json: args.json,
-    })
-}
-
-fn dispatch_stop(
-    context: &ResolvedStopContext,
-    executor: &mut impl StopExecutor,
-) -> Result<StopOutcome> {
-    let ssh_base = helpers::build_ssh_args(
-        &context.remote,
-        context.ssh_key.as_deref(),
-        context.ssh_port,
-    );
-    match context.format {
-        DeployFormat::Systemd => {
-            stop_systemd(&context.component, &context.slot, &ssh_base, executor)
-        }
-        DeployFormat::Docker => stop_docker(
-            &context.component,
-            &context.slot,
-            &context.workdir,
-            &ssh_base,
-            executor,
-        ),
-    }
-}
-
-fn stop(args: StopArgs) -> Result<()> {
-    let config_path = args.config.clone();
-    let deploy_cfg = DeployConfig::load_or_discover(config_path.as_deref())?;
-    let context = resolve_stop_context_from(args, deploy_cfg, StopEnvironment::from_process())?;
-    let mut executor = SshStopExecutor::new();
-    let outcome = dispatch_stop(&context, &mut executor)?;
-    render_stop_outcome(&outcome, context.json)
-}
-
-fn deployment_failure_detail(error: &anyhow::Error) -> String {
-    let detail = error.to_string();
-    if detail.contains("postgres://") || detail.contains("postgresql://") {
-        return "deployment stage failed; database URL omitted".to_string();
-    }
-    detail.chars().take(4096).collect()
-}
-
-fn deployment_attempt_token(prefix: &str) -> String {
-    format!(
-        "{prefix}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    )
 }
 
 fn validate_deploy_listener_ports(configs: &[(String, String)], peer_port: u16) -> Result<()> {
@@ -1864,516 +1059,418 @@ fn expected_engines(manifest: &Manifest) -> Vec<ExpectedEngine> {
         .collect()
 }
 
-async fn wait_for_deployment(
-    manager: &str,
+struct ResolvedStage {
+    root: PathBuf,
+    archive: PathBuf,
+    manifest: ResolvedReleaseManifest,
+    digest: String,
+}
+
+impl Drop for ResolvedStage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn resolved_stage_root() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "wr-resolved-release-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+}
+
+#[allow(clippy::too_many_arguments)] // Resolution binds the complete deploy contract in one atomic staging operation.
+fn materialize_resolved_release(
+    bundle_path: &str,
+    manifest: &Manifest,
+    configs: &[(String, String)],
     node_id: &str,
     revision: u64,
-    bundle_digest: &str,
-    timeout: Duration,
-) -> Result<()> {
-    let subject = format!("deployment {node_id}/{revision}/{bundle_digest}");
-    helpers::wait_with_deadline(
-        &subject,
-        timeout,
-        Duration::from_millis(500),
-        || async {
-            let mut manager_client = match client::connect(manager).await {
-                Ok(client) => client,
-                Err(error) => return helpers::WaitAttempt::QueryFailure(error),
-            };
-            let response = match manager_client
-                .verify_deployment(VerifyDeploymentRequest {
-                    node_id: node_id.to_string(),
-                    revision,
-                })
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    return helpers::WaitAttempt::QueryFailure(anyhow::Error::new(error))
-                }
-            };
-            let verification = response.into_inner();
-            let deployment = match verification.deployment {
-                Some(deployment) => deployment,
-                None => {
-                    return helpers::WaitAttempt::Terminal(anyhow::anyhow!(
-                        "VerifyDeployment returned no deployment record"
-                    ))
-                }
-            };
-            if deployment.node_id != node_id
-                || deployment.revision != revision
-                || deployment.bundle_digest != bundle_digest
-            {
-                return helpers::WaitAttempt::Terminal(anyhow::anyhow!(
-                    "deployment identity mismatch: expected {node_id}/{revision}/{bundle_digest}, observed {}/{}/{}",
-                    deployment.node_id,
-                    deployment.revision,
-                    deployment.bundle_digest
-                ));
+    format: DeployFormat,
+    db_url: &str,
+    peer_port: u16,
+    cert_dir: &str,
+    remote: &str,
+    host_ip: &str,
+) -> Result<ResolvedStage> {
+    let root = resolved_stage_root();
+    std::fs::create_dir_all(&root)?;
+    let archive_file = std::fs::File::open(bundle_path)?;
+    let decoder = flate2::read::GzDecoder::new(archive_file);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .unpack(&root)
+        .context("failed to extract verified source bundle")?;
+    let release = root.join("wr-node");
+    anyhow::ensure!(release.is_dir(), "bundle omitted wr-node release root");
+    let mut vars = HashMap::new();
+    let peer_port_string = peer_port.to_string();
+    let revision_string = revision.to_string();
+    vars.insert("host", host_ip);
+    vars.insert("db_url", db_url);
+    vars.insert("peer_port", peer_port_string.as_str());
+    vars.insert("node_id", node_id);
+    vars.insert("revision", revision_string.as_str());
+    vars.insert("bundle_digest", manifest.bundle_digest.as_str());
+    for (name, template) in configs {
+        let resolved = helpers::resolve_template(template, &vars)
+            .with_context(|| format!("failed to resolve template in {name}"))?;
+        std::fs::write(release.join("config").join(name), resolved)?;
+    }
+    let host_name = helpers::extract_remote_host(remote);
+    std::fs::create_dir_all(release.join("certs"))?;
+    for (source, name, mode) in [
+        (format!("{cert_dir}/ca.crt"), "ca.crt", 0o644),
+        (format!("{cert_dir}/{host_name}.crt"), "node.crt", 0o644),
+        (format!("{cert_dir}/{host_name}.key"), "node.key", 0o600),
+    ] {
+        anyhow::ensure!(
+            Path::new(&source).is_file(),
+            "certificate file not found: {source}"
+        );
+        let target = release.join("certs").join(name);
+        std::fs::copy(&source, &target)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
+    }
+    let run_user = helpers::extract_remote_user(remote).unwrap_or("root");
+    let systemd = release.join("systemd");
+    if systemd.is_dir() {
+        for entry in std::fs::read_dir(&systemd)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("service") {
+                let template = std::fs::read_to_string(&path)?;
+                let resolved = template
+                    .replace("{run_user}", run_user)
+                    .replace("{run_group}", run_user);
+                std::fs::write(path, resolved)?;
             }
-            let deployment_state = match DeploymentState::try_from(deployment.state) {
-                Ok(DeploymentState::Unspecified) | Err(_) => {
-                    return helpers::WaitAttempt::Terminal(anyhow::anyhow!(
-                        "VerifyDeployment returned malformed deployment state {}",
-                        deployment.state
-                    ))
-                }
-                Ok(state) => state,
-            };
-            let evidence = if verification.conditions.is_empty() {
-                format!("state={}; no conditions", deployment_state.as_str_name())
-            } else {
-                verification
-                    .conditions
-                    .iter()
-                    .map(|condition| {
-                        format!(
-                            "{} severity={} affected={} desired={} actual={}: {}",
-                            condition.code,
-                            condition.severity,
-                            condition.affected_identity,
-                            condition.desired,
-                            condition.actual,
-                            condition.detail
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            };
-            if verification.ready {
-                return helpers::WaitAttempt::Matched(());
-            }
-            if deployment_state == DeploymentState::Failed {
-                return helpers::WaitAttempt::Terminal(anyhow::anyhow!(
-                    "deployment entered FAILED: {evidence}"
-                ));
-            }
-            helpers::WaitAttempt::Pending(evidence)
-        },
-    )
-    .await
-}
-
-fn combine_deployment_readiness_and_tail(
-    readiness: Result<()>,
-    tail_result: Result<()>,
-) -> Result<()> {
-    match (readiness, tail_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(tail_error)) => Err(anyhow::anyhow!(
-            "live startup log tail did not shut down cleanly: {tail_error:#}"
-        )),
-        (Err(error), Err(tail_error)) => {
-            bail!("{error:#}; live startup log tail also failed to shut down: {tail_error:#}")
         }
     }
+    let marker = serde_json::json!({
+        "node_id": node_id,
+        "revision": revision,
+        "bundle_digest": manifest.bundle_digest,
+        "format": match format { DeployFormat::Systemd => "systemd", DeployFormat::Docker => "docker" },
+        "engines": manifest.engines,
+    });
+    std::fs::write(
+        release.join("deployment.json"),
+        serde_json::to_vec_pretty(&marker)?,
+    )?;
+    std::fs::write(
+        release.join("bundle.sha256"),
+        format!("{}\n", manifest.bundle_digest),
+    )?;
+    let backend = match format {
+        DeployFormat::Systemd => "systemd",
+        DeployFormat::Docker => "docker",
+    };
+    let resolved_manifest = build_resolved_manifest(
+        &release,
+        node_id,
+        revision,
+        backend,
+        &manifest.bundle_digest,
+    )?;
+    let digest = write_resolved_identity(&release, &resolved_manifest)?;
+    let output = root.join("resolved-release.tar.gz");
+    let file = std::fs::File::create(&output)?;
+    let encoder = GzEncoder::new(file, Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+    builder.append_dir_all(".", &release)?;
+    builder.into_inner()?.finish()?;
+    Ok(ResolvedStage {
+        root,
+        archive: output,
+        manifest: resolved_manifest,
+        digest,
+    })
 }
 
-async fn deploy(args: DeployArgs, manager: &str) -> Result<()> {
-    if !Path::new(&args.bundle).exists() {
-        bail!("Bundle not found: {}", args.bundle);
-    }
+fn remote_resolved_verification(
+    release: &str,
+    manifest: &ResolvedReleaseManifest,
+    resolved_digest: &str,
+) -> String {
+    let mut checks = vec![
+        format!(
+            "test \"$(cat {release}/bundle.sha256)\" = '{}'",
+            manifest.bundle_digest
+        ),
+        format!("test \"$(cat {release}/resolved-release.sha256)\" = '{resolved_digest}'"),
+    ];
+    checks.extend(manifest.files.iter().map(|(path, file)| {
+        format!(
+            "test \"$(sha256sum {release}/{path} | cut -d' ' -f1)\" = '{}' && test \"$(stat -c '%a' {release}/{path})\" = '{:o}'",
+            file.sha256, file.mode
+        )
+    }));
+    checks.join(" && ")
+}
 
-    // Resolve args from CLI > config file > env vars > defaults
+fn finalize_remote_release(
+    stage: &ResolvedStage,
+    remote: &str,
+    ssh_key: Option<&str>,
+    ssh_port: Option<u16>,
+    ssh_base: &[String],
+    workdir: &str,
+    revision: u64,
+) -> Result<()> {
+    let root = format!("{workdir}/wr-node/releases");
+    let temporary = format!("{root}/.{revision}.tmp");
+    let release = format!("{root}/{revision}");
+    let upload = format!("/tmp/wr-resolved-{revision}.tar.gz");
+    helpers::scp_file(
+        stage
+            .archive
+            .to_str()
+            .context("temporary archive path is not UTF-8")?,
+        remote,
+        &upload,
+        ssh_key,
+        ssh_port,
+    )?;
+    let verify = remote_resolved_verification(&release, &stage.manifest, &stage.digest);
+    let verify_tmp = remote_resolved_verification(&temporary, &stage.manifest, &stage.digest);
+    helpers::run_ssh(
+        ssh_base,
+        &format!(
+            "sudo mkdir -p {root} && if test -d {release}; then {verify}; else sudo rm -rf {temporary} && sudo mkdir {temporary} && sudo tar xzf {upload} -C {temporary} && {verify_tmp} && sudo chown -R root:root {temporary} && sudo mv {temporary} {release}; fi && sudo rm -f {upload}"
+        ),
+    )
+}
+
+async fn require_compatible_attestation(
+    manager: &str,
+    node_id: &str,
+    format: DeployFormat,
+    manifest: &Manifest,
+) -> Result<()> {
+    let status = client::connect_operator(manager)
+        .await?
+        .get_status(wr_common::wruntime::GetOperatorStatusRequest {
+            node_id: node_id.to_string(),
+            engine_slot: String::new(),
+        })
+        .await?
+        .into_inner();
+    let expected_backend = match format {
+        DeployFormat::Systemd => wr_common::wruntime::BackendKind::Systemd,
+        DeployFormat::Docker => wr_common::wruntime::BackendKind::Docker,
+    } as i32;
+    let expected_binary = format!(
+        "sha256:{}",
+        manifest
+            .checksums
+            .get("wr-node/agent/wr-cli")
+            .context("bundle omits the digest-covered node-agent binary")?
+    );
+    let fresh = chrono::Utc::now().timestamp();
+    anyhow::ensure!(
+        status.agent_attestations.iter().any(|attestation| {
+            attestation.protocol_version == AGENT_PROTOCOL_VERSION
+                && attestation.backend == expected_backend
+                && attestation.binary_digest == expected_binary
+                && attestation
+                    .observed_at
+                    .as_ref()
+                    .is_some_and(|time| fresh.saturating_sub(time.seconds) <= 30)
+        }),
+        "fresh compatible installed node-agent attestation is required before submission"
+    );
+    Ok(())
+}
+
+async fn durable_deploy(
+    args: DeployArgs,
+    manager: &str,
+    action: NodeOperationAction,
+) -> Result<()> {
+    anyhow::ensure!(
+        Path::new(&args.bundle).is_file(),
+        "Bundle not found: {}",
+        args.bundle
+    );
     let deploy_cfg = DeployConfig::load_or_discover(args.config.as_deref())?;
     let format = deploy_config::resolve_format(args.format, deploy_cfg.format);
-    let db_url =
-        deploy_config::resolve_required(args.db_url, deploy_cfg.db_url, "WR_DB_URL", "db_url")?;
-    let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key, "WR_SSH_KEY");
+    let db_url = deploy_config::resolve_required(
+        args.db_url,
+        deploy_cfg.db_url.clone(),
+        "WR_DB_URL",
+        "db_url",
+    )?;
+    let ssh_key =
+        deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key.clone(), "WR_SSH_KEY");
     let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port)?
         .map(helpers::DeployPort::get);
-    let cert_dir = deploy_config::resolve_cert_dir(&args.cert_dir, deploy_cfg.cert_dir);
+    let cert_dir = deploy_config::resolve_cert_dir(&args.cert_dir, deploy_cfg.cert_dir.clone());
     let peer_port = deploy_config::resolve_peer_port(args.peer_port, deploy_cfg.peer_port)?.get();
-
     let manifest: Manifest = bundle::read_manifest(&args.bundle)?;
     verify_bundle(&args.bundle, &manifest)?;
-    let configs = bundle::read_configs_from_tarball(&args.bundle)?;
     validate_remote_workdir(&manifest.workdir)?;
+    let configs = bundle::read_configs_from_tarball(&args.bundle)?;
     validate_deploy_listener_ports(&configs, peer_port)?;
-    let attempt_token = deployment_attempt_token("deploy");
-    let deployment = client::connect(manager)
+    let token = args
+        .request_token
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    println!("Request token: {token}");
+    println!("Bundle digest: {}", manifest.bundle_digest);
+    println!(
+        "Target slots: {}",
+        manifest
+            .engines
+            .iter()
+            .map(|engine| engine.engine_slot.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let deployment = client::connect_operator(manager)
         .await?
         .begin_deployment(BeginDeploymentRequest {
             node_id: args.node_id.clone(),
-            attempt_token,
+            attempt_token: token.clone(),
             bundle_digest: manifest.bundle_digest.clone(),
             expected_engines: expected_engines(&manifest),
         })
         .await?
         .into_inner()
         .deployment
-        .ok_or_else(|| anyhow::anyhow!("manager returned no deployment record"))?;
-    println!(
-        "[deploy]  manager assigned node '{}' revision {} ({})",
-        deployment.node_id, deployment.revision, deployment.bundle_digest
-    );
-
-    let operation: Result<()> = async {
+        .context("manager returned no deployment record")?;
     let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
-
-    // Build template variables
     let host_ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
-    let host_name = helpers::extract_remote_host(&args.remote);
-    let peer_port_str = peer_port.to_string();
-    let mut vars = HashMap::new();
-    vars.insert("host", host_ip.as_str());
-    vars.insert("db_url", db_url.as_str());
-    vars.insert("peer_port", peer_port_str.as_str());
-    let revision = deployment.revision.to_string();
-    vars.insert("node_id", deployment.node_id.as_str());
-    vars.insert("revision", revision.as_str());
-    vars.insert("bundle_digest", deployment.bundle_digest.as_str());
-
-    // Resolve all config templates
-    let mut resolved_configs: Vec<(String, String)> = Vec::new();
-    for (name, template) in &configs {
-        let resolved = helpers::resolve_template(template, &vars)
-            .with_context(|| format!("failed to resolve template in {name}"))?;
-        resolved_configs.push((name.clone(), resolved));
-    }
-
-    let mut first_start_timestamp = String::new();
-    for phase in node_deploy_phase_order(&format) {
-        match phase {
-            NodeDeployPhase::PrepareBundle => match format {
-                DeployFormat::Systemd => {
-                    prepare_systemd(
-                        &args.bundle,
-                        &args.remote,
-                        ssh_key.as_deref(),
-                        ssh_port,
-                        &manifest,
-                        deployment.revision,
-                        &ssh_base,
-                    )
-                    .await?;
-                }
-                DeployFormat::Docker => {
-                    prepare_docker(
-                        &args.bundle,
-                        &args.remote,
-                        ssh_key.as_deref(),
-                        ssh_port,
-                        &manifest,
-                        deployment.revision,
-                        &ssh_base,
-                    )
-                    .await?;
-                }
-            },
-            NodeDeployPhase::UploadResolvedConfigs => {
-                // Overwrite template configs with resolved versions
-                print!("[deploy]  writing resolved configs ... ");
-                let staging = staging_release_dir(&manifest.workdir, deployment.revision);
-                for (name, content) in &resolved_configs {
-                    let remote_path = format!("{staging}/config/{name}");
-                    helpers::scp_bytes(
-                        content.as_bytes(),
-                        &args.remote,
-                        &remote_path,
-                        ssh_key.as_deref(),
-                        ssh_port,
-                    )
-                    .with_context(|| format!("failed to upload resolved {name}"))?;
-                }
-                let marker = serde_json::json!({
-                    "node_id": deployment.node_id,
-                    "revision": deployment.revision,
-                    "bundle_digest": deployment.bundle_digest,
-                    "format": match &format {
-                        DeployFormat::Systemd => "systemd",
-                        DeployFormat::Docker => "docker",
-                    },
-                    "engines": manifest.engines,
-                });
-                helpers::scp_bytes(
-                    serde_json::to_vec_pretty(&marker)?.as_slice(),
-                    &args.remote,
-                    &format!("{staging}/deployment.json"),
-                    ssh_key.as_deref(),
-                    ssh_port,
-                )?;
-                println!("OK");
-            }
-            NodeDeployPhase::ProvisionTls => {
-                // Provision TLS certificates on the remote host
-                print!("[deploy]  provisioning TLS certificates ... ");
-                let remote_cert_dir = format!(
-                    "{}/certs",
-                    staging_release_dir(&manifest.workdir, deployment.revision)
-                );
-                let ca_cert = format!("{cert_dir}/ca.crt");
-                let host_cert = format!("{cert_dir}/{host_name}.crt");
-                let host_key = format!("{cert_dir}/{host_name}.key");
-
-                for (local, remote_name) in [
-                    (&ca_cert, "ca.crt"),
-                    (&host_cert, "node.crt"),
-                    (&host_key, "node.key"),
-                ] {
-                    if !Path::new(local).exists() {
-                        bail!("Certificate file not found: {local}. Run `wr-cli cert generate {host_name}` first.");
-                    }
-                    let tmp_path = format!("/tmp/{remote_name}");
-                    helpers::scp_file(local, &args.remote, &tmp_path, ssh_key.as_deref(), ssh_port)
-                        .with_context(|| format!("failed to upload {local}"))?;
-                    helpers::run_ssh(
-                        &ssh_base,
-                        &format!("sudo mkdir -p {remote_cert_dir} && sudo mv {tmp_path} {remote_cert_dir}/{remote_name}"),
-                    )?;
-                }
-                println!("OK");
-            }
-            NodeDeployPhase::CaptureFirstStartTimestamp => {
-                // Capture remote timestamp before first start to anchor the post-deploy log dump
-                first_start_timestamp =
-                    helpers::get_remote_timestamp(&ssh_base).unwrap_or_default();
-            }
-            NodeDeployPhase::FirstStart => {
-                helpers::run_ssh(
-                    &ssh_base,
-                    &activate_release_command(
-                        &manifest.workdir,
-                        deployment.revision,
-                        &manifest.engines.iter().map(|engine| engine.engine_slot.clone()).collect::<Vec<_>>(),
-                    ),
-                )
-                .context("failed to atomically activate staged release")?;
-                match format {
-                    DeployFormat::Systemd => {
-                        print!("[deploy]  starting services ... ");
-                        start_systemd(&ssh_base, &manifest)?;
-                    }
-                    DeployFormat::Docker => {
-                        print!("[deploy]  starting containers ... ");
-                        start_docker(&ssh_base, &manifest)?;
-                    }
-                }
-                println!("OK");
-            }
-        }
-    }
-
-    println!("[deploy]  waiting for exact revision readiness...");
-
-    // Tail service logs in the background while we wait
-    let log_cmd = match format {
-        DeployFormat::Systemd => super::logs::build_journalctl_command(None, 20, "1m", true),
-        DeployFormat::Docker => {
-            super::logs::build_docker_logs_command(&manifest.workdir, None, 20, true)
-        }
-    };
-    let log_tail = match helpers::spawn_ssh_prefixed(&ssh_base, &log_cmd, "\t") {
-        Ok(tail) => Some(tail),
-        Err(error) => {
-            eprintln!("[deploy]  live log diagnostic unavailable: {error:#}");
-            None
-        }
-    };
-
-    let registered = wait_for_deployment(
-        manager,
-        &deployment.node_id,
+    let stage = materialize_resolved_release(
+        &args.bundle,
+        &manifest,
+        &configs,
+        &args.node_id,
         deployment.revision,
-        &deployment.bundle_digest,
-        Duration::from_secs(60),
-    )
-    .await;
-
-    let tail_result = match log_tail {
-        Some(tail) => tail.stop().await,
-        None => Ok(()),
-    };
-    println!();
-
-    if registered.is_err() {
-        println!("[deploy]  revision verification failed; check remote logs for conditions");
-    }
-
-    // Dump all startup logs from the deploy window (catches fast starts the tail missed)
-    if !first_start_timestamp.is_empty() {
-        println!();
-        println!("[deploy]  startup logs:");
-        let dump_cmd = match format {
-            DeployFormat::Systemd => super::logs::build_journalctl_command_absolute(
-                None,
-                200,
-                &first_start_timestamp,
-                false,
-            ),
-            DeployFormat::Docker => {
-                super::logs::build_docker_logs_command(&manifest.workdir, None, 200, false)
-            }
-        };
-        if let Err(error) = helpers::run_ssh_prefixed_diagnostic(&ssh_base, &dump_cmd, "\t") {
-            eprintln!("[deploy]  startup log diagnostic unavailable: {error:#}");
-        }
-    }
-
-    combine_deployment_readiness_and_tail(registered, tail_result)?;
-
-    println!("[deploy]  exact revision is healthy and routable");
-    // Apply schedules from config if present.
-    if let Some(ref schedules_path) = deploy_cfg.schedules_path {
-        if std::path::Path::new(schedules_path).exists() {
-            println!("[deploy]  applying schedules from {schedules_path}...");
-            let content = std::fs::read_to_string(schedules_path)?;
-            let schedules_file: SchedulesFile = toml::from_str(&content)?;
-            super::schedules::apply_entries(manager, &schedules_file.schedule).await?;
-            println!(
-                "[deploy]  {} schedule(s) applied.",
-                schedules_file.schedule.len()
-            );
-        } else {
-            println!(
-                "[deploy]  WARNING: schedules_path '{}' not found, skipping",
-                schedules_path
-            );
-        }
-    }
-    Ok(())
-    }
-    .await;
-
-    match operation {
-        Ok(()) => {
-            client::connect(manager)
-                .await?
-                .complete_deployment(CompleteDeploymentRequest {
-                    node_id: deployment.node_id,
-                    revision: deployment.revision,
-                    succeeded: true,
-                    failure_detail: String::new(),
-                })
-                .await?;
-            Ok(())
-        }
-        Err(error) => {
-            let failure_detail = deployment_failure_detail(&error);
-            let completion = async {
-                client::connect(manager)
-                    .await?
-                    .complete_deployment(CompleteDeploymentRequest {
-                        node_id: deployment.node_id,
-                        revision: deployment.revision,
-                        succeeded: false,
-                        failure_detail,
-                    })
-                    .await?;
-                Result::<()>::Ok(())
-            }
-            .await;
-            match completion {
-                Ok(()) => Err(error),
-                Err(completion_error) => Err(anyhow::anyhow!(
-                    "{error:#}; reporting deployment failure also failed: {completion_error:#}"
-                )),
-            }
-        }
-    }
-}
-
-async fn prepare_systemd(
-    bundle: &str,
-    remote: &str,
-    ssh_key: Option<&str>,
-    ssh_port: Option<u16>,
-    manifest: &Manifest,
-    revision: u64,
-    ssh_base: &[String],
-) -> Result<()> {
-    prepare_release(
-        bundle, remote, ssh_key, ssh_port, manifest, revision, ssh_base,
-    )
-    .await?;
-    let workdir = &manifest.workdir;
-    let staging = staging_release_dir(workdir, revision);
-    let run_user = helpers::extract_remote_user(remote).unwrap_or("root");
-    print!("[deploy]  installing systemd units ... ");
-    let service_files = bundle::list_files_from_tarball(bundle, "wr-node/systemd/", ".service")?;
-    let mut user_vars = std::collections::HashMap::new();
-    user_vars.insert("run_user", run_user);
-    user_vars.insert("run_group", run_user);
-    for (archive_path, template) in &service_files {
-        let resolved = helpers::resolve_template(template, &user_vars)
-            .with_context(|| format!("failed to resolve {archive_path}"))?;
-        let name = archive_path.rsplit('/').next().unwrap_or(archive_path);
-        helpers::scp_bytes(
-            resolved.as_bytes(),
-            remote,
-            &format!("{staging}/systemd/{name}"),
-            ssh_key,
-            ssh_port,
-        )?;
-    }
-    helpers::run_ssh(
-        ssh_base,
-        &format!("sudo cp {staging}/systemd/*.service /etc/systemd/system/"),
+        format,
+        &db_url,
+        peer_port,
+        &cert_dir,
+        &args.remote,
+        &host_ip,
     )?;
-    println!("OK");
-    helpers::run_ssh(ssh_base, &format!("sudo cp {staging}/systemd/99-wruntime.conf /etc/sysctl.d/ && sudo sysctl --system > /dev/null"))?;
-    Ok(())
-}
-
-async fn prepare_docker(
-    bundle: &str,
-    remote: &str,
-    ssh_key: Option<&str>,
-    ssh_port: Option<u16>,
-    manifest: &Manifest,
-    revision: u64,
-    ssh_base: &[String],
-) -> Result<()> {
-    prepare_release(
-        bundle, remote, ssh_key, ssh_port, manifest, revision, ssh_base,
-    )
-    .await
-}
-
-async fn prepare_release(
-    bundle: &str,
-    remote: &str,
-    ssh_key: Option<&str>,
-    ssh_port: Option<u16>,
-    manifest: &Manifest,
-    revision: u64,
-    ssh_base: &[String],
-) -> Result<()> {
-    let root = format!("{}/wr-node", manifest.workdir);
-    let bundle_dir = format!("{root}/bundles/{}", manifest.bundle_digest);
-    let staging = staging_release_dir(&manifest.workdir, revision);
-    let digest = &manifest.bundle_digest;
-    print!("[deploy]  staging immutable release ... ");
-    helpers::scp_file(bundle, remote, "/tmp/wr-bundle.tar.gz", ssh_key, ssh_port)?;
-    helpers::run_ssh(
-        ssh_base,
-        &format!(
-            "sudo mkdir -p {root}/bundles {root}/releases && test ! -e {staging} && test ! -e {root}/releases/{revision} && (test -d {bundle_dir} || (sudo mkdir {bundle_dir}.tmp && sudo tar xzf /tmp/wr-bundle.tar.gz -C {bundle_dir}.tmp --strip-components=1 && sudo mv {bundle_dir}.tmp {bundle_dir})) && sudo cp -a {bundle_dir} {staging} && printf '%s\\n' '{digest}' | sudo tee {staging}/bundle.sha256 >/dev/null && sudo chown -R $(id -u):$(id -g) {staging} && sudo rm -f /tmp/wr-bundle.tar.gz"
-        ),
+    println!("Resolved release digest: {}", stage.digest);
+    finalize_remote_release(
+        &stage,
+        &args.remote,
+        ssh_key.as_deref(),
+        ssh_port,
+        &ssh_base,
+        &manifest.workdir,
+        deployment.revision,
     )?;
-    println!("OK");
-    Ok(())
-}
-
-fn start_systemd(ssh_base: &[String], manifest: &Manifest) -> Result<()> {
-    let slots = manifest
+    let finalized = client::connect_operator(manager)
+        .await?
+        .finalize_deployment(FinalizeDeploymentRequest {
+            node_id: args.node_id.clone(),
+            attempt_token: token.clone(),
+            revision: deployment.revision,
+            bundle_digest: manifest.bundle_digest.clone(),
+            resolved_release_digest: stage.digest.clone(),
+        })
+        .await?
+        .into_inner()
+        .deployment
+        .context("FinalizeDeployment omitted deployment")?;
+    anyhow::ensure!(
+        finalized.resolved_release_digest == stage.digest,
+        "manager finalized a conflicting release identity"
+    );
+    if args.exit_after_finalization {
+        bail!("deterministic exit after inactive release finalization");
+    }
+    require_compatible_attestation(manager, &args.node_id, format, &manifest).await?;
+    let mut slots = manifest
         .engines
         .iter()
         .map(|engine| engine.engine_slot.clone())
         .collect::<Vec<_>>();
-    helpers::run_ssh(ssh_base, &node_systemd_start_command(&slots))
+    slots.sort();
+    let canary = args
+        .canary
+        .unwrap_or_else(|| slots.first().cloned().unwrap_or_default());
+    let operation = client::connect_operator(manager)
+        .await?
+        .submit_operation(SubmitOperationRequest {
+            node_id: args.node_id,
+            request_token: token,
+            action: action as i32,
+            engine_slots: slots,
+            target_revision: deployment.revision,
+            bundle_digest: manifest.bundle_digest,
+            policy: Some(RolloutPolicy {
+                max_unavailable: args.max_unavailable,
+                canary_slot: canary,
+                pause_after_canary: args.pause_after_canary,
+                allow_downtime: args.allow_downtime,
+                deadline_seconds: args.deadline,
+            }),
+            resolved_release_digest: stage.digest.clone(),
+        })
+        .await?
+        .into_inner()
+        .operation
+        .context("SubmitOperation omitted operation")?;
+    println!("Operation ID: {}", operation.operation_id);
+    if args.no_wait {
+        super::operations::render_operation(&operation, args.json)
+    } else {
+        super::operations::wait_for_terminal(
+            manager,
+            operation,
+            Duration::from_secs(args.wait_timeout),
+            args.json,
+        )
+        .await
+    }
 }
 
-fn start_docker(ssh_base: &[String], manifest: &Manifest) -> Result<()> {
-    helpers::run_ssh(ssh_base, &node_docker_start_command(&manifest.workdir))
+async fn abandon(args: AbandonArgs, manager: &str) -> Result<()> {
+    let deploy = DeployConfig::load_or_discover(args.config.as_deref())?;
+    let workdir = deploy_config::resolve_with_default(
+        &args.workdir,
+        "/opt/wruntime",
+        deploy.workdir,
+        "WR_WORKDIR",
+    );
+    validate_remote_workdir(&workdir)?;
+    let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy.ssh_key, "WR_SSH_KEY");
+    let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy.ssh_port)?
+        .map(helpers::DeployPort::get);
+    let response = client::connect_operator(manager)
+        .await?
+        .abandon_deployment(AbandonDeploymentRequest {
+            node_id: args.node_id,
+            attempt_token: args.request_token,
+        })
+        .await?
+        .into_inner();
+    let deployment = response
+        .deployment
+        .context("AbandonDeployment omitted deployment")?;
+    let release = release_dir(&workdir, deployment.revision);
+    let temporary = staging_release_dir(&workdir, deployment.revision);
+    let ssh = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
+    helpers::run_ssh(
+        &ssh,
+        &format!(
+            "if test -d {release}; then test \"$(cat {release}/bundle.sha256)\" = '{}' && test \"$(cat {release}/resolved-release.sha256)\" = '{}'; fi && sudo rm -rf {temporary} {release}",
+            deployment.bundle_digest, deployment.resolved_release_digest
+        ),
+    )?;
+    println!(
+        "Abandoned request token {} revision {}",
+        deployment.attempt_token, deployment.revision
+    );
+    Ok(())
 }
 
-// --- status ---
-
-async fn rollback(args: RollbackArgs, manager: &str) -> Result<()> {
+async fn durable_rollback(args: RollbackArgs, manager: &str) -> Result<()> {
     let deploy_cfg = DeployConfig::load_or_discover(args.config.as_deref())?;
     let workdir = deploy_config::resolve_with_default(
         &args.workdir,
@@ -2385,175 +1482,123 @@ async fn rollback(args: RollbackArgs, manager: &str) -> Result<()> {
     let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key, "WR_SSH_KEY");
     let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port)?
         .map(helpers::DeployPort::get);
-    let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
-    let attempt_token = deployment_attempt_token("rollback");
-    let deployment = client::connect(manager)
+    let token = args
+        .request_token
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    println!("Request token: {token}");
+    let deployment = client::connect_operator(manager)
         .await?
         .begin_rollback(BeginRollbackRequest {
             node_id: args.node_id.clone(),
             to_revision: args.to.unwrap_or(0),
-            attempt_token,
+            attempt_token: token.clone(),
         })
         .await?
         .into_inner()
         .deployment
-        .ok_or_else(|| anyhow::anyhow!("manager returned no rollback deployment record"))?;
-
-    println!(
-        "[rollback] manager assigned node '{}' revision {} from revision {} ({})",
-        deployment.node_id,
-        deployment.revision,
-        deployment.source_revision,
-        deployment.bundle_digest
+        .context("manager returned no rollback deployment")?;
+    let source = release_dir(&workdir, deployment.source_revision);
+    let target = release_dir(&workdir, deployment.revision);
+    let temporary = staging_release_dir(&workdir, deployment.revision);
+    let ssh = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
+    let script = format!(
+        r#"set -eu
+SOURCE={source:?} TARGET={target:?} TMP={temporary:?} NODE={node:?} REV={revision} BUNDLE={bundle:?} python3 - <<'PY'
+import hashlib,json,os,pathlib,re,shutil,stat
+source=pathlib.Path(os.environ['SOURCE']); target=pathlib.Path(os.environ['TARGET']); tmp=pathlib.Path(os.environ['TMP'])
+node=os.environ['NODE']; revision=int(os.environ['REV']); bundle=os.environ['BUNDLE']
+if target.exists():
+ print((target/'resolved-release.sha256').read_text().strip()); raise SystemExit(0)
+shutil.rmtree(tmp, ignore_errors=True); shutil.copytree(source,tmp,symlinks=False)
+for name in ('resolved-release.json','resolved-release.sha256'): (tmp/name).unlink(missing_ok=True)
+for config in (tmp/'config').glob('*.toml'):
+ text=config.read_text(); parts=text.split('[deployment]',1)
+ if len(parts)==2:
+  head,tail=parts; tail=re.sub(r'(?m)^revision\s*=\s*\d+',f'revision = {revision}',tail,count=1)
+  config.write_text(head+'[deployment]'+tail)
+marker=tmp/'deployment.json'; value=json.loads(marker.read_text()); value['revision']=revision; value['source_revision']={source_revision}; marker.write_text(json.dumps(value,indent=2)+'\n')
+files={{}}
+for path in sorted(tmp.rglob('*')):
+ if path.is_symlink() or (path.exists() and not (path.is_file() or path.is_dir())): raise SystemExit('invalid release entry')
+ if path.is_file() and path.name not in ('resolved-release.json','resolved-release.sha256'):
+  rel=path.relative_to(tmp).as_posix(); files[rel]={{'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'mode':stat.S_IMODE(path.stat().st_mode)}}
+backend=json.loads(marker.read_text())['format']
+manifest={{'version':1,'node_id':node,'revision':revision,'backend':backend,'bundle_digest':bundle,'files':files}}
+canonical=json.dumps(manifest,separators=(',',':')).encode(); digest='sha256:'+hashlib.sha256(b'wruntime.resolved-release.v1\0'+canonical).hexdigest()
+(tmp/'resolved-release.json').write_text(json.dumps(manifest,indent=2)+'\n'); (tmp/'resolved-release.sha256').write_text(digest+'\n')
+os.rename(tmp,target); print(digest)
+PY"#,
+        source = source,
+        target = target,
+        temporary = temporary,
+        node = args.node_id,
+        revision = deployment.revision,
+        bundle = deployment.bundle_digest,
+        source_revision = deployment.source_revision,
     );
-    let result: Result<()> = async {
-        if deployment.source_revision == 0 {
-            bail!("manager rollback response omitted source_revision");
-        }
-        let root = format!("{workdir}/wr-node");
-        let source = release_dir(&workdir, deployment.source_revision);
-        let staging = staging_release_dir(&workdir, deployment.revision);
-        let retained_bundle = format!("{root}/bundles/{}", deployment.bundle_digest);
-        let source_marker: serde_json::Value = serde_json::from_str(&helpers::run_ssh_output(
-            &ssh_base,
-            &format!("sudo cat {source}/deployment.json"),
-        )?)
-        .context("retained release has an invalid deployment marker")?;
-        let format = match source_marker.get("format").and_then(serde_json::Value::as_str) {
-            Some("systemd") => DeployFormat::Systemd,
-            Some("docker") => DeployFormat::Docker,
-            _ => bail!("retained release deployment marker has no valid format"),
-        };
-        helpers::run_ssh(
-            &ssh_base,
-            &format!(
-                "test -d {source} && test -d {retained_bundle} && test ! -e {staging} && \
-                 test ! -e {root}/releases/{} && sudo cp -a {source} {staging} && \
-                 sudo chown -R $(id -u):$(id -g) {staging}",
-                deployment.revision
-            ),
-        )
-        .context("retained rollback release or immutable bundle is missing")?;
-
-        let revision = deployment.revision;
-        let digest = &deployment.bundle_digest;
-        let node_id = &deployment.node_id;
-        let expected_config_count = deployment.expected_engines.len();
-        helpers::run_ssh(
-            &ssh_base,
-            &format!(
-                "test $(grep -l '^\\[deployment\\]$' {staging}/config/*.toml | wc -l) -eq {expected_config_count} && \
-                 for config in {staging}/config/*.toml; do \
-                   sed -i '/^\\[deployment\\]$/,/^\\[/ s/^node_id = .*/node_id = \"{node_id}\"/' \"$config\"; \
-                   sed -i '/^\\[deployment\\]$/,/^\\[/ s/^revision = .*/revision = {revision}/' \"$config\"; \
-                   sed -i '/^\\[deployment\\]$/,/^\\[/ s|^bundle_digest = .*|bundle_digest = \"{digest}\"|' \"$config\"; \
-                 done",
-            ),
-        )
-        .context("failed to inject rollback activation metadata")?;
-        let marker_engines = deployment
-            .expected_engines
-            .iter()
-            .map(|engine| {
-                serde_json::json!({
-                    "engine_slot": engine.engine_slot,
-                    "modules": engine.modules.iter().map(|module| serde_json::json!({
-                        "namespace": module.namespace,
-                        "name": module.name,
-                        "version": module.version,
-                    })).collect::<Vec<_>>(),
-                })
-            })
-            .collect::<Vec<_>>();
-        let marker = serde_json::json!({
-            "node_id": deployment.node_id,
-            "revision": deployment.revision,
-            "bundle_digest": deployment.bundle_digest,
-            "source_revision": deployment.source_revision,
-            "format": match &format {
-                DeployFormat::Systemd => "systemd",
-                DeployFormat::Docker => "docker",
-            },
-            "expected_engines": marker_engines,
-        });
-        helpers::scp_bytes(
-            serde_json::to_vec_pretty(&marker)?.as_slice(),
-            &args.remote,
-            &format!("{staging}/deployment.json"),
-            ssh_key.as_deref(),
-            ssh_port,
-        )?;
-
-        let slots = deployment
-            .expected_engines
-            .iter()
-            .map(|engine| engine.engine_slot.clone())
-            .collect::<Vec<_>>();
-        if matches!(format, DeployFormat::Systemd) {
-            helpers::run_ssh(
-                &ssh_base,
-                &format!("sudo cp {staging}/systemd/*.service /etc/systemd/system/"),
-            )?;
-        }
-        helpers::run_ssh(
-            &ssh_base,
-            &activate_release_command(&workdir, deployment.revision, &slots),
-        )?;
-        match format {
-            DeployFormat::Systemd => {
-                helpers::run_ssh(&ssh_base, &node_systemd_start_command(&slots))?;
-            }
-            DeployFormat::Docker => {
-                helpers::run_ssh(&ssh_base, &node_docker_start_command(&workdir))?;
-            }
-        }
-        wait_for_deployment(
+    let resolved_digest = helpers::run_ssh_output(&ssh, &script)?;
+    let finalized = client::connect_operator(manager)
+        .await?
+        .finalize_deployment(FinalizeDeploymentRequest {
+            node_id: args.node_id.clone(),
+            attempt_token: token.clone(),
+            revision: deployment.revision,
+            bundle_digest: deployment.bundle_digest.clone(),
+            resolved_release_digest: resolved_digest.clone(),
+        })
+        .await?
+        .into_inner()
+        .deployment
+        .context("FinalizeDeployment omitted rollback deployment")?;
+    anyhow::ensure!(
+        finalized.resolved_release_digest == resolved_digest,
+        "rollback finalization identity mismatch"
+    );
+    if args.exit_after_finalization {
+        bail!("deterministic exit after inactive release finalization");
+    }
+    let mut slots = deployment
+        .expected_engines
+        .iter()
+        .map(|engine| engine.engine_slot.clone())
+        .collect::<Vec<_>>();
+    slots.sort();
+    let canary = args
+        .canary
+        .unwrap_or_else(|| slots.first().cloned().unwrap_or_default());
+    let operation = client::connect_operator(manager)
+        .await?
+        .submit_operation(SubmitOperationRequest {
+            node_id: args.node_id,
+            request_token: token,
+            action: NodeOperationAction::Rollback as i32,
+            engine_slots: slots,
+            target_revision: deployment.revision,
+            bundle_digest: deployment.bundle_digest,
+            policy: Some(RolloutPolicy {
+                max_unavailable: args.max_unavailable,
+                canary_slot: canary,
+                pause_after_canary: args.pause_after_canary,
+                allow_downtime: args.allow_downtime,
+                deadline_seconds: args.deadline,
+            }),
+            resolved_release_digest: resolved_digest,
+        })
+        .await?
+        .into_inner()
+        .operation
+        .context("SubmitOperation omitted rollback operation")?;
+    println!("Operation ID: {}", operation.operation_id);
+    if args.no_wait {
+        super::operations::render_operation(&operation, args.json)
+    } else {
+        super::operations::wait_for_terminal(
             manager,
-            &deployment.node_id,
-            deployment.revision,
-            &deployment.bundle_digest,
-            Duration::from_secs(60),
+            operation,
+            Duration::from_secs(args.wait_timeout),
+            args.json,
         )
         .await
-    }
-    .await;
-
-    match result {
-        Ok(()) => {
-            client::connect(manager)
-                .await?
-                .complete_deployment(CompleteDeploymentRequest {
-                    node_id: deployment.node_id,
-                    revision: deployment.revision,
-                    succeeded: true,
-                    failure_detail: String::new(),
-                })
-                .await?;
-            println!("[rollback] exact rollback revision is healthy and routable");
-            Ok(())
-        }
-        Err(error) => {
-            let failure_detail = deployment_failure_detail(&error);
-            let completion = async {
-                client::connect(manager)
-                    .await?
-                    .complete_deployment(CompleteDeploymentRequest {
-                        node_id: deployment.node_id,
-                        revision: deployment.revision,
-                        succeeded: false,
-                        failure_detail,
-                    })
-                    .await?;
-                Result::<()>::Ok(())
-            }
-            .await;
-            match completion {
-                Ok(()) => Err(error),
-                Err(completion_error) => Err(anyhow::anyhow!(
-                    "{error:#}; reporting rollback failure also failed: {completion_error:#}"
-                )),
-            }
-        }
     }
 }
 
@@ -2636,7 +1681,6 @@ fn add_migrations_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_bundle_path(name: &str) -> PathBuf {
@@ -2645,491 +1689,6 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{name}-{}-{nanos}.tar.gz", std::process::id()))
-    }
-
-    fn index_of<T: PartialEq + std::fmt::Debug>(items: &[T], needle: T) -> usize {
-        items
-            .iter()
-            .position(|item| item == &needle)
-            .expect("expected item in deploy phase order")
-    }
-
-    #[derive(Clone, Copy)]
-    enum MockStopMode {
-        AlreadyStopped,
-        Graceful,
-        GracefulActionFailsThenExit,
-        RequiresForce,
-        ForceActionFailsThenExit,
-        NeverExits,
-    }
-
-    struct MockStopExecutor {
-        elapsed: Duration,
-        mode: MockStopMode,
-        running: bool,
-        removed: bool,
-        commands: Vec<String>,
-        ssh_bases: Vec<Vec<String>>,
-        max_call_deadline: Duration,
-    }
-
-    impl MockStopExecutor {
-        fn new(mode: MockStopMode) -> Self {
-            Self {
-                elapsed: Duration::ZERO,
-                running: !matches!(mode, MockStopMode::AlreadyStopped),
-                mode,
-                removed: matches!(mode, MockStopMode::AlreadyStopped),
-                commands: Vec::new(),
-                ssh_bases: Vec::new(),
-                max_call_deadline: Duration::ZERO,
-            }
-        }
-    }
-
-    impl StopExecutor for MockStopExecutor {
-        fn elapsed(&self) -> Duration {
-            self.elapsed
-        }
-
-        fn run(
-            &mut self,
-            ssh_base: &[String],
-            command: &str,
-            timeout: Duration,
-        ) -> Result<RemoteOutput> {
-            assert!(!timeout.is_zero());
-            self.max_call_deadline = self.max_call_deadline.max(self.elapsed + timeout);
-            assert!(self.max_call_deadline <= REMOTE_STOP_BUDGET);
-            self.commands.push(command.to_string());
-            self.ssh_bases.push(ssh_base.to_vec());
-
-            let is_docker_stop = command.contains(" stop --timeout ");
-            let is_systemd_stop = command.contains("systemctl stop --no-block");
-            let is_force = command.contains("signal=KILL") || command.contains(" kill -s KILL ");
-            let consumes_full_grace = (is_docker_stop || is_systemd_stop)
-                && matches!(
-                    self.mode,
-                    MockStopMode::RequiresForce
-                        | MockStopMode::ForceActionFailsThenExit
-                        | MockStopMode::NeverExits
-                );
-            let consumed = if consumes_full_grace {
-                timeout
-            } else {
-                Duration::from_millis(100).min(timeout)
-            };
-            self.elapsed += consumed;
-
-            if (is_docker_stop || is_systemd_stop)
-                && matches!(
-                    self.mode,
-                    MockStopMode::Graceful | MockStopMode::GracefulActionFailsThenExit
-                )
-            {
-                self.running = false;
-            }
-            if is_force
-                && matches!(
-                    self.mode,
-                    MockStopMode::RequiresForce | MockStopMode::ForceActionFailsThenExit
-                )
-            {
-                self.running = false;
-                self.removed = command.contains(" rm --force --stop ")
-                    && matches!(self.mode, MockStopMode::RequiresForce);
-            }
-            if ((is_docker_stop || is_systemd_stop)
-                && matches!(self.mode, MockStopMode::GracefulActionFailsThenExit))
-                || (is_force && matches!(self.mode, MockStopMode::ForceActionFailsThenExit))
-            {
-                anyhow::bail!("injected remote action failure");
-            }
-
-            let stdout = if command.contains("systemctl show") {
-                if self.removed {
-                    "LoadState=not-found\nActiveState=inactive".to_string()
-                } else if self.running {
-                    "LoadState=loaded\nActiveState=active".to_string()
-                } else {
-                    "LoadState=loaded\nActiveState=inactive".to_string()
-                }
-            } else if command.contains("running=$(") {
-                let running = if self.running { "container-id" } else { "" };
-                let container = if self.removed { "" } else { "container-id" };
-                format!("running={running}\ncontainer={container}")
-            } else {
-                String::new()
-            };
-            Ok(RemoteOutput { stdout })
-        }
-
-        fn sleep(&mut self, duration: Duration) {
-            self.elapsed += duration;
-        }
-    }
-
-    fn test_ssh_base() -> Vec<String> {
-        helpers::build_ssh_args("deploy@example", Some("/tmp/test-key"), Some(2222))
-    }
-
-    #[test]
-    fn production_executor_hard_kills_a_term_resistant_child_inside_budget() {
-        let mut executor = SshStopExecutor::new();
-        let started = Instant::now();
-        let error = executor
-            .run(
-                &["sh".to_string(), "-c".to_string()],
-                "trap '' TERM; exec sleep 30",
-                Duration::from_millis(300),
-            )
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("bounded SSH stop operation failed"));
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed >= Duration::from_millis(200),
-            "production fixture did not exercise timeout enforcement: {elapsed:?}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "TERM-resistant production fixture exceeded its hard bound: {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn stop_selector_accepts_only_safe_engine_slots_and_has_no_node_id_surface() {
-        assert_eq!(parse_engine_selector("engine:primary").unwrap(), "primary");
-        for selector in [
-            "proxy",
-            "manager",
-            "engine:",
-            "engine:slot;shutdown",
-            "engine:slot/name",
-            "wr-engine-primary.service",
-        ] {
-            assert!(
-                parse_engine_selector(selector).is_err(),
-                "accepted {selector}"
-            );
-        }
-
-        #[derive(clap::Parser)]
-        struct Fixture {
-            #[command(flatten)]
-            stop: StopArgs,
-        }
-        let parsed = Fixture::try_parse_from([
-            "fixture",
-            "deploy@example",
-            "--component",
-            "engine:primary",
-            "--workdir",
-            "/srv/wruntime",
-            "--ssh-key",
-            "/tmp/key",
-            "--ssh-port",
-            "2222",
-            "--json",
-        ])
-        .unwrap();
-        assert_eq!(parsed.stop.remote, "deploy@example");
-        assert_eq!(parsed.stop.workdir.as_deref(), Some("/srv/wruntime"));
-        assert!(parsed.stop.json);
-        assert!(Fixture::try_parse_from([
-            "fixture",
-            "deploy@example",
-            "--component",
-            "engine:primary",
-            "--node-id",
-            "node-a",
-        ])
-        .is_err());
-    }
-
-    #[test]
-    fn stop_context_precedence_reaches_dispatch_and_selected_renderer() {
-        let base_args = || StopArgs {
-            remote: "deploy@example".to_string(),
-            component: "engine:blue".to_string(),
-            config: None,
-            format: None,
-            workdir: None,
-            ssh_key: None,
-            ssh_port: None,
-            json: true,
-        };
-
-        let environment = StopEnvironment {
-            format: Some("docker".to_string()),
-            workdir: Some("/srv/from-env".to_string()),
-            ssh_key: Some("/keys/from-env".to_string()),
-            ssh_port: deploy_config::SshPortEnvironment::Value("2201".to_string()),
-        };
-        let context =
-            resolve_stop_context_from(base_args(), DeployConfig::default(), environment).unwrap();
-        assert_eq!(context.format, DeployFormat::Docker);
-        assert_eq!(context.workdir, "/srv/from-env");
-        let mut executor = MockStopExecutor::new(MockStopMode::AlreadyStopped);
-        let outcome = dispatch_stop(&context, &mut executor).unwrap();
-        assert!(executor.commands[0].contains("cd /srv/from-env/wr-node/current"));
-        assert!(executor.ssh_bases.iter().all(|base| {
-            base == &helpers::build_ssh_args("deploy@example", Some("/keys/from-env"), Some(2201))
-        }));
-        let rendered = format_stop_outcome(&outcome, context.json).unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&rendered).unwrap()["target"],
-            "engine-blue"
-        );
-
-        let config = DeployConfig {
-            workdir: Some("/srv/from-config".to_string()),
-            ssh_key: Some("/keys/from-config".to_string()),
-            ssh_port: Some(2202),
-            format: Some(DeployFormat::Docker),
-            ..DeployConfig::default()
-        };
-        let context = resolve_stop_context_from(
-            StopArgs {
-                json: false,
-                ..base_args()
-            },
-            config,
-            StopEnvironment {
-                format: Some("systemd".to_string()),
-                workdir: Some("/srv/ignored-env".to_string()),
-                ssh_key: Some("/keys/ignored-env".to_string()),
-                ssh_port: deploy_config::SshPortEnvironment::Value("2299".to_string()),
-            },
-        )
-        .unwrap();
-        let mut executor = MockStopExecutor::new(MockStopMode::AlreadyStopped);
-        let outcome = dispatch_stop(&context, &mut executor).unwrap();
-        assert!(executor.commands[0].contains("cd /srv/from-config/wr-node/current"));
-        assert!(executor.ssh_bases.iter().all(|base| {
-            base == &helpers::build_ssh_args(
-                "deploy@example",
-                Some("/keys/from-config"),
-                Some(2202),
-            )
-        }));
-        assert!(format_stop_outcome(&outcome, context.json)
-            .unwrap()
-            .starts_with("[stop] docker engine-blue"));
-
-        let explicit = StopArgs {
-            format: Some(DeployFormat::Systemd),
-            workdir: Some("/srv/explicit".to_string()),
-            ssh_key: Some("/keys/explicit".to_string()),
-            ssh_port: Some(2203),
-            json: false,
-            ..base_args()
-        };
-        let context = resolve_stop_context_from(
-            explicit,
-            DeployConfig {
-                format: Some(DeployFormat::Docker),
-                workdir: Some("/srv/ignored-config".to_string()),
-                ssh_key: Some("/keys/ignored-config".to_string()),
-                ssh_port: Some(2298),
-                ..DeployConfig::default()
-            },
-            StopEnvironment::default(),
-        )
-        .unwrap();
-        assert_eq!(context.format, DeployFormat::Systemd);
-        assert_eq!(context.workdir, "/srv/explicit");
-        let mut executor = MockStopExecutor::new(MockStopMode::AlreadyStopped);
-        let outcome = dispatch_stop(&context, &mut executor).unwrap();
-        assert_eq!(outcome.target, "wr-engine-blue.service");
-        assert!(executor.ssh_bases.iter().all(|base| {
-            base == &helpers::build_ssh_args("deploy@example", Some("/keys/explicit"), Some(2203))
-        }));
-
-        let defaults = resolve_stop_context_from(
-            base_args(),
-            DeployConfig::default(),
-            StopEnvironment::default(),
-        )
-        .unwrap();
-        assert_eq!(defaults.format, DeployFormat::Systemd);
-        assert_eq!(defaults.workdir, "/opt/wruntime");
-        assert!(defaults.ssh_key.is_none());
-        assert!(defaults.ssh_port.is_none());
-    }
-
-    #[test]
-    fn systemd_stop_reports_graceful_already_stopped_and_escalated_outcomes() {
-        let ssh = test_ssh_base();
-        for (mode, expected, forced) in [
-            (
-                MockStopMode::AlreadyStopped,
-                GracefulStopDisposition::AlreadyStopped,
-                false,
-            ),
-            (
-                MockStopMode::Graceful,
-                GracefulStopDisposition::Stopped,
-                false,
-            ),
-            (
-                MockStopMode::RequiresForce,
-                GracefulStopDisposition::Escalated,
-                true,
-            ),
-        ] {
-            let mut executor = MockStopExecutor::new(mode);
-            let outcome = stop_systemd("engine:blue", "blue", &ssh, &mut executor).unwrap();
-            assert_eq!(outcome.target, "wr-engine-blue.service");
-            assert_eq!(outcome.graceful_result, expected);
-            assert_eq!(outcome.forced, forced);
-            assert!(outcome.final_exited);
-            assert!(executor.max_call_deadline <= REMOTE_STOP_BUDGET);
-            assert!(executor
-                .ssh_bases
-                .iter()
-                .all(|base| base == &test_ssh_base()));
-        }
-    }
-
-    #[test]
-    fn action_failure_followed_by_exit_remains_explicit_for_both_backends() {
-        let ssh = test_ssh_base();
-        for backend in [DeployFormat::Systemd, DeployFormat::Docker] {
-            let run = |mode| {
-                let mut executor = MockStopExecutor::new(mode);
-                let outcome = match backend {
-                    DeployFormat::Systemd => {
-                        stop_systemd("engine:blue", "blue", &ssh, &mut executor)
-                    }
-                    DeployFormat::Docker => {
-                        stop_docker("engine:blue", "blue", "/opt/wruntime", &ssh, &mut executor)
-                    }
-                }
-                .unwrap();
-                (outcome, executor)
-            };
-
-            let (graceful_failed, _) = run(MockStopMode::GracefulActionFailsThenExit);
-            assert_eq!(
-                graceful_failed.graceful_action.status,
-                StopActionStatus::Failed
-            );
-            assert!(graceful_failed.graceful_action.detail.is_some());
-            assert_eq!(
-                graceful_failed.force_action.status,
-                StopActionStatus::NotAttempted
-            );
-            assert!(!graceful_failed.forced);
-            assert!(graceful_failed.final_exited);
-
-            let (force_failed, _) = run(MockStopMode::ForceActionFailsThenExit);
-            assert_eq!(force_failed.force_action.status, StopActionStatus::Failed);
-            assert!(force_failed.force_action.detail.is_some());
-            assert!(!force_failed.forced);
-            assert!(force_failed.final_exited);
-            let json = serde_json::to_value(&force_failed).unwrap();
-            assert_eq!(json["force_action"]["status"], "failed");
-            assert_eq!(json["forced"], false);
-        }
-    }
-
-    #[test]
-    fn docker_stop_uses_custom_release_root_and_one_bounded_deadline() {
-        let ssh = test_ssh_base();
-        let mut executor = MockStopExecutor::new(MockStopMode::RequiresForce);
-        let outcome = stop_docker(
-            "engine:canary",
-            "canary",
-            "/srv/custom",
-            &ssh,
-            &mut executor,
-        )
-        .unwrap();
-        assert_eq!(outcome.target, "engine-canary");
-        assert_eq!(outcome.graceful_result, GracefulStopDisposition::Escalated);
-        assert!(outcome.forced);
-        assert!(executor.max_call_deadline <= REMOTE_STOP_BUDGET);
-        assert!(executor.commands.iter().all(|command| {
-            !command.contains("docker compose")
-                || command.contains("cd /srv/custom/wr-node/current")
-        }));
-        assert!(executor
-            .commands
-            .iter()
-            .any(|command| command.contains("stop --timeout 30 engine-canary")));
-        assert!(executor
-            .commands
-            .iter()
-            .any(|command| command.contains("kill -s KILL engine-canary")));
-    }
-
-    #[test]
-    fn backend_stop_fails_when_final_exit_cannot_be_proved() {
-        let ssh = test_ssh_base();
-        let mut systemd = MockStopExecutor::new(MockStopMode::NeverExits);
-        let error = stop_systemd("engine:x", "x", &ssh, &mut systemd).unwrap_err();
-        assert!(error.to_string().contains("could not prove"));
-        assert!(systemd.elapsed <= REMOTE_STOP_BUDGET);
-        assert!(systemd.max_call_deadline <= REMOTE_STOP_BUDGET);
-
-        let mut docker = MockStopExecutor::new(MockStopMode::NeverExits);
-        let error = stop_docker("engine:x", "x", "/opt/wruntime", &ssh, &mut docker).unwrap_err();
-        assert!(error.to_string().contains("could not prove"));
-        assert!(docker.elapsed <= REMOTE_STOP_BUDGET);
-        assert!(docker.max_call_deadline <= REMOTE_STOP_BUDGET);
-    }
-
-    #[test]
-    fn stop_renderers_share_one_typed_outcome() {
-        let outcome = StopOutcome {
-            component: "engine:primary".to_string(),
-            backend: "systemd",
-            target: "wr-engine-primary.service".to_string(),
-            graceful_result: GracefulStopDisposition::AlreadyStopped,
-            graceful_action: StopActionEvidence::not_attempted(),
-            force_action: StopActionEvidence::not_attempted(),
-            final_state: "load=not-found,active=inactive".to_string(),
-            final_exited: true,
-            elapsed_ms: 42,
-            forced: false,
-        };
-        let value: serde_json::Value =
-            serde_json::from_str(&format_stop_outcome(&outcome, true).unwrap()).unwrap();
-        assert_eq!(value["component"], "engine:primary");
-        assert_eq!(value["target"], "wr-engine-primary.service");
-        assert_eq!(value["graceful_result"], "already-stopped");
-        assert_eq!(value["final_exited"], true);
-        assert_eq!(value["elapsed_ms"], 42);
-        assert_eq!(value["graceful_action"]["status"], "not-attempted");
-        assert_eq!(value["force_action"]["status"], "not-attempted");
-        assert_eq!(value["forced"], false);
-        let human = format_stop_outcome(&outcome, false).unwrap();
-        assert!(human.contains("wr-engine-primary.service"));
-        assert!(human.contains("AlreadyStopped"));
-        assert!(human.contains("forced=false"));
-    }
-
-    #[test]
-    fn node_deploy_propagates_live_tail_failure() {
-        let error =
-            combine_deployment_readiness_and_tail(Ok(()), Err(anyhow::anyhow!("tail exited 255")))
-                .unwrap_err();
-        assert!(error.to_string().contains("tail exited 255"));
-        assert!(error
-            .to_string()
-            .contains("live startup log tail did not shut down cleanly"));
-
-        let combined = combine_deployment_readiness_and_tail(
-            Err(anyhow::anyhow!("deployment failed")),
-            Err(anyhow::anyhow!("tail exited 255")),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(combined.contains("deployment failed"));
-        assert!(combined.contains("tail exited 255"));
     }
 
     #[test]
@@ -3147,6 +1706,136 @@ mod tests {
                 ("migrations/", "migrations/")
             ]
         );
+    }
+
+    struct ProductionBundleOutputs {
+        archive: Vec<u8>,
+        proxy_config: Vec<u8>,
+        engine_config: Vec<u8>,
+        agent_unit: Vec<u8>,
+        release_metadata: Vec<u8>,
+    }
+
+    fn assemble_production_fixture(root: &Path, output: &Path) -> Result<ProductionBundleOutputs> {
+        let binaries = root.join("bin");
+        fs::create_dir_all(&binaries)?;
+        for name in ["wr-proxy", "wr-engine", "wr-cli"] {
+            fs::write(binaries.join(name), format!("fixture-{name}"))?;
+        }
+        let wasm = root.join("inventory.wasm");
+        let cwasm = root.join("inventory.cwasm");
+        let schema = root.join("inventory.binpb");
+        let migrations = root.join("migrations");
+        fs::write(&wasm, b"fixture-wasm")?;
+        fs::write(&cwasm, b"fixture-cwasm")?;
+        fs::write(&schema, b"fixture-schema")?;
+        fs::create_dir_all(&migrations)?;
+        fs::write(migrations.join("V1__fixture.sql"), b"SELECT 1;\n")?;
+        let engine: EngineConfig = toml::from_str(&format!(
+            r#"
+listen_address = "127.0.0.1:9100"
+
+[node]
+proxy_address = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_address = "https://127.0.0.1:9443"
+
+[[module]]
+name = "inventory"
+namespace = "store"
+version = "1.0.0"
+wasm_path = {wasm:?}
+schema_path = {schema:?}
+migrations_path = {migrations:?}
+"#,
+            wasm = wasm.to_string_lossy(),
+            schema = schema.to_string_lossy(),
+            migrations = migrations.to_string_lossy(),
+        ))?;
+        let engine_configs = vec![("blue.toml".to_string(), engine)];
+        let manifest = assemble_node_bundle(NodeBundleAssembly {
+            output,
+            target: "x86_64-unknown-linux-gnu",
+            host_binary_dir: &binaries,
+            workdir: "/opt/wruntime",
+            image_prefix: "wr",
+            peer_port: 9443,
+            no_otel: false,
+            source_proxy_config: None,
+            engine_configs: &engine_configs,
+            precompile_hash: Some("fixture-precompile-hash".into()),
+        })?;
+        verify_bundle_archive(
+            output.to_str().context("fixture path is not UTF-8")?,
+            &manifest,
+        )?;
+        let archive_path = output.to_str().context("fixture path is not UTF-8")?;
+        for required in [
+            "wr-node/bin/wr-proxy",
+            "wr-node/bin/wr-engine",
+            "wr-node/agent/wr-cli",
+            "wr-node/agent/protocol-version",
+            "wr-node/agent/wr-node-agent.service",
+            "wr-node/config/proxy.toml",
+            "wr-node/config/engine.toml",
+            "wr-node/modules/inventory.wasm",
+            "wr-node/modules/inventory.cwasm",
+            "wr-node/schemas/inventory.binpb",
+            "wr-node/migrations/inventory/V1__fixture.sql",
+            "wr-node/systemd/wr-proxy.service",
+            "wr-node/systemd/wr-engine-blue.service",
+            "wr-node/docker/docker-compose.yml",
+            "wr-node/release-metadata.json",
+            "wr-node/manifest.json",
+        ] {
+            bundle::read_bytes_from_tarball(archive_path, required)
+                .with_context(|| format!("production fixture omitted {required}"))?;
+        }
+        Ok(ProductionBundleOutputs {
+            archive: fs::read(output)?,
+            proxy_config: bundle::read_bytes_from_tarball(
+                archive_path,
+                "wr-node/config/proxy.toml",
+            )?,
+            engine_config: bundle::read_bytes_from_tarball(
+                archive_path,
+                "wr-node/config/engine.toml",
+            )?,
+            agent_unit: bundle::read_bytes_from_tarball(
+                archive_path,
+                "wr-node/agent/wr-node-agent.service",
+            )?,
+            release_metadata: bundle::read_bytes_from_tarball(
+                archive_path,
+                "wr-node/release-metadata.json",
+            )?,
+        })
+    }
+
+    #[test]
+    fn complete_production_bundle_path_is_byte_deterministic() {
+        let root = std::env::temp_dir().join(format!(
+            "wr-production-bundle-determinism-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let left = root.join("left.tar.gz");
+        let right = root.join("right.tar.gz");
+        let left_outputs = assemble_production_fixture(&root, &left).unwrap();
+        let right_outputs = assemble_production_fixture(&root, &right).unwrap();
+        assert_eq!(left_outputs.proxy_config, right_outputs.proxy_config);
+        assert_eq!(left_outputs.engine_config, right_outputs.engine_config);
+        assert_eq!(left_outputs.agent_unit, right_outputs.agent_unit);
+        assert_eq!(
+            left_outputs.release_metadata,
+            right_outputs.release_metadata
+        );
+        assert_eq!(
+            left_outputs.archive, right_outputs.archive,
+            "production bundle archive bytes changed"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3196,15 +1885,6 @@ mod tests {
     }
 
     #[test]
-    fn activation_switches_current_atomically() {
-        let command = activate_release_command("/opt/wruntime", 7, &["blue".into()]);
-        assert!(command.contains("releases/.7.tmp"));
-        assert!(command.contains("releases/7"));
-        assert!(command.contains("mv -Tf"));
-        assert!(!command.contains("ln -sfn"));
-    }
-
-    #[test]
     fn listener_validation_accepts_unresolved_revision_template() {
         let configs = vec![(
             "engine.toml".to_string(),
@@ -3221,68 +1901,6 @@ engine_slot = "engine"
         )];
 
         validate_deploy_listener_ports(&configs, 9443).unwrap();
-    }
-
-    #[test]
-    fn node_systemd_deploy_sequence_uploads_configs_and_certs_before_start() {
-        let slots = vec!["engine-a".to_string(), "engine-b".to_string()];
-        let phases = node_deploy_phase_order(&DeployFormat::Systemd);
-        assert!(
-            index_of(phases, NodeDeployPhase::PrepareBundle)
-                < index_of(phases, NodeDeployPhase::UploadResolvedConfigs)
-        );
-        assert!(
-            index_of(phases, NodeDeployPhase::UploadResolvedConfigs)
-                < index_of(phases, NodeDeployPhase::ProvisionTls)
-        );
-        assert!(
-            index_of(phases, NodeDeployPhase::ProvisionTls)
-                < index_of(phases, NodeDeployPhase::CaptureFirstStartTimestamp)
-        );
-        assert!(
-            index_of(phases, NodeDeployPhase::CaptureFirstStartTimestamp)
-                < index_of(phases, NodeDeployPhase::FirstStart)
-        );
-        assert_eq!(
-            node_service_names(&slots),
-            vec![
-                "wr-proxy.service".to_string(),
-                "wr-engine-engine-a.service".to_string(),
-                "wr-engine-engine-b.service".to_string()
-            ]
-        );
-        let command = node_systemd_start_command(&slots);
-        assert!(command.contains("systemctl daemon-reload"));
-        assert!(command.contains("systemctl enable"));
-        assert!(command.contains("systemctl restart"));
-        assert!(command.contains("wr-proxy.service"));
-        assert!(command.contains("wr-engine-engine-a.service"));
-        assert!(command.contains("wr-engine-engine-b.service"));
-        assert!(command.contains("disable --now"));
-        assert!(command.contains("rm -f"));
-    }
-
-    #[test]
-    fn node_docker_deploy_sequence_uploads_source_proxy_config_before_compose_start() {
-        let configs = ["proxy.toml".to_string(), "engine.toml".to_string()];
-        let phases = node_deploy_phase_order(&DeployFormat::Docker);
-        assert!(
-            index_of(phases, NodeDeployPhase::UploadResolvedConfigs)
-                < index_of(phases, NodeDeployPhase::ProvisionTls)
-        );
-        assert!(
-            index_of(phases, NodeDeployPhase::ProvisionTls)
-                < index_of(phases, NodeDeployPhase::FirstStart)
-        );
-        assert_eq!(configs[0], "proxy.toml");
-        let command = node_docker_start_command("/opt/wruntime");
-        assert!(command.contains("docker compose"));
-        assert!(command.contains("--project-name wruntime-node"));
-        assert!(!command.contains("--project-name wruntime-manager"));
-        assert!(command.contains("up -d"));
-        assert!(command.contains("--build"));
-        assert!(command.contains("--force-recreate"));
-        assert!(command.contains("--remove-orphans"));
     }
 
     #[test]
@@ -3357,6 +1975,8 @@ allowed_hosts = ["api.example.com"]
                     workdir: "/opt/wruntime",
                     config_names: &config_names,
                     engine_names: &["engine".to_string()],
+                    engine_listen_ports: &[9100],
+                    proxy_port,
                     no_otel: false,
                 },
             )?;

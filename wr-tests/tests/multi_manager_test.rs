@@ -16,15 +16,237 @@ use helpers::{
 use std::time::Duration;
 
 use wr_common::wruntime::{
-    BeginDeploymentRequest, EngineRegistration, ExpectedEngine, GetClusterStatusRequest,
-    HeartbeatRequest, ListManagersRequest, ModuleDescriptor, RegisterEngineRequest,
-    VerifyDeploymentRequest,
+    BackendProcessState, BeginDeploymentRequest, EngineRegistration, ExpectedEngine,
+    FinalizeDeploymentRequest, GetClusterStatusRequest, HeartbeatRequest, LifecycleStatus,
+    ListManagersRequest, ModuleDescriptor, NodeOperationAction, NodeOperationStepKind,
+    ProcessLifecycleState, RegisterEngineRequest, ReportNodeObservationRequest,
+    ReportStepResultRequest, RolloutPolicy, ServiceKind, SubmitOperationRequest,
 };
 
 // ── Multi-manager integration tests ──────────────────────────────────────────
 //
 // These tests verify DB-based health monitoring across multiple managers
 // sharing the same Postgres. Chitchat is used only for manager liveness.
+
+#[tokio::test]
+async fn test_operation_survives_manager_loss_and_reconciles_without_repeating_effect() {
+    let pool = manager_pool().await;
+    let managers = start_manager_cluster(pool.clone(), 2, 30).await.unwrap();
+    let digest = format!("sha256:{}", "7".repeat(64));
+    let resolved = format!("sha256:{}", "8".repeat(64));
+    let deployment = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
+            node_id: "takeover-node".into(),
+            attempt_token: "takeover-operation".into(),
+            bundle_digest: digest.clone(),
+            expected_engines: vec![ExpectedEngine {
+                engine_slot: "blue".into(),
+                modules: vec![],
+            }],
+        },
+        "operator-a",
+    )
+    .await
+    .unwrap()
+    .record;
+    wr_manager::db::finalize_deployment(
+        &pool,
+        &FinalizeDeploymentRequest {
+            node_id: "takeover-node".into(),
+            attempt_token: "takeover-operation".into(),
+            revision: deployment.revision,
+            bundle_digest: digest.clone(),
+            resolved_release_digest: resolved.clone(),
+        },
+        "operator-a",
+    )
+    .await
+    .unwrap();
+    let policy = helpers::node_agent::systemd_policy("takeover-node", 2);
+    wr_manager::operations::put_agent_policy(&pool, "operator-a", &policy)
+        .await
+        .unwrap();
+    assert!(wr_manager::operations::attest(
+        &pool,
+        "agent-a",
+        &helpers::node_agent::attestation(&policy, "activation-a"),
+    )
+    .await
+    .unwrap()
+    .is_empty());
+    let submitted = wr_manager::operations::submit(
+        &pool,
+        "operator-a",
+        &SubmitOperationRequest {
+            node_id: "takeover-node".into(),
+            request_token: "takeover-operation".into(),
+            action: NodeOperationAction::InitialApply as i32,
+            engine_slots: vec!["blue".into()],
+            target_revision: deployment.revision,
+            bundle_digest: digest.clone(),
+            resolved_release_digest: resolved.clone(),
+            policy: Some(RolloutPolicy {
+                max_unavailable: 1,
+                canary_slot: String::new(),
+                pause_after_canary: false,
+                allow_downtime: true,
+                deadline_seconds: 300,
+            }),
+        },
+    )
+    .await
+    .unwrap();
+
+    let select = wr_manager::operations::claim(&pool, "takeover-node", "activation-a", "agent-a")
+        .await
+        .unwrap()
+        .unwrap()
+        .instruction
+        .unwrap();
+    assert_eq!(select.step, NodeOperationStepKind::SelectRelease as i32);
+    let target = select.target.as_ref().unwrap();
+    wr_manager::operations::report_step(
+        &pool,
+        &ReportStepResultRequest {
+            node_id: select.node_id.clone(),
+            operation_id: select.operation_id.clone(),
+            lease_epoch: select.lease_epoch,
+            step: select.step,
+            agent_instance_id: select.agent_instance_id.clone(),
+            observed_revision: target.revision,
+            observed_digest: target.bundle_digest.clone(),
+            observed_resolved_release_digest: target.resolved_release_digest.clone(),
+            backend_instance_id: "proxy-old".into(),
+            process_instance_id: "proxy-process-old".into(),
+            ..Default::default()
+        },
+        "agent-a",
+    )
+    .await
+    .unwrap();
+    let start = wr_manager::operations::claim(&pool, "takeover-node", "activation-a", "agent-a")
+        .await
+        .unwrap()
+        .unwrap()
+        .instruction
+        .unwrap();
+    assert_eq!(start.step, NodeOperationStepKind::StartBackend as i32);
+    let before = wr_manager::operations::get(&pool, &submitted.operation_id)
+        .await
+        .unwrap();
+    let deadline = before.forward_deadline;
+    let events_before = wr_manager::operations::events(&pool, &submitted.operation_id)
+        .await
+        .unwrap();
+    assert!(before.proxy_effect_delivered_at.is_some());
+
+    managers[0].abort_service();
+    assert!(manager_client(&managers[1].addr).await.is_ok());
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE wr_node_operations SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE operation_id = $1",
+            &[&uuid::Uuid::parse_str(&submitted.operation_id).unwrap()],
+        )
+        .await
+        .unwrap();
+    let stale = wr_manager::operations::report_step(
+        &pool,
+        &ReportStepResultRequest {
+            node_id: start.node_id.clone(),
+            operation_id: start.operation_id.clone(),
+            lease_epoch: start.lease_epoch,
+            step: start.step,
+            agent_instance_id: start.agent_instance_id.clone(),
+            ..Default::default()
+        },
+        "agent-a",
+    )
+    .await
+    .expect_err("expired manager-A lease must be fenced");
+    assert_eq!(stale.code(), tonic::Code::Aborted);
+    assert!(
+        wr_manager::operations::claim(&pool, "takeover-node", "activation-a", "agent-a")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    wr_manager::operations::resume(&pool, &submitted.operation_id, "operator-b")
+        .await
+        .unwrap();
+    assert!(wr_manager::operations::attest(
+        &pool,
+        "agent-b",
+        &helpers::node_agent::attestation(&policy, "activation-b"),
+    )
+    .await
+    .unwrap()
+    .is_empty());
+    let inspection =
+        wr_manager::operations::claim(&pool, "takeover-node", "activation-b", "agent-b")
+            .await
+            .unwrap()
+            .unwrap()
+            .instruction
+            .unwrap();
+    assert_eq!(
+        inspection.step,
+        NodeOperationStepKind::InspectBackend as i32
+    );
+    assert!(inspection.lease_epoch > start.lease_epoch);
+    let target = inspection.target.as_ref().unwrap();
+    wr_manager::operations::report_observation(
+        &pool,
+        &ReportNodeObservationRequest {
+            node_id: inspection.node_id.clone(),
+            operation_id: inspection.operation_id.clone(),
+            agent_instance_id: inspection.agent_instance_id.clone(),
+            lease_epoch: inspection.lease_epoch,
+            lifecycle: Some(LifecycleStatus {
+                state: ProcessLifecycleState::Ready as i32,
+                service_kind: ServiceKind::Proxy as i32,
+                process_instance_id: "proxy-process-new".into(),
+                ..Default::default()
+            }),
+            backend_state: BackendProcessState::Running as i32,
+            backend_instance_id: "proxy-new".into(),
+            observed_revision: target.revision,
+            observed_digest: target.bundle_digest.clone(),
+            observed_resolved_release_digest: target.resolved_release_digest.clone(),
+            ..Default::default()
+        },
+        "agent-b",
+    )
+    .await
+    .unwrap();
+    let continued =
+        wr_manager::operations::claim(&pool, "takeover-node", "activation-b", "agent-b")
+            .await
+            .unwrap()
+            .unwrap()
+            .instruction
+            .unwrap();
+    assert_eq!(
+        continued.step,
+        NodeOperationStepKind::InspectBackend as i32,
+        "takeover may repeat read-only inspection but must not repeat StartBackend"
+    );
+    let after = wr_manager::operations::get(&pool, &submitted.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(after.forward_deadline, deadline);
+    assert!(after.proxy_effect_delivered_at.is_some());
+    let events_after = wr_manager::operations::events(&pool, &submitted.operation_id)
+        .await
+        .unwrap();
+    assert!(events_after.len() > events_before.len());
+    assert!(events_after
+        .windows(2)
+        .all(|pair| pair[0].sequence < pair[1].sequence));
+}
 
 /// Engine heartbeats to manager-1; manager-2 sees the engine as healthy
 /// immediately via shared Postgres.
@@ -63,10 +285,11 @@ async fn test_heartbeat_visible_across_managers() {
 #[tokio::test]
 async fn test_deployment_desired_state_is_visible_across_managers() {
     let pool = manager_pool().await;
-    let managers = start_manager_cluster(pool, 2, 30).await.unwrap();
+    let managers = start_manager_cluster(pool.clone(), 2, 30).await.unwrap();
     let mut first = manager_client(&managers[0].addr).await.unwrap();
-    let deployment = first
-        .begin_deployment(BeginDeploymentRequest {
+    let deployment = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
             node_id: "shared-node".into(),
             attempt_token: "shared-attempt".into(),
             bundle_digest: format!("sha256:{}", "3".repeat(64)),
@@ -74,24 +297,20 @@ async fn test_deployment_desired_state_is_visible_across_managers() {
                 engine_slot: "primary".into(),
                 modules: vec![],
             }],
-        })
+        },
+        "operator-a",
+    )
+    .await
+    .unwrap()
+    .record;
+
+    let conditions = wr_manager::db::deployment_conditions(&pool, &deployment, 30.0, 30.0)
         .await
-        .unwrap()
-        .into_inner()
-        .deployment
         .unwrap();
+    assert_eq!(deployment.revision, 1);
+    assert_eq!(conditions[0].0, "MISSING_ENGINE");
 
     let mut second = manager_client(&managers[1].addr).await.unwrap();
-    let verification = second
-        .verify_deployment(VerifyDeploymentRequest {
-            node_id: "shared-node".into(),
-            revision: deployment.revision,
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(verification.deployment.unwrap().revision, 1);
-    assert_eq!(verification.conditions[0].code, "MISSING_ENGINE");
 
     let first_status = first
         .get_cluster_status(GetClusterStatusRequest {})

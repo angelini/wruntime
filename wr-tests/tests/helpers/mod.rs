@@ -5,6 +5,7 @@ pub mod db;
 pub mod lifecycle;
 pub mod llm;
 pub mod manager;
+pub mod node_agent;
 pub mod pki;
 pub mod proto;
 pub mod proxy;

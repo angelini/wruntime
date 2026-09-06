@@ -126,6 +126,25 @@ def assert_failed(status: dict[str, Any], args) -> dict[str, Any]:
     return {"failed_revision": record["revision"], "serving_revision": desired.get("revision")}
 
 
+def assert_abandoned(status: dict[str, Any], args) -> dict[str, Any]:
+    selected = node(status, args.node_id)
+    desired = selected.get("desired_deployment") or {}
+    if desired.get("state") != "succeeded" or desired.get("bundle_digest") != args.serving_digest:
+        raise AssertionFailure("abandoned attempt changed the desired serving deployment")
+    abandoned = [
+        item
+        for item in selected.get("deployment_history", [])
+        if item.get("state") == "abandoned"
+        and item.get("bundle_digest") == args.abandoned_digest
+        and isinstance(item.get("revision"), int)
+        and item["revision"] > args.after_revision
+    ]
+    record = max(abandoned, key=lambda item: item["revision"], default=None)
+    if record is None:
+        raise AssertionFailure("the expected abandoned deployment attempt was not recorded")
+    return {"abandoned_revision": record["revision"], "serving_revision": desired.get("revision")}
+
+
 def codes(value: Any) -> set[str]:
     found: set[str] = set()
     if isinstance(value, dict):
@@ -175,7 +194,7 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     manager = commands.add_parser("manager")
     manager.add_argument("--address", required=True)
-    for name in ("desired", "failed", "unhealthy", "rollback"):
+    for name in ("desired", "failed", "abandoned", "unhealthy", "rollback"):
         command = commands.add_parser(name)
         command.add_argument("--node-id", required=True)
         if name in {"desired", "rollback"}:
@@ -186,6 +205,10 @@ def parser() -> argparse.ArgumentParser:
     failed.add_argument("--serving-digest", required=True)
     failed.add_argument("--failed-digest", required=True)
     failed.add_argument("--after-revision", type=int)
+    abandoned = commands.choices["abandoned"]
+    abandoned.add_argument("--serving-digest", required=True)
+    abandoned.add_argument("--abandoned-digest", required=True)
+    abandoned.add_argument("--after-revision", required=True, type=int)
     unhealthy = commands.choices["unhealthy"]
     unhealthy.add_argument(
         "--condition",
@@ -205,6 +228,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "manager": result = assert_manager(status, args.address)
         elif args.command == "desired": result = assert_desired(status, args)
         elif args.command == "failed": result = assert_failed(status, args)
+        elif args.command == "abandoned": result = assert_abandoned(status, args)
         elif args.command == "unhealthy": result = assert_unhealthy(status, args)
         else: result = assert_rollback(status, args)
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))

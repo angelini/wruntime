@@ -22,8 +22,14 @@ just validate-all --deployment-e2e    # trusted runner: require both live deploy
 just deployment-e2e-python-test       # locked provider/assertion unit tests
 just test-local-e2e-lock              # same-host fixed-port exclusion fixture
 just test-lifecycle-runners            # foreground runner/barrier/reaping fixtures
-WRT_TEST_DB_URL=postgres://postgres@localhost:5433/wruntime_test \
-  cargo test -p wr-tests --test operation_test # durable operation/fence transaction
+just test-one migration_test          # real DB migration history and constraints
+just test-one operation_test          # manager evidence/authority/restoration transactions
+just test-one manager_test            # real role-gated manager mTLS boundary
+just test-one multi_manager_test      # shared-DB manager loss/takeover behavior
+just test-one node_agent_operation_test # deterministic agent lease/recovery/effect tests
+just test-one lifecycle_test          # signal-driven lifecycle and retained Child proof
+just test-one proxy_test
+just test-one version_test
 just deployment-e2e-preflight         # non-mutating Proxmox target verification
 just dev-down                # stop dev infrastructure
 ```
@@ -37,8 +43,7 @@ components. Run `just dev-up` first when using those full recipes.
 `just bench-proxy-routing [iterations] [warmup] [concurrency]` runs only the proxy-to-stub benchmark. It creates one HTTP/2 client, warms its connection before measurement, and reuses it for sequential and concurrent requests. The default dimensions are `500 10 20`; explicit positional values are preserved. `just bench [iterations] [warmup] [concurrency]` applies the same dimension contract to the full benchmark test target. `cargo test -p wr-proxy --features count-allocations direct_selection_core_is_allocation_free_for_eight_candidates` runs the vetted `allocation-counter` gate after a warm routing-core call; selector parsing is checked separately because `semver::VersionReq` parsing is not part of that zero-allocation selection boundary.
 
 Direct `cargo test -p wr-tests` runs are allowed for quick local checks.
-DB-backed tests use `WRT_TEST_DB_URL` and skip through the shared helper policy
-when it is absent. S3-backed tests use `WRT_TEST_S3_ENDPOINT`,
+DB-backed tests use `WRT_TEST_DB_URL` and skip through the shared helper policy when it is absent. A skip is useful for unrelated local work but is **unmet evidence**, not a passing result, when migration or durable manager semantics changed. S3-backed tests use `WRT_TEST_S3_ENDPOINT`,
 `WRT_TEST_S3_ACCESS_KEY`, and `WRT_TEST_S3_SECRET_KEY`; direct S3-backed cargo
 tests require those variables because the current blobstore helper expects
 them. Required WASM artifacts must be built before direct WASM host binding
@@ -132,7 +137,9 @@ service and waits on the exact launcher-issued activation identity and manager s
 deployment and rollback wait on exact `VerifyDeployment` identity and conditions. Post-ready guest invocations run
 once. Expected unhealthy evidence uses `cluster wait` and therefore succeeds
 with a matching JSON snapshot rather than an expected non-zero display gate.
-The durable lifecycle path uses `wr-cli engines drain|restart`, with `wr-cli operations` for status/resume/cancel and a node-bound `wr-cli node agent`. The retained `wr-cli node stop --json` fixture still qualifies the shared backend-owner primitive: stable service mapping, graceful action, bounded escalation, and final-exit inspection under one absolute 45-second deadline. Lifecycle operation tests additionally require request-token idempotency, stale-epoch fencing, pause/resume, source/target overlap, and distinct lifecycle/availability/backend evidence. Protected systemd and Docker qualification remains mandatory for changes to generated services or remote lifecycle behavior.
+The durable lifecycle path uses `wr-cli engines drain|restart`, bundle-oriented `wr-cli node deploy|upgrade|scale|rollback`, `wr-cli operations` for status/resume/cancel, and an independently installed node-bound agent. The agent's typed systemd/Docker adapter is the sole deployed workload effect and final-exit authority. Focused tests cover request-token idempotency, activation/epoch fencing, ambiguous delivery, interruption/recovery, source restoration, per-slot authority, commit/cleanup, and distinct lifecycle/availability/backend evidence. The pure locked Python tests validate stable deployment JSON and scenario logging without infrastructure. `just test-lifecycle-runners` remains the local retained-`Child` and teardown proof; `just validate-ecommerce` must emit no `WARN` or `WARNING`, and host-binding changes require `just test-wasm`.
+
+Protected systemd and Docker qualification is mandatory for generated deployment or remote lifecycle behavior. A local `--no-deployment-e2e` run records an environmental skip; it does not prove this change class. Completion evidence is exactly `just validate-all --deployment-e2e` on the protected runner. In Pi, use exactly `just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e`; it must still run multi-node, ecommerce, and stockmarket.
 Per-task output, lifecycle state JSON, remote diagnostics, bundle inspections,
 and the final reset result are retained under `WR_VALIDATE_LOG_DIR` (or
 `target/validate-all/<timestamp>/`). Diagnostic collection failures are listed

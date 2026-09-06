@@ -124,6 +124,8 @@ message DeploymentRecord {
   string failure_detail = 9;
   uint64 source_revision = 10; // non-zero when this attempt rolls back a prior snapshot
   optional google.protobuf.Timestamp activated_at = 11;
+  string resolved_release_digest = 12; // immutable finalized post-template release identity
+  optional google.protobuf.Timestamp finalized_at = 13;
 }
 
 message BeginDeploymentRequest {
@@ -133,6 +135,22 @@ message BeginDeploymentRequest {
   repeated ExpectedEngine expected_engines = 4;
 }
 message BeginDeploymentResponse { DeploymentRecord deployment = 1; }
+message FinalizeDeploymentRequest {
+  string node_id = 1;
+  string attempt_token = 2;
+  uint64 revision = 3;
+  string bundle_digest = 4;
+  string resolved_release_digest = 5;
+}
+message FinalizeDeploymentResponse { DeploymentRecord deployment = 1; }
+message AbandonDeploymentRequest {
+  string node_id = 1;
+  string attempt_token = 2;
+}
+message AbandonDeploymentResponse {
+  bool abandoned = 1;
+  DeploymentRecord deployment = 2;
+}
 
 message VerifyDeploymentRequest { string node_id = 1; uint64 revision = 2; }
 message VerifyDeploymentResponse {
@@ -140,14 +158,6 @@ message VerifyDeploymentResponse {
   bool ready = 2;
   repeated DeploymentCondition conditions = 3;
 }
-
-message CompleteDeploymentRequest {
-  string node_id = 1;
-  uint64 revision = 2;
-  bool succeeded = 3;
-  string failure_detail = 4;
-}
-message CompleteDeploymentResponse { DeploymentRecord deployment = 1; }
 
 message BeginRollbackRequest {
   string node_id = 1;
@@ -345,7 +355,7 @@ message GetClusterStatusResponse {
   repeated DeploymentCondition conditions = 10; // cluster-wide/unsupported signals
 }
 
-// ── Durable operator operations ──────────────────────────────────────────
+// ── Durable operator lifecycle operations (manager-owned) ────────────────
 
 // Operator actions are durable deployment/node intent. They never identify a
 // PID and never mutate LifecycleService directly.
@@ -369,19 +379,61 @@ enum NodeOperationState {
   NODE_OPERATION_STATE_CANCELLED = 6;
 }
 
+// Operation phase is intentionally separate from terminal/lease state. In particular,
+// restoration is deadline-free but lease-fenced and cleanup is visibly
+// committed even while paused.
+enum NodeOperationPhase {
+  NODE_OPERATION_PHASE_UNSPECIFIED = 0;
+  NODE_OPERATION_PHASE_FORWARD = 1;
+  NODE_OPERATION_PHASE_RESTORING_SOURCE = 2;
+  NODE_OPERATION_PHASE_COMMITTING = 3;
+  NODE_OPERATION_PHASE_COMMITTED_CLEANUP = 4;
+  NODE_OPERATION_PHASE_COMPLETE = 5;
+  NODE_OPERATION_PHASE_SUPERSEDED = 6;
+}
+
 enum NodeOperationStepKind {
   NODE_OPERATION_STEP_KIND_UNSPECIFIED = 0;
-  NODE_OPERATION_STEP_KIND_VERIFY_RELEASE = 1;
-  NODE_OPERATION_STEP_KIND_STOP_SLOT = 2;
-  NODE_OPERATION_STEP_KIND_SELECT_RELEASE = 3;
-  NODE_OPERATION_STEP_KIND_START_SLOT = 4;
-  NODE_OPERATION_STEP_KIND_VERIFY_READY = 5;
+  NODE_OPERATION_STEP_KIND_VERIFY_RELEASE_METADATA = 1;
+  NODE_OPERATION_STEP_KIND_VERIFY_PROXY = 2;
+  NODE_OPERATION_STEP_KIND_STOP_BACKEND = 3;
+  NODE_OPERATION_STEP_KIND_SELECT_RELEASE = 4;
+  NODE_OPERATION_STEP_KIND_START_BACKEND = 5;
+  NODE_OPERATION_STEP_KIND_VERIFY_TARGET = 6;
+  NODE_OPERATION_STEP_KIND_SWITCH_AUTHORITY = 7;
+  NODE_OPERATION_STEP_KIND_VERIFY_SERVING = 8;
+  NODE_OPERATION_STEP_KIND_RESTORE_SOURCE = 9;
+  NODE_OPERATION_STEP_KIND_CLEANUP_RELEASE = 10;
+  // Read-only backend inspection after takeover or ambiguous effect delivery.
+  NODE_OPERATION_STEP_KIND_INSPECT_BACKEND = 11;
+}
+
+enum InstructionTargetKind {
+  INSTRUCTION_TARGET_KIND_UNSPECIFIED = 0;
+  INSTRUCTION_TARGET_KIND_PROXY = 1;
+  INSTRUCTION_TARGET_KIND_ENGINE_SLOT = 2;
+  INSTRUCTION_TARGET_KIND_RELEASE_CLEANUP = 3;
+}
+
+enum BackendKind {
+  BACKEND_KIND_UNSPECIFIED = 0;
+  BACKEND_KIND_SYSTEMD = 1;
+  BACKEND_KIND_DOCKER = 2;
 }
 
 enum BackendProcessState {
   BACKEND_PROCESS_STATE_UNSPECIFIED = 0;
   BACKEND_PROCESS_STATE_RUNNING = 1;
   BACKEND_PROCESS_STATE_EXITED = 2;
+  BACKEND_PROCESS_STATE_QUERY_ERROR = 3;
+}
+
+message InstructionTarget {
+  InstructionTargetKind kind = 1;
+  string engine_slot = 2;
+  uint64 revision = 3;
+  string bundle_digest = 4;
+  string resolved_release_digest = 5;
 }
 
 message RolloutPolicy {
@@ -399,6 +451,28 @@ message OperationSlotProgress {
   uint32 completed_steps = 4;
   bool complete = 5;
   repeated DeploymentCondition conditions = 6;
+  uint64 source_revision = 7;
+  string source_digest = 8;
+  uint64 target_revision = 9;
+  string target_digest = 10;
+  string pinned_backend_instance_id = 11;
+  string pinned_process_instance_id = 12;
+  bool authority_switched = 13;
+  bool serving_converged = 14;
+  bool changed = 15;
+  optional google.protobuf.Timestamp effect_delivered_at = 16;
+  bool effect_reported = 17;
+  uint64 effect_observed_revision = 18;
+  string effect_observed_digest = 19;
+  string effect_backend_instance_id = 20;
+  string effect_process_instance_id = 21;
+  string effect_condition_code = 22;
+  string effect_detail = 23;
+  uint32 rollout_order = 24;
+  bool effect_ambiguous = 25;
+  string source_resolved_release_digest = 26;
+  string target_resolved_release_digest = 27;
+  string effect_observed_resolved_release_digest = 28;
 }
 
 message NodeOperation {
@@ -419,6 +493,38 @@ message NodeOperation {
   optional google.protobuf.Timestamp created_at = 15;
   optional google.protobuf.Timestamp updated_at = 16;
   repeated DeploymentCondition conditions = 17;
+  NodeOperationPhase phase = 18;
+  optional google.protobuf.Timestamp forward_deadline = 19;
+  bool forward_fenced = 20;
+  bool restoration_requested = 21;
+  string agent_instance_id = 22;
+  string cleanup_superseded_by = 23;
+  CleanupReleaseEvidence cleanup_evidence = 24;
+  optional google.protobuf.Timestamp cleanup_reported_at = 25;
+  string cleanup_backend_query_error = 26;
+  NodeOperationState restoration_terminal_state = 27;
+  optional google.protobuf.Timestamp cleanup_delivered_at = 28;
+  string proxy_process_instance_id = 29;
+  string resolved_release_digest = 30;
+  NodeOperationStepKind proxy_next_step = 31;
+  uint64 proxy_source_revision = 32;
+  string proxy_source_digest = 33;
+  string proxy_source_resolved_release_digest = 34;
+  uint64 proxy_target_revision = 35;
+  string proxy_target_digest = 36;
+  string proxy_target_resolved_release_digest = 37;
+  string proxy_backend_instance_id = 38;
+  bool proxy_changed = 39;
+  bool proxy_effect_ambiguous = 40;
+  optional google.protobuf.Timestamp proxy_effect_delivered_at = 41;
+  bool proxy_effect_reported = 42;
+  uint64 proxy_effect_observed_revision = 43;
+  string proxy_effect_observed_digest = 44;
+  string proxy_effect_observed_resolved_release_digest = 45;
+  string proxy_effect_backend_instance_id = 46;
+  string proxy_effect_process_instance_id = 47;
+  string proxy_effect_condition_code = 48;
+  string proxy_effect_detail = 49;
 }
 
 message OperationEvent {
@@ -439,6 +545,7 @@ message SubmitOperationRequest {
   uint64 target_revision = 5;
   string bundle_digest = 6;
   RolloutPolicy policy = 7;
+  string resolved_release_digest = 8;
 }
 message SubmitOperationResponse { NodeOperation operation = 1; }
 message GetOperationRequest { string operation_id = 1; }
@@ -467,23 +574,91 @@ message SlotObservation {
   string backend_instance_id = 5;
   uint64 observed_revision = 6;
   optional google.protobuf.Timestamp observed_at = 7;
+  string observed_digest = 8;
+  string backend_query_error = 9;
+  string operation_id = 10;
+  string agent_instance_id = 11;
+  uint64 lease_epoch = 12;
+  string observed_resolved_release_digest = 13;
+}
+message SlotAuthorityStatus {
+  string node_id = 1;
+  string engine_slot = 2;
+  uint64 revision = 3;
+  string bundle_digest = 4;
+  string resolved_release_digest = 5;
+}
+message NodeAgentAttestation {
+  string node_id = 1;
+  string agent_instance_id = 2;
+  string protocol_version = 3;
+  string binary_digest = 4;
+  string config_digest = 5;
+  BackendKind backend = 6;
+  repeated string capabilities = 7;
+  optional google.protobuf.Timestamp observed_at = 8;
+  string authenticated_principal = 9;
+  uint32 retention_count = 10;
+}
+// Complete canonical non-secret host policy. The manager recomputes
+// config_digest from every semantic field rather than trusting an installer
+// rendering. Credential paths are included; credential contents never are.
+message NodeAgentPolicy {
+  string node_id = 1;
+  string protocol_version = 2;
+  string config_digest = 3;
+  BackendKind backend = 4;
+  uint32 retention_count = 5;
+  uint32 policy_version = 6;
+  string binary_digest = 7;
+  string manager_endpoint = 8;
+  string client_cert_path = 9;
+  string client_key_path = 10;
+  string ca_cert_path = 11;
+  string deployment_root = 12;
+  string runtime_dir = 13;
+  string compose_project = 14;
+  string systemctl_path = 15;
+  string docker_path = 16;
+  uint64 poll_interval_seconds = 17;
+  uint64 renew_interval_seconds = 18;
+  repeated string capabilities = 19;
+}
+message PutNodeAgentPolicyRequest { NodeAgentPolicy policy = 1; }
+message PutNodeAgentPolicyResponse { NodeAgentPolicy policy = 1; }
+message AttestNodeAgentRequest { NodeAgentAttestation attestation = 1; }
+message AttestNodeAgentResponse {
+  bool accepted = 1;
+  repeated DeploymentCondition conditions = 2;
 }
 message GetOperatorStatusResponse {
   GetClusterStatusResponse cluster = 1;
   repeated NodeOperation active_operations = 2;
   repeated SlotObservation observations = 3;
+  repeated SlotAuthorityStatus slot_authorities = 4;
+  repeated NodeAgentAttestation agent_attestations = 5;
 }
 
-message ClaimOperationRequest { string node_id = 1; }
+message ClaimOperationRequest {
+  string node_id = 1;
+  string agent_instance_id = 2;
+}
 message AgentInstruction {
+  reserved 3, 6, 7;
+  reserved "engine_slot", "revision", "bundle_digest";
   string operation_id = 1;
   string node_id = 2;
-  string engine_slot = 3;
   uint64 lease_epoch = 4;
   NodeOperationStepKind step = 5;
-  uint64 revision = 6;
-  string bundle_digest = 7;
   optional google.protobuf.Timestamp operation_deadline = 8;
+  string agent_instance_id = 9;
+  InstructionTarget target = 10;
+  string pinned_backend_instance_id = 11;
+  string pinned_process_instance_id = 12;
+  bool restoration = 13;
+  // Manager-derived exact deletion allow-list for committed cleanup. The
+  // agent validates each revision/digest/path but never derives retention.
+  repeated ReleaseInventoryEntry cleanup_delete_releases = 14;
 }
 message ClaimOperationResponse {
   AgentInstruction instruction = 1;
@@ -493,6 +668,7 @@ message RenewOperationLeaseRequest {
   string node_id = 1;
   string operation_id = 2;
   uint64 lease_epoch = 3;
+  string agent_instance_id = 4;
 }
 message RenewOperationLeaseResponse {
   optional google.protobuf.Timestamp lease_expires_at = 1;
@@ -505,30 +681,58 @@ message ReportNodeObservationRequest {
   string backend_instance_id = 5;
   uint64 observed_revision = 6;
   optional google.protobuf.Timestamp observed_at = 7;
+  string observed_digest = 8;
+  string backend_query_error = 9;
+  string operation_id = 10;
+  string agent_instance_id = 11;
+  uint64 lease_epoch = 12;
+  string observed_resolved_release_digest = 13;
 }
-message ReportNodeObservationResponse {}
+message ReportNodeObservationResponse { NodeOperation operation = 1; }
+message ReleaseInventoryEntry {
+  uint64 revision = 1;
+  string bundle_digest = 2;
+  string resolved_release_digest = 3;
+}
+message CleanupReleaseEvidence {
+  repeated ReleaseInventoryEntry retained_releases = 1;
+}
 message ReportStepResultRequest {
   string node_id = 1;
   string operation_id = 2;
   string engine_slot = 3;
   uint64 lease_epoch = 4;
   NodeOperationStepKind step = 5;
-  bool succeeded = 6;
-  string condition_code = 7;
-  string detail = 8;
+  string condition_code = 6;
+  string detail = 7;
+  string agent_instance_id = 8;
+  uint64 observed_revision = 9;
+  string observed_digest = 10;
+  string backend_instance_id = 11;
+  string process_instance_id = 12;
+  string backend_query_error = 13;
+  CleanupReleaseEvidence cleanup_evidence = 14;
+  string observed_resolved_release_digest = 15;
 }
 message ReportStepResultResponse { NodeOperation operation = 1; }
 
 service OperatorService {
   rpc GetStatus(GetOperatorStatusRequest) returns (GetOperatorStatusResponse);
+  rpc BeginDeployment(BeginDeploymentRequest) returns (BeginDeploymentResponse);
+  rpc VerifyDeployment(VerifyDeploymentRequest) returns (VerifyDeploymentResponse);
+  rpc BeginRollback(BeginRollbackRequest) returns (BeginRollbackResponse);
   rpc SubmitOperation(SubmitOperationRequest) returns (SubmitOperationResponse);
   rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
   rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);
   rpc ResumeOperation(ResumeOperationRequest) returns (ResumeOperationResponse);
   rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);
+  rpc PutNodeAgentPolicy(PutNodeAgentPolicyRequest) returns (PutNodeAgentPolicyResponse);
+  rpc FinalizeDeployment(FinalizeDeploymentRequest) returns (FinalizeDeploymentResponse);
+  rpc AbandonDeployment(AbandonDeploymentRequest) returns (AbandonDeploymentResponse);
 }
 
 service NodeAgentService {
+  rpc Attest(AttestNodeAgentRequest) returns (AttestNodeAgentResponse);
   rpc ClaimOperation(ClaimOperationRequest) returns (ClaimOperationResponse);
   rpc RenewOperationLease(RenewOperationLeaseRequest) returns (RenewOperationLeaseResponse);
   rpc ReportObservation(ReportNodeObservationRequest) returns (ReportNodeObservationResponse);
@@ -678,10 +882,4 @@ service ManagerService {
   rpc DeleteSchedule    (DeleteScheduleRequest)    returns (DeleteScheduleResponse);
   rpc ListSchedules     (ListSchedulesRequest)     returns (ListSchedulesResponse);
 
-  // Desired deployment lifecycle. Engines continue to use NodeService and only
-  // report their activated metadata through RegisterEngine.
-  rpc BeginDeployment   (BeginDeploymentRequest)   returns (BeginDeploymentResponse);
-  rpc VerifyDeployment  (VerifyDeploymentRequest)  returns (VerifyDeploymentResponse);
-  rpc CompleteDeployment(CompleteDeploymentRequest) returns (CompleteDeploymentResponse);
-  rpc BeginRollback     (BeginRollbackRequest)     returns (BeginRollbackResponse);
 }

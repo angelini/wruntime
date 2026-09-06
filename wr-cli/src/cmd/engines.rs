@@ -310,6 +310,7 @@ async fn mutate(manager: &str, args: MutationArgs, action: NodeOperationAction) 
                 allow_downtime: false,
                 deadline_seconds: args.deadline.unwrap_or(default_deadline),
             }),
+            resolved_release_digest: String::new(),
         })
         .await?
         .into_inner()

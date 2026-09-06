@@ -13,25 +13,28 @@ use wr_common::lifecycle_service::{AdmissionGate, AdmissionGuard};
 use wr_common::naming::namespace_role;
 use wr_common::wruntime::{
     manager_service_server::ManagerService, node_agent_service_server::NodeAgentService,
-    operator_service_server::OperatorService, BeginDeploymentRequest, BeginDeploymentResponse,
-    BeginEngineDrainRequest, BeginEngineDrainResponse, BeginRollbackRequest, BeginRollbackResponse,
-    CancelOperationRequest, CancelOperationResponse, ClaimOperationRequest, ClaimOperationResponse,
-    CompleteDeploymentRequest, CompleteDeploymentResponse, DeleteRoutingRuleRequest,
+    operator_service_server::OperatorService, AbandonDeploymentRequest, AbandonDeploymentResponse,
+    AttestNodeAgentRequest, AttestNodeAgentResponse, BeginDeploymentRequest,
+    BeginDeploymentResponse, BeginEngineDrainRequest, BeginEngineDrainResponse,
+    BeginRollbackRequest, BeginRollbackResponse, CancelOperationRequest, CancelOperationResponse,
+    ClaimOperationRequest, ClaimOperationResponse, DeleteRoutingRuleRequest,
     DeleteRoutingRuleResponse, DeleteScheduleRequest, DeleteScheduleResponse, DeleteSecretRequest,
     DeleteSecretResponse, DeploymentCondition, DeregisterEngineRequest, DeregisterEngineResponse,
-    GetClusterStatusRequest, GetClusterStatusResponse, GetOperationRequest, GetOperationResponse,
-    GetOperatorStatusRequest, GetOperatorStatusResponse, GetRoutingTableRequest,
-    GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse, HeartbeatRequest,
-    HeartbeatResponse, ListEnginesRequest, ListEnginesResponse, ListManagersRequest,
-    ListManagersResponse, ListOperationsRequest, ListOperationsResponse, ListSchedulesRequest,
-    ListSchedulesResponse, ListSecretsRequest, ListSecretsResponse, ManagerInfo,
-    NamespaceDbCredential, NamespaceSecrets, NodeOperationAction, RegisterEngineRequest,
+    FinalizeDeploymentRequest, FinalizeDeploymentResponse, GetClusterStatusRequest,
+    GetClusterStatusResponse, GetOperationRequest, GetOperationResponse, GetOperatorStatusRequest,
+    GetOperatorStatusResponse, GetRoutingTableRequest, GetRoutingTableResponse, GetSchemaRequest,
+    GetSchemaResponse, HeartbeatRequest, HeartbeatResponse, ListEnginesRequest,
+    ListEnginesResponse, ListManagersRequest, ListManagersResponse, ListOperationsRequest,
+    ListOperationsResponse, ListSchedulesRequest, ListSchedulesResponse, ListSecretsRequest,
+    ListSecretsResponse, ManagerInfo, NamespaceDbCredential, NamespaceSecrets, NodeOperationAction,
+    PutNodeAgentPolicyRequest, PutNodeAgentPolicyResponse, RegisterEngineRequest,
     RegisterEngineResponse, RenewOperationLeaseRequest, RenewOperationLeaseResponse,
     ReportNodeObservationRequest, ReportNodeObservationResponse, ReportStepResultRequest,
     ReportStepResultResponse, ResumeOperationRequest, ResumeOperationResponse, RoutingRule,
-    Schedule, SecretEntry, SetSecretRequest, SetSecretResponse, SubmitOperationRequest,
-    SubmitOperationResponse, UpsertRoutingRuleResponse, UpsertScheduleRequest,
-    UpsertScheduleResponse, VerifyDeploymentRequest, VerifyDeploymentResponse,
+    Schedule, SecretEntry, SetSecretRequest, SetSecretResponse, SlotAuthorityStatus,
+    SubmitOperationRequest, SubmitOperationResponse, UpsertRoutingRuleResponse,
+    UpsertScheduleRequest, UpsertScheduleResponse, VerifyDeploymentRequest,
+    VerifyDeploymentResponse,
 };
 
 use crate::auth::PrincipalPolicy;
@@ -529,152 +532,6 @@ impl ManagerService for Manager {
         Ok(Response::new(ListEnginesResponse { engines }))
     }
 
-    // ── Desired node deployments ──────────────────────────────────────────
-
-    async fn begin_deployment(
-        &self,
-        request: Request<BeginDeploymentRequest>,
-    ) -> Result<Response<BeginDeploymentResponse>, Status> {
-        let _admission = self.require_admission()?;
-        let mut request = request.into_inner();
-        Self::validate_deployment_request(&request)?;
-        Self::canonicalize_deployment_request(&mut request);
-        let deployment = db::begin_deployment(&self.pool, &request).await?.record;
-        Ok(Response::new(BeginDeploymentResponse {
-            deployment: Some(deployment),
-        }))
-    }
-
-    async fn verify_deployment(
-        &self,
-        request: Request<VerifyDeploymentRequest>,
-    ) -> Result<Response<VerifyDeploymentResponse>, Status> {
-        let request = request.into_inner();
-        if request.node_id.is_empty() || request.revision == 0 {
-            return Err(Status::invalid_argument(
-                "node_id and non-zero revision are required",
-            ));
-        }
-        let deployment = db::get_deployment(&self.pool, &request.node_id, request.revision)
-            .await?
-            .record;
-        let conditions = db::deployment_conditions(
-            &self.pool,
-            &deployment,
-            self.engine_heartbeat_timeout_secs,
-            self.module_heartbeat_timeout_secs,
-        )
-        .await?
-        .into_iter()
-        .map(|(code, detail)| deployment_condition(code, detail))
-        .collect::<Vec<_>>();
-        Ok(Response::new(VerifyDeploymentResponse {
-            deployment: Some(deployment),
-            ready: conditions.is_empty(),
-            conditions,
-        }))
-    }
-
-    async fn complete_deployment(
-        &self,
-        request: Request<CompleteDeploymentRequest>,
-    ) -> Result<Response<CompleteDeploymentResponse>, Status> {
-        let _admission = self.require_admission()?;
-        let request = request.into_inner();
-        if request.node_id.is_empty() || request.revision == 0 {
-            return Err(Status::invalid_argument(
-                "node_id and non-zero revision are required",
-            ));
-        }
-        if request.succeeded && !request.failure_detail.is_empty() {
-            return Err(Status::invalid_argument(
-                "successful deployment cannot include failure_detail",
-            ));
-        }
-        if request.failure_detail.len() > 4096
-            || request.failure_detail.contains("postgres://")
-            || request.failure_detail.contains("postgresql://")
-        {
-            return Err(Status::invalid_argument(
-                "failure_detail must be at most 4096 characters and must not contain database URLs",
-            ));
-        }
-        if request.succeeded {
-            let candidate = db::get_deployment(&self.pool, &request.node_id, request.revision)
-                .await?
-                .record;
-            let conditions = db::deployment_conditions(
-                &self.pool,
-                &candidate,
-                self.engine_heartbeat_timeout_secs,
-                self.module_heartbeat_timeout_secs,
-            )
-            .await?;
-            if !conditions.is_empty() {
-                return Err(Status::failed_precondition(format!(
-                    "deployment is not ready: {}",
-                    conditions
-                        .into_iter()
-                        .map(|(code, _)| code)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )));
-            }
-        }
-        let deployment = db::complete_deployment(
-            &self.pool,
-            &request.node_id,
-            request.revision,
-            request.succeeded,
-            &request.failure_detail,
-        )
-        .await?
-        .record;
-        if !request.succeeded {
-            match db::update_route_health(
-                &self.pool,
-                self.engine_heartbeat_timeout_secs,
-                self.module_heartbeat_timeout_secs,
-            )
-            .await
-            {
-                Ok(_) => {}
-                Err(error) => {
-                    warn!(%error, node_id = request.node_id, revision = request.revision, "failed to reconcile routes after deployment failure");
-                }
-            }
-        }
-        Ok(Response::new(CompleteDeploymentResponse {
-            deployment: Some(deployment),
-        }))
-    }
-
-    async fn begin_rollback(
-        &self,
-        request: Request<BeginRollbackRequest>,
-    ) -> Result<Response<BeginRollbackResponse>, Status> {
-        let _admission = self.require_admission()?;
-        let request = request.into_inner();
-        Namespace::parse(&request.node_id)
-            .map_err(|_| Status::invalid_argument("node_id must be a valid stable identity"))?;
-        if !Self::valid_deployment_token(&request.attempt_token) {
-            return Err(Status::invalid_argument(
-                "attempt_token must be 1..=128 URL-safe characters",
-            ));
-        }
-        let deployment = db::begin_rollback(
-            &self.pool,
-            &request.node_id,
-            request.to_revision,
-            &request.attempt_token,
-        )
-        .await?
-        .record;
-        Ok(Response::new(BeginRollbackResponse {
-            deployment: Some(deployment),
-        }))
-    }
-
     // ── Manager discovery ─────────────────────────────────────────────────
 
     async fn list_managers(
@@ -1021,7 +878,8 @@ impl OperatorApi {
             return Err(Status::invalid_argument("operation action is required"));
         }
         request.engine_slots.sort();
-        if request.engine_slots.is_empty()
+        let permits_empty_inventory = action == NodeOperationAction::Scale;
+        if (!permits_empty_inventory && request.engine_slots.is_empty())
             || request
                 .engine_slots
                 .iter()
@@ -1044,17 +902,18 @@ impl OperatorApi {
         );
         if deployment_action
             && (request.target_revision == 0
-                || !Manager::valid_bundle_digest(&request.bundle_digest))
+                || !Manager::valid_bundle_digest(&request.bundle_digest)
+                || !Manager::valid_bundle_digest(&request.resolved_release_digest))
         {
             return Err(Status::invalid_argument(
-                "deployment operations require target_revision and sha256 bundle_digest",
+                "deployment operations require target_revision, source bundle digest, and resolved release digest",
             ));
         }
         let policy = request
             .policy
             .get_or_insert_with(|| wr_common::wruntime::RolloutPolicy {
                 max_unavailable: 1,
-                canary_slot: request.engine_slots[0].clone(),
+                canary_slot: request.engine_slots.first().cloned().unwrap_or_default(),
                 pause_after_canary: false,
                 allow_downtime: false,
                 deadline_seconds: match action {
@@ -1064,7 +923,8 @@ impl OperatorApi {
                 },
             });
         if policy.max_unavailable == 0
-            || policy.max_unavailable as usize > request.engine_slots.len()
+            || (!request.engine_slots.is_empty()
+                && policy.max_unavailable as usize > request.engine_slots.len())
             || policy.deadline_seconds == 0
         {
             return Err(Status::invalid_argument(
@@ -1076,12 +936,12 @@ impl OperatorApi {
                 "canary_slot is not in engine_slots",
             ));
         }
-        if deployment_action
-            && request.engine_slots.len() <= policy.max_unavailable as usize
+        if action == NodeOperationAction::Scale
+            && request.engine_slots.is_empty()
             && !policy.allow_downtime
         {
             return Err(Status::failed_precondition(
-                "operation cannot retain one authoritative slot; allow_downtime is required",
+                "scale-to-zero requires explicit allow_downtime",
             ));
         }
         Ok(())
@@ -1090,6 +950,80 @@ impl OperatorApi {
 
 #[tonic::async_trait]
 impl OperatorService for OperatorApi {
+    async fn begin_deployment(
+        &self,
+        mut request: Request<BeginDeploymentRequest>,
+    ) -> Result<Response<BeginDeploymentResponse>, Status> {
+        let principal = self.policy.authorize_operator(&mut request)?;
+        let mut request = request.into_inner();
+        Manager::validate_deployment_request(&request)?;
+        Manager::canonicalize_deployment_request(&mut request);
+        let deployment = db::begin_deployment(&self.pool, &request, &principal.name)
+            .await?
+            .record;
+        Ok(Response::new(BeginDeploymentResponse {
+            deployment: Some(deployment),
+        }))
+    }
+
+    async fn verify_deployment(
+        &self,
+        mut request: Request<VerifyDeploymentRequest>,
+    ) -> Result<Response<VerifyDeploymentResponse>, Status> {
+        self.policy.authorize_read(&mut request)?;
+        let request = request.into_inner();
+        if request.node_id.is_empty() || request.revision == 0 {
+            return Err(Status::invalid_argument(
+                "node_id and non-zero revision are required",
+            ));
+        }
+        let deployment = db::get_deployment(&self.pool, &request.node_id, request.revision)
+            .await?
+            .record;
+        let conditions = db::deployment_conditions(
+            &self.pool,
+            &deployment,
+            self.engine_heartbeat_timeout_secs,
+            self.module_heartbeat_timeout_secs,
+        )
+        .await?
+        .into_iter()
+        .map(|(code, detail)| deployment_condition(code, detail))
+        .collect::<Vec<_>>();
+        Ok(Response::new(VerifyDeploymentResponse {
+            deployment: Some(deployment),
+            ready: conditions.is_empty(),
+            conditions,
+        }))
+    }
+
+    async fn begin_rollback(
+        &self,
+        mut request: Request<BeginRollbackRequest>,
+    ) -> Result<Response<BeginRollbackResponse>, Status> {
+        let principal = self.policy.authorize_operator(&mut request)?;
+        let request = request.into_inner();
+        Namespace::parse(&request.node_id)
+            .map_err(|_| Status::invalid_argument("node_id must be a valid stable identity"))?;
+        if !Manager::valid_deployment_token(&request.attempt_token) {
+            return Err(Status::invalid_argument(
+                "attempt_token must be 1..=128 URL-safe characters",
+            ));
+        }
+        let deployment = db::begin_rollback(
+            &self.pool,
+            &request.node_id,
+            request.to_revision,
+            &request.attempt_token,
+            &principal.name,
+        )
+        .await?
+        .record;
+        Ok(Response::new(BeginRollbackResponse {
+            deployment: Some(deployment),
+        }))
+    }
+
     async fn get_status(
         &self,
         mut request: Request<GetOperatorStatusRequest>,
@@ -1098,6 +1032,20 @@ impl OperatorService for OperatorApi {
         let filter = request.into_inner();
         let membership = self.cluster.membership_snapshot().await;
         let snapshot = db::get_cluster_status_snapshot(&self.pool).await?;
+        let mut active_operations = snapshot.active_operations.clone();
+        let mut observations = snapshot.observations.clone();
+        let mut slot_authorities = snapshot
+            .slot_authorities
+            .iter()
+            .map(|authority| SlotAuthorityStatus {
+                node_id: authority.node_id.clone(),
+                engine_slot: authority.engine_slot.clone(),
+                revision: authority.revision,
+                bundle_digest: authority.bundle_digest.clone(),
+                resolved_release_digest: authority.resolved_release_digest.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut agent_attestations = snapshot.agent_attestations.clone();
         let mut cluster = crate::status::compose(
             snapshot,
             membership,
@@ -1118,14 +1066,36 @@ impl OperatorService for OperatorApi {
                 return Err(Status::not_found("selected node or slot was not found"));
             }
         }
-        let active_operations = crate::operations::list(&self.pool, &filter.node_id, false).await?;
-        let observations =
-            crate::operations::observations(&self.pool, &filter.node_id, &filter.engine_slot)
-                .await?;
+        if !filter.engine_slot.is_empty()
+            && !cluster.engines.iter().any(|engine| {
+                engine.deployment.as_ref().is_some_and(|deployment| {
+                    deployment.node_id == filter.node_id
+                        && deployment.engine_slot == filter.engine_slot
+                })
+            })
+        {
+            return Err(Status::not_found("selected node or slot was not found"));
+        }
+        if !filter.node_id.is_empty() {
+            active_operations.retain(|operation| operation.node_id == filter.node_id);
+            observations.retain(|observation| {
+                observation.node_id == filter.node_id
+                    && (filter.engine_slot.is_empty()
+                        || observation.engine_slot == filter.engine_slot)
+            });
+            slot_authorities.retain(|authority| {
+                authority.node_id == filter.node_id
+                    && (filter.engine_slot.is_empty()
+                        || authority.engine_slot == filter.engine_slot)
+            });
+            agent_attestations.retain(|attestation| attestation.node_id == filter.node_id);
+        }
         Ok(Response::new(GetOperatorStatusResponse {
             cluster: Some(cluster),
             active_operations,
             observations,
+            slot_authorities,
+            agent_attestations,
         }))
     }
 
@@ -1198,6 +1168,74 @@ impl OperatorService for OperatorApi {
             operation: Some(operation),
         }))
     }
+
+    async fn put_node_agent_policy(
+        &self,
+        mut request: Request<PutNodeAgentPolicyRequest>,
+    ) -> Result<Response<PutNodeAgentPolicyResponse>, Status> {
+        let principal = self.policy.authorize_operator(&mut request)?;
+        let policy = request
+            .into_inner()
+            .policy
+            .ok_or_else(|| Status::invalid_argument("policy is required"))?;
+        let policy =
+            crate::operations::put_agent_policy(&self.pool, &principal.name, &policy).await?;
+        Ok(Response::new(PutNodeAgentPolicyResponse {
+            policy: Some(policy),
+        }))
+    }
+
+    async fn finalize_deployment(
+        &self,
+        mut request: Request<FinalizeDeploymentRequest>,
+    ) -> Result<Response<FinalizeDeploymentResponse>, Status> {
+        let principal = self.policy.authorize_operator(&mut request)?;
+        let request = request.into_inner();
+        Namespace::parse(&request.node_id)
+            .map_err(|_| Status::invalid_argument("node_id must be a valid stable identity"))?;
+        if !Manager::valid_deployment_token(&request.attempt_token)
+            || request.revision == 0
+            || !Manager::valid_bundle_digest(&request.bundle_digest)
+            || !Manager::valid_bundle_digest(&request.resolved_release_digest)
+        {
+            return Err(Status::invalid_argument(
+                "finalization requires token, revision, source digest, and resolved digest",
+            ));
+        }
+        let deployment = db::finalize_deployment(&self.pool, &request, &principal.name)
+            .await?
+            .record;
+        Ok(Response::new(FinalizeDeploymentResponse {
+            deployment: Some(deployment),
+        }))
+    }
+
+    async fn abandon_deployment(
+        &self,
+        mut request: Request<AbandonDeploymentRequest>,
+    ) -> Result<Response<AbandonDeploymentResponse>, Status> {
+        let principal = self.policy.authorize_operator(&mut request)?;
+        let request = request.into_inner();
+        Namespace::parse(&request.node_id)
+            .map_err(|_| Status::invalid_argument("node_id must be a valid stable identity"))?;
+        if !Manager::valid_deployment_token(&request.attempt_token) {
+            return Err(Status::invalid_argument(
+                "attempt_token must be 1..=128 URL-safe characters",
+            ));
+        }
+        let deployment = db::abandon_deployment(
+            &self.pool,
+            &request.node_id,
+            &request.attempt_token,
+            &principal.name,
+        )
+        .await?
+        .record;
+        Ok(Response::new(AbandonDeploymentResponse {
+            abandoned: true,
+            deployment: Some(deployment),
+        }))
+    }
 }
 
 /// Pull-based node executor protocol. Certificate mapping fixes one agent to
@@ -1215,18 +1253,40 @@ impl NodeAgentApi {
 
 #[tonic::async_trait]
 impl NodeAgentService for NodeAgentApi {
+    async fn attest(
+        &self,
+        mut request: Request<AttestNodeAgentRequest>,
+    ) -> Result<Response<AttestNodeAgentResponse>, Status> {
+        let node_id = request
+            .get_ref()
+            .attestation
+            .as_ref()
+            .map(|value| value.node_id.clone())
+            .ok_or_else(|| Status::invalid_argument("attestation is required"))?;
+        let principal = self.policy.authorize_agent(&mut request, &node_id)?;
+        let attestation = request.into_inner().attestation.expect("validated above");
+        let conditions =
+            crate::operations::attest(&self.pool, &principal.name, &attestation).await?;
+        Ok(Response::new(AttestNodeAgentResponse {
+            accepted: conditions.is_empty(),
+            conditions,
+        }))
+    }
+
     async fn claim_operation(
         &self,
         mut request: Request<ClaimOperationRequest>,
     ) -> Result<Response<ClaimOperationResponse>, Status> {
         let node_id = request.get_ref().node_id.clone();
+        let agent_instance_id = request.get_ref().agent_instance_id.clone();
         let principal = self.policy.authorize_agent(&mut request, &node_id)?;
-        let response = crate::operations::claim(&self.pool, &node_id, &principal.name)
-            .await?
-            .unwrap_or(ClaimOperationResponse {
-                instruction: None,
-                lease_seconds: 0,
-            });
+        let response =
+            crate::operations::claim(&self.pool, &node_id, &agent_instance_id, &principal.name)
+                .await?
+                .unwrap_or(ClaimOperationResponse {
+                    instruction: None,
+                    lease_seconds: 0,
+                });
         Ok(Response::new(response))
     }
 
@@ -1242,6 +1302,7 @@ impl NodeAgentService for NodeAgentApi {
             &request.node_id,
             &request.operation_id,
             request.lease_epoch,
+            &request.agent_instance_id,
             &principal.name,
         )
         .await?;
@@ -1255,9 +1316,13 @@ impl NodeAgentService for NodeAgentApi {
         mut request: Request<ReportNodeObservationRequest>,
     ) -> Result<Response<ReportNodeObservationResponse>, Status> {
         let node_id = request.get_ref().node_id.clone();
-        self.policy.authorize_agent(&mut request, &node_id)?;
-        crate::operations::report_observation(&self.pool, request.get_ref()).await?;
-        Ok(Response::new(ReportNodeObservationResponse {}))
+        let principal = self.policy.authorize_agent(&mut request, &node_id)?;
+        let operation =
+            crate::operations::report_observation(&self.pool, request.get_ref(), &principal.name)
+                .await?;
+        Ok(Response::new(ReportNodeObservationResponse {
+            operation: Some(operation),
+        }))
     }
 
     async fn report_step_result(

@@ -18,8 +18,133 @@ use anyhow::Result;
 use http::StatusCode;
 
 use wr_common::wruntime::{
-    EngineRegistration, HeartbeatRequest, ModuleDescriptor, RegisterEngineRequest, RoutingRule,
+    BeginDeploymentRequest, DeploymentMetadata, EngineRegistration, ExpectedEngine,
+    HeartbeatRequest, ModuleDescriptor, RegisterEngineRequest, RoutingRule,
 };
+
+#[tokio::test]
+async fn staged_registration_remains_non_serving_without_exact_slot_authority() -> Result<()> {
+    let pool = helpers::db::manager_pool().await;
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let deployment = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
+            node_id: "staged-authority-node".into(),
+            attempt_token: "staged-authority".into(),
+            bundle_digest: digest.clone(),
+            expected_engines: vec![ExpectedEngine {
+                engine_slot: "blue".into(),
+                modules: vec![],
+            }],
+        },
+        "operator-a",
+    )
+    .await?
+    .record;
+    let module = ModuleDescriptor {
+        name: "staged-service".into(),
+        version: "1.0.0".into(),
+        proto_schema: minimal_file_descriptor_set(),
+        namespace: "staged-ns".into(),
+    };
+    wr_manager::db::register_engine_and_routes(
+        &pool,
+        &EngineRegistration {
+            engine_id: "staged-engine".into(),
+            address: "http://127.0.0.1:19100".into(),
+            modules: vec![module.clone()],
+            proxy_address: "http://127.0.0.1:19001".into(),
+            secrets: vec![],
+            peer_address: TEST_SELF_PEER.into(),
+            db_namespaces: vec![],
+            deployment: Some(DeploymentMetadata {
+                node_id: deployment.node_id,
+                revision: deployment.revision,
+                bundle_digest: digest,
+                engine_slot: "blue".into(),
+            }),
+        },
+    )
+    .await?;
+    wr_manager::db::publish_engine_readiness(&pool, "staged-engine", &[module]).await?;
+    wr_manager::db::update_route_health(&pool, 30.0, 30.0).await?;
+    let table = wr_manager::db::get_routing_table(&pool, 0)
+        .await?
+        .expect("routing table");
+    assert_eq!(table.rules.len(), 1);
+    assert!(
+        !table.rules[0].healthy,
+        "staged registration must not serve"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn route_health_publication_participates_in_operation_evidence_lock() -> Result<()> {
+    let pool = helpers::db::manager_pool().await;
+    let module = ModuleDescriptor {
+        name: "serialized-service".into(),
+        version: "1.0.0".into(),
+        proto_schema: minimal_file_descriptor_set(),
+        namespace: "serialized-ns".into(),
+    };
+    wr_manager::db::register_engine_and_routes(
+        &pool,
+        &EngineRegistration {
+            engine_id: "serialized-engine".into(),
+            address: "http://127.0.0.1:19101".into(),
+            modules: vec![module.clone()],
+            proxy_address: "http://127.0.0.1:19001".into(),
+            secrets: vec![],
+            peer_address: TEST_SELF_PEER.into(),
+            db_namespaces: vec![],
+            deployment: None,
+        },
+    )
+    .await?;
+    wr_manager::db::publish_engine_readiness(&pool, "serialized-engine", &[module]).await?;
+    backdate_engine_heartbeat(&pool, "serialized-engine", 60).await;
+
+    let mut holder = pool.get().await?;
+    let transaction = holder.transaction().await?;
+    transaction
+        .query_one(
+            "SELECT version FROM wr_manager_lock WHERE id = 1 FOR UPDATE",
+            &[],
+        )
+        .await?;
+    let publisher_pool = pool.clone();
+    let mut publisher = tokio::spawn(async move {
+        wr_manager::db::update_route_health(&publisher_pool, 1.0, 1.0).await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut publisher)
+            .await
+            .is_err(),
+        "route health must not update outside the shared evidence lock"
+    );
+    let healthy: bool = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT healthy FROM wr_routing_rules
+             WHERE rule_id = 'serialized-engine/serialized-ns/serialized-service/1.0.0'",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(healthy, "blocked publisher has not changed route evidence");
+    transaction.commit().await?;
+    let (stale, recovered) = publisher.await??;
+    assert_eq!(
+        stale,
+        vec!["serialized-engine/serialized-ns/serialized-service/1.0.0"]
+    );
+    assert!(recovered.is_empty());
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_heartbeat_timeout_marks_module_unhealthy() -> Result<()> {

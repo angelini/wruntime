@@ -5168,6 +5168,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wasmtime-wasi-http",
+ "wr-cli",
  "wr-common",
  "wr-engine",
  "wr-manager",

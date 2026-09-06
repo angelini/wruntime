@@ -1,10 +1,7 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use wr_cli::{client, cmd};
 use wr_common::node::TlsConfig;
-
-mod client;
-mod cmd;
-mod display;
 
 #[derive(Parser)]
 #[command(name = "wr-cli", about = "wruntime deployment management CLI")]
@@ -78,7 +75,7 @@ enum Commands {
     Schedules(cmd::schedules::SchedulesArgs),
     /// Manage namespace-scoped secrets
     Secrets(cmd::secrets::SecretsArgs),
-    /// Remote node deployment and lifecycle (bundle, deploy, rollback, stop, inspect-bundle)
+    /// Remote node deployment and lifecycle (bundle, deploy, upgrade, scale, rollback, agent)
     Node(cmd::node::NodeArgs),
     /// Inspect, resume, or cancel durable node operations
     Operations(cmd::operations::OperationsArgs),

@@ -1,5 +1,6 @@
 pub mod build_helpers;
 pub mod bundle;
+pub mod bundle_integrity;
 pub mod cert;
 pub mod cluster;
 pub mod config;
@@ -16,6 +17,7 @@ pub mod managers;
 pub mod metrics;
 pub mod node;
 pub mod node_agent;
+pub mod node_backend;
 pub mod operations;
 pub mod schedules;
 pub mod secrets;

@@ -4,6 +4,7 @@ pub mod wruntime {
     tonic::include_proto!("wruntime");
 }
 
+pub mod agent_policy;
 #[cfg(feature = "config")]
 pub mod config;
 #[cfg(feature = "discovery")]

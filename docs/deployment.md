@@ -26,14 +26,14 @@ cargo install cargo-zigbuild
 | `wr-cli managers inspect-bundle` | Inspect a manager bundle without deploying |
 | `wr-cli managers list` | List active managers in the cluster |
 | `wr-cli node bundle` | Package proxy + engine binaries, WASM modules, and schemas |
-| `wr-cli node deploy` | Push node bundle to a remote host and start services |
-| `wr-cli node rollback` | Activate a retained prior successful bundle as a new revision |
-| `wr-cli node agent --config …` | Run the node-bound fenced lifecycle executor |
-| `wr-cli node upgrade` / `node scale` | Submit a staged target revision to the durable rollout state machine |
+| `wr-cli node agent install/update` | Deterministically install the independent host agent and wait for exact attestation |
+| `wr-cli node deploy` | Stage/finalize a bundle and submit its initial durable operation |
+| `wr-cli node rollback` | Stage a retained successful bundle as a new revision and submit rollback |
+| `wr-cli node upgrade` / `node scale` | Stage/finalize a bundle and submit a durable rollout |
 | `wr-cli engines status` | Compose lifecycle, availability, revision authority, backend evidence, and active operation status |
 | `wr-cli engines drain` / `engines restart` | Submit one durable stable-slot lifecycle operation |
 | `wr-cli operations get/list/resume/cancel` | Inspect and administer durable operation history |
-| `wr-cli node stop` | Legacy backend diagnostic stop; operator automation uses `engines drain` |
+| `wr-cli node abandon` | Remove an unsubmitted inactive allocation after manager safety checks |
 | `wr-cli node inspect-bundle` | Verify and inspect a node bundle without deploying |
 | `wr-cli cluster status` | Show the authoritative cluster-wide runtime snapshot |
 | `wr-cli logs node` | View logs from services on a remote node (systemd or Docker) |
@@ -183,10 +183,13 @@ wr-cli node bundle --engine-config engine.toml
 Add `--proxy-config examples/config/proxy.toml` (or set `proxy_config` in `wr-deploy.toml`) when the source proxy config has runtime sections such as egress allowlists, external routes, or non-default circuit-breaker settings that must be preserved in the bundle.
 
 ```bash
-# 4. Deploy node
-wr-cli node deploy --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.1 --manager https://10.0.1.1:9000
+# 4. Install the independent host agent and wait for exact attestation
+wr-cli node agent install --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.1 --manager https://10.0.1.1:9000
 
-# 5. Inspect the immutable bundle (runtime health is verified by deploy)
+# 5. Stage/finalize the release and submit its durable initial apply
+wr-cli node deploy --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.1 --manager https://10.0.1.1:9000 --request-token node-a-initial
+
+# 6. Inspect immutable bundle content without querying runtime health
 wr-cli node inspect-bundle wr-node-bundle.tar.gz
 ```
 
@@ -207,14 +210,16 @@ wr-cli node bundle \
     --target aarch64-unknown-linux-gnu \
     --output myapp.tar.gz
 
+wr-cli node agent install --node-id node-a myapp.tar.gz deploy@10.0.1.1 \
+    --manager https://10.0.1.1:9000
 wr-cli node deploy --node-id node-a myapp.tar.gz deploy@10.0.1.1 \
     --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
-    --manager https://10.0.1.1:9000
+    --manager https://10.0.1.1:9000 --request-token node-a-initial
 ```
 
-Deploy steps (systemd): the CLI creates a manager-owned deployment attempt for the explicit stable `--node-id`, verifies and uploads the immutable bundle, resolves revision metadata into every engine config, provisions TLS, daemon-reloads, restarts all desired units, and removes obsolete engine units. It exits zero only after the manager verifies the exact current node/revision/digest/engine-slot/module inventory has fresh heartbeats and healthy default routes; timeout or any staging/activation/readiness failure is non-zero. A bundle has a deterministic SHA-256 digest while every deploy attempt receives a new monotonic per-node revision.
+Node deploy creates an inactive manager allocation for the stable `--node-id`, verifies the bundle, resolves host values, uploads bytes without touching running workloads, writes digest-covered release metadata, and calls `FinalizeDeployment`. It then requires a fresh compatible agent attestation and submits one durable operation. The manager and agent—not the CLI's SSH session—select, stop, start, verify, switch authority, commit, and clean up. A CLI wait timeout is nonzero but does not cancel durable work.
 
-On the remote host, immutable bundle content is retained under `{workdir}/wr-node/bundles/<digest>/`, activation instances under `releases/<revision>/`, and `current` is switched atomically only after staging is complete. A pre-switch failure leaves the previous release running. A post-switch failure remains a failed attempt and requires an explicit rollback; it is never silently reported as success.
+Immutable bundle content is retained under `{workdir}/wr-node/bundles/<digest>/` and revisions under `wr-node/releases/<revision>/`. Each proxy/engine slot selects its own release through `wr-node/slots/<slot>`; no node-wide engine `current` or aggregate activation exists. A staging/finalization interruption leaves serving authority unchanged. An allocation finalized but not submitted is explicit and may be removed only with `node abandon`; once submitted, recovery uses operation status/resume or rollback rather than inference from CLI exit.
 
 ```bash
 # Select a successful historical revision explicitly, or omit --to for the previous successful revision.
@@ -222,7 +227,7 @@ wr-cli node rollback deploy@10.0.1.1 --node-id node-a --to 3 \
   --manager https://10.0.1.1:9000
 ```
 
-Rollback verifies that the retained bundle and source release exist, reads the recorded systemd/Docker backend, allocates a new revision, copies the historical desired inventory/digest, injects the new revision metadata, force-restarts/recreates services, and runs the same exact readiness verification. Revisions never move backward. Bundles and releases are retained indefinitely in this initial lifecycle; garbage collection and automatic rollback are intentionally out of scope. An interrupted CLI can leave a pending/active attempt, which history records truthfully rather than inferring remote failure.
+Rollback verifies retained source content, allocates and finalizes a new monotonic revision, and submits a rollback operation. The agent performs only manager-issued per-slot effects; manager evidence gates authority and commit. Revisions never move backward. After commit, cleanup deletes only the manager-derived revision/digest allow-list while preserving configured retention, committed/staged revisions, active authority, and rollback sources. Automatic post-commit rollback is never inferred from CLI failure.
 
 ## Operator lifecycle operations
 
@@ -239,18 +244,18 @@ wr-cli operations cancel <operation-id>
 
 Drain defaults to a two-minute durable deadline and restart to five minutes. Waiting is default. `--wait-timeout` limits only the CLI; timeout is nonzero and prints the operation ID and last observation while durable work continues. `--no-wait` returns after submission. Omitting `--request-token` generates and prints a UUID. Reusing the same actor/token/payload follows the same operation; conflicting reuse fails.
 
-Upgrade and scale consume a manager-assigned staged revision whose digest and exact slot inventory already match the verified immutable deployment snapshot:
+Upgrade and scale use the same bundle-oriented staging/finalization boundary:
 
 ```bash
-wr-cli node upgrade --node-id node-a --target-revision 8 \
-  --bundle-digest sha256:<digest> --slot blue --slot green
-wr-cli node scale --node-id node-a --target-revision 9 \
-  --bundle-digest sha256:<digest> --slot blue --slot green --slot amber
+wr-cli node upgrade --node-id node-a wr-node-v2.tar.gz deploy@10.0.1.1 \
+  --request-token node-a-v2 --max-unavailable 1 --canary blue
+wr-cli node scale --node-id node-a wr-node-scaled.tar.gz deploy@10.0.1.1 \
+  --request-token node-a-scale --max-unavailable 1
 ```
 
-The default is `max_unavailable=1`, lexical first-slot canary, automatic continuation, and a 30-minute operation deadline. `--canary`, `--pause-after-canary`, and `--allow-downtime` make deviations explicit. A paused canary or expired lease requires `operations resume`. Cancellation is accepted only before commit; committed work is corrected by a separately authorized rollback revision. The CLI never performs process effects after operation submission.
+The default is `max_unavailable=1`, lexical first-slot canary, automatic continuation, and a 30-minute durable deadline for deploy-family operations. `--canary`, `--pause-after-canary`, and `--allow-downtime` make deviations explicit; reducing a one-slot or zero-capacity topology requires downtime acknowledgement. `--wait-timeout` is caller-only and `--no-wait` returns after submission. A paused canary or expired lease requires `operations resume`. Cancellation before commit first restores source authority and processes without the expired forward deadline; committed work is corrected by a separately authorized rollback.
 
-The host agent verifies `bundle.sha256`, confines paths below `deployment_root`, atomically selects `wr-node/slots/<slot>`, and invokes only the fixed systemd unit or Compose service for that slot. It has no network listener. A stop remains bounded by the existing 45-second backend-owner contract; the engine's 30-second signal shutdown performs route withdrawal and deregistration. Successful drain/restart requires backend exit evidence, while lifecycle endpoint disappearance alone is never success.
+The host agent verifies digest-covered release metadata, confines paths below `deployment_root`, atomically selects `wr-node/slots/<slot>`, and invokes only fixed systemd units or Compose services. It has no listener. Stop sends SIGTERM through that backend; the engine's 30-second shutdown emits `STOPPING`, withdraws routes, converges the proxy, drains, and deregisters. The manager requires action-specific lifecycle, routing, registration, and backend evidence. Endpoint disappearance alone is never final-exit proof, and an inspection failure is unknown rather than exited.
 
 ## Multi-node cluster setup
 
@@ -274,12 +279,14 @@ wr-cli managers deploy manager.tar.gz deploy@10.0.1.1
 # --- Node A ---
 
 wr-cli node bundle --engine-config examples/multi-node/node-a/engine-1.toml --output node-a.tar.gz
-wr-cli node deploy --node-id node-a node-a.tar.gz deploy@10.0.1.50
+wr-cli node agent install --node-id node-a node-a.tar.gz deploy@10.0.1.50
+wr-cli node deploy --node-id node-a node-a.tar.gz deploy@10.0.1.50 --request-token node-a-initial
 
 # --- Node B ---
 
 wr-cli node bundle --engine-config examples/multi-node/node-b/engine-1.toml --output node-b.tar.gz
-wr-cli node deploy --node-id node-b node-b.tar.gz deploy@10.0.1.51
+wr-cli node agent install --node-id node-b node-b.tar.gz deploy@10.0.1.51
+wr-cli node deploy --node-id node-b node-b.tar.gz deploy@10.0.1.51 --request-token node-b-initial
 ```
 
 Each node's proxy/engine internal listeners and `[node]` data/control URLs bind loopback. Only the proxy's explicitly advertised `[node].peer_address` mTLS listener is reachable across nodes; `--peer-port` fills that target-specific URL in a staged release.
@@ -399,7 +406,7 @@ wr-cli node deploy --node-id node-a myapp.tar.gz deploy@10.0.1.50 --format docke
 # Via wr-deploy.toml
 # format = "docker"
 
-Docker deployments use Linux host networking so proxy/engine loopback trust boundaries match systemd. The CLI builds and force-recreates every desired container for the activated revision; direct Compose startup from an unresolved bundle is not supported.
+Docker deployments use Linux host networking so proxy/engine loopback trust boundaries match systemd. Inactive images and Compose metadata are staged first; only the node agent invokes fixed Compose services after manager authorization. Direct Compose startup from an unresolved bundle is not supported.
 ```
 
 ## TLS certificates
@@ -418,13 +425,13 @@ wr-cli cert generate 10.0.1.51 --ca-dir ./certs/   # node B
 
 During `managers deploy`, pass `--cert-dir <dir>` (or set `cert_dir` in `wr-deploy.toml`). The command provisions `ca.crt`, `<host>.crt`, and `<host>.key` for the remote manager and uses those same local files explicitly for its readiness connection. Docker mounts the provisioned remote certificate directory read-only into the manager container.
 
-During `node deploy`, the same option stages the files inside the revision release before switching `current`. The resolved proxy/engine configs reference those release-relative paths.
+During `node deploy`, the same option stages files inside an inactive revision release. Digest-covered release metadata supplies per-slot config and lifecycle mapping; the agent later changes only the manager-authorized slot selectors.
 
 For local development, run `just certs` to generate a CA and localhost certificates.
 
 ## Remote host requirements
 
-Deploy commands run privileged operations over SSH via `sudo`. The deploy user must have **passwordless sudo** configured on each target host:
+Bootstrap, agent install/update, inactive staging, and diagnostic commands use privileged operations over SSH via `sudo`. Workload effects do not. The deploy user must have **passwordless sudo** configured on each target host:
 
 ```bash
 echo "deploy ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/deploy
@@ -479,20 +486,18 @@ The scenario owns an isolated process group. Scenario completion, service exit, 
 
 Repository examples keep artifact construction outside foreground execution: their Just recipes run the matching `dev build` group before invoking a run script, and each run script renders configuration before making one `dev run` call with its scenario.
 
-## Backend-owned remote stop
+## Agent-owned deployed process effects
 
-Stop one deployed engine by its stable bundle slot; arbitrary remote commands and proxy selectors are not accepted:
+Operators address stable deployment identity and submit durable intent:
 
 ```bash
-wr-cli node stop deploy@10.0.1.50 \
-  --component engine:inventory \
-  --format systemd \
-  --json
+wr-cli engines drain --node-id node-a --slot inventory --request-token maintenance-42 --json
+wr-cli engines restart --node-id node-a --slot inventory --request-token restart-42 --json
 ```
 
-The command derives `wr-engine-<slot>.service` for systemd or `engine-<slot>` for Docker Compose, asks that backend owner to stop the process, and inspects the same backend until exit is proven. It owns one absolute 45-second budget across SSH actions and polls. If graceful exit does not complete with enough budget remaining, it uses the backend's fixed force action and still requires final exit evidence; a timeout or unproved exit is non-zero.
+Only the continuously fenced node agent maps the typed target to `wr-engine-<slot>.service` or the fixed Compose service. It records backend instance identity, sends the backend's graceful SIGTERM action, and inspects until the exact instance exits. Manager reconciliation separately requires `STOPPING`, route withdrawal, deregistration, and backend final exit where the action calls for them. A restarted process must have the requested revision/digests and a fresh process/backend identity before authority can return.
 
-`--json` emits the selected component, backend and derived target, graceful disposition and action evidence, force-action evidence, final backend state, `final_exited`, elapsed milliseconds, and whether force succeeded. The protected deployment qualification retains this record, then keeps the co-located proxy running while `cluster wait` observes the stopped engine's node become unhealthy before rollback.
+SSH remains available for installing/updating the host agent, pre-staging immutable bytes, and bounded diagnostics. It is never used to execute workload stop/start/select/cleanup effects. If the agent loses its activation lease or cannot inspect the backend, the operation pauses with explicit evidence; a replacement activation begins with inspection and cannot blindly repeat the prior effect.
 
 ## Semantic startup and bounded shutdown
 
@@ -504,7 +509,7 @@ Startup remains tolerant only through bounded, owned retries. A proxy must reach
 
 On engine shutdown, route withdrawal and local proxy convergence happen before HTTP admission closes and before final deregistration. Existing HTTP requests and claimed jobs drain to the shared deadline; new work is rejected deterministically. Proxy shutdown closes data-plane admission and every data listener before joining control and background tasks. Manager shutdown rejects new administrative mutations but retains read-only status and required engine drain/deregister operations during teardown. These are internal `STOPPING` phases; deadline expiry or failed required deregistration is a non-zero process outcome.
 
-The CLI `node deploy` and `node rollback` commands use one absolute deadline around `VerifyDeployment`, require the exact node/revision/digest record, and retain every typed condition as timeout evidence. `node stop` separately owns backend stop and final-exit proof under its single 45-second budget; deployment callers do not open a lifecycle tunnel or poll the backend themselves. A ready result is sufficient because engine readiness already proves local proxy route convergence; callers perform no post-ready sleep or invoke retry. Process lifecycle readiness and cluster availability remain distinct contracts.
+`node deploy`, `upgrade`, `scale`, and `rollback` stage/finalize exact node/revision/bundle/resolved-release identity and then submit durable work. The manager owns the absolute operation deadline; the CLI's wait deadline is separate. Backend inspection, lifecycle READY/STOPPING, registration, routing convergence, slot authority, and commit remain distinct evidence, and callers add no readiness sleep. Post-commit cleanup remains visible until its exact manager-approved retention evidence is accepted.
 
 ## Pre-compilation
 

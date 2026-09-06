@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -767,7 +768,7 @@ pub fn scp_file(
     ssh_key: Option<&str>,
     ssh_port: Option<u16>,
 ) -> Result<()> {
-    let mut args = vec!["scp".to_string()];
+    let mut args = vec!["scp".to_string(), "-p".to_string()];
     if let Some(key) = ssh_key {
         args.extend(["-i".to_string(), key.to_string()]);
     }
@@ -786,9 +787,21 @@ pub fn scp_bytes(
     ssh_key: Option<&str>,
     ssh_port: Option<u16>,
 ) -> Result<()> {
-    let tmp = std::env::temp_dir().join(format!("wr-deploy-{}", std::process::id()));
-    std::fs::write(&tmp, content).context("failed to write temp file")?;
-    let remote_tmp = format!("/tmp/wr-deploy-{}", std::process::id());
+    let transfer_id = uuid::Uuid::new_v4();
+    let tmp = std::env::temp_dir().join(format!("wr-deploy-{transfer_id}"));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp)
+        .context("failed to create owner-only transfer file")?;
+    use std::io::Write as _;
+    file.write_all(content)
+        .context("failed to write owner-only transfer file")?;
+    file.sync_all()
+        .context("failed to sync owner-only transfer file")?;
+    drop(file);
+    let remote_tmp = format!("/tmp/wr-deploy-{transfer_id}");
     let result = scp_file(
         &tmp.to_string_lossy(),
         remote,
@@ -799,7 +812,10 @@ pub fn scp_bytes(
     let _ = std::fs::remove_file(&tmp);
     result?;
     let ssh_base = build_ssh_args(remote, ssh_key, ssh_port);
-    run_ssh(&ssh_base, &format!("sudo mv {remote_tmp} {remote_path}"))
+    run_ssh(
+        &ssh_base,
+        &format!("chmod 600 {remote_tmp} && sudo mv {remote_tmp} {remote_path}"),
+    )
 }
 
 #[cfg(test)]

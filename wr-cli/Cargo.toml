@@ -34,7 +34,12 @@ prost-reflect = { version = "0.16", features = ["serde"] }
 serde_json = "1"
 http = "1"
 chrono = "0.4"
-wr-common = { path = "../wr-common", features = ["discovery", "signal", "tls"] }
+wr-common = { path = "../wr-common", features = [
+  "config",
+  "discovery",
+  "signal",
+  "tls",
+] }
 wasmtime = { version = "46", default-features = false, features = [
   "all-arch",
   "anyhow",

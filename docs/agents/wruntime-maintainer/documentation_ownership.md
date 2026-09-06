@@ -23,10 +23,11 @@ Use one authority for each information class. Derived documentation explains int
 | Root WIT ABI or host implementation | `docs/host-bindings.md`, guest `api_guide.md` when preferred usage or semantics change, `generated_contracts.md`, and relevant constraints/examples |
 | `wr-sdk` public helper or `wr-build` generator | guest `api_guide.md`, `codegen.md`, template/examples when usage changes, and generated-contract guidance |
 | `proto/wruntime.proto` | `docs/grpc-api.md`, architecture/configuration where behavior changes, CLI docs, tests, and generated-contract guidance |
+| Operator lifecycle, authority, or agent backend | `docs/architecture.md`, `docs/deployment.md`, `docs/configuration.md`, `docs/testing.md`, invariants/validation/map, and protected deployment assertions |
 | Engine/manager/proxy configuration | `docs/configuration.md`, example configs, architecture when flow changes, and relevant guest capability guidance |
 | Manager migration | migration policy in configuration/architecture as applicable, repository map, and migration tests |
 | Module migration behavior | `docs/configuration.md`, guest template/constraints, and migration tests/examples |
-| Deployment generation, templates, or backend-owned node stop | `docs/deployment.md`, sample deploy config, CLI help/tests, and parity/determinism and final-exit invariants |
+| Deployment generation, templates, node-agent installation, or backend effects | `docs/deployment.md`, `docs/configuration.md`, sample deploy config, CLI help/tests, and parity/determinism/final-exit invariants |
 | Executable example | example configs/scripts, guest examples index, README if the advertised workflow changes, and matching validation guidance |
 | Architecture/request flow | `docs/architecture.md`, concise root README/CLAUDE summary, invariants, and any affected public guide |
 | Validation recipe or prerequisites | `Justfile`, `dev/validate-all.sh`, `docs/testing.md`, and maintainer `validation.md` |

@@ -1,15 +1,46 @@
 mod helpers;
-use helpers::{manager::manager_trio, proxy::TEST_SELF_PEER, wasm::minimal_file_descriptor_set};
+use helpers::{
+    manager::{manager_trio, start_authorized_manager},
+    proxy::TEST_SELF_PEER,
+    wasm::minimal_file_descriptor_set,
+};
 
 use anyhow::Result;
 
 use wr_common::wruntime::{
-    BeginDeploymentRequest, BeginEngineDrainRequest, BeginRollbackRequest,
-    CompleteDeploymentRequest, DeploymentMetadata, DeploymentState, DeregisterEngineRequest,
-    EngineRegistration, ExpectedEngine, GetClusterStatusRequest, GetRoutingTableRequest,
-    GetSchemaRequest, HeartbeatRequest, ListEnginesRequest, ModuleDescriptor, ModuleIdentity,
-    RegisterEngineRequest, RoutingRule, SecretRequest, StatusSeverity, VerifyDeploymentRequest,
+    AbandonDeploymentRequest, AttestNodeAgentRequest, BackendProcessState, BeginDeploymentRequest,
+    BeginEngineDrainRequest, ClaimOperationRequest, DeploymentMetadata, DeploymentState,
+    DeregisterEngineRequest, EngineRegistration, ExpectedEngine, FinalizeDeploymentRequest,
+    GetClusterStatusRequest, GetOperatorStatusRequest, GetRoutingTableRequest, GetSchemaRequest,
+    HeartbeatRequest, ListEnginesRequest, ModuleDescriptor, ModuleIdentity, NodeOperationAction,
+    NodeOperationStepKind, PutNodeAgentPolicyRequest, RegisterEngineRequest,
+    ReportNodeObservationRequest, ReportStepResultRequest, ResumeOperationRequest, RolloutPolicy,
+    RoutingRule, SecretRequest, StatusSeverity, SubmitOperationRequest, VerifyDeploymentResponse,
 };
+
+async fn verify_deployment(
+    pool: &deadpool_postgres::Pool,
+    node_id: &str,
+    revision: u64,
+) -> Result<VerifyDeploymentResponse> {
+    let deployment = wr_manager::db::get_deployment(pool, node_id, revision)
+        .await?
+        .record;
+    let conditions = wr_manager::db::deployment_conditions(pool, &deployment, 10.0, 10.0)
+        .await?
+        .into_iter()
+        .map(|(code, detail)| wr_common::wruntime::DeploymentCondition {
+            code,
+            detail,
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    Ok(VerifyDeploymentResponse {
+        deployment: Some(deployment),
+        ready: conditions.is_empty(),
+        conditions,
+    })
+}
 
 #[tokio::test]
 async fn test_register_and_list_engines() -> Result<()> {
@@ -1034,48 +1065,47 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
     let digest_one = format!("sha256:{}", "1".repeat(64));
     let digest_two = format!("sha256:{}", "2".repeat(64));
 
-    let first = client
-        .begin_deployment(BeginDeploymentRequest {
+    let first = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
             node_id: "node-a".into(),
             attempt_token: "attempt-one".into(),
             bundle_digest: digest_one.clone(),
             expected_engines: expected.clone(),
-        })
-        .await?
-        .into_inner()
-        .deployment
-        .unwrap();
+        },
+        "operator-a",
+    )
+    .await?
+    .record;
     assert_eq!(first.revision, 1);
-    let retry = client
-        .begin_deployment(BeginDeploymentRequest {
+    let retry = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
             node_id: "node-a".into(),
             attempt_token: "attempt-one".into(),
             bundle_digest: digest_one.clone(),
             expected_engines: expected.clone(),
-        })
-        .await?
-        .into_inner()
-        .deployment
-        .unwrap();
+        },
+        "operator-a",
+    )
+    .await?
+    .record;
     assert_eq!(retry.revision, first.revision);
-    let conflict = client
-        .begin_deployment(BeginDeploymentRequest {
+    let conflict = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
             node_id: "node-a".into(),
             attempt_token: "attempt-one".into(),
             bundle_digest: digest_two.clone(),
             expected_engines: expected.clone(),
-        })
-        .await
-        .unwrap_err();
+        },
+        "operator-a",
+    )
+    .await
+    .unwrap_err();
     assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
 
-    let missing = client
-        .verify_deployment(VerifyDeploymentRequest {
-            node_id: "node-a".into(),
-            revision: first.revision,
-        })
-        .await?
-        .into_inner();
+    let missing = verify_deployment(&pool, "node-a", first.revision).await?;
     assert!(!missing.ready);
     assert_eq!(missing.conditions[0].code, "MISSING_ENGINE");
 
@@ -1113,6 +1143,27 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
                 }),
             })
             .await?;
+        let revision = i64::try_from(revision)?;
+        let mut db = pool.get().await?;
+        let transaction = db.transaction().await?;
+        transaction
+            .execute(
+                "UPDATE wr_node_slot_authority SET authoritative = FALSE, updated_at = NOW()
+                 WHERE node_id = 'node-a' AND engine_slot = 'primary' AND authoritative",
+                &[],
+            )
+            .await?;
+        transaction
+            .execute(
+                "INSERT INTO wr_node_slot_authority
+                   (node_id, engine_slot, revision, authoritative)
+                 VALUES ('node-a', 'primary', $1, TRUE)
+                 ON CONFLICT (node_id, engine_slot, revision) DO UPDATE SET
+                   authoritative = TRUE, updated_at = NOW()",
+                &[&revision],
+            )
+            .await?;
+        transaction.commit().await?;
         client
             .heartbeat(HeartbeatRequest {
                 engine_id: engine_id.into(),
@@ -1124,13 +1175,7 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
     }
 
     activate(&mut client, &pool, "deploy-e1", 1, &digest_one).await?;
-    let ready = client
-        .verify_deployment(VerifyDeploymentRequest {
-            node_id: "node-a".into(),
-            revision: 1,
-        })
-        .await?
-        .into_inner();
+    let ready = verify_deployment(&pool, "node-a", 1).await?;
     assert!(ready.ready, "conditions: {:?}", ready.conditions);
     assert!(
         ready
@@ -1169,13 +1214,7 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
             &[&"deploy-e1"],
         )
         .await?;
-    let stale = client
-        .verify_deployment(VerifyDeploymentRequest {
-            node_id: "node-a".into(),
-            revision: 1,
-        })
-        .await?
-        .into_inner();
+    let stale = verify_deployment(&pool, "node-a", 1).await?;
     assert_eq!(stale.conditions[0].code, "STALE_ENGINE_HEARTBEAT");
     let stale_status = client
         .get_cluster_status(GetClusterStatusRequest {})
@@ -1202,34 +1241,22 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
             }],
         })
         .await?;
-    client
-        .complete_deployment(CompleteDeploymentRequest {
-            node_id: "node-a".into(),
-            revision: 1,
-            succeeded: true,
-            failure_detail: String::new(),
-        })
-        .await?;
+    wr_manager::db::complete_deployment(&pool, "node-a", 1, true, "").await?;
 
-    let failed = client
-        .begin_deployment(BeginDeploymentRequest {
+    let failed = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
             node_id: "node-a".into(),
             attempt_token: "attempt-two".into(),
             bundle_digest: digest_two.clone(),
             expected_engines: expected.clone(),
-        })
-        .await?
-        .into_inner()
-        .deployment
-        .unwrap();
+        },
+        "operator-a",
+    )
+    .await?
+    .record;
     assert_eq!(failed.revision, 2);
-    client
-        .complete_deployment(CompleteDeploymentRequest {
-            node_id: "node-a".into(),
-            revision: failed.revision,
-            succeeded: false,
-            failure_detail: "staging failed".into(),
-        })
+    wr_manager::db::complete_deployment(&pool, "node-a", failed.revision, false, "staging failed")
         .await?;
     let preserved = client
         .get_cluster_status(GetClusterStatusRequest {})
@@ -1254,25 +1281,20 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
         deployment.revision == failed.revision && deployment.state == DeploymentState::Failed as i32
     }));
 
-    let second = client
-        .begin_deployment(BeginDeploymentRequest {
+    let second = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
             node_id: "node-a".into(),
             attempt_token: "attempt-three".into(),
             bundle_digest: digest_two.clone(),
             expected_engines: expected,
-        })
-        .await?
-        .into_inner()
-        .deployment
-        .unwrap();
+        },
+        "operator-a",
+    )
+    .await?
+    .record;
     assert_eq!(second.revision, 3);
-    let committed_during_overlap = client
-        .verify_deployment(VerifyDeploymentRequest {
-            node_id: "node-a".into(),
-            revision: 1,
-        })
-        .await?
-        .into_inner();
+    let committed_during_overlap = verify_deployment(&pool, "node-a", 1).await?;
     assert!(
         committed_during_overlap.ready,
         "the committed source remains authoritative while revision 3 is staged"
@@ -1291,6 +1313,11 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
         1
     );
     assert_eq!(overlap_node.target_deployment.as_ref().unwrap().revision, 3);
+    let conflicting_rollback =
+        wr_manager::db::begin_rollback(&pool, "node-a", 1, "rollback-while-staged", "operator-a")
+            .await
+            .expect_err("rollback must not overwrite an existing staged target");
+    assert_eq!(conflicting_rollback.code(), tonic::Code::FailedPrecondition);
     activate(
         &mut client,
         &pool,
@@ -1299,25 +1326,11 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
         &digest_two,
     )
     .await?;
-    client
-        .complete_deployment(CompleteDeploymentRequest {
-            node_id: "node-a".into(),
-            revision: second.revision,
-            succeeded: true,
-            failure_detail: String::new(),
-        })
-        .await?;
+    wr_manager::db::complete_deployment(&pool, "node-a", second.revision, true, "").await?;
 
-    let rollback = client
-        .begin_rollback(BeginRollbackRequest {
-            node_id: "node-a".into(),
-            to_revision: 0,
-            attempt_token: "rollback-one".into(),
-        })
+    let rollback = wr_manager::db::begin_rollback(&pool, "node-a", 0, "rollback-one", "operator-a")
         .await?
-        .into_inner()
-        .deployment
-        .unwrap();
+        .record;
     assert_eq!(rollback.revision, 4);
     assert_eq!(rollback.source_revision, 1);
     assert_eq!(rollback.bundle_digest, digest_one);
@@ -1337,7 +1350,7 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
 
 #[tokio::test]
 async fn test_concurrent_deployment_revision_allocation_is_unique() -> Result<()> {
-    let (_pool, _addr, client) = manager_trio().await?;
+    let (pool, _addr, _client) = manager_trio().await?;
     let request = |token: &str| BeginDeploymentRequest {
         node_id: "concurrent-node".into(),
         attempt_token: token.into(),
@@ -1347,11 +1360,11 @@ async fn test_concurrent_deployment_revision_allocation_is_unique() -> Result<()
             modules: vec![],
         }],
     };
-    let mut left = client.clone();
-    let mut right = client;
+    let left_request = request("concurrent-left");
+    let right_request = request("concurrent-right");
     let (left, right) = tokio::join!(
-        left.begin_deployment(request("concurrent-left")),
-        right.begin_deployment(request("concurrent-right")),
+        wr_manager::db::begin_deployment(&pool, &left_request, "operator-a"),
+        wr_manager::db::begin_deployment(&pool, &right_request, "operator-a"),
     );
     let outcomes = [left, right];
     let successes = outcomes.iter().filter(|result| result.is_ok()).count();
@@ -1365,5 +1378,411 @@ async fn test_concurrent_deployment_revision_allocation_is_unique() -> Result<()
         .count();
     assert_eq!(successes, 1, "only one staged target is allowed");
     assert_eq!(conflicts, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn role_gated_services_enforce_real_mtls_identity_and_node_binding() -> Result<()> {
+    let pool = helpers::db::manager_pool().await;
+    let server = start_authorized_manager(pool).await?;
+
+    let mut viewer = server.operator_client(Some(&server.pki.viewer)).await?;
+    viewer
+        .get_status(GetOperatorStatusRequest {
+            node_id: String::new(),
+            engine_slot: String::new(),
+        })
+        .await?;
+    let denied = viewer
+        .submit_operation(SubmitOperationRequest {
+            node_id: "node-a".into(),
+            request_token: "viewer-denied".into(),
+            action: NodeOperationAction::Restart as i32,
+            engine_slots: vec!["blue".into()],
+            target_revision: 0,
+            bundle_digest: String::new(),
+            policy: Some(RolloutPolicy {
+                max_unavailable: 1,
+                canary_slot: "blue".into(),
+                pause_after_canary: false,
+                allow_downtime: true,
+                deadline_seconds: 300,
+            }),
+            resolved_release_digest: String::new(),
+        })
+        .await
+        .expect_err("viewer mutation must be denied");
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    let denied = viewer
+        .begin_deployment(BeginDeploymentRequest {
+            node_id: "viewer-node".into(),
+            attempt_token: "viewer-allocation".into(),
+            bundle_digest: format!("sha256:{}", "a".repeat(64)),
+            expected_engines: vec![],
+        })
+        .await
+        .expect_err("viewer allocation must be denied");
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+    let mut unknown = server.operator_client(Some(&server.pki.unknown)).await?;
+    let denied = unknown
+        .get_status(GetOperatorStatusRequest {
+            node_id: String::new(),
+            engine_slot: String::new(),
+        })
+        .await
+        .expect_err("unmapped certificate must be denied");
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    let mut missing_certificate = server.operator_client(None).await?;
+    let denied = missing_certificate
+        .get_status(GetOperatorStatusRequest {
+            node_id: String::new(),
+            engine_slot: String::new(),
+        })
+        .await
+        .expect_err("a request without a client certificate must be denied");
+    assert_eq!(
+        denied.code(),
+        tonic::Code::Unknown,
+        "tonic maps the mTLS handshake rejection to a transport status"
+    );
+
+    let mut agent = server.agent_client(Some(&server.pki.agent_a)).await?;
+    let denied = agent
+        .attest(AttestNodeAgentRequest {
+            attestation: Some(helpers::node_agent::attestation(
+                &helpers::node_agent::systemd_policy("node-b", 2),
+                "activation-a",
+            )),
+        })
+        .await
+        .expect_err("node-a certificate must not act for node-b");
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rotated_operator_identity_and_attestation_policy_are_applied_over_mtls() -> Result<()> {
+    let pool = helpers::db::manager_pool().await;
+    let server = start_authorized_manager(pool.clone()).await?;
+    let policy = helpers::node_agent::systemd_policy("node-a", 2);
+    let mut inconsistent_policy = policy.clone();
+    inconsistent_policy.retention_count += 1;
+    let rejected = server
+        .operator_client(Some(&server.pki.operator))
+        .await?
+        .put_node_agent_policy(PutNodeAgentPolicyRequest {
+            policy: Some(inconsistent_policy),
+        })
+        .await
+        .expect_err("manager must recompute the canonical config digest");
+    assert_eq!(rejected.code(), tonic::Code::InvalidArgument);
+    for identity in [&server.pki.operator, &server.pki.operator_rotated] {
+        server
+            .operator_client(Some(identity))
+            .await?
+            .put_node_agent_policy(PutNodeAgentPolicyRequest {
+                policy: Some(policy.clone()),
+            })
+            .await?;
+    }
+    let actor: String = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT actor FROM wr_node_agent_policies WHERE node_id = 'node-a'",
+            &[],
+        )
+        .await?
+        .get("actor");
+    assert_eq!(actor, "operator-a", "rotated fingerprints retain one actor");
+
+    server
+        .operator_client(Some(&server.pki.operator))
+        .await?
+        .begin_deployment(BeginDeploymentRequest {
+            node_id: "abandon-node".into(),
+            attempt_token: "abandon-token".into(),
+            bundle_digest: format!("sha256:{}", "d".repeat(64)),
+            expected_engines: vec![ExpectedEngine {
+                engine_slot: "blue".into(),
+                modules: vec![],
+            }],
+        })
+        .await?;
+    let abandoned = server
+        .operator_client(Some(&server.pki.operator_rotated))
+        .await?
+        .abandon_deployment(AbandonDeploymentRequest {
+            node_id: "abandon-node".into(),
+            attempt_token: "abandon-token".into(),
+        })
+        .await?
+        .into_inner();
+    assert!(abandoned.abandoned);
+    let abandoned_by: String = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT abandoned_by FROM wr_node_deployments
+             WHERE node_id = 'abandon-node' AND attempt_token = 'abandon-token'",
+            &[],
+        )
+        .await?
+        .get("abandoned_by");
+    assert_eq!(abandoned_by, "operator-a");
+
+    let mut agent = server.agent_client(Some(&server.pki.agent_a)).await?;
+    let mut mismatches = Vec::new();
+    let mut protocol = helpers::node_agent::attestation(&policy, "activation-protocol");
+    protocol.protocol_version = "wrong".into();
+    mismatches.push(("PROTOCOL_MISMATCH", protocol));
+    let mut binary = helpers::node_agent::attestation(&policy, "activation-binary");
+    binary.binary_digest = format!("sha256:{}", "b".repeat(64));
+    mismatches.push(("BINARY_MISMATCH", binary));
+    let mut config = helpers::node_agent::attestation(&policy, "activation-config");
+    config.config_digest = format!("sha256:{}", "c".repeat(64));
+    mismatches.push(("CONFIG_MISMATCH", config));
+    let mut backend = helpers::node_agent::attestation(&policy, "activation-backend");
+    backend.backend = wr_common::wruntime::BackendKind::Docker as i32;
+    mismatches.push(("BACKEND_MISMATCH", backend));
+    let mut retention = helpers::node_agent::attestation(&policy, "activation-retention");
+    retention.retention_count += 1;
+    mismatches.push(("RETENTION_MISMATCH", retention));
+    let mut capability = helpers::node_agent::attestation(&policy, "activation-capability");
+    capability.capabilities.pop();
+    mismatches.push(("CAPABILITY_MISMATCH", capability));
+    for (expected_code, attestation) in mismatches {
+        let mismatch = agent
+            .attest(AttestNodeAgentRequest {
+                attestation: Some(attestation),
+            })
+            .await?
+            .into_inner();
+        assert!(!mismatch.accepted);
+        assert!(mismatch
+            .conditions
+            .iter()
+            .any(|condition| condition.code == expected_code));
+    }
+
+    let accepted = agent
+        .attest(AttestNodeAgentRequest {
+            attestation: Some(helpers::node_agent::attestation(&policy, "activation-a")),
+        })
+        .await?
+        .into_inner();
+    assert!(accepted.accepted);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resumed_agent_receives_epoch_bound_inspection_through_node_agent_rpc() -> Result<()> {
+    let pool = helpers::db::manager_pool().await;
+    let server = start_authorized_manager(pool.clone()).await?;
+    let mut operator = server.operator_client(Some(&server.pki.operator)).await?;
+    operator
+        .put_node_agent_policy(PutNodeAgentPolicyRequest {
+            policy: Some(helpers::node_agent::systemd_policy("node-a", 2)),
+        })
+        .await?;
+    let digest = format!("sha256:{}", "9".repeat(64));
+    let deployment = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
+            node_id: "node-a".into(),
+            attempt_token: "rpc-resume".into(),
+            bundle_digest: digest.clone(),
+            expected_engines: vec![ExpectedEngine {
+                engine_slot: "blue".into(),
+                modules: vec![],
+            }],
+        },
+        "operator-a",
+    )
+    .await?
+    .record;
+    operator
+        .finalize_deployment(FinalizeDeploymentRequest {
+            node_id: "node-a".into(),
+            attempt_token: "rpc-resume".into(),
+            revision: deployment.revision,
+            bundle_digest: digest.clone(),
+            resolved_release_digest: format!("sha256:{}", "8".repeat(64)),
+        })
+        .await?;
+    let operation = operator
+        .submit_operation(SubmitOperationRequest {
+            node_id: "node-a".into(),
+            request_token: "rpc-resume".into(),
+            action: NodeOperationAction::InitialApply as i32,
+            engine_slots: vec!["blue".into()],
+            target_revision: deployment.revision,
+            bundle_digest: digest.clone(),
+            policy: Some(RolloutPolicy {
+                max_unavailable: 1,
+                canary_slot: "blue".into(),
+                pause_after_canary: false,
+                allow_downtime: true,
+                deadline_seconds: 300,
+            }),
+            resolved_release_digest: format!("sha256:{}", "8".repeat(64)),
+        })
+        .await?
+        .into_inner()
+        .operation
+        .expect("submitted operation");
+    let mut agent = server.agent_client(Some(&server.pki.agent_a)).await?;
+    for activation in ["activation-a", "activation-b"] {
+        let accepted = agent
+            .attest(AttestNodeAgentRequest {
+                attestation: Some(helpers::node_agent::attestation(
+                    &helpers::node_agent::systemd_policy("node-a", 2),
+                    activation,
+                )),
+            })
+            .await?
+            .into_inner();
+        assert!(accepted.accepted);
+    }
+    for expected in [
+        NodeOperationStepKind::SelectRelease,
+        NodeOperationStepKind::StartBackend,
+        NodeOperationStepKind::VerifyProxy,
+    ] {
+        let instruction = agent
+            .claim_operation(ClaimOperationRequest {
+                node_id: "node-a".into(),
+                agent_instance_id: "activation-a".into(),
+            })
+            .await?
+            .into_inner()
+            .instruction
+            .expect("proxy operation instruction");
+        assert_eq!(instruction.step, expected as i32);
+        let target = instruction.target.as_ref().expect("proxy target");
+        assert!(target.engine_slot.is_empty());
+        agent
+            .report_step_result(ReportStepResultRequest {
+                node_id: "node-a".into(),
+                operation_id: operation.operation_id.clone(),
+                lease_epoch: instruction.lease_epoch,
+                step: instruction.step,
+                agent_instance_id: "activation-a".into(),
+                observed_revision: target.revision,
+                observed_digest: target.bundle_digest.clone(),
+                observed_resolved_release_digest: target.resolved_release_digest.clone(),
+                backend_instance_id: "proxy-backend".into(),
+                process_instance_id: "proxy-process".into(),
+                ..Default::default()
+            })
+            .await?;
+    }
+    let verify_release = agent
+        .claim_operation(ClaimOperationRequest {
+            node_id: "node-a".into(),
+            agent_instance_id: "activation-a".into(),
+        })
+        .await?
+        .into_inner()
+        .instruction
+        .expect("verify release instruction");
+    assert_eq!(
+        verify_release.step,
+        NodeOperationStepKind::VerifyReleaseMetadata as i32
+    );
+    let target = verify_release.target.as_ref().expect("engine target");
+    agent
+        .report_step_result(ReportStepResultRequest {
+            node_id: "node-a".into(),
+            operation_id: operation.operation_id.clone(),
+            engine_slot: "blue".into(),
+            lease_epoch: verify_release.lease_epoch,
+            step: verify_release.step,
+            agent_instance_id: "activation-a".into(),
+            observed_revision: target.revision,
+            observed_digest: target.bundle_digest.clone(),
+            observed_resolved_release_digest: target.resolved_release_digest.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let select = agent
+        .claim_operation(ClaimOperationRequest {
+            node_id: "node-a".into(),
+            agent_instance_id: "activation-a".into(),
+        })
+        .await?
+        .into_inner()
+        .instruction
+        .expect("select instruction");
+    assert_eq!(select.step, NodeOperationStepKind::SelectRelease as i32);
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE wr_node_operations SET lease_expires_at = NOW() - INTERVAL '1 second'
+             WHERE operation_id = $1",
+            &[&uuid::Uuid::parse_str(&operation.operation_id)?],
+        )
+        .await?;
+    assert!(agent
+        .claim_operation(ClaimOperationRequest {
+            node_id: "node-a".into(),
+            agent_instance_id: "activation-a".into(),
+        })
+        .await?
+        .into_inner()
+        .instruction
+        .is_none());
+    operator
+        .resume_operation(ResumeOperationRequest {
+            operation_id: operation.operation_id.clone(),
+        })
+        .await?;
+    let inspection = agent
+        .claim_operation(ClaimOperationRequest {
+            node_id: "node-a".into(),
+            agent_instance_id: "activation-b".into(),
+        })
+        .await?
+        .into_inner()
+        .instruction
+        .expect("replacement activation receives inspection context");
+    assert_eq!(
+        inspection.step,
+        NodeOperationStepKind::InspectBackend as i32
+    );
+    assert_eq!(inspection.operation_id, operation.operation_id);
+    assert_eq!(inspection.agent_instance_id, "activation-b");
+    assert!(inspection.lease_epoch > select.lease_epoch);
+    assert_eq!(inspection.target.as_ref().unwrap().engine_slot, "blue");
+    agent
+        .report_observation(ReportNodeObservationRequest {
+            node_id: "node-a".into(),
+            engine_slot: "blue".into(),
+            backend_state: BackendProcessState::Exited as i32,
+            backend_instance_id: "pre-effect".into(),
+            observed_revision: 0,
+            observed_digest: String::new(),
+            operation_id: inspection.operation_id.clone(),
+            agent_instance_id: inspection.agent_instance_id.clone(),
+            lease_epoch: inspection.lease_epoch,
+            ..Default::default()
+        })
+        .await?;
+    let reissued = agent
+        .claim_operation(ClaimOperationRequest {
+            node_id: "node-a".into(),
+            agent_instance_id: "activation-b".into(),
+        })
+        .await?
+        .into_inner()
+        .instruction
+        .expect("fresh unchanged evidence permits fenced effect retry");
+    assert_eq!(reissued.step, NodeOperationStepKind::SelectRelease as i32);
+    assert_eq!(reissued.operation_id, operation.operation_id);
+    assert_eq!(reissued.lease_epoch, inspection.lease_epoch);
+
     Ok(())
 }

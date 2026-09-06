@@ -80,7 +80,7 @@ impl ServiceUnit<'_> {
 /// own active control process.
 pub fn node_agent_systemd_unit(workdir: &str) -> String {
     format!(
-        "[Unit]\nDescription=wruntime node lifecycle agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser={{run_user}}\nGroup={{run_group}}\nWorkingDirectory={workdir}/wr-agent\nExecStart={workdir}/wr-agent/wr-cli node agent --config {workdir}/wr-agent/agent.toml\nRestart=on-failure\nRestartSec=5\nKillSignal=SIGTERM\nTimeoutStopSec=45s\nSendSIGKILL=yes\n\n[Install]\nWantedBy=multi-user.target\n"
+        "[Unit]\nDescription=wruntime node lifecycle agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=root\nGroup=root\nUMask=0077\nWorkingDirectory={workdir}/wr-agent\nExecStart={workdir}/wr-agent/wr-cli node agent run --config {workdir}/wr-agent/agent.toml\nEnvironment=PATH=\nEnvironment=LANG=C.UTF-8\nNoNewPrivileges=true\nPrivateTmp=true\nPrivateDevices=true\nProtectHome=true\nProtectSystem=strict\nProtectControlGroups=true\nProtectKernelTunables=true\nProtectKernelModules=true\nProtectKernelLogs=true\nProtectClock=true\nProtectHostname=true\nProtectProc=invisible\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nRestrictNamespaces=true\nRestrictSUIDSGID=true\nLockPersonality=true\nRestrictRealtime=true\nSystemCallArchitectures=native\nRuntimeDirectory=wruntime\nRuntimeDirectoryMode=0700\nReadWritePaths={workdir}/wr-node {workdir}/wr-agent/state /run/wruntime -/run/docker.sock -/var/run/docker.sock\nRestart=on-failure\nRestartSec=5\nKillSignal=SIGTERM\nTimeoutStopSec=45s\nSendSIGKILL=yes\n\n[Install]\nWantedBy=multi-user.target\n"
     )
 }
 
@@ -297,6 +297,24 @@ mod tests {
                 }]
             )
         );
+    }
+
+    #[test]
+    fn node_agent_is_a_hardened_root_owned_host_service() {
+        let unit = node_agent_systemd_unit("/opt/wruntime");
+        assert!(unit.contains("User=root\nGroup=root\nUMask=0077\n"));
+        assert!(unit.contains("Environment=PATH=\nEnvironment=LANG=C.UTF-8\n"));
+        assert!(unit.contains("NoNewPrivileges=true\n"));
+        assert!(unit.contains("ProtectSystem=strict\n"));
+        assert!(unit.contains("ProtectControlGroups=true\n"));
+        assert!(unit.contains("PrivateDevices=true\n"));
+        assert!(unit.contains("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n"));
+        assert!(unit.contains("RuntimeDirectory=wruntime\nRuntimeDirectoryMode=0700\n"));
+        assert!(unit.contains("ReadWritePaths=/opt/wruntime/wr-node /opt/wruntime/wr-agent/state /run/wruntime -/run/docker.sock -/var/run/docker.sock\n"));
+        assert!(unit.contains("/opt/wruntime/wr-agent/wr-cli node agent run"));
+        assert!(!unit.contains("{run_user}"));
+        assert!(!unit.contains("sudo"));
+        assert!(!unit.contains("wr-node/releases"));
     }
 
     #[test]

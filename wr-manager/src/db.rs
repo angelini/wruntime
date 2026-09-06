@@ -1,4 +1,4 @@
-use deadpool_postgres::Pool;
+use deadpool_postgres::{GenericClient, Pool};
 use prost::Message;
 use tokio_retry::strategy::ExponentialBackoff;
 use tokio_retry::RetryIf;
@@ -7,7 +7,8 @@ use tonic::Status;
 use wr_common::identity::NamespaceFilter;
 use wr_common::wruntime::{
     BeginDeploymentRequest, DeploymentRecord, DeploymentState, EngineRegistration,
-    ModuleDescriptor, RoutingRule, RoutingTable,
+    ModuleDescriptor, NodeAgentAttestation, NodeAgentPolicy, NodeOperation, RoutingRule,
+    RoutingTable, SlotObservation,
 };
 
 /// Exponential backoff strategy for NOWAIT lock retries: 10ms, 20ms, 40ms, 80ms.
@@ -380,21 +381,21 @@ pub async fn publish_engine_readiness(
         .query_opt(
             "SELECT e.draining,
                     e.deployment_node_id IS NULL
-                    OR e.deployment_revision = n.current_revision
-                    OR (
-                        e.deployment_revision = n.target_revision
-                        AND NOT EXISTS (
-                            SELECT 1 FROM wr_node_operations o
-                            WHERE o.node_id = e.deployment_node_id
-                              AND o.state IN ('queued', 'running', 'paused')
-                        )
-                    )
                     OR EXISTS (
                         SELECT 1 FROM wr_node_slot_authority a
                         WHERE a.node_id = e.deployment_node_id
                           AND a.engine_slot = e.deployment_engine_slot
                           AND a.revision = e.deployment_revision
                           AND a.authoritative
+                    )
+                    OR (
+                        e.deployment_revision = n.current_revision
+                        AND NOT EXISTS (
+                            SELECT 1 FROM wr_node_slot_authority selected
+                            WHERE selected.node_id = e.deployment_node_id
+                              AND selected.engine_slot = e.deployment_engine_slot
+                              AND selected.authoritative
+                        )
                     ) AS authoritative
              FROM wr_engines e
              LEFT JOIN wr_nodes n ON n.node_id = e.deployment_node_id
@@ -515,9 +516,9 @@ pub async fn begin_engine_drain(pool: &Pool, engine_id: &str) -> Result<u64, Sta
 /// (within `module_timeout_secs`). A stale engine fails all its rules; a stale
 /// or missing module takes only its own routes out of rotation.
 ///
-/// The health UPDATEs run without the global lock (they are idempotent). The
-/// global lock is acquired only briefly to bump the routing table version when
-/// changes occurred.
+/// Health recomputation and its routing generation update share the global
+/// routing/evidence lock so operation reconciliation cannot commit from a
+/// snapshot that predates a completed health publication.
 ///
 /// Returns `(stale_rule_ids, recovered_rule_ids)`.
 pub async fn update_route_health(
@@ -526,83 +527,78 @@ pub async fn update_route_health(
     module_timeout_secs: f64,
 ) -> Result<(Vec<String>, Vec<String>), Status> {
     let mut client = pool.get().await.internal()?;
+    let txn = client.transaction().await.internal()?;
+    acquire_global_lock_wait(&txn).await?;
 
     // Mark unhealthy: currently healthy but no longer backed by BOTH a fresh
-    // engine heartbeat and a fresh matching module heartbeat.
-    let stale_rows = client
-        .query(
-            "UPDATE wr_routing_rules r SET healthy = FALSE, updated_at = NOW()
-             WHERE r.healthy = TRUE
-               AND NOT EXISTS (
-                 SELECT 1 FROM wr_engines e
-                 LEFT JOIN wr_nodes n ON n.node_id = e.deployment_node_id
-                 JOIN wr_module_heartbeats m
-                   ON m.engine_id   = e.engine_id
-                  AND m.namespace   = r.destination_namespace
-                  AND m.module_name = r.destination_module
-                  AND m.version     = r.destination_version
-                 WHERE e.engine_id = r.engine_id
-                   AND e.draining = FALSE
-                   AND (
-                     e.deployment_node_id IS NULL
-                     OR e.deployment_revision = n.current_revision
-                     OR (e.deployment_revision = n.target_revision AND NOT EXISTS (
-                       SELECT 1 FROM wr_node_operations o
-                       WHERE o.node_id = e.deployment_node_id
-                         AND o.state IN ('queued', 'running', 'paused')
-                     ))
-                     OR EXISTS (
-                       SELECT 1 FROM wr_node_slot_authority a
-                       WHERE a.node_id = e.deployment_node_id
-                         AND a.engine_slot = e.deployment_engine_slot
-                         AND a.revision = e.deployment_revision
-                         AND a.authoritative
-                     )
-                   )
-                   AND e.last_heartbeat >= NOW() - make_interval(secs => $1::double precision)
-                   AND m.last_healthy   >= NOW() - make_interval(secs => $2::double precision)
-               )
-             RETURNING rule_id",
-            &[&engine_timeout_secs, &module_timeout_secs],
+    // engine heartbeat and a fresh matching module heartbeat. Once any exact
+    // slot authority exists it overrides the committed-revision fallback.
+    let authority_predicate = "(
+        e.deployment_node_id IS NULL
+        OR EXISTS (
+            SELECT 1 FROM wr_node_slot_authority a
+            WHERE a.node_id = e.deployment_node_id
+              AND a.engine_slot = e.deployment_engine_slot
+              AND a.revision = e.deployment_revision
+              AND a.authoritative
         )
+        OR (
+            e.deployment_revision = n.current_revision
+            AND NOT EXISTS (
+                SELECT 1 FROM wr_node_slot_authority selected
+                WHERE selected.node_id = e.deployment_node_id
+                  AND selected.engine_slot = e.deployment_engine_slot
+                  AND selected.authoritative
+            )
+        )
+    )";
+    let stale_sql = format!(
+        "UPDATE wr_routing_rules r SET healthy = FALSE, updated_at = NOW()
+         WHERE r.healthy = TRUE
+           AND NOT EXISTS (
+             SELECT 1 FROM wr_engines e
+             LEFT JOIN wr_nodes n ON n.node_id = e.deployment_node_id
+             JOIN wr_module_heartbeats m
+               ON m.engine_id = e.engine_id
+              AND m.namespace = r.destination_namespace
+              AND m.module_name = r.destination_module
+              AND m.version = r.destination_version
+             WHERE e.engine_id = r.engine_id
+               AND e.draining = FALSE
+               AND {authority_predicate}
+               AND e.last_heartbeat >= NOW() - make_interval(secs => $1::double precision)
+               AND m.last_healthy >= NOW() - make_interval(secs => $2::double precision)
+           )
+         RETURNING rule_id"
+    );
+    let stale_rows = txn
+        .query(&stale_sql, &[&engine_timeout_secs, &module_timeout_secs])
         .await
         .internal()?;
 
     // Mark healthy: currently unhealthy but now backed by BOTH fresh signals.
-    let recovered_rows = client
+    let recovered_sql = format!(
+        "UPDATE wr_routing_rules r SET healthy = TRUE, updated_at = NOW()
+         WHERE r.healthy = FALSE
+           AND EXISTS (
+             SELECT 1 FROM wr_engines e
+             LEFT JOIN wr_nodes n ON n.node_id = e.deployment_node_id
+             JOIN wr_module_heartbeats m
+               ON m.engine_id = e.engine_id
+              AND m.namespace = r.destination_namespace
+              AND m.module_name = r.destination_module
+              AND m.version = r.destination_version
+             WHERE e.engine_id = r.engine_id
+               AND e.draining = FALSE
+               AND {authority_predicate}
+               AND e.last_heartbeat >= NOW() - make_interval(secs => $1::double precision)
+               AND m.last_healthy >= NOW() - make_interval(secs => $2::double precision)
+           )
+         RETURNING rule_id"
+    );
+    let recovered_rows = txn
         .query(
-            "UPDATE wr_routing_rules r SET healthy = TRUE, updated_at = NOW()
-             WHERE r.healthy = FALSE
-               AND EXISTS (
-                 SELECT 1 FROM wr_engines e
-                 LEFT JOIN wr_nodes n ON n.node_id = e.deployment_node_id
-                 JOIN wr_module_heartbeats m
-                   ON m.engine_id   = e.engine_id
-                  AND m.namespace   = r.destination_namespace
-                  AND m.module_name = r.destination_module
-                  AND m.version     = r.destination_version
-                 WHERE e.engine_id = r.engine_id
-                   AND e.draining = FALSE
-                   AND (
-                     e.deployment_node_id IS NULL
-                     OR e.deployment_revision = n.current_revision
-                     OR (e.deployment_revision = n.target_revision AND NOT EXISTS (
-                       SELECT 1 FROM wr_node_operations o
-                       WHERE o.node_id = e.deployment_node_id
-                         AND o.state IN ('queued', 'running', 'paused')
-                     ))
-                     OR EXISTS (
-                       SELECT 1 FROM wr_node_slot_authority a
-                       WHERE a.node_id = e.deployment_node_id
-                         AND a.engine_slot = e.deployment_engine_slot
-                         AND a.revision = e.deployment_revision
-                         AND a.authoritative
-                     )
-                   )
-                   AND e.last_heartbeat >= NOW() - make_interval(secs => $1::double precision)
-                   AND m.last_healthy   >= NOW() - make_interval(secs => $2::double precision)
-               )
-             RETURNING rule_id",
+            &recovered_sql,
             &[&engine_timeout_secs, &module_timeout_secs],
         )
         .await
@@ -611,13 +607,10 @@ pub async fn update_route_health(
     let stale: Vec<String> = stale_rows.iter().map(|r| r.get(0)).collect();
     let recovered: Vec<String> = recovered_rows.iter().map(|r| r.get(0)).collect();
 
-    // Only acquire the lock briefly to bump the version
     if !stale.is_empty() || !recovered.is_empty() {
-        let txn = client.transaction().await.internal()?;
-        acquire_global_lock_wait(&txn).await?;
         increment_version(&txn).await?;
-        txn.commit().await.internal()?;
     }
+    txn.commit().await.internal()?;
 
     Ok((stale, recovered))
 }
@@ -684,6 +677,8 @@ pub struct StatusSlotAuthority {
     pub node_id: String,
     pub engine_slot: String,
     pub revision: u64,
+    pub bundle_digest: String,
+    pub resolved_release_digest: String,
 }
 
 #[derive(Clone, Debug)]
@@ -696,6 +691,10 @@ pub struct ClusterStatusSnapshot {
     pub routes: Vec<StatusRouteRecord>,
     pub managers: Vec<StatusManagerRecord>,
     pub slot_authorities: Vec<StatusSlotAuthority>,
+    pub active_operations: Vec<NodeOperation>,
+    pub observations: Vec<SlotObservation>,
+    pub agent_attestations: Vec<NodeAgentAttestation>,
+    pub agent_policies: Vec<NodeAgentPolicy>,
 }
 
 fn deployment_revision(value: u64) -> Result<i64, Status> {
@@ -748,6 +747,13 @@ fn deployment_row(row: &tokio_postgres::Row) -> Result<DeploymentRow, Status> {
                 seconds: time.timestamp(),
                 nanos: time.timestamp_subsec_nanos() as i32,
             }),
+            resolved_release_digest: row.get("resolved_release_digest"),
+            finalized_at: row
+                .get::<_, Option<chrono::DateTime<chrono::Utc>>>("finalized_at")
+                .map(|time| prost_types::Timestamp {
+                    seconds: time.timestamp(),
+                    nanos: time.timestamp_subsec_nanos() as i32,
+                }),
         },
     })
 }
@@ -758,7 +764,7 @@ async fn get_deployment_in_transaction(
     revision: i64,
 ) -> Result<Option<DeploymentRow>, Status> {
     txn.query_opt(
-        "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, created_at, activated_at, completed_at
+        "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, resolved_release_digest, finalized_at, created_at, activated_at, completed_at
          FROM wr_node_deployments WHERE node_id = $1 AND revision = $2",
         &[&node_id, &revision],
     )
@@ -774,6 +780,7 @@ async fn get_deployment_in_transaction(
 pub async fn begin_deployment(
     pool: &Pool,
     request: &BeginDeploymentRequest,
+    actor: &str,
 ) -> Result<DeploymentRow, Status> {
     let mut client = pool.get().await.internal()?;
     let txn = client.transaction().await.internal()?;
@@ -796,7 +803,7 @@ pub async fn begin_deployment(
         .internal()?;
     if let Some(row) = txn
         .query_opt(
-            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, created_at, activated_at, completed_at
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, resolved_release_digest, finalized_at, created_at, activated_at, completed_at, allocated_by
              FROM wr_node_deployments WHERE node_id = $1 AND attempt_token = $2",
             &[&request.node_id, &request.attempt_token],
         )
@@ -804,7 +811,8 @@ pub async fn begin_deployment(
         .internal()?
     {
         let existing = deployment_row(&row)?;
-        if existing.record.bundle_digest != request.bundle_digest
+        if row.get::<_, String>("allocated_by") != actor
+            || existing.record.bundle_digest != request.bundle_digest
             || existing.record.expected_engines != request.expected_engines
             || existing.record.source_revision != 0
         {
@@ -849,18 +857,21 @@ pub async fn begin_deployment(
         failure_detail: String::new(),
         source_revision: 0,
         activated_at: None,
+        resolved_release_digest: String::new(),
+        finalized_at: None,
     }
     .encode_to_vec();
     txn.execute(
         "INSERT INTO wr_node_deployments
-           (node_id, revision, attempt_token, bundle_digest, expected_inventory, state)
-         VALUES ($1, $2, $3, $4, $5, 'pending')",
+           (node_id, revision, attempt_token, bundle_digest, expected_inventory, state, allocated_by)
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6)",
         &[
             &request.node_id,
             &revision,
             &request.attempt_token,
             &request.bundle_digest,
             &snapshot,
+            &actor,
         ],
     )
     .await
@@ -868,6 +879,161 @@ pub async fn begin_deployment(
     let deployment = get_deployment_in_transaction(&txn, &request.node_id, revision)
         .await?
         .expect("deployment inserted in this transaction");
+    txn.commit().await.internal()?;
+    Ok(deployment)
+}
+
+/// Bind the exact post-template release identity once before operation
+/// submission. The source bundle identity remains independently immutable.
+pub async fn finalize_deployment(
+    pool: &Pool,
+    request: &wr_common::wruntime::FinalizeDeploymentRequest,
+    actor: &str,
+) -> Result<DeploymentRow, Status> {
+    let mut client = pool.get().await.internal()?;
+    let txn = client.transaction().await.internal()?;
+    let revision = deployment_revision(request.revision)?;
+    let row = txn
+        .query_one(
+            "SELECT bundle_digest, resolved_release_digest, abandoned_at, operation_id, allocated_by
+             FROM wr_node_deployments
+             WHERE node_id = $1 AND attempt_token = $2 AND revision = $3 FOR UPDATE",
+            &[&request.node_id, &request.attempt_token, &revision],
+        )
+        .await
+        .internal()?;
+    if row.get::<_, String>("allocated_by") != actor {
+        return Err(Status::permission_denied(
+            "deployment allocation belongs to a different authenticated actor",
+        ));
+    }
+    if row.get::<_, String>("bundle_digest") != request.bundle_digest {
+        return Err(Status::already_exists(
+            "finalization source identity conflicts with the allocated deployment",
+        ));
+    }
+    if row
+        .get::<_, Option<chrono::DateTime<chrono::Utc>>>("abandoned_at")
+        .is_some()
+    {
+        return Err(Status::failed_precondition(
+            "staged allocation was abandoned",
+        ));
+    }
+    let existing: String = row.get("resolved_release_digest");
+    if !existing.is_empty() && existing != request.resolved_release_digest {
+        return Err(Status::already_exists(
+            "deployment was already finalized with a different resolved release digest",
+        ));
+    }
+    if existing.is_empty() {
+        if row.get::<_, Option<uuid::Uuid>>("operation_id").is_some() {
+            return Err(Status::failed_precondition(
+                "submitted deployment cannot be finalized",
+            ));
+        }
+        txn.execute(
+            "UPDATE wr_node_deployments
+             SET resolved_release_digest = $4, finalized_at = NOW(), finalized_by = $5
+             WHERE node_id = $1 AND attempt_token = $2 AND revision = $3",
+            &[
+                &request.node_id,
+                &request.attempt_token,
+                &revision,
+                &request.resolved_release_digest,
+                &actor,
+            ],
+        )
+        .await
+        .internal()?;
+    }
+    let deployment = get_deployment_in_transaction(&txn, &request.node_id, revision)
+        .await?
+        .expect("finalized deployment remains present");
+    txn.commit().await.internal()?;
+    Ok(deployment)
+}
+
+/// Abandon an unbound staged allocation only while manager evidence proves it
+/// has no operation, registration, or serving authority. Exact retries are
+/// idempotent; submitted allocations must be cancelled through the operation.
+pub async fn abandon_deployment(
+    pool: &Pool,
+    node_id: &str,
+    attempt_token: &str,
+    actor: &str,
+) -> Result<DeploymentRow, Status> {
+    let mut client = pool.get().await.internal()?;
+    let txn = client.transaction().await.internal()?;
+    let row = txn
+        .query_opt(
+            "SELECT revision, operation_id, abandoned_at, allocated_by
+             FROM wr_node_deployments
+             WHERE node_id = $1 AND attempt_token = $2 FOR UPDATE",
+            &[&node_id, &attempt_token],
+        )
+        .await
+        .internal()?
+        .ok_or_else(|| Status::not_found("staged allocation not found"))?;
+    if row.get::<_, String>("allocated_by") != actor {
+        return Err(Status::permission_denied(
+            "deployment allocation belongs to a different authenticated actor",
+        ));
+    }
+    if row
+        .get::<_, Option<chrono::DateTime<chrono::Utc>>>("abandoned_at")
+        .is_some()
+    {
+        let deployment = get_deployment_in_transaction(&txn, node_id, row.get("revision"))
+            .await?
+            .expect("abandoned deployment remains present");
+        txn.commit().await.internal()?;
+        return Ok(deployment);
+    }
+    if row.get::<_, Option<uuid::Uuid>>("operation_id").is_some() {
+        return Err(Status::failed_precondition(
+            "a submitted allocation must be cancelled through its operation",
+        ));
+    }
+    let revision: i64 = row.get("revision");
+    let has_effect: bool = txn
+        .query_one(
+            "SELECT EXISTS(
+                SELECT 1 FROM wr_engines
+                WHERE deployment_node_id = $1 AND deployment_revision = $2
+             ) OR EXISTS(
+                SELECT 1 FROM wr_node_slot_authority
+                WHERE node_id = $1 AND revision = $2 AND authoritative
+             )",
+            &[&node_id, &revision],
+        )
+        .await
+        .internal()?
+        .get(0);
+    if has_effect {
+        return Err(Status::failed_precondition(
+            "staged allocation has activation or authority evidence and cannot be abandoned",
+        ));
+    }
+    txn.execute(
+        "UPDATE wr_node_deployments
+         SET state = 'failed', failure_detail = 'staged allocation abandoned',
+             completed_at = NOW(), abandoned_at = NOW(), abandoned_by = $3
+         WHERE node_id = $1 AND revision = $2",
+        &[&node_id, &revision, &actor],
+    )
+    .await
+    .internal()?;
+    txn.execute(
+        "UPDATE wr_nodes SET target_revision = NULL, updated_at = NOW()
+         WHERE node_id = $1 AND target_revision = $2",
+        &[&node_id, &revision],
+    )
+    .await
+    .internal()?;
+    let deployment = get_deployment_in_transaction(&txn, node_id, revision)
+        .await?
+        .expect("abandoned deployment remains present");
     txn.commit().await.internal()?;
     Ok(deployment)
 }
@@ -880,7 +1046,7 @@ pub async fn get_deployment(
     let client = pool.get().await.internal()?;
     let row = client
         .query_opt(
-            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, created_at, activated_at, completed_at
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, resolved_release_digest, finalized_at, created_at, activated_at, completed_at
              FROM wr_node_deployments WHERE node_id = $1 AND revision = $2",
             &[&node_id, &deployment_revision(revision)?],
         )
@@ -941,15 +1107,14 @@ pub async fn complete_deployment(
     Ok(deployment)
 }
 
-/// Capture all DB-backed cluster status evidence under one repeatable-read,
-/// read-only transaction. Presentation severity is intentionally not persisted.
-pub async fn get_cluster_status_snapshot(pool: &Pool) -> Result<ClusterStatusSnapshot, Status> {
-    let mut client = pool.get().await.internal()?;
-    let txn = client.transaction().await.internal()?;
-    txn.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        .await
-        .internal()?;
-
+/// Capture all DB-backed cluster and operation evidence through one transaction.
+/// Callers select read-only or mutation semantics before invoking this helper.
+pub(crate) async fn capture_cluster_status_snapshot<C>(
+    txn: &C,
+) -> Result<ClusterStatusSnapshot, Status>
+where
+    C: GenericClient + Sync,
+{
     let observed_at: chrono::DateTime<chrono::Utc> =
         txn.query_one("SELECT NOW()", &[]).await.internal()?.get(0);
     let routing_version = txn
@@ -962,7 +1127,8 @@ pub async fn get_cluster_status_snapshot(pool: &Pool) -> Result<ClusterStatusSna
         .query(
             "SELECT d.node_id, d.revision, d.attempt_token, d.bundle_digest,
                     d.expected_inventory, d.state, d.failure_detail, d.source_revision,
-                    d.created_at, d.activated_at, d.completed_at, n.current_revision,
+                    d.resolved_release_digest, d.finalized_at, d.created_at,
+                    d.activated_at, d.completed_at, n.current_revision,
                     n.target_revision
              FROM wr_node_deployments d
              JOIN wr_nodes n ON n.node_id = d.node_id
@@ -1073,8 +1239,11 @@ pub async fn get_cluster_status_snapshot(pool: &Pool) -> Result<ClusterStatusSna
 
     let slot_authorities = txn
         .query(
-            "SELECT node_id, engine_slot, revision FROM wr_node_slot_authority
-             WHERE authoritative ORDER BY node_id, engine_slot",
+            "SELECT a.node_id, a.engine_slot, a.revision, d.bundle_digest,
+                    a.resolved_release_digest
+             FROM wr_node_slot_authority a
+             JOIN wr_node_deployments d ON d.node_id = a.node_id AND d.revision = a.revision
+             WHERE a.authoritative ORDER BY a.node_id, a.engine_slot",
             &[],
         )
         .await
@@ -1084,10 +1253,15 @@ pub async fn get_cluster_status_snapshot(pool: &Pool) -> Result<ClusterStatusSna
             node_id: row.get("node_id"),
             engine_slot: row.get("engine_slot"),
             revision: row.get::<_, i64>("revision") as u64,
+            bundle_digest: row.get("bundle_digest"),
+            resolved_release_digest: row.get("resolved_release_digest"),
         })
         .collect();
 
-    txn.commit().await.internal()?;
+    let active_operations = crate::operations::list_from_client(txn, "", false).await?;
+    let observations = crate::operations::observations_from_client(txn, "", "").await?;
+    let agent_attestations = crate::operations::attestations_from_client(txn, "").await?;
+    let agent_policies = crate::operations::policies_from_client(txn).await?;
     Ok(ClusterStatusSnapshot {
         observed_at,
         routing_version,
@@ -1097,7 +1271,24 @@ pub async fn get_cluster_status_snapshot(pool: &Pool) -> Result<ClusterStatusSna
         routes,
         managers,
         slot_authorities,
+        active_operations,
+        observations,
+        agent_attestations,
+        agent_policies,
     })
+}
+
+/// Capture all DB-backed cluster status evidence under one repeatable-read,
+/// read-only transaction. Presentation severity is intentionally not persisted.
+pub async fn get_cluster_status_snapshot(pool: &Pool) -> Result<ClusterStatusSnapshot, Status> {
+    let mut client = pool.get().await.internal()?;
+    let txn = client.transaction().await.internal()?;
+    txn.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await
+        .internal()?;
+    let snapshot = capture_cluster_status_snapshot(&txn).await?;
+    txn.commit().await.internal()?;
+    Ok(snapshot)
 }
 
 fn fresh(
@@ -1324,22 +1515,23 @@ pub async fn begin_rollback(
     node_id: &str,
     to_revision: u64,
     attempt_token: &str,
+    actor: &str,
 ) -> Result<DeploymentRow, Status> {
     let mut client = pool.get().await.internal()?;
     let txn = client.transaction().await.internal()?;
-    let current_revision: i64 = txn
+    let node = txn
         .query_opt(
-            "SELECT current_revision FROM wr_nodes WHERE node_id = $1 FOR UPDATE",
+            "SELECT current_revision, target_revision FROM wr_nodes WHERE node_id = $1 FOR UPDATE",
             &[&node_id],
         )
         .await
         .internal()?
-        .ok_or_else(|| Status::not_found(format!("node '{node_id}' has no deployment history")))?
-        .get(0);
+        .ok_or_else(|| Status::not_found(format!("node '{node_id}' has no deployment history")))?;
+    let current_revision: i64 = node.get("current_revision");
 
     if let Some(row) = txn
         .query_opt(
-            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, created_at, activated_at, completed_at
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, resolved_release_digest, finalized_at, created_at, activated_at, completed_at, allocated_by
              FROM wr_node_deployments WHERE node_id = $1 AND attempt_token = $2",
             &[&node_id, &attempt_token],
         )
@@ -1347,7 +1539,8 @@ pub async fn begin_rollback(
         .internal()?
     {
         let existing = deployment_row(&row)?;
-        if existing.record.source_revision == 0
+        if row.get::<_, String>("allocated_by") != actor
+            || existing.record.source_revision == 0
             || (to_revision != 0 && existing.record.source_revision != to_revision)
         {
             return Err(Status::already_exists(
@@ -1357,10 +1550,15 @@ pub async fn begin_rollback(
         txn.commit().await.internal()?;
         return Ok(existing);
     }
+    if let Some(target_revision) = node.get::<_, Option<i64>>("target_revision") {
+        return Err(Status::failed_precondition(format!(
+            "node '{node_id}' already has staged target revision {target_revision}"
+        )));
+    }
 
     let selected_row = if to_revision == 0 {
         txn.query_opt(
-            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, created_at, activated_at, completed_at
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, resolved_release_digest, finalized_at, created_at, activated_at, completed_at
              FROM wr_node_deployments
              WHERE node_id = $1 AND state = 'succeeded' AND revision < $2
              ORDER BY revision DESC LIMIT 1",
@@ -1372,7 +1570,7 @@ pub async fn begin_rollback(
         let requested = i64::try_from(to_revision)
             .map_err(|_| Status::invalid_argument("to_revision is too large"))?;
         txn.query_opt(
-            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, created_at, activated_at, completed_at
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, resolved_release_digest, finalized_at, created_at, activated_at, completed_at
              FROM wr_node_deployments
              WHERE node_id = $1 AND revision = $2 AND revision < $3 AND state = 'succeeded'",
             &[&node_id, &requested, &current_revision],
@@ -1409,12 +1607,14 @@ pub async fn begin_rollback(
         failure_detail: String::new(),
         source_revision: selected.revision,
         activated_at: None,
+        resolved_release_digest: String::new(),
+        finalized_at: None,
     }
     .encode_to_vec();
     txn.execute(
         "INSERT INTO wr_node_deployments
-           (node_id, revision, attempt_token, bundle_digest, expected_inventory, state, source_revision)
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6)",
+           (node_id, revision, attempt_token, bundle_digest, expected_inventory, state, source_revision, allocated_by)
+         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)",
         &[
             &node_id,
             &revision,
@@ -1422,6 +1622,7 @@ pub async fn begin_rollback(
             &selected.bundle_digest,
             &snapshot,
             &(selected.revision as i64),
+            &actor,
         ],
     )
     .await
