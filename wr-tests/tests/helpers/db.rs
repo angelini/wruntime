@@ -31,49 +31,18 @@ pub fn require_db_url() -> String {
 }
 
 pub async fn manager_pool() -> deadpool_postgres::Pool {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    static CLEANED: AtomicBool = AtomicBool::new(false);
-    static CLEANUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     let base_url = require_db_url();
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let schema = format!("mgr_test_{n}");
+    let schema = format!("mgr_test_{}", uuid::Uuid::new_v4().simple());
 
     // Create the schema using a one-shot connection to the base DB (no search_path override).
+    // A UUID keeps independently launched integration-test processes isolated. Do not clean up
+    // other mgr_test_* schemas here: without shared liveness metadata they may still be in use.
     let setup_pool = wr_common::pool::build_pool(&base_url, 1).expect("failed to build setup pool");
     let client = setup_pool.get().await.expect("setup connection");
-
-    // On the first call only, drop all leftover mgr_test_* schemas from
-    // previous (possibly failed) test runs.
-    if !CLEANED.load(Ordering::SeqCst) {
-        let _guard = CLEANUP_LOCK.lock().await;
-        if !CLEANED.load(Ordering::SeqCst) {
-            let rows = client
-                .query(
-                    "SELECT schema_name FROM information_schema.schemata
-                     WHERE schema_name LIKE 'mgr_test_%'",
-                    &[],
-                )
-                .await
-                .expect("list mgr_test schemas");
-            for row in &rows {
-                let name: &str = row.get(0);
-                client
-                    .batch_execute(&format!("DROP SCHEMA \"{name}\" CASCADE"))
-                    .await
-                    .expect("drop leftover schema");
-            }
-            // Ensure wr_system schema exists before any migrations run.
-            // Done once under the lock to avoid races between parallel tests.
-            client
-                .batch_execute("CREATE SCHEMA IF NOT EXISTS wr_system")
-                .await
-                .expect("create wr_system schema");
-            CLEANED.store(true, Ordering::SeqCst);
-        }
-    }
-
+    client
+        .batch_execute("CREATE SCHEMA IF NOT EXISTS wr_system")
+        .await
+        .expect("create wr_system schema");
     client
         .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
         .await

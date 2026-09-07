@@ -1118,7 +1118,7 @@ impl InstructionExecutor for HostBackend {
                         after.process_instance_id = instruction.pinned_process_instance_id.clone();
                         Ok(after)
                     }
-                    NodeOperationStepKind::VerifyProxy => {
+                    NodeOperationStepKind::VerifyTarget | NodeOperationStepKind::VerifyProxy => {
                         let evidence = self.inspect_proxy().await;
                         anyhow::ensure!(
                             evidence.observed_revision == desired.revision
@@ -1683,9 +1683,12 @@ fn parse_systemd_observation(bytes: &[u8]) -> BackendObservation {
             "systemd state is not conclusive: {active}/{sub}"
         ));
     };
-    if invocation.is_empty() {
+    if invocation.is_empty() && !(active == "inactive" && sub == "dead") {
         return BackendObservation::query_error("systemd InvocationID is missing");
     }
+    // A newly installed unit that has never started is inactive/dead with no
+    // InvocationID. Treat it as not running, but keep the identity empty so
+    // callers that require proof of a prior process exit still fail closed.
     BackendObservation {
         state,
         instance_id: invocation.to_string(),
@@ -1772,6 +1775,26 @@ mod tests {
         );
         assert_eq!(running.state, BackendProcessState::Running);
         assert_eq!(running.instance_id, "abc");
+
+        let never_started = parse_systemd_observation(
+            b"LoadState=loaded\nActiveState=inactive\nSubState=dead\nInvocationID=\n",
+        );
+        assert_eq!(never_started.state, BackendProcessState::Exited);
+        assert!(never_started.instance_id.is_empty());
+        assert!(never_started.query_error.is_empty());
+
+        let missing_running_identity = parse_systemd_observation(
+            b"LoadState=loaded\nActiveState=active\nSubState=running\nInvocationID=\n",
+        );
+        assert_eq!(
+            missing_running_identity.state,
+            BackendProcessState::QueryError
+        );
+        assert_eq!(
+            missing_running_identity.query_error,
+            "systemd InvocationID is missing"
+        );
+
         let unknown = parse_systemd_observation(
             b"LoadState=loaded\nActiveState=activating\nSubState=start\nInvocationID=abc\n",
         );
@@ -1952,27 +1975,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_proxy_verification_uses_target_release_without_selection() {
+    async fn proxy_source_and_target_verification_require_exact_selected_release() {
         let root = temp_root("proxy");
         let digest = stage_release(&root, 1, false);
         let backend = test_backend(&root);
-        let (_cancel, receiver) = watch::channel(false);
-        let mut verify = instruction(
+        for step in [
+            NodeOperationStepKind::VerifyTarget,
             NodeOperationStepKind::VerifyProxy,
-            1,
-            digest,
-            resolved_digest(&root, 1),
-        );
-        verify.target.as_mut().unwrap().kind =
-            wr_common::wruntime::InstructionTargetKind::Proxy as i32;
-        verify.target.as_mut().unwrap().engine_slot.clear();
-        let error = backend.execute(&verify, receiver).await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("proxy is not selected and lifecycle READY with exact identity"),
-            "unexpected proxy verification error: {error:#}"
-        );
+        ] {
+            let (_cancel, receiver) = watch::channel(false);
+            let mut verify = instruction(step, 1, digest.clone(), resolved_digest(&root, 1));
+            verify.target.as_mut().unwrap().kind =
+                wr_common::wruntime::InstructionTargetKind::Proxy as i32;
+            verify.target.as_mut().unwrap().engine_slot.clear();
+            let error = backend.execute(&verify, receiver).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("proxy is not selected and lifecycle READY with exact identity"),
+                "unexpected proxy verification error: {error:#}"
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

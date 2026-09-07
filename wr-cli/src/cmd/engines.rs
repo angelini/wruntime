@@ -54,6 +54,9 @@ pub struct MutationArgs {
     /// Durable operation deadline in seconds.
     #[arg(long)]
     deadline: Option<u64>,
+    /// Permit an operation that temporarily removes all serving capacity.
+    #[arg(long)]
+    allow_downtime: bool,
     /// Caller-only wait timeout in seconds.
     #[arg(long, default_value_t = 300)]
     wait_timeout: u64,
@@ -285,15 +288,30 @@ async fn status(
     Ok(())
 }
 
-async fn mutate(manager: &str, args: MutationArgs, action: NodeOperationAction) -> Result<()> {
-    let token = args
-        .request_token
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+fn mutation_policy(
+    action: NodeOperationAction,
+    deadline: Option<u64>,
+    allow_downtime: bool,
+) -> RolloutPolicy {
     let default_deadline = if action == NodeOperationAction::Drain {
         120
     } else {
         300
     };
+    RolloutPolicy {
+        max_unavailable: 1,
+        canary_slot: String::new(),
+        pause_after_canary: false,
+        allow_downtime,
+        deadline_seconds: deadline.unwrap_or(default_deadline),
+    }
+}
+
+async fn mutate(manager: &str, args: MutationArgs, action: NodeOperationAction) -> Result<()> {
+    let token = args
+        .request_token
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let policy = mutation_policy(action, args.deadline, args.allow_downtime);
     let operation = client::connect_operator(manager)
         .await?
         .submit_operation(SubmitOperationRequest {
@@ -303,13 +321,7 @@ async fn mutate(manager: &str, args: MutationArgs, action: NodeOperationAction) 
             engine_slots: vec![args.slot],
             target_revision: 0,
             bundle_digest: String::new(),
-            policy: Some(RolloutPolicy {
-                max_unavailable: 1,
-                canary_slot: String::new(),
-                pause_after_canary: false,
-                allow_downtime: false,
-                deadline_seconds: args.deadline.unwrap_or(default_deadline),
-            }),
+            policy: Some(policy),
             resolved_release_digest: String::new(),
         })
         .await?
@@ -329,4 +341,20 @@ async fn mutate(manager: &str, args: MutationArgs, action: NodeOperationAction) 
         args.json,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutation_policy_requires_explicit_downtime_and_preserves_deadlines() {
+        let drain = mutation_policy(NodeOperationAction::Drain, None, false);
+        assert!(!drain.allow_downtime);
+        assert_eq!(drain.deadline_seconds, 120);
+
+        let explicit = mutation_policy(NodeOperationAction::Restart, Some(45), true);
+        assert!(explicit.allow_downtime);
+        assert_eq!(explicit.deadline_seconds, 45);
+    }
 }

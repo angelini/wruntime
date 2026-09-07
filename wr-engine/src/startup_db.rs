@@ -25,16 +25,20 @@ pub struct StartupDbManifest {
     pub schemas: Vec<SchemaStartup>,
     pub namespace_capacities: BTreeMap<String, usize>,
     pub has_workers: bool,
+    pub needs_job_queue: bool,
 }
 
 impl StartupDbManifest {
     pub fn build(config: &EngineConfig) -> Result<Self> {
+        let has_workers = config
+            .modules
+            .iter()
+            .any(|module| module.mode == ModuleMode::Worker);
+        let needs_job_queue = has_workers || config.job_admin.is_some();
         let Some(database) = config.database.as_ref() else {
             return Ok(Self {
-                has_workers: config
-                    .modules
-                    .iter()
-                    .any(|module| module.mode == ModuleMode::Worker),
+                has_workers,
+                needs_job_queue,
                 ..Self::default()
             });
         };
@@ -99,10 +103,8 @@ impl StartupDbManifest {
         Ok(Self {
             schemas: schemas.into_values().collect(),
             namespace_capacities,
-            has_workers: config
-                .modules
-                .iter()
-                .any(|module| module.mode == ModuleMode::Worker),
+            has_workers,
+            needs_job_queue,
         })
     }
 }
@@ -185,6 +187,25 @@ database = true
         );
         let error = StartupDbManifest::build(&config).expect_err("conflict must fail");
         assert!(error.to_string().contains("conflicting migration sources"));
+    }
+
+    #[test]
+    fn job_admin_without_workers_still_requires_the_job_queue() {
+        let config = config_with_modules(
+            r#"
+[job_admin]
+listen_address = "127.0.0.1:9150"
+advertise_address = "https://127.0.0.1:9150"
+queue_id = "test-jobs"
+[job_admin.tls]
+cert_path = "job-admin.crt"
+key_path = "job-admin.key"
+ca_cert_path = "job-admin-ca.crt"
+"#,
+        );
+        let manifest = StartupDbManifest::build(&config).expect("manifest");
+        assert!(!manifest.has_workers);
+        assert!(manifest.needs_job_queue);
     }
 
     #[test]

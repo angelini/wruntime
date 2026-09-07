@@ -187,6 +187,7 @@ PY_REDACT
         for command in ("node deploy", "node upgrade", "node scale", "engines drain", "node rollback"):
             self.assertIn(command, script)
         self.assertIn("--exit-after-finalization", script)
+        self.assertEqual(script.count("--allow-downtime"), 4)
         self.assertIn('operations list --node-id "$NODE_ID" --include-terminal --json', script)
         self.assertIn('len(matches) != 1', script)
         for obsolete in (
@@ -200,6 +201,23 @@ PY_REDACT
             "status exited --services engine-engine",
         ):
             self.assertNotIn(obsolete, script)
+
+    def test_deployment_bootstraps_fingerprint_mapped_operator_and_agent(self):
+        script = DEPLOYMENT_LIFECYCLE.read_text()
+        self.assertIn('client-cert "$CERT_DIR/${OPERATOR_CERT_NAME}.crt"', script)
+        self.assertIn('role = "operator"', script)
+        self.assertIn('role = "node-agent"', script)
+        self.assertIn('node_id = {json.dumps(node_id)}', script)
+        self.assertLess(
+            script.index("write_manager_config wr-tests/deployment/manager.toml"),
+            script.index('run_logged manager-bundle'),
+        )
+        self.assertLess(
+            script.index('run_to_log "$backend node agent install"'),
+            script.index('run_to_log "$backend node A deploy"'),
+        )
+        self.assertIn('--agent-cert "$CERT_DIR/${AGENT_CERT_NAME}.crt"', script)
+        self.assertIn('--agent-ca-cert "$CERT_DIR/ca.crt"', script)
 
     def test_failure_excerpt_is_bounded(self):
         with tempfile.TemporaryDirectory() as directory:

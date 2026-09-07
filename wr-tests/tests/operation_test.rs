@@ -438,6 +438,75 @@ async fn durable_operation_is_idempotent_and_fences_activation_and_epoch() -> Re
 }
 
 #[tokio::test]
+async fn rolling_upgrade_proves_the_source_proxy_before_stop() -> Result<()> {
+    let pool = manager_pool().await;
+    let source_digest = format!("sha256:{}", "7".repeat(64));
+    let source = stage(
+        &pool,
+        "proxy-source-node",
+        "source-allocation",
+        &source_digest,
+        &["blue"],
+    )
+    .await;
+    wr_manager::db::complete_deployment(&pool, "proxy-source-node", source.revision, true, "")
+        .await?;
+    let target_digest = format!("sha256:{}", "8".repeat(64));
+    let target = stage(
+        &pool,
+        "proxy-source-node",
+        "upgrade-allocation",
+        &target_digest,
+        &["blue"],
+    )
+    .await;
+    wr_manager::operations::submit(
+        &pool,
+        "operator-a",
+        &SubmitOperationRequest {
+            node_id: "proxy-source-node".into(),
+            request_token: "upgrade-allocation".into(),
+            action: NodeOperationAction::RollingUpgrade as i32,
+            engine_slots: vec!["blue".into()],
+            target_revision: target.revision,
+            bundle_digest: target.bundle_digest.clone(),
+            policy: Some(policy(300)),
+            resolved_release_digest: target.resolved_release_digest.clone(),
+        },
+    )
+    .await?;
+    configure_agent(&pool, "proxy-source-node", "activation-a").await;
+
+    let verify =
+        wr_manager::operations::claim(&pool, "proxy-source-node", "activation-a", "agent-a")
+            .await?
+            .expect("source proxy proof must be claimable")
+            .instruction
+            .expect("source proxy proof instruction");
+    assert_eq!(verify.step, NodeOperationStepKind::VerifyTarget as i32);
+    let verify_target = verify.target.as_ref().expect("source proxy target");
+    assert_eq!(verify_target.kind, InstructionTargetKind::Proxy as i32);
+    assert_eq!(verify_target.revision, source.revision);
+    assert_eq!(verify_target.bundle_digest, source.bundle_digest);
+
+    report_ok(&pool, &verify, "proxy-backend-old", "proxy-process-old").await?;
+    let stop = wr_manager::operations::claim(&pool, "proxy-source-node", "activation-a", "agent-a")
+        .await?
+        .expect("source proof must advance to proxy stop")
+        .instruction
+        .expect("proxy stop instruction");
+    assert_eq!(stop.step, NodeOperationStepKind::StopBackend as i32);
+    assert_eq!(
+        stop.target.as_ref().expect("proxy stop target").revision,
+        source.revision
+    );
+    assert_eq!(stop.pinned_backend_instance_id, "proxy-backend-old");
+    assert_eq!(stop.pinned_process_instance_id, "proxy-process-old");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn reported_success_cannot_bypass_manager_evidence_or_grant_authority() -> Result<()> {
     let pool = manager_pool().await;
     let digest = format!("sha256:{}", "8".repeat(64));

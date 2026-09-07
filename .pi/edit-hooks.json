@@ -1,9 +1,9 @@
 {
   "onStop": {
     "*.rs": [
-      "cd {projectRoot} && just fmt",
-      "cd {projectRoot} && just lint"
+      "cd {projectRoot} && just --quiet fmt",
+      "cd {projectRoot} && just --quiet lint"
     ],
-    "*.toml": "cd {projectRoot} && taplo fmt"
+    "*.toml": "cd {projectRoot} && just --quiet fmt"
   }
 }

@@ -476,7 +476,7 @@ struct DeployArtifactParams<'a> {
     config_names: &'a [String],
     engine_names: &'a [String],
     engine_listen_ports: &'a [u16],
-    proxy_port: u16,
+    proxy_control_port: u16,
     no_otel: bool,
 }
 
@@ -505,7 +505,7 @@ fn add_deployment_artifacts(
         config_names,
         engine_names,
         engine_listen_ports,
-        proxy_port,
+        proxy_control_port,
         ..
     } = params;
     let no_otel = params.no_otel;
@@ -529,7 +529,7 @@ fn add_deployment_artifacts(
     release_slots.sort_by(|left, right| left.engine_slot.cmp(&right.engine_slot));
     let release_metadata = ReleaseMetadata {
         format_version: 1,
-        proxy_lifecycle_address: format!("http://127.0.0.1:{proxy_port}"),
+        proxy_lifecycle_address: format!("http://127.0.0.1:{proxy_control_port}"),
         proxy_systemd_unit: "wr-proxy.service".to_string(),
         proxy_docker_service: "proxy".to_string(),
         slots: release_slots,
@@ -809,7 +809,7 @@ fn assemble_node_bundle(input: NodeBundleAssembly<'_>) -> Result<Manifest> {
             config_names: &config_names,
             engine_names: &engine_names,
             engine_listen_ports: &engine_listen_ports,
-            proxy_port,
+            proxy_control_port: control_port,
             no_otel: input.no_otel,
         },
     )?;
@@ -1080,6 +1080,8 @@ fn expected_engines(manifest: &Manifest) -> Vec<ExpectedEngine> {
         .collect()
 }
 
+const WORKLOAD_PRIVATE_KEY_MODE: u32 = 0o640;
+
 struct ResolvedStage {
     root: PathBuf,
     archive: PathBuf,
@@ -1144,7 +1146,11 @@ fn materialize_resolved_release(
     for (source, name, mode) in [
         (format!("{cert_dir}/ca.crt"), "ca.crt", 0o644),
         (format!("{cert_dir}/{host_name}.crt"), "node.crt", 0o644),
-        (format!("{cert_dir}/{host_name}.key"), "node.key", 0o600),
+        (
+            format!("{cert_dir}/{host_name}.key"),
+            "node.key",
+            WORKLOAD_PRIVATE_KEY_MODE,
+        ),
     ] {
         anyhow::ensure!(
             Path::new(&source).is_file(),
@@ -1166,7 +1172,7 @@ fn materialize_resolved_release(
         for (source, name, mode) in [
             (delegation_ca, "ca.crt", 0o644),
             (delegation_cert, "node.crt", 0o644),
-            (delegation_key, "node.key", 0o600),
+            (delegation_key, "node.key", WORKLOAD_PRIVATE_KEY_MODE),
         ] {
             anyhow::ensure!(
                 Path::new(&source).is_file(),
@@ -1240,18 +1246,22 @@ fn remote_resolved_verification(
 ) -> String {
     let mut checks = vec![
         format!(
-            "test \"$(cat {release}/bundle.sha256)\" = '{}'",
+            "test \"$(sudo cat {release}/bundle.sha256)\" = '{}'",
             manifest.bundle_digest
         ),
-        format!("test \"$(cat {release}/resolved-release.sha256)\" = '{resolved_digest}'"),
+        format!("test \"$(sudo cat {release}/resolved-release.sha256)\" = '{resolved_digest}'"),
     ];
     checks.extend(manifest.files.iter().map(|(path, file)| {
         format!(
-            "test \"$(sha256sum {release}/{path} | cut -d' ' -f1)\" = '{}' && test \"$(stat -c '%a' {release}/{path})\" = '{:o}'",
+            "test \"$(sudo sha256sum {release}/{path} | cut -d' ' -f1)\" = '{}' && test \"$(sudo stat -c '%a' {release}/{path})\" = '{:o}'",
             file.sha256, file.mode
         )
     }));
     checks.join(" && ")
+}
+
+fn remote_release_hardening(release: &str, run_group: &str) -> String {
+    format!("sudo chown -R root:{run_group} {release} && sudo chmod 755 {release}")
 }
 
 fn finalize_remote_release(
@@ -1279,10 +1289,13 @@ fn finalize_remote_release(
     )?;
     let verify = remote_resolved_verification(&release, &stage.manifest, &stage.digest);
     let verify_tmp = remote_resolved_verification(&temporary, &stage.manifest, &stage.digest);
+    let run_group = helpers::extract_remote_user(remote).unwrap_or("root");
+    let harden = remote_release_hardening(&release, run_group);
+    let harden_tmp = remote_release_hardening(&temporary, run_group);
     helpers::run_ssh(
         ssh_base,
         &format!(
-            "sudo mkdir -p {root} && if test -d {release}; then {verify}; else sudo rm -rf {temporary} && sudo mkdir {temporary} && sudo tar xzf {upload} -C {temporary} && {verify_tmp} && sudo chown -R root:root {temporary} && sudo mv {temporary} {release}; fi && sudo rm -f {upload}"
+            "sudo mkdir -p {root} && if test -d {release}; then {verify} && {harden}; else sudo rm -rf {temporary} && sudo mkdir {temporary} && sudo tar xzf {upload} -C {temporary} && {verify_tmp} && {harden_tmp} && sudo mv {temporary} {release}; fi && sudo rm -f {upload}"
         ),
     )
 }
@@ -1545,9 +1558,11 @@ async fn durable_rollback(args: RollbackArgs, manager: &str) -> Result<()> {
     let target = release_dir(&workdir, deployment.revision);
     let temporary = staging_release_dir(&workdir, deployment.revision);
     let ssh = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
+    let run_group = helpers::extract_remote_user(&args.remote).unwrap_or("root");
+    let harden = remote_release_hardening(&target, run_group);
     let script = format!(
         r#"set -eu
-SOURCE={source:?} TARGET={target:?} TMP={temporary:?} NODE={node:?} REV={revision} BUNDLE={bundle:?} python3 - <<'PY'
+sudo env SOURCE={source:?} TARGET={target:?} TMP={temporary:?} NODE={node:?} REV={revision} BUNDLE={bundle:?} python3 - <<'PY'
 import hashlib,json,os,pathlib,re,shutil,stat
 source=pathlib.Path(os.environ['SOURCE']); target=pathlib.Path(os.environ['TARGET']); tmp=pathlib.Path(os.environ['TMP'])
 node=os.environ['NODE']; revision=int(os.environ['REV']); bundle=os.environ['BUNDLE']
@@ -1571,7 +1586,8 @@ manifest={{'version':1,'node_id':node,'revision':revision,'backend':backend,'bun
 canonical=json.dumps(manifest,separators=(',',':')).encode(); digest='sha256:'+hashlib.sha256(b'wruntime.resolved-release.v1\0'+canonical).hexdigest()
 (tmp/'resolved-release.json').write_text(json.dumps(manifest,indent=2)+'\n'); (tmp/'resolved-release.sha256').write_text(digest+'\n')
 os.rename(tmp,target); print(digest)
-PY"#,
+PY
+{harden}"#,
         source = source,
         target = target,
         temporary = temporary,
@@ -1725,7 +1741,48 @@ fn add_migrations_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::bundle_integrity::{ResolvedFile, RESOLVED_MANIFEST_VERSION};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn remote_resolved_verification_reads_root_owned_payloads_with_sudo() {
+        let manifest = ResolvedReleaseManifest {
+            version: RESOLVED_MANIFEST_VERSION,
+            node_id: "node-a".into(),
+            revision: 1,
+            backend: "systemd".into(),
+            bundle_digest: "sha256:bundle".into(),
+            files: BTreeMap::from([(
+                "certs/job-admin-delegation/node.key".into(),
+                ResolvedFile {
+                    sha256: "key-digest".into(),
+                    mode: WORKLOAD_PRIVATE_KEY_MODE,
+                },
+            )]),
+        };
+
+        let command = remote_resolved_verification(
+            "/opt/wruntime/wr-node/releases/.1.tmp",
+            &manifest,
+            "sha256:resolved",
+        );
+        assert!(command.contains("$(sudo cat /opt/wruntime/wr-node/releases/.1.tmp/bundle.sha256)"));
+        assert!(command
+            .contains("$(sudo cat /opt/wruntime/wr-node/releases/.1.tmp/resolved-release.sha256)"));
+        assert!(command.contains(
+            "$(sudo sha256sum /opt/wruntime/wr-node/releases/.1.tmp/certs/job-admin-delegation/node.key | cut -d' ' -f1)"
+        ));
+        assert!(command.contains(
+            "$(sudo stat -c '%a' /opt/wruntime/wr-node/releases/.1.tmp/certs/job-admin-delegation/node.key)"
+        ));
+        assert!(command.contains("= '640'"));
+        assert!(!command.contains("$(sha256sum"));
+        assert!(!command.contains("$(stat"));
+        assert_eq!(
+            remote_release_hardening("/opt/wruntime/wr-node/releases/.1.tmp", "wruntime"),
+            "sudo chown -R root:wruntime /opt/wruntime/wr-node/releases/.1.tmp && sudo chmod 755 /opt/wruntime/wr-node/releases/.1.tmp"
+        );
+    }
 
     #[test]
     fn protected_script_generates_node_delegation_certificate_under_provisioned_host_name() {
@@ -1892,6 +1949,16 @@ migrations_path = {migrations:?}
             left_outputs.release_metadata,
             right_outputs.release_metadata
         );
+        let release_metadata: ReleaseMetadata =
+            serde_json::from_slice(&left_outputs.release_metadata).unwrap();
+        assert_eq!(
+            release_metadata.proxy_lifecycle_address,
+            "http://127.0.0.1:9002"
+        );
+        assert_eq!(
+            release_metadata.slots[0].lifecycle_address,
+            "http://127.0.0.1:9100"
+        );
         assert_eq!(
             left_outputs.archive, right_outputs.archive,
             "production bundle archive bytes changed"
@@ -2037,12 +2104,19 @@ allowed_hosts = ["api.example.com"]
                     config_names: &config_names,
                     engine_names: &["engine".to_string()],
                     engine_listen_ports: &[9100],
-                    proxy_port,
+                    proxy_control_port: control_port,
                     no_otel: false,
                 },
             )?;
             tar.into_inner()?.finish()?;
 
+            let release_metadata: ReleaseMetadata = serde_json::from_slice(
+                &bundle::read_bytes_from_tarball(path.to_str().unwrap(), "release-metadata.json")?,
+            )?;
+            assert_eq!(
+                release_metadata.proxy_lifecycle_address,
+                "http://127.0.0.1:9102"
+            );
             let proxy_toml = bundle::read_file_from_tarball(path.to_str().unwrap(), "proxy.toml")?;
             let proxy_value: toml::Value = toml::from_str(&proxy_toml)?;
             assert_eq!(proxy_value["database"]["url"].as_str(), Some("{db_url}"));

@@ -1115,16 +1115,31 @@ fn attestation_matches_policy(
         && attestation.capabilities == policy.capabilities
 }
 
+fn unfiltered_status_request() -> GetOperatorStatusRequest {
+    GetOperatorStatusRequest {
+        node_id: String::new(),
+        engine_slot: String::new(),
+    }
+}
+
+fn attestations_for_node(
+    attestations: Vec<NodeAgentAttestation>,
+    node_id: &str,
+) -> Vec<NodeAgentAttestation> {
+    attestations
+        .into_iter()
+        .filter(|attestation| attestation.node_id == node_id)
+        .collect()
+}
+
 async fn node_attestations(manager: &str, node_id: &str) -> Result<Vec<NodeAgentAttestation>> {
-    Ok(client::connect_operator(manager)
+    let attestations = client::connect_operator(manager)
         .await?
-        .get_status(GetOperatorStatusRequest {
-            node_id: node_id.to_string(),
-            engine_slot: String::new(),
-        })
+        .get_status(unfiltered_status_request())
         .await?
         .into_inner()
-        .agent_attestations)
+        .agent_attestations;
+    Ok(attestations_for_node(attestations, node_id))
 }
 
 fn require_prior_attestations(
@@ -1160,6 +1175,25 @@ fn remote_payload_matches_command(workdir: &str, material: &AgentInstallMaterial
             format!(
                 "sudo test -f {path} && test \"$(sudo sha256sum {path} | cut -d' ' -f1)\" = {} && test \"$(sudo stat -c '%u:%a' {path})\" = '0:{mode:o}'",
                 digest.trim_start_matches("sha256:")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
+fn staged_payload_checks_command(agent_root: &str, material: &AgentInstallMaterial) -> String {
+    material
+        .named_payloads()
+        .iter()
+        .map(|(name, bytes, _)| {
+            let path = if *name == "wr-node-agent.service" {
+                format!("{agent_root}/.wr-node-agent.service.new")
+            } else {
+                format!("{agent_root}/.{name}.new")
+            };
+            format!(
+                "test \"$(sudo sha256sum {path} | cut -d' ' -f1)\" = {} && sudo sync -f {path}",
+                wr_common::agent_policy::sha256_digest(bytes).trim_start_matches("sha256:")
             )
         })
         .collect::<Vec<_>>()
@@ -1355,22 +1389,7 @@ async fn install(args: AgentInstallArgs, manager: &str, updating: bool) -> Resul
             };
             helpers::scp_bytes(bytes, &args.remote, &staged, ssh_key.as_deref(), ssh_port)?;
         }
-        let staged_checks = material
-            .named_payloads()
-            .iter()
-            .map(|(name, bytes, _)| {
-                let path = if *name == "wr-node-agent.service" {
-                    format!("{agent_root}/.wr-node-agent.service.new")
-                } else {
-                    format!("{agent_root}/.{name}.new")
-                };
-                format!(
-                    "test \"$(sha256sum {path} | cut -d' ' -f1)\" = {} && sudo sync -f {path}",
-                    wr_common::agent_policy::sha256_digest(bytes).trim_start_matches("sha256:")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" && ");
+        let staged_checks = staged_payload_checks_command(&agent_root, &material);
         helpers::run_ssh(&ssh, &staged_checks)
             .context("remote node-agent payload checksum mismatch")?;
         // Only after every new byte is durably staged does the manager expectation
@@ -1416,10 +1435,7 @@ async fn install(args: AgentInstallArgs, manager: &str, updating: bool) -> Resul
     println!("[agent] authenticated activation {instance} is ready");
     let status = client::connect_operator(manager)
         .await?
-        .get_status(GetOperatorStatusRequest {
-            node_id: node.clone(),
-            engine_slot: String::new(),
-        })
+        .get_status(unfiltered_status_request())
         .await?
         .into_inner();
     for operation in status.active_operations.iter().filter(|operation| {
@@ -1570,6 +1586,24 @@ ca_cert_path = "/etc/wruntime/ca.crt"
         assert!(check.contains("sudo sha256sum /opt/wruntime/wr-agent/certs/agent.key"));
         assert!(check.contains("sudo stat -c '%u:%a' /opt/wruntime/wr-agent/certs/agent.crt"));
         assert!(!check.contains("&& sha256sum"));
+
+        let staged = staged_payload_checks_command("/opt/wruntime/wr-agent", &material);
+        for (name, bytes, _) in material.named_payloads() {
+            let path = if name == "wr-node-agent.service" {
+                "/opt/wruntime/wr-agent/.wr-node-agent.service.new".to_string()
+            } else {
+                format!("/opt/wruntime/wr-agent/.{name}.new")
+            };
+            let digest = wr_common::agent_policy::sha256_digest(bytes);
+            assert!(staged.contains(&format!(
+                "test \"$(sudo sha256sum {path} | cut -d' ' -f1)\" = {} && sudo sync -f {path}",
+                digest.trim_start_matches("sha256:")
+            )));
+        }
+        assert_eq!(staged.matches("$(sudo sha256sum").count(), 7);
+        assert_eq!(staged.matches("sudo sync -f").count(), 7);
+        assert!(!staged.contains("$(sha256sum"));
+
         let command = remote_activate_command("/opt/wruntime", &material);
         assert!(command.contains("install -o root -g root -m 600"));
         assert!(command.contains("systemctl restart wr-node-agent.service"));
@@ -1585,6 +1619,30 @@ ca_cert_path = "/etc/wruntime/ca.crt"
         assert!(error
             .to_string()
             .contains("failed to read authenticated pre-restart node-agent status"));
+    }
+
+    #[test]
+    fn unfiltered_status_attestations_are_scoped_to_the_requested_node() {
+        let request = unfiltered_status_request();
+        assert!(request.node_id.is_empty());
+        assert!(request.engine_slot.is_empty());
+
+        let attestations = vec![
+            NodeAgentAttestation {
+                node_id: "node-a".into(),
+                agent_instance_id: "activation-a".into(),
+                ..Default::default()
+            },
+            NodeAgentAttestation {
+                node_id: "node-b".into(),
+                agent_instance_id: "activation-b".into(),
+                ..Default::default()
+            },
+        ];
+        let selected = attestations_for_node(attestations, "node-a");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].agent_instance_id, "activation-a");
+        assert!(attestations_for_node(Vec::new(), "node-a").is_empty());
     }
 
     #[test]

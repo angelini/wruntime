@@ -42,12 +42,12 @@ guest_crates := "examples/ecommerce/client examples/ecommerce/inventory examples
 # Format workspace source code
 fmt:
     cargo fmt --all
-    taplo fmt
+    RUST_LOG=error taplo fmt
 
 # Check workspace formatting without writing changes
 fmt-check:
     cargo fmt --all -- --check
-    taplo fmt --check
+    RUST_LOG=error taplo fmt --check
 
 # Format example guest crates
 fmt-examples:

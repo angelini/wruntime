@@ -110,19 +110,18 @@ printf '#!/usr/bin/env bash\nexec %q -o BatchMode=yes -o StrictHostKeyChecking=y
 chmod 700 "$RUN_DIR/bin/ssh" "$RUN_DIR/bin/scp"
 export PATH="$RUN_DIR/bin:$PATH"
 CERT_DIR="$RUN_DIR/certs"
+MANAGER_CONFIG="$RUN_DIR/manager.toml"
 MANAGER_BUNDLE="$RUN_DIR/manager.tar.gz"
 BUNDLE_A="$RUN_DIR/node-a.tar.gz"
 BUNDLE_B="$RUN_DIR/node-b.tar.gz"
 MANAGER_ADDR="https://${MANAGER_HOST}:9000"
 MANAGER_REMOTE="${MANAGER_USER}@${MANAGER_HOST}"
 NODE_REMOTE="${NODE_USER}@${NODE_HOST}"
+OPERATOR_CERT_NAME="deployment-operator"
+AGENT_CERT_NAME="deployment-node-agent"
 SSH=(timeout -k 5 60 ssh -i "$WRT_DEPLOY_E2E_SSH_KEY" -o ConnectTimeout=5)
-CLI_ARGS=("$ROOT/target/debug/wr-cli" --manager "$MANAGER_ADDR" --ca-cert "$CERT_DIR/ca.crt" --client-cert "$CERT_DIR/${MANAGER_HOST}.crt" --client-key "$CERT_DIR/${MANAGER_HOST}.key")
+CLI_ARGS=("$ROOT/target/debug/wr-cli" --manager "$MANAGER_ADDR" --ca-cert "$CERT_DIR/ca.crt" --client-cert "$CERT_DIR/${OPERATOR_CERT_NAME}.crt" --client-key "$CERT_DIR/${OPERATOR_CERT_NAME}.key")
 CLI=(timeout -k 10 600 "${CLI_ARGS[@]}")
-NODE_STOP_SSH_ARGS=()
-if [ -n "${WRT_DEPLOY_E2E_SSH_PORT:-}" ]; then
-	NODE_STOP_SSH_ARGS=(--ssh-port "$WRT_DEPLOY_E2E_SSH_PORT")
-fi
 
 mkdir -p "$(dirname "$LOCK_FILE")"
 exec 9>"$LOCK_FILE" || {
@@ -279,6 +278,33 @@ print(node["desired_deployment"]["revision"])
 PY
 }
 digest_from_inspect() { awk '$1 == "digest:" {print $2; exit}' "$1"; }
+certificate_fingerprint() {
+	"${PYTHON[@]}" - "$1" <<'PY'
+import hashlib, pathlib, ssl, sys
+pem = pathlib.Path(sys.argv[1]).read_text()
+der = ssl.PEM_cert_to_DER_cert(pem)
+print(f"sha256:{hashlib.sha256(der).hexdigest()}")
+PY
+}
+write_manager_config() {
+	"${PYTHON[@]}" - "$1" "$2" "$3" "$4" "$5" <<'PY'
+import json, pathlib, sys
+source, output, operator_fingerprint, agent_fingerprint, node_id = sys.argv[1:]
+config = pathlib.Path(source).read_text().rstrip()
+config += f'''\n\n[[operator_principals]]
+fingerprint = {json.dumps(operator_fingerprint)}
+principal = "deployment-e2e-operator"
+role = "operator"
+
+[[operator_principals]]
+fingerprint = {json.dumps(agent_fingerprint)}
+principal = "deployment-e2e-node-agent"
+role = "node-agent"
+node_id = {json.dumps(node_id)}
+'''
+pathlib.Path(output).write_text(config)
+PY
+}
 invoke_echo() {
 	local expected="$1" log="$2" port tunnel_log invoke_error status
 	port="$(
@@ -425,13 +451,19 @@ chmod 700 "$CERT_DIR"
 run_logged cert-init target/debug/wr-cli cert init-ca --output "$CERT_DIR"
 run_logged cert-manager target/debug/wr-cli cert generate "$MANAGER_HOST" --ca-dir "$CERT_DIR" --ip "$MANAGER_HOST"
 run_logged cert-node target/debug/wr-cli cert generate "$NODE_HOST" --ca-dir "$CERT_DIR" --ip "$NODE_HOST"
+run_logged cert-operator target/debug/wr-cli cert generate "$OPERATOR_CERT_NAME" --ca-dir "$CERT_DIR"
+run_logged cert-node-agent target/debug/wr-cli cert generate "$AGENT_CERT_NAME" --ca-dir "$CERT_DIR"
+OPERATOR_FINGERPRINT="$(certificate_fingerprint "$CERT_DIR/${OPERATOR_CERT_NAME}.crt")"
+AGENT_FINGERPRINT="$(certificate_fingerprint "$CERT_DIR/${AGENT_CERT_NAME}.crt")"
+write_manager_config wr-tests/deployment/manager.toml "$MANAGER_CONFIG" \
+	"$OPERATOR_FINGERPRINT" "$AGENT_FINGERPRINT" "$NODE_ID"
 run_logged job-admin-operator-cert-init target/debug/wr-cli cert init-ca --output "$CERT_DIR/job-admin-operator"
 run_logged job-admin-operator-cert-manager target/debug/wr-cli cert generate "$MANAGER_HOST" --ca-dir "$CERT_DIR/job-admin-operator" --ip "$MANAGER_HOST"
 run_logged job-admin-operator-cert-client target/debug/wr-cli cert generate operator --ca-dir "$CERT_DIR/job-admin-operator"
 run_logged job-admin-delegation-cert-init target/debug/wr-cli cert init-ca --output "$CERT_DIR/job-admin-delegation"
 run_logged job-admin-delegation-cert-manager target/debug/wr-cli cert generate manager --ca-dir "$CERT_DIR/job-admin-delegation"
 run_logged job-admin-delegation-cert-node target/debug/wr-cli cert generate "$NODE_HOST" --ca-dir "$CERT_DIR/job-admin-delegation" --ip "$NODE_HOST"
-run_logged manager-bundle target/debug/wr-cli managers bundle --manager-config wr-tests/deployment/manager.toml --output "$MANAGER_BUNDLE"
+run_logged manager-bundle target/debug/wr-cli managers bundle --manager-config "$MANAGER_CONFIG" --output "$MANAGER_BUNDLE"
 run_logged manager-inspect target/debug/wr-cli managers inspect-bundle "$MANAGER_BUNDLE"
 cp wr-tests/deployment/engine-a.toml "$RUN_DIR/engine.toml"
 run_logged node-a-bundle target/debug/wr-cli node bundle --engine-config "$RUN_DIR/engine.toml" --proxy-config wr-tests/deployment/proxy.toml --output "$BUNDLE_A"
@@ -466,6 +498,11 @@ lifecycle() {
 		--advertise-address "$MANAGER_ADDR"
 	status_json "$pass/manager-status.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/manager-status.json" manager --address "$MANAGER_ADDR" >"$pass/manager-assert.json"
+	run_to_log "$backend node agent install" "$pass/node-agent-install.log" \
+		"${CLI[@]}" node agent install "$BUNDLE_A" "$NODE_REMOTE" --node-id "$NODE_ID" \
+		--format "$backend" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" \
+		--agent-cert "$CERT_DIR/${AGENT_CERT_NAME}.crt" \
+		--agent-key "$CERT_DIR/${AGENT_CERT_NAME}.key" --agent-ca-cert "$CERT_DIR/ca.crt"
 	job_admin queues --format json >"$pass/job-queues-empty.json"
 	if "${CLI[@]}" \
 		--job-admin-manager "https://${MANAGER_HOST}:9020" \
@@ -492,7 +529,8 @@ lifecycle() {
 
 	local failed_status retry_token="$backend-finalized-retry" staged_revision
 	if "${CLI[@]}" node upgrade --node-id "$NODE_ID" "$BUNDLE_B" "$NODE_REMOTE" --format "$backend" \
-		--request-token "$retry_token" --exit-after-finalization --db-url "$WRT_DEPLOY_E2E_DB_URL" \
+		--request-token "$retry_token" --allow-downtime --exit-after-finalization \
+		--db-url "$WRT_DEPLOY_E2E_DB_URL" \
 		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR" >"$pass/interrupted-after-finalization.log" 2>&1; then
 		failed_status=0
 	else
@@ -516,7 +554,7 @@ PY
 
 	run_to_log "$backend node B same-token retry" "$pass/upgrade-b.log" \
 		"${CLI[@]}" node upgrade --node-id "$NODE_ID" "$BUNDLE_B" "$NODE_REMOTE" --format "$backend" \
-		--request-token "$retry_token" --db-url "$WRT_DEPLOY_E2E_DB_URL" \
+		--request-token "$retry_token" --allow-downtime --db-url "$WRT_DEPLOY_E2E_DB_URL" \
 		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
 	status_json "$pass/status-b.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-b.json" desired --node-id "$NODE_ID" --digest "$DIGEST_B" --version 2.0.0 >"$pass/assert-b.json"
@@ -544,7 +582,7 @@ PY
 	invoke_echo "hello-$backend-scale" "$pass/invoke-scale.json"
 
 	run_to_log "$backend durable engine drain" "$pass/drain.log" \
-		"${CLI[@]}" engines drain --node-id "$NODE_ID" --slot engine \
+		"${CLI[@]}" engines drain --node-id "$NODE_ID" --slot engine --allow-downtime \
 		--request-token "$backend-drain" --wait-timeout 300 --json
 	"${CLI[@]}" cluster wait --node "$NODE_ID" --severity unhealthy \
 		--timeout-secs 30 >"$pass/expect-unhealthy.json"
@@ -557,7 +595,8 @@ PY
 		--node-id "$NODE_ID" >"$pass/assert-unhealthy.json"
 
 	run_to_log "$backend node rollback" "$pass/rollback.log" \
-		"${CLI[@]}" node rollback "$NODE_REMOTE" --node-id "$NODE_ID" --to "$revision_a" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY"
+		"${CLI[@]}" node rollback "$NODE_REMOTE" --node-id "$NODE_ID" --to "$revision_a" \
+		--allow-downtime --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY"
 	status_json "$pass/status-rollback.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-rollback.json" rollback --node-id "$NODE_ID" --source-revision "$revision_a" --after-revision "$revision_b" --digest "$DIGEST_A" --version 1.0.0 >"$pass/assert-rollback.json"
 	invoke_echo "hello-$backend-rollback" "$pass/invoke-rollback.json"

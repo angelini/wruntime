@@ -101,7 +101,7 @@ impl EngineRunner {
     }
 
     pub async fn run_job_migrations(&self) -> Result<()> {
-        if !self.startup_db.has_workers {
+        if !self.startup_db.needs_job_queue {
             return Ok(());
         }
         let pool = self

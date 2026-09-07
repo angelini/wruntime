@@ -620,6 +620,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+    // Recovery scans the whole queue, so tests that expire leases must not race each other.
+    static RECOVERY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn db_url() -> Option<String> {
         std::env::var("WRT_TEST_DB_URL").ok()
@@ -1005,6 +1007,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_stale_jobs() {
         let pool = require_pool!();
+        let _recovery_guard = RECOVERY_TEST_LOCK.lock().await;
         let p = unique_prefix();
         let id = insert_job(&pool, &p, "mod", "1.0.0", "/test", b"", 1, 3, "", "")
             .await
@@ -1030,6 +1033,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_engine_recovery_applies_each_lease_once() {
         let pool = require_pool!();
+        let _recovery_guard = RECOVERY_TEST_LOCK.lock().await;
         let namespace = unique_prefix();
         let id = insert_job(
             &pool, &namespace, "mod", "1.0.0", "/test", b"", 1, 3, "", "",
@@ -1062,6 +1066,7 @@ mod tests {
     #[tokio::test]
     async fn stale_claim_cannot_finalize_a_recovered_job() {
         let pool = require_pool!();
+        let _recovery_guard = RECOVERY_TEST_LOCK.lock().await;
         let namespace = unique_prefix();
         let id = insert_job(
             &pool, &namespace, "mod", "1.0.0", "/test", b"payload", 1, 3, "", "",

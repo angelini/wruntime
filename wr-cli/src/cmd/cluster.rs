@@ -516,10 +516,12 @@ struct DeploymentDto<'a> {
     revision: u64,
     attempt_token: &'a str,
     bundle_digest: &'a str,
+    resolved_release_digest: &'a str,
     state: &'static str,
     source_revision: u64,
     expected_engines: Vec<ExpectedEngineDto<'a>>,
     created_at: Option<TimestampDto>,
+    finalized_at: Option<TimestampDto>,
     activated_at: Option<TimestampDto>,
     completed_at: Option<TimestampDto>,
     failure_detail: &'a str,
@@ -538,6 +540,7 @@ impl<'a> From<&'a DeploymentRecord> for DeploymentDto<'a> {
             revision: value.revision,
             attempt_token: &value.attempt_token,
             bundle_digest: &value.bundle_digest,
+            resolved_release_digest: &value.resolved_release_digest,
             state: match DeploymentState::try_from(value.state)
                 .unwrap_or(DeploymentState::Unspecified)
             {
@@ -557,6 +560,7 @@ impl<'a> From<&'a DeploymentRecord> for DeploymentDto<'a> {
                 })
                 .collect(),
             created_at: value.created_at.as_ref().map(TimestampDto::from),
+            finalized_at: value.finalized_at.as_ref().map(TimestampDto::from),
             activated_at: value.activated_at.as_ref().map(TimestampDto::from),
             completed_at: value.completed_at.as_ref().map(TimestampDto::from),
             failure_detail: &value.failure_detail,
@@ -735,6 +739,7 @@ struct NodeDto<'a> {
     node_id: &'a str,
     severity: &'static str,
     desired_deployment: Option<DeploymentDto<'a>>,
+    target_deployment: Option<DeploymentDto<'a>>,
     deployment_history: Vec<DeploymentDto<'a>>,
     engines: Vec<EngineDto<'a>>,
     conditions: Vec<ConditionDto<'a>>,
@@ -746,6 +751,7 @@ impl<'a> From<&'a NodeStatus> for NodeDto<'a> {
             node_id: &value.node_id,
             severity: severity_name(value.severity),
             desired_deployment: value.desired_deployment.as_ref().map(DeploymentDto::from),
+            target_deployment: value.target_deployment.as_ref().map(DeploymentDto::from),
             deployment_history: value
                 .deployment_history
                 .iter()
@@ -826,6 +832,44 @@ mod tests {
         assert_eq!(json["schema_version"], 2);
         assert_eq!(json["severity"], "healthy");
         assert!(render_table(&value, false).contains("No problems reported"));
+    }
+
+    #[test]
+    fn json_includes_finalized_target_deployment() {
+        let target = DeploymentRecord {
+            node_id: "node-a".into(),
+            revision: 2,
+            attempt_token: "retry-token".into(),
+            bundle_digest: "sha256:bundle".into(),
+            resolved_release_digest: "sha256:resolved".into(),
+            finalized_at: Some(prost_types::Timestamp {
+                seconds: 123,
+                nanos: 456,
+            }),
+            ..Default::default()
+        };
+        let node = NodeStatus {
+            node_id: "node-a".into(),
+            target_deployment: Some(target.clone()),
+            deployment_history: vec![target],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(NodeDto::from(&node)).unwrap();
+        assert_eq!(json["target_deployment"]["revision"], 2);
+        assert_eq!(json["target_deployment"]["bundle_digest"], "sha256:bundle");
+        assert_eq!(
+            json["target_deployment"]["resolved_release_digest"],
+            "sha256:resolved"
+        );
+        assert_eq!(
+            json["target_deployment"]["finalized_at"],
+            serde_json::json!({"seconds": 123, "nanos": 456})
+        );
+        assert_eq!(
+            json["deployment_history"][0]["resolved_release_digest"],
+            "sha256:resolved"
+        );
     }
 
     #[test]

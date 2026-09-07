@@ -710,7 +710,9 @@ pub async fn submit(
                 &(deadline_seconds as f64),
                 &if deployment_action {
                     if source_revision > 0 {
-                        "inspect_backend"
+                        // Explicit source proof must produce a result. Reserve
+                        // inspect_backend for observation-only ambiguity recovery.
+                        "verify_target"
                     } else {
                         "select_release"
                     }
@@ -2436,11 +2438,13 @@ pub async fn claim(
             InstructionTargetKind::ReleaseCleanup,
         )
     } else if proxy_pending {
+        let proving_source = proxy_step == NodeOperationStepKind::VerifyTarget;
         let uses_source = phase == NodeOperationPhase::RestoringSource
             || matches!(
                 proxy_step,
                 NodeOperationStepKind::InspectBackend | NodeOperationStepKind::StopBackend
-            );
+            )
+            || proving_source;
         (
             String::new(),
             proxy_step,
@@ -3220,12 +3224,13 @@ pub async fn report_step(
         }
         let source_revision: i64 = operation.get("proxy_source_revision");
         let target_revision: i64 = operation.get("proxy_target_revision");
+        let proving_source = reported_step == NodeOperationStepKind::VerifyTarget;
         let uses_source = matches!(
             reported_step,
             NodeOperationStepKind::InspectBackend
                 | NodeOperationStepKind::StopBackend
                 | NodeOperationStepKind::RestoreSource
-        );
+        ) || proving_source;
         let (expected_revision, expected_digest, expected_resolved): (i64, String, String) =
             if uses_source {
                 (
@@ -3253,7 +3258,10 @@ pub async fn report_step(
             condition_code = "RELEASE_EVIDENCE_MISMATCH".into();
             detail = "proxy evidence does not match the immutable instruction triple".into();
         } else if condition_code.is_empty()
-            && reported_step == NodeOperationStepKind::VerifyProxy
+            && matches!(
+                reported_step,
+                NodeOperationStepKind::VerifyTarget | NodeOperationStepKind::VerifyProxy
+            )
             && request.process_instance_id.is_empty()
         {
             condition_code = "PROXY_EVIDENCE_MISSING".into();
@@ -3277,6 +3285,7 @@ pub async fn report_step(
                 NodeOperationStepKind::StopBackend => NodeOperationStepKind::SelectRelease,
                 NodeOperationStepKind::SelectRelease => NodeOperationStepKind::StartBackend,
                 NodeOperationStepKind::StartBackend => NodeOperationStepKind::VerifyProxy,
+                NodeOperationStepKind::VerifyTarget => NodeOperationStepKind::StopBackend,
                 NodeOperationStepKind::VerifyProxy | NodeOperationStepKind::RestoreSource => {
                     NodeOperationStepKind::Unspecified
                 }
