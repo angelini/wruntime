@@ -10,6 +10,7 @@ use opentelemetry_sdk::{
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
     Resource,
 };
+use tracing::debug;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -137,6 +138,24 @@ impl TelemetryGuard {
             status: TelemetryFinalizeStatus::Finalized,
             failures,
         }
+    }
+
+    /// Finalize telemetry without changing the service's exit result.
+    ///
+    /// OpenTelemetry SDK error text is explicitly logging-only, so the warning
+    /// records only a bounded signal/operation classification. A primary
+    /// service or shutdown error is returned unchanged; exporter availability
+    /// alone never turns an otherwise clean shutdown into exit 1.
+    pub fn finalize_preserving<T>(&mut self, result: Result<T>) -> Result<T> {
+        let outcome = self.finalize();
+        for failure in outcome.failures {
+            debug!(
+                signal = ?failure.signal,
+                operation = ?failure.operation,
+                "telemetry finalization did not complete"
+            );
+        }
+        result
     }
 }
 
@@ -342,5 +361,27 @@ mod tests {
         assert_eq!(first.failures[0].error, "collector unavailable");
         assert!(guard.finalize().failures.is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn finalization_failure_does_not_replace_a_clean_service_result() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut guard = test_guard(calls, true);
+        assert_eq!(
+            guard
+                .finalize_preserving(Ok::<_, anyhow::Error>(42))
+                .unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn finalization_failure_preserves_the_primary_service_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut guard = test_guard(calls, true);
+        let error = guard
+            .finalize_preserving::<()>(Err(anyhow::anyhow!("primary shutdown failure")))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "primary shutdown failure");
     }
 }

@@ -203,7 +203,7 @@ pub(crate) async fn wait_for_terminal(
             );
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
-        latest = client::connect_operator(manager)
+        latest = client::connect_operator(manager, wr_common::manager_client::RetryClass::ReadOnly)
             .await?
             .get_operation(GetOperationRequest {
                 operation_id: operation_id.clone(),
@@ -216,7 +216,11 @@ pub(crate) async fn wait_for_terminal(
 }
 
 pub async fn run(args: OperationsArgs, manager: &str) -> Result<()> {
-    let mut operator = client::connect_operator(manager).await?;
+    let mut operator = client::connect_operator(
+        manager,
+        wr_common::manager_client::RetryClass::NoReplayMutation,
+    )
+    .await?;
     match args.command {
         OperationsCommand::Get { operation_id, json } => {
             let response = operator

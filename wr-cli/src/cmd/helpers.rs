@@ -2,7 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -72,6 +73,8 @@ pub fn extract_port(addr: &str) -> Result<DeployPort> {
         .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("address '{addr}' is missing a port"))?;
     let parsed = port
+        .strip_suffix('/')
+        .unwrap_or(port)
         .parse::<u16>()
         .with_context(|| format!("invalid port in address '{addr}'"))?;
     DeployPort::new(parsed).with_context(|| format!("invalid port in address '{addr}'"))
@@ -546,24 +549,6 @@ pub async fn wait_for_lifecycle_state(
     .await
 }
 
-pub async fn wait_for_lifecycle_ready(
-    endpoint: &str,
-    tls: Option<&TlsConfig>,
-    expected_kind: ServiceKind,
-    expected_instance: &str,
-    timeout: Duration,
-) -> Result<LifecycleObservation> {
-    wait_for_lifecycle_state(
-        endpoint,
-        tls,
-        ProcessLifecycleState::Ready,
-        Some(expected_kind),
-        Some(expected_instance),
-        timeout,
-    )
-    .await
-}
-
 /// One proxy endpoint and the activation observed from READY on that endpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProxyRoutingBarrierTarget {
@@ -759,6 +744,303 @@ pub fn resolve_template(
     Ok(result)
 }
 
+/// Quote one opaque argument for a POSIX remote shell.
+pub fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteInstallClass {
+    Sensitive,
+    Public,
+}
+
+fn remote_mktemp(ssh_base: &[String], class: RemoteInstallClass) -> Result<String> {
+    let mode = if class == RemoteInstallClass::Sensitive {
+        "077"
+    } else {
+        "022"
+    };
+    let path = run_ssh_output(
+        ssh_base,
+        &format!("umask {mode}; mktemp /tmp/wruntime-transfer.XXXXXXXXXX"),
+    )?;
+    if !path.starts_with("/tmp/wruntime-transfer.") || path.contains('\n') {
+        bail!("remote host returned an invalid staging path");
+    }
+    Ok(path)
+}
+
+fn local_private_temp(bytes: &[u8]) -> Result<std::path::PathBuf> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+    for _ in 0..8 {
+        let path = std::env::temp_dir().join(format!("wruntime-transfer-{}", uuid::Uuid::new_v4()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("failed to create private local staging file"),
+        }
+    }
+    bail!("failed to allocate unpredictable local staging file")
+}
+
+/// Atomically install a digest-qualified local file using unpredictable,
+/// owner-only staging. An existing destination is accepted only on exact digest
+/// replay. Debug output intentionally omits sensitive local and remote paths.
+#[allow(clippy::too_many_arguments)]
+pub fn install_remote_file(
+    local_path: &Path,
+    remote: &str,
+    remote_path: &str,
+    ssh_key: Option<&str>,
+    ssh_port: Option<u16>,
+    mode: u32,
+    class: RemoteInstallClass,
+    expected_digest: Option<&str>,
+) -> Result<()> {
+    let ssh_base = build_ssh_args(remote, ssh_key, ssh_port);
+    let remote_tmp = remote_mktemp(&ssh_base, class)?;
+    let result = scp_file(
+        &local_path.to_string_lossy(),
+        remote,
+        &remote_tmp,
+        ssh_key,
+        ssh_port,
+    );
+    if let Err(error) = result {
+        let _ = run_ssh(&ssh_base, &format!("rm -f -- {}", shell_quote(&remote_tmp)));
+        return Err(error);
+    }
+    let parent = Path::new(remote_path)
+        .parent()
+        .context("remote install path has no parent")?
+        .to_string_lossy();
+    let digest_check = expected_digest.map_or_else(String::new, |digest| {
+        format!(
+            "test \"sha256:$(sha256sum -- {} | cut -d' ' -f1)\" = {} && ",
+            shell_quote(&remote_tmp),
+            shell_quote(digest)
+        )
+    });
+    let command = format!(
+        "set -eu; {digest_check}sudo install -d -m 0700 {parent}; if sudo test -e {dest}; then {existing} sudo rm -f -- {tmp}; else sudo install -m {mode:04o} {tmp} {dest_tmp}; sudo mv {dest_tmp} {dest}; sudo chmod {mode:04o} {dest}; sudo sync -f {parent}; rm -f -- {tmp}; fi",
+        parent = shell_quote(&parent),
+        dest = shell_quote(remote_path),
+        tmp = shell_quote(&remote_tmp),
+        dest_tmp = shell_quote(&format!("{remote_path}.install-{}", uuid::Uuid::new_v4())),
+        existing = expected_digest.map_or_else(
+            || {
+                let replacement = format!("{remote_path}.replace-{}", uuid::Uuid::new_v4());
+                format!(
+                    "sudo install -m {mode:04o} {tmp} {replacement}; sudo mv {replacement} {dest}; sudo chmod {mode:04o} {dest}; sudo sync -f {parent}; rm -f -- {tmp};",
+                    tmp = shell_quote(&remote_tmp),
+                    replacement = shell_quote(&replacement),
+                    dest = shell_quote(remote_path),
+                    parent = shell_quote(&parent),
+                )
+            },
+            |digest| format!("test \"sha256:$(sudo sha256sum -- {} | cut -d' ' -f1)\" = {} || exit 73;", shell_quote(remote_path), shell_quote(digest)),
+        ),
+    );
+    run_ssh(&ssh_base, &command).context("remote atomic install failed")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn install_remote_bytes(
+    bytes: &[u8],
+    remote: &str,
+    remote_path: &str,
+    ssh_key: Option<&str>,
+    ssh_port: Option<u16>,
+    mode: u32,
+    class: RemoteInstallClass,
+    expected_digest: Option<&str>,
+) -> Result<()> {
+    let local = local_private_temp(bytes)?;
+    let result = install_remote_file(
+        &local,
+        remote,
+        remote_path,
+        ssh_key,
+        ssh_port,
+        mode,
+        class,
+        expected_digest,
+    );
+    let _ = std::fs::remove_file(local);
+    result
+}
+
+pub fn local_tree_digest(root: &Path) -> Result<String> {
+    fn visit(root: &Path, current: &Path, entries: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
+        let mut children = std::fs::read_dir(current)?.collect::<std::io::Result<Vec<_>>>()?;
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            let path = child.path();
+            let metadata = child.metadata()?;
+            if metadata.is_dir() {
+                visit(root, &path, entries)?;
+            } else if metadata.is_file() {
+                entries.push((
+                    path.strip_prefix(root)?
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    std::fs::read(path)?,
+                ));
+            } else {
+                bail!(
+                    "protected set contains a non-file entry: {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries)?;
+    let mut hash = sha2::Sha256::new();
+    use sha2::Digest;
+    for (path, bytes) in entries {
+        let path = path.as_bytes();
+        hash.update((path.len() as u64).to_be_bytes());
+        hash.update(path);
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    Ok(format!("sha256:{:x}", hash.finalize()))
+}
+
+/// Install an immutable credential directory. Symlinks and special files are
+/// rejected locally; the remote canonical tree digest must match before rename.
+pub fn install_remote_directory(
+    local_dir: &Path,
+    remote: &str,
+    remote_path: &str,
+    ssh_key: Option<&str>,
+    ssh_port: Option<u16>,
+    expected_tree_digest: &str,
+) -> Result<()> {
+    fn append_dir(
+        tar: &mut tar::Builder<std::fs::File>,
+        root: &Path,
+        current: &Path,
+    ) -> Result<()> {
+        let mut entries = std::fs::read_dir(current)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = entry.metadata()?;
+            let relative = path.strip_prefix(root)?;
+            if metadata.is_dir() {
+                tar.append_dir(relative, &path)?;
+                append_dir(tar, root, &path)?;
+            } else if metadata.is_file() {
+                tar.append_path_with_name(&path, relative)?;
+            } else {
+                bail!(
+                    "credential set contains a non-file entry: {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+    let archive_path = local_private_temp(&[])?;
+    let archive_file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&archive_path)?;
+    let mut archive = tar::Builder::new(archive_file);
+    append_dir(&mut archive, local_dir, local_dir)?;
+    archive.into_inner()?.sync_all()?;
+    let ssh_base = build_ssh_args(remote, ssh_key, ssh_port);
+    let remote_archive = remote_mktemp(&ssh_base, RemoteInstallClass::Sensitive)?;
+    scp_file(
+        &archive_path.to_string_lossy(),
+        remote,
+        &remote_archive,
+        ssh_key,
+        ssh_port,
+    )?;
+    let _ = std::fs::remove_file(archive_path);
+    let staging = format!("{remote_path}.install-{}", uuid::Uuid::new_v4());
+    let script = r#"import hashlib, os, pathlib, struct, sys
+root=pathlib.Path(sys.argv[1]); h=hashlib.sha256()
+for p in sorted((p for p in root.rglob('*') if p.is_file()), key=lambda p:p.relative_to(root).as_posix()):
+ r=p.relative_to(root).as_posix().encode(); b=p.read_bytes(); h.update(struct.pack('>Q',len(r))); h.update(r); h.update(struct.pack('>Q',len(b))); h.update(b)
+print('sha256:'+h.hexdigest())"#;
+    let parent = Path::new(remote_path)
+        .parent()
+        .context("credential destination has no parent")?
+        .to_string_lossy();
+    let command = format!(
+        "set -eu; sudo install -d -m 0700 {parent}; if sudo test -e {dest}; then actual=$(sudo python3 -c {script} {dest}); test \"$actual\" = {digest}; rm -f -- {archive}; else sudo mkdir -m 0700 {staging}; sudo tar xpf {archive} -C {staging}; actual=$(sudo python3 -c {script} {staging}); test \"$actual\" = {digest}; sudo find {staging} -type d -exec chmod 0500 {{}} +; sudo find {staging} -type f -exec chmod 0400 {{}} +; sudo mv {staging} {dest}; sudo sync -f {parent}; rm -f -- {archive}; fi",
+        parent=shell_quote(&parent), dest=shell_quote(remote_path), staging=shell_quote(&staging), archive=shell_quote(&remote_archive), script=shell_quote(script), digest=shell_quote(expected_tree_digest)
+    );
+    run_ssh(&ssh_base, &command).context("remote immutable credential install failed")
+}
+
+/// Commit one owner-only fenced host-action record. Lower epochs, regressing
+/// sequences, conflicting replay, and new effects after lease expiry are
+/// rejected by the host rather than trusted to the remote caller.
+pub fn install_remote_fenced_json(
+    bytes: &[u8],
+    remote: &str,
+    remote_path: &str,
+    ssh_key: Option<&str>,
+    ssh_port: Option<u16>,
+) -> Result<()> {
+    let local = local_private_temp(bytes)?;
+    let ssh_base = build_ssh_args(remote, ssh_key, ssh_port);
+    let remote_tmp = remote_mktemp(&ssh_base, RemoteInstallClass::Sensitive)?;
+    let transfer = scp_file(
+        &local.to_string_lossy(),
+        remote,
+        &remote_tmp,
+        ssh_key,
+        ssh_port,
+    );
+    let _ = std::fs::remove_file(local);
+    transfer?;
+    let parent = Path::new(remote_path)
+        .parent()
+        .context("evidence path has no parent")?
+        .to_string_lossy();
+    let script = r#"import json, os, pathlib, sys, time
+incoming=pathlib.Path(sys.argv[1]); current=pathlib.Path(sys.argv[2]); data=json.loads(incoming.read_text())
+if current.exists():
+ old=json.loads(current.read_text())
+ if data['lease_epoch'] < old['lease_epoch'] or (data['lease_epoch']==old['lease_epoch'] and data['action_sequence'] < old['action_sequence']): sys.exit('stale host action fence')
+ same=data['lease_epoch']==old['lease_epoch'] and data['action_sequence']==old['action_sequence']
+ immutable=['rollout_id','manager_id','manifest_digest','executable_digest','backend_spec_digest','config_digest','credential_digest','old_selector_digest','new_selector_digest','effect']
+ if same and any(data.get(k)!=old.get(k) for k in immutable): sys.exit('conflicting host action replay')
+ if same and old.get('outcome') in ('completed','failed') and data.get('outcome')!=old.get('outcome'): sys.exit('terminal host action replay conflict')
+ if not same and data.get('lease_expires_unix',0) <= int(time.time()): sys.exit('host action lease expired')
+tmp=current.with_name(current.name+'.tmp-'+str(os.getpid())); tmp.write_bytes(incoming.read_bytes()); os.chmod(tmp,0o600)
+with open(tmp,'rb') as f: os.fsync(f.fileno())
+os.replace(tmp,current)
+fd=os.open(current.parent,os.O_RDONLY); os.fsync(fd); os.close(fd)
+incoming.unlink()"#;
+    let command = format!(
+        "set -eu; sudo install -d -m 0700 {parent}; sudo python3 -c {script} {incoming} {current}",
+        parent = shell_quote(&parent),
+        script = shell_quote(script),
+        incoming = shell_quote(&remote_tmp),
+        current = shell_quote(remote_path)
+    );
+    run_ssh(&ssh_base, &command).context("remote fenced evidence install failed")
+}
+
 /// SCP a local file to a remote path.
 /// When `ssh_port` is `None`, no `-P` flag is emitted so the SSH config default applies.
 pub fn scp_file(
@@ -776,10 +1058,24 @@ pub fn scp_file(
         args.extend(["-P".to_string(), port.to_string()]);
     }
     args.extend([local_path.to_string(), format!("{remote}:{remote_path}")]);
-    run_command(&args)
+    debug!("exec: scp [redacted local and remote paths]");
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to run scp")?;
+    if !output.status.success() {
+        bail!(
+            "scp failed with exit code {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
-/// Write content to a local temp file, SCP it to the remote, then sudo mv into place.
+/// Atomically install generated bytes through unpredictable owner-only staging.
 pub fn scp_bytes(
     content: &[u8],
     remote: &str,
@@ -787,34 +1083,15 @@ pub fn scp_bytes(
     ssh_key: Option<&str>,
     ssh_port: Option<u16>,
 ) -> Result<()> {
-    let transfer_id = uuid::Uuid::new_v4();
-    let tmp = std::env::temp_dir().join(format!("wr-deploy-{transfer_id}"));
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&tmp)
-        .context("failed to create owner-only transfer file")?;
-    use std::io::Write as _;
-    file.write_all(content)
-        .context("failed to write owner-only transfer file")?;
-    file.sync_all()
-        .context("failed to sync owner-only transfer file")?;
-    drop(file);
-    let remote_tmp = format!("/tmp/wr-deploy-{transfer_id}");
-    let result = scp_file(
-        &tmp.to_string_lossy(),
+    install_remote_bytes(
+        content,
         remote,
-        &remote_tmp,
+        remote_path,
         ssh_key,
         ssh_port,
-    );
-    let _ = std::fs::remove_file(&tmp);
-    result?;
-    let ssh_base = build_ssh_args(remote, ssh_key, ssh_port);
-    run_ssh(
-        &ssh_base,
-        &format!("chmod 600 {remote_tmp} && sudo mv {remote_tmp} {remote_path}"),
+        0o600,
+        RemoteInstallClass::Sensitive,
+        None,
     )
 }
 

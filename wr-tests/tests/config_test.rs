@@ -31,6 +31,19 @@ fn write_temp_file(name: &str, ext: &str, content: &[u8]) -> PathBuf {
     path
 }
 
+fn write_manager_client_certificate(name: &str) -> PathBuf {
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, SanType};
+
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.subject_alt_names = vec![SanType::URI(
+        "urn:wruntime:default:manager:manager-a".try_into().unwrap(),
+    )];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let certificate = params.self_signed(&key).unwrap();
+    write_temp_file(name, "crt", certificate.pem().as_bytes())
+}
+
 fn workspace_path(path: impl AsRef<Path>) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -51,28 +64,27 @@ fn load_config_from_toml<T>(
 
 #[test]
 fn test_manager_config_valid() {
-    let toml = r#"
+    let policy = workspace_path("examples/config/policy/authorization.toml");
+    let manager_client_certificate = write_manager_client_certificate("manager-valid-client");
+    let toml = format!(
+        r#"
+        manager_id                    = "manager-a"
         listen_address                = "0.0.0.0:9000"
         engine_heartbeat_timeout_secs = 30
         local_proxy_address           = "http://127.0.0.1:9001"
 
         [tls]
-        cert_path    = "certs/mgr.crt"
-        key_path     = "certs/mgr.key"
-        ca_cert_path = "certs/ca.crt"
+        cert_path = "certs/mgr.crt"
+        key_path = "certs/mgr.key"
+        client_ca_cert_path = "certs/client-root.crt"
 
-        [job_admin]
-        listen_address = "0.0.0.0:9020"
+        [client_tls]
+        cert_path = "{}"
+        key_path = "certs/manager-client.key"
+        server_ca_cert_path = "certs/server-root.crt"
 
-        [job_admin.tls]
-        cert_path    = "certs/operator-server.crt"
-        key_path     = "certs/operator-server.key"
-        ca_cert_path = "certs/operator-ca.crt"
-
-        [job_admin_delegation_tls]
-        cert_path    = "certs/delegate.crt"
-        key_path     = "certs/delegate.key"
-        ca_cert_path = "certs/delegate-ca.crt"
+        [authorization]
+        policy_file = "{}"
 
         [database]
         url = "postgres://localhost/test"
@@ -81,8 +93,11 @@ fn test_manager_config_valid() {
         manager_heartbeat_interval_secs       = 2
         manager_liveness_threshold_secs       = 8
         manager_stale_row_reap_threshold_secs = 120
-    "#;
-    let cfg = load_config_from_toml("manager-valid", toml, ManagerConfig::load);
+    "#,
+        manager_client_certificate.display(),
+        policy.display()
+    );
+    let cfg = load_config_from_toml("manager-valid", &toml, ManagerConfig::load);
     assert_eq!(cfg.listen_address, "0.0.0.0:9000");
     assert_eq!(cfg.engine_heartbeat_timeout_secs, 30);
     assert_eq!(cfg.module_heartbeat_timeout_secs.get(), 30);
@@ -92,6 +107,7 @@ fn test_manager_config_valid() {
     assert_eq!(cfg.cluster.manager_heartbeat_interval_secs, 2);
     assert_eq!(cfg.cluster.manager_liveness_threshold_secs, 8);
     assert_eq!(cfg.cluster.manager_stale_row_reap_threshold_secs, 120);
+    fs::remove_file(manager_client_certificate).unwrap();
 }
 
 #[test]
@@ -110,41 +126,59 @@ fn test_manager_config_rejects_removed_cluster_fields() {
 }
 
 #[test]
+fn test_manager_rejects_obsolete_dedicated_job_listener() {
+    let obsolete = include_str!("../../examples/config/manager.toml").replacen(
+        "[authorization]",
+        "[job_admin]\nlisten_address = \"127.0.0.1:9020\"\n\n[authorization]",
+        1,
+    );
+    let error = match toml::from_str::<RawManagerConfig>(&obsolete) {
+        Ok(_) => panic!("obsolete job_admin listener config must be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("unknown field `job_admin`"));
+}
+
+#[test]
 fn test_manager_config_default_heartbeat() {
     // engine_heartbeat_timeout_secs should default to 10 when omitted.
-    let toml = r#"
+    let policy = workspace_path("examples/config/policy/authorization.toml");
+    let manager_client_certificate =
+        write_manager_client_certificate("manager-default-heartbeat-client");
+    let toml = format!(
+        r#"
+        manager_id = "manager-a"
         listen_address = "0.0.0.0:9000"
         local_proxy_address = "http://127.0.0.1:9001"
 
         [tls]
-        cert_path    = "certs/mgr.crt"
-        key_path     = "certs/mgr.key"
-        ca_cert_path = "certs/ca.crt"
+        cert_path = "certs/mgr.crt"
+        key_path = "certs/mgr.key"
+        client_ca_cert_path = "certs/client-root.crt"
 
-        [job_admin]
-        listen_address = "0.0.0.0:9020"
+        [client_tls]
+        cert_path = "{}"
+        key_path = "certs/manager-client.key"
+        server_ca_cert_path = "certs/server-root.crt"
 
-        [job_admin.tls]
-        cert_path    = "certs/operator-server.crt"
-        key_path     = "certs/operator-server.key"
-        ca_cert_path = "certs/operator-ca.crt"
-
-        [job_admin_delegation_tls]
-        cert_path    = "certs/delegate.crt"
-        key_path     = "certs/delegate.key"
-        ca_cert_path = "certs/delegate-ca.crt"
+        [authorization]
+        policy_file = "{}"
 
         [database]
         url = "postgres://localhost/test"
 
         [cluster]
-    "#;
-    let cfg = load_config_from_toml("manager-default-heartbeat", toml, ManagerConfig::load);
+    "#,
+        manager_client_certificate.display(),
+        policy.display()
+    );
+    let cfg = load_config_from_toml("manager-default-heartbeat", &toml, ManagerConfig::load);
     assert_eq!(cfg.engine_heartbeat_timeout_secs, 10);
     assert_eq!(cfg.module_heartbeat_timeout_secs.get(), 10);
     assert_eq!(cfg.cluster.manager_heartbeat_interval_secs, 1);
     assert_eq!(cfg.cluster.manager_liveness_threshold_secs, 5);
     assert_eq!(cfg.cluster.manager_stale_row_reap_threshold_secs, 300);
+    fs::remove_file(manager_client_certificate).unwrap();
 }
 
 #[test]
@@ -158,10 +192,15 @@ fn test_proxy_config_valid() {
         control_address = "http://127.0.0.1:9002"
         peer_address    = "https://127.0.0.1:9443"
 
-        [node.tls]
-        cert_path    = "certs/node.crt"
-        key_path     = "certs/node.key"
-        ca_cert_path = "certs/ca.crt"
+        [endpoint_tls]
+        cert_path = "certs/endpoint.crt"
+        key_path = "certs/endpoint.key"
+        client_ca_cert_path = "certs/client-root.crt"
+
+        [client_tls]
+        cert_path = "certs/client.crt"
+        key_path = "certs/client.key"
+        server_ca_cert_path = "certs/server-root.crt"
 
         [database]
         url = "postgres://localhost/test"
@@ -189,10 +228,15 @@ fn test_proxy_config_defaults() {
         control_address = "http://127.0.0.1:9002"
         peer_address    = "https://127.0.0.1:9443"
 
-        [node.tls]
-        cert_path    = "certs/node.crt"
-        key_path     = "certs/node.key"
-        ca_cert_path = "certs/ca.crt"
+        [endpoint_tls]
+        cert_path = "certs/endpoint.crt"
+        key_path = "certs/endpoint.key"
+        client_ca_cert_path = "certs/client-root.crt"
+
+        [client_tls]
+        cert_path = "certs/client.crt"
+        key_path = "certs/client.key"
+        server_ca_cert_path = "certs/server-root.crt"
 
         [database]
         url = "postgres://localhost/test"
@@ -203,6 +247,32 @@ fn test_proxy_config_defaults() {
     assert_eq!(cfg.node.peer_port().unwrap(), 9443);
     assert_eq!(cfg.circuit_breaker.failure_threshold, 5);
     assert_eq!(cfg.circuit_breaker.open_duration_secs, 30);
+}
+
+#[test]
+fn test_proxy_requires_both_directional_tls_blocks() {
+    let valid = proxy_toml("127.0.0.1:9001", "127.0.0.1:9002");
+    let without_endpoint = valid.replacen(
+        "        [endpoint_tls]\n        cert_path = \"certs/endpoint.crt\"\n        key_path = \"certs/endpoint.key\"\n        client_ca_cert_path = \"certs/client-root.crt\"\n\n",
+        "",
+        1,
+    );
+    assert!(toml::from_str::<ProxyConfig>(&without_endpoint).is_err());
+    let without_client = valid.replacen(
+        "        [client_tls]\n        cert_path = \"certs/client.crt\"\n        key_path = \"certs/client.key\"\n        server_ca_cert_path = \"certs/server-root.crt\"\n\n",
+        "",
+        1,
+    );
+    assert!(toml::from_str::<ProxyConfig>(&without_client).is_err());
+}
+
+#[test]
+fn test_engine_rejects_proxy_directional_tls_material() {
+    let engine = format!(
+        "{}\n[endpoint_tls]\ncert_path=\"endpoint.crt\"\nkey_path=\"endpoint.key\"\nclient_ca_cert_path=\"client-root.crt\"\n",
+        engine_toml("127.0.0.1:9100", "")
+    );
+    assert!(toml::from_str::<EngineConfig>(&engine).is_err());
 }
 
 #[test]
@@ -260,10 +330,15 @@ fn test_proxy_config_rejects_zero_ttl() {
         control_address = "http://127.0.0.1:9002"
         peer_address    = "https://127.0.0.1:9443"
 
-        [node.tls]
-        cert_path    = "certs/node.crt"
-        key_path     = "certs/node.key"
-        ca_cert_path = "certs/ca.crt"
+        [endpoint_tls]
+        cert_path = "certs/endpoint.crt"
+        key_path = "certs/endpoint.key"
+        client_ca_cert_path = "certs/client-root.crt"
+
+        [client_tls]
+        cert_path = "certs/client.crt"
+        key_path = "certs/client.key"
+        server_ca_cert_path = "certs/server-root.crt"
 
         [database]
         url = "postgres://localhost/test"
@@ -395,18 +470,10 @@ fn test_example_config_files_parse() {
     // so check parse and structural invariants without EngineConfig::validate().
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
-    struct TlsSection {
-        cert_path: String,
-        key_path: String,
-        ca_cert_path: String,
-    }
-    #[derive(serde::Deserialize)]
-    #[allow(dead_code)]
     struct NodeSection {
         proxy_address: String,
         control_address: String,
         peer_address: String,
-        tls: TlsSection,
     }
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
@@ -859,10 +926,15 @@ fn proxy_toml(listen: &str, control: &str) -> String {
         control_address = "http://127.0.0.1:9002"
         peer_address    = "https://127.0.0.1:9443"
 
-        [node.tls]
-        cert_path    = "certs/node.crt"
-        key_path     = "certs/node.key"
-        ca_cert_path = "certs/ca.crt"
+        [endpoint_tls]
+        cert_path = "certs/endpoint.crt"
+        key_path = "certs/endpoint.key"
+        client_ca_cert_path = "certs/client-root.crt"
+
+        [client_tls]
+        cert_path = "certs/client.crt"
+        key_path = "certs/client.key"
+        server_ca_cert_path = "certs/server-root.crt"
 
         [database]
         url = "postgres://localhost/test"
@@ -880,11 +952,6 @@ fn engine_toml(listen: &str, allow_line: &str) -> String {
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
         peer_address    = "https://127.0.0.1:9443"
-
-        [node.tls]
-        cert_path    = "certs/node.crt"
-        key_path     = "certs/node.key"
-        ca_cert_path = "certs/ca.crt"
     "#
     )
 }
@@ -898,11 +965,6 @@ fn engine_toml_with_modules(module_blocks: &str) -> String {
           proxy_address   = "http://127.0.0.1:9001"
           control_address = "http://127.0.0.1:9002"
           peer_address    = "https://127.0.0.1:9443"
-
-          [node.tls]
-          cert_path    = "certs/node.crt"
-          key_path     = "certs/node.key"
-          ca_cert_path = "certs/ca.crt"
 
           {module_blocks}
       "#

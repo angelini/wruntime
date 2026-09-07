@@ -120,7 +120,7 @@ NODE_REMOTE="${NODE_USER}@${NODE_HOST}"
 OPERATOR_CERT_NAME="deployment-operator"
 AGENT_CERT_NAME="deployment-node-agent"
 SSH=(timeout -k 5 60 ssh -i "$WRT_DEPLOY_E2E_SSH_KEY" -o ConnectTimeout=5)
-CLI_ARGS=("$ROOT/target/debug/wr-cli" --manager "$MANAGER_ADDR" --ca-cert "$CERT_DIR/ca.crt" --client-cert "$CERT_DIR/${OPERATOR_CERT_NAME}.crt" --client-key "$CERT_DIR/${OPERATOR_CERT_NAME}.key")
+CLI_ARGS=("$ROOT/target/debug/wr-cli" --manager "$MANAGER_ADDR" --ca-cert "$CERT_DIR/server-root/ca.crt" --client-cert "$CERT_DIR/human-client/leaf.pem" --client-key "$CERT_DIR/human-client/key.pem")
 CLI=(timeout -k 10 600 "${CLI_ARGS[@]}")
 
 mkdir -p "$(dirname "$LOCK_FILE")"
@@ -242,12 +242,7 @@ status_json() {
 	"${CLI[@]}" cluster status --node "$NODE_ID" --output json >"$output"
 }
 job_admin() {
-	"${CLI[@]}" \
-		--job-admin-manager "https://${MANAGER_HOST}:9020" \
-		--job-admin-ca-cert "$CERT_DIR/job-admin-operator/ca.crt" \
-		--job-admin-client-cert "$CERT_DIR/job-admin-operator/operator.crt" \
-		--job-admin-client-key "$CERT_DIR/job-admin-operator/operator.key" \
-		jobs "$@"
+	"${CLI[@]}" jobs "$@"
 }
 assert_job_summary() {
 	"${PYTHON[@]}" - "$1" <<'PY'
@@ -448,22 +443,16 @@ run_logged build-echo cargo run --bin wr-cli -- dev build --config examples/mult
 run_logged build-workspace cargo build
 mkdir -p "$CERT_DIR"
 chmod 700 "$CERT_DIR"
-run_logged cert-init target/debug/wr-cli cert init-ca --output "$CERT_DIR"
-run_logged cert-manager target/debug/wr-cli cert generate "$MANAGER_HOST" --ca-dir "$CERT_DIR" --ip "$MANAGER_HOST"
-run_logged cert-node target/debug/wr-cli cert generate "$NODE_HOST" --ca-dir "$CERT_DIR" --ip "$NODE_HOST"
-run_logged cert-operator target/debug/wr-cli cert generate "$OPERATOR_CERT_NAME" --ca-dir "$CERT_DIR"
-run_logged cert-node-agent target/debug/wr-cli cert generate "$AGENT_CERT_NAME" --ca-dir "$CERT_DIR"
-OPERATOR_FINGERPRINT="$(certificate_fingerprint "$CERT_DIR/${OPERATOR_CERT_NAME}.crt")"
-AGENT_FINGERPRINT="$(certificate_fingerprint "$CERT_DIR/${AGENT_CERT_NAME}.crt")"
-write_manager_config wr-tests/deployment/manager.toml "$MANAGER_CONFIG" \
-	"$OPERATOR_FINGERPRINT" "$AGENT_FINGERPRINT" "$NODE_ID"
-run_logged job-admin-operator-cert-init target/debug/wr-cli cert init-ca --output "$CERT_DIR/job-admin-operator"
-run_logged job-admin-operator-cert-manager target/debug/wr-cli cert generate "$MANAGER_HOST" --ca-dir "$CERT_DIR/job-admin-operator" --ip "$MANAGER_HOST"
-run_logged job-admin-operator-cert-client target/debug/wr-cli cert generate operator --ca-dir "$CERT_DIR/job-admin-operator"
-run_logged job-admin-delegation-cert-init target/debug/wr-cli cert init-ca --output "$CERT_DIR/job-admin-delegation"
-run_logged job-admin-delegation-cert-manager target/debug/wr-cli cert generate manager --ca-dir "$CERT_DIR/job-admin-delegation"
-run_logged job-admin-delegation-cert-node target/debug/wr-cli cert generate "$NODE_HOST" --ca-dir "$CERT_DIR/job-admin-delegation" --ip "$NODE_HOST"
-run_logged manager-bundle target/debug/wr-cli managers bundle --manager-config "$MANAGER_CONFIG" --output "$MANAGER_BUNDLE"
+run_logged cert-server-root target/debug/wr-cli cert init-root server --output "$CERT_DIR/server-root"
+run_logged cert-client-root target/debug/wr-cli cert init-root client --output "$CERT_DIR/client-root"
+run_logged cert-manager-endpoint target/debug/wr-cli cert issue manager-endpoint --ca-dir "$CERT_DIR/server-root" --endpoint "$MANAGER_HOST" --ip "$MANAGER_HOST" --destination "$CERT_DIR/manager-endpoint"
+run_logged cert-manager-client target/debug/wr-cli cert issue manager --ca-dir "$CERT_DIR/client-root" --cluster-id deployment --name manager-a --destination "$CERT_DIR/manager-client"
+run_logged cert-human-client target/debug/wr-cli cert issue human --ca-dir "$CERT_DIR/client-root" --cluster-id deployment --name deployer --destination "$CERT_DIR/human-client"
+run_logged cert-proxy-endpoint target/debug/wr-cli cert issue proxy-peer-endpoint --ca-dir "$CERT_DIR/server-root" --endpoint "$NODE_HOST" --ip "$NODE_HOST" --destination "$CERT_DIR/proxy-endpoint"
+run_logged cert-proxy-client target/debug/wr-cli cert issue proxy --ca-dir "$CERT_DIR/client-root" --cluster-id deployment --name "$NODE_ID" --destination "$CERT_DIR/proxy-client"
+run_logged cert-node-agent target/debug/wr-cli cert issue node-agent --ca-dir "$CERT_DIR/client-root" --cluster-id deployment --name "$NODE_ID" --destination "$CERT_DIR/node-agent"
+run_logged cert-engine-admin-endpoint target/debug/wr-cli cert issue engine-admin-endpoint --ca-dir "$CERT_DIR/server-root" --endpoint "$NODE_HOST" --ip "$NODE_HOST" --destination "$CERT_DIR/engine-admin-endpoint"
+run_logged manager-bundle target/debug/wr-cli managers bundle --manager-config wr-tests/deployment/manager.toml --output "$MANAGER_BUNDLE"
 run_logged manager-inspect target/debug/wr-cli managers inspect-bundle "$MANAGER_BUNDLE"
 cp wr-tests/deployment/engine-a.toml "$RUN_DIR/engine.toml"
 run_logged node-a-bundle target/debug/wr-cli node bundle --engine-config "$RUN_DIR/engine.toml" --proxy-config wr-tests/deployment/proxy.toml --output "$BUNDLE_A"
@@ -501,16 +490,16 @@ lifecycle() {
 	run_to_log "$backend node agent install" "$pass/node-agent-install.log" \
 		"${CLI[@]}" node agent install "$BUNDLE_A" "$NODE_REMOTE" --node-id "$NODE_ID" \
 		--format "$backend" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" \
-		--agent-cert "$CERT_DIR/${AGENT_CERT_NAME}.crt" \
-		--agent-key "$CERT_DIR/${AGENT_CERT_NAME}.key" --agent-ca-cert "$CERT_DIR/ca.crt"
+		--agent-cert "$CERT_DIR/node-agent/leaf.pem" \
+		--agent-key "$CERT_DIR/node-agent/key.pem" \
+		--agent-ca-cert "$CERT_DIR/server-root/ca.crt"
 	job_admin queues --format json >"$pass/job-queues-empty.json"
-	if "${CLI[@]}" \
-		--job-admin-manager "https://${MANAGER_HOST}:9020" \
-		--job-admin-ca-cert "$CERT_DIR/ca.crt" \
-		--job-admin-client-cert "$CERT_DIR/${MANAGER_HOST}.crt" \
-		--job-admin-client-key "$CERT_DIR/${MANAGER_HOST}.key" \
-		jobs queues --format json >"$pass/job-runtime-trust-unexpected.json" 2>&1; then
-		echo "runtime credential unexpectedly reached the operator job-admin listener" >&2
+	if "$ROOT/target/debug/wr-cli" --manager "$MANAGER_ADDR" \
+		--ca-cert "$CERT_DIR/server-root/ca.crt" \
+		--client-cert "$CERT_DIR/proxy-client/leaf.pem" \
+		--client-key "$CERT_DIR/proxy-client/key.pem" \
+		jobs queues --format json >"$pass/job-role-trust-unexpected.json" 2>&1; then
+		echo "proxy workload credential unexpectedly received manager job authorization" >&2
 		return 1
 	fi
 

@@ -112,6 +112,8 @@ async fn test_manager_rejects_module_without_namespace() -> Result<()> {
                 job_queue_id: String::new(),
                 job_admin_address: String::new(),
             }),
+
+            activation_id: uuid::Uuid::new_v4().to_string(),
         })
         .await;
 

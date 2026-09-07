@@ -75,6 +75,65 @@ impl ServiceUnit<'_> {
     }
 }
 
+pub fn manager_activation_systemd_unit() -> &'static str {
+    "[Unit]\nDescription=wruntime manager\nAfter=network.target\n\n[Service]\nType=notify\nNotifyAccess=main\nExecStart=/usr/local/libexec/wruntime-manager-launch\nRestart=on-failure\nRestartSec=5\nKillSignal=SIGTERM\nTimeoutStopSec=45s\nSendSIGKILL=yes\n\n[Install]\nWantedBy=multi-user.target\n"
+}
+
+/// Stable manager launcher. The systemd unit points only at this shim; rollout
+/// staging cannot therefore change the executable/config/credential selector.
+/// The shim validates the descriptor and every digest immediately before exec.
+pub fn manager_launcher_script() -> &'static str {
+    r#"#!/usr/bin/env python3
+import hashlib, json, os, pathlib, struct, sys
+DESCRIPTOR='/var/lib/wruntime/manager-activation/current-activation.json'
+def digest_file(path): return 'sha256:'+hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+def digest_tree(root):
+ h=hashlib.sha256(); root=pathlib.Path(root)
+ for p in sorted((p for p in root.rglob('*') if p.is_file()), key=lambda p:p.relative_to(root).as_posix()):
+  r=p.relative_to(root).as_posix().encode(); b=p.read_bytes(); h.update(struct.pack('>Q',len(r))); h.update(r); h.update(struct.pack('>Q',len(b))); h.update(b)
+ return 'sha256:'+h.hexdigest()
+d=json.loads(pathlib.Path(DESCRIPTOR).read_text())
+if d.get('schema_version') != 1 or d.get('backend') != 'systemd': sys.exit('invalid systemd activation descriptor')
+for path,key in [(d['executable'],'executable_digest'),(d['backend_spec_path'],'backend_spec_digest'),(d['config_path'],'config_digest')]:
+ if digest_file(path) != d[key]: sys.exit(key+' mismatch')
+if digest_tree(d['credential_set_path']) != d['credential_digest']: sys.exit('credential_digest mismatch')
+env=os.environ.copy(); env['WRT_MANAGER_CREDENTIAL_SET']=d['credential_set_path']
+os.execve(d['executable'],[d['executable'],d['config_path']],env)
+"#
+}
+
+/// Build the single post-OLD_CLOSED selector transition. Preparatory config
+/// writes may happen first, but the final descriptor rename is authoritative.
+pub fn manager_activation_command(
+    systemd: bool,
+    next_descriptor: &str,
+    current_descriptor: &str,
+    config_dir: &str,
+    config_digest: &str,
+    old_selector_digest: &str,
+    new_selector_digest: &str,
+) -> String {
+    fn q(value: &str) -> String {
+        super::helpers::shell_quote(value)
+    }
+    let stop = if systemd {
+        "sudo systemctl stop wr-manager.service; sudo systemctl mask --runtime wr-manager.service"
+    } else {
+        r#"if sudo test -e "$current"; then old_spec=$(sudo python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["backend_spec_path"])' "$current"); sudo docker compose --project-name wruntime-manager -f "$old_spec" down; fi"#
+    };
+    let start = if systemd {
+        "sudo systemctl unmask wr-manager.service; sudo systemctl start wr-manager.service"
+    } else {
+        // The immutable backend spec is selected by the descriptor; it contains
+        // the digest-qualified image and stable mounts/project declaration.
+        r#"spec=$(sudo python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["backend_spec_path"])' "$current"); sudo docker compose --project-name wruntime-manager -f "$spec" up -d --force-recreate --no-build"#
+    };
+    format!(
+        "set -eu; current={current}; next={next}; config={config}; test \"sha256:$(sudo sha256sum -- \"$next\" | cut -d' ' -f1)\" = {new}; if sudo test -e \"$current\"; then test \"sha256:$(sudo sha256sum -- \"$current\" | cut -d' ' -f1)\" = {old}; sudo cp --reflink=auto -- \"$current\" \"$current.previous.tmp\"; sudo sync -f \"$current.previous.tmp\"; sudo mv \"$current.previous.tmp\" \"$current.previous\"; fi; {stop}; test \"sha256:$(sudo sha256sum -- \"$config/next.tmp\" | cut -d' ' -f1)\" = {config_digest}; if sudo test -e \"$config/current.toml\"; then sudo cp --reflink=auto -- \"$config/current.toml\" \"$config/previous.tmp\"; sudo chmod 0600 \"$config/previous.tmp\"; sudo sync -f \"$config/previous.tmp\"; sudo mv \"$config/previous.tmp\" \"$config/previous.toml\"; fi; sudo mv \"$config/next.tmp\" \"$config/current.toml\"; sudo chmod 0600 \"$config/current.toml\"; sudo sync -f \"$config\"; sudo mv \"$next\" \"$current\"; sudo chmod 0600 \"$current\"; sudo sync -f $(dirname \"$current\"); {start}",
+        current=q(current_descriptor), next=q(next_descriptor), config=q(config_dir), new=q(new_selector_digest), old=q(old_selector_digest), config_digest=q(config_digest), stop=stop, start=start,
+    )
+}
+
 /// Render the independently installed host node-agent unit. The executor is
 /// outside revision-specific engine releases so a rollout cannot replace its
 /// own active control process.
@@ -316,6 +375,31 @@ mod tests {
         assert!(!unit.contains("{run_user}"));
         assert!(!unit.contains("sudo"));
         assert!(!unit.contains("wr-node/releases"));
+    }
+
+    #[test]
+    fn manager_launcher_and_activation_are_digest_gated_and_ordered() {
+        let launcher = manager_launcher_script();
+        assert!(launcher.contains("executable_digest"));
+        assert!(launcher.contains("backend_spec_digest"));
+        assert!(launcher.contains("credential_digest"));
+        assert!(launcher.find("digest_tree").unwrap() < launcher.find("os.execve").unwrap());
+
+        let action = manager_activation_command(
+            true,
+            "/state/new.next",
+            "/state/current-activation.json",
+            "/state/config",
+            &format!("sha256:{}", "1".repeat(64)),
+            &format!("sha256:{}", "2".repeat(64)),
+            &format!("sha256:{}", "3".repeat(64)),
+        );
+        let stop = action.find("systemctl stop").unwrap();
+        let select = action.find("mv \"$next\" \"$current\"").unwrap();
+        let start = action.find("systemctl start").unwrap();
+        assert!(stop < select && select < start);
+        assert!(action.contains("previous.toml"));
+        assert!(!action.contains("rm -rf"));
     }
 
     #[test]

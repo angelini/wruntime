@@ -5,15 +5,17 @@ use anyhow::{bail, Result};
 use http::Uri;
 use semver::{Version, VersionReq};
 
-const MAX_ID_LEN: usize = 24;
+pub const MAX_STABLE_NAME_LEN: usize = 24;
 
-fn validate_name(value: &str, kind: &str) -> Result<()> {
+/// Validate a stable identity segment used by both resource names and
+/// certificate URI principals.
+pub fn validate_name(value: &str, kind: &str) -> Result<()> {
     let bytes = value.as_bytes();
     if bytes.is_empty() {
         bail!("{kind} is required");
     }
-    if bytes.len() > MAX_ID_LEN {
-        bail!("{kind} must be at most {MAX_ID_LEN} characters");
+    if bytes.len() > MAX_STABLE_NAME_LEN {
+        bail!("{kind} must be at most {MAX_STABLE_NAME_LEN} characters");
     }
     if !bytes.first().is_some_and(u8::is_ascii_lowercase)
         && !bytes.first().is_some_and(u8::is_ascii_digit)
@@ -65,6 +67,131 @@ macro_rules! name_type {
 name_type!(Namespace, "namespace");
 name_type!(ModuleName, "module name");
 name_type!(JobQueueId, "job queue id");
+name_type!(ClusterId, "cluster id");
+name_type!(NodeId, "node id");
+name_type!(ManagerId, "manager id");
+name_type!(PrincipalName, "principal name");
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PrincipalKind {
+    Human,
+    ServiceAccount,
+    Manager,
+    Proxy,
+    NodeAgent,
+}
+
+impl PrincipalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::ServiceAccount => "service-account",
+            Self::Manager => "manager",
+            Self::Proxy => "proxy",
+            Self::NodeAgent => "node-agent",
+        }
+    }
+}
+
+impl FromStr for PrincipalKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "human" => Ok(Self::Human),
+            "service-account" => Ok(Self::ServiceAccount),
+            "manager" => Ok(Self::Manager),
+            "proxy" => Ok(Self::Proxy),
+            "node-agent" => Ok(Self::NodeAgent),
+            _ => bail!("unsupported principal kind"),
+        }
+    }
+}
+
+/// A byte-exact project-owned client identity from the sole URI SAN.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PrincipalUri {
+    value: String,
+    cluster_id: ClusterId,
+    kind: PrincipalKind,
+    name: PrincipalName,
+}
+
+impl PrincipalUri {
+    pub fn parse(value: &str) -> Result<Self> {
+        // Split and compare the complete input; accepting URI normalization here
+        // would make a certificate identity ambiguous.
+        let mut segments = value.split(':');
+        if segments.next() != Some("urn") || segments.next() != Some("wruntime") {
+            bail!("principal URI must start with urn:wruntime:");
+        }
+        let cluster = segments
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("principal URI is missing cluster id"))?;
+        let kind = segments
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("principal URI is missing kind"))?;
+        let name = segments
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("principal URI is missing name"))?;
+        if segments.next().is_some() {
+            bail!("principal URI has trailing segments");
+        }
+        let cluster_id = ClusterId::parse(cluster)?;
+        let kind = PrincipalKind::from_str(kind)?;
+        let name = PrincipalName::parse(name)?;
+        let canonical = format!("urn:wruntime:{cluster_id}:{}:{name}", kind.as_str());
+        if canonical.as_bytes() != value.as_bytes() {
+            bail!("principal URI is not byte-exact canonical form");
+        }
+        Ok(Self {
+            value: canonical,
+            cluster_id,
+            kind,
+            name,
+        })
+    }
+
+    pub fn new(cluster_id: ClusterId, kind: PrincipalKind, name: PrincipalName) -> Self {
+        let value = format!("urn:wruntime:{cluster_id}:{}:{name}", kind.as_str());
+        Self {
+            value,
+            cluster_id,
+            kind,
+            name,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    pub fn cluster_id(&self) -> &ClusterId {
+        &self.cluster_id
+    }
+
+    pub fn kind(&self) -> PrincipalKind {
+        self.kind
+    }
+
+    pub fn name(&self) -> &PrincipalName {
+        &self.name
+    }
+}
+
+impl fmt::Display for PrincipalUri {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.value)
+    }
+}
+
+impl FromStr for PrincipalUri {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::parse(value)
+    }
+}
 
 macro_rules! opaque_id_type {
     ($name:ident, $label:literal) => {
@@ -233,6 +360,25 @@ mod tests {
         assert!(JobQueueId::parse("primary-jobs").is_ok());
         assert!(JobQueueId::parse("Primary_Jobs").is_err());
     }
+    #[test]
+    fn principal_uris_are_byte_exact_and_reuse_stable_names() {
+        let principal = PrincipalUri::parse("urn:wruntime:cluster-a:node-agent:node-a").unwrap();
+        assert_eq!(principal.cluster_id().as_str(), "cluster-a");
+        assert_eq!(principal.kind(), PrincipalKind::NodeAgent);
+        assert_eq!(principal.name().as_str(), "node-a");
+        for invalid in [
+            "spiffe://wruntime/cluster-a/node-agent/node-a",
+            "urn:wruntime:Cluster-a:node-agent:node-a",
+            "urn:wruntime:cluster-a:unknown:node-a",
+            "urn:wruntime:cluster-a:proxy:",
+            "urn:wruntime:cluster-a:proxy:node-a:",
+            "urn:wruntime:cluster-a:proxy:node_a",
+            "urn:wruntime:cluster-a:proxy:node-a?x=1",
+        ] {
+            assert!(PrincipalUri::parse(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
     #[test]
     fn borrowed_and_owned_route_validation_match() {
         let valid_24 = "a".repeat(24);

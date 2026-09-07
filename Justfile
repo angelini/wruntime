@@ -24,16 +24,15 @@ check:
 
 # Generate local CA + localhost certs for development
 certs:
-    just cli cert init-ca --output certs/
-    just cli cert generate 127.0.0.1 --ca-dir certs/
-    just cli cert generate manager --ca-dir certs/
-    just cli cert init-ca --output certs/job-admin-operator/
-    just cli cert generate 127.0.0.1 --ca-dir certs/job-admin-operator/
-    just cli cert generate manager --ca-dir certs/job-admin-operator/
-    just cli cert generate operator --ca-dir certs/job-admin-operator/
-    just cli cert init-ca --output certs/job-admin-delegation/
-    just cli cert generate 127.0.0.1 --ca-dir certs/job-admin-delegation/
-    just cli cert generate manager --ca-dir certs/job-admin-delegation/
+    just cli cert init-root server --output certs/runtime-server-root
+    just cli cert init-root client --output certs/runtime-client-root
+    just cli cert issue manager-endpoint --endpoint localhost --ip 127.0.0.1 --ca-dir certs/runtime-server-root --destination certs/runtime-manager-endpoint
+    just cli cert issue proxy-peer-endpoint --endpoint localhost --ip 127.0.0.1 --ca-dir certs/runtime-server-root --destination certs/runtime-proxy-endpoint
+    just cli cert issue engine-admin-endpoint --endpoint localhost --ip 127.0.0.1 --ca-dir certs/runtime-server-root --destination certs/job-admin-engine-endpoint
+    just cli cert issue human --cluster-id default --name deployer --ca-dir certs/runtime-client-root --destination certs/runtime-human-client
+    just cli cert issue manager --cluster-id default --name manager-a --ca-dir certs/runtime-client-root --destination certs/runtime-manager-client
+    just cli cert issue proxy --cluster-id default --name proxy-a --ca-dir certs/runtime-client-root --destination certs/runtime-proxy-client
+    just cli cert issue node-agent --cluster-id default --name node-a --ca-dir certs/runtime-client-root --destination certs/runtime-node-agent-client
 
 # ── Lint & Format ─────────────────────────────────────────────────────────────
 

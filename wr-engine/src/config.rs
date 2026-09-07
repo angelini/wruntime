@@ -5,9 +5,10 @@ use anyhow::Result;
 use serde::de::{value::MapAccessDeserializer, Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use wr_common::identity::{JobQueueId, ModuleId, PeerHttpsUrl};
-use wr_common::node::{is_loopback_addr, NodeConfig, TlsConfig};
+use wr_common::node::{is_loopback_addr, NodeConfig, ServerTlsConfig};
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct EngineConfig {
     /// Address this engine listens on for inbound requests from the proxy
     pub listen_address: String,
@@ -108,6 +109,8 @@ pub struct DeploymentMetadata {
     pub revision: u64,
     pub bundle_digest: String,
     pub engine_slot: String,
+    pub operation_id: String,
+    pub revision_digest: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -118,8 +121,8 @@ pub struct JobAdminConfig {
     pub advertise_address: String,
     /// Stable identity of this physical `wr__jobs` database.
     pub queue_id: String,
-    /// Server identity and delegation CA. Operator certificates are not trusted here.
-    pub tls: TlsConfig,
+    /// Server identity and client root for enrolled manager workload callers.
+    pub tls: ServerTlsConfig,
 }
 
 #[derive(Deserialize, Clone)]
@@ -544,6 +547,15 @@ impl EngineConfig {
                 !deployment.engine_slot.is_empty(),
                 "deployment.engine_slot is required",
             );
+            v.check(
+                uuid::Uuid::parse_str(&deployment.operation_id).is_ok(),
+                "deployment.operation_id must be a UUID",
+            );
+            v.check(
+                deployment.revision_digest.starts_with("sha256:")
+                    && deployment.revision_digest.len() == 71,
+                "deployment.revision_digest must be sha256:<lowercase hex>",
+            );
         }
 
         v.check(
@@ -619,8 +631,8 @@ impl EngineConfig {
                 "job_admin.tls.key_path is required",
             );
             v.check(
-                !job_admin.tls.ca_cert_path.is_empty(),
-                "job_admin.tls.ca_cert_path is required",
+                !job_admin.tls.client_ca_cert_path.is_empty(),
+                "job_admin.tls.client_ca_cert_path is required",
             );
         }
         if let Some(database) = &self.database {
@@ -854,10 +866,7 @@ listen_address = "127.0.0.1:9100"
 proxy_address = "http://127.0.0.1:9001"
 control_address = "http://127.0.0.1:9002"
 peer_address = "https://127.0.0.1:9443"
-[node.tls]
-cert_path = "c.crt"
-key_path = "c.key"
-ca_cert_path = "ca.crt"
+
 [database]
 url = "postgres://localhost/test"
 {database_fields}
@@ -868,7 +877,7 @@ queue_id = "test-jobs"
 [job_admin.tls]
 cert_path = "delegate.crt"
 key_path = "delegate.key"
-ca_cert_path = "delegate-ca.crt"
+client_ca_cert_path = "delegate-ca.crt"
 "#
         ))
         .expect("engine config")
@@ -887,10 +896,7 @@ listen_address = "127.0.0.1:9100"
 proxy_address = "http://127.0.0.1:9001"
 control_address = "http://127.0.0.1:9002"
 peer_address = "https://127.0.0.1:9443"
-[node.tls]
-cert_path = "c.crt"
-key_path = "c.key"
-ca_cert_path = "ca.crt"
+
 [database]
 url = "postgres://localhost/test"
 "#,
@@ -948,10 +954,7 @@ max_outbound_body_bytes = 0
 proxy_address = "http://127.0.0.1:9001"
 control_address = "http://127.0.0.1:9002"
 peer_address = "https://127.0.0.1:9443"
-[node.tls]
-cert_path = "c.crt"
-key_path = "c.key"
-ca_cert_path = "ca.crt"
+
 [pool]
 total_component_instances = 0
 max_memory_size = 0
@@ -968,7 +971,7 @@ queue_id = "test-jobs"
 [job_admin.tls]
 cert_path = "delegate.crt"
 key_path = "delegate.key"
-ca_cert_path = "delegate-ca.crt"
+client_ca_cert_path = "delegate-ca.crt"
 [llm]
 provider = "anthropic"
 api_key_env = "TEST_KEY"
@@ -1014,10 +1017,7 @@ listen_address = "127.0.0.1:9100"
 proxy_address = "http://127.0.0.1:9001"
 control_address = "http://127.0.0.1:9002"
 peer_address = "https://127.0.0.1:9443"
-[node.tls]
-cert_path = "c.crt"
-key_path = "c.key"
-ca_cert_path = "ca.crt"
+
 [[module]]
 name = "orders"
 namespace = "shop"

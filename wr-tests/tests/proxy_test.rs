@@ -2,8 +2,8 @@ mod helpers;
 use helpers::{
     db::manager_pool,
     manager::{
-        manager_trio, register_test_module_raw, register_test_module_ready, start_manager,
-        start_manager_cluster, sync_table, synced_routing_table,
+        manager_proxy_tls, manager_trio, register_test_module_raw, register_test_module_ready,
+        start_manager, start_manager_cluster, sync_table, synced_routing_table,
     },
     proxy::{http_client, proxy_get, start_proxy},
     stubs::spawn_stub_engine,
@@ -18,10 +18,12 @@ use http_body_util::Full;
 
 use wr_common::discovery::ManagerDiscovery;
 use wr_common::process_lifecycle::{LifecycleOwner, ServiceKind};
-use wr_common::wruntime::node_service_server::NodeService; // brings NodeService methods into scope
+use wr_common::wruntime::proxy_node_control_service_server::ProxyNodeControlService; // brings proxy-local methods into scope
 use wr_common::wruntime::{
-    BeginEngineDrainRequest, EngineRegistration, GetProxyRoutingStatusRequest,
-    GetRoutingTableRequest, HeartbeatRequest, ModuleDescriptor, RegisterEngineRequest,
+    BeginDeploymentRequest, BeginEngineDrainRequest, DeploymentInventoryV1, DeploymentMetadata,
+    EngineRegistration, ExpectedEngine, ExpectedModule, GetProxyRoutingStatusRequest,
+    GetRoutingTableRequest, HeartbeatRequest, ModuleDescriptor, ModuleIdentity,
+    NodeOperationAction, RegisterEngineRequest, RolloutPolicy, SubmitOperationRequest,
 };
 use wr_proxy::node_service::NodeAgent;
 
@@ -99,7 +101,8 @@ async fn test_proxy_excludes_raw_registration_until_healthy() -> Result<()> {
     let (pool, mgr_addr, mut mgr_c) = manager_trio().await?;
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
 
-    register_test_module_raw(
+    let fence = register_test_module_raw(
+        &pool,
         &mut mgr_c,
         "proxy-ready-e1",
         &engine_addr,
@@ -124,6 +127,8 @@ async fn test_proxy_excludes_raw_registration_until_healthy() -> Result<()> {
                 version: "1.0.0".into(),
                 proto_schema: vec![],
             }],
+
+            fence: Some(fence),
         })
         .await?;
     wr_manager::db::update_route_health(&pool, 30.0, 30.0)
@@ -143,14 +148,16 @@ async fn test_proxy_excludes_raw_registration_until_healthy() -> Result<()> {
 async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<()> {
     let (pool, mgr_addr, mut mgr_c) = manager_trio().await?;
 
-    // ManagerDiscovery resolves managers from wr_managers — register the test
-    // manager (plaintext, no TLS) so the NodeAgent can forward to it.
+    // ManagerDiscovery resolves managers from wr_managers and authenticates
+    // every selected manager epoch with the enrolled proxy identity.
     wr_manager::db::register_manager(&pool, "proxy-test-mgr", &mgr_addr).await?;
     let discovery = Arc::new(ManagerDiscovery::new(
         pool.clone(),
-        None,
+        manager_proxy_tls(),
+        "test-manager-server-root.pem",
+        "test-proxy-client.pem",
         wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
-    ));
+    )?);
     discovery.refresh().await;
 
     let routing = wr_proxy::routing::new_routing_table(
@@ -174,6 +181,64 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
         routing.version().await
     );
 
+    let bundle_digest = format!("sha256:{}", "c".repeat(64));
+    let schema = minimal_file_descriptor_set();
+    let deployment = mgr_c
+        .begin_deployment(BeginDeploymentRequest {
+            node_id: "node-a".into(),
+            attempt_token: "proxy-register-deployment".into(),
+            bundle_digest: bundle_digest.clone(),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![ExpectedEngine {
+                    engine_slot: "primary".into(),
+                    modules: vec![ExpectedModule {
+                        identity: Some(ModuleIdentity {
+                            namespace: "store".into(),
+                            name: "inventory".into(),
+                            version: "1.0.0".into(),
+                        }),
+                        proto_schema_digest: wr_common::deployment_contract::schema_digest(&schema),
+                    }],
+                    ..Default::default()
+                }],
+            }),
+        })
+        .await?
+        .into_inner()
+        .deployment
+        .expect("proxy registration deployment");
+    let resolved_release_digest = format!("sha256:{}", "d".repeat(64));
+    mgr_c
+        .finalize_deployment(wr_common::wruntime::FinalizeDeploymentRequest {
+            node_id: "node-a".into(),
+            attempt_token: "proxy-register-deployment".into(),
+            revision: deployment.revision,
+            bundle_digest: bundle_digest.clone(),
+            resolved_release_digest: resolved_release_digest.clone(),
+        })
+        .await?;
+    let operation = mgr_c
+        .submit_operation(SubmitOperationRequest {
+            node_id: "node-a".into(),
+            request_token: "proxy-register-deployment".into(),
+            action: NodeOperationAction::InitialApply as i32,
+            engine_slots: vec!["primary".into()],
+            target_revision: deployment.revision,
+            bundle_digest: bundle_digest.clone(),
+            policy: Some(RolloutPolicy {
+                max_unavailable: 1,
+                canary_slot: "primary".into(),
+                pause_after_canary: false,
+                allow_downtime: true,
+                deadline_seconds: 300,
+            }),
+            resolved_release_digest,
+        })
+        .await?
+        .into_inner()
+        .operation
+        .expect("proxy registration operation");
     let resp = agent
         .register_engine(tonic::Request::new(RegisterEngineRequest {
             registration: Some(EngineRegistration {
@@ -185,18 +250,28 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
                     name: "inventory".into(),
                     namespace: "store".into(),
                     version: "1.0.0".into(),
-                    proto_schema: minimal_file_descriptor_set(),
+                    proto_schema: schema,
                 }],
                 secrets: vec![],
                 db_namespaces: vec![],
-                deployment: None,
+                deployment: Some(DeploymentMetadata {
+                    node_id: "node-a".into(),
+                    revision: deployment.revision,
+                    bundle_digest,
+                    engine_slot: "primary".into(),
+                    operation_id: operation.operation_id,
+                    revision_digest: deployment.revision_digest,
+                }),
                 job_queue_id: String::new(),
                 job_admin_address: String::new(),
             }),
+
+            activation_id: uuid::Uuid::new_v4().to_string(),
         }))
         .await?
         .into_inner();
     assert!(resp.accepted);
+    let fence = resp.fence.clone();
 
     let table = mgr_c
         .get_routing_table(GetRoutingTableRequest { known_version: 0 })
@@ -224,6 +299,8 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
                 version: "1.0.0".into(),
                 proto_schema: vec![],
             }],
+
+            fence: fence.clone(),
         }))
         .await?
         .into_inner();
@@ -261,6 +338,8 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
     let withdrawal = agent
         .begin_engine_drain(tonic::Request::new(BeginEngineDrainRequest {
             engine_id: "proxy-e1".into(),
+
+            fence: fence.clone(),
         }))
         .await?
         .into_inner();
@@ -282,6 +361,8 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
         .heartbeat(tonic::Request::new(HeartbeatRequest {
             engine_id: "proxy-e1".into(),
             healthy_modules: vec![],
+
+            fence,
         }))
         .await
     {
@@ -330,15 +411,46 @@ async fn test_discovery_refreshes_via_list_managers() -> Result<()> {
 
     let discovery = Arc::new(ManagerDiscovery::new(
         pool.clone(),
-        None,
+        manager_proxy_tls(),
+        "test-manager-server-root.pem",
+        "test-proxy-client.pem",
         wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
-    ));
+    )?);
     discovery.refresh().await; // cold-start DB seed → ListManagers RPC → cache
 
     // A client can be obtained, i.e. the cache was populated with a reachable addr.
-    let client = discovery.get_client().await;
+    let client = discovery
+        .pin(wr_common::manager_client::RetryClass::ReadOnly)
+        .await;
     assert!(client.is_ok(), "discovery should have a reachable manager");
     let _ = managers;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_discovery_repin_rotates_order_and_rejects_no_replay() -> Result<()> {
+    let pool = manager_pool().await;
+    let _managers = start_manager_cluster(pool.clone(), 2, 30).await?;
+    let discovery = ManagerDiscovery::new(
+        pool,
+        manager_proxy_tls(),
+        "test-manager-server-root.pem",
+        "test-proxy-client.pem",
+        wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
+    )?;
+    discovery.refresh().await;
+
+    let first = discovery
+        .pin(wr_common::manager_client::RetryClass::ReadOnly)
+        .await?;
+    let second = discovery.repin(&first).await?;
+    assert_ne!(first.endpoint(), second.endpoint());
+
+    let no_replay = discovery
+        .pin(wr_common::manager_client::RetryClass::NoReplayMutation)
+        .await?;
+    let error = discovery.repin(&no_replay).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     Ok(())
 }
 
@@ -349,11 +461,16 @@ async fn test_discovery_evicts_cached_affinity_after_lease_becomes_stale() -> Re
     wr_manager::db::register_manager(&pool, "cached-mgr", &manager_addr).await?;
     let discovery = ManagerDiscovery::new(
         pool.clone(),
-        None,
+        manager_proxy_tls(),
+        "test-manager-server-root.pem",
+        "test-proxy-client.pem",
         wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
-    );
+    )?;
     discovery.refresh().await;
-    assert!(discovery.get_client().await.is_ok());
+    assert!(discovery
+        .pin(wr_common::manager_client::RetryClass::ReadOnly)
+        .await
+        .is_ok());
 
     pool.get()
         .await?
@@ -365,8 +482,11 @@ async fn test_discovery_evicts_cached_affinity_after_lease_becomes_stale() -> Re
     discovery.refresh().await;
 
     assert!(
-        discovery.get_client().await.is_err(),
-        "successful empty lease evidence must evict cached and affinity-pinned managers"
+        discovery
+            .pin(wr_common::manager_client::RetryClass::ReadOnly)
+            .await
+            .is_err(),
+        "successful empty lease evidence must evict cached managers"
     );
     Ok(())
 }
@@ -384,11 +504,20 @@ async fn test_discovery_direct_db_fallback_uses_configured_lease_threshold() -> 
         )
         .await?;
 
-    let discovery = ManagerDiscovery::new(pool, None, 1);
+    let discovery = ManagerDiscovery::new(
+        pool,
+        manager_proxy_tls(),
+        "test-manager-server-root.pem",
+        "test-proxy-client.pem",
+        1,
+    )?;
     discovery.refresh().await;
 
     assert!(
-        discovery.get_client().await.is_err(),
+        discovery
+            .pin(wr_common::manager_client::RetryClass::ReadOnly)
+            .await
+            .is_err(),
         "a row stale under the configured threshold must not bootstrap discovery"
     );
     Ok(())
@@ -402,11 +531,16 @@ async fn test_discovery_falls_back_to_db_when_no_manager_reachable() -> Result<(
 
     let discovery = Arc::new(ManagerDiscovery::new(
         pool.clone(),
-        None,
+        manager_proxy_tls(),
+        "test-manager-server-root.pem",
+        "test-proxy-client.pem",
         wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
-    ));
+    )?);
     discovery.refresh().await; // cold-start DB seed; ListManagers unreachable → DB fallback keeps the row
 
-    assert!(discovery.get_client().await.is_err());
+    assert!(discovery
+        .pin(wr_common::manager_client::RetryClass::ReadOnly)
+        .await
+        .is_err());
     Ok(())
 }

@@ -1,9 +1,12 @@
-use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
-use wr_common::node::TlsConfig;
+use wr_common::authorization_policy::ValidatedPolicy;
+use wr_common::identity::ManagerId;
+use wr_common::node::{ClientTlsConfig, ServerTlsConfig};
 use wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS;
 
 pub const DEFAULT_MANAGER_HEARTBEAT_INTERVAL_SECS: u64 = 1;
@@ -18,28 +21,16 @@ impl HeartbeatTimeoutSecs {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum PrincipalRole {
-    Viewer,
-    Operator,
-    NodeAgent,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct PrincipalMapping {
-    /// `sha256:<64 lowercase hex>` over the complete DER client certificate.
-    pub fingerprint: String,
-    /// Stable audit identity. Certificate rotation may map several fingerprints
-    /// to the same principal with identical role/node binding.
-    pub principal: String,
-    pub role: PrincipalRole,
-    #[serde(default)]
-    pub node_id: Option<String>,
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationConfig {
+    pub policy_file: String,
 }
 
 #[derive(Clone)]
 pub struct ManagerConfig {
+    /// Stable manager identity across process activations.
+    pub manager_id: ManagerId,
     /// gRPC listen address, e.g. "0.0.0.0:9000"
     pub listen_address: String,
     /// How long (seconds) without a heartbeat before an engine is considered unhealthy
@@ -61,14 +52,13 @@ pub struct ManagerConfig {
     pub database: DatabaseConfig,
     /// Cluster configuration for multi-manager HA.
     pub cluster: ClusterConfig,
-    /// TLS certificate configuration for the runtime gRPC listener.
-    pub tls: TlsConfig,
-    /// Dedicated operator job-administration listener and trust root.
-    pub job_admin: JobAdminConfig,
-    /// Client identity and delegation CA used only for manager-to-engine job administration.
-    pub job_admin_delegation_tls: TlsConfig,
-    /// Explicit identities allowed to use OperatorService/NodeAgentService.
-    pub operator_principals: Vec<PrincipalMapping>,
+    /// Server identity and client roots for the sole manager gRPC listener.
+    pub tls: ServerTlsConfig,
+    /// Stable manager workload identity used for self-observation and engine job administration.
+    pub client_tls: ClientTlsConfig,
+    /// Resolved authorization-policy path and immutable validated snapshot.
+    pub authorization_policy_path: PathBuf,
+    pub authorization_policy: Arc<ValidatedPolicy>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -102,14 +92,6 @@ fn default_manager_stale_row_reap_threshold_secs() -> u64 {
 }
 
 #[derive(Deserialize, Clone)]
-pub struct JobAdminConfig {
-    /// Dedicated operator-facing gRPC bind address.
-    pub listen_address: String,
-    /// Server identity and operator-admin client CA.
-    pub tls: TlsConfig,
-}
-
-#[derive(Deserialize, Clone)]
 pub struct DatabaseConfig {
     /// `postgres://user:pass@host:port/dbname` connection string.
     pub url: String,
@@ -137,7 +119,9 @@ fn default_max_connections() -> usize {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RawManagerConfig {
+    pub manager_id: String,
     pub listen_address: String,
     #[serde(default = "default_heartbeat_timeout")]
     pub engine_heartbeat_timeout_secs: u64,
@@ -152,11 +136,9 @@ pub struct RawManagerConfig {
     pub scheduler_retry_cap_secs: u64,
     pub database: DatabaseConfig,
     pub cluster: ClusterConfig,
-    pub tls: TlsConfig,
-    pub job_admin: JobAdminConfig,
-    pub job_admin_delegation_tls: TlsConfig,
-    #[serde(default)]
-    pub operator_principals: Vec<PrincipalMapping>,
+    pub tls: ServerTlsConfig,
+    pub client_tls: ClientTlsConfig,
+    pub authorization: AuthorizationConfig,
 }
 
 impl wr_common::config::Validatable for RawManagerConfig {
@@ -170,6 +152,10 @@ impl RawManagerConfig {
         use wr_common::config::Validator;
         let mut v = Validator::new();
 
+        v.check(
+            ManagerId::parse(&self.manager_id).is_ok(),
+            "manager_id must be a valid stable identity",
+        );
         v.check(
             !self.listen_address.is_empty(),
             "listen_address is required",
@@ -222,108 +208,107 @@ impl RawManagerConfig {
         v.check(!self.tls.cert_path.is_empty(), "tls.cert_path is required");
         v.check(!self.tls.key_path.is_empty(), "tls.key_path is required");
         v.check(
-            !self.tls.ca_cert_path.is_empty(),
-            "tls.ca_cert_path is required",
+            !self.tls.client_ca_cert_path.is_empty(),
+            "tls.client_ca_cert_path is required",
         );
         v.check(
-            !self.job_admin.listen_address.is_empty(),
-            "job_admin.listen_address is required",
-        );
-        match self
-            .job_admin
-            .listen_address
-            .parse::<std::net::SocketAddr>()
-        {
-            Ok(job_admin) => {
-                v.check(
-                    job_admin.port() > 0,
-                    "job_admin.listen_address port must be > 0",
-                );
-                if let Ok(runtime) = self.listen_address.parse::<std::net::SocketAddr>() {
-                    v.check(
-                        runtime != job_admin,
-                        "job_admin.listen_address must not conflict with listen_address",
-                    );
-                }
-            }
-            Err(_) => v.check(false, "job_admin.listen_address must be a socket address"),
-        }
-        v.check(
-            !self.job_admin.tls.cert_path.is_empty(),
-            "job_admin.tls.cert_path is required",
+            !self.client_tls.cert_path.is_empty(),
+            "client_tls.cert_path is required",
         );
         v.check(
-            !self.job_admin.tls.key_path.is_empty(),
-            "job_admin.tls.key_path is required",
+            !self.client_tls.key_path.is_empty(),
+            "client_tls.key_path is required",
         );
         v.check(
-            !self.job_admin.tls.ca_cert_path.is_empty(),
-            "job_admin.tls.ca_cert_path is required",
+            !self.client_tls.server_ca_cert_path.is_empty(),
+            "client_tls.server_ca_cert_path is required",
         );
         v.check(
-            !self.job_admin_delegation_tls.cert_path.is_empty(),
-            "job_admin_delegation_tls.cert_path is required",
+            !self.authorization.policy_file.trim().is_empty(),
+            "authorization.policy_file is required",
         );
-        v.check(
-            !self.job_admin_delegation_tls.key_path.is_empty(),
-            "job_admin_delegation_tls.key_path is required",
-        );
-        v.check(
-            !self.job_admin_delegation_tls.ca_cert_path.is_empty(),
-            "job_admin_delegation_tls.ca_cert_path is required",
-        );
-
-        let mut fingerprints = HashSet::new();
-        let mut principals: HashMap<&str, (PrincipalRole, Option<&str>)> = HashMap::new();
-        for mapping in &self.operator_principals {
-            let valid_fingerprint = mapping.fingerprint.len() == 71
-                && mapping.fingerprint.starts_with("sha256:")
-                && mapping.fingerprint[7..]
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
-            v.check(
-                valid_fingerprint,
-                "operator principal fingerprint must be sha256:<64 lowercase hex>",
-            );
-            v.check(
-                !mapping.principal.trim().is_empty(),
-                "operator principal name is required",
-            );
-            v.check(
-                fingerprints.insert(mapping.fingerprint.as_str()),
-                "operator principal fingerprints must be unique",
-            );
-            let node = mapping.node_id.as_deref();
-            v.check(
-                matches!(mapping.role, PrincipalRole::NodeAgent) == node.is_some(),
-                "node-agent principals require exactly one node_id and other roles must not set node_id",
-            );
-            if let Some((role, existing_node)) = principals.get(mapping.principal.as_str()) {
-                v.check(
-                    *role == mapping.role && *existing_node == node,
-                    "all fingerprints for one principal must have the same role and node_id",
-                );
-            } else {
-                principals.insert(mapping.principal.as_str(), (mapping.role, node));
-            }
-        }
 
         v.finish()
     }
 }
 
-impl TryFrom<RawManagerConfig> for ManagerConfig {
-    type Error = anyhow::Error;
-
-    fn try_from(raw: RawManagerConfig) -> Result<Self> {
+impl ManagerConfig {
+    pub fn load(path: &str) -> Result<Self> {
+        let raw: RawManagerConfig = wr_common::config::load(path)?;
         let module_timeout = raw
             .module_heartbeat_timeout_secs
             .unwrap_or(raw.engine_heartbeat_timeout_secs);
         let module_heartbeat_timeout_secs = NonZeroU64::new(module_timeout)
             .map(HeartbeatTimeoutSecs)
             .ok_or_else(|| anyhow::anyhow!("module_heartbeat_timeout_secs must be > 0"))?;
+        let manager_id = ManagerId::parse(raw.manager_id)?;
+        let config_path = Path::new(path);
+        let policy_path = {
+            let configured = Path::new(&raw.authorization.policy_file);
+            if configured.is_absolute() {
+                configured.to_path_buf()
+            } else {
+                config_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(configured)
+            }
+        };
+        let metadata = std::fs::metadata(&policy_path).with_context(|| {
+            format!(
+                "failed to inspect authorization policy {}",
+                policy_path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.len() <= wr_common::authorization_policy::MAX_POLICY_BYTES as u64,
+            "authorization policy exceeds 4 MiB raw limit"
+        );
+        let bytes = std::fs::read(&policy_path).with_context(|| {
+            format!(
+                "failed to read authorization policy {}",
+                policy_path.display()
+            )
+        })?;
+        let authorization_policy = Arc::new(ValidatedPolicy::load(&bytes)?);
+        let advertised = raw
+            .cluster
+            .advertise_grpc_address
+            .clone()
+            .unwrap_or_else(|| {
+                format!(
+                    "https://{}",
+                    raw.listen_address.replace("0.0.0.0", "127.0.0.1")
+                )
+            });
+        let enrollment = authorization_policy
+            .manager_enrollments
+            .iter()
+            .find(|item| item.manager_id == manager_id.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!("running manager is not enrolled by authorization policy")
+            })?;
+        anyhow::ensure!(
+            enrollment.endpoint == advertised,
+            "manager advertised endpoint does not match authorization policy enrollment"
+        );
+        let cluster_id = wr_common::identity::ClusterId::parse(&authorization_policy.cluster_id)?;
+        let manager_leaf =
+            wr_common::tls::load_client_leaf_evidence(&raw.client_tls.cert_path, Some(&cluster_id))
+                .context("failed to validate manager client-profile certificate")?;
+        let manager_principal = manager_leaf.principal.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("manager client-profile certificate has no principal")
+        })?;
+        anyhow::ensure!(manager_principal.as_str() == enrollment.principal, "manager client-profile certificate principal does not match authorization policy enrollment");
+        anyhow::ensure!(
+            !authorization_policy
+                .revoked_leaf_fingerprints
+                .contains(&manager_leaf.fingerprint),
+            "manager client-profile certificate is revoked by authorization policy"
+        );
 
         Ok(Self {
+            manager_id,
             listen_address: raw.listen_address,
             engine_heartbeat_timeout_secs: raw.engine_heartbeat_timeout_secs,
             module_heartbeat_timeout_secs,
@@ -334,17 +319,10 @@ impl TryFrom<RawManagerConfig> for ManagerConfig {
             database: raw.database,
             cluster: raw.cluster,
             tls: raw.tls,
-            job_admin: raw.job_admin,
-            job_admin_delegation_tls: raw.job_admin_delegation_tls,
-            operator_principals: raw.operator_principals,
+            client_tls: raw.client_tls,
+            authorization_policy_path: policy_path,
+            authorization_policy,
         })
-    }
-}
-
-impl ManagerConfig {
-    pub fn load(path: &str) -> Result<Self> {
-        let raw: RawManagerConfig = wr_common::config::load(path)?;
-        raw.try_into()
     }
 }
 
@@ -352,17 +330,9 @@ impl ManagerConfig {
 mod tests {
     use super::*;
 
-    fn mapping(fingerprint: char, principal: &str, role: PrincipalRole) -> PrincipalMapping {
-        PrincipalMapping {
-            fingerprint: format!("sha256:{}", fingerprint.to_string().repeat(64)),
-            principal: principal.into(),
-            role,
-            node_id: (role == PrincipalRole::NodeAgent).then(|| "node-a".into()),
-        }
-    }
-
-    fn config(operator_principals: Vec<PrincipalMapping>) -> RawManagerConfig {
+    fn config() -> RawManagerConfig {
         RawManagerConfig {
+            manager_id: "manager-a".into(),
             listen_address: "127.0.0.1:9000".into(),
             engine_heartbeat_timeout_secs: 10,
             module_heartbeat_timeout_secs: None,
@@ -381,95 +351,40 @@ mod tests {
                 manager_stale_row_reap_threshold_secs:
                     DEFAULT_MANAGER_STALE_ROW_REAP_THRESHOLD_SECS,
             },
-            tls: TlsConfig {
+            tls: ServerTlsConfig {
                 cert_path: "cert".into(),
                 key_path: "key".into(),
-                ca_cert_path: "ca".into(),
+                client_ca_cert_path: "client-ca".into(),
             },
-            job_admin: JobAdminConfig {
-                listen_address: "127.0.0.1:9020".into(),
-                tls: TlsConfig {
-                    cert_path: "operator-server-cert".into(),
-                    key_path: "operator-server-key".into(),
-                    ca_cert_path: "operator-ca".into(),
-                },
+            client_tls: ClientTlsConfig {
+                cert_path: "manager-client-cert".into(),
+                key_path: "manager-client-key".into(),
+                server_ca_cert_path: "server-ca".into(),
             },
-            job_admin_delegation_tls: TlsConfig {
-                cert_path: "delegate-cert".into(),
-                key_path: "delegate-key".into(),
-                ca_cert_path: "delegate-ca".into(),
+            authorization: AuthorizationConfig {
+                policy_file: "policy/authorization.toml".into(),
             },
-            operator_principals,
         }
     }
 
     #[test]
-    fn certificate_rotation_with_same_binding_is_valid() {
-        let result = config(vec![
-            mapping('a', "operator-a", PrincipalRole::Operator),
-            mapping('b', "operator-a", PrincipalRole::Operator),
-        ])
-        .validate_inner();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn duplicate_fingerprint_is_rejected() {
-        let result = config(vec![
-            mapping('a', "operator-a", PrincipalRole::Operator),
-            mapping('a', "operator-b", PrincipalRole::Viewer),
-        ])
-        .validate_inner();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn conflicting_rotation_binding_is_rejected() {
-        let result = config(vec![
-            mapping('a', "principal", PrincipalRole::Operator),
-            mapping('b', "principal", PrincipalRole::Viewer),
-        ])
-        .validate_inner();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn node_agent_requires_exact_node_binding() {
-        let mut unbound = mapping('a', "agent", PrincipalRole::NodeAgent);
-        unbound.node_id = None;
-        assert!(config(vec![unbound]).validate_inner().is_err());
-
-        let mut viewer = mapping('b', "viewer", PrincipalRole::Viewer);
-        viewer.node_id = Some("node-a".into());
-        assert!(config(vec![viewer]).validate_inner().is_err());
-    }
-
-    #[test]
     fn manager_lease_intervals_are_ordered_and_positive() {
-        let mut invalid = config(vec![]);
+        let mut invalid = config();
         invalid.cluster.manager_heartbeat_interval_secs = 0;
         invalid.cluster.manager_liveness_threshold_secs = 1;
         invalid.cluster.manager_stale_row_reap_threshold_secs = 9;
         let error = invalid.validate_inner().unwrap_err().to_string();
         assert!(error.contains("manager_heartbeat_interval_secs must be > 0"));
         assert!(error.contains("must be at least 10 times"));
-
-        let mut invalid = config(vec![]);
-        invalid.cluster.manager_liveness_threshold_secs =
-            invalid.cluster.manager_heartbeat_interval_secs;
-        assert!(invalid.validate_inner().is_err());
     }
 
     #[test]
-    fn job_admin_listener_is_dedicated_and_fully_configured() {
-        let mut conflicting = config(vec![]);
-        conflicting.job_admin.listen_address = conflicting.listen_address.clone();
-        let error = conflicting.validate_inner().unwrap_err().to_string();
-        assert!(error.contains("must not conflict"));
-
-        let mut incomplete = config(vec![]);
-        incomplete.job_admin.tls.ca_cert_path.clear();
-        let error = incomplete.validate_inner().unwrap_err().to_string();
-        assert!(error.contains("job_admin.tls.ca_cert_path"));
+    fn policy_path_and_stable_manager_id_are_required() {
+        let mut invalid = config();
+        invalid.manager_id = "not_valid".into();
+        invalid.authorization.policy_file.clear();
+        let error = invalid.validate_inner().unwrap_err().to_string();
+        assert!(error.contains("manager_id"));
+        assert!(error.contains("authorization.policy_file"));
     }
 }

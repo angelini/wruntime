@@ -10,28 +10,12 @@ struct Cli {
     #[arg(long, env = "WR_MANAGER", global = true)]
     manager: Option<String>,
 
-    /// Dedicated manager job-administration gRPC address
-    #[arg(long, env = "WR_JOB_ADMIN_MANAGER", global = true)]
-    job_admin_manager: Option<String>,
-
-    /// Operator-admin CA certificate for the dedicated manager listener
-    #[arg(long, env = "WR_JOB_ADMIN_CA_CERT", global = true)]
-    job_admin_ca_cert: Option<String>,
-
-    /// Operator-admin client certificate for the dedicated manager listener
-    #[arg(long, env = "WR_JOB_ADMIN_CLIENT_CERT", global = true)]
-    job_admin_client_cert: Option<String>,
-
-    /// Operator-admin private key for the dedicated manager listener
-    #[arg(long, env = "WR_JOB_ADMIN_CLIENT_KEY", global = true)]
-    job_admin_client_key: Option<String>,
-
     /// CA certificate for verifying the manager's TLS cert
     #[arg(
         long,
         env = "WR_CA_CERT",
         global = true,
-        default_value = "certs/ca.crt"
+        default_value = "certs/runtime-server-root/ca.crt"
     )]
     ca_cert: String,
 
@@ -40,7 +24,7 @@ struct Cli {
         long,
         env = "WR_CLIENT_CERT",
         global = true,
-        default_value = "certs/127.0.0.1.crt"
+        default_value = "certs/runtime-human-client/leaf.pem"
     )]
     client_cert: String,
 
@@ -49,7 +33,7 @@ struct Cli {
         long,
         env = "WR_CLIENT_KEY",
         global = true,
-        default_value = "certs/127.0.0.1.key"
+        default_value = "certs/runtime-human-client/key.pem"
     )]
     client_key: String,
 
@@ -112,37 +96,6 @@ fn require_manager(manager: &Option<String>) -> Result<&str> {
     }
 }
 
-fn require_job_admin_connection(cli: &Cli) -> Result<(String, TlsConfig)> {
-    let manager = cli.job_admin_manager.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "--job-admin-manager (or WR_JOB_ADMIN_MANAGER) is required for jobs commands"
-        )
-    })?;
-    let ca_cert_path = cli.job_admin_ca_cert.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "--job-admin-ca-cert (or WR_JOB_ADMIN_CA_CERT) is required for jobs commands"
-        )
-    })?;
-    let cert_path = cli.job_admin_client_cert.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "--job-admin-client-cert (or WR_JOB_ADMIN_CLIENT_CERT) is required for jobs commands"
-        )
-    })?;
-    let key_path = cli.job_admin_client_key.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "--job-admin-client-key (or WR_JOB_ADMIN_CLIENT_KEY) is required for jobs commands"
-        )
-    })?;
-    Ok((
-        manager,
-        TlsConfig {
-            cert_path,
-            key_path,
-            ca_cert_path,
-        },
-    ))
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
@@ -154,8 +107,13 @@ async fn main() -> Result<()> {
     cmd::helpers::set_verbose(cli.verbose);
 
     client::set_tls_config(build_tls_config(&cli));
-    let job_admin_connection = matches!(&cli.command, Commands::Jobs(_))
-        .then(|| require_job_admin_connection(&cli))
+    let job_connection = matches!(&cli.command, Commands::Jobs(_))
+        .then(|| {
+            Ok::<_, anyhow::Error>((
+                require_manager(&cli.manager)?.to_string(),
+                build_tls_config(&cli),
+            ))
+        })
         .transpose()?;
 
     match cli.command {
@@ -168,7 +126,7 @@ async fn main() -> Result<()> {
         Commands::Metrics(args) => cmd::metrics::run(args).await,
         Commands::Invoke(args) => cmd::invoke::run(args, require_manager(&cli.manager)?).await,
         Commands::Jobs(args) => {
-            let (manager, tls) = job_admin_connection
+            let (manager, tls) = job_connection
                 .as_ref()
                 .expect("jobs connection was validated before command dispatch");
             cmd::jobs::run(args, manager, tls).await
@@ -192,24 +150,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn jobs_never_falls_back_to_runtime_manager_credentials() {
-        let cli = Cli::try_parse_from([
+    fn obsolete_job_admin_listener_flags_are_rejected() {
+        assert!(Cli::try_parse_from([
             "wr-cli",
-            "--manager",
-            "https://runtime-manager:9000",
-            "--ca-cert",
-            "runtime-ca.crt",
-            "--client-cert",
-            "runtime-client.crt",
-            "--client-key",
-            "runtime-client.key",
+            "--job-admin-manager",
+            "https://jobs-manager:9020",
             "jobs",
             "queues",
         ])
-        .unwrap();
-
-        let error = require_job_admin_connection(&cli).unwrap_err();
-        assert!(error.to_string().contains("--job-admin-manager"));
+        .is_err());
     }
 
     #[test]
@@ -243,26 +192,27 @@ mod tests {
     }
 
     #[test]
-    fn jobs_requires_and_uses_complete_dedicated_credentials() {
+    fn jobs_uses_the_named_manager_identity() {
         let cli = Cli::try_parse_from([
             "wr-cli",
-            "--job-admin-manager",
-            "https://jobs-manager:9020",
-            "--job-admin-ca-cert",
-            "operator-ca.crt",
-            "--job-admin-client-cert",
+            "--manager",
+            "https://manager:9000",
+            "--ca-cert",
+            "server-root.crt",
+            "--client-cert",
             "operator.crt",
-            "--job-admin-client-key",
+            "--client-key",
             "operator.key",
             "jobs",
             "queues",
         ])
         .unwrap();
-
-        let (manager, tls) = require_job_admin_connection(&cli).unwrap();
-        assert_eq!(manager, "https://jobs-manager:9020");
-        assert_eq!(tls.ca_cert_path, "operator-ca.crt");
+        assert_eq!(
+            require_manager(&cli.manager).unwrap(),
+            "https://manager:9000"
+        );
+        let tls = build_tls_config(&cli);
+        assert_eq!(tls.ca_cert_path, "server-root.crt");
         assert_eq!(tls.cert_path, "operator.crt");
-        assert_eq!(tls.key_path, "operator.key");
     }
 }

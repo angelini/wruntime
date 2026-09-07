@@ -5,24 +5,19 @@ proxy_address   = "http://127.0.0.1:9001"
 control_address = "http://127.0.0.1:9002"
 peer_address    = "https://127.0.0.1:9443"
 
-[node.tls]
-cert_path    = "certs/127.0.0.1.crt"
-key_path     = "certs/127.0.0.1.key"
-ca_cert_path = "certs/ca.crt"
-
 [database]
 url             = "postgres://user:pass@localhost:5432/codegen"
 max_connections = 20
 
 [job_admin]
 listen_address    = "127.0.0.1:9150"
-advertise_address = "https://127.0.0.1:9150"
+advertise_address = "https://127.0.0.1:9150/"
 queue_id          = "codegen-jobs"
 
 [job_admin.tls]
-cert_path    = "certs/job-admin-delegation/127.0.0.1.crt"
-key_path     = "certs/job-admin-delegation/127.0.0.1.key"
-ca_cert_path = "certs/job-admin-delegation/ca.crt"
+cert_path           = "certs/job-admin-engine-endpoint/leaf.pem"
+key_path            = "certs/job-admin-engine-endpoint/key.pem"
+client_ca_cert_path = "certs/runtime-client-root/ca.crt"
 
 [blobstore]
 endpoint          = "http://127.0.0.1:8900"

@@ -12,8 +12,6 @@ pub struct NodeConfig {
     pub control_address: String,
     /// Explicit mTLS URL advertised to peer proxies, e.g. "https://node-a:9443".
     pub peer_address: String,
-    /// TLS certificate configuration for mTLS.
-    pub tls: TlsConfig,
 }
 
 /// Returns `true` if `addr` binds a loopback interface.
@@ -41,15 +39,34 @@ pub fn is_loopback_addr(addr: &str) -> bool {
     host == "localhost"
 }
 
-/// TLS certificate paths for mutual TLS authentication.
+/// Generic TLS paths retained for non-directional tooling inputs. Runtime
+/// listener and connector configuration uses the direction-specific types.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
-    /// PEM file containing this node's certificate chain.
     pub cert_path: String,
-    /// PEM file containing this node's private key.
     pub key_path: String,
-    /// PEM file containing the CA certificate used to verify peers.
     pub ca_cert_path: String,
+}
+
+/// Server endpoint identity plus the explicit root used to authenticate
+/// clients. Server and client private keys are never represented by one value.
+#[derive(Debug, Deserialize, Clone, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ServerTlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
+    pub client_ca_cert_path: String,
+}
+
+/// Outbound workload identity plus the explicit root used to authenticate the
+/// remote server endpoint.
+#[derive(Debug, Deserialize, Clone, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientTlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
+    pub server_ca_cert_path: String,
 }
 
 impl NodeConfig {
@@ -93,14 +110,39 @@ mod tests {
             proxy_address = "http://127.0.0.1:9001"
             control_address = "http://127.0.0.1:9002"
             peer_address = "{peer_address}"
-
-            [tls]
-            cert_path = "c.crt"
-            key_path = "c.key"
-            ca_cert_path = "ca.crt"
         "#
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn direction_specific_tls_rejects_ambiguous_root_fields() {
+        let client: ClientTlsConfig = toml::from_str(
+            r#"
+            cert_path = "client.crt"
+            key_path = "client.key"
+            server_ca_cert_path = "server-root.crt"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(client.server_ca_cert_path, "server-root.crt");
+        assert!(toml::from_str::<ClientTlsConfig>(
+            r#"
+            cert_path = "client.crt"
+            key_path = "client.key"
+            ca_cert_path = "ambiguous.crt"
+        "#
+        )
+        .is_err());
+        let server: ServerTlsConfig = toml::from_str(
+            r#"
+            cert_path = "server.crt"
+            key_path = "server.key"
+            client_ca_cert_path = "client-root.crt"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(server.client_ca_cert_path, "client-root.crt");
     }
 
     #[test]
@@ -134,11 +176,6 @@ mod tests {
             proxy_address = "http://127.0.0.1:9001"
             control_address = "http://127.0.0.1:9002"
             peer_port = 9443
-
-            [tls]
-            cert_path = "c.crt"
-            key_path = "c.key"
-            ca_cert_path = "ca.crt"
         "#;
         assert!(toml::from_str::<NodeConfig>(toml).is_err());
     }
@@ -146,21 +183,6 @@ mod tests {
     #[test]
     fn missing_proxy_address_fails() {
         let toml = r#"
-            control_address = "http://127.0.0.1:9002"
-            peer_address = "https://node-a:9443"
-
-            [tls]
-            cert_path = "c.crt"
-            key_path = "c.key"
-            ca_cert_path = "ca.crt"
-        "#;
-        assert!(toml::from_str::<NodeConfig>(toml).is_err());
-    }
-
-    #[test]
-    fn missing_tls_fails() {
-        let toml = r#"
-            proxy_address = "http://127.0.0.1:9001"
             control_address = "http://127.0.0.1:9002"
             peer_address = "https://node-a:9443"
         "#;

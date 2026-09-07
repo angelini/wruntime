@@ -7,8 +7,9 @@ use helpers::{
 use anyhow::Result;
 
 use wr_common::wruntime::{
-    DeleteSecretRequest, EngineRegistration, ListSecretsRequest, ModuleDescriptor,
-    RegisterEngineRequest, SecretRequest, SetSecretRequest,
+    BeginDeploymentRequest, DeleteSecretRequest, DeploymentInventoryV1, DeploymentMetadata,
+    EngineRegistration, ExpectedEngine, ListSecretsRequest, ModuleDescriptor, NodeOperationAction,
+    RegisterEngineRequest, RolloutPolicy, SecretRequest, SetSecretRequest, SubmitOperationRequest,
 };
 
 #[tokio::test]
@@ -112,7 +113,7 @@ async fn test_delete_secret() -> Result<()> {
 
 #[tokio::test]
 async fn test_set_secret_upsert_overwrites() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
     c.set_secret(SetSecretRequest {
         namespace: "ns".into(),
@@ -140,31 +141,32 @@ async fn test_set_secret_upsert_overwrites() -> Result<()> {
 
     // Verify the new value is returned during registration.
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    let reg_resp = c
-        .register_engine(RegisterEngineRequest {
-            registration: Some(EngineRegistration {
-                engine_id: "upsert-engine".into(),
-                address: engine_addr,
-                proxy_address: "http://127.0.0.1:9001".into(),
-                peer_address: TEST_SELF_PEER.into(),
-                modules: vec![ModuleDescriptor {
-                    name: "mod".into(),
-                    namespace: "ns".into(),
-                    version: "1.0.0".into(),
-                    proto_schema: minimal_file_descriptor_set(),
-                }],
-                secrets: vec![SecretRequest {
-                    namespace: "ns".into(),
-                    key: "API_KEY".into(),
-                }],
-                db_namespaces: vec![],
-                deployment: None,
-                job_queue_id: String::new(),
-                job_admin_address: String::new(),
-            }),
-        })
-        .await?
-        .into_inner();
+    let reg_resp = helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
+            engine_id: "upsert-engine".into(),
+            address: engine_addr,
+            proxy_address: "http://127.0.0.1:9001".into(),
+            peer_address: TEST_SELF_PEER.into(),
+            modules: vec![ModuleDescriptor {
+                name: "mod".into(),
+                namespace: "ns".into(),
+                version: "1.0.0".into(),
+                proto_schema: minimal_file_descriptor_set(),
+            }],
+            secrets: vec![SecretRequest {
+                namespace: "ns".into(),
+                key: "API_KEY".into(),
+            }],
+            db_namespaces: vec![],
+            deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
+        },
+    )
+    .await?
+    .into_inner();
 
     assert!(reg_resp.accepted);
     assert_eq!(reg_resp.secrets.len(), 1);
@@ -240,7 +242,7 @@ async fn test_delete_secret_empty_fields_rejected() -> Result<()> {
 
 #[tokio::test]
 async fn test_register_engine_with_secrets() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
     // Store secrets.
     c.set_secret(SetSecretRequest {
@@ -258,37 +260,38 @@ async fn test_register_engine_with_secrets() -> Result<()> {
 
     // Register engine requesting those secrets.
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    let resp = c
-        .register_engine(RegisterEngineRequest {
-            registration: Some(EngineRegistration {
-                engine_id: "secret-engine".into(),
-                address: engine_addr,
-                proxy_address: "http://127.0.0.1:9001".into(),
-                peer_address: TEST_SELF_PEER.into(),
-                modules: vec![ModuleDescriptor {
-                    name: "svc".into(),
+    let resp = helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
+            engine_id: "secret-engine".into(),
+            address: engine_addr,
+            proxy_address: "http://127.0.0.1:9001".into(),
+            peer_address: TEST_SELF_PEER.into(),
+            modules: vec![ModuleDescriptor {
+                name: "svc".into(),
+                namespace: "myapp".into(),
+                version: "1.0.0".into(),
+                proto_schema: minimal_file_descriptor_set(),
+            }],
+            secrets: vec![
+                SecretRequest {
                     namespace: "myapp".into(),
-                    version: "1.0.0".into(),
-                    proto_schema: minimal_file_descriptor_set(),
-                }],
-                secrets: vec![
-                    SecretRequest {
-                        namespace: "myapp".into(),
-                        key: "DB_PASSWORD".into(),
-                    },
-                    SecretRequest {
-                        namespace: "myapp".into(),
-                        key: "API_TOKEN".into(),
-                    },
-                ],
-                db_namespaces: vec![],
-                deployment: None,
-                job_queue_id: String::new(),
-                job_admin_address: String::new(),
-            }),
-        })
-        .await?
-        .into_inner();
+                    key: "DB_PASSWORD".into(),
+                },
+                SecretRequest {
+                    namespace: "myapp".into(),
+                    key: "API_TOKEN".into(),
+                },
+            ],
+            db_namespaces: vec![],
+            deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
+        },
+    )
+    .await?
+    .into_inner();
 
     assert!(resp.accepted);
     // Should have one NamespaceSecrets entry for "myapp".
@@ -305,39 +308,40 @@ async fn test_register_engine_with_secrets() -> Result<()> {
 
 #[tokio::test]
 async fn test_register_engine_with_missing_secret_fails() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
     // Register engine requesting a secret that doesn't exist.
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    let result = c
-        .register_engine(RegisterEngineRequest {
-            registration: Some(EngineRegistration {
-                engine_id: "missing-secret-engine".into(),
-                address: engine_addr,
-                proxy_address: "http://127.0.0.1:9001".into(),
-                peer_address: TEST_SELF_PEER.into(),
-                modules: vec![ModuleDescriptor {
-                    name: "svc".into(),
-                    namespace: "myapp".into(),
-                    version: "1.0.0".into(),
-                    proto_schema: minimal_file_descriptor_set(),
-                }],
-                secrets: vec![SecretRequest {
-                    namespace: "myapp".into(),
-                    key: "NONEXISTENT".into(),
-                }],
-                db_namespaces: vec![],
-                deployment: None,
-                job_queue_id: String::new(),
-                job_admin_address: String::new(),
-            }),
-        })
-        .await;
+    let result = helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
+            engine_id: "missing-secret-engine".into(),
+            address: engine_addr,
+            proxy_address: "http://127.0.0.1:9001".into(),
+            peer_address: TEST_SELF_PEER.into(),
+            modules: vec![ModuleDescriptor {
+                name: "svc".into(),
+                namespace: "myapp".into(),
+                version: "1.0.0".into(),
+                proto_schema: minimal_file_descriptor_set(),
+            }],
+            secrets: vec![SecretRequest {
+                namespace: "myapp".into(),
+                key: "NONEXISTENT".into(),
+            }],
+            db_namespaces: vec![],
+            deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
+        },
+    )
+    .await;
 
     assert!(result.is_err());
     let status = result.unwrap_err();
     assert_eq!(status.code(), tonic::Code::NotFound);
-    assert!(status.message().contains("missing secrets"));
+    assert!(status.message().contains("missing secret"));
 
     let _ = engine_shutdown.send(());
     Ok(())
@@ -345,31 +349,32 @@ async fn test_register_engine_with_missing_secret_fails() -> Result<()> {
 
 #[tokio::test]
 async fn test_register_engine_no_secrets_succeeds() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    let resp = c
-        .register_engine(RegisterEngineRequest {
-            registration: Some(EngineRegistration {
-                engine_id: "no-secrets-engine".into(),
-                address: engine_addr,
-                proxy_address: "http://127.0.0.1:9001".into(),
-                peer_address: TEST_SELF_PEER.into(),
-                modules: vec![ModuleDescriptor {
-                    name: "svc".into(),
-                    namespace: "ns".into(),
-                    version: "1.0.0".into(),
-                    proto_schema: minimal_file_descriptor_set(),
-                }],
-                secrets: vec![],
-                db_namespaces: vec![],
-                deployment: None,
-                job_queue_id: String::new(),
-                job_admin_address: String::new(),
-            }),
-        })
-        .await?
-        .into_inner();
+    let resp = helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
+            engine_id: "no-secrets-engine".into(),
+            address: engine_addr,
+            proxy_address: "http://127.0.0.1:9001".into(),
+            peer_address: TEST_SELF_PEER.into(),
+            modules: vec![ModuleDescriptor {
+                name: "svc".into(),
+                namespace: "ns".into(),
+                version: "1.0.0".into(),
+                proto_schema: minimal_file_descriptor_set(),
+            }],
+            secrets: vec![],
+            db_namespaces: vec![],
+            deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
+        },
+    )
+    .await?
+    .into_inner();
 
     assert!(resp.accepted);
     assert!(resp.secrets.is_empty());
@@ -380,7 +385,7 @@ async fn test_register_engine_no_secrets_succeeds() -> Result<()> {
 
 #[tokio::test]
 async fn test_secrets_across_namespaces() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
     // Store secrets in two namespaces.
     c.set_secret(SetSecretRequest {
@@ -398,45 +403,46 @@ async fn test_secrets_across_namespaces() -> Result<()> {
 
     // Register engine requesting secrets from both namespaces.
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    let resp = c
-        .register_engine(RegisterEngineRequest {
-            registration: Some(EngineRegistration {
-                engine_id: "multi-ns-engine".into(),
-                address: engine_addr,
-                proxy_address: "http://127.0.0.1:9001".into(),
-                peer_address: TEST_SELF_PEER.into(),
-                modules: vec![
-                    ModuleDescriptor {
-                        name: "fe".into(),
-                        namespace: "frontend".into(),
-                        version: "1.0.0".into(),
-                        proto_schema: minimal_file_descriptor_set(),
-                    },
-                    ModuleDescriptor {
-                        name: "be".into(),
-                        namespace: "backend".into(),
-                        version: "1.0.0".into(),
-                        proto_schema: minimal_file_descriptor_set(),
-                    },
-                ],
-                secrets: vec![
-                    SecretRequest {
-                        namespace: "frontend".into(),
-                        key: "API_KEY".into(),
-                    },
-                    SecretRequest {
-                        namespace: "backend".into(),
-                        key: "API_KEY".into(),
-                    },
-                ],
-                db_namespaces: vec![],
-                deployment: None,
-                job_queue_id: String::new(),
-                job_admin_address: String::new(),
-            }),
-        })
-        .await?
-        .into_inner();
+    let resp = helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
+            engine_id: "multi-ns-engine".into(),
+            address: engine_addr,
+            proxy_address: "http://127.0.0.1:9001".into(),
+            peer_address: TEST_SELF_PEER.into(),
+            modules: vec![
+                ModuleDescriptor {
+                    name: "fe".into(),
+                    namespace: "frontend".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: minimal_file_descriptor_set(),
+                },
+                ModuleDescriptor {
+                    name: "be".into(),
+                    namespace: "backend".into(),
+                    version: "1.0.0".into(),
+                    proto_schema: minimal_file_descriptor_set(),
+                },
+            ],
+            secrets: vec![
+                SecretRequest {
+                    namespace: "frontend".into(),
+                    key: "API_KEY".into(),
+                },
+                SecretRequest {
+                    namespace: "backend".into(),
+                    key: "API_KEY".into(),
+                },
+            ],
+            db_namespaces: vec![],
+            deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
+        },
+    )
+    .await?
+    .into_inner();
 
     assert!(resp.accepted);
     assert_eq!(resp.secrets.len(), 2);
@@ -476,7 +482,7 @@ async fn test_delete_nonexistent_secret_succeeds() -> Result<()> {
 
 #[tokio::test]
 async fn test_secret_deleted_then_registration_fails() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
     // Set then delete a secret.
     c.set_secret(SetSecretRequest {
@@ -493,30 +499,31 @@ async fn test_secret_deleted_then_registration_fails() -> Result<()> {
 
     // Now register requesting that deleted secret — should fail.
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    let result = c
-        .register_engine(RegisterEngineRequest {
-            registration: Some(EngineRegistration {
-                engine_id: "deleted-secret-engine".into(),
-                address: engine_addr,
-                proxy_address: "http://127.0.0.1:9001".into(),
-                peer_address: TEST_SELF_PEER.into(),
-                modules: vec![ModuleDescriptor {
-                    name: "svc".into(),
-                    namespace: "ns".into(),
-                    version: "1.0.0".into(),
-                    proto_schema: minimal_file_descriptor_set(),
-                }],
-                secrets: vec![SecretRequest {
-                    namespace: "ns".into(),
-                    key: "TEMP".into(),
-                }],
-                db_namespaces: vec![],
-                deployment: None,
-                job_queue_id: String::new(),
-                job_admin_address: String::new(),
-            }),
-        })
-        .await;
+    let result = helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
+            engine_id: "deleted-secret-engine".into(),
+            address: engine_addr,
+            proxy_address: "http://127.0.0.1:9001".into(),
+            peer_address: TEST_SELF_PEER.into(),
+            modules: vec![ModuleDescriptor {
+                name: "svc".into(),
+                namespace: "ns".into(),
+                version: "1.0.0".into(),
+                proto_schema: minimal_file_descriptor_set(),
+            }],
+            secrets: vec![SecretRequest {
+                namespace: "ns".into(),
+                key: "TEMP".into(),
+            }],
+            db_namespaces: vec![],
+            deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
+        },
+    )
+    .await;
 
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
@@ -527,15 +534,72 @@ async fn test_secret_deleted_then_registration_fails() -> Result<()> {
 
 #[tokio::test]
 async fn test_concurrent_db_credential_registration_same_password() -> Result<()> {
-    let (_pool, _addr, c) = manager_trio().await?;
+    let (_pool, _addr, mut c) = manager_trio().await?;
 
     const N: usize = 8;
     let namespace = "concurrent-db-ns";
 
+    let bundle_digest = format!("sha256:{}", "b".repeat(64));
+    let slots = (0..N).map(|i| format!("slot-{i}")).collect::<Vec<_>>();
+    let deployment = c
+        .begin_deployment(BeginDeploymentRequest {
+            node_id: "node-a".into(),
+            attempt_token: "concurrent-db-deployment".into(),
+            bundle_digest: bundle_digest.clone(),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: slots
+                    .iter()
+                    .map(|slot| ExpectedEngine {
+                        engine_slot: slot.clone(),
+                        db_namespaces: vec![namespace.into()],
+                        ..Default::default()
+                    })
+                    .collect(),
+            }),
+        })
+        .await?
+        .into_inner()
+        .deployment
+        .expect("concurrent credential deployment");
+    let resolved_release_digest = format!("sha256:{}", "c".repeat(64));
+    c.finalize_deployment(wr_common::wruntime::FinalizeDeploymentRequest {
+        node_id: "node-a".into(),
+        attempt_token: "concurrent-db-deployment".into(),
+        revision: deployment.revision,
+        bundle_digest: bundle_digest.clone(),
+        resolved_release_digest: resolved_release_digest.clone(),
+    })
+    .await?;
+    let operation = c
+        .submit_operation(SubmitOperationRequest {
+            node_id: "node-a".into(),
+            request_token: "concurrent-db-deployment".into(),
+            action: NodeOperationAction::InitialApply as i32,
+            engine_slots: slots.clone(),
+            target_revision: deployment.revision,
+            bundle_digest: bundle_digest.clone(),
+            policy: Some(RolloutPolicy {
+                max_unavailable: N as u32,
+                canary_slot: slots[0].clone(),
+                pause_after_canary: false,
+                allow_downtime: true,
+                deadline_seconds: 300,
+            }),
+            resolved_release_digest,
+        })
+        .await?
+        .into_inner()
+        .operation
+        .expect("concurrent credential operation");
+
     let mut handles = Vec::with_capacity(N);
-    for i in 0..N {
+    for (i, slot) in slots.into_iter().enumerate() {
         let mut client = c.clone();
         let ns = namespace.to_string();
+        let deployment = deployment.clone();
+        let operation_id = operation.operation_id.clone();
+        let bundle_digest = bundle_digest.clone();
         handles.push(tokio::spawn(async move {
             client
                 .register_engine(RegisterEngineRequest {
@@ -547,10 +611,18 @@ async fn test_concurrent_db_credential_registration_same_password() -> Result<()
                         modules: vec![],
                         secrets: vec![],
                         db_namespaces: vec![ns],
-                        deployment: None,
+                        deployment: Some(DeploymentMetadata {
+                            node_id: "node-a".into(),
+                            revision: deployment.revision,
+                            bundle_digest,
+                            engine_slot: slot,
+                            operation_id,
+                            revision_digest: deployment.revision_digest,
+                        }),
                         job_queue_id: String::new(),
                         job_admin_address: String::new(),
                     }),
+                    activation_id: uuid::Uuid::new_v4().to_string(),
                 })
                 .await
                 .map(|r| r.into_inner())
@@ -585,10 +657,18 @@ async fn test_concurrent_db_credential_registration_same_password() -> Result<()
                 modules: vec![],
                 secrets: vec![],
                 db_namespaces: vec![namespace.into()],
-                deployment: None,
+                deployment: Some(DeploymentMetadata {
+                    node_id: "node-a".into(),
+                    revision: deployment.revision,
+                    bundle_digest,
+                    engine_slot: "slot-0".into(),
+                    operation_id: operation.operation_id,
+                    revision_digest: deployment.revision_digest,
+                }),
                 job_queue_id: String::new(),
                 job_admin_address: String::new(),
             }),
+            activation_id: uuid::Uuid::new_v4().to_string(),
         })
         .await?
         .into_inner();
@@ -599,44 +679,46 @@ async fn test_concurrent_db_credential_registration_same_password() -> Result<()
 
 #[tokio::test]
 async fn test_db_credential_reregistration_returns_same_password() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
     let namespace = "reg-db-ns";
 
-    let first = c
-        .register_engine(RegisterEngineRequest {
-            registration: Some(EngineRegistration {
-                engine_id: "reg-engine-1".into(),
-                address: "http://127.0.0.1:9999".into(),
-                proxy_address: "http://127.0.0.1:9001".into(),
-                peer_address: TEST_SELF_PEER.into(),
-                modules: vec![],
-                secrets: vec![],
-                db_namespaces: vec![namespace.into()],
-                deployment: None,
-                job_queue_id: String::new(),
-                job_admin_address: String::new(),
-            }),
-        })
-        .await?
-        .into_inner();
+    let first = helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
+            engine_id: "reg-engine-1".into(),
+            address: "http://127.0.0.1:9999".into(),
+            proxy_address: "http://127.0.0.1:9001".into(),
+            peer_address: TEST_SELF_PEER.into(),
+            modules: vec![],
+            secrets: vec![],
+            db_namespaces: vec![namespace.into()],
+            deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
+        },
+    )
+    .await?
+    .into_inner();
 
-    let second = c
-        .register_engine(RegisterEngineRequest {
-            registration: Some(EngineRegistration {
-                engine_id: "reg-engine-2".into(),
-                address: "http://127.0.0.1:9999".into(),
-                proxy_address: "http://127.0.0.1:9001".into(),
-                peer_address: TEST_SELF_PEER.into(),
-                modules: vec![],
-                secrets: vec![],
-                db_namespaces: vec![namespace.into()],
-                deployment: None,
-                job_queue_id: String::new(),
-                job_admin_address: String::new(),
-            }),
-        })
-        .await?
-        .into_inner();
+    let second = helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
+            engine_id: "reg-engine-2".into(),
+            address: "http://127.0.0.1:9999".into(),
+            proxy_address: "http://127.0.0.1:9001".into(),
+            peer_address: TEST_SELF_PEER.into(),
+            modules: vec![],
+            secrets: vec![],
+            db_namespaces: vec![namespace.into()],
+            deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
+        },
+    )
+    .await?
+    .into_inner();
 
     assert_eq!(first.db_credentials.len(), 1);
     assert_eq!(second.db_credentials.len(), 1);

@@ -4918,6 +4918,7 @@ dependencies = [
  "wr-engine",
  "wr-manager",
  "wr-proxy",
+ "x509-parser",
 ]
 
 [[package]]
@@ -4956,6 +4957,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]
@@ -5022,6 +5024,7 @@ dependencies = [
  "refinery",
  "rustls",
  "serde",
+ "sha2 0.10.9",
  "tokio",
  "tokio-postgres",
  "tokio-retry",

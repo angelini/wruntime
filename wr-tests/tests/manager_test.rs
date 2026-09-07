@@ -9,13 +9,15 @@ use anyhow::Result;
 
 use wr_common::wruntime::{
     AbandonDeploymentRequest, AttestNodeAgentRequest, BackendProcessState, BeginDeploymentRequest,
-    BeginEngineDrainRequest, ClaimOperationRequest, DeploymentMetadata, DeploymentState,
-    DeregisterEngineRequest, EngineRegistration, ExpectedEngine, FinalizeDeploymentRequest,
-    GetClusterStatusRequest, GetOperatorStatusRequest, GetRoutingTableRequest, GetSchemaRequest,
-    HeartbeatRequest, ListEnginesRequest, ModuleDescriptor, ModuleIdentity, NodeOperationAction,
+    BeginEngineDrainRequest, ClaimOperationRequest, DeploymentInventoryV1, DeploymentMetadata,
+    DeploymentState, DeregisterEngineRequest, EngineOwnershipFence, EngineRegistration,
+    ExpectedEngine, ExpectedModule, FinalizeDeploymentRequest, GetClusterStatusRequest,
+    GetOperatorStatusRequest, GetRoutingTableRequest, GetSchemaRequest, HeartbeatRequest,
+    ListEnginesRequest, ModuleDescriptor, ModuleIdentity, NodeOperationAction,
     NodeOperationStepKind, PutNodeAgentPolicyRequest, RegisterEngineRequest,
     ReportNodeObservationRequest, ReportStepResultRequest, ResumeOperationRequest, RolloutPolicy,
-    RoutingRule, SecretRequest, StatusSeverity, SubmitOperationRequest, VerifyDeploymentResponse,
+    RoutingRule, SecretRequest, StatusSeverity, SubmitOperationRequest, VerifyDeploymentRequest,
+    VerifyDeploymentResponse,
 };
 
 async fn verify_deployment(
@@ -44,10 +46,12 @@ async fn verify_deployment(
 
 #[tokio::test]
 async fn test_register_and_list_engines() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9100".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -63,8 +67,8 @@ async fn test_register_and_list_engines() -> Result<()> {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     let list = c
@@ -92,13 +96,9 @@ async fn job_admin_registration_is_atomic_validated_and_persisted() -> Result<()
         db_namespaces: vec![],
         deployment: None,
         job_queue_id: "primary-jobs".into(),
-        job_admin_address: "https://127.0.0.1:9150".into(),
+        job_admin_address: "https://127.0.0.1:9150/".into(),
     };
-    client
-        .register_engine(RegisterEngineRequest {
-            registration: Some(registration.clone()),
-        })
-        .await?;
+    helpers::manager::register_managed_engine(&pool, &mut client, registration.clone()).await?;
 
     let listed = client
         .list_engines(ListEnginesRequest {})
@@ -106,7 +106,7 @@ async fn job_admin_registration_is_atomic_validated_and_persisted() -> Result<()
         .into_inner()
         .engines;
     assert_eq!(listed[0].job_queue_id, "primary-jobs");
-    assert_eq!(listed[0].job_admin_address, "https://127.0.0.1:9150");
+    assert_eq!(listed[0].job_admin_address, "https://127.0.0.1:9150/");
     let delegates = wr_manager::db::list_job_admin_delegates(&pool, 30).await?;
     assert_eq!(delegates.len(), 1);
     assert!(delegates[0].fresh);
@@ -114,8 +114,8 @@ async fn job_admin_registration_is_atomic_validated_and_persisted() -> Result<()
 
     for (queue_id, address) in [
         ("primary-jobs", ""),
-        ("", "https://127.0.0.1:9151"),
-        ("Invalid_Queue", "https://127.0.0.1:9151"),
+        ("", "https://127.0.0.1:9151/"),
+        ("Invalid_Queue", "https://127.0.0.1:9151/"),
         ("other-jobs", "http://127.0.0.1:9151"),
         ("other-jobs", "https://0.0.0.0:9151"),
     ] {
@@ -123,10 +123,7 @@ async fn job_admin_registration_is_atomic_validated_and_persisted() -> Result<()
         malformed.engine_id = format!("bad-{}", malformed.engine_id);
         malformed.job_queue_id = queue_id.into();
         malformed.job_admin_address = address.into();
-        let status = client
-            .register_engine(RegisterEngineRequest {
-                registration: Some(malformed),
-            })
+        let status = helpers::manager::register_managed_engine(&pool, &mut client, malformed)
             .await
             .expect_err("malformed job delegate must be rejected");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
@@ -137,10 +134,12 @@ async fn job_admin_registration_is_atomic_validated_and_persisted() -> Result<()
 
 #[tokio::test]
 async fn test_deregister_engine() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    let registration = helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9101".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -151,12 +150,14 @@ async fn test_deregister_engine() -> Result<()> {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     c.deregister_engine(DeregisterEngineRequest {
         engine_id: "e1".into(),
+
+        fence: registration.into_inner().fence,
     })
     .await?;
 
@@ -172,10 +173,12 @@ async fn test_deregister_engine() -> Result<()> {
 
 #[tokio::test]
 async fn test_heartbeat() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    let registration = helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "e1".into(),
             address: "http://127.0.0.1:9102".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -186,13 +189,15 @@ async fn test_heartbeat() -> Result<()> {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     c.heartbeat(HeartbeatRequest {
         engine_id: "e1".into(),
         healthy_modules: vec![],
+
+        fence: registration.into_inner().fence,
     })
     .await?;
 
@@ -201,28 +206,30 @@ async fn test_heartbeat() -> Result<()> {
 
 #[tokio::test]
 async fn test_readiness_and_drain_are_atomic_versioned_and_fenced() -> Result<()> {
-    let (_pool, _addr, mut client) = manager_trio().await?;
-    client
-        .register_engine(RegisterEngineRequest {
-            registration: Some(EngineRegistration {
-                engine_id: "lifecycle-engine".into(),
-                address: "http://127.0.0.1:9199".into(),
-                proxy_address: TEST_SELF_PEER.into(),
-                peer_address: TEST_SELF_PEER.into(),
-                modules: vec![ModuleDescriptor {
-                    name: "lifecycle-service".into(),
-                    namespace: "store".into(),
-                    version: "1.0.0".into(),
-                    proto_schema: minimal_file_descriptor_set(),
-                }],
-                secrets: vec![],
-                db_namespaces: vec![],
-                deployment: None,
-                job_queue_id: String::new(),
-                job_admin_address: String::new(),
-            }),
-        })
-        .await?;
+    let (pool, _addr, mut client) = manager_trio().await?;
+    let registration = helpers::manager::register_managed_engine(
+        &pool,
+        &mut client,
+        EngineRegistration {
+            engine_id: "lifecycle-engine".into(),
+            address: "http://127.0.0.1:9199".into(),
+            proxy_address: TEST_SELF_PEER.into(),
+            peer_address: TEST_SELF_PEER.into(),
+            modules: vec![ModuleDescriptor {
+                name: "lifecycle-service".into(),
+                namespace: "store".into(),
+                version: "1.0.0".into(),
+                proto_schema: minimal_file_descriptor_set(),
+            }],
+            secrets: vec![],
+            db_namespaces: vec![],
+            deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
+        },
+    )
+    .await?;
+    let fence = registration.into_inner().fence;
 
     let readiness = client
         .heartbeat(HeartbeatRequest {
@@ -233,6 +240,8 @@ async fn test_readiness_and_drain_are_atomic_versioned_and_fenced() -> Result<()
                 version: "1.0.0".into(),
                 proto_schema: vec![],
             }],
+
+            fence: fence.clone(),
         })
         .await?
         .into_inner();
@@ -248,6 +257,8 @@ async fn test_readiness_and_drain_are_atomic_versioned_and_fenced() -> Result<()
     let drained = client
         .begin_engine_drain(BeginEngineDrainRequest {
             engine_id: "lifecycle-engine".into(),
+
+            fence: fence.clone(),
         })
         .await?
         .into_inner();
@@ -264,6 +275,8 @@ async fn test_readiness_and_drain_are_atomic_versioned_and_fenced() -> Result<()
         .heartbeat(HeartbeatRequest {
             engine_id: "lifecycle-engine".into(),
             healthy_modules: vec![],
+
+            fence: fence.clone(),
         })
         .await
     {
@@ -272,13 +285,12 @@ async fn test_readiness_and_drain_are_atomic_versioned_and_fenced() -> Result<()
     };
     assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
 
-    for _ in 0..2 {
-        client
-            .deregister_engine(DeregisterEngineRequest {
-                engine_id: "lifecycle-engine".into(),
-            })
-            .await?;
-    }
+    client
+        .deregister_engine(DeregisterEngineRequest {
+            engine_id: "lifecycle-engine".into(),
+            fence,
+        })
+        .await?;
     Ok(())
 }
 
@@ -372,12 +384,14 @@ async fn test_routing_rule_rejects_empty_peer_address() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_schema_after_registration() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
     let schema_bytes = minimal_file_descriptor_set();
 
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "schema-e1".into(),
             address: "http://127.0.0.1:9200".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -393,8 +407,8 @@ async fn test_get_schema_after_registration() -> Result<()> {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     let resp = c
@@ -462,7 +476,7 @@ async fn test_get_schema_empty_namespace_rejected() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_schema_multiple_versions() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
     // Build two distinct schemas so we can tell them apart.
     let schema_v1 = minimal_file_descriptor_set();
@@ -481,8 +495,10 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
     assert_ne!(schema_v1, schema_v2, "test schemas must differ");
 
     // Register v1.
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "ver-e1".into(),
             address: "http://127.0.0.1:9210".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -498,13 +514,15 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     // Register v2 from a different engine.
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "ver-e2".into(),
             address: "http://127.0.0.1:9211".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -520,8 +538,8 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     // Fetch each version independently.
@@ -550,13 +568,15 @@ async fn test_get_schema_multiple_versions() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_schema_cross_namespace_isolation() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
     let schema = minimal_file_descriptor_set();
 
     // Register same module name in two different namespaces.
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "ns-e1".into(),
             address: "http://127.0.0.1:9220".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -572,8 +592,8 @@ async fn test_get_schema_cross_namespace_isolation() -> Result<()> {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     // Query with the wrong namespace — should not find it.
@@ -603,13 +623,15 @@ async fn test_get_schema_cross_namespace_isolation() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_schema_updated_on_reregistration() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
     let schema_v1 = minimal_file_descriptor_set();
 
     // Initial registration.
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "reup-e1".into(),
             address: "http://127.0.0.1:9230".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -625,8 +647,8 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     // Re-register the same module/version with a different schema (ON CONFLICT UPDATE).
@@ -641,8 +663,10 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
     });
     let schema_updated = fds.encode_to_vec();
 
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "reup-e1".into(),
             address: "http://127.0.0.1:9230".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -658,8 +682,8 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     let resp = c
@@ -682,13 +706,15 @@ async fn test_get_schema_updated_on_reregistration() -> Result<()> {
 
 #[tokio::test]
 async fn test_get_schema_multi_module_engine() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
     let schema = minimal_file_descriptor_set();
 
     // Register one engine with two modules.
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "multi-e1".into(),
             address: "http://127.0.0.1:9240".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -712,8 +738,8 @@ async fn test_get_schema_multi_module_engine() -> Result<()> {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     // Both modules should be retrievable.
@@ -742,10 +768,12 @@ async fn test_get_schema_multi_module_engine() -> Result<()> {
 
 #[tokio::test]
 async fn test_register_engine_creates_default_routing_rule() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "route-e1".into(),
             address: "http://127.0.0.1:9600".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -761,8 +789,8 @@ async fn test_register_engine_creates_default_routing_rule() -> Result<()> {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     let table = c
@@ -796,11 +824,13 @@ async fn test_register_engine_creates_default_routing_rule() -> Result<()> {
 
 #[tokio::test]
 async fn test_register_engine_dedups_duplicate_module_instances() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
     let schema = minimal_file_descriptor_set();
 
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "dup-e1".into(),
             address: "http://127.0.0.1:9610".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -824,8 +854,8 @@ async fn test_register_engine_dedups_duplicate_module_instances() -> Result<()> 
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     let table = c
@@ -845,30 +875,31 @@ async fn test_register_engine_dedups_duplicate_module_instances() -> Result<()> 
 
 #[tokio::test]
 async fn test_register_engine_missing_schema_rejected_no_writes() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
-    let err = c
-        .register_engine(RegisterEngineRequest {
-            registration: Some(EngineRegistration {
-                engine_id: "badschema-e1".into(),
-                address: "http://127.0.0.1:9620".into(),
-                proxy_address: TEST_SELF_PEER.into(),
-                peer_address: TEST_SELF_PEER.into(),
-                modules: vec![ModuleDescriptor {
-                    name: "inventory".into(),
-                    namespace: "store".into(),
-                    version: "1.0.0".into(),
-                    proto_schema: vec![], // empty first descriptor -> rejected
-                }],
-                secrets: vec![],
-                db_namespaces: vec![],
-                deployment: None,
-                job_queue_id: String::new(),
-                job_admin_address: String::new(),
-            }),
-        })
-        .await
-        .unwrap_err();
+    let err = helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
+            engine_id: "badschema-e1".into(),
+            address: "http://127.0.0.1:9620".into(),
+            proxy_address: TEST_SELF_PEER.into(),
+            peer_address: TEST_SELF_PEER.into(),
+            modules: vec![ModuleDescriptor {
+                name: "inventory".into(),
+                namespace: "store".into(),
+                version: "1.0.0".into(),
+                proto_schema: vec![], // empty first descriptor -> rejected
+            }],
+            secrets: vec![],
+            db_namespaces: vec![],
+            deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
+        },
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
     let engines = c
@@ -899,35 +930,36 @@ async fn test_register_engine_missing_schema_rejected_no_writes() -> Result<()> 
 
 #[tokio::test]
 async fn test_register_engine_missing_secret_leaves_no_routes() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
-    let err = c
-        .register_engine(RegisterEngineRequest {
-            registration: Some(EngineRegistration {
-                engine_id: "secret-e1".into(),
-                address: "http://127.0.0.1:9630".into(),
-                proxy_address: TEST_SELF_PEER.into(),
-                peer_address: TEST_SELF_PEER.into(),
-                modules: vec![ModuleDescriptor {
-                    name: "inventory".into(),
-                    namespace: "store".into(),
-                    version: "1.0.0".into(),
-                    proto_schema: minimal_file_descriptor_set(),
-                }],
-                secrets: vec![SecretRequest {
-                    namespace: "store".into(),
-                    key: "api-key".into(), // never stored -> resolve_secrets fails
-                }],
-                db_namespaces: vec![],
-                deployment: None,
-                job_queue_id: String::new(),
-                job_admin_address: String::new(),
-            }),
-        })
-        .await
-        .unwrap_err();
+    let err = helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
+            engine_id: "secret-e1".into(),
+            address: "http://127.0.0.1:9630".into(),
+            proxy_address: TEST_SELF_PEER.into(),
+            peer_address: TEST_SELF_PEER.into(),
+            modules: vec![ModuleDescriptor {
+                name: "inventory".into(),
+                namespace: "store".into(),
+                version: "1.0.0".into(),
+                proto_schema: minimal_file_descriptor_set(),
+            }],
+            secrets: vec![SecretRequest {
+                namespace: "store".into(),
+                key: "api-key".into(), // never stored -> resolve_secrets fails
+            }],
+            db_namespaces: vec![],
+            deployment: None,
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
+        },
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
-    assert!(err.message().contains("missing secrets"));
+    assert!(err.message().contains("missing secret"));
 
     let engines = c
         .list_engines(ListEnginesRequest {})
@@ -967,8 +999,10 @@ async fn test_reregister_removes_dropped_module_route_and_heartbeat() -> Result<
         proto_schema: schema.clone(),
     };
 
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "recon-e1".into(),
             address: "http://127.0.0.1:9640".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -979,8 +1013,8 @@ async fn test_reregister_removes_dropped_module_route_and_heartbeat() -> Result<
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     let v_before: i64 = pool
@@ -990,8 +1024,10 @@ async fn test_reregister_removes_dropped_module_route_and_heartbeat() -> Result<
         .await?
         .get(0);
 
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "recon-e1".into(),
             address: "http://127.0.0.1:9640".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -1002,8 +1038,8 @@ async fn test_reregister_removes_dropped_module_route_and_heartbeat() -> Result<
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     let table = c
@@ -1059,8 +1095,10 @@ async fn test_reregister_removes_dropped_module_route_and_heartbeat() -> Result<
 async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Result<()> {
     let (pool, _addr, mut c) = manager_trio().await?;
 
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "recon-e2".into(),
             address: "http://127.0.0.1:9650".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -1076,8 +1114,8 @@ async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Re
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     let v_before: i64 = pool
@@ -1087,8 +1125,10 @@ async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Re
         .await?
         .get(0);
 
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    helpers::manager::register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "recon-e2".into(),
             address: "http://127.0.0.1:9650".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -1099,8 +1139,8 @@ async fn test_reregister_with_no_modules_clears_routes_and_bumps_version() -> Re
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     let table = c
@@ -1150,14 +1190,21 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
     let (pool, _addr, mut client) = manager_trio().await?;
     let expected = vec![ExpectedEngine {
         engine_slot: "primary".into(),
-        modules: vec![ModuleIdentity {
-            namespace: "store".into(),
-            name: "inventory".into(),
-            version: "1.0.0".into(),
+        modules: vec![ExpectedModule {
+            identity: Some(ModuleIdentity {
+                namespace: "store".into(),
+                name: "inventory".into(),
+                version: "1.0.0".into(),
+            }),
+            proto_schema_digest: wr_common::deployment_contract::schema_digest(
+                &minimal_file_descriptor_set(),
+            ),
         }],
+        ..Default::default()
     }];
     let digest_one = format!("sha256:{}", "1".repeat(64));
     let digest_two = format!("sha256:{}", "2".repeat(64));
+    let actor = "urn:wruntime:cluster-a:human:test-admin";
 
     let first = wr_manager::db::begin_deployment(
         &pool,
@@ -1165,9 +1212,12 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
             node_id: "node-a".into(),
             attempt_token: "attempt-one".into(),
             bundle_digest: digest_one.clone(),
-            expected_engines: expected.clone(),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: expected.clone(),
+            }),
         },
-        "operator-a",
+        actor,
     )
     .await?
     .record;
@@ -1178,9 +1228,12 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
             node_id: "node-a".into(),
             attempt_token: "attempt-one".into(),
             bundle_digest: digest_one.clone(),
-            expected_engines: expected.clone(),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: expected.clone(),
+            }),
         },
-        "operator-a",
+        actor,
     )
     .await?
     .record;
@@ -1191,9 +1244,12 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
             node_id: "node-a".into(),
             attempt_token: "attempt-one".into(),
             bundle_digest: digest_two.clone(),
-            expected_engines: expected.clone(),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: expected.clone(),
+            }),
         },
-        "operator-a",
+        actor,
     )
     .await
     .unwrap_err();
@@ -1204,21 +1260,59 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
     assert_eq!(missing.conditions[0].code, "MISSING_ENGINE");
 
     async fn activate(
-        client: &mut wr_common::wruntime::manager_service_client::ManagerServiceClient<
-            tonic::transport::Channel,
-        >,
+        client: &mut wr_common::manager_client::ManagerClient<tonic::transport::Channel>,
         pool: &deadpool_postgres::Pool,
         engine_id: &str,
         revision: u64,
         digest: &str,
-    ) -> Result<()> {
+        revision_digest: &str,
+        attempt_token: &str,
+    ) -> Result<EngineOwnershipFence> {
+        let resolved_release_digest = format!("sha256:{}", "b".repeat(64));
+        wr_manager::db::finalize_deployment(
+            pool,
+            &FinalizeDeploymentRequest {
+                node_id: "node-a".into(),
+                attempt_token: attempt_token.into(),
+                revision,
+                bundle_digest: digest.into(),
+                resolved_release_digest: resolved_release_digest.clone(),
+            },
+            "urn:wruntime:cluster-a:human:test-admin",
+        )
+        .await?;
+        let operation = client
+            .submit_operation(SubmitOperationRequest {
+                node_id: "node-a".into(),
+                request_token: attempt_token.into(),
+                action: if revision == 1 {
+                    NodeOperationAction::InitialApply as i32
+                } else {
+                    NodeOperationAction::RollingUpgrade as i32
+                },
+                engine_slots: vec!["primary".into()],
+                target_revision: revision,
+                bundle_digest: digest.into(),
+                policy: Some(RolloutPolicy {
+                    max_unavailable: 1,
+                    canary_slot: "primary".into(),
+                    pause_after_canary: false,
+                    allow_downtime: true,
+                    deadline_seconds: 300,
+                }),
+                resolved_release_digest,
+            })
+            .await?
+            .into_inner()
+            .operation
+            .ok_or_else(|| anyhow::anyhow!("activation operation missing"))?;
         let module = ModuleDescriptor {
             name: "inventory".into(),
             namespace: "store".into(),
             version: "1.0.0".into(),
             proto_schema: minimal_file_descriptor_set(),
         };
-        client
+        let registration = client
             .register_engine(RegisterEngineRequest {
                 registration: Some(EngineRegistration {
                     engine_id: engine_id.into(),
@@ -1233,11 +1327,22 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
                         revision,
                         bundle_digest: digest.into(),
                         engine_slot: "primary".into(),
+                        operation_id: operation.operation_id.clone(),
+                        revision_digest: revision_digest.into(),
                     }),
                     job_queue_id: String::new(),
                     job_admin_address: String::new(),
                 }),
+                activation_id: uuid::Uuid::new_v4().to_string(),
             })
+            .await?
+            .into_inner();
+        pool.get()
+            .await?
+            .execute(
+                "UPDATE wr_node_operations SET state='succeeded', phase='complete', updated_at=NOW() WHERE operation_id=$1",
+                &[&uuid::Uuid::parse_str(&operation.operation_id)?],
+            )
             .await?;
         let revision = i64::try_from(revision)?;
         let mut db = pool.get().await?;
@@ -1264,14 +1369,32 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
             .heartbeat(HeartbeatRequest {
                 engine_id: engine_id.into(),
                 healthy_modules: vec![module],
+                fence: registration.fence.clone(),
             })
             .await?;
         wr_manager::db::update_route_health(pool, 10.0, 10.0).await?;
-        Ok(())
+        registration
+            .fence
+            .ok_or_else(|| anyhow::anyhow!("registration fence missing"))
     }
 
-    activate(&mut client, &pool, "deploy-e1", 1, &digest_one).await?;
-    let ready = verify_deployment(&pool, "node-a", 1).await?;
+    let first_fence = activate(
+        &mut client,
+        &pool,
+        "deploy-e1",
+        1,
+        &digest_one,
+        &first.revision_digest,
+        "attempt-one",
+    )
+    .await?;
+    let ready = client
+        .verify_deployment(VerifyDeploymentRequest {
+            node_id: "node-a".into(),
+            revision: 1,
+        })
+        .await?
+        .into_inner();
     assert!(ready.ready, "conditions: {:?}", ready.conditions);
     assert!(
         ready
@@ -1334,6 +1457,8 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
                 version: "1.0.0".into(),
                 proto_schema: vec![],
             }],
+
+            fence: Some(first_fence),
         })
         .await?;
     wr_manager::db::complete_deployment(&pool, "node-a", 1, true, "").await?;
@@ -1344,9 +1469,12 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
             node_id: "node-a".into(),
             attempt_token: "attempt-two".into(),
             bundle_digest: digest_two.clone(),
-            expected_engines: expected.clone(),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: expected.clone(),
+            }),
         },
-        "operator-a",
+        actor,
     )
     .await?
     .record;
@@ -1382,9 +1510,12 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
             node_id: "node-a".into(),
             attempt_token: "attempt-three".into(),
             bundle_digest: digest_two.clone(),
-            expected_engines: expected,
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: expected,
+            }),
         },
-        "operator-a",
+        actor,
     )
     .await?
     .record;
@@ -1409,21 +1540,23 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
     );
     assert_eq!(overlap_node.target_deployment.as_ref().unwrap().revision, 3);
     let conflicting_rollback =
-        wr_manager::db::begin_rollback(&pool, "node-a", 1, "rollback-while-staged", "operator-a")
+        wr_manager::db::begin_rollback(&pool, "node-a", 1, "rollback-while-staged", actor)
             .await
             .expect_err("rollback must not overwrite an existing staged target");
     assert_eq!(conflicting_rollback.code(), tonic::Code::FailedPrecondition);
-    activate(
+    let _second_fence = activate(
         &mut client,
         &pool,
         "deploy-e2",
         second.revision,
         &digest_two,
+        &second.revision_digest,
+        "attempt-three",
     )
     .await?;
     wr_manager::db::complete_deployment(&pool, "node-a", second.revision, true, "").await?;
 
-    let rollback = wr_manager::db::begin_rollback(&pool, "node-a", 0, "rollback-one", "operator-a")
+    let rollback = wr_manager::db::begin_rollback(&pool, "node-a", 0, "rollback-one", actor)
         .await?
         .record;
     assert_eq!(rollback.revision, 4);
@@ -1450,10 +1583,14 @@ async fn test_concurrent_deployment_revision_allocation_is_unique() -> Result<()
         node_id: "concurrent-node".into(),
         attempt_token: token.into(),
         bundle_digest: format!("sha256:{}", "a".repeat(64)),
-        expected_engines: vec![ExpectedEngine {
-            engine_slot: "primary".into(),
-            modules: vec![],
-        }],
+        inventory: Some(DeploymentInventoryV1 {
+            schema_version: 1,
+            engines: vec![ExpectedEngine {
+                engine_slot: "primary".into(),
+                modules: vec![],
+                ..Default::default()
+            }],
+        }),
     };
     let left_request = request("concurrent-left");
     let right_request = request("concurrent-right");
@@ -1513,7 +1650,10 @@ async fn role_gated_services_enforce_real_mtls_identity_and_node_binding() -> Re
             node_id: "viewer-node".into(),
             attempt_token: "viewer-allocation".into(),
             bundle_digest: format!("sha256:{}", "a".repeat(64)),
-            expected_engines: vec![],
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![],
+            }),
         })
         .await
         .expect_err("viewer allocation must be denied");
@@ -1591,7 +1731,10 @@ async fn rotated_operator_identity_and_attestation_policy_are_applied_over_mtls(
         )
         .await?
         .get("actor");
-    assert_eq!(actor, "operator-a", "rotated fingerprints retain one actor");
+    assert_eq!(
+        actor, "urn:wruntime:cluster-a:human:operator-a",
+        "rotated certificates retain one principal"
+    );
 
     server
         .operator_client(Some(&server.pki.operator))
@@ -1600,10 +1743,14 @@ async fn rotated_operator_identity_and_attestation_policy_are_applied_over_mtls(
             node_id: "abandon-node".into(),
             attempt_token: "abandon-token".into(),
             bundle_digest: format!("sha256:{}", "d".repeat(64)),
-            expected_engines: vec![ExpectedEngine {
-                engine_slot: "blue".into(),
-                modules: vec![],
-            }],
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![ExpectedEngine {
+                    engine_slot: "blue".into(),
+                    modules: vec![],
+                    ..Default::default()
+                }],
+            }),
         })
         .await?;
     let abandoned = server
@@ -1626,7 +1773,7 @@ async fn rotated_operator_identity_and_attestation_policy_are_applied_over_mtls(
         )
         .await?
         .get("abandoned_by");
-    assert_eq!(abandoned_by, "operator-a");
+    assert_eq!(abandoned_by, "urn:wruntime:cluster-a:human:operator-a");
 
     let mut agent = server.agent_client(Some(&server.pki.agent_a)).await?;
     let mut mismatches = Vec::new();
@@ -1690,12 +1837,16 @@ async fn resumed_agent_receives_epoch_bound_inspection_through_node_agent_rpc() 
             node_id: "node-a".into(),
             attempt_token: "rpc-resume".into(),
             bundle_digest: digest.clone(),
-            expected_engines: vec![ExpectedEngine {
-                engine_slot: "blue".into(),
-                modules: vec![],
-            }],
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![ExpectedEngine {
+                    engine_slot: "blue".into(),
+                    modules: vec![],
+                    ..Default::default()
+                }],
+            }),
         },
-        "operator-a",
+        "urn:wruntime:cluster-a:human:operator-a",
     )
     .await?
     .record;
@@ -1879,5 +2030,368 @@ async fn resumed_agent_receives_epoch_bound_inspection_through_node_agent_rpc() 
     assert_eq!(reissued.operation_id, operation.operation_id);
     assert_eq!(reissued.lease_epoch, inspection.lease_epoch);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn manager_rollout_lease_phases_and_activation_barriers_are_fenced() -> Result<()> {
+    use wr_common::wruntime::{
+        BeginManagerRolloutRequest, ManagerRolloutPhase, ManagerRolloutTarget,
+    };
+
+    let pool = helpers::db::manager_pool().await;
+    let target_digest = format!("sha256:{}", "a".repeat(64));
+    wr_manager::db::register_manager(&pool, "manager-a", "https://manager-a:9000").await?;
+    wr_manager::db::initialize_manager_policy_state(&pool, "manager-a", 2, &target_digest).await?;
+    let request = BeginManagerRolloutRequest {
+        client_operation_id: "83c54ac7-fe23-4ddf-96e5-0da2e4b18d7d".into(),
+        cluster_id: "cluster-a".into(),
+        target_generation: 2,
+        target_policy_digest: target_digest.clone(),
+        expected_targets: vec![ManagerRolloutTarget {
+            manager_id: "manager-a".into(),
+            endpoint: "https://manager-a:9000".into(),
+            host_digest: format!("sha256:{}", "b".repeat(64)),
+            config_digest: format!("sha256:{}", "c".repeat(64)),
+            ..Default::default()
+        }],
+        recovery_of: String::new(),
+        target_policy_validator_version: 1,
+        target_deployment_principal_uri: "urn:wruntime:cluster-a:human:deployer".into(),
+        target_deployment_leaf_fingerprint: format!("sha256:{}", "d".repeat(64)),
+        ..Default::default()
+    };
+    let rollout = wr_manager::db::begin_manager_rollout(
+        &pool,
+        &request.target_deployment_principal_uri,
+        &request.target_deployment_leaf_fingerprint,
+        &request,
+        &format!("sha256:{}", "e".repeat(64)),
+        false,
+    )
+    .await?;
+    let owner = "11111111-1111-4111-8111-111111111111";
+    let lease = wr_manager::db::lease_manager_rollout(&pool, &rollout.rollout_id, owner, 0).await?;
+    assert_eq!(lease.lease_epoch, 1);
+    let denied = wr_manager::db::lease_manager_rollout(
+        &pool,
+        &rollout.rollout_id,
+        "22222222-2222-4222-8222-222222222222",
+        1,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::FailedPrecondition);
+
+    let advance = |expected: ManagerRolloutPhase, next: ManagerRolloutPhase| {
+        wr_manager::db::advance_manager_rollout(
+            &pool,
+            &rollout.rollout_id,
+            owner,
+            1,
+            expected as i32,
+            next as i32,
+            &[],
+        )
+    };
+    advance(ManagerRolloutPhase::Prepared, ManagerRolloutPhase::Staging).await?;
+    advance(
+        ManagerRolloutPhase::Staging,
+        ManagerRolloutPhase::ClosingOld,
+    )
+    .await?;
+    advance(
+        ManagerRolloutPhase::ClosingOld,
+        ManagerRolloutPhase::OldClosed,
+    )
+    .await?;
+    advance(
+        ManagerRolloutPhase::OldClosed,
+        ManagerRolloutPhase::StartingTarget,
+    )
+    .await?;
+    pool.get().await?.execute(
+        "UPDATE wr_manager_rollout_members SET process_state='READY',admission_state='CLOSED_ROLLOUT',observed_policy_generation=2,observed_policy_digest=$2 WHERE rollout_id=$1 AND member_role='target'",
+        &[&uuid::Uuid::parse_str(&rollout.rollout_id)?, &target_digest],
+    ).await?;
+    advance(
+        ManagerRolloutPhase::StartingTarget,
+        ManagerRolloutPhase::TargetReadyClosed,
+    )
+    .await?;
+    advance(
+        ManagerRolloutPhase::TargetReadyClosed,
+        ManagerRolloutPhase::ActivatingTarget,
+    )
+    .await?;
+    pool.get().await?.execute(
+        "UPDATE wr_manager_rollout_members SET admission_state='OPEN' WHERE rollout_id=$1 AND member_role='target'",
+        &[&uuid::Uuid::parse_str(&rollout.rollout_id)?],
+    ).await?;
+    advance(
+        ManagerRolloutPhase::ActivatingTarget,
+        ManagerRolloutPhase::Completed,
+    )
+    .await?;
+    let guard = pool.get().await?.query_one(
+        "SELECT accepted_generation,accepted_digest,active_rollout_id FROM wr_manager_rollout_guard WHERE singleton",
+        &[],
+    ).await?;
+    assert_eq!(guard.get::<_, Option<i64>>(0), Some(2));
+    assert_eq!(
+        guard.get::<_, Option<String>>(1).as_deref(),
+        Some(target_digest.as_str())
+    );
+    assert!(guard.get::<_, Option<uuid::Uuid>>(2).is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn manager_rollout_observer_disambiguates_and_updates_in_place_member_roles() -> Result<()> {
+    use wr_common::authorization_policy::ValidatedPolicy;
+    use wr_common::lifecycle_service::{AdmissionGate, ManagerLifecycleState};
+    use wr_common::wruntime::{
+        BeginManagerRolloutRequest, ManagerRolloutSource, ManagerRolloutTarget,
+    };
+
+    let policy = |generation: u64| {
+        ValidatedPolicy::load(
+            format!(
+                r#"schema_version=1
+generation={generation}
+cluster_id="cluster-a"
+revoked_leaf_fingerprints=[]
+principals=[
+ {{uri="urn:wruntime:cluster-a:human:deployer",kind="human"}},
+ {{uri="urn:wruntime:cluster-a:manager:manager-a",kind="manager"}}
+]
+assignments=[{{principal="urn:wruntime:cluster-a:human:deployer",role="admin",scope={{}}}}]
+manager_enrollments=[{{principal="urn:wruntime:cluster-a:manager:manager-a",manager_id="manager-a",endpoint="https://manager-a:9000"}}]
+proxy_enrollments=[]
+node_agent_enrollments=[]
+"#
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    };
+    let source_policy = policy(1);
+    let target_policy = policy(2);
+    let pool = helpers::db::manager_pool().await;
+    wr_manager::db::register_manager(&pool, "manager-a", "https://manager-a:9000").await?;
+    let client = pool.get().await?;
+    client
+        .execute(
+            "UPDATE wr_manager_rollout_guard SET accepted_generation=1,accepted_digest=$1",
+            &[&source_policy.digest],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE wr_managers SET policy_generation=1,policy_digest=$1,admission_state='OPEN',last_heartbeat=NOW() WHERE manager_id='manager-a'",
+            &[&source_policy.digest],
+        )
+        .await?;
+    drop(client);
+    let request = BeginManagerRolloutRequest {
+        client_operation_id: "93c54ac7-fe23-4ddf-96e5-0da2e4b18d7d".into(),
+        cluster_id: "cluster-a".into(),
+        target_generation: 2,
+        target_policy_digest: target_policy.digest.clone(),
+        expected_targets: vec![ManagerRolloutTarget {
+            manager_id: "manager-a".into(),
+            endpoint: "https://manager-a:9000".into(),
+            host_digest: format!("sha256:{}", "b".repeat(64)),
+            config_digest: format!("sha256:{}", "c".repeat(64)),
+            ..Default::default()
+        }],
+        recovery_of: String::new(),
+        target_policy_validator_version: 1,
+        target_deployment_principal_uri: "urn:wruntime:cluster-a:human:deployer".into(),
+        target_deployment_leaf_fingerprint: format!("sha256:{}", "d".repeat(64)),
+        source_managers: vec![ManagerRolloutSource {
+            manager_id: "manager-a".into(),
+            endpoint: "https://manager-a:9000".into(),
+            host_digest: format!("sha256:{}", "e".repeat(64)),
+            selector_digest: format!("sha256:{}", "f".repeat(64)),
+        }],
+        ..Default::default()
+    };
+    let rollout = wr_manager::db::begin_manager_rollout(
+        &pool,
+        &request.target_deployment_principal_uri,
+        &request.target_deployment_leaf_fingerprint,
+        &request,
+        &format!("sha256:{}", "e".repeat(64)),
+        true,
+    )
+    .await?;
+    let admission = AdmissionGate::closed();
+    let lifecycle = ManagerLifecycleState::default();
+    wr_manager::db::observe_manager_rollout(
+        &pool,
+        "manager-a",
+        1,
+        &source_policy.digest,
+        &admission,
+        &lifecycle,
+        &source_policy,
+    )
+    .await?;
+    let rollout_id = uuid::Uuid::parse_str(&rollout.rollout_id)?;
+    let rows = pool
+        .get()
+        .await?
+        .query(
+            "SELECT member_role,observed_policy_generation FROM wr_manager_rollout_members WHERE rollout_id=$1 ORDER BY member_role",
+            &[&rollout_id],
+        )
+        .await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "source");
+    assert_eq!(rows[0].get::<_, Option<i64>>(1), Some(1));
+    assert_eq!(rows[1].get::<_, String>(0), "target");
+    assert_eq!(rows[1].get::<_, Option<i64>>(1), None);
+
+    wr_manager::db::observe_manager_rollout(
+        &pool,
+        "manager-a",
+        2,
+        &target_policy.digest,
+        &admission,
+        &lifecycle,
+        &target_policy,
+    )
+    .await?;
+    let rows = pool
+        .get()
+        .await?
+        .query(
+            "SELECT member_role,observed_policy_generation FROM wr_manager_rollout_members WHERE rollout_id=$1 ORDER BY member_role",
+            &[&rollout_id],
+        )
+        .await?;
+    assert_eq!(rows[0].get::<_, Option<i64>>(1), Some(1));
+    assert_eq!(rows[1].get::<_, Option<i64>>(1), Some(2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn manager_rollout_same_generation_reports_digest_mismatch() -> Result<()> {
+    use wr_common::wruntime::{BeginManagerRolloutRequest, ManagerRolloutTarget};
+
+    let pool = helpers::db::manager_pool().await;
+    let accepted_digest = format!("sha256:{}", "a".repeat(64));
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE wr_manager_rollout_guard SET accepted_generation=2,accepted_digest=$1",
+            &[&accepted_digest],
+        )
+        .await?;
+    let request = BeginManagerRolloutRequest {
+        client_operation_id: "a3c54ac7-fe23-4ddf-96e5-0da2e4b18d7d".into(),
+        cluster_id: "cluster-a".into(),
+        target_generation: 2,
+        target_policy_digest: format!("sha256:{}", "b".repeat(64)),
+        expected_targets: vec![ManagerRolloutTarget {
+            manager_id: "manager-a".into(),
+            endpoint: "https://manager-a:9000".into(),
+            host_digest: format!("sha256:{}", "c".repeat(64)),
+            config_digest: format!("sha256:{}", "d".repeat(64)),
+            ..Default::default()
+        }],
+        recovery_of: String::new(),
+        target_policy_validator_version: 1,
+        target_deployment_principal_uri: "urn:wruntime:cluster-a:human:deployer".into(),
+        target_deployment_leaf_fingerprint: format!("sha256:{}", "e".repeat(64)),
+        ..Default::default()
+    };
+    let error = wr_manager::db::begin_manager_rollout(
+        &pool,
+        &request.target_deployment_principal_uri,
+        &request.target_deployment_leaf_fingerprint,
+        &request,
+        &format!("sha256:{}", "f".repeat(64)),
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        error.message(),
+        "same policy generation has a different digest"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn manager_rollout_create_recovers_lost_response_and_rejects_token_reuse() -> Result<()> {
+    use wr_common::wruntime::{BeginManagerRolloutRequest, ManagerRolloutTarget};
+
+    let pool = helpers::db::manager_pool().await;
+    let target_digest = format!("sha256:{}", "a".repeat(64));
+    wr_manager::db::register_manager(&pool, "manager-a", "https://manager-a:9000").await?;
+    assert!(
+        !wr_manager::db::initialize_manager_policy_state(&pool, "manager-a", 2, &target_digest,)
+            .await?
+    );
+    let request = BeginManagerRolloutRequest {
+        client_operation_id: "73c54ac7-fe23-4ddf-96e5-0da2e4b18d7d".into(),
+        cluster_id: "cluster-a".into(),
+        target_generation: 2,
+        target_policy_digest: target_digest,
+        expected_targets: vec![ManagerRolloutTarget {
+            manager_id: "manager-a".into(),
+            endpoint: "https://manager-a:9000".into(),
+            host_digest: format!("sha256:{}", "b".repeat(64)),
+            config_digest: format!("sha256:{}", "c".repeat(64)),
+            ..Default::default()
+        }],
+        recovery_of: String::new(),
+        target_policy_validator_version: 1,
+        target_deployment_principal_uri: "urn:wruntime:cluster-a:human:deployer".into(),
+        target_deployment_leaf_fingerprint: format!("sha256:{}", "d".repeat(64)),
+        ..Default::default()
+    };
+    let first = wr_manager::db::begin_manager_rollout(
+        &pool,
+        "urn:wruntime:cluster-a:human:deployer",
+        &format!("sha256:{}", "d".repeat(64)),
+        &request,
+        &format!("sha256:{}", "e".repeat(64)),
+        false,
+    )
+    .await?;
+    let replay = wr_manager::db::begin_manager_rollout(
+        &pool,
+        "urn:wruntime:cluster-a:human:deployer",
+        &format!("sha256:{}", "f".repeat(64)),
+        &request,
+        &format!("sha256:{}", "e".repeat(64)),
+        false,
+    )
+    .await?;
+    assert_eq!(replay.rollout_id, first.rollout_id);
+    assert_eq!(replay.phase, first.phase);
+
+    let conflict = wr_manager::db::begin_manager_rollout(
+        &pool,
+        "urn:wruntime:cluster-a:human:deployer",
+        &format!("sha256:{}", "d".repeat(64)),
+        &request,
+        &format!("sha256:{}", "0".repeat(64)),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+    let count: i64 = pool
+        .get()
+        .await?
+        .query_one("SELECT COUNT(*) FROM wr_manager_rollouts", &[])
+        .await?
+        .get(0);
+    assert_eq!(count, 1);
     Ok(())
 }

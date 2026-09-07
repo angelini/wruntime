@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use deadpool_postgres::Pool;
@@ -9,24 +9,29 @@ use wr_common::identity::{
     EngineHttpUrl, EngineId, JobQueueId, ModuleId, Namespace, NamespaceFilter, PeerHttpsUrl,
     ProxyHttpUrl, RouteKey, RuleId,
 };
-use wr_common::lifecycle_service::{AdmissionGate, AdmissionGuard};
-use wr_common::naming::namespace_role;
+use wr_common::lifecycle_service::{AdmissionGate, AdmissionGuard, ManagerLifecycleState};
 use wr_common::wruntime::{
-    manager_service_server::ManagerService, node_agent_service_server::NodeAgentService,
-    operator_service_server::OperatorService, AbandonDeploymentRequest, AbandonDeploymentResponse,
-    AttestNodeAgentRequest, AttestNodeAgentResponse, BeginDeploymentRequest,
-    BeginDeploymentResponse, BeginEngineDrainRequest, BeginEngineDrainResponse,
-    BeginRollbackRequest, BeginRollbackResponse, CancelOperationRequest, CancelOperationResponse,
-    ClaimOperationRequest, ClaimOperationResponse, DeleteRoutingRuleRequest,
-    DeleteRoutingRuleResponse, DeleteScheduleRequest, DeleteScheduleResponse, DeleteSecretRequest,
-    DeleteSecretResponse, DeploymentCondition, DeregisterEngineRequest, DeregisterEngineResponse,
-    FinalizeDeploymentRequest, FinalizeDeploymentResponse, GetClusterStatusRequest,
-    GetClusterStatusResponse, GetOperationRequest, GetOperationResponse, GetOperatorStatusRequest,
-    GetOperatorStatusResponse, GetRoutingTableRequest, GetRoutingTableResponse, GetSchemaRequest,
-    GetSchemaResponse, HeartbeatRequest, HeartbeatResponse, ListEnginesRequest,
+    cluster_service_server::ClusterService, infrastructure_service_server::InfrastructureService,
+    lifecycle_service_server::LifecycleService, node_service_server::NodeService,
+    policy_service_server::PolicyService, AbandonDeploymentRequest, AbandonDeploymentResponse,
+    AdvanceManagerRolloutRequest, AdvanceManagerRolloutResponse, AttestNodeAgentRequest,
+    AttestNodeAgentResponse, BeginDeploymentRequest, BeginDeploymentResponse,
+    BeginEngineDrainRequest, BeginEngineDrainResponse, BeginManagerRolloutRequest,
+    BeginManagerRolloutResponse, BeginRollbackRequest, BeginRollbackResponse,
+    CancelOperationRequest, CancelOperationResponse, ClaimOperationRequest, ClaimOperationResponse,
+    DeleteRoutingRuleRequest, DeleteRoutingRuleResponse, DeleteScheduleRequest,
+    DeleteScheduleResponse, DeleteSecretRequest, DeleteSecretResponse, DeploymentCondition,
+    DeregisterEngineRequest, DeregisterEngineResponse, FinalizeDeploymentRequest,
+    FinalizeDeploymentResponse, GetClusterStatusRequest, GetClusterStatusResponse,
+    GetLifecycleStatusRequest, GetLifecycleStatusResponse, GetManagerRolloutRequest,
+    GetManagerRolloutResponse, GetOperationRequest, GetOperationResponse, GetOperatorStatusRequest,
+    GetOperatorStatusResponse, GetPolicyStatusRequest, GetPolicyStatusResponse,
+    GetRoutingTableRequest, GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse,
+    GetWorkloadSnapshotRequest, GetWorkloadSnapshotResponse, HeartbeatRequest, HeartbeatResponse,
+    LeaseManagerRolloutRequest, LeaseManagerRolloutResponse, ListEnginesRequest,
     ListEnginesResponse, ListManagersRequest, ListManagersResponse, ListOperationsRequest,
     ListOperationsResponse, ListSchedulesRequest, ListSchedulesResponse, ListSecretsRequest,
-    ListSecretsResponse, ManagerInfo, NamespaceDbCredential, NamespaceSecrets, NodeOperationAction,
+    ListSecretsResponse, ManagerInfo, NodeOperationAction, PolicyCapHeadroom,
     PutNodeAgentPolicyRequest, PutNodeAgentPolicyResponse, RegisterEngineRequest,
     RegisterEngineResponse, RenewOperationLeaseRequest, RenewOperationLeaseResponse,
     ReportNodeObservationRequest, ReportNodeObservationResponse, ReportStepResultRequest,
@@ -72,6 +77,37 @@ pub fn reconcile_managers(db_records: &[db::ManagerRecord]) -> Vec<ManagerInfo> 
         .collect()
 }
 
+/// Strict, mount-ready authorization seam for the six manager service
+/// contracts. Phase 3 mounts these façades on the consolidated listener; Phase
+/// 2 keeps the current production router topology unchanged.
+#[derive(Clone)]
+pub struct AuthAwareServiceFacade {
+    service: &'static str,
+    policy: PrincipalPolicy,
+}
+
+impl AuthAwareServiceFacade {
+    pub fn new(service: &'static str, policy: PrincipalPolicy) -> Result<Self, Status> {
+        if !crate::auth::MANAGER_SERVICE_SET.contains(&service) {
+            return Err(Status::permission_denied(
+                "service is outside the manager authorization registry",
+            ));
+        }
+        Ok(Self { service, policy })
+    }
+
+    pub fn authorize(
+        &self,
+        method: &str,
+        evidence: &wr_common::tls::LeafEvidence,
+        resource: &crate::auth::AuthorizationResource<'_>,
+    ) -> Result<crate::auth::AuthorizedPrincipal, Status> {
+        self.policy
+            .authorize_row_evidence(self.service, method, evidence, resource)
+    }
+}
+
+#[derive(Clone)]
 pub struct Manager {
     pool: Pool,
     crypto: Arc<SecretCrypto>,
@@ -79,6 +115,7 @@ pub struct Manager {
     engine_heartbeat_timeout_secs: f64,
     module_heartbeat_timeout_secs: f64,
     admission: AdmissionGate,
+    workload_policy: Option<Arc<wr_common::authorization_policy::ValidatedPolicy>>,
 }
 
 impl Manager {
@@ -124,7 +161,16 @@ impl Manager {
             engine_heartbeat_timeout_secs,
             module_heartbeat_timeout_secs,
             admission,
+            workload_policy: None,
         }
+    }
+
+    pub fn with_workload_policy(
+        mut self,
+        policy: Arc<wr_common::authorization_policy::ValidatedPolicy>,
+    ) -> Self {
+        self.workload_policy = Some(policy);
+        self
     }
 
     fn require_admission(&self) -> Result<AdmissionGuard, Status> {
@@ -149,19 +195,16 @@ impl Manager {
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     }
 
-    fn canonicalize_deployment_request(request: &mut BeginDeploymentRequest) {
-        request
-            .expected_engines
-            .sort_by(|left, right| left.engine_slot.cmp(&right.engine_slot));
-        for engine in &mut request.expected_engines {
-            engine.modules.sort_by(|left, right| {
-                (&left.namespace, &left.name, &left.version).cmp(&(
-                    &right.namespace,
-                    &right.name,
-                    &right.version,
-                ))
-            });
-        }
+    fn canonicalize_deployment_request(request: &mut BeginDeploymentRequest) -> Result<(), Status> {
+        let inventory = request
+            .inventory
+            .take()
+            .ok_or_else(|| Status::invalid_argument("deployment inventory is required"))?;
+        request.inventory = Some(
+            wr_common::deployment_contract::canonicalize_inventory(inventory)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?,
+        );
+        Ok(())
     }
 
     fn validate_deployment_request(request: &BeginDeploymentRequest) -> Result<(), Status> {
@@ -177,157 +220,18 @@ impl Manager {
                 "bundle_digest must be sha256:<lowercase hex>",
             ));
         }
-        if request.expected_engines.is_empty() {
-            return Err(Status::invalid_argument(
-                "expected_engines must not be empty",
-            ));
-        }
-        let mut slots = HashSet::new();
-        for engine in &request.expected_engines {
-            if !Self::valid_deployment_token(&engine.engine_slot)
-                || !slots.insert(&engine.engine_slot)
-            {
-                return Err(Status::invalid_argument(
-                    "engine slots must be unique URL-safe identities",
-                ));
-            }
-            let mut modules = HashSet::new();
-            for module in &engine.modules {
-                ModuleId::parse(&module.namespace, &module.name, &module.version)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
-                if !modules.insert((&module.namespace, &module.name, &module.version)) {
-                    return Err(Status::invalid_argument(
-                        "expected engine inventory contains a duplicate module",
-                    ));
-                }
-            }
-        }
+        wr_common::deployment_contract::canonicalize_inventory(
+            request
+                .inventory
+                .clone()
+                .ok_or_else(|| Status::invalid_argument("deployment inventory is required"))?,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
         Ok(())
-    }
-
-    /// Ensure a DB password exists for the given namespace, creating one if not.
-    /// Returns the plaintext password.
-    async fn ensure_db_password(&self, namespace: &str) -> Result<String, Status> {
-        let key = "__db_password";
-
-        // Fast path: already stored — decrypt and return.
-        let existing =
-            db::get_secrets(&self.pool, &[(namespace.to_string(), key.to_string())]).await?;
-        if let Some((_, _, ciphertext, nonce)) = existing.into_iter().next() {
-            return self
-                .crypto
-                .decrypt(&ciphertext, &nonce)
-                .map_err(|e| Status::internal(format!("failed to decrypt db password: {e}")));
-        }
-
-        // Miss: generate + encrypt a candidate, then insert only if absent.
-        // Concurrent callers race here; ON CONFLICT DO NOTHING lets the DB pick
-        // a single winning row.
-        let candidate = SecretCrypto::generate_random_password();
-        let (ciphertext, nonce) = self
-            .crypto
-            .encrypt(&candidate)
-            .map_err(|e| Status::internal(format!("encryption failed: {e}")))?;
-        db::insert_secret_if_absent(&self.pool, namespace, key, &ciphertext, &nonce).await?;
-
-        // Re-read unconditionally and decrypt the STORED value, so a caller
-        // whose insert lost the conflict still returns the persisted password.
-        let stored =
-            db::get_secrets(&self.pool, &[(namespace.to_string(), key.to_string())]).await?;
-        let (_, _, ciphertext, nonce) = stored
-            .into_iter()
-            .next()
-            .ok_or_else(|| Status::internal("db password missing immediately after insert"))?;
-        self.crypto
-            .decrypt(&ciphertext, &nonce)
-            .map_err(|e| Status::internal(format!("failed to decrypt db password: {e}")))
-    }
-
-    /// Resolve DB credentials for each namespace that needs database access.
-    async fn resolve_db_credentials(
-        &self,
-        db_namespaces: &[String],
-    ) -> Result<Vec<NamespaceDbCredential>, Status> {
-        let mut credentials = Vec::with_capacity(db_namespaces.len());
-        // Deduplicate namespaces
-        let unique: std::collections::HashSet<&str> =
-            db_namespaces.iter().map(|s| s.as_str()).collect();
-        for namespace in unique {
-            let role = namespace_role(namespace);
-            let password = self.ensure_db_password(namespace).await?;
-            credentials.push(NamespaceDbCredential {
-                namespace: namespace.to_string(),
-                role,
-                password,
-            });
-        }
-        Ok(credentials)
-    }
-
-    /// Fetch, validate, decrypt, and group secrets by namespace.
-    async fn resolve_secrets(
-        &self,
-        requests: &[wr_common::wruntime::SecretRequest],
-    ) -> Result<Vec<NamespaceSecrets>, Status> {
-        if requests.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Block reserved key prefix
-        for req in requests {
-            if req.key.starts_with("__") {
-                return Err(Status::invalid_argument(format!(
-                    "secret key '{}' uses reserved prefix '__'",
-                    req.key
-                )));
-            }
-        }
-
-        let pairs: Vec<(String, String)> = requests
-            .iter()
-            .map(|s| (s.namespace.clone(), s.key.clone()))
-            .collect();
-        let encrypted = db::get_secrets(&self.pool, &pairs).await?;
-
-        // Check for missing secrets
-        let found: std::collections::HashSet<(String, String)> = encrypted
-            .iter()
-            .map(|(ns, key, _, _)| (ns.clone(), key.clone()))
-            .collect();
-        let missing: Vec<String> = pairs
-            .iter()
-            .filter(|r| !found.contains(r))
-            .map(|(ns, key)| format!("{ns}/{key}"))
-            .collect();
-        if !missing.is_empty() {
-            return Err(Status::not_found(format!(
-                "missing secrets: {}",
-                missing.join(", ")
-            )));
-        }
-
-        // Decrypt and group by namespace
-        let mut by_namespace: HashMap<String, HashMap<String, String>> = HashMap::new();
-        for (ns, key, ciphertext, nonce) in &encrypted {
-            let plaintext = self
-                .crypto
-                .decrypt(ciphertext, nonce)
-                .map_err(|e| Status::internal(format!("failed to decrypt secret: {e}")))?;
-            by_namespace
-                .entry(ns.clone())
-                .or_default()
-                .insert(key.clone(), plaintext);
-        }
-
-        Ok(by_namespace
-            .into_iter()
-            .map(|(namespace, secrets)| NamespaceSecrets { namespace, secrets })
-            .collect())
     }
 }
 
-#[tonic::async_trait]
-impl ManagerService for Manager {
+impl Manager {
     // ── Engine lifecycle ──────────────────────────────────────────────────
 
     async fn register_engine(
@@ -335,8 +239,9 @@ impl ManagerService for Manager {
         request: Request<RegisterEngineRequest>,
     ) -> Result<Response<RegisterEngineResponse>, Status> {
         let _admission = self.require_admission()?;
+        let request = request.into_inner();
+        let activation_id = request.activation_id;
         let reg = request
-            .into_inner()
             .registration
             .ok_or_else(|| Status::invalid_argument("registration field is required"))?;
 
@@ -374,17 +279,9 @@ impl ManagerService for Manager {
         // descriptor for a given (namespace, name, version) tuple; additional
         // entries represent extra instances on the same engine.
         {
-            let mut seen = std::collections::HashSet::new();
             for module in &reg.modules {
                 ModuleId::parse(&module.namespace, &module.name, &module.version)
                     .map_err(|error| Status::invalid_argument(error.to_string()))?;
-                let first = seen.insert((&module.namespace, &module.name, &module.version));
-                if first && module.proto_schema.is_empty() {
-                    return Err(Status::invalid_argument(format!(
-                        "module '{}' in namespace '{}' has no schema — proto_schema is required",
-                        module.name, module.namespace
-                    )));
-                }
             }
         }
 
@@ -413,23 +310,39 @@ impl ManagerService for Manager {
 
         let engine_id = reg.engine_id.clone();
 
-        // Resolve requested secrets (fails before any write).
-        let secrets = self.resolve_secrets(&reg.secrets).await?;
+        // Desired state, ownership, credential lookup/creation, engine state, and
+        // initially-unhealthy routes commit in one transaction. No plaintext or
+        // fence escapes when any domain statement fails.
+        let committed =
+            db::register_engine_and_routes(&self.pool, &self.crypto, &reg, &activation_id).await?;
+        let fence = committed.fence;
+        let secrets = committed.secrets;
+        let db_credentials = committed.db_credentials;
+        let serialized_snapshot = self
+            .workload_policy
+            .as_ref()
+            .map(|policy| {
+                wr_common::snapshot_consumer::build_snapshot(
+                    policy,
+                    wr_common::wruntime::WorkloadProjectionKind::EngineJobAdminV1,
+                    std::time::SystemTime::now(),
+                )
+            })
+            .transpose()
+            .map_err(|error| Status::internal(error.to_string()))?
+            .unwrap_or_default();
 
-        // Resolve DB credentials for namespaces that need database access
-        // (fails before any write).
-        let db_credentials = self.resolve_db_credentials(&reg.db_namespaces).await?;
-
-        // Persist engine, schemas, and initially-unhealthy default routing rules
-        // atomically. Routes are published last, so a failure in either resolver
-        // above leaves no engine, schema, or routing-rule rows.
-        db::register_engine_and_routes(&self.pool, &reg).await?;
-
-        info!(engine_id, "engine registered");
+        info!(
+            engine_id,
+            generation = fence.slot_generation,
+            "engine registered"
+        );
         Ok(Response::new(RegisterEngineResponse {
             accepted: true,
             secrets,
             db_credentials,
+            fence: Some(fence),
+            serialized_snapshot,
         }))
     }
 
@@ -437,13 +350,20 @@ impl ManagerService for Manager {
         &self,
         request: Request<DeregisterEngineRequest>,
     ) -> Result<Response<DeregisterEngineResponse>, Status> {
-        let engine_id = request.into_inner().engine_id;
-
-        // Persist to DB (marks rules unhealthy, deletes engine)
-        db::deregister_engine(&self.pool, &engine_id).await?;
-
-        info!(engine_id, "engine deregistered");
-        Ok(Response::new(DeregisterEngineResponse {}))
+        let request = request.into_inner();
+        let engine_id = request.engine_id;
+        let fence = request
+            .fence
+            .ok_or_else(|| Status::permission_denied("ownership fence is required"))?;
+        db::deregister_engine(&self.pool, &engine_id, &fence).await?;
+        info!(
+            engine_id,
+            generation = fence.slot_generation,
+            "engine deregistered"
+        );
+        Ok(Response::new(DeregisterEngineResponse {
+            accepted_fence: Some(fence),
+        }))
     }
 
     async fn heartbeat(
@@ -453,7 +373,10 @@ impl ManagerService for Manager {
         let HeartbeatRequest {
             engine_id,
             healthy_modules,
+            fence,
         } = request.into_inner();
+        let fence =
+            fence.ok_or_else(|| Status::permission_denied("ownership fence is required"))?;
 
         // Validate each reported module independently; skip and log invalid
         // entries rather than rejecting the whole heartbeat.
@@ -472,11 +395,26 @@ impl ManagerService for Manager {
             valid.push(m);
         }
 
-        let routing_version = db::publish_engine_readiness(&self.pool, &engine_id, &valid).await?;
-
+        let routing_version =
+            db::publish_engine_readiness(&self.pool, &engine_id, &valid, &fence).await?;
+        let serialized_snapshot = self
+            .workload_policy
+            .as_ref()
+            .map(|policy| {
+                wr_common::snapshot_consumer::build_snapshot(
+                    policy,
+                    wr_common::wruntime::WorkloadProjectionKind::EngineJobAdminV1,
+                    std::time::SystemTime::now(),
+                )
+            })
+            .transpose()
+            .map_err(|error| Status::internal(error.to_string()))?
+            .unwrap_or_default();
         Ok(Response::new(HeartbeatResponse {
             manager_routing_table_version: routing_version,
             proxy_routing_table_version: 0,
+            accepted_fence: Some(fence),
+            serialized_snapshot,
         }))
     }
 
@@ -484,13 +422,18 @@ impl ManagerService for Manager {
         &self,
         request: Request<BeginEngineDrainRequest>,
     ) -> Result<Response<BeginEngineDrainResponse>, Status> {
-        let engine_id = request.into_inner().engine_id;
+        let request = request.into_inner();
+        let engine_id = request.engine_id;
+        let fence = request
+            .fence
+            .ok_or_else(|| Status::permission_denied("ownership fence is required"))?;
         EngineId::parse(&engine_id).map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let routing_version = db::begin_engine_drain(&self.pool, &engine_id).await?;
+        let routing_version = db::begin_engine_drain(&self.pool, &engine_id, &fence).await?;
         info!(engine_id, routing_version, "engine routes withdrawn");
         Ok(Response::new(BeginEngineDrainResponse {
             manager_routing_table_version: routing_version,
             proxy_routing_table_version: 0,
+            accepted_fence: Some(fence),
         }))
     }
 
@@ -578,20 +521,6 @@ impl ManagerService for Manager {
 
         db::upsert_routing_rule(&self.pool, &rule).await?;
         Ok(Response::new(UpsertRoutingRuleResponse {}))
-    }
-
-    async fn delete_routing_rule(
-        &self,
-        request: Request<DeleteRoutingRuleRequest>,
-    ) -> Result<Response<DeleteRoutingRuleResponse>, Status> {
-        let _admission = self.require_admission()?;
-        let rule_id = request.into_inner().rule_id;
-
-        if db::delete_routing_rule(&self.pool, &rule_id).await? {
-            info!(rule_id, "routing rule deleted");
-        }
-
-        Ok(Response::new(DeleteRoutingRuleResponse {}))
     }
 
     // ── Schemas ───────────────────────────────────────────────────────────
@@ -784,9 +713,11 @@ impl ManagerService for Manager {
 
 /// Role-gated durable operator API. It composes existing status evidence and
 /// delegates every mutation to one transactional operation state machine.
+#[derive(Clone)]
 pub struct OperatorApi {
     pool: Pool,
     policy: PrincipalPolicy,
+    admission: AdmissionGate,
     manager_liveness_threshold_secs: f64,
     engine_heartbeat_timeout_secs: f64,
     module_heartbeat_timeout_secs: f64,
@@ -800,13 +731,40 @@ impl OperatorApi {
         engine_heartbeat_timeout_secs: f64,
         module_heartbeat_timeout_secs: f64,
     ) -> Self {
+        let admission = AdmissionGate::closed();
+        admission.open();
+        Self::with_admission(
+            pool,
+            policy,
+            admission,
+            manager_liveness_threshold_secs,
+            engine_heartbeat_timeout_secs,
+            module_heartbeat_timeout_secs,
+        )
+    }
+
+    pub fn with_admission(
+        pool: Pool,
+        policy: PrincipalPolicy,
+        admission: AdmissionGate,
+        manager_liveness_threshold_secs: f64,
+        engine_heartbeat_timeout_secs: f64,
+        module_heartbeat_timeout_secs: f64,
+    ) -> Self {
         Self {
             pool,
             policy,
+            admission,
             manager_liveness_threshold_secs,
             engine_heartbeat_timeout_secs,
             module_heartbeat_timeout_secs,
         }
+    }
+
+    fn require_admission(&self) -> Result<AdmissionGuard, Status> {
+        self.admission
+            .try_enter()
+            .ok_or_else(|| Status::unavailable("privileged manager admission is closed"))
     }
 
     fn validate_submission(request: &mut SubmitOperationRequest) -> Result<(), Status> {
@@ -893,16 +851,16 @@ impl OperatorApi {
     }
 }
 
-#[tonic::async_trait]
-impl OperatorService for OperatorApi {
+impl OperatorApi {
     async fn begin_deployment(
         &self,
         mut request: Request<BeginDeploymentRequest>,
     ) -> Result<Response<BeginDeploymentResponse>, Status> {
+        let _admission = self.require_admission()?;
         let principal = self.policy.authorize_operator(&mut request)?;
         let mut request = request.into_inner();
         Manager::validate_deployment_request(&request)?;
-        Manager::canonicalize_deployment_request(&mut request);
+        Manager::canonicalize_deployment_request(&mut request)?;
         let deployment = db::begin_deployment(&self.pool, &request, &principal.name)
             .await?
             .record;
@@ -915,6 +873,7 @@ impl OperatorService for OperatorApi {
         &self,
         mut request: Request<VerifyDeploymentRequest>,
     ) -> Result<Response<VerifyDeploymentResponse>, Status> {
+        let _admission = self.require_admission()?;
         self.policy.authorize_read(&mut request)?;
         let request = request.into_inner();
         if request.node_id.is_empty() || request.revision == 0 {
@@ -946,6 +905,7 @@ impl OperatorService for OperatorApi {
         &self,
         mut request: Request<BeginRollbackRequest>,
     ) -> Result<Response<BeginRollbackResponse>, Status> {
+        let _admission = self.require_admission()?;
         let principal = self.policy.authorize_operator(&mut request)?;
         let request = request.into_inner();
         Namespace::parse(&request.node_id)
@@ -973,7 +933,12 @@ impl OperatorService for OperatorApi {
         &self,
         mut request: Request<GetOperatorStatusRequest>,
     ) -> Result<Response<GetOperatorStatusResponse>, Status> {
-        self.policy.authorize_read(&mut request)?;
+        let _admission = self.require_admission()?;
+        let requested_node =
+            (!request.get_ref().node_id.is_empty()).then(|| request.get_ref().node_id.clone());
+        let principal = self
+            .policy
+            .authorize_infrastructure_read(&mut request, requested_node.as_deref())?;
         let filter = request.into_inner();
         let snapshot = db::get_cluster_status_snapshot(&self.pool).await?;
         let mut active_operations = snapshot.active_operations.clone();
@@ -996,18 +961,24 @@ impl OperatorService for OperatorApi {
             self.engine_heartbeat_timeout_secs,
             self.module_heartbeat_timeout_secs,
         )?;
-        if !filter.node_id.is_empty() {
-            cluster.nodes.retain(|node| node.node_id == filter.node_id);
-            cluster.engines.retain(|engine| {
-                engine.deployment.as_ref().is_some_and(|deployment| {
-                    deployment.node_id == filter.node_id
-                        && (filter.engine_slot.is_empty()
-                            || deployment.engine_slot == filter.engine_slot)
-                })
-            });
-            if cluster.nodes.is_empty() {
-                return Err(Status::not_found("selected node or slot was not found"));
-            }
+        cluster.nodes.retain(|node| {
+            (filter.node_id.is_empty() || node.node_id == filter.node_id)
+                && self
+                    .policy
+                    .allows_infrastructure_read(&principal, &node.node_id)
+        });
+        cluster.engines.retain(|engine| {
+            engine.deployment.as_ref().is_some_and(|deployment| {
+                (filter.node_id.is_empty() || deployment.node_id == filter.node_id)
+                    && (filter.engine_slot.is_empty()
+                        || deployment.engine_slot == filter.engine_slot)
+                    && self
+                        .policy
+                        .allows_infrastructure_read(&principal, &deployment.node_id)
+            })
+        });
+        if !filter.node_id.is_empty() && cluster.nodes.is_empty() {
+            return Err(Status::not_found("selected node or slot was not found"));
         }
         if !filter.engine_slot.is_empty()
             && !cluster.engines.iter().any(|engine| {
@@ -1019,20 +990,32 @@ impl OperatorService for OperatorApi {
         {
             return Err(Status::not_found("selected node or slot was not found"));
         }
-        if !filter.node_id.is_empty() {
-            active_operations.retain(|operation| operation.node_id == filter.node_id);
-            observations.retain(|observation| {
-                observation.node_id == filter.node_id
-                    && (filter.engine_slot.is_empty()
-                        || observation.engine_slot == filter.engine_slot)
-            });
-            slot_authorities.retain(|authority| {
-                authority.node_id == filter.node_id
-                    && (filter.engine_slot.is_empty()
-                        || authority.engine_slot == filter.engine_slot)
-            });
-            agent_attestations.retain(|attestation| attestation.node_id == filter.node_id);
-        }
+        active_operations.retain(|operation| {
+            (filter.node_id.is_empty() || operation.node_id == filter.node_id)
+                && self
+                    .policy
+                    .allows_infrastructure_read(&principal, &operation.node_id)
+        });
+        observations.retain(|observation| {
+            (filter.node_id.is_empty() || observation.node_id == filter.node_id)
+                && (filter.engine_slot.is_empty() || observation.engine_slot == filter.engine_slot)
+                && self
+                    .policy
+                    .allows_infrastructure_read(&principal, &observation.node_id)
+        });
+        slot_authorities.retain(|authority| {
+            (filter.node_id.is_empty() || authority.node_id == filter.node_id)
+                && (filter.engine_slot.is_empty() || authority.engine_slot == filter.engine_slot)
+                && self
+                    .policy
+                    .allows_infrastructure_read(&principal, &authority.node_id)
+        });
+        agent_attestations.retain(|attestation| {
+            (filter.node_id.is_empty() || attestation.node_id == filter.node_id)
+                && self
+                    .policy
+                    .allows_infrastructure_read(&principal, &attestation.node_id)
+        });
         Ok(Response::new(GetOperatorStatusResponse {
             cluster: Some(cluster),
             active_operations,
@@ -1046,7 +1029,11 @@ impl OperatorService for OperatorApi {
         &self,
         mut request: Request<SubmitOperationRequest>,
     ) -> Result<Response<SubmitOperationResponse>, Status> {
-        let principal = self.policy.authorize_operator(&mut request)?;
+        let _admission = self.require_admission()?;
+        let node_id = request.get_ref().node_id.clone();
+        let principal = self
+            .policy
+            .authorize_infrastructure_write(&mut request, &node_id)?;
         let mut request = request.into_inner();
         Self::validate_submission(&mut request)?;
         let operation = crate::operations::submit(&self.pool, &principal.name, &request).await?;
@@ -1059,9 +1046,11 @@ impl OperatorService for OperatorApi {
         &self,
         mut request: Request<GetOperationRequest>,
     ) -> Result<Response<GetOperationResponse>, Status> {
-        self.policy.authorize_read(&mut request)?;
-        let operation_id = request.into_inner().operation_id;
+        let _admission = self.require_admission()?;
+        let operation_id = request.get_ref().operation_id.clone();
         let operation = crate::operations::get(&self.pool, &operation_id).await?;
+        self.policy
+            .authorize_infrastructure_read(&mut request, Some(&operation.node_id))?;
         let events = crate::operations::events(&self.pool, &operation_id).await?;
         Ok(Response::new(GetOperationResponse {
             operation: Some(operation),
@@ -1073,10 +1062,19 @@ impl OperatorService for OperatorApi {
         &self,
         mut request: Request<ListOperationsRequest>,
     ) -> Result<Response<ListOperationsResponse>, Status> {
-        self.policy.authorize_read(&mut request)?;
+        let _admission = self.require_admission()?;
+        let requested_node =
+            (!request.get_ref().node_id.is_empty()).then(|| request.get_ref().node_id.clone());
+        let principal = self
+            .policy
+            .authorize_infrastructure_read(&mut request, requested_node.as_deref())?;
         let request = request.into_inner();
-        let operations =
+        let mut operations =
             crate::operations::list(&self.pool, &request.node_id, request.include_terminal).await?;
+        operations.retain(|operation| {
+            self.policy
+                .allows_infrastructure_read(&principal, &operation.node_id)
+        });
         Ok(Response::new(ListOperationsResponse { operations }))
     }
 
@@ -1084,13 +1082,14 @@ impl OperatorService for OperatorApi {
         &self,
         mut request: Request<ResumeOperationRequest>,
     ) -> Result<Response<ResumeOperationResponse>, Status> {
-        let principal = self.policy.authorize_operator(&mut request)?;
-        let operation = crate::operations::resume(
-            &self.pool,
-            &request.into_inner().operation_id,
-            &principal.name,
-        )
-        .await?;
+        let _admission = self.require_admission()?;
+        let operation_id = request.get_ref().operation_id.clone();
+        let existing = crate::operations::get(&self.pool, &operation_id).await?;
+        let principal = self
+            .policy
+            .authorize_infrastructure_write(&mut request, &existing.node_id)?;
+        let operation =
+            crate::operations::resume(&self.pool, &operation_id, &principal.name).await?;
         Ok(Response::new(ResumeOperationResponse {
             operation: Some(operation),
         }))
@@ -1100,13 +1099,14 @@ impl OperatorService for OperatorApi {
         &self,
         mut request: Request<CancelOperationRequest>,
     ) -> Result<Response<CancelOperationResponse>, Status> {
-        let principal = self.policy.authorize_operator(&mut request)?;
-        let operation = crate::operations::cancel(
-            &self.pool,
-            &request.into_inner().operation_id,
-            &principal.name,
-        )
-        .await?;
+        let _admission = self.require_admission()?;
+        let operation_id = request.get_ref().operation_id.clone();
+        let existing = crate::operations::get(&self.pool, &operation_id).await?;
+        let principal = self
+            .policy
+            .authorize_infrastructure_write(&mut request, &existing.node_id)?;
+        let operation =
+            crate::operations::cancel(&self.pool, &operation_id, &principal.name).await?;
         Ok(Response::new(CancelOperationResponse {
             operation: Some(operation),
         }))
@@ -1116,6 +1116,7 @@ impl OperatorService for OperatorApi {
         &self,
         mut request: Request<PutNodeAgentPolicyRequest>,
     ) -> Result<Response<PutNodeAgentPolicyResponse>, Status> {
+        let _admission = self.require_admission()?;
         let principal = self.policy.authorize_operator(&mut request)?;
         let policy = request
             .into_inner()
@@ -1132,6 +1133,7 @@ impl OperatorService for OperatorApi {
         &self,
         mut request: Request<FinalizeDeploymentRequest>,
     ) -> Result<Response<FinalizeDeploymentResponse>, Status> {
+        let _admission = self.require_admission()?;
         let principal = self.policy.authorize_operator(&mut request)?;
         let request = request.into_inner();
         Namespace::parse(&request.node_id)
@@ -1157,6 +1159,7 @@ impl OperatorService for OperatorApi {
         &self,
         mut request: Request<AbandonDeploymentRequest>,
     ) -> Result<Response<AbandonDeploymentResponse>, Status> {
+        let _admission = self.require_admission()?;
         let principal = self.policy.authorize_operator(&mut request)?;
         let request = request.into_inner();
         Namespace::parse(&request.node_id)
@@ -1183,23 +1186,41 @@ impl OperatorService for OperatorApi {
 
 /// Pull-based node executor protocol. Certificate mapping fixes one agent to
 /// one node before any lease or observation is accepted.
+#[derive(Clone)]
 pub struct NodeAgentApi {
     pool: Pool,
     policy: PrincipalPolicy,
+    admission: AdmissionGate,
 }
 
 impl NodeAgentApi {
     pub fn new(pool: Pool, policy: PrincipalPolicy) -> Self {
-        Self { pool, policy }
+        let admission = AdmissionGate::closed();
+        admission.open();
+        Self::with_admission(pool, policy, admission)
+    }
+
+    pub fn with_admission(pool: Pool, policy: PrincipalPolicy, admission: AdmissionGate) -> Self {
+        Self {
+            pool,
+            policy,
+            admission,
+        }
+    }
+
+    fn require_admission(&self) -> Result<AdmissionGuard, Status> {
+        self.admission
+            .try_enter()
+            .ok_or_else(|| Status::unavailable("privileged manager admission is closed"))
     }
 }
 
-#[tonic::async_trait]
-impl NodeAgentService for NodeAgentApi {
+impl NodeAgentApi {
     async fn attest(
         &self,
         mut request: Request<AttestNodeAgentRequest>,
     ) -> Result<Response<AttestNodeAgentResponse>, Status> {
+        let _admission = self.require_admission()?;
         let node_id = request
             .get_ref()
             .attestation
@@ -1220,6 +1241,7 @@ impl NodeAgentService for NodeAgentApi {
         &self,
         mut request: Request<ClaimOperationRequest>,
     ) -> Result<Response<ClaimOperationResponse>, Status> {
+        let _admission = self.require_admission()?;
         let node_id = request.get_ref().node_id.clone();
         let agent_instance_id = request.get_ref().agent_instance_id.clone();
         let principal = self.policy.authorize_agent(&mut request, &node_id)?;
@@ -1237,6 +1259,7 @@ impl NodeAgentService for NodeAgentApi {
         &self,
         mut request: Request<RenewOperationLeaseRequest>,
     ) -> Result<Response<RenewOperationLeaseResponse>, Status> {
+        let _admission = self.require_admission()?;
         let node_id = request.get_ref().node_id.clone();
         let principal = self.policy.authorize_agent(&mut request, &node_id)?;
         let request = request.into_inner();
@@ -1258,6 +1281,7 @@ impl NodeAgentService for NodeAgentApi {
         &self,
         mut request: Request<ReportNodeObservationRequest>,
     ) -> Result<Response<ReportNodeObservationResponse>, Status> {
+        let _admission = self.require_admission()?;
         let node_id = request.get_ref().node_id.clone();
         let principal = self.policy.authorize_agent(&mut request, &node_id)?;
         let operation =
@@ -1272,6 +1296,7 @@ impl NodeAgentService for NodeAgentApi {
         &self,
         mut request: Request<ReportStepResultRequest>,
     ) -> Result<Response<ReportStepResultResponse>, Status> {
+        let _admission = self.require_admission()?;
         let node_id = request.get_ref().node_id.clone();
         let principal = self.policy.authorize_agent(&mut request, &node_id)?;
         let operation =
@@ -1279,6 +1304,1225 @@ impl NodeAgentService for NodeAgentApi {
         Ok(Response::new(ReportStepResultResponse {
             operation: Some(operation),
         }))
+    }
+}
+
+#[derive(Clone)]
+pub struct AuthorizedClusterService {
+    inner: Manager,
+    authorizer: Arc<crate::auth::ManagerAuthorizer>,
+}
+
+impl AuthorizedClusterService {
+    pub fn new(inner: Manager, authorizer: Arc<crate::auth::ManagerAuthorizer>) -> Self {
+        Self { inner, authorizer }
+    }
+
+    fn authorize<T>(
+        &self,
+        request: &mut Request<T>,
+        method: &'static str,
+        resource: &crate::auth::AuthorizationResource<'_>,
+    ) -> Result<(), Status> {
+        self.authorizer
+            .authorize(request, "wruntime.ClusterService", method, resource)?
+            .verify("wruntime.ClusterService", method)
+    }
+}
+
+#[tonic::async_trait]
+impl ClusterService for AuthorizedClusterService {
+    async fn list_engines(
+        &self,
+        mut request: Request<ListEnginesRequest>,
+    ) -> Result<Response<ListEnginesResponse>, Status> {
+        let call = self.authorizer.authorize(
+            &mut request,
+            "wruntime.ClusterService",
+            "ListEngines",
+            &Default::default(),
+        )?;
+        call.verify("wruntime.ClusterService", "ListEngines")?;
+        let mut response = self.inner.list_engines(request).await?;
+        response.get_mut().engines.retain(|engine| {
+            let node = engine
+                .deployment
+                .as_ref()
+                .map(|deployment| deployment.node_id.as_str());
+            engine.modules.iter().all(|module| {
+                call.allows_collection_item(Some(&module.namespace), node, None, None)
+            })
+        });
+        Ok(response)
+    }
+    async fn get_routing_table(
+        &self,
+        mut request: Request<GetRoutingTableRequest>,
+    ) -> Result<Response<GetRoutingTableResponse>, Status> {
+        let call = self.authorizer.authorize(
+            &mut request,
+            "wruntime.ClusterService",
+            "GetRoutingTable",
+            &Default::default(),
+        )?;
+        call.verify("wruntime.ClusterService", "GetRoutingTable")?;
+        let mut response = self.inner.get_routing_table(request).await?;
+        if let Some(table) = response.get_mut().table.as_mut() {
+            table.rules.retain(|rule| {
+                call.allows_collection_item(Some(&rule.destination_namespace), None, None, None)
+            });
+        }
+        Ok(response)
+    }
+    async fn upsert_routing_rule(
+        &self,
+        mut request: Request<RoutingRule>,
+    ) -> Result<Response<UpsertRoutingRuleResponse>, Status> {
+        let namespace = request.get_ref().destination_namespace.clone();
+        self.authorize(
+            &mut request,
+            "UpsertRoutingRule",
+            &crate::auth::AuthorizationResource {
+                namespace_id: Some(&namespace),
+                ..Default::default()
+            },
+        )?;
+        self.inner.upsert_routing_rule(request).await
+    }
+    async fn delete_routing_rule(
+        &self,
+        mut request: Request<DeleteRoutingRuleRequest>,
+    ) -> Result<Response<DeleteRoutingRuleResponse>, Status> {
+        let call = self.authorizer.authorize(
+            &mut request,
+            "wruntime.ClusterService",
+            "DeleteRoutingRule",
+            &Default::default(),
+        )?;
+        call.verify("wruntime.ClusterService", "DeleteRoutingRule")?;
+        let rule_id = request.get_ref().rule_id.clone();
+        let namespace = db::resolve_routing_rule_namespace(&self.inner.pool, &rule_id).await?;
+        if let Some(namespace) = namespace {
+            if !call.allows_collection_item(Some(&namespace), None, None, None) {
+                return Err(Status::permission_denied(
+                    "role scope does not cover the routing rule",
+                ));
+            }
+            if db::delete_routing_rule_scoped(&self.inner.pool, &rule_id, &namespace).await? {
+                info!(rule_id, "routing rule deleted");
+            }
+        }
+        Ok(Response::new(DeleteRoutingRuleResponse {}))
+    }
+    async fn list_managers(
+        &self,
+        mut request: Request<ListManagersRequest>,
+    ) -> Result<Response<ListManagersResponse>, Status> {
+        let call = self.authorizer.authorize(
+            &mut request,
+            "wruntime.ClusterService",
+            "ListManagers",
+            &Default::default(),
+        )?;
+        call.verify("wruntime.ClusterService", "ListManagers")?;
+        let mut response = self.inner.list_managers(request).await?;
+        response.get_mut().managers.retain(|manager| {
+            call.allows_collection_item(None, None, None, Some(&manager.manager_id))
+        });
+        Ok(response)
+    }
+    async fn get_cluster_status(
+        &self,
+        mut request: Request<GetClusterStatusRequest>,
+    ) -> Result<Response<GetClusterStatusResponse>, Status> {
+        self.authorize(&mut request, "GetClusterStatus", &Default::default())?;
+        self.inner.get_cluster_status(request).await
+    }
+    async fn get_schema(
+        &self,
+        mut request: Request<GetSchemaRequest>,
+    ) -> Result<Response<GetSchemaResponse>, Status> {
+        let namespace = request.get_ref().namespace.clone();
+        self.authorize(
+            &mut request,
+            "GetSchema",
+            &crate::auth::AuthorizationResource {
+                namespace_id: Some(&namespace),
+                ..Default::default()
+            },
+        )?;
+        self.inner.get_schema(request).await
+    }
+    async fn set_secret(
+        &self,
+        mut request: Request<SetSecretRequest>,
+    ) -> Result<Response<SetSecretResponse>, Status> {
+        let namespace = request.get_ref().namespace.clone();
+        self.authorize(
+            &mut request,
+            "SetSecret",
+            &crate::auth::AuthorizationResource {
+                namespace_id: Some(&namespace),
+                ..Default::default()
+            },
+        )?;
+        self.inner.set_secret(request).await
+    }
+    async fn delete_secret(
+        &self,
+        mut request: Request<DeleteSecretRequest>,
+    ) -> Result<Response<DeleteSecretResponse>, Status> {
+        let namespace = request.get_ref().namespace.clone();
+        self.authorize(
+            &mut request,
+            "DeleteSecret",
+            &crate::auth::AuthorizationResource {
+                namespace_id: Some(&namespace),
+                ..Default::default()
+            },
+        )?;
+        self.inner.delete_secret(request).await
+    }
+    async fn list_secrets(
+        &self,
+        mut request: Request<ListSecretsRequest>,
+    ) -> Result<Response<ListSecretsResponse>, Status> {
+        let namespace = request.get_ref().namespace.clone();
+        let resource = crate::auth::AuthorizationResource {
+            namespace_id: (!namespace.is_empty()).then_some(namespace.as_str()),
+            ..Default::default()
+        };
+        let call = self.authorizer.authorize(
+            &mut request,
+            "wruntime.ClusterService",
+            "ListSecrets",
+            &resource,
+        )?;
+        call.verify("wruntime.ClusterService", "ListSecrets")?;
+        let mut response = self.inner.list_secrets(request).await?;
+        response.get_mut().secrets.retain(|secret| {
+            call.allows_collection_item(Some(&secret.namespace), None, None, None)
+        });
+        Ok(response)
+    }
+    async fn upsert_schedule(
+        &self,
+        mut request: Request<UpsertScheduleRequest>,
+    ) -> Result<Response<UpsertScheduleResponse>, Status> {
+        let namespace = request.get_ref().worker_namespace.clone();
+        self.authorize(
+            &mut request,
+            "UpsertSchedule",
+            &crate::auth::AuthorizationResource {
+                namespace_id: Some(&namespace),
+                ..Default::default()
+            },
+        )?;
+        self.inner.upsert_schedule(request).await
+    }
+    async fn delete_schedule(
+        &self,
+        mut request: Request<DeleteScheduleRequest>,
+    ) -> Result<Response<DeleteScheduleResponse>, Status> {
+        let namespace = request.get_ref().worker_namespace.clone();
+        self.authorize(
+            &mut request,
+            "DeleteSchedule",
+            &crate::auth::AuthorizationResource {
+                namespace_id: Some(&namespace),
+                ..Default::default()
+            },
+        )?;
+        self.inner.delete_schedule(request).await
+    }
+    async fn list_schedules(
+        &self,
+        mut request: Request<ListSchedulesRequest>,
+    ) -> Result<Response<ListSchedulesResponse>, Status> {
+        let namespace = request.get_ref().worker_namespace.clone();
+        let resource = crate::auth::AuthorizationResource {
+            namespace_id: (!namespace.is_empty()).then_some(namespace.as_str()),
+            ..Default::default()
+        };
+        let call = self.authorizer.authorize(
+            &mut request,
+            "wruntime.ClusterService",
+            "ListSchedules",
+            &resource,
+        )?;
+        call.verify("wruntime.ClusterService", "ListSchedules")?;
+        let mut response = self.inner.list_schedules(request).await?;
+        response.get_mut().schedules.retain(|schedule| {
+            call.allows_collection_item(Some(&schedule.worker_namespace), None, None, None)
+        });
+        Ok(response)
+    }
+}
+
+#[derive(Clone)]
+pub struct InfrastructureApi {
+    manager: Manager,
+    operator: OperatorApi,
+}
+
+impl InfrastructureApi {
+    pub fn new(manager: Manager, operator: OperatorApi) -> Self {
+        Self { manager, operator }
+    }
+
+    fn canonical_rollout_request(
+        request: &mut BeginManagerRolloutRequest,
+    ) -> Result<String, Status> {
+        use prost::Message;
+        use sha2::{Digest, Sha256};
+        if !Manager::valid_deployment_token(&request.client_operation_id) {
+            return Err(Status::invalid_argument(
+                "client_operation_id must satisfy the bounded operation-token grammar",
+            ));
+        }
+        uuid::Uuid::parse_str(&request.client_operation_id)
+            .map_err(|_| Status::invalid_argument("client_operation_id must be a UUID"))?;
+        wr_common::identity::ClusterId::parse(&request.cluster_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if request.target_generation == 0
+            || !Manager::valid_bundle_digest(&request.target_policy_digest)
+        {
+            return Err(Status::invalid_argument(
+                "target generation and sha256 policy digest are required",
+            ));
+        }
+        if request.target_policy_validator_version
+            != wr_common::authorization_policy::AUTHORIZATION_POLICY_VALIDATOR_VERSION
+        {
+            return Err(Status::invalid_argument(
+                "target policy validator version 1 is required",
+            ));
+        }
+        wr_common::identity::PrincipalUri::parse(&request.target_deployment_principal_uri)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if !Manager::valid_bundle_digest(&request.target_deployment_leaf_fingerprint) {
+            return Err(Status::invalid_argument(
+                "target deployment leaf fingerprint must be sha256:<lowercase hex>",
+            ));
+        }
+        if request.expected_targets.is_empty() {
+            return Err(Status::invalid_argument(
+                "expected target manager set must not be empty",
+            ));
+        }
+        request
+            .source_managers
+            .sort_by(|left, right| left.manager_id.cmp(&right.manager_id));
+        let mut source_managers = HashSet::new();
+        for source in &request.source_managers {
+            wr_common::identity::ManagerId::parse(&source.manager_id)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            if !source_managers.insert(source.manager_id.as_str())
+                || PeerHttpsUrl::parse(&source.endpoint).is_err()
+                || !Manager::valid_bundle_digest(&source.host_digest)
+                || !Manager::valid_bundle_digest(&source.selector_digest)
+            {
+                return Err(Status::invalid_argument(
+                    "source managers require unique IDs and canonical endpoint/host/selector digests",
+                ));
+            }
+        }
+        if !Manager::valid_bundle_digest(&request.manifest_digest)
+            || uuid::Uuid::parse_str(&request.executor_id).is_err()
+            || request.deployment_certificate.is_empty()
+            || request.deployment_certificate.len() > 128
+            || request.deployment_certificate.contains('/')
+        {
+            return Err(Status::invalid_argument(
+                "manifest digest, executor UUID, and deployment certificate name are required",
+            ));
+        }
+        request
+            .expected_targets
+            .sort_by(|left, right| left.manager_id.cmp(&right.manager_id));
+        let mut managers = HashSet::new();
+        for target in &request.expected_targets {
+            wr_common::identity::ManagerId::parse(&target.manager_id)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            if !managers.insert(target.manager_id.as_str()) {
+                return Err(Status::invalid_argument(
+                    "expected target manager IDs must be unique",
+                ));
+            }
+            if PeerHttpsUrl::parse(&target.endpoint).is_err()
+                || !Manager::valid_bundle_digest(&target.host_digest)
+                || !Manager::valid_bundle_digest(&target.config_digest)
+                || !Manager::valid_bundle_digest(&target.executable_digest)
+                || !Manager::valid_bundle_digest(&target.backend_spec_digest)
+                || !Manager::valid_bundle_digest(&target.credential_digest)
+                || !Manager::valid_bundle_digest(&target.old_selector_digest)
+                || !Manager::valid_bundle_digest(&target.new_selector_digest)
+                || !matches!(target.backend.as_str(), "systemd" | "compose")
+            {
+                return Err(Status::invalid_argument(
+                    "target endpoint, backend, and canonical artifact/selector digests are required",
+                ));
+            }
+        }
+        if !request.recovery_of.is_empty() {
+            uuid::Uuid::parse_str(&request.recovery_of)
+                .map_err(|_| Status::invalid_argument("recovery_of must be a rollout UUID"))?;
+        }
+        Ok(format!(
+            "sha256:{:x}",
+            Sha256::digest(request.encode_to_vec())
+        ))
+    }
+
+    #[cfg(test)]
+    fn reject_revoked_rollout_leaf(
+        policy: &PrincipalPolicy,
+        evidence: &wr_common::tls::LeafEvidence,
+    ) -> Result<(), Status> {
+        if policy
+            .snapshot()
+            .revoked_leaf_fingerprints
+            .contains(&evidence.fingerprint)
+        {
+            return Err(Status::permission_denied(
+                "rollout caller certificate leaf is revoked",
+            ));
+        }
+        Ok(())
+    }
+
+    fn authorize_rollout_controller<T>(
+        &self,
+        request: &Request<T>,
+        rollout: &wr_common::wruntime::ManagerRollout,
+    ) -> Result<(), Status> {
+        let principal = request
+            .extensions()
+            .get::<crate::auth::AuthorizedPrincipal>()
+            .ok_or_else(|| Status::permission_denied("authorized caller context is missing"))?;
+        if principal.name != rollout.deployment_principal_uri
+            || principal.fingerprint != rollout.target_deployment_leaf_fingerprint
+        {
+            return Err(Status::permission_denied(
+                "rollout control requires its recorded deployment identity",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn begin_manager_rollout_inner(
+        &self,
+        request: Request<BeginManagerRolloutRequest>,
+    ) -> Result<Response<BeginManagerRolloutResponse>, Status> {
+        let principal = request
+            .extensions()
+            .get::<crate::auth::AuthorizedPrincipal>()
+            .cloned()
+            .ok_or_else(|| Status::permission_denied("authorized caller context is missing"))?;
+        if !matches!(
+            principal.kind,
+            wr_common::identity::PrincipalKind::Human
+                | wr_common::identity::PrincipalKind::ServiceAccount
+        ) {
+            return Err(Status::permission_denied(
+                "manager rollout creation requires a deployment principal",
+            ));
+        }
+        let mut request = request.into_inner();
+        if request.target_deployment_principal_uri != principal.name
+            || request.target_deployment_leaf_fingerprint != principal.fingerprint
+        {
+            return Err(Status::permission_denied(
+                "target prevalidation claims do not match the authenticated leaf",
+            ));
+        }
+        let manager_ids = request
+            .expected_targets
+            .iter()
+            .map(|target| target.manager_id.clone())
+            .collect::<Vec<_>>();
+        if self.manager.admission.is_open() {
+            if !self
+                .operator
+                .policy
+                .snapshot()
+                .authorizes_rollout(&principal.name, &manager_ids)
+            {
+                return Err(Status::permission_denied(
+                    "source policy does not authorize the complete rollout target set",
+                ));
+            }
+        } else {
+            let targets = request
+                .expected_targets
+                .iter()
+                .map(|target| wr_common::authorization_policy::RolloutTarget {
+                    manager_id: target.manager_id.clone(),
+                    endpoint: target.endpoint.clone(),
+                })
+                .collect::<Vec<_>>();
+            let receipt = self
+                .operator
+                .policy
+                .snapshot()
+                .prevalidate_rollout_claims(&principal.name, &principal.fingerprint, &targets)
+                .map_err(|error| {
+                    Status::permission_denied(format!(
+                        "closed-startup target validation failed: {error}"
+                    ))
+                })?;
+            if receipt.generation != request.target_generation
+                || receipt.digest != request.target_policy_digest
+                || receipt.cluster_id != request.cluster_id
+                || receipt.validator_version != request.target_policy_validator_version
+            {
+                return Err(Status::failed_precondition(
+                    "closed-startup rollout does not match the loaded target policy",
+                ));
+            }
+        }
+        let digest = Self::canonical_rollout_request(&mut request)?;
+        let rollout = db::begin_manager_rollout(
+            &self.manager.pool,
+            &principal.name,
+            &principal.fingerprint,
+            &request,
+            &digest,
+            self.manager.admission.is_open(),
+        )
+        .await?;
+        Ok(Response::new(BeginManagerRolloutResponse {
+            rollout: Some(rollout),
+        }))
+    }
+}
+
+impl InfrastructureApi {
+    async fn get_status(
+        &self,
+        request: Request<GetOperatorStatusRequest>,
+    ) -> Result<Response<GetOperatorStatusResponse>, Status> {
+        self.operator.get_status(request).await
+    }
+    async fn submit_operation(
+        &self,
+        request: Request<SubmitOperationRequest>,
+    ) -> Result<Response<SubmitOperationResponse>, Status> {
+        self.operator.submit_operation(request).await
+    }
+    async fn get_operation(
+        &self,
+        request: Request<GetOperationRequest>,
+    ) -> Result<Response<GetOperationResponse>, Status> {
+        self.operator.get_operation(request).await
+    }
+    async fn list_operations(
+        &self,
+        request: Request<ListOperationsRequest>,
+    ) -> Result<Response<ListOperationsResponse>, Status> {
+        self.operator.list_operations(request).await
+    }
+    async fn resume_operation(
+        &self,
+        request: Request<ResumeOperationRequest>,
+    ) -> Result<Response<ResumeOperationResponse>, Status> {
+        self.operator.resume_operation(request).await
+    }
+    async fn cancel_operation(
+        &self,
+        request: Request<CancelOperationRequest>,
+    ) -> Result<Response<CancelOperationResponse>, Status> {
+        self.operator.cancel_operation(request).await
+    }
+    async fn begin_deployment(
+        &self,
+        request: Request<BeginDeploymentRequest>,
+    ) -> Result<Response<BeginDeploymentResponse>, Status> {
+        self.operator.begin_deployment(request).await
+    }
+    async fn verify_deployment(
+        &self,
+        request: Request<VerifyDeploymentRequest>,
+    ) -> Result<Response<VerifyDeploymentResponse>, Status> {
+        self.operator.verify_deployment(request).await
+    }
+    async fn finalize_deployment(
+        &self,
+        request: Request<FinalizeDeploymentRequest>,
+    ) -> Result<Response<FinalizeDeploymentResponse>, Status> {
+        self.operator.finalize_deployment(request).await
+    }
+    async fn abandon_deployment(
+        &self,
+        request: Request<AbandonDeploymentRequest>,
+    ) -> Result<Response<AbandonDeploymentResponse>, Status> {
+        self.operator.abandon_deployment(request).await
+    }
+    async fn begin_rollback(
+        &self,
+        request: Request<BeginRollbackRequest>,
+    ) -> Result<Response<BeginRollbackResponse>, Status> {
+        self.operator.begin_rollback(request).await
+    }
+    async fn put_node_agent_policy(
+        &self,
+        request: Request<PutNodeAgentPolicyRequest>,
+    ) -> Result<Response<PutNodeAgentPolicyResponse>, Status> {
+        self.operator.put_node_agent_policy(request).await
+    }
+    async fn begin_manager_rollout(
+        &self,
+        request: Request<BeginManagerRolloutRequest>,
+    ) -> Result<Response<BeginManagerRolloutResponse>, Status> {
+        self.begin_manager_rollout_inner(request).await
+    }
+    async fn lease_manager_rollout(
+        &self,
+        request: Request<LeaseManagerRolloutRequest>,
+    ) -> Result<Response<LeaseManagerRolloutResponse>, Status> {
+        let current =
+            db::get_manager_rollout(&self.manager.pool, &request.get_ref().rollout_id).await?;
+        self.authorize_rollout_controller(&request, &current)?;
+        let request = request.into_inner();
+        let rollout = db::lease_manager_rollout(
+            &self.manager.pool,
+            &request.rollout_id,
+            &request.executor_id,
+            request.expected_lease_epoch,
+        )
+        .await?;
+        Ok(Response::new(LeaseManagerRolloutResponse {
+            rollout: Some(rollout),
+        }))
+    }
+    async fn advance_manager_rollout(
+        &self,
+        request: Request<AdvanceManagerRolloutRequest>,
+    ) -> Result<Response<AdvanceManagerRolloutResponse>, Status> {
+        let current =
+            db::get_manager_rollout(&self.manager.pool, &request.get_ref().rollout_id).await?;
+        self.authorize_rollout_controller(&request, &current)?;
+        let request = request.into_inner();
+        let rollout = db::advance_manager_rollout(
+            &self.manager.pool,
+            &request.rollout_id,
+            &request.executor_id,
+            request.lease_epoch,
+            request.expected_phase,
+            request.next_phase,
+            &request.member_outcomes,
+        )
+        .await?;
+        Ok(Response::new(AdvanceManagerRolloutResponse {
+            rollout: Some(rollout),
+        }))
+    }
+    async fn get_manager_rollout(
+        &self,
+        request: Request<GetManagerRolloutRequest>,
+    ) -> Result<Response<GetManagerRolloutResponse>, Status> {
+        let rollout =
+            db::get_manager_rollout(&self.manager.pool, &request.get_ref().rollout_id).await?;
+        let call = request
+            .extensions()
+            .get::<crate::auth::AuthorizedCall>()
+            .ok_or_else(|| Status::permission_denied("authorized caller context is missing"))?;
+        if !rollout
+            .expected_targets
+            .iter()
+            .all(|target| call.allows_collection_item(None, None, None, Some(&target.manager_id)))
+        {
+            return Err(Status::permission_denied(
+                "role scope does not cover the rollout manager set",
+            ));
+        }
+        if !self.manager.admission.is_open() {
+            self.authorize_rollout_controller(&request, &rollout)?;
+        }
+        Ok(Response::new(GetManagerRolloutResponse {
+            rollout: Some(rollout),
+        }))
+    }
+}
+
+#[derive(Clone)]
+pub struct AuthorizedInfrastructureService {
+    inner: InfrastructureApi,
+    authorizer: Arc<crate::auth::ManagerAuthorizer>,
+}
+
+impl AuthorizedInfrastructureService {
+    pub fn new(inner: InfrastructureApi, authorizer: Arc<crate::auth::ManagerAuthorizer>) -> Self {
+        Self { inner, authorizer }
+    }
+    fn authorize<T>(&self, request: &mut Request<T>, method: &'static str) -> Result<(), Status> {
+        self.authorize_node(request, method, None)
+    }
+
+    fn authorize_node<T>(
+        &self,
+        request: &mut Request<T>,
+        method: &'static str,
+        node_id: Option<&str>,
+    ) -> Result<(), Status> {
+        self.authorizer
+            .authorize(
+                request,
+                "wruntime.InfrastructureService",
+                method,
+                &crate::auth::AuthorizationResource {
+                    node_id,
+                    ..Default::default()
+                },
+            )?
+            .verify("wruntime.InfrastructureService", method)
+    }
+}
+
+#[tonic::async_trait]
+impl InfrastructureService for AuthorizedInfrastructureService {
+    async fn get_status(
+        &self,
+        mut r: Request<GetOperatorStatusRequest>,
+    ) -> Result<Response<GetOperatorStatusResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize_node(
+            &mut r,
+            "GetStatus",
+            (!node.is_empty()).then_some(node.as_str()),
+        )?;
+        self.inner.get_status(r).await
+    }
+    async fn submit_operation(
+        &self,
+        mut r: Request<SubmitOperationRequest>,
+    ) -> Result<Response<SubmitOperationResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize_node(&mut r, "SubmitOperation", Some(&node))?;
+        self.inner.submit_operation(r).await
+    }
+    async fn get_operation(
+        &self,
+        mut r: Request<GetOperationRequest>,
+    ) -> Result<Response<GetOperationResponse>, Status> {
+        self.authorize(&mut r, "GetOperation")?;
+        self.inner.get_operation(r).await
+    }
+    async fn list_operations(
+        &self,
+        mut r: Request<ListOperationsRequest>,
+    ) -> Result<Response<ListOperationsResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        let call = self.authorizer.authorize(
+            &mut r,
+            "wruntime.InfrastructureService",
+            "ListOperations",
+            &crate::auth::AuthorizationResource {
+                node_id: (!node.is_empty()).then_some(node.as_str()),
+                ..Default::default()
+            },
+        )?;
+        call.verify("wruntime.InfrastructureService", "ListOperations")?;
+        let mut response = self.inner.list_operations(r).await?;
+        response.get_mut().operations.retain(|operation| {
+            call.allows_collection_item(None, Some(&operation.node_id), None, None)
+        });
+        Ok(response)
+    }
+    async fn resume_operation(
+        &self,
+        mut r: Request<ResumeOperationRequest>,
+    ) -> Result<Response<ResumeOperationResponse>, Status> {
+        self.authorize(&mut r, "ResumeOperation")?;
+        self.inner.resume_operation(r).await
+    }
+    async fn cancel_operation(
+        &self,
+        mut r: Request<CancelOperationRequest>,
+    ) -> Result<Response<CancelOperationResponse>, Status> {
+        self.authorize(&mut r, "CancelOperation")?;
+        self.inner.cancel_operation(r).await
+    }
+    async fn begin_deployment(
+        &self,
+        mut r: Request<BeginDeploymentRequest>,
+    ) -> Result<Response<BeginDeploymentResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize_node(&mut r, "BeginDeployment", Some(&node))?;
+        self.inner.begin_deployment(r).await
+    }
+    async fn verify_deployment(
+        &self,
+        mut r: Request<VerifyDeploymentRequest>,
+    ) -> Result<Response<VerifyDeploymentResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize_node(&mut r, "VerifyDeployment", Some(&node))?;
+        self.inner.verify_deployment(r).await
+    }
+    async fn finalize_deployment(
+        &self,
+        mut r: Request<FinalizeDeploymentRequest>,
+    ) -> Result<Response<FinalizeDeploymentResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize_node(&mut r, "FinalizeDeployment", Some(&node))?;
+        self.inner.finalize_deployment(r).await
+    }
+    async fn abandon_deployment(
+        &self,
+        mut r: Request<AbandonDeploymentRequest>,
+    ) -> Result<Response<AbandonDeploymentResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize_node(&mut r, "AbandonDeployment", Some(&node))?;
+        self.inner.abandon_deployment(r).await
+    }
+    async fn begin_rollback(
+        &self,
+        mut r: Request<BeginRollbackRequest>,
+    ) -> Result<Response<BeginRollbackResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize_node(&mut r, "BeginRollback", Some(&node))?;
+        self.inner.begin_rollback(r).await
+    }
+    async fn put_node_agent_policy(
+        &self,
+        mut r: Request<PutNodeAgentPolicyRequest>,
+    ) -> Result<Response<PutNodeAgentPolicyResponse>, Status> {
+        let node = r
+            .get_ref()
+            .policy
+            .as_ref()
+            .map(|policy| policy.node_id.clone())
+            .ok_or_else(|| Status::invalid_argument("policy is required"))?;
+        self.authorize_node(&mut r, "PutNodeAgentPolicy", Some(&node))?;
+        self.inner.put_node_agent_policy(r).await
+    }
+    async fn begin_manager_rollout(
+        &self,
+        mut r: Request<BeginManagerRolloutRequest>,
+    ) -> Result<Response<BeginManagerRolloutResponse>, Status> {
+        let manager_ids = r
+            .get_ref()
+            .expected_targets
+            .iter()
+            .map(|target| target.manager_id.clone())
+            .collect::<Vec<_>>();
+        self.authorizer
+            .authorize(
+                &mut r,
+                "wruntime.InfrastructureService",
+                "BeginManagerRollout",
+                &crate::auth::AuthorizationResource {
+                    manager_ids: &manager_ids,
+                    ..Default::default()
+                },
+            )?
+            .verify("wruntime.InfrastructureService", "BeginManagerRollout")?;
+        self.inner.begin_manager_rollout(r).await
+    }
+    async fn lease_manager_rollout(
+        &self,
+        mut r: Request<LeaseManagerRolloutRequest>,
+    ) -> Result<Response<LeaseManagerRolloutResponse>, Status> {
+        self.authorize(&mut r, "LeaseManagerRollout")?;
+        self.inner.lease_manager_rollout(r).await
+    }
+    async fn advance_manager_rollout(
+        &self,
+        mut r: Request<AdvanceManagerRolloutRequest>,
+    ) -> Result<Response<AdvanceManagerRolloutResponse>, Status> {
+        self.authorize(&mut r, "AdvanceManagerRollout")?;
+        self.inner.advance_manager_rollout(r).await
+    }
+    async fn get_manager_rollout(
+        &self,
+        mut r: Request<GetManagerRolloutRequest>,
+    ) -> Result<Response<GetManagerRolloutResponse>, Status> {
+        self.authorize(&mut r, "GetManagerRollout")?;
+        self.inner.get_manager_rollout(r).await
+    }
+}
+
+#[derive(Clone)]
+pub struct AuthenticatedLifecycleApi {
+    inner: wr_common::lifecycle_service::LifecycleServiceAdapter,
+    policy: PrincipalPolicy,
+}
+
+impl AuthenticatedLifecycleApi {
+    pub fn new(
+        inner: wr_common::lifecycle_service::LifecycleServiceAdapter,
+        policy: PrincipalPolicy,
+    ) -> Self {
+        Self { inner, policy }
+    }
+}
+
+impl AuthenticatedLifecycleApi {
+    async fn get_status(
+        &self,
+        mut request: Request<GetLifecycleStatusRequest>,
+    ) -> Result<Response<GetLifecycleStatusResponse>, Status> {
+        self.policy.authorize_enrolled(&mut request)?;
+        self.inner.get_status(request).await
+    }
+}
+
+#[derive(Clone)]
+pub struct AuthorizedLifecycleService {
+    inner: AuthenticatedLifecycleApi,
+    authorizer: Arc<crate::auth::ManagerAuthorizer>,
+}
+impl AuthorizedLifecycleService {
+    pub fn new(
+        inner: AuthenticatedLifecycleApi,
+        authorizer: Arc<crate::auth::ManagerAuthorizer>,
+    ) -> Self {
+        Self { inner, authorizer }
+    }
+}
+#[tonic::async_trait]
+impl LifecycleService for AuthorizedLifecycleService {
+    async fn get_status(
+        &self,
+        mut request: Request<GetLifecycleStatusRequest>,
+    ) -> Result<Response<GetLifecycleStatusResponse>, Status> {
+        self.authorizer
+            .authorize(
+                &mut request,
+                "wruntime.LifecycleService",
+                "GetStatus",
+                &Default::default(),
+            )?
+            .verify("wruntime.LifecycleService", "GetStatus")?;
+        self.inner.get_status(request).await
+    }
+}
+
+#[derive(Clone)]
+pub struct PolicyApi {
+    policy: PrincipalPolicy,
+    admission: AdmissionGate,
+    lifecycle: ManagerLifecycleState,
+}
+
+impl PolicyApi {
+    pub fn new(
+        policy: PrincipalPolicy,
+        admission: AdmissionGate,
+        lifecycle: ManagerLifecycleState,
+    ) -> Self {
+        Self {
+            policy,
+            admission,
+            lifecycle,
+        }
+    }
+
+    fn require_admission(&self) -> Result<AdmissionGuard, Status> {
+        self.admission
+            .try_enter()
+            .ok_or_else(|| Status::unavailable("privileged manager admission is closed"))
+    }
+}
+
+impl PolicyApi {
+    async fn get_policy_status(
+        &self,
+        mut request: Request<GetPolicyStatusRequest>,
+    ) -> Result<Response<GetPolicyStatusResponse>, Status> {
+        let _admission = self.require_admission()?;
+        self.policy.authorize_enrolled(&mut request)?;
+        let snapshot = self.policy.snapshot();
+        let headroom = &snapshot.cap_headroom;
+        Ok(Response::new(GetPolicyStatusResponse {
+            generation: snapshot.generation,
+            digest: snapshot.digest.clone(),
+            admission: self.lifecycle.admission().as_str_name().into(),
+            schema_version: snapshot.schema_version,
+            validator_version:
+                wr_common::authorization_policy::AUTHORIZATION_POLICY_VALIDATOR_VERSION,
+            cap_headroom: Some(PolicyCapHeadroom {
+                raw_bytes: headroom.raw_bytes as u64,
+                canonical_bytes: headroom.canonical_bytes as u64,
+                principals: headroom.principals as u64,
+                assignments: headroom.assignments as u64,
+                scope_values: headroom.scope_values as u64,
+                managers: headroom.managers as u64,
+                proxies: headroom.proxies as u64,
+                node_agents: headroom.node_agents as u64,
+                revoked_fingerprints: headroom.revoked_fingerprints as u64,
+            }),
+        }))
+    }
+
+    async fn get_workload_snapshot(
+        &self,
+        mut request: Request<GetWorkloadSnapshotRequest>,
+    ) -> Result<Response<GetWorkloadSnapshotResponse>, Status> {
+        let _admission = self.require_admission()?;
+        self.policy.authorize_proxy(&mut request)?;
+        let snapshot = self.policy.snapshot();
+        Ok(Response::new(GetWorkloadSnapshotResponse {
+            generation: snapshot.generation,
+            digest: snapshot.digest.clone(),
+            serialized_snapshot: wr_common::snapshot_consumer::build_snapshot(
+                snapshot,
+                wr_common::wruntime::WorkloadProjectionKind::ProxyPeerV1,
+                std::time::SystemTime::now(),
+            )
+            .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+}
+
+#[derive(Clone)]
+pub struct AuthorizedPolicyService {
+    inner: PolicyApi,
+    authorizer: Arc<crate::auth::ManagerAuthorizer>,
+}
+impl AuthorizedPolicyService {
+    pub fn new(inner: PolicyApi, authorizer: Arc<crate::auth::ManagerAuthorizer>) -> Self {
+        Self { inner, authorizer }
+    }
+}
+#[tonic::async_trait]
+impl PolicyService for AuthorizedPolicyService {
+    async fn get_policy_status(
+        &self,
+        mut request: Request<GetPolicyStatusRequest>,
+    ) -> Result<Response<GetPolicyStatusResponse>, Status> {
+        self.authorizer
+            .authorize(
+                &mut request,
+                "wruntime.PolicyService",
+                "GetPolicyStatus",
+                &Default::default(),
+            )?
+            .verify("wruntime.PolicyService", "GetPolicyStatus")?;
+        self.inner.get_policy_status(request).await
+    }
+    async fn get_workload_snapshot(
+        &self,
+        mut request: Request<GetWorkloadSnapshotRequest>,
+    ) -> Result<Response<GetWorkloadSnapshotResponse>, Status> {
+        self.authorizer
+            .authorize(
+                &mut request,
+                "wruntime.PolicyService",
+                "GetWorkloadSnapshot",
+                &Default::default(),
+            )?
+            .verify("wruntime.PolicyService", "GetWorkloadSnapshot")?;
+        self.inner.get_workload_snapshot(request).await
+    }
+}
+
+#[derive(Clone)]
+pub struct ManagerNodeApi {
+    manager: Manager,
+    agent: NodeAgentApi,
+}
+
+impl ManagerNodeApi {
+    pub fn new(manager: Manager, agent: NodeAgentApi) -> Self {
+        Self { manager, agent }
+    }
+}
+
+impl ManagerNodeApi {
+    async fn register_engine(
+        &self,
+        request: Request<RegisterEngineRequest>,
+    ) -> Result<Response<RegisterEngineResponse>, Status> {
+        self.manager.register_engine(request).await
+    }
+    async fn deregister_engine(
+        &self,
+        request: Request<DeregisterEngineRequest>,
+    ) -> Result<Response<DeregisterEngineResponse>, Status> {
+        self.manager.deregister_engine(request).await
+    }
+    async fn heartbeat(
+        &self,
+        request: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        self.manager.heartbeat(request).await
+    }
+    async fn begin_engine_drain(
+        &self,
+        request: Request<BeginEngineDrainRequest>,
+    ) -> Result<Response<BeginEngineDrainResponse>, Status> {
+        self.manager.begin_engine_drain(request).await
+    }
+    async fn attest(
+        &self,
+        request: Request<AttestNodeAgentRequest>,
+    ) -> Result<Response<AttestNodeAgentResponse>, Status> {
+        self.agent.attest(request).await
+    }
+    async fn claim_operation(
+        &self,
+        request: Request<ClaimOperationRequest>,
+    ) -> Result<Response<ClaimOperationResponse>, Status> {
+        self.agent.claim_operation(request).await
+    }
+    async fn renew_operation_lease(
+        &self,
+        request: Request<RenewOperationLeaseRequest>,
+    ) -> Result<Response<RenewOperationLeaseResponse>, Status> {
+        self.agent.renew_operation_lease(request).await
+    }
+    async fn report_observation(
+        &self,
+        request: Request<ReportNodeObservationRequest>,
+    ) -> Result<Response<ReportNodeObservationResponse>, Status> {
+        self.agent.report_observation(request).await
+    }
+    async fn report_step_result(
+        &self,
+        request: Request<ReportStepResultRequest>,
+    ) -> Result<Response<ReportStepResultResponse>, Status> {
+        self.agent.report_step_result(request).await
+    }
+}
+
+#[derive(Clone)]
+pub struct AuthorizedNodeService {
+    inner: ManagerNodeApi,
+    authorizer: Arc<crate::auth::ManagerAuthorizer>,
+}
+impl AuthorizedNodeService {
+    pub fn new(inner: ManagerNodeApi, authorizer: Arc<crate::auth::ManagerAuthorizer>) -> Self {
+        Self { inner, authorizer }
+    }
+    fn authorize<T>(
+        &self,
+        request: &mut Request<T>,
+        method: &'static str,
+        node_id: Option<&str>,
+    ) -> Result<(), Status> {
+        self.authorizer
+            .authorize(
+                request,
+                "wruntime.NodeService",
+                method,
+                &crate::auth::AuthorizationResource {
+                    node_id,
+                    ..Default::default()
+                },
+            )?
+            .verify("wruntime.NodeService", method)
+    }
+
+    async fn authorize_existing_engine<T>(
+        &self,
+        request: &mut Request<T>,
+        method: &'static str,
+        engine_id: &str,
+    ) -> Result<(), Status> {
+        let call = self.authorizer.authorize(
+            request,
+            "wruntime.NodeService",
+            method,
+            &Default::default(),
+        )?;
+        call.verify("wruntime.NodeService", method)?;
+        if let Some(node_id) = db::resolve_engine_node(&self.inner.manager.pool, engine_id).await? {
+            if call.principal_node_id() != Some(node_id.as_str()) {
+                return Err(Status::permission_denied(
+                    "enrolled proxy does not own the engine deployment",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+#[tonic::async_trait]
+impl NodeService for AuthorizedNodeService {
+    async fn register_engine(
+        &self,
+        mut r: Request<RegisterEngineRequest>,
+    ) -> Result<Response<RegisterEngineResponse>, Status> {
+        let node = r
+            .get_ref()
+            .registration
+            .as_ref()
+            .and_then(|x| x.deployment.as_ref())
+            .map(|x| x.node_id.clone());
+        self.authorize(&mut r, "RegisterEngine", node.as_deref())?;
+        self.inner.register_engine(r).await
+    }
+    async fn deregister_engine(
+        &self,
+        mut r: Request<DeregisterEngineRequest>,
+    ) -> Result<Response<DeregisterEngineResponse>, Status> {
+        let engine_id = r.get_ref().engine_id.clone();
+        self.authorize_existing_engine(&mut r, "DeregisterEngine", &engine_id)
+            .await?;
+        self.inner.deregister_engine(r).await
+    }
+    async fn heartbeat(
+        &self,
+        mut r: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        let engine_id = r.get_ref().engine_id.clone();
+        self.authorize_existing_engine(&mut r, "Heartbeat", &engine_id)
+            .await?;
+        self.inner.heartbeat(r).await
+    }
+    async fn begin_engine_drain(
+        &self,
+        mut r: Request<BeginEngineDrainRequest>,
+    ) -> Result<Response<BeginEngineDrainResponse>, Status> {
+        let engine_id = r.get_ref().engine_id.clone();
+        self.authorize_existing_engine(&mut r, "BeginEngineDrain", &engine_id)
+            .await?;
+        self.inner.begin_engine_drain(r).await
+    }
+    async fn attest(
+        &self,
+        mut r: Request<AttestNodeAgentRequest>,
+    ) -> Result<Response<AttestNodeAgentResponse>, Status> {
+        let node = r
+            .get_ref()
+            .attestation
+            .as_ref()
+            .map(|attestation| attestation.node_id.clone())
+            .ok_or_else(|| Status::invalid_argument("attestation is required"))?;
+        self.authorize(&mut r, "Attest", Some(&node))?;
+        self.inner.attest(r).await
+    }
+    async fn claim_operation(
+        &self,
+        mut r: Request<ClaimOperationRequest>,
+    ) -> Result<Response<ClaimOperationResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize(&mut r, "ClaimOperation", Some(&node))?;
+        self.inner.claim_operation(r).await
+    }
+    async fn renew_operation_lease(
+        &self,
+        mut r: Request<RenewOperationLeaseRequest>,
+    ) -> Result<Response<RenewOperationLeaseResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize(&mut r, "RenewOperationLease", Some(&node))?;
+        self.inner.renew_operation_lease(r).await
+    }
+    async fn report_observation(
+        &self,
+        mut r: Request<ReportNodeObservationRequest>,
+    ) -> Result<Response<ReportNodeObservationResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize(&mut r, "ReportObservation", Some(&node))?;
+        self.inner.report_observation(r).await
+    }
+    async fn report_step_result(
+        &self,
+        mut r: Request<ReportStepResultRequest>,
+    ) -> Result<Response<ReportStepResultResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize(&mut r, "ReportStepResult", Some(&node))?;
+        self.inner.report_step_result(r).await
     }
 }
 
@@ -1292,6 +2536,97 @@ mod reconcile_tests {
         let timestamp = proto_timestamp(value);
         assert_eq!(timestamp.seconds, 1_700_000_000);
         assert_eq!(timestamp.nanos, 123_456_789);
+    }
+
+    #[test]
+    fn rollout_creation_and_controller_gate_reject_revoked_leaf() {
+        let policy = PrincipalPolicy::new(Arc::new(
+            wr_common::authorization_policy::ValidatedPolicy::load(
+                br#"schema_version=1
+generation=1
+cluster_id="cluster-a"
+revoked_leaf_fingerprints=["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+principals=[{uri="urn:wruntime:cluster-a:human:deployer",kind="human"}]
+assignments=[{principal="urn:wruntime:cluster-a:human:deployer",role="admin",scope={}}]
+manager_enrollments=[]
+proxy_enrollments=[]
+node_agent_enrollments=[]
+"#,
+            )
+            .unwrap(),
+        ));
+        let evidence = wr_common::tls::LeafEvidence {
+            profile: wr_common::tls::LeafProfile::Client,
+            principal: Some(
+                wr_common::identity::PrincipalUri::parse("urn:wruntime:cluster-a:human:deployer")
+                    .unwrap(),
+            ),
+            endpoint_dns_names: Vec::new(),
+            endpoint_ip_addresses: Vec::new(),
+            fingerprint: format!("sha256:{}", "a".repeat(64)),
+            serial: "01".into(),
+            spki_fingerprint: format!("sha256:{}", "b".repeat(64)),
+        };
+        assert_eq!(
+            InfrastructureApi::reject_revoked_rollout_leaf(&policy, &evidence)
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn manager_rollout_canonicalization_sorts_targets_and_binds_content() {
+        let target = |manager_id: &str, digit: char| wr_common::wruntime::ManagerRolloutTarget {
+            manager_id: manager_id.into(),
+            endpoint: format!("https://{manager_id}:9000"),
+            host_digest: format!("sha256:{}", digit.to_string().repeat(64)),
+            config_digest: format!("sha256:{}", digit.to_string().repeat(64)),
+            backend: "systemd".into(),
+            executable_digest: format!("sha256:{}", digit.to_string().repeat(64)),
+            backend_spec_digest: format!("sha256:{}", digit.to_string().repeat(64)),
+            credential_digest: format!("sha256:{}", digit.to_string().repeat(64)),
+            old_selector_digest: format!("sha256:{}", digit.to_string().repeat(64)),
+            new_selector_digest: format!("sha256:{}", digit.to_string().repeat(64)),
+        };
+        let mut first = BeginManagerRolloutRequest {
+            client_operation_id: "73c54ac7-fe23-4ddf-96e5-0da2e4b18d7d".into(),
+            cluster_id: "cluster-a".into(),
+            target_generation: 2,
+            target_policy_digest: format!("sha256:{}", "a".repeat(64)),
+            expected_targets: vec![target("manager-b", 'b'), target("manager-a", 'a')],
+            recovery_of: String::new(),
+            target_policy_validator_version: 1,
+            target_deployment_principal_uri: "urn:wruntime:cluster-a:human:deployer".into(),
+            target_deployment_leaf_fingerprint: format!("sha256:{}", "c".repeat(64)),
+            source_managers: vec![],
+            manifest_digest: format!("sha256:{}", "d".repeat(64)),
+            executor_id: "9ba18521-717d-4c39-bf79-e4bb87f95c55".into(),
+            deployment_certificate: "deploy-set-v1".into(),
+        };
+        first.source_managers = vec![wr_common::wruntime::ManagerRolloutSource {
+            manager_id: "manager-source".into(),
+            endpoint: "https://manager-source:9000".into(),
+            host_digest: format!("sha256:{}", "e".repeat(64)),
+            selector_digest: format!("sha256:{}", "f".repeat(64)),
+        }];
+        let mut reordered = first.clone();
+        reordered.expected_targets.reverse();
+        let first_digest = InfrastructureApi::canonical_rollout_request(&mut first).unwrap();
+        let reordered_digest =
+            InfrastructureApi::canonical_rollout_request(&mut reordered).unwrap();
+        assert_eq!(first_digest, reordered_digest);
+        reordered.expected_targets[0].credential_digest = format!("sha256:{}", "9".repeat(64));
+        assert_ne!(
+            first_digest,
+            InfrastructureApi::canonical_rollout_request(&mut reordered).unwrap()
+        );
+        let mut changed_source = first.clone();
+        changed_source.source_managers[0].selector_digest = format!("sha256:{}", "8".repeat(64));
+        assert_ne!(
+            first_digest,
+            InfrastructureApi::canonical_rollout_request(&mut changed_source).unwrap()
+        );
     }
 
     #[test]

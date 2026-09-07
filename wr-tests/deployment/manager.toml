@@ -1,25 +1,21 @@
+manager_id                    = "manager-a"
 listen_address                = "0.0.0.0:9000"
 engine_heartbeat_timeout_secs = 8
 module_heartbeat_timeout_secs = 8
 local_proxy_address           = "http://127.0.0.1:9001"
 
 [tls]
-cert_path    = "certs/manager.crt"
-key_path     = "certs/manager.key"
-ca_cert_path = "certs/ca.crt"
+cert_path           = "certs/manager.crt"
+key_path            = "certs/manager.key"
+client_ca_cert_path = "certs/client-root/ca.crt"
 
-[job_admin]
-listen_address = "0.0.0.0:9020"
+[client_tls]
+cert_path           = "certs/manager-client/leaf.pem"
+key_path            = "certs/manager-client/key.pem"
+server_ca_cert_path = "certs/server-root/ca.crt"
 
-[job_admin.tls]
-cert_path    = "certs/job-admin-operator/manager.crt"
-key_path     = "certs/job-admin-operator/manager.key"
-ca_cert_path = "certs/job-admin-operator/ca.crt"
-
-[job_admin_delegation_tls]
-cert_path    = "certs/job-admin-delegation/manager.crt"
-key_path     = "certs/job-admin-delegation/manager.key"
-ca_cert_path = "certs/job-admin-delegation/ca.crt"
+[authorization]
+policy_file = "policy/authorization.toml"
 
 [database]
 url             = "postgres://postgres@127.0.0.1:5432/wruntime_deployment_e2e"

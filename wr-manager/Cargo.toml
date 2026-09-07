@@ -25,6 +25,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 aes-gcm = "0.10"
 hex = "0.4"
+sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 refinery = { version = "0.9", features = ["tokio-postgres"] }
 tokio-retry = "0.3"

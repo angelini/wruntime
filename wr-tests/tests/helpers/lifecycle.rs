@@ -19,7 +19,7 @@ use super::wait::DEFAULT_POLL_INTERVAL;
 
 #[derive(Clone, Debug)]
 pub enum LifecycleObservation {
-    Status(LifecycleStatus),
+    Status(Box<LifecycleStatus>),
     Rpc { code: Code, message: String },
 }
 
@@ -29,11 +29,11 @@ pub enum LifecycleWaitError {
         expected: ProcessLifecycleState,
         last_observation: Option<LifecycleObservation>,
     },
-    TerminalBeforeReady(LifecycleStatus),
+    TerminalBeforeReady(Box<LifecycleStatus>),
     InvalidState(i32),
     InvalidStatus {
         error: LifecycleStatusValidationError,
-        status: LifecycleStatus,
+        status: Box<LifecycleStatus>,
     },
     Rpc {
         code: Code,
@@ -105,15 +105,15 @@ pub(crate) fn evaluate_state(
     let observed = validate_lifecycle_status(status)
         .map_err(|error| LifecycleWaitError::InvalidStatus {
             error,
-            status: status.clone(),
+            status: Box::new(status.clone()),
         })?
         .state;
     match classify_lifecycle_state(observed, expected) {
         Ok(LifecycleStateClassification::Matched) => Ok(StateEvaluation::Reached),
         Ok(LifecycleStateClassification::Pending) => Ok(StateEvaluation::Pending),
-        Ok(LifecycleStateClassification::Terminal) => {
-            Err(LifecycleWaitError::TerminalBeforeReady(status.clone()))
-        }
+        Ok(LifecycleStateClassification::Terminal) => Err(LifecycleWaitError::TerminalBeforeReady(
+            Box::new(status.clone()),
+        )),
         Err(_) => Err(LifecycleWaitError::InvalidState(status.state)),
     }
 }
@@ -212,7 +212,7 @@ async fn wait_for_state_inner(
                 let validated = validate_lifecycle_status(&status).map_err(|error| {
                     LifecycleWaitError::InvalidStatus {
                         error,
-                        status: status.clone(),
+                        status: Box::new(status.clone()),
                     }
                 })?;
                 if let Some((expected_kind, expected_instance)) = expected_identity {
@@ -232,7 +232,7 @@ async fn wait_for_state_inner(
                 match evaluate_state(&status, expected)? {
                     StateEvaluation::Reached => return Ok(status),
                     StateEvaluation::Pending => {
-                        last_observation = Some(LifecycleObservation::Status(status));
+                        last_observation = Some(LifecycleObservation::Status(Box::new(status)));
                     }
                 }
             }

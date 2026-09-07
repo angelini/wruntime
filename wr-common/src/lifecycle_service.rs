@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use tokio::sync::Notify;
@@ -113,11 +113,89 @@ impl Drop for AdmissionGuard {
 #[derive(Clone)]
 pub struct LifecycleServiceAdapter {
     lifecycle: LifecycleSnapshotHandle,
+    manager: Option<ManagerLifecycleMetadata>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ManagerRolloutObservation {
+    admission: i32,
+    rollout_operation_id: String,
+    rollout_phase: i32,
+    rollout_expected_set_hash: String,
+    last_observed_rollout_lease_epoch: u64,
+}
+
+/// Coherent rollout metadata shared by the manager's durable observer and its
+/// read-only lifecycle endpoint.
+#[derive(Clone, Debug, Default)]
+pub struct ManagerLifecycleState {
+    observation: Arc<RwLock<ManagerRolloutObservation>>,
+}
+
+impl ManagerLifecycleState {
+    pub fn admission(&self) -> crate::wruntime::PrivilegedAdmissionState {
+        let value = self
+            .observation
+            .read()
+            .expect("manager lifecycle state poisoned")
+            .admission;
+        crate::wruntime::PrivilegedAdmissionState::try_from(value)
+            .unwrap_or(crate::wruntime::PrivilegedAdmissionState::ClosedMismatch)
+    }
+
+    pub fn update(
+        &self,
+        admission: crate::wruntime::PrivilegedAdmissionState,
+        rollout_operation_id: impl Into<String>,
+        rollout_phase: i32,
+        rollout_expected_set_hash: impl Into<String>,
+        last_observed_rollout_lease_epoch: u64,
+    ) {
+        *self
+            .observation
+            .write()
+            .expect("manager lifecycle state poisoned") = ManagerRolloutObservation {
+            admission: admission as i32,
+            rollout_operation_id: rollout_operation_id.into(),
+            rollout_phase,
+            rollout_expected_set_hash: rollout_expected_set_hash.into(),
+            last_observed_rollout_lease_epoch,
+        };
+    }
+}
+
+#[derive(Clone)]
+struct ManagerLifecycleMetadata {
+    manager_id: String,
+    policy_generation: u64,
+    policy_digest: String,
+    rollout: ManagerLifecycleState,
 }
 
 impl LifecycleServiceAdapter {
     pub fn new(lifecycle: LifecycleSnapshotHandle) -> Self {
-        Self { lifecycle }
+        Self {
+            lifecycle,
+            manager: None,
+        }
+    }
+
+    pub fn new_manager(
+        lifecycle: LifecycleSnapshotHandle,
+        manager_id: String,
+        policy_generation: u64,
+        policy_digest: String,
+        rollout: ManagerLifecycleState,
+    ) -> Self {
+        Self {
+            lifecycle,
+            manager: Some(ManagerLifecycleMetadata {
+                manager_id,
+                policy_generation,
+                policy_digest,
+                rollout,
+            }),
+        }
     }
 }
 
@@ -127,8 +205,25 @@ impl LifecycleService for LifecycleServiceAdapter {
         &self,
         _request: Request<GetLifecycleStatusRequest>,
     ) -> Result<Response<GetLifecycleStatusResponse>, Status> {
+        let mut status: LifecycleStatus = (&self.lifecycle.current()).into();
+        if let Some(manager) = &self.manager {
+            status.manager_id = manager.manager_id.clone();
+            status.process_ready = status.state == ProcessLifecycleState::Ready as i32;
+            status.policy_generation = manager.policy_generation;
+            status.policy_digest = manager.policy_digest.clone();
+            let rollout = manager
+                .rollout
+                .observation
+                .read()
+                .expect("manager lifecycle state poisoned");
+            status.privileged_admission = rollout.admission;
+            status.rollout_operation_id = rollout.rollout_operation_id.clone();
+            status.rollout_phase = rollout.rollout_phase;
+            status.rollout_expected_set_hash = rollout.rollout_expected_set_hash.clone();
+            status.last_observed_rollout_lease_epoch = rollout.last_observed_rollout_lease_epoch;
+        }
         Ok(Response::new(GetLifecycleStatusResponse {
-            status: Some((&self.lifecycle.current()).into()),
+            status: Some(status),
         }))
     }
 }
@@ -303,6 +398,46 @@ mod tests {
         for status in rejected {
             assert!(validate_ready_status(status, ServiceKind::Proxy).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn manager_status_projects_the_latest_rollout_observation() -> anyhow::Result<()> {
+        let mut lifecycle = LifecycleOwner::new(ProcessServiceKind::Manager, "manager-process");
+        lifecycle.mark_ready("ready closed")?;
+        let rollout = ManagerLifecycleState::default();
+        rollout.update(
+            crate::wruntime::PrivilegedAdmissionState::ClosedRollout,
+            "11111111-1111-4111-8111-111111111111",
+            crate::wruntime::ManagerRolloutPhase::ClosingOld as i32,
+            format!("sha256:{}", "a".repeat(64)),
+            7,
+        );
+        let adapter = LifecycleServiceAdapter::new_manager(
+            lifecycle.snapshot(),
+            "manager-a".into(),
+            42,
+            format!("sha256:{}", "b".repeat(64)),
+            rollout,
+        );
+        let status = adapter
+            .get_status(Request::new(GetLifecycleStatusRequest {}))
+            .await?
+            .into_inner()
+            .status
+            .expect("status");
+        assert_eq!(status.manager_id, "manager-a");
+        assert!(status.process_ready);
+        assert_eq!(status.policy_generation, 42);
+        assert_eq!(
+            status.privileged_admission,
+            crate::wruntime::PrivilegedAdmissionState::ClosedRollout as i32
+        );
+        assert_eq!(
+            status.rollout_phase,
+            crate::wruntime::ManagerRolloutPhase::ClosingOld as i32
+        );
+        assert_eq!(status.last_observed_rollout_lease_epoch, 7);
+        Ok(())
     }
 
     #[tokio::test]

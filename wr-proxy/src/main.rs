@@ -34,10 +34,12 @@ use wr_common::lifecycle_service::{
 };
 use wr_common::process_lifecycle::{LifecycleOwner, ProcessState, ServiceKind, TransitionReason};
 use wr_common::signal::{shutdown_signal_request, ShutdownCause, ShutdownRequest};
+use wr_common::snapshot_consumer::{consume, SnapshotConsumerState};
 use wr_common::task_group::{TaskCancellation, TaskExit, TaskGroup};
 use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
 use wr_common::wruntime::lifecycle_service_server::LifecycleServiceServer;
-use wr_common::wruntime::node_service_server::NodeServiceServer;
+use wr_common::wruntime::proxy_node_control_service_server::ProxyNodeControlServiceServer;
+use wr_common::wruntime::{GetWorkloadSnapshotRequest, WorkloadProjectionKind};
 
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
 
@@ -149,11 +151,7 @@ async fn main() -> Result<()> {
 
     let mut telemetry = wr_common::telemetry::init("wr-proxy")?;
     let result = run_service(arguments.get(1).map(String::as_str).unwrap_or("proxy.toml")).await;
-    let finalized = telemetry.finalize();
-    if !finalized.is_success() && result.is_ok() {
-        anyhow::bail!("telemetry finalization failed: {:?}", finalized.failures);
-    }
-    result
+    telemetry.finalize_preserving(result)
 }
 
 async fn lifecycle_probe(config_path: &str) -> Result<()> {
@@ -199,22 +197,51 @@ async fn run_service(config_path: &str) -> Result<()> {
         "wr_system",
     )
     .context("failed to create discovery pool")?;
-    let manager_tls = wr_common::tls::build_tonic_client_tls(&config.node.tls)
+    let manager_tls = wr_common::tls::build_tonic_client_tls(&config.client_tls)
         .context("failed to build manager TLS config")?;
+    let client_evidence =
+        wr_common::tls::load_client_leaf_evidence(&config.client_tls.cert_path, None)?;
+    let proxy_principal = client_evidence
+        .principal
+        .as_ref()
+        .context("proxy client certificate lacks principal")?;
+    let cluster_id = proxy_principal.cluster_id().to_string();
+    let policy_state = Arc::new(tokio::sync::Mutex::new(SnapshotConsumerState::Empty));
     let discovery = Arc::new(ManagerDiscovery::new(
         db_pool,
-        Some(manager_tls),
+        manager_tls,
+        config.client_tls.server_ca_cert_path.clone(),
+        config.client_tls.cert_path.clone(),
         config.database.manager_liveness_threshold_secs,
-    ));
+    )?);
     discovery.refresh().await;
+    let mut initial_routing_epoch = discovery
+        .pin(wr_common::manager_client::RetryClass::ReadOnly)
+        .await
+        .map_err(|error| anyhow::anyhow!("initial manager connect failed: {error}"))?;
+    routing::sync_once(&mut initial_routing_epoch, &routing_table)
+        .await
+        .context("initial routing table sync failed")?;
+    let initial_snapshot = initial_routing_epoch
+        .get_workload_snapshot(GetWorkloadSnapshotRequest {})
+        .await
+        .context("initial proxy policy snapshot failed")?
+        .into_inner();
     {
-        let mut client = discovery
-            .get_client()
-            .await
-            .map_err(|error| anyhow::anyhow!("initial manager connect failed: {error}"))?;
-        routing::sync_once(&mut client, &routing_table)
-            .await
-            .context("initial routing table sync failed")?;
+        let mut state = policy_state.lock().await;
+        consume(
+            &mut state,
+            Ok(&initial_snapshot.serialized_snapshot),
+            &cluster_id,
+            WorkloadProjectionKind::ProxyPeerV1,
+            std::time::SystemTime::now(),
+            std::time::Instant::now(),
+            true,
+        );
+        anyhow::ensure!(
+            state.is_fresh(std::time::Instant::now()),
+            "initial proxy policy snapshot was rejected"
+        );
     }
 
     let schema_cache = Arc::new(schema::SchemaCache::new(Arc::clone(&discovery)));
@@ -226,12 +253,12 @@ async fn run_service(config_path: &str) -> Result<()> {
     let control_incoming =
         TcpIncoming::bind(control_addr).context("failed to bind proxy control listener")?;
 
-    let mtls_client_config = wr_common::tls::build_client_config(&config.node.tls)?;
+    let mtls_client_config = wr_common::tls::build_client_config(&config.client_tls)?;
     let mtls_pool = wr_common::tls::HttpsClientPool::new(
         wr_common::http_pool::DEFAULT_POOL_SIZE,
         mtls_client_config,
     );
-    let tls_acceptor = wr_common::tls::build_acceptor(&config.node.tls)?;
+    let tls_acceptor = wr_common::tls::build_acceptor(&config.endpoint_tls)?;
 
     let egress_domains = config
         .egress
@@ -278,7 +305,9 @@ async fn run_service(config_path: &str) -> Result<()> {
 
     let lifecycle_service = LifecycleServiceAdapter::new(lifecycle.snapshot());
     let control_router = Server::builder()
-        .add_service(NodeServiceServer::from_arc(Arc::clone(&node_agent)))
+        .add_service(ProxyNodeControlServiceServer::from_arc(Arc::clone(
+            &node_agent,
+        )))
         .add_service(LifecycleServiceServer::new(lifecycle_service));
 
     let mut scopes = ProxyTaskScopes::new(admission.clone());
@@ -293,13 +322,25 @@ async fn run_service(config_path: &str) -> Result<()> {
         let table = routing_table.clone();
         let ttl = config.cache.routing_table_ttl_secs;
         scopes.spawn_background("proxy-routing-sync", move |cancellation| {
-            routing::sync_routing_table(discovery, table, ttl, cancellation)
+            routing::sync_routing_table(discovery, initial_routing_epoch, table, ttl, cancellation)
         });
     }
     {
         let node_agent = Arc::clone(&node_agent);
         scopes.spawn_background("proxy-heartbeat-flush", move |cancellation| {
             node_agent.run_heartbeat_loop(Duration::from_secs(3), cancellation)
+        });
+    }
+    {
+        let discovery = Arc::clone(&discovery);
+        let policy_state = Arc::clone(&policy_state);
+        let cluster_id = cluster_id.clone();
+        scopes.spawn_background("proxy-policy-poll", move |mut cancellation| async move {
+            let mut epoch=discovery.pin(wr_common::manager_client::RetryClass::ReadOnly).await?; let mut interval=tokio::time::interval(Duration::from_secs(5));
+            loop { tokio::select!{_=cancellation.cancelled()=>return Ok(TaskExit::Cancelled),_=interval.tick()=>{}}
+                let result=epoch.get_workload_snapshot(GetWorkloadSnapshotRequest{}).await.map(|r|r.into_inner().serialized_snapshot).map_err(|e|e.to_string());
+                let mut state=policy_state.lock().await; match result {Ok(bytes)=>consume(&mut state,Ok(&bytes),&cluster_id,WorkloadProjectionKind::ProxyPeerV1,std::time::SystemTime::now(),std::time::Instant::now(),true),Err(error)=>consume(&mut state,Err(error),&cluster_id,WorkloadProjectionKind::ProxyPeerV1,std::time::SystemTime::now(),std::time::Instant::now(),true)}
+            }
         });
     }
     scopes.spawn_background("proxy-control-listener", move |cancellation| async move {
@@ -330,6 +371,8 @@ async fn run_service(config_path: &str) -> Result<()> {
                 tls_acceptor,
                 internal_service,
                 admission,
+                policy_state,
+                cluster_id,
                 cancellation,
             )
         });
@@ -496,6 +539,8 @@ async fn tls_accept_loop<S>(
     acceptor: TlsAcceptor,
     service: S,
     admission: AdmissionGate,
+    policy_state: Arc<tokio::sync::Mutex<SnapshotConsumerState>>,
+    cluster_id: String,
     mut cancellation: TaskCancellation,
 ) -> Result<TaskExit>
 where
@@ -512,6 +557,8 @@ where
                 let acceptor = acceptor.clone();
                 let service = service.clone();
                 let admission = admission.clone();
+                let policy_state=Arc::clone(&policy_state);
+                let cluster_id=cluster_id.clone();
                 let mut connection_cancellation = cancellation.clone();
                 connections.spawn(async move {
                     let tls_stream = tokio::select! {
@@ -524,11 +571,16 @@ where
                             }
                         }
                     };
+                    let evidence=tls_stream.get_ref().1.peer_certificates().and_then(|certs|certs.first()).and_then(|cert|wr_common::tls::parse_leaf_evidence(cert.as_ref(),wr_common::tls::LeafProfile::Client,None).ok());
                     let io = TokioIo::new(tls_stream);
-                    let hyper_service = hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
+                    let hyper_service = hyper::service::service_fn(move |mut request: Request<hyper::body::Incoming>| {
                         let mut service = service.clone();
                         let admission = admission.clone();
+                        let policy_state=Arc::clone(&policy_state); let evidence=evidence.clone(); let cluster_id=cluster_id.clone();
                         async move {
+                            let authorized=if let Some(evidence)=evidence.as_ref().filter(|e|e.principal.as_ref().is_some_and(|p|p.cluster_id().as_str()==cluster_id)) { let mut state=policy_state.lock().await; state.expire(std::time::Instant::now()); state.retained().is_some_and(|snapshot|state.is_fresh(std::time::Instant::now())&&snapshot.admits(evidence.principal.as_ref().expect("checked").as_str(),&evidence.fingerprint)) } else {false};
+                            if !authorized { return Ok::<_,Infallible>(layers::error_response(StatusCode::FORBIDDEN,"peer authorization denied")); }
+                            if let Some(evidence)=evidence { request.extensions_mut().insert(evidence); }
                             let Some(guard) = admission.try_enter() else {
                                 return Ok::<_, Infallible>(layers::error_response(
                                     StatusCode::SERVICE_UNAVAILABLE,

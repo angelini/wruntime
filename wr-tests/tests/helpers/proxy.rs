@@ -10,9 +10,9 @@ use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use wr_common::manager_client::ManagerClient as ManagerServiceClient;
 use wr_common::wruntime::{
-    manager_service_client::ManagerServiceClient, EngineRegistration, ModuleDescriptor,
-    RegisterEngineRequest, RoutingRule,
+    EngineRegistration, ModuleDescriptor, RegisterEngineRequest, RoutingRule,
 };
 
 pub use wr_proxy::config::{EgressConfig, ExternalRoute};
@@ -65,6 +65,8 @@ pub async fn register_module_raw(
             job_queue_id: String::new(),
             job_admin_address: String::new(),
         }),
+
+        activation_id: uuid::Uuid::new_v4().to_string(),
     })
     .await?;
     Ok(())
@@ -180,8 +182,8 @@ pub async fn start_node(mgr_addr: &str) -> Result<Node> {
 
     let pki = shared_test_pki();
     let server_config = wr_common::tls::build_server_config_from_der(
-        pki.node_cert_der.clone(),
-        pki.node_key_der.clone_key(),
+        pki.server_cert_der.clone(),
+        pki.server_key_der.clone_key(),
         &pki.ca_cert_der,
     )?;
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(server_config);

@@ -1,0 +1,24 @@
+schema_version            = 1
+generation                = 1
+cluster_id                = "deployment"
+proxy_enrollments         = []
+node_agent_enrollments    = []
+revoked_leaf_fingerprints = []
+
+[[principals]]
+uri  = "urn:wruntime:deployment:human:deployer"
+kind = "human"
+
+[[principals]]
+uri  = "urn:wruntime:deployment:manager:manager-a"
+kind = "manager"
+
+[[assignments]]
+principal = "urn:wruntime:deployment:human:deployer"
+role      = "admin"
+[assignments.scope]
+
+[[manager_enrollments]]
+principal  = "urn:wruntime:deployment:manager:manager-a"
+manager_id = "manager-a"
+endpoint   = "https://127.0.0.1:9000"

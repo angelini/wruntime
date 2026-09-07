@@ -39,6 +39,14 @@ enum LifecycleTransitionReason {
   LIFECYCLE_TRANSITION_REASON_TASK_FAILURE = 6;
 }
 
+enum PrivilegedAdmissionState {
+  PRIVILEGED_ADMISSION_STATE_UNSPECIFIED = 0;
+  PRIVILEGED_ADMISSION_STATE_OPEN = 1;
+  PRIVILEGED_ADMISSION_STATE_CLOSED_STARTUP = 2;
+  PRIVILEGED_ADMISSION_STATE_CLOSED_ROLLOUT = 3;
+  PRIVILEGED_ADMISSION_STATE_CLOSED_MISMATCH = 4;
+}
+
 message LifecycleStatus {
   ProcessLifecycleState state = 1;
   ServiceKind service_kind = 2;
@@ -46,6 +54,15 @@ message LifecycleStatus {
   google.protobuf.Timestamp transitioned_at = 4;
   LifecycleTransitionReason reason = 5;
   string detail = 6; // bounded explanatory text; never an automation key
+  string manager_id = 7;
+  bool process_ready = 8;
+  uint64 policy_generation = 9;
+  string policy_digest = 10;
+  PrivilegedAdmissionState privileged_admission = 11;
+  string rollout_operation_id = 12;
+  ManagerRolloutPhase rollout_phase = 13;
+  string rollout_expected_set_hash = 14;
+  uint64 last_observed_rollout_lease_epoch = 15;
 }
 
 message GetLifecycleStatusRequest {}
@@ -84,6 +101,8 @@ message DeploymentMetadata {
   uint64 revision = 2;
   string bundle_digest = 3; // sha256:<lowercase hex>
   string engine_slot = 4;
+  string operation_id = 5; // manager-created deployment operation UUID
+  string revision_digest = 6; // manager-derived canonical revision digest
 }
 
 message ModuleIdentity {
@@ -92,9 +111,23 @@ message ModuleIdentity {
   string version = 3;
 }
 
+message ExpectedModule {
+  ModuleIdentity identity = 1;
+  string proto_schema_digest = 2; // empty when no schema is declared
+}
+
 message ExpectedEngine {
   string engine_slot = 1;
-  repeated ModuleIdentity modules = 2;
+  repeated ExpectedModule modules = 2;
+  repeated SecretRequest secrets = 3;
+  repeated string db_namespaces = 4;
+  string job_queue_id = 5;
+  string job_admin_address = 6;
+}
+
+message DeploymentInventoryV1 {
+  uint32 schema_version = 1;
+  repeated ExpectedEngine engines = 2;
 }
 
 enum DeploymentState {
@@ -119,7 +152,7 @@ message DeploymentRecord {
   uint64 revision = 2;
   string attempt_token = 3;
   string bundle_digest = 4;
-  repeated ExpectedEngine expected_engines = 5;
+  DeploymentInventoryV1 inventory = 5;
   DeploymentState state = 6;
   optional google.protobuf.Timestamp created_at = 7;
   optional google.protobuf.Timestamp completed_at = 8;
@@ -128,13 +161,15 @@ message DeploymentRecord {
   optional google.protobuf.Timestamp activated_at = 11;
   string resolved_release_digest = 12; // immutable finalized post-template release identity
   optional google.protobuf.Timestamp finalized_at = 13;
+  uint32 inventory_schema_version = 14;
+  string revision_digest = 15;
 }
 
 message BeginDeploymentRequest {
   string node_id = 1;
   string attempt_token = 2;
   string bundle_digest = 3;
-  repeated ExpectedEngine expected_engines = 4;
+  DeploymentInventoryV1 inventory = 4;
 }
 message BeginDeploymentResponse { DeploymentRecord deployment = 1; }
 message FinalizeDeploymentRequest {
@@ -190,17 +225,31 @@ message RoutingTable {
 
 // ── Engine lifecycle ──────────────────────────────────────────────────────
 
-message RegisterEngineRequest    { EngineRegistration registration = 1; }
+message EngineOwnershipFence {
+  string node_id = 1;
+  string slot = 2;
+  string revision_digest = 3;
+  string activation_id = 4;
+  uint64 slot_generation = 5;
+}
+
+message RegisterEngineRequest {
+  EngineRegistration registration = 1;
+  string activation_id = 2; // process-generated UUID; never persisted in prelaunch config
+}
 message RegisterEngineResponse   {
   bool                              accepted       = 1;
   repeated NamespaceSecrets         secrets        = 2; // only the requested secrets, decrypted
   repeated NamespaceDbCredential    db_credentials = 3; // per-namespace DB role + password
+  EngineOwnershipFence              fence          = 4;
+  bytes serialized_snapshot                        = 5;
 }
-message DeregisterEngineRequest  { string engine_id = 1; }
-message DeregisterEngineResponse {}
+message DeregisterEngineRequest  { string engine_id = 1; EngineOwnershipFence fence = 2; }
+message DeregisterEngineResponse { EngineOwnershipFence accepted_fence = 1; }
 message HeartbeatRequest {
   string                    engine_id       = 1;
   repeated ModuleDescriptor healthy_modules = 2; // modules the engine considers healthy
+  EngineOwnershipFence      fence = 3;
 }
 // A manager reply reports the routing-table version produced by readiness
 // publication. A NodeService reply additionally reports the local proxy version
@@ -208,15 +257,18 @@ message HeartbeatRequest {
 message HeartbeatResponse {
   uint64 manager_routing_table_version = 1;
   uint64 proxy_routing_table_version = 2;
+  EngineOwnershipFence accepted_fence = 3;
+  bytes serialized_snapshot = 4;
 }
 
 // Begin drain withdraws route admission but intentionally retains the final
 // engine registration. It is idempotent and returns the same convergence
 // evidence as HeartbeatResponse.
-message BeginEngineDrainRequest { string engine_id = 1; }
+message BeginEngineDrainRequest { string engine_id = 1; EngineOwnershipFence fence = 2; }
 message BeginEngineDrainResponse {
   uint64 manager_routing_table_version = 1;
   uint64 proxy_routing_table_version = 2;
+  EngineOwnershipFence accepted_fence = 3;
 }
 message ListEnginesRequest       {}
 message ListEnginesResponse      { repeated EngineRegistration engines = 1; }
@@ -534,6 +586,7 @@ message NodeOperation {
   string proxy_effect_process_instance_id = 47;
   string proxy_effect_condition_code = 48;
   string proxy_effect_detail = 49;
+  string revision_digest = 50;
 }
 
 message OperationEvent {
@@ -668,6 +721,7 @@ message AgentInstruction {
   // Manager-derived exact deletion allow-list for committed cleanup. The
   // agent validates each revision/digest/path but never derives retention.
   repeated ReleaseInventoryEntry cleanup_delete_releases = 14;
+  string revision_digest = 15;
 }
 message ClaimOperationResponse {
   AgentInstruction instruction = 1;
@@ -725,28 +779,9 @@ message ReportStepResultRequest {
 }
 message ReportStepResultResponse { NodeOperation operation = 1; }
 
-service OperatorService {
-  rpc GetStatus(GetOperatorStatusRequest) returns (GetOperatorStatusResponse);
-  rpc BeginDeployment(BeginDeploymentRequest) returns (BeginDeploymentResponse);
-  rpc VerifyDeployment(VerifyDeploymentRequest) returns (VerifyDeploymentResponse);
-  rpc BeginRollback(BeginRollbackRequest) returns (BeginRollbackResponse);
-  rpc SubmitOperation(SubmitOperationRequest) returns (SubmitOperationResponse);
-  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
-  rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);
-  rpc ResumeOperation(ResumeOperationRequest) returns (ResumeOperationResponse);
-  rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);
-  rpc PutNodeAgentPolicy(PutNodeAgentPolicyRequest) returns (PutNodeAgentPolicyResponse);
-  rpc FinalizeDeployment(FinalizeDeploymentRequest) returns (FinalizeDeploymentResponse);
-  rpc AbandonDeployment(AbandonDeploymentRequest) returns (AbandonDeploymentResponse);
-}
-
-service NodeAgentService {
-  rpc Attest(AttestNodeAgentRequest) returns (AttestNodeAgentResponse);
-  rpc ClaimOperation(ClaimOperationRequest) returns (ClaimOperationResponse);
-  rpc RenewOperationLease(RenewOperationLeaseRequest) returns (RenewOperationLeaseResponse);
-  rpc ReportObservation(ReportNodeObservationRequest) returns (ReportNodeObservationResponse);
-  rpc ReportStepResult(ReportStepResultRequest) returns (ReportStepResultResponse);
-}
+// These operation messages are hosted by the manager-listener domain services
+// declared below. Service boundaries are intentionally distinct from process
+// implementation types.
 
 // ── Schemas ───────────────────────────────────────────────────────────────
 
@@ -902,9 +937,8 @@ message RetryJobResponse { JobDetail job = 1; }
 message CheckJobQueueRequest { string job_queue_id = 1; }
 message CheckJobQueueResponse { bool ready = 1; }
 
-// Operator-facing service. This service is hosted on the manager's dedicated
-// operator-admin mTLS listener, not the ordinary ManagerService listener.
-service JobAdminService {
+// Manager-listener job administration domain.
+service JobService {
   rpc ListJobQueues(ListJobQueuesRequest) returns (ListJobQueuesResponse);
   rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
   rpc GetJobQueueSummary(GetJobQueueSummaryRequest) returns (GetJobQueueSummaryResponse);
@@ -912,8 +946,9 @@ service JobAdminService {
   rpc RetryJob(RetryJobRequest) returns (RetryJobResponse);
 }
 
-// Manager-intended delegated service hosted by database-enabled engines.
-// The listener authorizes the delegation CA, which must issue only manager identities.
+// Manager-workload service hosted by database-enabled engines. Stock TLS
+// verifies the explicit client root; leaf policy admits enrolled manager URI
+// principals with the clientAuth profile.
 service EngineJobAdminService {
   rpc CheckJobQueue(CheckJobQueueRequest) returns (CheckJobQueueResponse);
   rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
@@ -968,7 +1003,158 @@ message DeleteScheduleResponse {}
 message ListSchedulesRequest  { string worker_namespace = 1; }
 message ListSchedulesResponse { repeated Schedule schedules = 1; }
 
-// ── NodeService ──────────────────────────────────────────────────────────
+// ── Manager-set rollout creation and observation ─────────────────────────
+
+enum ManagerRolloutPhase {
+  MANAGER_ROLLOUT_PHASE_UNSPECIFIED = 0;
+  MANAGER_ROLLOUT_PHASE_PREPARED = 1;
+  MANAGER_ROLLOUT_PHASE_STAGING = 2;
+  MANAGER_ROLLOUT_PHASE_CLOSING_OLD = 3;
+  MANAGER_ROLLOUT_PHASE_OLD_CLOSED = 4;
+  MANAGER_ROLLOUT_PHASE_STARTING_TARGET = 5;
+  MANAGER_ROLLOUT_PHASE_TARGET_READY_CLOSED = 6;
+  MANAGER_ROLLOUT_PHASE_ACTIVATING_TARGET = 7;
+  MANAGER_ROLLOUT_PHASE_COMPLETED = 8;
+  MANAGER_ROLLOUT_PHASE_FAILED_PRE_CLOSE = 9;
+  MANAGER_ROLLOUT_PHASE_FAILED_CLOSED = 10;
+}
+
+message ManagerRolloutSource {
+  string manager_id = 1;
+  string endpoint = 2;
+  string host_digest = 3;
+  string selector_digest = 4;
+}
+
+message ManagerRolloutTarget {
+  string manager_id = 1;
+  string endpoint = 2;
+  string host_digest = 3;
+  string config_digest = 4;
+  string backend = 5;
+  string executable_digest = 6;
+  string backend_spec_digest = 7;
+  string credential_digest = 8;
+  string old_selector_digest = 9;
+  string new_selector_digest = 10;
+}
+
+message BeginManagerRolloutRequest {
+  string client_operation_id = 1; // required bounded caller UUID
+  string cluster_id = 2;
+  uint64 target_generation = 3;
+  string target_policy_digest = 4;
+  repeated ManagerRolloutTarget expected_targets = 5;
+  string recovery_of = 6; // optional predecessor rollout UUID
+  uint32 target_policy_validator_version = 7;
+  string target_deployment_principal_uri = 8;
+  string target_deployment_leaf_fingerprint = 9;
+  repeated ManagerRolloutSource source_managers = 10;
+  string manifest_digest = 11;
+  string executor_id = 12;
+  string deployment_certificate = 13;
+}
+
+message ManagerRollout {
+  string rollout_id = 1;
+  string deployment_principal_uri = 2;
+  string client_operation_id = 3;
+  string request_digest = 4;
+  string cluster_id = 5;
+  uint64 target_generation = 6;
+  string target_policy_digest = 7;
+  repeated ManagerRolloutTarget expected_targets = 8;
+  string recovery_of = 9;
+  ManagerRolloutPhase phase = 10;
+  string executor_id = 11;
+  uint64 lease_epoch = 12;
+  optional google.protobuf.Timestamp lease_expires_at = 13;
+  uint32 target_policy_validator_version = 14;
+  string target_deployment_principal_uri = 15;
+  string target_deployment_leaf_fingerprint = 16;
+  string expected_target_set_hash = 17;
+  string failure = 18;
+  repeated ManagerRolloutSource source_managers = 19;
+  string manifest_digest = 20;
+  string executor_id_from_manifest = 21;
+  string deployment_certificate = 22;
+}
+message BeginManagerRolloutResponse { ManagerRollout rollout = 1; }
+message LeaseManagerRolloutRequest {
+  string rollout_id = 1;
+  string executor_id = 2;
+  uint64 expected_lease_epoch = 3;
+}
+message LeaseManagerRolloutResponse { ManagerRollout rollout = 1; }
+message ManagerRolloutMemberOutcome {
+  string manager_id = 1;
+  string member_role = 2;
+  string host_action_outcome = 3;
+  string error = 4;
+}
+message AdvanceManagerRolloutRequest {
+  string rollout_id = 1;
+  string executor_id = 2;
+  uint64 lease_epoch = 3;
+  ManagerRolloutPhase expected_phase = 4;
+  ManagerRolloutPhase next_phase = 5;
+  repeated ManagerRolloutMemberOutcome member_outcomes = 6;
+}
+message AdvanceManagerRolloutResponse { ManagerRollout rollout = 1; }
+message GetManagerRolloutRequest { string rollout_id = 1; }
+message GetManagerRolloutResponse { ManagerRollout rollout = 1; }
+
+message GetPolicyStatusRequest {}
+message PolicyCapHeadroom {
+  uint64 raw_bytes = 1;
+  uint64 canonical_bytes = 2;
+  uint64 principals = 3;
+  uint64 assignments = 4;
+  uint64 scope_values = 5;
+  uint64 managers = 6;
+  uint64 proxies = 7;
+  uint64 node_agents = 8;
+  uint64 revoked_fingerprints = 9;
+}
+message GetPolicyStatusResponse {
+  uint64 generation = 1;
+  string digest = 2;
+  string admission = 3;
+  uint32 schema_version = 4;
+  uint32 validator_version = 5;
+  PolicyCapHeadroom cap_headroom = 6;
+}
+enum WorkloadProjectionKind {
+  WORKLOAD_PROJECTION_KIND_UNSPECIFIED = 0;
+  WORKLOAD_PROJECTION_KIND_PROXY_PEER_V1 = 1;
+  WORKLOAD_PROJECTION_KIND_ENGINE_JOB_ADMIN_V1 = 2;
+}
+message WorkloadEnrollmentV1 {
+  string principal_uri = 1;
+  string workload_id = 2;
+}
+message WorkloadSnapshotV1 {
+  uint32 schema_version = 1;
+  WorkloadProjectionKind projection_kind = 2;
+  string cluster_id = 3;
+  uint64 policy_generation = 4;
+  string policy_digest = 5;
+  string projection_digest = 6;
+  google.protobuf.Timestamp issued_at = 7;
+  google.protobuf.Timestamp valid_until = 8;
+  uint32 enrollment_count = 9;
+  uint32 revoked_fingerprint_count = 10;
+  repeated WorkloadEnrollmentV1 enrollments = 11;
+  repeated string revoked_leaf_fingerprints = 12;
+}
+message GetWorkloadSnapshotRequest {}
+message GetWorkloadSnapshotResponse {
+  uint64 generation = 1;
+  string digest = 2;
+  bytes serialized_snapshot = 3;
+}
+
+// ── ProxyNodeControlService ───────────────────────────────────────────────
 // Local gRPC service exposed by wr-proxy for engines on the same node.
 // Engines use this instead of connecting directly to wr-manager. Local process
 // owners may also read the proxy's activation-bound routing progress.
@@ -981,7 +1167,7 @@ message GetProxyRoutingStatusResponse {
   uint64 installed_routing_table_version = 2;
 }
 
-service NodeService {
+service ProxyNodeControlService {
   rpc RegisterEngine   (RegisterEngineRequest)   returns (RegisterEngineResponse);
   rpc DeregisterEngine (DeregisterEngineRequest)  returns (DeregisterEngineResponse);
   rpc Heartbeat        (HeartbeatRequest)          returns (HeartbeatResponse);
@@ -989,36 +1175,56 @@ service NodeService {
   rpc GetProxyRoutingStatus(GetProxyRoutingStatusRequest) returns (GetProxyRoutingStatusResponse);
 }
 
-// ── ManagerService ────────────────────────────────────────────────────────
+// ── Manager-listener services ─────────────────────────────────────────────
 
-service ManagerService {
-  // Engine lifecycle
-  rpc RegisterEngine    (RegisterEngineRequest)    returns (RegisterEngineResponse);
-  rpc DeregisterEngine  (DeregisterEngineRequest)  returns (DeregisterEngineResponse);
-  rpc Heartbeat         (HeartbeatRequest)         returns (HeartbeatResponse);
-  rpc BeginEngineDrain  (BeginEngineDrainRequest)  returns (BeginEngineDrainResponse);
-  rpc ListEngines       (ListEnginesRequest)       returns (ListEnginesResponse);
+service ClusterService {
+  rpc ListEngines(ListEnginesRequest) returns (ListEnginesResponse);
+  rpc GetRoutingTable(GetRoutingTableRequest) returns (GetRoutingTableResponse);
+  rpc UpsertRoutingRule(RoutingRule) returns (UpsertRoutingRuleResponse);
+  rpc DeleteRoutingRule(DeleteRoutingRuleRequest) returns (DeleteRoutingRuleResponse);
+  rpc ListManagers(ListManagersRequest) returns (ListManagersResponse);
+  rpc GetClusterStatus(GetClusterStatusRequest) returns (GetClusterStatusResponse);
+  rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
+  rpc SetSecret(SetSecretRequest) returns (SetSecretResponse);
+  rpc DeleteSecret(DeleteSecretRequest) returns (DeleteSecretResponse);
+  rpc ListSecrets(ListSecretsRequest) returns (ListSecretsResponse);
+  rpc UpsertSchedule(UpsertScheduleRequest) returns (UpsertScheduleResponse);
+  rpc DeleteSchedule(DeleteScheduleRequest) returns (DeleteScheduleResponse);
+  rpc ListSchedules(ListSchedulesRequest) returns (ListSchedulesResponse);
+}
 
-  // Routing table
-  rpc GetRoutingTable   (GetRoutingTableRequest)   returns (GetRoutingTableResponse);
-  rpc UpsertRoutingRule (RoutingRule)              returns (UpsertRoutingRuleResponse);
-  rpc DeleteRoutingRule (DeleteRoutingRuleRequest) returns (DeleteRoutingRuleResponse);
+service InfrastructureService {
+  rpc GetStatus(GetOperatorStatusRequest) returns (GetOperatorStatusResponse);
+  rpc SubmitOperation(SubmitOperationRequest) returns (SubmitOperationResponse);
+  rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
+  rpc ListOperations(ListOperationsRequest) returns (ListOperationsResponse);
+  rpc ResumeOperation(ResumeOperationRequest) returns (ResumeOperationResponse);
+  rpc CancelOperation(CancelOperationRequest) returns (CancelOperationResponse);
+  rpc BeginDeployment(BeginDeploymentRequest) returns (BeginDeploymentResponse);
+  rpc VerifyDeployment(VerifyDeploymentRequest) returns (VerifyDeploymentResponse);
+  rpc FinalizeDeployment(FinalizeDeploymentRequest) returns (FinalizeDeploymentResponse);
+  rpc AbandonDeployment(AbandonDeploymentRequest) returns (AbandonDeploymentResponse);
+  rpc BeginRollback(BeginRollbackRequest) returns (BeginRollbackResponse);
+  rpc PutNodeAgentPolicy(PutNodeAgentPolicyRequest) returns (PutNodeAgentPolicyResponse);
+  rpc BeginManagerRollout(BeginManagerRolloutRequest) returns (BeginManagerRolloutResponse);
+  rpc LeaseManagerRollout(LeaseManagerRolloutRequest) returns (LeaseManagerRolloutResponse);
+  rpc AdvanceManagerRollout(AdvanceManagerRolloutRequest) returns (AdvanceManagerRolloutResponse);
+  rpc GetManagerRollout(GetManagerRolloutRequest) returns (GetManagerRolloutResponse);
+}
 
-  // Manager discovery and coherent read-only cluster status
-  rpc ListManagers      (ListManagersRequest)      returns (ListManagersResponse);
-  rpc GetClusterStatus  (GetClusterStatusRequest)  returns (GetClusterStatusResponse);
+service NodeService {
+  rpc RegisterEngine(RegisterEngineRequest) returns (RegisterEngineResponse);
+  rpc DeregisterEngine(DeregisterEngineRequest) returns (DeregisterEngineResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc BeginEngineDrain(BeginEngineDrainRequest) returns (BeginEngineDrainResponse);
+  rpc Attest(AttestNodeAgentRequest) returns (AttestNodeAgentResponse);
+  rpc ClaimOperation(ClaimOperationRequest) returns (ClaimOperationResponse);
+  rpc RenewOperationLease(RenewOperationLeaseRequest) returns (RenewOperationLeaseResponse);
+  rpc ReportObservation(ReportNodeObservationRequest) returns (ReportNodeObservationResponse);
+  rpc ReportStepResult(ReportStepResultRequest) returns (ReportStepResultResponse);
+}
 
-  // Schemas
-  rpc GetSchema         (GetSchemaRequest)         returns (GetSchemaResponse);
-
-  // Secrets
-  rpc SetSecret         (SetSecretRequest)         returns (SetSecretResponse);
-  rpc DeleteSecret      (DeleteSecretRequest)      returns (DeleteSecretResponse);
-  rpc ListSecrets       (ListSecretsRequest)       returns (ListSecretsResponse);
-
-  // Schedules
-  rpc UpsertSchedule    (UpsertScheduleRequest)    returns (UpsertScheduleResponse);
-  rpc DeleteSchedule    (DeleteScheduleRequest)    returns (DeleteScheduleResponse);
-  rpc ListSchedules     (ListSchedulesRequest)     returns (ListSchedulesResponse);
-
+service PolicyService {
+  rpc GetPolicyStatus(GetPolicyStatusRequest) returns (GetPolicyStatusResponse);
+  rpc GetWorkloadSnapshot(GetWorkloadSnapshotRequest) returns (GetWorkloadSnapshotResponse);
 }

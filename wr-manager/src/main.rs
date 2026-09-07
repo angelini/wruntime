@@ -16,21 +16,21 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tonic::transport::server::TcpIncoming;
-use tonic::transport::{Endpoint, Server};
+use tonic::transport::Server;
 use tracing::info;
 use uuid::Uuid;
 use wr_common::lifecycle_service::{
-    notify_supervisor, query_ready_status, AdmissionGate, LifecycleServiceAdapter,
+    notify_supervisor, AdmissionGate, LifecycleServiceAdapter, ManagerLifecycleState,
 };
 use wr_common::process_lifecycle::{LifecycleOwner, ProcessState, ServiceKind, TransitionReason};
 use wr_common::signal::{shutdown_signal_request, wait_for_shutdown_trigger, ShutdownCause};
 use wr_common::task_group::{TaskExit, TaskGroup};
-use wr_common::wruntime::job_admin_service_server::JobAdminServiceServer;
-use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
+use wr_common::wruntime::cluster_service_server::ClusterServiceServer;
+use wr_common::wruntime::infrastructure_service_server::InfrastructureServiceServer;
+use wr_common::wruntime::job_service_server::JobServiceServer;
 use wr_common::wruntime::lifecycle_service_server::LifecycleServiceServer;
-use wr_common::wruntime::manager_service_server::ManagerServiceServer;
-use wr_common::wruntime::node_agent_service_server::NodeAgentServiceServer;
-use wr_common::wruntime::operator_service_server::OperatorServiceServer;
+use wr_common::wruntime::node_service_server::NodeServiceServer;
+use wr_common::wruntime::policy_service_server::PolicyServiceServer;
 
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
 const STALE_MANAGER_REAP_INTERVAL: Duration = Duration::from_secs(60);
@@ -61,11 +61,7 @@ async fn main() -> Result<()> {
             .unwrap_or("manager.toml"),
     )
     .await;
-    let finalized = telemetry.finalize();
-    if !finalized.is_success() && result.is_ok() {
-        anyhow::bail!("telemetry finalization failed: {:?}", finalized.failures);
-    }
-    result
+    telemetry.finalize_preserving(result)
 }
 
 async fn lifecycle_probe(config_path: &str) -> Result<()> {
@@ -80,35 +76,47 @@ async fn lifecycle_probe(config_path: &str) -> Result<()> {
                 config.listen_address.replace("0.0.0.0", "127.0.0.1")
             )
         });
-    let tls = wr_common::tls::build_tonic_client_tls(&config.tls)?;
-    let channel = Endpoint::from_shared(endpoint)?
-        .tls_config(tls)?
-        .connect()
+    let tls = wr_common::tls::build_tonic_client_tls(&config.client_tls)?;
+    let uri: http::Uri = endpoint.parse()?;
+    let server_name = uri
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("manager lifecycle endpoint requires a host"))?
+        .to_owned();
+    let provider = wr_common::manager_client::ManagerEpochProvider::new(
+        vec![wr_common::manager_client::ManagerCandidate {
+            endpoint,
+            server_name,
+        }],
+        tls,
+        config.client_tls.server_ca_cert_path.clone(),
+        config.client_tls.cert_path.clone(),
+    )?;
+    let epoch = provider
+        .pin(wr_common::manager_client::RetryClass::ReadOnly)
         .await?;
-    let mut client = LifecycleServiceClient::new(channel);
-    query_ready_status(&mut client, wr_common::wruntime::ServiceKind::Manager).await?;
+    epoch
+        .observation()
+        .require_identity(&wr_common::manager_client::EpochIdentity {
+            manager_id: config.manager_id.to_string(),
+            policy_generation: config.authorization_policy.generation,
+            policy_digest: config.authorization_policy.digest.clone(),
+        })?;
+    anyhow::ensure!(
+        epoch.observation().process_ready,
+        "manager lifecycle endpoint is not ready"
+    );
     Ok(())
 }
 
 async fn run_service(config_path: &str) -> Result<()> {
-    let manager_id = Uuid::new_v4().to_string();
+    let config = config::ManagerConfig::load(config_path)?;
+    let manager_id = config.manager_id.to_string();
     let mut lifecycle = LifecycleOwner::new(
         ServiceKind::Manager,
-        wr_common::process_lifecycle::resolve_process_instance_id(manager_id.clone()),
+        wr_common::process_lifecycle::resolve_process_instance_id(Uuid::new_v4().to_string()),
     );
     let admission = AdmissionGate::closed();
-    let config = config::ManagerConfig::load(config_path)?;
     let addr = config.listen_address.parse()?;
-    let job_admin_addr = config.job_admin.listen_address.parse()?;
-    wr_common::tls::ensure_disjoint_ca_roots(&[
-        ("runtime manager", &config.tls),
-        ("operator job administration", &config.job_admin.tls),
-        (
-            "engine job-admin delegation",
-            &config.job_admin_delegation_tls,
-        ),
-    ])
-    .context("manager TLS trust domains must use distinct CA certificates")?;
 
     let database_url = wr_common::pool::redact_database_url(&config.database.url);
     {
@@ -149,14 +157,10 @@ async fn run_service(config_path: &str) -> Result<()> {
         });
     let crypto = Arc::new(crypto::SecretCrypto::from_env()?);
     let incoming = TcpIncoming::bind(addr).context("failed to bind manager gRPC listener")?;
-    let job_admin_incoming = TcpIncoming::bind(job_admin_addr)
-        .context("failed to bind manager job-admin gRPC listener")?;
     let tls = wr_common::tls::build_tonic_server_tls(&config.tls)
         .map_err(|error| anyhow::anyhow!("failed to build TLS config: {error}"))?;
-    let job_admin_tls = wr_common::tls::build_tonic_server_tls(&config.job_admin.tls)
-        .context("failed to build operator job-admin TLS configuration")?;
-    wr_common::tls::build_tonic_client_tls(&config.job_admin_delegation_tls)
-        .context("failed to build job-admin delegation TLS configuration")?;
+    wr_common::tls::build_tonic_client_tls(&config.client_tls)
+        .context("failed to build manager workload TLS configuration")?;
     let mut server = Server::builder()
         .tls_config(tls)
         .context("failed to apply TLS config")?;
@@ -166,11 +170,13 @@ async fn run_service(config_path: &str) -> Result<()> {
         crypto,
         config.cluster.manager_liveness_threshold_secs,
         admission.clone(),
-    );
-    let principal_policy = auth::PrincipalPolicy::new(&config.operator_principals);
-    let operator_service = service::OperatorApi::new(
+    )
+    .with_workload_policy(config.authorization_policy.clone());
+    let principal_policy = auth::PrincipalPolicy::new(config.authorization_policy.clone());
+    let operator_service = service::OperatorApi::with_admission(
         db_pool.clone(),
         principal_policy.clone(),
+        admission.clone(),
         config.cluster.manager_liveness_threshold_secs as f64,
         config.engine_heartbeat_timeout_secs as f64,
         config.module_heartbeat_timeout_secs.get() as f64,
@@ -178,27 +184,98 @@ async fn run_service(config_path: &str) -> Result<()> {
     let job_admin_service = job_admin::JobAdminApi::new(
         db_pool.clone(),
         config.engine_heartbeat_timeout_secs,
-        config.job_admin_delegation_tls.clone(),
+        config.client_tls.clone(),
         admission.clone(),
     );
-    let agent_service = service::NodeAgentApi::new(db_pool.clone(), principal_policy);
-    let lifecycle_service = LifecycleServiceAdapter::new(lifecycle.snapshot());
+    let agent_service = service::NodeAgentApi::with_admission(
+        db_pool.clone(),
+        principal_policy.clone(),
+        admission.clone(),
+    );
+    let manager_lifecycle = ManagerLifecycleState::default();
+    manager_lifecycle.update(
+        wr_common::wruntime::PrivilegedAdmissionState::ClosedStartup,
+        "",
+        wr_common::wruntime::ManagerRolloutPhase::Unspecified as i32,
+        "",
+        0,
+    );
+    let policy_service = service::PolicyApi::new(
+        principal_policy.clone(),
+        admission.clone(),
+        manager_lifecycle.clone(),
+    );
+    let infrastructure_service = service::InfrastructureApi::new(manager.clone(), operator_service);
+    let node_service = service::ManagerNodeApi::new(manager.clone(), agent_service);
+    let lifecycle_service = service::AuthenticatedLifecycleApi::new(
+        LifecycleServiceAdapter::new_manager(
+            lifecycle.snapshot(),
+            manager_id.clone(),
+            config.authorization_policy.generation,
+            config.authorization_policy.digest.clone(),
+            manager_lifecycle.clone(),
+        ),
+        principal_policy.clone(),
+    );
+    let authorizer = Arc::new(auth::ManagerAuthorizer::new(
+        principal_policy,
+        admission.clone(),
+    ));
     let router = server
-        .add_service(ManagerServiceServer::new(manager))
-        .add_service(OperatorServiceServer::new(operator_service))
-        .add_service(NodeAgentServiceServer::new(agent_service))
-        .add_service(LifecycleServiceServer::new(lifecycle_service));
-    let job_admin_router = Server::builder()
-        .tls_config(job_admin_tls)
-        .context("failed to apply operator job-admin TLS config")?
+        .add_service(ClusterServiceServer::new(
+            service::AuthorizedClusterService::new(manager, authorizer.clone()),
+        ))
+        .add_service(InfrastructureServiceServer::new(
+            service::AuthorizedInfrastructureService::new(
+                infrastructure_service,
+                authorizer.clone(),
+            ),
+        ))
+        .add_service(NodeServiceServer::new(service::AuthorizedNodeService::new(
+            node_service,
+            authorizer.clone(),
+        )))
         .add_service(
-            JobAdminServiceServer::new(job_admin_service)
-                .max_encoding_message_size(wr_common::lifecycle::MAX_JOB_ADMIN_MESSAGE_BYTES),
-        );
+            JobServiceServer::new(job_admin::AuthorizedJobService::new(
+                job_admin_service,
+                authorizer.clone(),
+            ))
+            .max_encoding_message_size(wr_common::lifecycle::MAX_JOB_ADMIN_MESSAGE_BYTES),
+        )
+        .add_service(PolicyServiceServer::new(
+            service::AuthorizedPolicyService::new(policy_service, authorizer.clone()),
+        ))
+        .add_service(LifecycleServiceServer::new(
+            service::AuthorizedLifecycleService::new(lifecycle_service, authorizer),
+        ));
 
     db::register_manager(&db_pool, &manager_id, &grpc_address)
         .await
         .map_err(|error| anyhow::anyhow!("failed to register manager: {error}"))?;
+    db::bootstrap_initial_manager_policy_state(
+        &db_pool,
+        config.authorization_policy.generation,
+        &config.authorization_policy.digest,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("failed to bootstrap initial manager policy: {error}"))?;
+    let open_at_startup = db::initialize_manager_policy_state(
+        &db_pool,
+        &manager_id,
+        config.authorization_policy.generation,
+        &config.authorization_policy.digest,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("failed to install manager policy state: {error}"))?;
+    if open_at_startup {
+        manager_lifecycle.update(
+            wr_common::wruntime::PrivilegedAdmissionState::Open,
+            "",
+            wr_common::wruntime::ManagerRolloutPhase::Unspecified as i32,
+            "",
+            0,
+        );
+    }
 
     let mut tasks = TaskGroup::new();
     tasks.spawn("manager-grpc", move |cancellation| async move {
@@ -214,20 +291,6 @@ async fn run_service(config_path: &str) -> Result<()> {
             TaskExit::Completed
         })
     });
-    tasks.spawn("manager-job-admin-grpc", move |cancellation| async move {
-        let mut shutdown = cancellation.clone();
-        job_admin_router
-            .serve_with_incoming_shutdown(job_admin_incoming, async move {
-                shutdown.cancelled().await;
-            })
-            .await?;
-        Ok(if cancellation.is_cancelled() {
-            TaskExit::Cancelled
-        } else {
-            TaskExit::Completed
-        })
-    });
-
     {
         let pool = db_pool.clone();
         let id = manager_id.clone();
@@ -235,6 +298,28 @@ async fn run_service(config_path: &str) -> Result<()> {
         let interval = Duration::from_secs(config.cluster.manager_heartbeat_interval_secs);
         tasks.spawn("manager-self-heartbeat", move |cancellation| {
             db::run_manager_heartbeat_owned(pool, id, interval, admission, cancellation)
+        });
+    }
+
+    {
+        let pool = db_pool.clone();
+        let id = manager_id.clone();
+        let generation = config.authorization_policy.generation;
+        let digest = config.authorization_policy.digest.clone();
+        let rollout_admission = admission.clone();
+        let rollout_lifecycle = manager_lifecycle.clone();
+        let rollout_policy = config.authorization_policy.clone();
+        tasks.spawn("manager-rollout-observer", move |cancellation| {
+            db::run_manager_rollout_observer_owned(
+                pool,
+                id,
+                generation,
+                digest,
+                rollout_admission,
+                rollout_lifecycle,
+                rollout_policy,
+                cancellation,
+            )
         });
     }
 
@@ -299,9 +384,11 @@ async fn run_service(config_path: &str) -> Result<()> {
         let _ = lifecycle.request_stop(TransitionReason::TaskFailure, "manager startup failed");
     }
     if failure.is_none() {
-        admission.open();
+        if open_at_startup {
+            admission.open();
+        }
         if let Err(error) =
-            lifecycle.mark_ready("database, scheduler, monitor, and gRPC services ready")
+            lifecycle.mark_ready("database, policy, scheduler, monitor, and gRPC services ready")
         {
             failure = Some(error.into());
             let _ =
@@ -321,7 +408,7 @@ async fn run_service(config_path: &str) -> Result<()> {
         }
     }
     if failure.is_none() {
-        info!(address = %addr, job_admin_address = %job_admin_addr, manager_id, "manager ready");
+        info!(address = %addr, manager_id, "manager ready");
     }
 
     if failure.is_none() {

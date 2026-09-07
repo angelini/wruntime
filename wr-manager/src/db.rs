@@ -4,13 +4,17 @@ use tokio_retry::strategy::ExponentialBackoff;
 use tokio_retry::RetryIf;
 use tonic::Status;
 
+use wr_common::deployment_contract::{canonicalize_inventory, revision_digest};
 use wr_common::identity::NamespaceFilter;
-use wr_common::lifecycle_service::AdmissionGate;
+use wr_common::lifecycle_service::{AdmissionGate, ManagerLifecycleState};
+use wr_common::naming::namespace_role;
 use wr_common::task_group::{TaskCancellation, TaskExit};
 use wr_common::wruntime::{
-    BeginDeploymentRequest, DeploymentRecord, DeploymentState, EngineRegistration,
-    ModuleDescriptor, NodeAgentAttestation, NodeAgentPolicy, NodeOperation, RoutingRule,
-    RoutingTable, SlotObservation,
+    BeginDeploymentRequest, BeginManagerRolloutRequest, DeploymentInventoryV1, DeploymentRecord,
+    DeploymentState, EngineOwnershipFence, EngineRegistration, ManagerRollout, ManagerRolloutPhase,
+    ModuleDescriptor, NamespaceDbCredential, NamespaceSecrets, NodeAgentAttestation,
+    NodeAgentPolicy, NodeOperation, PrivilegedAdmissionState, RoutingRule, RoutingTable,
+    SlotObservation,
 };
 
 /// Exponential backoff strategy for NOWAIT lock retries: 10ms, 20ms, 40ms, 80ms.
@@ -103,15 +107,291 @@ impl<T, E: std::fmt::Display> IntoInternalStatus<T> for Result<T, E> {
 /// become routable only after heartbeat-driven health recomputation. Routes are
 /// the last statements before commit, so any earlier failure rolls back the whole
 /// registration (no partial routes).
+fn assigned_slot_generation(current: u64, replay: bool) -> Result<u64, Status> {
+    if replay {
+        Ok(current)
+    } else {
+        current
+            .checked_add(1)
+            .ok_or_else(|| Status::resource_exhausted("engine slot generation exhausted"))
+    }
+}
+
+pub struct RegistrationCommit {
+    pub fence: EngineOwnershipFence,
+    pub secrets: Vec<NamespaceSecrets>,
+    pub db_credentials: Vec<NamespaceDbCredential>,
+}
+
 pub async fn register_engine_and_routes(
     pool: &Pool,
+    crypto: &crate::crypto::SecretCrypto,
     reg: &EngineRegistration,
-) -> Result<(), Status> {
+    activation_id: &str,
+) -> Result<RegistrationCommit, Status> {
     let mut client = pool.get().await.internal()?;
     let txn = client.transaction().await.internal()?;
 
     acquire_global_lock_wait(&txn).await?;
 
+    let metadata = reg
+        .deployment
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("managed deployment metadata is required"))?;
+    let operation_id = uuid::Uuid::parse_str(&metadata.operation_id)
+        .map_err(|_| Status::invalid_argument("deployment operation_id must be a UUID"))?;
+    let activation_uuid = uuid::Uuid::parse_str(activation_id)
+        .map_err(|_| Status::invalid_argument("activation_id must be a UUID"))?;
+    txn.query_one(
+        "SELECT current_revision, target_revision FROM wr_nodes WHERE node_id=$1 FOR UPDATE",
+        &[&metadata.node_id],
+    )
+    .await
+    .internal()?;
+    let operation = txn
+        .query_opt(
+            "SELECT operation.target_revision, operation.bundle_digest,
+                operation.target_revision_digest, operation.action, operation.phase,
+                slot.source_revision AS slot_source_revision,
+                slot.source_digest AS slot_source_digest,
+                slot.target_revision AS slot_target_revision,
+                slot.target_digest AS slot_target_digest
+         FROM wr_node_operations operation
+         JOIN wr_node_operation_slots slot
+           ON slot.operation_id = operation.operation_id
+          AND slot.engine_slot = $3
+         WHERE operation.operation_id=$1 AND operation.node_id=$2
+           AND operation.state IN ('queued','running','paused')
+         FOR UPDATE",
+            &[&operation_id, &metadata.node_id, &metadata.engine_slot],
+        )
+        .await
+        .internal()?
+        .ok_or_else(|| {
+            Status::failed_precondition("deployment operation is not live for this node and slot")
+        })?;
+    let deployment = txn
+        .query_opt(
+            "SELECT deployment.expected_inventory, deployment.revision_digest, deployment.state,
+                node.current_revision
+         FROM wr_node_deployments deployment
+         JOIN wr_nodes node ON node.node_id = deployment.node_id
+         WHERE deployment.node_id=$1 AND deployment.revision=$2
+           AND deployment.bundle_digest=$3
+           AND deployment.state IN ('pending','active','succeeded')
+         FOR UPDATE",
+            &[
+                &metadata.node_id,
+                &i64::try_from(metadata.revision)
+                    .map_err(|_| Status::invalid_argument("deployment revision is too large"))?,
+                &metadata.bundle_digest,
+            ],
+        )
+        .await
+        .internal()?
+        .ok_or_else(|| {
+            Status::failed_precondition("deployment metadata does not match desired state")
+        })?;
+    let stored_digest: String = deployment.get("revision_digest");
+    let deployment_state: String = deployment.get("state");
+    let is_staged = matches!(deployment_state.as_str(), "pending" | "active");
+    let is_committed = deployment_state == "succeeded"
+        && deployment.get::<_, i64>("current_revision") == metadata.revision as i64;
+    let operation_target_matches = operation.get::<_, i64>("target_revision")
+        == metadata.revision as i64
+        && operation.get::<_, String>("bundle_digest") == metadata.bundle_digest
+        && operation
+            .get::<_, Option<String>>("target_revision_digest")
+            .as_deref()
+            == Some(&stored_digest);
+    let restart_target_matches = operation.get::<_, String>("action") == "restart"
+        && operation.get::<_, i64>("slot_target_revision") == metadata.revision as i64
+        && operation.get::<_, String>("slot_target_digest") == metadata.bundle_digest;
+    let restoration_source_matches = operation.get::<_, String>("phase") == "restoring_source"
+        && operation.get::<_, i64>("slot_source_revision") == metadata.revision as i64
+        && operation.get::<_, String>("slot_source_digest") == metadata.bundle_digest;
+    if !((operation_target_matches && is_staged)
+        || ((restart_target_matches || restoration_source_matches) && is_committed))
+        || metadata.revision_digest != stored_digest
+    {
+        return Err(Status::failed_precondition(
+            "deployment operation/revision digest mismatch",
+        ));
+    }
+    txn.query_opt("SELECT authoritative FROM wr_node_slot_authority WHERE node_id=$1 AND engine_slot=$2 AND revision=$3 FOR UPDATE", &[&metadata.node_id,&metadata.engine_slot,&(metadata.revision as i64)]).await.internal()?;
+    let inventory = DeploymentInventoryV1::decode(
+        deployment
+            .get::<_, Vec<u8>>("expected_inventory")
+            .as_slice(),
+    )
+    .map_err(|e| Status::internal(format!("stored deployment inventory is invalid: {e}")))?;
+    let expected = inventory
+        .engines
+        .iter()
+        .find(|e| e.engine_slot == metadata.engine_slot)
+        .ok_or_else(|| Status::failed_precondition("slot is not declared by deployment"))?;
+    let mut actual_modules: std::collections::BTreeMap<(String, String, String), String> =
+        std::collections::BTreeMap::new();
+    for module in &reg.modules {
+        let key = (
+            module.namespace.clone(),
+            module.name.clone(),
+            module.version.clone(),
+        );
+        let digest = if module.proto_schema.is_empty() {
+            String::new()
+        } else {
+            wr_common::deployment_contract::schema_digest(&module.proto_schema)
+        };
+        if digest.is_empty() {
+            if actual_modules.contains_key(&key) {
+                continue;
+            }
+            return Err(Status::invalid_argument(
+                "module registration requires a protobuf schema",
+            ));
+        }
+        match actual_modules.get(&key) {
+            Some(existing) if existing.is_empty() => {
+                actual_modules.insert(key, digest);
+            }
+            Some(existing) if existing != &digest => {
+                return Err(Status::failed_precondition(
+                    "duplicate module registration has conflicting schemas",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                actual_modules.insert(key, digest);
+            }
+        }
+    }
+    let expected_modules = expected
+        .modules
+        .iter()
+        .map(|m| {
+            let i = m
+                .identity
+                .as_ref()
+                .ok_or_else(|| Status::internal("stored expected module identity missing"))?;
+            Ok((
+                (i.namespace.clone(), i.name.clone(), i.version.clone()),
+                m.proto_schema_digest.clone(),
+            ))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, Status>>()?;
+    let mut actual_secrets = reg.secrets.clone();
+    actual_secrets.sort_by(|a, b| (&a.namespace, &a.key).cmp(&(&b.namespace, &b.key)));
+    let mut actual_dbs = reg.db_namespaces.clone();
+    actual_dbs.sort();
+    if actual_modules != expected_modules
+        || actual_secrets != expected.secrets
+        || actual_dbs != expected.db_namespaces
+        || reg.job_queue_id != expected.job_queue_id
+        || reg.job_admin_address != expected.job_admin_address
+    {
+        return Err(Status::failed_precondition(
+            "registration resources do not exactly match declared slot inventory",
+        ));
+    }
+    let owner=txn.query_one("SELECT operation_id,revision,revision_digest,activation_id,engine_id,slot_generation FROM wr_node_slot_owners WHERE node_id=$1 AND engine_slot=$2 FOR UPDATE", &[&metadata.node_id,&metadata.engine_slot]).await.internal()?;
+    let generation_bytes: Vec<u8> = owner.get("slot_generation");
+    let generation = u64::from_be_bytes(
+        generation_bytes
+            .try_into()
+            .map_err(|_| Status::internal("stored slot generation is malformed"))?,
+    );
+    let replay = owner.get::<_, Option<uuid::Uuid>>("operation_id") == Some(operation_id)
+        && owner.get::<_, Option<i64>>("revision") == Some(metadata.revision as i64)
+        && owner.get::<_, Option<String>>("revision_digest").as_deref() == Some(&stored_digest)
+        && owner.get::<_, Option<uuid::Uuid>>("activation_id") == Some(activation_uuid);
+    let next_generation = assigned_slot_generation(generation, replay)?;
+    if next_generation == 0 {
+        return Err(Status::internal(
+            "manager attempted to assign zero slot generation",
+        ));
+    }
+    // Credential lookup and creation occur only after all desired-state and fence checks,
+    // under this same owner transaction. Plaintext is returned only after commit.
+    let mut grouped =
+        std::collections::BTreeMap::<String, std::collections::HashMap<String, String>>::new();
+    for secret in &reg.secrets {
+        if secret.key.starts_with("__") {
+            return Err(Status::invalid_argument("reserved secret key"));
+        }
+        let row = txn
+            .query_opt(
+                "SELECT ciphertext,nonce FROM wr_secrets WHERE namespace=$1 AND key=$2 FOR SHARE",
+                &[&secret.namespace, &secret.key],
+            )
+            .await
+            .internal()?
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "missing secret: {}/{}",
+                    secret.namespace, secret.key
+                ))
+            })?;
+        let value = crypto
+            .decrypt(&row.get::<_, Vec<u8>>(0), &row.get::<_, Vec<u8>>(1))
+            .map_err(|e| Status::internal(format!("failed to decrypt secret: {e}")))?;
+        grouped
+            .entry(secret.namespace.clone())
+            .or_default()
+            .insert(secret.key.clone(), value);
+    }
+    let mut db_credentials = Vec::new();
+    let dbs = reg
+        .db_namespaces
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    for namespace in dbs {
+        let key = "__db_password";
+        let row = txn
+            .query_opt(
+                "SELECT ciphertext,nonce FROM wr_secrets WHERE namespace=$1 AND key=$2 FOR UPDATE",
+                &[namespace, &key],
+            )
+            .await
+            .internal()?;
+        let password = if let Some(row) = row {
+            crypto
+                .decrypt(&row.get::<_, Vec<u8>>(0), &row.get::<_, Vec<u8>>(1))
+                .map_err(|e| Status::internal(format!("failed to decrypt db password: {e}")))?
+        } else {
+            let candidate = crate::crypto::SecretCrypto::generate_random_password();
+            let (ciphertext, nonce) = crypto
+                .encrypt(&candidate)
+                .map_err(|e| Status::internal(format!("encryption failed: {e}")))?;
+            txn.execute(
+                "INSERT INTO wr_secrets(namespace,key,ciphertext,nonce) VALUES($1,$2,$3,$4)",
+                &[namespace, &key, &ciphertext, &nonce],
+            )
+            .await
+            .internal()?;
+            candidate
+        };
+        db_credentials.push(NamespaceDbCredential {
+            namespace: (*namespace).clone(),
+            role: namespace_role(namespace),
+            password,
+        });
+    }
+    let secrets = grouped
+        .into_iter()
+        .map(|(namespace, secrets)| NamespaceSecrets { namespace, secrets })
+        .collect();
+    if !replay {
+        if let Some(old_engine) = owner.get::<_, Option<String>>("engine_id") {
+            txn.execute("UPDATE wr_routing_rules SET healthy=FALSE,updated_at=NOW() WHERE engine_id=$1 AND healthy", &[&old_engine]).await.internal()?;
+            txn.execute(
+                "DELETE FROM wr_module_heartbeats WHERE engine_id=$1",
+                &[&old_engine],
+            )
+            .await
+            .internal()?;
+        }
+    }
     let registration_bytes = reg.encode_to_vec();
     let deployment_node_id = reg.deployment.as_ref().map(|value| value.node_id.as_str());
     let deployment_revision = reg
@@ -133,8 +413,9 @@ pub async fn register_engine_and_routes(
         "INSERT INTO wr_engines
            (engine_id, address, proxy_address, peer_address, registration,
             deployment_node_id, deployment_revision, deployment_bundle_digest,
-            deployment_engine_slot, job_queue_id, job_admin_address)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULLIF($10, ''), NULLIF($11, ''))
+            deployment_engine_slot, job_queue_id, job_admin_address, operation_id,
+            deployment_revision_digest, activation_id, slot_generation)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULLIF($10, ''), NULLIF($11, ''), $12, $13, $14, $15)
          ON CONFLICT (engine_id) DO UPDATE
            SET address = EXCLUDED.address,
                proxy_address = EXCLUDED.proxy_address,
@@ -146,6 +427,10 @@ pub async fn register_engine_and_routes(
                deployment_engine_slot = EXCLUDED.deployment_engine_slot,
                job_queue_id = EXCLUDED.job_queue_id,
                job_admin_address = EXCLUDED.job_admin_address,
+               operation_id = EXCLUDED.operation_id,
+               deployment_revision_digest = EXCLUDED.deployment_revision_digest,
+               activation_id = EXCLUDED.activation_id,
+               slot_generation = EXCLUDED.slot_generation,
                updated_at = NOW(),
                last_heartbeat = NOW(),
                draining = FALSE",
@@ -161,6 +446,10 @@ pub async fn register_engine_and_routes(
             &deployment_engine_slot,
             &reg.job_queue_id,
             &reg.job_admin_address,
+            &operation_id,
+            &stored_digest,
+            &activation_uuid,
+            &&next_generation.to_be_bytes()[..],
         ],
     )
     .await
@@ -332,17 +621,58 @@ pub async fn register_engine_and_routes(
         .internal()?;
     }
 
+    txn.execute("UPDATE wr_node_slot_owners SET operation_id=$3,revision=$4,revision_digest=$5,activation_id=$6,engine_id=$7,slot_generation=$8,route_authority=TRUE,lifecycle_authority=TRUE,updated_at=NOW() WHERE node_id=$1 AND engine_slot=$2", &[&metadata.node_id,&metadata.engine_slot,&operation_id,&(metadata.revision as i64),&stored_digest,&activation_uuid,&reg.engine_id,&&next_generation.to_be_bytes()[..]]).await.internal()?;
     txn.commit().await.internal()?;
+    Ok(RegistrationCommit {
+        fence: EngineOwnershipFence {
+            node_id: metadata.node_id.clone(),
+            slot: metadata.engine_slot.clone(),
+            revision_digest: stored_digest,
+            activation_id: activation_id.to_string(),
+            slot_generation: next_generation,
+        },
+        secrets,
+        db_credentials,
+    })
+}
+
+async fn require_owner_fence(
+    txn: &deadpool_postgres::Transaction<'_>,
+    engine_id: &str,
+    fence: &EngineOwnershipFence,
+) -> Result<(), Status> {
+    if fence.node_id.is_empty()
+        || fence.slot.is_empty()
+        || fence.revision_digest.is_empty()
+        || fence.activation_id.is_empty()
+        || fence.slot_generation == 0
+    {
+        return Err(Status::permission_denied(
+            "complete non-zero ownership fence is required",
+        ));
+    }
+    let generation = fence.slot_generation.to_be_bytes();
+    let row=txn.query_opt("SELECT 1 FROM wr_node_slot_owners WHERE node_id=$1 AND engine_slot=$2 AND revision_digest=$3 AND activation_id=$4 AND engine_id=$5 AND slot_generation=$6 AND lifecycle_authority FOR UPDATE", &[&fence.node_id,&fence.slot,&fence.revision_digest,&uuid::Uuid::parse_str(&fence.activation_id).map_err(|_|Status::permission_denied("ownership activation is invalid"))?,&engine_id,&&generation[..]]).await.internal()?;
+    if row.is_none() {
+        return Err(Status::permission_denied(
+            "ownership fence is stale or mismatched",
+        ));
+    }
     Ok(())
 }
 
 /// Deregister an engine: mark its routing rules unhealthy, delete the engine
 /// row, and bump the routing table version.
-pub async fn deregister_engine(pool: &Pool, engine_id: &str) -> Result<(), Status> {
+pub async fn deregister_engine(
+    pool: &Pool,
+    engine_id: &str,
+    fence: &EngineOwnershipFence,
+) -> Result<(), Status> {
     let mut client = pool.get().await.internal()?;
     let txn = client.transaction().await.internal()?;
 
     acquire_global_lock_wait(&txn).await?;
+    require_owner_fence(&txn, engine_id, fence).await?;
 
     let changed = txn
         .execute(
@@ -353,6 +683,7 @@ pub async fn deregister_engine(pool: &Pool, engine_id: &str) -> Result<(), Statu
         .await
         .internal()?;
 
+    txn.execute("UPDATE wr_node_slot_owners SET route_authority=FALSE,lifecycle_authority=FALSE,updated_at=NOW() WHERE node_id=$1 AND engine_slot=$2", &[&fence.node_id,&fence.slot]).await.internal()?;
     txn.execute("DELETE FROM wr_engines WHERE engine_id = $1", &[&engine_id])
         .await
         .internal()?;
@@ -378,29 +709,42 @@ pub async fn publish_engine_readiness(
     pool: &Pool,
     engine_id: &str,
     modules: &[ModuleDescriptor],
+    fence: &EngineOwnershipFence,
 ) -> Result<u64, Status> {
     let mut client = pool.get().await.internal()?;
     let txn = client.transaction().await.internal()?;
     let mut version = acquire_global_lock_wait(&txn).await?;
+    require_owner_fence(&txn, engine_id, fence).await?;
 
     let engine = txn
         .query_opt(
             "SELECT e.draining,
                     e.deployment_node_id IS NULL
-                    OR EXISTS (
-                        SELECT 1 FROM wr_node_slot_authority a
-                        WHERE a.node_id = e.deployment_node_id
-                          AND a.engine_slot = e.deployment_engine_slot
-                          AND a.revision = e.deployment_revision
-                          AND a.authoritative
-                    )
                     OR (
-                        e.deployment_revision = n.current_revision
-                        AND NOT EXISTS (
-                            SELECT 1 FROM wr_node_slot_authority selected
-                            WHERE selected.node_id = e.deployment_node_id
-                              AND selected.engine_slot = e.deployment_engine_slot
-                              AND selected.authoritative
+                        EXISTS (
+                            SELECT 1 FROM wr_node_slot_owners owner
+                            WHERE owner.node_id = e.deployment_node_id
+                              AND owner.engine_slot = e.deployment_engine_slot
+                              AND owner.engine_id = e.engine_id
+                              AND owner.route_authority
+                        )
+                        AND (
+                            EXISTS (
+                                SELECT 1 FROM wr_node_slot_authority a
+                                WHERE a.node_id = e.deployment_node_id
+                                  AND a.engine_slot = e.deployment_engine_slot
+                                  AND a.revision = e.deployment_revision
+                                  AND a.authoritative
+                            )
+                            OR (
+                                e.deployment_revision = n.current_revision
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM wr_node_slot_authority selected
+                                    WHERE selected.node_id = e.deployment_node_id
+                                      AND selected.engine_slot = e.deployment_engine_slot
+                                      AND selected.authoritative
+                                )
+                            )
                         )
                     ) AS authoritative
              FROM wr_engines e
@@ -477,10 +821,15 @@ pub async fn publish_engine_readiness(
 
 /// Idempotently fence an engine from future readiness publication and make
 /// every route for it non-serving without deleting its registration.
-pub async fn begin_engine_drain(pool: &Pool, engine_id: &str) -> Result<u64, Status> {
+pub async fn begin_engine_drain(
+    pool: &Pool,
+    engine_id: &str,
+    fence: &EngineOwnershipFence,
+) -> Result<u64, Status> {
     let mut client = pool.get().await.internal()?;
     let txn = client.transaction().await.internal()?;
     let mut version = acquire_global_lock_wait(&txn).await?;
+    require_owner_fence(&txn, engine_id, fence).await?;
 
     let exists = txn
         .query_opt(
@@ -541,20 +890,31 @@ pub async fn update_route_health(
     // slot authority exists it overrides the committed-revision fallback.
     let authority_predicate = "(
         e.deployment_node_id IS NULL
-        OR EXISTS (
-            SELECT 1 FROM wr_node_slot_authority a
-            WHERE a.node_id = e.deployment_node_id
-              AND a.engine_slot = e.deployment_engine_slot
-              AND a.revision = e.deployment_revision
-              AND a.authoritative
-        )
         OR (
-            e.deployment_revision = n.current_revision
-            AND NOT EXISTS (
-                SELECT 1 FROM wr_node_slot_authority selected
-                WHERE selected.node_id = e.deployment_node_id
-                  AND selected.engine_slot = e.deployment_engine_slot
-                  AND selected.authoritative
+            EXISTS (
+                SELECT 1 FROM wr_node_slot_owners owner
+                WHERE owner.node_id = e.deployment_node_id
+                  AND owner.engine_slot = e.deployment_engine_slot
+                  AND owner.engine_id = e.engine_id
+                  AND owner.route_authority
+            )
+            AND (
+                EXISTS (
+                    SELECT 1 FROM wr_node_slot_authority a
+                    WHERE a.node_id = e.deployment_node_id
+                      AND a.engine_slot = e.deployment_engine_slot
+                      AND a.revision = e.deployment_revision
+                      AND a.authoritative
+                )
+                OR (
+                    e.deployment_revision = n.current_revision
+                    AND NOT EXISTS (
+                        SELECT 1 FROM wr_node_slot_authority selected
+                        WHERE selected.node_id = e.deployment_node_id
+                          AND selected.engine_slot = e.deployment_engine_slot
+                          AND selected.authoritative
+                    )
+                )
             )
         )
     )";
@@ -764,7 +1124,7 @@ fn deployment_state(value: &str) -> Result<i32, Status> {
 
 fn deployment_row(row: &tokio_postgres::Row) -> Result<DeploymentRow, Status> {
     let inventory: Vec<u8> = row.get("expected_inventory");
-    let snapshot = DeploymentRecord::decode(inventory.as_slice())
+    let snapshot = DeploymentInventoryV1::decode(inventory.as_slice())
         .map_err(|e| Status::internal(format!("failed to decode deployment inventory: {e}")))?;
     let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
     let activated_at: Option<chrono::DateTime<chrono::Utc>> = row.get("activated_at");
@@ -775,7 +1135,7 @@ fn deployment_row(row: &tokio_postgres::Row) -> Result<DeploymentRow, Status> {
             revision: row.get::<_, i64>("revision") as u64,
             attempt_token: row.get("attempt_token"),
             bundle_digest: row.get("bundle_digest"),
-            expected_engines: snapshot.expected_engines,
+            inventory: Some(snapshot),
             state: deployment_state(row.get::<_, String>("state").as_str())?,
             created_at: Some(prost_types::Timestamp {
                 seconds: created_at.timestamp(),
@@ -798,6 +1158,8 @@ fn deployment_row(row: &tokio_postgres::Row) -> Result<DeploymentRow, Status> {
                     seconds: time.timestamp(),
                     nanos: time.timestamp_subsec_nanos() as i32,
                 }),
+            inventory_schema_version: row.get::<_, i32>("inventory_schema_version") as u32,
+            revision_digest: row.get("revision_digest"),
         },
     })
 }
@@ -808,7 +1170,10 @@ async fn get_deployment_in_transaction(
     revision: i64,
 ) -> Result<Option<DeploymentRow>, Status> {
     txn.query_opt(
-        "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, resolved_release_digest, finalized_at, created_at, activated_at, completed_at
+        "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory,
+                inventory_schema_version, revision_digest, state, failure_detail,
+                source_revision, resolved_release_digest, finalized_at, created_at,
+                activated_at, completed_at
          FROM wr_node_deployments WHERE node_id = $1 AND revision = $2",
         &[&node_id, &revision],
     )
@@ -826,6 +1191,13 @@ pub async fn begin_deployment(
     request: &BeginDeploymentRequest,
     actor: &str,
 ) -> Result<DeploymentRow, Status> {
+    let inventory = canonicalize_inventory(
+        request
+            .inventory
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("deployment inventory is required"))?,
+    )
+    .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let mut client = pool.get().await.internal()?;
     let txn = client.transaction().await.internal()?;
 
@@ -847,7 +1219,10 @@ pub async fn begin_deployment(
         .internal()?;
     if let Some(row) = txn
         .query_opt(
-            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, resolved_release_digest, finalized_at, created_at, activated_at, completed_at, allocated_by
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory,
+                    inventory_schema_version, revision_digest, state, failure_detail,
+                    source_revision, resolved_release_digest, finalized_at, created_at,
+                    activated_at, completed_at, allocated_by
              FROM wr_node_deployments WHERE node_id = $1 AND attempt_token = $2",
             &[&request.node_id, &request.attempt_token],
         )
@@ -857,7 +1232,7 @@ pub async fn begin_deployment(
         let existing = deployment_row(&row)?;
         if row.get::<_, String>("allocated_by") != actor
             || existing.record.bundle_digest != request.bundle_digest
-            || existing.record.expected_engines != request.expected_engines
+            || existing.record.inventory.as_ref() != Some(&inventory)
             || existing.record.source_revision != 0
         {
             return Err(Status::already_exists(
@@ -889,37 +1264,44 @@ pub async fn begin_deployment(
     )
     .await
     .internal()?;
-    let snapshot = DeploymentRecord {
-        node_id: String::new(),
-        revision: 0,
-        attempt_token: String::new(),
-        bundle_digest: String::new(),
-        expected_engines: request.expected_engines.clone(),
-        state: DeploymentState::Unspecified as i32,
-        created_at: None,
-        completed_at: None,
-        failure_detail: String::new(),
-        source_revision: 0,
-        activated_at: None,
-        resolved_release_digest: String::new(),
-        finalized_at: None,
-    }
-    .encode_to_vec();
+    let digest = revision_digest(
+        &request.node_id,
+        revision as u64,
+        &request.bundle_digest,
+        &inventory,
+    )
+    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let snapshot = inventory.encode_to_vec();
     txn.execute(
         "INSERT INTO wr_node_deployments
-           (node_id, revision, attempt_token, bundle_digest, expected_inventory, state, allocated_by)
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6)",
+           (node_id, revision, attempt_token, bundle_digest, expected_inventory,
+            inventory_schema_version, revision_digest, state, allocated_by)
+         VALUES ($1, $2, $3, $4, $5, 1, $6, 'pending', $7)",
         &[
             &request.node_id,
             &revision,
             &request.attempt_token,
             &request.bundle_digest,
             &snapshot,
+            &digest,
             &actor,
         ],
     )
     .await
     .internal()?;
+    for engine in &inventory.engines {
+        txn.execute(
+            "INSERT INTO wr_node_slot_owners (node_id, engine_slot, slot_generation)
+             VALUES ($1, $2, $3) ON CONFLICT (node_id, engine_slot) DO NOTHING",
+            &[
+                &request.node_id,
+                &engine.engine_slot,
+                &&0u64.to_be_bytes()[..],
+            ],
+        )
+        .await
+        .internal()?;
+    }
     let deployment = get_deployment_in_transaction(&txn, &request.node_id, revision)
         .await?
         .expect("deployment inserted in this transaction");
@@ -1090,7 +1472,10 @@ pub async fn get_deployment(
     let client = pool.get().await.internal()?;
     let row = client
         .query_opt(
-            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, resolved_release_digest, finalized_at, created_at, activated_at, completed_at
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory,
+                    inventory_schema_version, revision_digest, state, failure_detail,
+                    source_revision, resolved_release_digest, finalized_at, created_at,
+                    activated_at, completed_at
              FROM wr_node_deployments WHERE node_id = $1 AND revision = $2",
             &[&node_id, &deployment_revision(revision)?],
         )
@@ -1170,7 +1555,8 @@ where
     let deployment_rows = txn
         .query(
             "SELECT d.node_id, d.revision, d.attempt_token, d.bundle_digest,
-                    d.expected_inventory, d.state, d.failure_detail, d.source_revision,
+                    d.expected_inventory, d.inventory_schema_version, d.revision_digest,
+                    d.state, d.failure_detail, d.source_revision,
                     d.resolved_release_digest, d.finalized_at, d.created_at,
                     d.activated_at, d.completed_at, n.current_revision,
                     n.target_revision
@@ -1375,7 +1761,12 @@ pub fn deployment_conditions_from_snapshot(
     }
 
     let mut conditions = Vec::new();
-    for expected in &deployment.expected_engines {
+    let expected_engines = deployment
+        .inventory
+        .as_ref()
+        .map(|inventory| inventory.engines.as_slice())
+        .unwrap_or_default();
+    for expected in expected_engines {
         let same_slot: Vec<_> = snapshot
             .engines
             .iter()
@@ -1460,6 +1851,13 @@ pub fn deployment_conditions_from_snapshot(
         }
         let engine = &fresh_engines[0].registration;
         for module in &expected.modules {
+            let Some(module) = module.identity.as_ref() else {
+                conditions.push((
+                    "INVALID_INVENTORY".into(),
+                    "expected module identity is missing".into(),
+                ));
+                continue;
+            };
             if !engine.modules.iter().any(|advertised| {
                 advertised.namespace == module.namespace
                     && advertised.name == module.name
@@ -1574,7 +1972,10 @@ pub async fn begin_rollback(
 
     if let Some(row) = txn
         .query_opt(
-            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, resolved_release_digest, finalized_at, created_at, activated_at, completed_at, allocated_by
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory,
+                    inventory_schema_version, revision_digest, state, failure_detail,
+                    source_revision, resolved_release_digest, finalized_at, created_at,
+                    activated_at, completed_at, allocated_by
              FROM wr_node_deployments WHERE node_id = $1 AND attempt_token = $2",
             &[&node_id, &attempt_token],
         )
@@ -1601,7 +2002,10 @@ pub async fn begin_rollback(
 
     let selected_row = if to_revision == 0 {
         txn.query_opt(
-            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, resolved_release_digest, finalized_at, created_at, activated_at, completed_at
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory,
+                    inventory_schema_version, revision_digest, state, failure_detail,
+                    source_revision, resolved_release_digest, finalized_at, created_at,
+                    activated_at, completed_at
              FROM wr_node_deployments
              WHERE node_id = $1 AND state = 'succeeded' AND revision < $2
              ORDER BY revision DESC LIMIT 1",
@@ -1613,7 +2017,10 @@ pub async fn begin_rollback(
         let requested = i64::try_from(to_revision)
             .map_err(|_| Status::invalid_argument("to_revision is too large"))?;
         txn.query_opt(
-            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory, state, failure_detail, source_revision, resolved_release_digest, finalized_at, created_at, activated_at, completed_at
+            "SELECT node_id, revision, attempt_token, bundle_digest, expected_inventory,
+                    inventory_schema_version, revision_digest, state, failure_detail,
+                    source_revision, resolved_release_digest, finalized_at, created_at,
+                    activated_at, completed_at
              FROM wr_node_deployments
              WHERE node_id = $1 AND revision = $2 AND revision < $3 AND state = 'succeeded'",
             &[&node_id, &requested, &current_revision],
@@ -1638,32 +2045,29 @@ pub async fn begin_rollback(
     )
     .await
     .internal()?;
-    let snapshot = DeploymentRecord {
-        node_id: String::new(),
-        revision: 0,
-        attempt_token: String::new(),
-        bundle_digest: String::new(),
-        expected_engines: selected.expected_engines,
-        state: DeploymentState::Unspecified as i32,
-        created_at: None,
-        completed_at: None,
-        failure_detail: String::new(),
-        source_revision: selected.revision,
-        activated_at: None,
-        resolved_release_digest: String::new(),
-        finalized_at: None,
-    }
-    .encode_to_vec();
+    let inventory = selected
+        .inventory
+        .ok_or_else(|| Status::internal("selected deployment inventory missing"))?;
+    let digest = revision_digest(
+        node_id,
+        revision as u64,
+        &selected.bundle_digest,
+        &inventory,
+    )
+    .map_err(|e| Status::internal(e.to_string()))?;
+    let snapshot = inventory.encode_to_vec();
     txn.execute(
         "INSERT INTO wr_node_deployments
-           (node_id, revision, attempt_token, bundle_digest, expected_inventory, state, source_revision, allocated_by)
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)",
+           (node_id, revision, attempt_token, bundle_digest, expected_inventory,
+            inventory_schema_version, revision_digest, state, source_revision, allocated_by)
+         VALUES ($1, $2, $3, $4, $5, 1, $6, 'pending', $7, $8)",
         &[
             &node_id,
             &revision,
             &attempt_token,
             &selected.bundle_digest,
             &snapshot,
+            &digest,
             &(selected.revision as i64),
             &actor,
         ],
@@ -1739,18 +2143,62 @@ async fn upsert_routing_rule_once(pool: &Pool, rule: &RoutingRule) -> Result<(),
     Ok(())
 }
 
+pub async fn resolve_engine_node(pool: &Pool, engine_id: &str) -> Result<Option<String>, Status> {
+    let client = pool.get().await.internal()?;
+    client
+        .query_opt(
+            "SELECT deployment_node_id FROM wr_engines WHERE engine_id=$1",
+            &[&engine_id],
+        )
+        .await
+        .internal()
+        .map(|row| row.and_then(|row| row.get(0)))
+}
+
+pub async fn resolve_routing_rule_namespace(
+    pool: &Pool,
+    rule_id: &str,
+) -> Result<Option<String>, Status> {
+    let client = pool.get().await.internal()?;
+    client
+        .query_opt(
+            "SELECT destination_namespace FROM wr_routing_rules WHERE rule_id=$1",
+            &[&rule_id],
+        )
+        .await
+        .internal()
+        .map(|row| row.map(|row| row.get(0)))
+}
+
 /// Delete a routing rule by ID. Returns true if a rule was actually deleted.
 /// Retries automatically on NOWAIT lock contention with exponential backoff.
-pub async fn delete_routing_rule(pool: &Pool, rule_id: &str) -> Result<bool, Status> {
+pub async fn delete_routing_rule_scoped(
+    pool: &Pool,
+    rule_id: &str,
+    expected_namespace: &str,
+) -> Result<bool, Status> {
     RetryIf::start(
         lock_retry_strategy(),
-        || delete_routing_rule_once(pool, rule_id),
+        || delete_routing_rule_once(pool, rule_id, Some(expected_namespace)),
         is_lock_contention,
     )
     .await
 }
 
-async fn delete_routing_rule_once(pool: &Pool, rule_id: &str) -> Result<bool, Status> {
+pub async fn delete_routing_rule(pool: &Pool, rule_id: &str) -> Result<bool, Status> {
+    RetryIf::start(
+        lock_retry_strategy(),
+        || delete_routing_rule_once(pool, rule_id, None),
+        is_lock_contention,
+    )
+    .await
+}
+
+async fn delete_routing_rule_once(
+    pool: &Pool,
+    rule_id: &str,
+    expected_namespace: Option<&str>,
+) -> Result<bool, Status> {
     let mut client = pool.get().await.internal()?;
     let txn = client.transaction().await.internal()?;
 
@@ -1758,8 +2206,8 @@ async fn delete_routing_rule_once(pool: &Pool, rule_id: &str) -> Result<bool, St
 
     let deleted = txn
         .execute(
-            "DELETE FROM wr_routing_rules WHERE rule_id = $1",
-            &[&rule_id],
+            "DELETE FROM wr_routing_rules WHERE rule_id = $1 AND ($2::text IS NULL OR destination_namespace = $2)",
+            &[&rule_id, &expected_namespace],
         )
         .await
         .internal()?;
@@ -2007,6 +2455,243 @@ pub async fn list_managers(
         .collect())
 }
 
+/// Install the first accepted policy only for a pristine control plane. This
+/// is the explicit fresh-database bootstrap path; rollout recovery never calls it.
+pub async fn bootstrap_initial_manager_policy_state(
+    pool: &Pool,
+    generation: u64,
+    digest: &str,
+) -> Result<(), Status> {
+    let client = pool.get().await.internal()?;
+    client
+        .execute(
+            "UPDATE wr_manager_rollout_guard SET accepted_generation=$1, accepted_digest=$2 WHERE singleton AND accepted_generation IS NULL AND accepted_digest IS NULL AND active_rollout_id IS NULL AND NOT EXISTS (SELECT 1 FROM wr_manager_rollouts)",
+            &[&(generation as i64), &digest],
+        )
+        .await
+        .internal()?;
+    Ok(())
+}
+
+pub async fn initialize_manager_policy_state(
+    pool: &Pool,
+    manager_id: &str,
+    generation: u64,
+    digest: &str,
+) -> Result<bool, Status> {
+    let client = pool.get().await.internal()?;
+    let row = client.query_one(
+        "SELECT accepted_generation, accepted_digest, active_rollout_id FROM wr_manager_rollout_guard WHERE singleton",
+        &[],
+    ).await.internal()?;
+    let accepted_generation: Option<i64> = row.get(0);
+    let accepted_digest: Option<String> = row.get(1);
+    let active: Option<uuid::Uuid> = row.get(2);
+    if accepted_generation.is_some_and(|accepted| generation < accepted as u64)
+        || (accepted_generation == Some(generation as i64)
+            && accepted_digest.as_deref() != Some(digest))
+    {
+        client.execute("UPDATE wr_managers SET policy_generation=$2, policy_digest=$3, admission_state='CLOSED_MISMATCH' WHERE manager_id=$1", &[&manager_id, &(generation as i64), &digest]).await.internal()?;
+        return Ok(false);
+    }
+    let open = active.is_none()
+        && accepted_generation == Some(generation as i64)
+        && accepted_digest.as_deref() == Some(digest);
+    let state = if open { "OPEN" } else { "CLOSED_STARTUP" };
+    client.execute("UPDATE wr_managers SET policy_generation=$2, policy_digest=$3, admission_state=$4 WHERE manager_id=$1", &[&manager_id, &(generation as i64), &digest, &state]).await.internal()?;
+    Ok(open)
+}
+
+pub async fn observe_manager_rollout(
+    pool: &Pool,
+    manager_id: &str,
+    generation: u64,
+    digest: &str,
+    admission: &AdmissionGate,
+    lifecycle: &ManagerLifecycleState,
+    policy: &wr_common::authorization_policy::ValidatedPolicy,
+) -> Result<(), Status> {
+    let client = pool.get().await.internal()?;
+    let row = client
+        .query_one(
+            "SELECT g.accepted_generation, g.accepted_digest,
+                r.rollout_id, r.phase, r.target_generation, r.target_policy_digest,
+                m.member_role, r.lease_epoch, r.expected_target_set_hash,
+                r.target_policy_validator_version, r.target_deployment_principal_uri,
+                r.target_deployment_leaf_fingerprint, r.cluster_id, r.canonical_request
+         FROM wr_manager_rollout_guard g
+         LEFT JOIN wr_manager_rollouts r ON r.rollout_id=g.active_rollout_id
+         LEFT JOIN wr_manager_rollout_members m ON m.rollout_id=r.rollout_id AND m.manager_id=$1
+            AND m.member_role=CASE
+                WHEN r.target_generation=$2 AND r.target_policy_digest=$3 THEN 'target'
+                ELSE 'source'
+            END
+         WHERE g.singleton",
+            &[&manager_id, &(generation as i64), &digest],
+        )
+        .await
+        .internal()?;
+    let accepted_generation: Option<i64> = row.get(0);
+    let accepted_digest: Option<String> = row.get(1);
+    let rollout_id: Option<uuid::Uuid> = row.get(2);
+
+    let Some(rollout_id) = rollout_id else {
+        let accepted = accepted_generation == Some(generation as i64)
+            && accepted_digest.as_deref() == Some(digest);
+        let mismatch = accepted_generation.is_some_and(|accepted_generation| {
+            generation < accepted_generation as u64
+                || (generation == accepted_generation as u64
+                    && accepted_digest.as_deref() != Some(digest))
+        });
+        let (state, wire_state) = if accepted {
+            ("OPEN", PrivilegedAdmissionState::Open)
+        } else if mismatch {
+            ("CLOSED_MISMATCH", PrivilegedAdmissionState::ClosedMismatch)
+        } else {
+            ("CLOSED_STARTUP", PrivilegedAdmissionState::ClosedStartup)
+        };
+        if accepted {
+            admission.open();
+        } else {
+            admission.close();
+        }
+        lifecycle.update(
+            wire_state,
+            "",
+            ManagerRolloutPhase::Unspecified as i32,
+            "",
+            0,
+        );
+        client.execute(
+            "UPDATE wr_managers SET policy_generation=$2,policy_digest=$3,admission_state=$4,rollout_id=NULL,rollout_phase=NULL,rollout_lease_epoch=0,last_heartbeat=NOW() WHERE manager_id=$1",
+            &[&manager_id, &(generation as i64), &digest, &state],
+        ).await.internal()?;
+        return Ok(());
+    };
+
+    let phase: i32 = row.get(3);
+    let target_generation: i64 = row.get(4);
+    let target_digest: String = row.get(5);
+    let role: Option<String> = row.get(6);
+    let epoch: i64 = row.get(7);
+    let expected_set_hash: String = row.get(8);
+    let validator_version: i32 = row.get(9);
+    let target_principal: String = row.get(10);
+    let target_fingerprint: String = row.get(11);
+    let cluster_id: String = row.get(12);
+    let canonical_request: Vec<u8> = row.get(13);
+    let request = BeginManagerRolloutRequest::decode(canonical_request.as_slice())
+        .map_err(|_| Status::internal("stored manager rollout request is corrupt"))?;
+    let targets = request
+        .expected_targets
+        .iter()
+        .map(|target| wr_common::authorization_policy::RolloutTarget {
+            manager_id: target.manager_id.clone(),
+            endpoint: target.endpoint.clone(),
+        })
+        .collect::<Vec<_>>();
+    let receipt_matches = policy
+        .prevalidate_rollout_claims(&target_principal, &target_fingerprint, &targets)
+        .is_ok_and(|receipt| {
+            validator_version == receipt.validator_version as i32
+                && generation == receipt.generation
+                && digest == receipt.digest
+                && cluster_id == receipt.cluster_id
+                && expected_set_hash == receipt.target_set_hash
+        });
+    let target_matches =
+        generation == target_generation as u64 && digest == target_digest && receipt_matches;
+    let (state, wire_state, should_open) =
+        match (ManagerRolloutPhase::try_from(phase).ok(), role.as_deref()) {
+            (
+                Some(ManagerRolloutPhase::Prepared | ManagerRolloutPhase::Staging),
+                Some("source"),
+            ) => ("OPEN", PrivilegedAdmissionState::Open, true),
+            (
+                Some(ManagerRolloutPhase::ActivatingTarget | ManagerRolloutPhase::Completed),
+                Some("target"),
+            ) if target_matches => ("OPEN", PrivilegedAdmissionState::Open, true),
+            (_, Some("target")) if !target_matches => (
+                "CLOSED_MISMATCH",
+                PrivilegedAdmissionState::ClosedMismatch,
+                false,
+            ),
+            (_, Some("source" | "target")) => (
+                "CLOSED_ROLLOUT",
+                PrivilegedAdmissionState::ClosedRollout,
+                false,
+            ),
+            _ => (
+                "CLOSED_ROLLOUT",
+                PrivilegedAdmissionState::ClosedRollout,
+                false,
+            ),
+        };
+    if should_open {
+        admission.open();
+    } else {
+        admission.close();
+    }
+    lifecycle.update(
+        wire_state,
+        rollout_id.to_string(),
+        phase,
+        expected_set_hash,
+        epoch as u64,
+    );
+    client.execute(
+        "UPDATE wr_managers SET policy_generation=$2,policy_digest=$3,admission_state=$4,rollout_id=$5,rollout_phase=$6,rollout_lease_epoch=$7,last_heartbeat=NOW() WHERE manager_id=$1",
+        &[&manager_id, &(generation as i64), &digest, &state, &rollout_id, &phase, &epoch],
+    ).await.internal()?;
+    let process_state = if target_matches || role.as_deref() == Some("source") {
+        "READY"
+    } else {
+        "MISMATCH"
+    };
+    client.execute(
+        "UPDATE wr_manager_rollout_members SET observed_policy_generation=$3,observed_policy_digest=$4,process_state=$5,admission_state=$6,last_acknowledged_at=NOW()
+         WHERE rollout_id=$1 AND manager_id=$2 AND member_role=$7",
+        &[
+            &rollout_id,
+            &manager_id,
+            &(generation as i64),
+            &digest,
+            &process_state,
+            &state,
+            &role,
+        ],
+    ).await.internal()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_manager_rollout_observer_owned(
+    pool: Pool,
+    manager_id: String,
+    generation: u64,
+    digest: String,
+    admission: AdmissionGate,
+    lifecycle: ManagerLifecycleState,
+    policy: std::sync::Arc<wr_common::authorization_policy::ValidatedPolicy>,
+    mut cancellation: TaskCancellation,
+) -> anyhow::Result<TaskExit> {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    loop {
+        tokio::select! { _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled), _ = ticker.tick() => {} }
+        observe_manager_rollout(
+            &pool,
+            &manager_id,
+            generation,
+            &digest,
+            &admission,
+            &lifecycle,
+            &policy,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("manager rollout observer failed: {error}"))?;
+    }
+}
+
 /// Update this manager's heartbeat timestamp.
 pub async fn heartbeat_manager(pool: &Pool, manager_id: &str) -> Result<(), Status> {
     let client = pool.get().await.internal()?;
@@ -2034,9 +2719,9 @@ pub async fn run_manager_heartbeat_owned(
             _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
             _ = ticker.tick() => {}
         }
-        if !admission.is_open() {
-            continue;
-        }
+        // Lease freshness is lifecycle evidence and continues while privileged
+        // admission is deliberately closed for startup or rollout.
+        let _ = &admission;
         tokio::select! {
             _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
             result = heartbeat_manager(&pool, &manager_id) => {
@@ -2347,4 +3032,614 @@ pub async fn mark_schedule_failed(
         .await
         .internal()?;
     Ok(n)
+}
+
+/// Atomically create or recover a manager rollout after a lost response.
+pub async fn begin_manager_rollout(
+    pool: &Pool,
+    deployment_principal_uri: &str,
+    deployment_leaf_fingerprint: &str,
+    request: &BeginManagerRolloutRequest,
+    canonical_request_digest: &str,
+    privileged_admission_open: bool,
+) -> Result<ManagerRollout, Status> {
+    let client_operation_id = uuid::Uuid::parse_str(&request.client_operation_id)
+        .map_err(|_| Status::invalid_argument("client_operation_id must be a UUID"))?;
+    let mut client = pool.get().await.internal()?;
+    let transaction = client.transaction().await.internal()?;
+    if let Some(row) = transaction
+        .query_opt(
+            "SELECT rollout_id, deployment_leaf_fingerprint, canonical_request_digest, canonical_request, phase
+             FROM wr_manager_rollouts
+             WHERE deployment_principal_uri = $1 AND client_operation_id = $2
+             FOR UPDATE",
+            &[&deployment_principal_uri, &client_operation_id],
+        )
+        .await
+        .internal()?
+    {
+        let _original_fingerprint: String = row.get(1);
+        let stored_digest: String = row.get(2);
+        if stored_digest != canonical_request_digest {
+            return Err(Status::already_exists(
+                "client_operation_id was already used with different rollout content",
+            ));
+        }
+        let stored: Vec<u8> = row.get(3);
+        let stored_request = BeginManagerRolloutRequest::decode(stored.as_slice())
+            .map_err(|_| Status::internal("stored manager rollout request is corrupt"))?;
+        let rollout = manager_rollout_from_row(
+            row.get(0),
+            deployment_principal_uri,
+            &stored_request,
+            stored_digest,
+            row.get(4),
+        );
+        transaction.commit().await.internal()?;
+        return Ok(rollout);
+    }
+
+    let guard = transaction.query_one(
+        "SELECT accepted_generation, accepted_digest, active_rollout_id FROM wr_manager_rollout_guard WHERE singleton FOR UPDATE",
+        &[],
+    ).await.internal()?;
+    let accepted_generation: Option<i64> = guard.get(0);
+    let accepted_digest: Option<String> = guard.get(1);
+    let active: Option<uuid::Uuid> = guard.get(2);
+    let recovery_of = if request.recovery_of.is_empty() {
+        None
+    } else {
+        Some(
+            uuid::Uuid::parse_str(&request.recovery_of)
+                .map_err(|_| Status::invalid_argument("recovery_of must be a rollout UUID"))?,
+        )
+    };
+    if !privileged_admission_open && accepted_generation.is_some() && recovery_of.is_none() {
+        return Err(Status::failed_precondition(
+            "closed privileged admission permits only empty-cluster bootstrap or failed-closed recovery",
+        ));
+    }
+    match (active, recovery_of) {
+        (None, None) => {}
+        (Some(active), Some(predecessor)) if active == predecessor => {
+            let predecessor = transaction
+                .query_one(
+                    "SELECT phase, deployment_principal_uri, target_generation
+                 FROM wr_manager_rollouts WHERE rollout_id=$1 FOR UPDATE",
+                    &[&predecessor],
+                )
+                .await
+                .internal()?;
+            let predecessor_phase: i32 = predecessor.get(0);
+            let predecessor_principal: String = predecessor.get(1);
+            let predecessor_generation: i64 = predecessor.get(2);
+            if predecessor_phase != ManagerRolloutPhase::FailedClosed as i32
+                || predecessor_principal != deployment_principal_uri
+                || request.target_generation <= predecessor_generation as u64
+            {
+                return Err(Status::failed_precondition(
+                    "failed-closed recovery requires the active predecessor, its recorded principal, and a strictly newer generation",
+                ));
+            }
+        }
+        (Some(_), None) => {
+            return Err(Status::failed_precondition(
+                "another manager rollout is active",
+            ))
+        }
+        _ => {
+            return Err(Status::failed_precondition(
+                "recovery_of must name the active failed-closed rollout",
+            ))
+        }
+    }
+    let live_sources = transaction
+        .query(
+            "SELECT manager_id, grpc_address FROM wr_managers
+             WHERE admission_state='OPEN' AND last_heartbeat > NOW() - INTERVAL '30 seconds'
+             ORDER BY manager_id FOR UPDATE",
+            &[],
+        )
+        .await
+        .internal()?;
+    let declared_sources = request
+        .source_managers
+        .iter()
+        .map(|source| (&source.manager_id, &source.endpoint))
+        .collect::<Vec<_>>();
+    let observed_sources = live_sources
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
+    if declared_sources.len() != observed_sources.len()
+        || declared_sources.iter().zip(&observed_sources).any(
+            |((declared_id, declared_endpoint), (observed_id, observed_endpoint))| {
+                declared_id.as_str() != observed_id
+                    || declared_endpoint.as_str() != observed_endpoint
+            },
+        )
+    {
+        return Err(Status::failed_precondition(
+            "manifest source manager set does not match the complete live source set",
+        ));
+    }
+    if accepted_generation.is_some_and(|generation| request.target_generation < generation as u64) {
+        return Err(Status::failed_precondition(
+            "target policy generation must be strictly newer",
+        ));
+    }
+    if accepted_generation == Some(request.target_generation as i64)
+        && accepted_digest.as_deref() != Some(&request.target_policy_digest)
+    {
+        return Err(Status::failed_precondition(
+            "same policy generation has a different digest",
+        ));
+    }
+    if accepted_generation.is_none() {
+        let fresh = transaction
+            .query(
+                "SELECT manager_id, policy_generation, policy_digest, admission_state
+             FROM wr_managers WHERE last_heartbeat > NOW() - INTERVAL '30 seconds'
+             ORDER BY manager_id FOR UPDATE",
+                &[],
+            )
+            .await
+            .internal()?;
+        let expected = request
+            .expected_targets
+            .iter()
+            .map(|target| target.manager_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let observed = fresh
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<std::collections::BTreeSet<_>>();
+        let matching = !fresh.is_empty()
+            && fresh.iter().all(|row| {
+                row.get::<_, Option<i64>>(1) == Some(request.target_generation as i64)
+                    && row.get::<_, Option<String>>(2).as_deref()
+                        == Some(&request.target_policy_digest)
+                    && row.get::<_, String>(3) == "CLOSED_STARTUP"
+            });
+        if !matching
+            || observed
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+                != expected
+        {
+            return Err(Status::failed_precondition(
+                "empty-cluster rollout requires the complete matching CLOSED_STARTUP manager set",
+            ));
+        }
+    }
+
+    let rollout_id = uuid::Uuid::new_v4();
+    let canonical_request = request.encode_to_vec();
+    let expected_target_set_hash = manager_target_set_hash(&request.expected_targets);
+    transaction
+        .execute(
+            "INSERT INTO wr_manager_rollouts
+             (rollout_id, deployment_principal_uri, deployment_leaf_fingerprint,
+              client_operation_id, canonical_request_digest, canonical_request,
+              target_policy_validator_version, target_deployment_principal_uri,
+              target_deployment_leaf_fingerprint, expected_target_set_hash, cluster_id,
+              target_generation, target_policy_digest, recovery_of)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+            &[
+                &rollout_id,
+                &deployment_principal_uri,
+                &deployment_leaf_fingerprint,
+                &client_operation_id,
+                &canonical_request_digest,
+                &canonical_request,
+                &(request.target_policy_validator_version as i32),
+                &request.target_deployment_principal_uri,
+                &request.target_deployment_leaf_fingerprint,
+                &expected_target_set_hash,
+                &request.cluster_id,
+                &(request.target_generation as i64),
+                &request.target_policy_digest,
+                &recovery_of,
+            ],
+        )
+        .await
+        .internal()?;
+    transaction
+        .execute(
+            "UPDATE wr_manager_rollout_guard SET active_rollout_id = $1 WHERE singleton",
+            &[&rollout_id],
+        )
+        .await
+        .internal()?;
+    transaction.execute(
+        "INSERT INTO wr_manager_rollout_members (rollout_id, member_role, manager_id, observed_policy_generation, observed_policy_digest, admission_state)
+         SELECT $1, 'source', manager_id, policy_generation, policy_digest, admission_state
+         FROM wr_managers
+         WHERE admission_state='OPEN' AND last_heartbeat > NOW() - INTERVAL '30 seconds'
+         ON CONFLICT DO NOTHING",
+        &[&rollout_id],
+    ).await.internal()?;
+    for target in &request.expected_targets {
+        transaction
+            .execute(
+                "INSERT INTO wr_manager_rollout_members
+             (rollout_id, member_role, manager_id, expected_host_digest, expected_config_digest,
+              expected_backend, expected_executable_digest, expected_backend_spec_digest,
+              expected_credential_digest, expected_old_selector_digest, expected_new_selector_digest)
+             VALUES ($1, 'target', $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                &[
+                    &rollout_id,
+                    &target.manager_id,
+                    &target.host_digest,
+                    &target.config_digest,
+                    &target.backend,
+                    &target.executable_digest,
+                    &target.backend_spec_digest,
+                    &target.credential_digest,
+                    &target.old_selector_digest,
+                    &target.new_selector_digest,
+                ],
+            )
+            .await
+            .internal()?;
+    }
+    transaction.execute(
+        "INSERT INTO wr_manager_rollout_events (rollout_id, event_type, phase) VALUES ($1, 'created', $2)",
+        &[&rollout_id, &(ManagerRolloutPhase::Prepared as i32)],
+    ).await.internal()?;
+    transaction.commit().await.internal()?;
+    Ok(manager_rollout_from_row(
+        rollout_id,
+        deployment_principal_uri,
+        request,
+        canonical_request_digest.to_string(),
+        ManagerRolloutPhase::Prepared as i32,
+    ))
+}
+
+pub async fn lease_manager_rollout(
+    pool: &Pool,
+    rollout_id: &str,
+    executor_id: &str,
+    expected_lease_epoch: u64,
+) -> Result<ManagerRollout, Status> {
+    let rollout_id = uuid::Uuid::parse_str(rollout_id)
+        .map_err(|_| Status::invalid_argument("rollout_id must be a UUID"))?;
+    let executor = uuid::Uuid::parse_str(executor_id)
+        .map_err(|_| Status::invalid_argument("executor_id must be a UUID"))?;
+    let mut client = pool.get().await.internal()?;
+    let transaction = client.transaction().await.internal()?;
+    let row = transaction.query_opt(
+        "SELECT executor_id, lease_epoch, lease_expires_at, phase FROM wr_manager_rollouts WHERE rollout_id=$1 FOR UPDATE",
+        &[&rollout_id],
+    ).await.internal()?.ok_or_else(|| Status::not_found("manager rollout was not found"))?;
+    let owner: Option<uuid::Uuid> = row.get(0);
+    let epoch: i64 = row.get(1);
+    let expires: Option<chrono::DateTime<chrono::Utc>> = row.get(2);
+    let phase: i32 = row.get(3);
+    if matches!(
+        ManagerRolloutPhase::try_from(phase),
+        Ok(ManagerRolloutPhase::Completed
+            | ManagerRolloutPhase::FailedPreClose
+            | ManagerRolloutPhase::FailedClosed)
+    ) {
+        return Err(Status::failed_precondition(
+            "terminal rollout cannot be leased",
+        ));
+    }
+    if expected_lease_epoch != epoch as u64 {
+        return Err(Status::failed_precondition("stale rollout lease epoch"));
+    }
+    let expired = expires.is_none_or(|deadline| deadline <= chrono::Utc::now());
+    let next_epoch = match owner {
+        Some(owner) if owner == executor => epoch.max(1),
+        Some(_) if !expired => {
+            return Err(Status::failed_precondition(
+                "rollout lease is owned by another executor",
+            ))
+        }
+        _ => epoch
+            .checked_add(1)
+            .ok_or_else(|| Status::resource_exhausted("rollout lease epoch exhausted"))?,
+    };
+    transaction
+        .execute(
+            "UPDATE wr_manager_rollouts SET executor_id=$2, lease_epoch=$3,
+         lease_expires_at=NOW()+INTERVAL '30 seconds', updated_at=NOW() WHERE rollout_id=$1",
+            &[&rollout_id, &executor, &next_epoch],
+        )
+        .await
+        .internal()?;
+    transaction.commit().await.internal()?;
+    get_manager_rollout(pool, &rollout_id.to_string()).await
+}
+
+pub async fn advance_manager_rollout(
+    pool: &Pool,
+    rollout_id: &str,
+    executor_id: &str,
+    lease_epoch: u64,
+    expected_phase: i32,
+    next_phase: i32,
+    member_outcomes: &[wr_common::wruntime::ManagerRolloutMemberOutcome],
+) -> Result<ManagerRollout, Status> {
+    let rollout_id = uuid::Uuid::parse_str(rollout_id)
+        .map_err(|_| Status::invalid_argument("rollout_id must be a UUID"))?;
+    let executor = uuid::Uuid::parse_str(executor_id)
+        .map_err(|_| Status::invalid_argument("executor_id must be a UUID"))?;
+    let expected = ManagerRolloutPhase::try_from(expected_phase)
+        .map_err(|_| Status::invalid_argument("expected rollout phase is invalid"))?;
+    let next = ManagerRolloutPhase::try_from(next_phase)
+        .map_err(|_| Status::invalid_argument("next rollout phase is invalid"))?;
+    let legal = matches!(
+        (expected, next),
+        (
+            ManagerRolloutPhase::Prepared,
+            ManagerRolloutPhase::Staging | ManagerRolloutPhase::FailedPreClose
+        ) | (
+            ManagerRolloutPhase::Staging,
+            ManagerRolloutPhase::ClosingOld | ManagerRolloutPhase::FailedPreClose
+        ) | (
+            ManagerRolloutPhase::ClosingOld,
+            ManagerRolloutPhase::OldClosed | ManagerRolloutPhase::FailedClosed
+        ) | (
+            ManagerRolloutPhase::OldClosed,
+            ManagerRolloutPhase::StartingTarget | ManagerRolloutPhase::FailedClosed
+        ) | (
+            ManagerRolloutPhase::StartingTarget,
+            ManagerRolloutPhase::TargetReadyClosed | ManagerRolloutPhase::FailedClosed
+        ) | (
+            ManagerRolloutPhase::TargetReadyClosed,
+            ManagerRolloutPhase::ActivatingTarget | ManagerRolloutPhase::FailedClosed
+        ) | (
+            ManagerRolloutPhase::ActivatingTarget,
+            ManagerRolloutPhase::Completed | ManagerRolloutPhase::FailedClosed
+        )
+    );
+    if !legal {
+        return Err(Status::failed_precondition(
+            "illegal manager rollout phase transition",
+        ));
+    }
+    let mut client = pool.get().await.internal()?;
+    let transaction = client.transaction().await.internal()?;
+    let row = transaction.query_opt(
+        "SELECT phase, executor_id, lease_epoch, lease_expires_at, target_generation, target_policy_digest
+         FROM wr_manager_rollouts WHERE rollout_id=$1 FOR UPDATE",
+        &[&rollout_id],
+    ).await.internal()?.ok_or_else(|| Status::not_found("manager rollout was not found"))?;
+    let current: i32 = row.get(0);
+    let owner: Option<uuid::Uuid> = row.get(1);
+    let epoch: i64 = row.get(2);
+    let expires: Option<chrono::DateTime<chrono::Utc>> = row.get(3);
+    if owner != Some(executor)
+        || epoch as u64 != lease_epoch
+        || expires.is_none_or(|deadline| deadline <= chrono::Utc::now())
+    {
+        return Err(Status::failed_precondition(
+            "rollout fenced lease no longer matches",
+        ));
+    }
+    if current != expected_phase && current != next_phase {
+        return Err(Status::failed_precondition(
+            "rollout phase no longer matches",
+        ));
+    }
+    let mut outcome_keys = std::collections::BTreeSet::new();
+    for outcome in member_outcomes {
+        wr_common::identity::ManagerId::parse(&outcome.manager_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if !matches!(outcome.member_role.as_str(), "source" | "target")
+            || outcome.host_action_outcome.is_empty()
+            || outcome.host_action_outcome.len() > 64
+            || outcome.error.len() > 1024
+            || !outcome_keys.insert((&outcome.member_role, &outcome.manager_id))
+        {
+            return Err(Status::invalid_argument(
+                "manager rollout member outcome is invalid or duplicated",
+            ));
+        }
+        let member = transaction
+            .query_opt(
+                "SELECT host_action_outcome, error FROM wr_manager_rollout_members
+             WHERE rollout_id=$1 AND member_role=$2 AND manager_id=$3 FOR UPDATE",
+                &[&rollout_id, &outcome.member_role, &outcome.manager_id],
+            )
+            .await
+            .internal()?
+            .ok_or_else(|| {
+                Status::invalid_argument("manager rollout outcome names an unexpected member")
+            })?;
+        let stored_outcome: Option<String> = member.get(0);
+        let stored_error: Option<String> = member.get(1);
+        if let Some(stored_outcome) = stored_outcome {
+            if stored_outcome != outcome.host_action_outcome
+                || stored_error.as_deref().unwrap_or_default() != outcome.error
+            {
+                return Err(Status::already_exists(
+                    "conflicting manager rollout member outcome replay",
+                ));
+            }
+        } else if current == next_phase {
+            return Err(Status::already_exists(
+                "phase replay adds an uncommitted member outcome",
+            ));
+        } else {
+            let admission_override = if outcome.member_role == "source"
+                && matches!(
+                    outcome.host_action_outcome.as_str(),
+                    "STOPPED" | "UNREACHABLE"
+                ) {
+                Some(outcome.host_action_outcome.as_str())
+            } else {
+                None
+            };
+            transaction.execute(
+                "UPDATE wr_manager_rollout_members
+                 SET host_action_outcome=$4,error=NULLIF($5,''),admission_state=COALESCE($6,admission_state),last_acknowledged_at=NOW()
+                 WHERE rollout_id=$1 AND member_role=$2 AND manager_id=$3",
+                &[&rollout_id, &outcome.member_role, &outcome.manager_id, &outcome.host_action_outcome, &outcome.error, &admission_override],
+            ).await.internal()?;
+        }
+    }
+    if current == next_phase {
+        transaction.commit().await.internal()?;
+        return get_manager_rollout(pool, &rollout_id.to_string()).await;
+    }
+    let barrier_sql = match next {
+        ManagerRolloutPhase::OldClosed => Some("SELECT COUNT(*) FROM wr_manager_rollout_members WHERE rollout_id=$1 AND member_role='source' AND COALESCE(admission_state,'') NOT IN ('CLOSED_ROLLOUT','STOPPED','UNREACHABLE')"),
+        ManagerRolloutPhase::TargetReadyClosed => Some("SELECT
+            (SELECT COUNT(*) FROM wr_manager_rollout_members m JOIN wr_manager_rollouts r USING (rollout_id)
+             WHERE m.rollout_id=$1 AND m.member_role='target'
+               AND (m.process_state!='READY' OR m.admission_state!='CLOSED_ROLLOUT'
+                    OR m.observed_policy_generation!=r.target_generation
+                    OR m.observed_policy_digest!=r.target_policy_digest))
+            + (SELECT COUNT(*) FROM wr_managers
+               WHERE last_heartbeat > NOW() - INTERVAL '30 seconds' AND admission_state='OPEN')"),
+        ManagerRolloutPhase::Completed => Some("SELECT
+            (SELECT COUNT(*) FROM wr_manager_rollout_members
+             WHERE rollout_id=$1 AND member_role='target' AND admission_state!='OPEN')
+            + (SELECT COUNT(*) FROM wr_managers live
+               WHERE live.last_heartbeat > NOW() - INTERVAL '30 seconds' AND live.admission_state='OPEN'
+                 AND NOT EXISTS (SELECT 1 FROM wr_manager_rollout_members target
+                                 WHERE target.rollout_id=$1 AND target.member_role='target'
+                                   AND target.manager_id=live.manager_id))"),
+        _ => None,
+    };
+    if let Some(sql) = barrier_sql {
+        let remaining: i64 = transaction
+            .query_one(sql, &[&rollout_id])
+            .await
+            .internal()?
+            .get(0);
+        if remaining != 0 {
+            return Err(Status::failed_precondition(
+                "manager rollout barrier is not satisfied",
+            ));
+        }
+    }
+    let terminal_failure = match next {
+        ManagerRolloutPhase::FailedPreClose => {
+            Some("manager rollout failed before privileged admission closed")
+        }
+        ManagerRolloutPhase::FailedClosed => {
+            Some("manager rollout failed after privileged admission closed")
+        }
+        _ => None,
+    };
+    transaction.execute(
+        "UPDATE wr_manager_rollouts SET phase=$2,failure=COALESCE($3,failure),updated_at=NOW() WHERE rollout_id=$1",
+        &[&rollout_id, &next_phase, &terminal_failure],
+    ).await.internal()?;
+    transaction.execute("INSERT INTO wr_manager_rollout_events (rollout_id,event_type,phase) VALUES ($1,'phase-advanced',$2)", &[&rollout_id, &next_phase]).await.internal()?;
+    match next {
+        ManagerRolloutPhase::Completed => {
+            let generation: i64 = row.get(4);
+            let digest: String = row.get(5);
+            transaction.execute("UPDATE wr_manager_rollout_guard SET accepted_generation=$2, accepted_digest=$3, active_rollout_id=NULL WHERE singleton AND active_rollout_id=$1", &[&rollout_id, &generation, &digest]).await.internal()?;
+        }
+        ManagerRolloutPhase::FailedPreClose => {
+            transaction.execute("UPDATE wr_manager_rollout_guard SET active_rollout_id=NULL WHERE singleton AND active_rollout_id=$1", &[&rollout_id]).await.internal()?;
+        }
+        _ => {}
+    }
+    transaction.commit().await.internal()?;
+    get_manager_rollout(pool, &rollout_id.to_string()).await
+}
+
+pub async fn get_manager_rollout(pool: &Pool, rollout_id: &str) -> Result<ManagerRollout, Status> {
+    let rollout_id = uuid::Uuid::parse_str(rollout_id)
+        .map_err(|_| Status::invalid_argument("rollout_id must be a UUID"))?;
+    let client = pool.get().await.internal()?;
+    let row = client
+        .query_opt(
+            "SELECT deployment_principal_uri, canonical_request_digest, canonical_request, phase,
+                    executor_id::text, lease_epoch, lease_expires_at, failure, expected_target_set_hash
+             FROM wr_manager_rollouts WHERE rollout_id = $1",
+            &[&rollout_id],
+        )
+        .await
+        .internal()?
+        .ok_or_else(|| Status::not_found("manager rollout was not found"))?;
+    let principal: String = row.get(0);
+    let request_bytes: Vec<u8> = row.get(2);
+    let request = BeginManagerRolloutRequest::decode(request_bytes.as_slice())
+        .map_err(|_| Status::internal("stored manager rollout request is corrupt"))?;
+    let mut rollout =
+        manager_rollout_from_row(rollout_id, &principal, &request, row.get(1), row.get(3));
+    rollout.executor_id = row.get::<_, Option<String>>(4).unwrap_or_default();
+    rollout.lease_epoch = row.get::<_, i64>(5) as u64;
+    rollout.lease_expires_at =
+        row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(6)
+            .map(|value| prost_types::Timestamp {
+                seconds: value.timestamp(),
+                nanos: value.timestamp_subsec_nanos() as i32,
+            });
+    rollout.failure = row.get::<_, Option<String>>(7).unwrap_or_default();
+    rollout.expected_target_set_hash = row.get(8);
+    Ok(rollout)
+}
+
+fn manager_rollout_from_row(
+    rollout_id: uuid::Uuid,
+    deployment_principal_uri: &str,
+    request: &BeginManagerRolloutRequest,
+    request_digest: String,
+    phase: i32,
+) -> ManagerRollout {
+    ManagerRollout {
+        rollout_id: rollout_id.to_string(),
+        deployment_principal_uri: deployment_principal_uri.to_string(),
+        client_operation_id: request.client_operation_id.clone(),
+        request_digest,
+        cluster_id: request.cluster_id.clone(),
+        target_generation: request.target_generation,
+        target_policy_digest: request.target_policy_digest.clone(),
+        expected_targets: request.expected_targets.clone(),
+        recovery_of: request.recovery_of.clone(),
+        phase,
+        executor_id: String::new(),
+        lease_epoch: 0,
+        lease_expires_at: None,
+        target_policy_validator_version: request.target_policy_validator_version,
+        target_deployment_principal_uri: request.target_deployment_principal_uri.clone(),
+        target_deployment_leaf_fingerprint: request.target_deployment_leaf_fingerprint.clone(),
+        expected_target_set_hash: manager_target_set_hash(&request.expected_targets),
+        failure: String::new(),
+        source_managers: request.source_managers.clone(),
+        manifest_digest: request.manifest_digest.clone(),
+        executor_id_from_manifest: request.executor_id.clone(),
+        deployment_certificate: request.deployment_certificate.clone(),
+    }
+}
+
+fn manager_target_set_hash(targets: &[wr_common::wruntime::ManagerRolloutTarget]) -> String {
+    let targets = targets
+        .iter()
+        .map(|target| wr_common::authorization_policy::RolloutTarget {
+            manager_id: target.manager_id.clone(),
+            endpoint: target.endpoint.clone(),
+        })
+        .collect::<Vec<_>>();
+    wr_common::authorization_policy::manager_set_hash(&targets)
+        .expect("canonical rollout request already validated unique manager targets")
+}
+
+#[cfg(test)]
+mod fence_generation_tests {
+    use super::*;
+
+    #[test]
+    fn first_replay_replacement_and_exhaustion_are_checked() {
+        assert_eq!(assigned_slot_generation(0, false).unwrap(), 1);
+        assert_eq!(assigned_slot_generation(7, true).unwrap(), 7);
+        assert_eq!(assigned_slot_generation(u64::MAX, true).unwrap(), u64::MAX);
+        assert_eq!(
+            assigned_slot_generation(u64::MAX, false)
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+    }
 }

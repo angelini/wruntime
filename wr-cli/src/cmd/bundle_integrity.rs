@@ -67,6 +67,14 @@ pub struct BundleManifest {
 pub struct ManifestEngine {
     pub engine_slot: String,
     pub modules: Vec<ManifestModule>,
+    #[serde(default)]
+    pub secrets: Vec<(String, String)>,
+    #[serde(default)]
+    pub db_namespaces: Vec<String>,
+    #[serde(default)]
+    pub job_queue_id: String,
+    #[serde(default)]
+    pub job_admin_address: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

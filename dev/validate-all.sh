@@ -312,8 +312,11 @@ fi
 
 section "setup"
 printf 'logs: %s\n' "$LOG_ROOT"
-if [ ! -f certs/ca.crt ] || [ ! -f certs/127.0.0.1.crt ] || [ ! -f certs/manager.crt ]; then
-	run_cmd "generate certs" "just certs"
+if [ ! -f certs/runtime-server-root/ca.crt ] \
+	|| [ ! -f certs/runtime-client-root/ca.crt ] \
+	|| [ ! -f certs/runtime-manager-endpoint/leaf.pem ] \
+	|| [ ! -f certs/runtime-manager-client/leaf.pem ]; then
+	run_cmd "generate profile certificate sets" "just certs"
 fi
 if [ "$START_DEV" = true ]; then
 	run_cmd "start dev infrastructure" "just dev-up"

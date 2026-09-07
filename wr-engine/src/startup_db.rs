@@ -121,10 +121,7 @@ listen_address = "127.0.0.1:9100"
 proxy_address = "http://127.0.0.1:9001"
 control_address = "http://127.0.0.1:9002"
 peer_address = "https://127.0.0.1:9443"
-[node.tls]
-cert_path = "c.crt"
-key_path = "c.key"
-ca_cert_path = "ca.crt"
+
 [database]
 url = "postgres://localhost/test"
 max_connections = 5
@@ -200,7 +197,7 @@ queue_id = "test-jobs"
 [job_admin.tls]
 cert_path = "job-admin.crt"
 key_path = "job-admin.key"
-ca_cert_path = "job-admin-ca.crt"
+client_ca_cert_path = "job-admin-ca.crt"
 "#,
         );
         let manifest = StartupDbManifest::build(&config).expect("manifest");

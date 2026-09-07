@@ -5,6 +5,7 @@ mod server;
 use wr_engine::config::{self, EnvValue};
 
 use anyhow::{Context, Result};
+use prost::Message;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -26,9 +27,10 @@ use wr_common::task_group::{TaskExit, TaskGroup};
 use wr_common::wruntime::engine_job_admin_service_server::EngineJobAdminServiceServer;
 use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
 use wr_common::wruntime::{
-    node_service_client::NodeServiceClient, BeginEngineDrainRequest, DeregisterEngineRequest,
-    EngineRegistration, HeartbeatRequest, HeartbeatResponse, ModuleDescriptor,
-    RegisterEngineRequest, SecretRequest,
+    proxy_node_control_service_client::ProxyNodeControlServiceClient, BeginEngineDrainRequest,
+    DeregisterEngineRequest, EngineOwnershipFence, EngineRegistration, HeartbeatRequest,
+    HeartbeatResponse, ModuleDescriptor, RegisterEngineRequest, SecretRequest,
+    WorkloadProjectionKind, WorkloadSnapshotV1,
 };
 
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
@@ -123,8 +125,9 @@ struct ProductionEngineShutdown<'a> {
     http_admission: &'a AdmissionGate,
     job_admin_admission: &'a AdmissionGate,
     job_admin_ready: &'a AtomicBool,
-    client: &'a mut NodeServiceClient<tonic::transport::Channel>,
+    client: &'a mut ProxyNodeControlServiceClient<tonic::transport::Channel>,
     engine_id: &'a str,
+    fence: &'a EngineOwnershipFence,
     tasks: &'a mut TaskGroup,
 }
 
@@ -143,6 +146,7 @@ impl EngineShutdownOperations for ProductionEngineShutdown<'_> {
                 deadline,
                 self.client.begin_engine_drain(BeginEngineDrainRequest {
                     engine_id: self.engine_id.to_string(),
+                    fence: Some(self.fence.clone()),
                 }),
             )
             .await
@@ -178,6 +182,7 @@ impl EngineShutdownOperations for ProductionEngineShutdown<'_> {
                 deadline,
                 self.client.deregister_engine(DeregisterEngineRequest {
                     engine_id: self.engine_id.to_string(),
+                    fence: Some(self.fence.clone()),
                 }),
             )
             .await
@@ -231,11 +236,7 @@ async fn async_main() -> Result<()> {
             .unwrap_or("engine.toml"),
     )
     .await;
-    let finalized = telemetry.finalize();
-    if !finalized.is_success() && result.is_ok() {
-        anyhow::bail!("telemetry finalization failed: {:?}", finalized.failures);
-    }
-    result
+    telemetry.finalize_preserving(result)
 }
 
 async fn lifecycle_probe(config_path: &str) -> Result<()> {
@@ -276,13 +277,15 @@ async fn collect_healthy_module_descriptors(
 }
 
 async fn send_heartbeat_with_retry(
-    client: &mut NodeServiceClient<tonic::transport::Channel>,
+    client: &mut ProxyNodeControlServiceClient<tonic::transport::Channel>,
     engine_id: &str,
     healthy_modules: Vec<ModuleDescriptor>,
+    fence: &EngineOwnershipFence,
 ) -> std::result::Result<HeartbeatResponse, tonic::Status> {
     let request = HeartbeatRequest {
         engine_id: engine_id.to_string(),
         healthy_modules,
+        fence: Some(fence.clone()),
     };
     Retry::start(FixedInterval::from_millis(50).take(2), || {
         let mut client = client.clone();
@@ -293,14 +296,16 @@ async fn send_heartbeat_with_retry(
     .map(tonic::Response::into_inner)
 }
 
-async fn connect_proxy(address: &str) -> Result<NodeServiceClient<tonic::transport::Channel>> {
+async fn connect_proxy(
+    address: &str,
+) -> Result<ProxyNodeControlServiceClient<tonic::transport::Channel>> {
     let strategy = ExponentialBackoff::from_millis(200)
         .max_delay(Duration::from_secs(5))
         .take(10);
     Retry::start(strategy, || {
         let address = address.to_string();
         async move {
-            NodeServiceClient::connect(address)
+            ProxyNodeControlServiceClient::connect(address)
                 .await
                 .map_err(anyhow::Error::from)
         }
@@ -311,13 +316,6 @@ async fn connect_proxy(address: &str) -> Result<NodeServiceClient<tonic::transpo
 
 async fn run_service(config_path: &str) -> Result<()> {
     let config = config::EngineConfig::load(config_path)?;
-    if let Some(job_admin) = &config.job_admin {
-        wr_common::tls::ensure_disjoint_ca_roots(&[
-            ("runtime node", &config.node.tls),
-            ("engine job-admin delegation", &job_admin.tls),
-        ])
-        .context("engine runtime and job-admin trust domains must use distinct CA certificates")?;
-    }
     let engine_id = Uuid::new_v4().to_string();
     let mut lifecycle = LifecycleOwner::new(
         ServiceKind::Engine,
@@ -350,12 +348,17 @@ async fn run_service(config_path: &str) -> Result<()> {
                 revision: metadata.revision,
                 bundle_digest: metadata.bundle_digest,
                 engine_slot: metadata.engine_slot,
+                operation_id: metadata.operation_id,
+                revision_digest: metadata.revision_digest,
             });
 
     let registry = registry::ModuleRegistry::new();
     let mut runner = engine::EngineRunner::new(config.clone())?;
     let mut tasks = TaskGroup::new();
     let job_admin_ready = Arc::new(AtomicBool::new(false));
+    let policy_state = Arc::new(tokio::sync::Mutex::new(
+        wr_common::snapshot_consumer::SnapshotConsumerState::Empty,
+    ));
     if let Some(job_admin) = &config.job_admin {
         let incoming = TcpIncoming::bind(job_admin.listen_address.parse()?)
             .context("failed to bind engine job-admin listener")?;
@@ -364,11 +367,12 @@ async fn run_service(config_path: &str) -> Result<()> {
         let pool = runner
             .admin_pool()
             .context("job-admin listener requires an engine database pool")?;
-        let api = wr_engine::job_admin::EngineJobAdminApi::new(
+        let api = wr_engine::job_admin::EngineJobAdminApi::new_authorized(
             job_admin.queue_id.clone(),
             pool,
             Arc::clone(&job_admin_ready),
             job_admin_admission.clone(),
+            Arc::clone(&policy_state),
         );
         let router = Server::builder().tls_config(tls)?.add_service(
             EngineJobAdminServiceServer::new(api)
@@ -412,7 +416,9 @@ async fn run_service(config_path: &str) -> Result<()> {
         });
     }
 
-    let mut node_client: Option<NodeServiceClient<tonic::transport::Channel>> = None;
+    let mut node_client: Option<ProxyNodeControlServiceClient<tonic::transport::Channel>> = None;
+    let activation_id = Uuid::new_v4().to_string();
+    let mut ownership_fence: Option<EngineOwnershipFence> = None;
     let startup: Result<()> = async {
         node_client = Some(connect_proxy(&config.node.control_address).await?);
         let client = node_client
@@ -424,22 +430,20 @@ async fn run_service(config_path: &str) -> Result<()> {
         for module in &config.modules {
             let first = schema_sent.insert((&module.namespace, &module.name, &module.version));
             let proto_schema = if first {
-                let schema_path = module
+                if let Some(schema_path) = module
                     .schema_path
                     .as_deref()
                     .filter(|path| !path.trim().is_empty())
-                    .with_context(|| {
+                {
+                    std::fs::read(schema_path).with_context(|| {
                         format!(
-                            "schema_path is required for '{}.{}@{}'",
+                            "failed to read schema for '{}.{}@{}' from {schema_path}",
                             module.namespace, module.name, module.version
                         )
-                    })?;
-                std::fs::read(schema_path).with_context(|| {
-                    format!(
-                        "failed to read schema for '{}.{}@{}' from {schema_path}",
-                        module.namespace, module.name, module.version
-                    )
-                })?
+                    })?
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
             };
@@ -495,6 +499,7 @@ async fn run_service(config_path: &str) -> Result<()> {
                     .map(|value| value.advertise_address.clone())
                     .unwrap_or_default(),
             }),
+            activation_id: activation_id.clone(),
         };
         let registration_response = Retry::start(
             ExponentialBackoff::from_millis(500)
@@ -509,6 +514,43 @@ async fn run_service(config_path: &str) -> Result<()> {
         .await
         .context("engine registration failed after retries")?
         .into_inner();
+        let fence = registration_response
+            .fence
+            .clone()
+            .context("manager registration response omitted ownership fence")?;
+        let metadata = registration
+            .registration
+            .as_ref()
+            .and_then(|r| r.deployment.as_ref())
+            .context("managed deployment metadata is required")?;
+        anyhow::ensure!(
+            fence.node_id == metadata.node_id
+                && fence.slot == metadata.engine_slot
+                && fence.revision_digest == metadata.revision_digest
+                && fence.activation_id == activation_id
+                && fence.slot_generation > 0,
+            "registration ownership fence mismatch"
+        );
+        let envelope =
+            WorkloadSnapshotV1::decode(registration_response.serialized_snapshot.as_slice())
+                .context("manager registration snapshot is malformed")?;
+        {
+            let mut state = policy_state.lock().await;
+            wr_common::snapshot_consumer::consume(
+                &mut state,
+                Ok(&registration_response.serialized_snapshot),
+                &envelope.cluster_id,
+                WorkloadProjectionKind::EngineJobAdminV1,
+                std::time::SystemTime::now(),
+                std::time::Instant::now(),
+                true,
+            );
+            anyhow::ensure!(
+                state.is_fresh(std::time::Instant::now()),
+                "manager registration snapshot was rejected"
+            );
+        }
+        ownership_fence = Some(fence);
 
         runner
             .provision_schemas(&registration_response.db_credentials)
@@ -571,7 +613,14 @@ async fn run_service(config_path: &str) -> Result<()> {
         );
         let readiness = tokio::time::timeout(
             SHUTDOWN_BUDGET,
-            send_heartbeat_with_retry(client, &engine_id, healthy),
+            send_heartbeat_with_retry(
+                client,
+                &engine_id,
+                healthy,
+                ownership_fence
+                    .as_ref()
+                    .expect("registration installed fence"),
+            ),
         )
         .await
         .context("engine readiness publication timed out")??;
@@ -615,6 +664,7 @@ async fn run_service(config_path: &str) -> Result<()> {
                 shutdown_deadline,
                 client.deregister_engine(DeregisterEngineRequest {
                     engine_id: engine_id.clone(),
+                    fence: ownership_fence.clone(),
                 }),
             )
             .await;
@@ -635,6 +685,10 @@ async fn run_service(config_path: &str) -> Result<()> {
         let heartbeat_engine_id = engine_id.clone();
         let heartbeat_registry = registry.clone();
         let heartbeat_modules = config.modules.clone();
+        let heartbeat_fence = ownership_fence
+            .clone()
+            .expect("startup installed ownership fence");
+        let heartbeat_policy = Arc::clone(&policy_state);
         let lifecycle_handle = lifecycle.snapshot();
         tasks.spawn("engine-heartbeat", move |mut cancellation| async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3));
@@ -649,11 +703,52 @@ async fn run_service(config_path: &str) -> Result<()> {
                 let healthy =
                     collect_healthy_module_descriptors(&heartbeat_registry, &heartbeat_modules)
                         .await;
-                if let Err(error) =
-                    send_heartbeat_with_retry(&mut heartbeat_client, &heartbeat_engine_id, healthy)
-                        .await
+                match send_heartbeat_with_retry(
+                    &mut heartbeat_client,
+                    &heartbeat_engine_id,
+                    healthy,
+                    &heartbeat_fence,
+                )
+                .await
                 {
-                    warn!(%error, "engine heartbeat failed after retries");
+                    Ok(response) if response.accepted_fence.as_ref() == Some(&heartbeat_fence) => {
+                        let decoded =
+                            WorkloadSnapshotV1::decode(response.serialized_snapshot.as_slice());
+                        let mut state = heartbeat_policy.lock().await;
+                        match decoded {
+                            Ok(envelope) => wr_common::snapshot_consumer::consume(
+                                &mut state,
+                                Ok(&response.serialized_snapshot),
+                                &envelope.cluster_id,
+                                WorkloadProjectionKind::EngineJobAdminV1,
+                                std::time::SystemTime::now(),
+                                std::time::Instant::now(),
+                                true,
+                            ),
+                            Err(error) => wr_common::snapshot_consumer::consume(
+                                &mut state,
+                                Err(error.to_string()),
+                                "",
+                                WorkloadProjectionKind::EngineJobAdminV1,
+                                std::time::SystemTime::now(),
+                                std::time::Instant::now(),
+                                true,
+                            ),
+                        }
+                    }
+                    Ok(_) => {
+                        let mut state = heartbeat_policy.lock().await;
+                        wr_common::snapshot_consumer::consume(
+                            &mut state,
+                            Err("heartbeat ownership fence mismatch".into()),
+                            "",
+                            WorkloadProjectionKind::EngineJobAdminV1,
+                            std::time::SystemTime::now(),
+                            std::time::Instant::now(),
+                            false,
+                        )
+                    }
+                    Err(error) => warn!(%error,"engine heartbeat failed after retries"),
                 }
             }
         });
@@ -691,6 +786,9 @@ async fn run_service(config_path: &str) -> Result<()> {
         job_admin_ready: &job_admin_ready,
         client: &mut client,
         engine_id: &engine_id,
+        fence: ownership_fence
+            .as_ref()
+            .expect("startup installed ownership fence"),
         tasks: &mut tasks,
     };
     if let Err(shutdown_error) = run_engine_shutdown(&mut shutdown, drain_deadline).await {

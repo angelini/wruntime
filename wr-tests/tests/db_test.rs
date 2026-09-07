@@ -21,10 +21,6 @@ fn test_engine_config_database_section_parses() {
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
         peer_address    = "https://127.0.0.1:9443"
-        [node.tls]
-        cert_path    = "c.crt"
-        key_path     = "c.key"
-        ca_cert_path = "ca.crt"
         [database]
         url             = "postgres://user:pass@localhost:5432/mydb"
         max_connections = 4
@@ -44,10 +40,6 @@ fn test_engine_config_database_max_connections_default() {
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
         peer_address    = "https://127.0.0.1:9443"
-        [node.tls]
-        cert_path    = "c.crt"
-        key_path     = "c.key"
-        ca_cert_path = "ca.crt"
         [database]
         url = "postgres://user:pass@localhost:5432/mydb"
     "#;
@@ -67,10 +59,6 @@ fn test_engine_config_module_database_flag_parses() {
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
         peer_address    = "https://127.0.0.1:9443"
-        [node.tls]
-        cert_path    = "c.crt"
-        key_path     = "c.key"
-        ca_cert_path = "ca.crt"
         [database]
         url = "postgres://user:pass@localhost:5432/mydb"
         [[module]]
@@ -98,10 +86,6 @@ fn test_engine_config_module_database_flag_defaults_to_false() {
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
         peer_address    = "https://127.0.0.1:9443"
-        [node.tls]
-        cert_path    = "c.crt"
-        key_path     = "c.key"
-        ca_cert_path = "ca.crt"
         [[module]]
         name        = "svc"
         namespace   = "my-ns"

@@ -307,92 +307,15 @@ wr-cli node deploy --node-id node-a node-a.tar.gz deploy@10.0.1.50 \
     --manager https://10.0.1.1:9000
 ```
 
-## Disposable first-deployment and two-manager acceptance
+## Manager-set deployment
 
-Use this procedure only with disposable hosts, database, and CA. It exercises a failed first start, a systemd manager, a Docker manager, a non-default certificate directory, and cross-seed identity/address convergence.
+Use one replay-stable TOML manifest with `wr-cli managers deploy-set --manifest <path>`. It names the caller operation UUID, executor UUID, cluster, existing endpoint (omitted only for pristine bootstrap), exact target policy file, deployment certificate set, complete source and target manager/host sets, and every executable/image, backend-spec, config, credential, and selector digest. Target entries use either a local systemd binary with its SHA-256 or an immutable Compose `name@sha256:...` image. The CLI validates all local bytes and reruns the shared policy/deployment-identity validator before contacting a host.
 
-1. Provision clean Linux hosts `${HOST_A}` and `${HOST_B}` plus an empty shared PostgreSQL database `${DB_URL}` reachable from both. Host A must use systemd; Host B must have Docker Compose. Configure passwordless sudo. Allow runtime manager gRPC TCP port 9000 and operator-admin TCP port 9020 from the operator network. Resolve routable addresses `${IP_A}` and `${IP_B}`. Use the same bundle, database, manager lease thresholds, secret key, and trust roots on both hosts.
-2. Generate a disposable CA and host certificates in a deliberately non-default directory. The certificate SAN must cover the IP used by deploy's readiness poll:
+Systemd binaries are retained at `/opt/wruntime/manager-artifacts/binaries/<sha256>/wr-manager`; Compose images are pulled and inspected by repo digest. Backend specs are also digest-qualified. During `STAGING`, config is only owner-readable `next.tmp`, credential sets remain immutable below `/etc/wruntime/pki`, and the target descriptor remains unselected. A spontaneous restart therefore uses the source descriptor. `FAILED_PRE_CLOSE` changes no active selector.
 
-   ```bash
-   export CERT_DIR="$PWD/disposable-manager-certs"
-   wr-cli cert init-ca --output "$CERT_DIR"
-   wr-cli cert generate "${HOST_A}" --ca-dir "$CERT_DIR" --ip "${IP_A}"
-   wr-cli cert generate "${HOST_B}" --ca-dir "$CERT_DIR" --ip "${IP_B}"
-   wr-cli cert init-ca --output "$CERT_DIR/job-admin-operator"
-   wr-cli cert generate "${HOST_A}" --ca-dir "$CERT_DIR/job-admin-operator" --ip "${IP_A}"
-   wr-cli cert generate "${HOST_B}" --ca-dir "$CERT_DIR/job-admin-operator" --ip "${IP_B}"
-   wr-cli cert generate operator --ca-dir "$CERT_DIR/job-admin-operator"
-   wr-cli cert init-ca --output "$CERT_DIR/job-admin-delegation"
-   wr-cli cert generate manager --ca-dir "$CERT_DIR/job-admin-delegation"
-   # Database-enabled nodes additionally need one host/SAN certificate from
-   # this delegation CA for each advertised engine-admin address.
-   ```
+After the manager reports `OLD_CLOSED`, the fenced host action stops/masks the source, maintains only `current.toml` and `previous.toml`, and atomically replaces `/var/lib/wruntime/manager-activation/current-activation.json`. The stable launcher verifies executable/image, backend-spec, config, and credential digests before start. Host evidence is fsynced below `/var/lib/wruntime/manager-rollouts/<rollout-id>/`; stale epochs and conflicting action replay fail closed. Multi-manager execution retains a closed control endpoint. A sole-manager action is bounded to 120 seconds and cannot open admission or advance rollout; failure requires explicit repair and a higher-generation recovery rollout. There is no automatic rollback or generic artifact cleanup.
 
-3. Build one reusable manager bundle:
-
-   ```bash
-   wr-cli managers bundle \
-     --manager-config examples/config/manager.toml \
-     --output manager.tar.gz
-   ```
-
-4. On a throwaway snapshot or third disposable host, deploy with an unreachable `${BAD_DB_URL}` and capture the status. Acceptance requires a non-zero lifecycle wait with last typed evidence and the bounded startup-log dump. Reset that host/snapshot and the database before continuing:
-
-   ```bash
-   if wr-cli managers deploy manager.tar.gz "${USER}@${HOST_A}" \
-     --format systemd --db-url "${BAD_DB_URL}" --secret-key "${SECRET_KEY}" \
-     --advertise-address "https://${IP_A}:9000" --cert-dir "$CERT_DIR"; then
-     echo "invalid deployment unexpectedly succeeded" >&2
-     exit 1
-   else
-     status=$?
-   fi
-   test "$status" -ne 0
-   ```
-
-5. Deploy the first manager on Host A. Deployment explicitly restarts the systemd service (or force-recreates the Compose container). Zero is valid only after output reports the replacement process instance `READY` at Host A's lifecycle endpoint; when a prior instance was observable, the new ID must differ:
-
-   ```bash
-   wr-cli managers deploy manager.tar.gz "${USER}@${HOST_A}" \
-     --format systemd --db-url "${DB_URL}" --secret-key "${SECRET_KEY}" \
-     --advertise-address "https://${IP_A}:9000" --cert-dir "$CERT_DIR"
-   ```
-
-6. Query Host A and record `${MANAGER_A_ID}` from the exact ID/address pair:
-
-   ```bash
-   wr-cli --manager "https://${IP_A}:9000" \
-     --ca-cert "$CERT_DIR/ca.crt" \
-     --client-cert "$CERT_DIR/${HOST_A}.crt" \
-     --client-key "$CERT_DIR/${HOST_A}.key" managers list
-   ```
-
-7. Deploy the same bundle to Host B with Docker and the same database, cluster, secret, and CA. Manager A cannot satisfy this process-local readiness gate; success must report Host B's newly observed process instance `READY`:
-
-   ```bash
-   wr-cli managers deploy manager.tar.gz "${USER}@${HOST_B}" \
-     --format docker --db-url "${DB_URL}" --secret-key "${SECRET_KEY}" \
-     --advertise-address "https://${IP_B}:9000" --cert-dir "$CERT_DIR"
-   ```
-
-8. Query through both seeds. Each result must contain exactly `${MANAGER_A_ID}` at `https://${IP_A}:9000` and `${MANAGER_B_ID}` at `https://${IP_B}:9000`:
-
-   ```bash
-   wr-cli --manager "https://${IP_A}:9000" \
-     --ca-cert "$CERT_DIR/ca.crt" \
-     --client-cert "$CERT_DIR/${HOST_A}.crt" \
-     --client-key "$CERT_DIR/${HOST_A}.key" managers list
-
-   wr-cli --manager "https://${IP_B}:9000" \
-     --ca-cert "$CERT_DIR/ca.crt" \
-     --client-cert "$CERT_DIR/${HOST_B}.crt" \
-     --client-key "$CERT_DIR/${HOST_B}.key" managers list
-   ```
-
-   `cluster status --detail` is optional additional evidence; it is not the deploy readiness contract.
-
-9. Retain CLI transcripts and remote service/container logs, then destroy both hosts, drop the disposable database, and delete the disposable CA. Reverse the backend assignment when release qualification requires Docker coverage for the first manager itself.
+Qualification must exercise both systemd and Compose, including spontaneous restart during staging, exact selector equality on pre-close failure, digest refusal, target `READY_CLOSED`, complete fleet activation, and protected file inspection.
 
 ## Docker deployment
 
@@ -410,36 +333,9 @@ Docker deployments use Linux host networking so proxy/engine loopback trust boun
 
 ## TLS certificates
 
-Manager runtime gRPC, the dedicated manager operator-admin listener, cross-node peer-proxy traffic, and manager-to-engine job administration use mTLS. Local engine-to-proxy data-plane and control-plane traffic use plain HTTP on loopback listeners. Manager liveness is the PostgreSQL lease and adds no network listener. Job administration deliberately uses two dedicated trust roots in addition to the runtime CA: the manager job-admin listener accepts only operator-admin CA clients, while engine listeners authorize every client certificate issued by the delegation CA. Issue that CA only to manager delegation identities; never cross-issue runtime, operator-admin, or delegation credentials.
+Manager gRPC, peer-proxy traffic, and manager-to-engine job administration use mTLS; loopback engine/proxy traffic remains plain HTTP. Server and client roots are disjoint. Every client leaf has `clientAuth` plus exactly one project URI SAN (`urn:wruntime:<cluster>:<kind>:<name>`), and every server leaf has only `serverAuth` plus its endpoint SANs. A manager's workload leaf is distinct from its endpoint leaf.
 
-Generate certificates for all three mTLS trust domains before deployment:
-
-```bash
-# 1. Create a CA (once per cluster)
-wr-cli cert init-ca --output ./certs/
-
-# 2. Generate per-node certificates (hostname must match the deploy target IP)
-wr-cli cert generate 10.0.1.1 --ip 10.0.1.1 --ca-dir ./certs/    # manager
-wr-cli cert generate 10.0.1.50 --ip 10.0.1.50 --ca-dir ./certs/   # node A
-wr-cli cert generate 10.0.1.51 --ip 10.0.1.51 --ca-dir ./certs/   # node B
-
-# Separate operator-to-manager job-admin CA, server identity, and client.
-wr-cli cert init-ca --output ./certs/job-admin-operator/
-wr-cli cert generate 10.0.1.1 --ip 10.0.1.1 --ca-dir ./certs/job-admin-operator/
-wr-cli cert generate operator --ca-dir ./certs/job-admin-operator/
-
-# Separate manager-to-engine job-admin delegation CA.
-wr-cli cert init-ca --output ./certs/job-admin-delegation/
-wr-cli cert generate manager --ca-dir ./certs/job-admin-delegation/
-wr-cli cert generate 10.0.1.50 --ip 10.0.1.50 --ca-dir ./certs/job-admin-delegation/
-wr-cli cert generate 10.0.1.51 --ip 10.0.1.51 --ca-dir ./certs/job-admin-delegation/
-```
-
-During `managers deploy`, pass `--cert-dir <dir>` (or set `cert_dir` in `wr-deploy.toml`). The command provisions runtime `ca.crt`, `<host>.crt`, and `<host>.key` for the remote manager and uses those same local files explicitly for its readiness connection. It also requires and provisions `job-admin-operator/{ca.crt,<host>.crt,<host>.key}` as the dedicated listener's `manager.crt`/`manager.key`, plus `job-admin-delegation/{ca.crt,manager.crt,manager.key}` for delegation. Docker mounts the provisioned remote certificate directory read-only into the manager container. Operator client keys remain caller-owned and are never copied to managers.
-
-During `node deploy`, the same option stages files inside an inactive revision release. Digest-covered release metadata supplies per-slot config and lifecycle mapping; the agent later changes only the manager-authorized slot selectors. Resolved releases remain root-owned and non-writable by workload services; private keys use mode `0640` and are assigned to the configured workload group. If any bundled engine has `[job_admin]`, deploy additionally requires `job-admin-delegation/{ca.crt,<host>.crt,<host>.key}` and installs them under the release-relative `certs/job-admin-delegation/` directory as `ca.crt`, `node.crt`, and `node.key`.
-
-For local development, run `just certs` to generate the runtime, operator-admin, and delegation CAs plus localhost certificates. Permit ordinary runtime clients to reach manager TCP 9000, permit operator clients to reach only the dedicated manager job-admin TCP port (9020 in maintained examples), permit managers to reach every advertised engine job-admin TCP port (9150/9151 in maintained local examples), and deny engine admin ports from general operator/client networks. Queue IDs are deployment invariants: replicas sharing one database use one ID; different databases use different IDs. Rotate all three trust domains independently, keeping overlap in the appropriate root only.
+Production roots are installed under `/etc/wruntime/pki/roots/`. Immutable credential sets are installed owner-only under `/etc/wruntime/pki/<service-or-slot>/sets/<version>`; private keys and runtime config never live in a release or image. Generate roots and profile leaves with `wr-cli cert init-root` and `wr-cli cert issue`, and validate an uncertain installation with `wr-cli cert verify`. Authorization and revocation use the leaf SHA-256 fingerprint recorded in immutable set metadata. Job access uses the same manager endpoint and policy; there is no operator-admin listener, delegation persona, or CA-wide capability.
 
 ## Remote host requirements
 

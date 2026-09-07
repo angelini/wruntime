@@ -5,8 +5,6 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use tokio_retry::strategy::FixedInterval;
-use tokio_retry::Retry;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
@@ -14,10 +12,11 @@ use wr_common::discovery::ManagerDiscovery;
 use wr_common::process_lifecycle::LifecycleSnapshotHandle;
 use wr_common::task_group::{TaskCancellation, TaskExit};
 use wr_common::wruntime::{
-    node_service_server::NodeService, BeginEngineDrainRequest, BeginEngineDrainResponse,
-    DeregisterEngineRequest, DeregisterEngineResponse, GetProxyRoutingStatusRequest,
-    GetProxyRoutingStatusResponse, HeartbeatRequest, HeartbeatResponse, ModuleDescriptor,
-    RegisterEngineRequest, RegisterEngineResponse,
+    proxy_node_control_service_server::ProxyNodeControlService, BeginEngineDrainRequest,
+    BeginEngineDrainResponse, DeregisterEngineRequest, DeregisterEngineResponse,
+    EngineOwnershipFence, GetProxyRoutingStatusRequest, GetProxyRoutingStatusResponse,
+    HeartbeatRequest, HeartbeatResponse, ModuleDescriptor, RegisterEngineRequest,
+    RegisterEngineResponse,
 };
 
 use crate::routing::{self, CachedRoutingTable};
@@ -33,13 +32,16 @@ enum EnginePhase {
 }
 
 struct EngineState {
-    generation: u64,
+    engine_id: String,
+    fence: Option<EngineOwnershipFence>,
     healthy_modules: Vec<ModuleDescriptor>,
+    serialized_snapshot: Vec<u8>,
     phase: EnginePhase,
 }
 
 struct EngineSlotState {
     state: Mutex<EngineState>,
+    manager_epoch: Mutex<Option<wr_common::manager_client::ManagerEpoch>>,
     forward: Mutex<()>,
 }
 
@@ -85,15 +87,13 @@ impl NodeAgent {
     async fn flush_heartbeats(self: &Arc<Self>) {
         let engines = {
             let engines = self.engines.lock().await;
-            engines
-                .iter()
-                .map(|(engine_id, state)| (engine_id.clone(), Arc::clone(state)))
-                .collect::<Vec<_>>()
+            engines.values().map(Arc::clone).collect::<Vec<_>>()
         };
         let mut forwards = JoinSet::new();
-        for (engine_id, state) in engines {
+        for state in engines {
             let agent = Arc::clone(self);
             forwards.spawn(async move {
+                let engine_id = state.state.lock().await.engine_id.clone();
                 agent.flush_engine_heartbeat(engine_id, state).await;
             });
         }
@@ -105,72 +105,129 @@ impl NodeAgent {
     }
 
     async fn flush_engine_heartbeat(&self, engine_id: String, slot: EngineSlot) {
-        let (generation, request) = {
+        let (fence, request) = {
             let state = slot.state.lock().await;
             if state.phase != EnginePhase::Ready {
                 return;
             }
+            let Some(fence) = state.fence.clone() else {
+                return;
+            };
             (
-                state.generation,
+                fence.clone(),
                 HeartbeatRequest {
                     engine_id: engine_id.clone(),
                     healthy_modules: state.healthy_modules.clone(),
+                    fence: Some(fence),
                 },
             )
         };
 
         let _forward = slot.forward.lock().await;
         let state = slot.state.lock().await;
-        if state.phase != EnginePhase::Ready || state.generation != generation {
+        if state.phase != EnginePhase::Ready || state.fence.as_ref() != Some(&fence) {
             return;
         }
-        let strategy = FixedInterval::from_millis(50).take(2);
-        let result = Retry::start(strategy, || {
-            let discovery = Arc::clone(&self.discovery);
-            let request = request.clone();
-            async move {
-                let mut client = discovery.get_client().await?;
-                client.heartbeat(request).await
+        let mut retained = slot.manager_epoch.lock().await;
+        if retained.is_none() {
+            *retained = self
+                .discovery
+                .pin(wr_common::manager_client::RetryClass::FreshRegistration)
+                .await
+                .ok();
+        }
+        let Some(epoch) = retained.as_mut() else {
+            warn!(
+                engine_id,
+                generation = fence.slot_generation,
+                "heartbeat forward could not pin a manager epoch"
+            );
+            return;
+        };
+        let response = match epoch.heartbeat(request.clone()).await {
+            Ok(response) => Some(response.into_inner()),
+            Err(error) if routing::is_transport_failure(&error) => {
+                match self.discovery.repin(epoch).await {
+                    Ok(replacement) => {
+                        *epoch = replacement;
+                        match epoch.heartbeat(request).await {
+                            Ok(response) => Some(response.into_inner()),
+                            Err(retry_error) => {
+                                warn!(engine_id,generation=fence.slot_generation,%retry_error,"heartbeat replay failed after deterministic repin");
+                                None
+                            }
+                        }
+                    }
+                    Err(repin_error) => {
+                        warn!(engine_id,generation=fence.slot_generation,%repin_error,"heartbeat forward could not repin manager epoch");
+                        None
+                    }
+                }
             }
-        })
-        .await;
-        if let Err(error) = result {
-            warn!(engine_id, generation, %error, "heartbeat forward failed after retries");
-            self.discovery.clear_affinity().await;
+            Err(error) => {
+                warn!(engine_id,generation=fence.slot_generation,%error,"heartbeat forward failed");
+                None
+            }
+        };
+        if let Some(response) = response {
+            if response.accepted_fence.as_ref() == Some(&fence) {
+                drop(state);
+                let mut state = slot.state.lock().await;
+                if state.fence.as_ref() == Some(&fence) {
+                    state.serialized_snapshot = response.serialized_snapshot;
+                }
+            }
         }
     }
 
     async fn engine_slot(&self, engine_id: &str) -> Result<EngineSlot, Status> {
-        self.engines
+        let slots = self
+            .engines
             .lock()
             .await
-            .get(engine_id)
+            .values()
             .cloned()
-            .ok_or_else(|| Status::not_found("engine is not registered with this proxy"))
+            .collect::<Vec<_>>();
+        for slot in slots {
+            if slot.state.lock().await.engine_id == engine_id {
+                return Ok(slot);
+            }
+        }
+        Err(Status::not_found(
+            "engine is not registered with this proxy",
+        ))
     }
 
-    async fn engine_slot_or_insert(&self, engine_id: &str) -> EngineSlot {
+    async fn engine_slot_or_insert(&self, slot_key: &str) -> EngineSlot {
         Arc::clone(
             self.engines
                 .lock()
                 .await
-                .entry(engine_id.to_string())
+                .entry(slot_key.to_string())
                 .or_insert_with(|| {
                     Arc::new(EngineSlotState {
                         state: Mutex::new(EngineState {
-                            generation: 0,
+                            engine_id: String::new(),
+                            fence: None,
                             healthy_modules: Vec::new(),
+                            serialized_snapshot: Vec::new(),
                             phase: EnginePhase::Tombstoned,
                         }),
+                        manager_epoch: Mutex::new(None),
                         forward: Mutex::new(()),
                     })
                 }),
         )
     }
 
-    async fn converge(&self, manager_version: u64) -> Result<u64, Status> {
+    async fn converge(
+        &self,
+        epoch: &mut wr_common::manager_client::ManagerEpoch,
+        manager_version: u64,
+    ) -> Result<u64, Status> {
         routing::converge_to_version(
             &self.discovery,
+            epoch,
             &self.routing,
             manager_version,
             Instant::now() + CONVERGENCE_BUDGET,
@@ -180,7 +237,7 @@ impl NodeAgent {
 }
 
 #[tonic::async_trait]
-impl NodeService for NodeAgent {
+impl ProxyNodeControlService for NodeAgent {
     async fn get_proxy_routing_status(
         &self,
         _request: Request<GetProxyRoutingStatusRequest>,
@@ -201,20 +258,64 @@ impl NodeService for NodeAgent {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("registration is required"))?;
         let engine_id = registration.engine_id.clone();
+        let activation_id = request.activation_id.clone();
+        let metadata = registration.deployment.clone().ok_or_else(|| {
+            Status::failed_precondition("managed deployment metadata is required")
+        })?;
 
-        let slot = self.engine_slot_or_insert(&engine_id).await;
+        let slot_key = format!("{}/{}", metadata.node_id, metadata.engine_slot);
+        let slot = self.engine_slot_or_insert(&slot_key).await;
         let _forward = slot.forward.lock().await;
         let mut state = slot.state.lock().await;
-        let generation = state.generation.saturating_add(1);
-        let mut client = self.discovery.get_client().await?;
-        let response = client.register_engine(request).await?.into_inner();
+        let mut epoch = self
+            .discovery
+            .pin(wr_common::manager_client::RetryClass::FreshRegistration)
+            .await?;
+        let response = match epoch.register_engine(request.clone()).await {
+            Ok(response) => response,
+            Err(error) if routing::is_transport_failure(&error) => {
+                epoch = self.discovery.repin(&epoch).await?;
+                epoch.register_engine(request).await?
+            }
+            Err(error) => return Err(error),
+        }
+        .into_inner();
+        let fence = response.fence.clone().ok_or_else(|| {
+            Status::data_loss("manager registration response omitted ownership fence")
+        })?;
+        if fence.node_id != metadata.node_id
+            || fence.slot != metadata.engine_slot
+            || fence.revision_digest != metadata.revision_digest
+            || fence.activation_id != activation_id
+            || fence.slot_generation == 0
+        {
+            return Err(Status::permission_denied(
+                "manager returned a mismatched ownership fence",
+            ));
+        }
+        if let Some(current) = state.fence.as_ref() {
+            if fence.slot_generation < current.slot_generation
+                || (fence.slot_generation == current.slot_generation && fence != *current)
+            {
+                return Err(Status::permission_denied(
+                    "manager returned stale ownership generation",
+                ));
+            }
+        }
+        *slot.manager_epoch.lock().await = Some(epoch);
         *state = EngineState {
-            generation,
+            engine_id: engine_id.clone(),
+            fence: Some(fence.clone()),
             healthy_modules: Vec::new(),
+            serialized_snapshot: response.serialized_snapshot.clone(),
             phase: EnginePhase::Registered,
         };
 
-        info!(engine_id, generation, "engine registered via proxy");
+        info!(
+            engine_id,
+            generation = fence.slot_generation,
+            "engine registered via proxy"
+        );
         Ok(Response::new(response))
     }
 
@@ -224,16 +325,28 @@ impl NodeService for NodeAgent {
     ) -> Result<Response<DeregisterEngineResponse>, Status> {
         let request = request.into_inner();
         let engine_id = request.engine_id.clone();
-        let slot = self.engine_slot_or_insert(&engine_id).await;
+        let slot = self.engine_slot(&engine_id).await?;
         let _forward = slot.forward.lock().await;
         let mut state = slot.state.lock().await;
-        state.generation = state.generation.saturating_add(1);
+        let expected = state
+            .fence
+            .as_ref()
+            .ok_or_else(|| Status::permission_denied("engine has no ownership fence"))?;
+        if request.fence.as_ref() != Some(expected) {
+            return Err(Status::permission_denied(
+                "ownership fence does not match proxy cache",
+            ));
+        }
+        let generation = expected.slot_generation;
         state.healthy_modules.clear();
         state.phase = EnginePhase::Tombstoned;
-        let generation = state.generation;
 
-        let mut client = self.discovery.get_client().await?;
-        let response = client.deregister_engine(request).await?.into_inner();
+        let mut epoch = self
+            .discovery
+            .pin(wr_common::manager_client::RetryClass::NoReplayMutation)
+            .await?;
+        let response = epoch.deregister_engine(request).await?.into_inner();
+        *slot.manager_epoch.lock().await = None;
         info!(engine_id, generation, "engine deregistered via proxy");
         Ok(Response::new(response))
     }
@@ -250,23 +363,47 @@ impl NodeService for NodeAgent {
         if matches!(state.phase, EnginePhase::Draining | EnginePhase::Tombstoned) {
             return Err(Status::failed_precondition("engine is draining"));
         }
-        state.generation = state.generation.saturating_add(1);
+        if request.fence.as_ref() != state.fence.as_ref() {
+            return Err(Status::permission_denied(
+                "ownership fence does not match proxy cache",
+            ));
+        }
         state.healthy_modules = request.healthy_modules.clone();
 
         if state.phase == EnginePhase::Ready {
             return Ok(Response::new(HeartbeatResponse {
                 manager_routing_table_version: 0,
                 proxy_routing_table_version: self.routing.version().await,
+                accepted_fence: state.fence.clone(),
+                serialized_snapshot: state.serialized_snapshot.clone(),
             }));
         }
 
-        let mut client = self.discovery.get_client().await?;
-        let manager_version = client
-            .heartbeat(request)
-            .await?
-            .into_inner()
-            .manager_routing_table_version;
-        let proxy_version = self.converge(manager_version).await?;
+        let mut retained = slot.manager_epoch.lock().await;
+        if retained.is_none() {
+            *retained = Some(
+                self.discovery
+                    .pin(wr_common::manager_client::RetryClass::FreshRegistration)
+                    .await?,
+            );
+        }
+        let epoch = retained.as_mut().expect("manager epoch was installed");
+        let response = match epoch.heartbeat(request.clone()).await {
+            Ok(response) => response,
+            Err(error) if routing::is_transport_failure(&error) => {
+                *epoch = self.discovery.repin(epoch).await?;
+                epoch.heartbeat(request).await?
+            }
+            Err(error) => return Err(error),
+        };
+        let manager_response = response.into_inner();
+        if manager_response.accepted_fence.as_ref() != state.fence.as_ref() {
+            return Err(Status::permission_denied(
+                "manager heartbeat fence does not match proxy cache",
+            ));
+        }
+        let manager_version = manager_response.manager_routing_table_version;
+        let proxy_version = self.converge(epoch, manager_version).await?;
         state.phase = EnginePhase::Ready;
         info!(
             engine_id,
@@ -275,6 +412,8 @@ impl NodeService for NodeAgent {
         Ok(Response::new(HeartbeatResponse {
             manager_routing_table_version: manager_version,
             proxy_routing_table_version: proxy_version,
+            accepted_fence: state.fence.clone(),
+            serialized_snapshot: manager_response.serialized_snapshot,
         }))
     }
 
@@ -290,18 +429,35 @@ impl NodeService for NodeAgent {
         if state.phase == EnginePhase::Tombstoned {
             return Err(Status::failed_precondition("engine is deregistered"));
         }
-        state.generation = state.generation.saturating_add(1);
+        if request.fence.as_ref() != state.fence.as_ref() {
+            return Err(Status::permission_denied(
+                "ownership fence does not match proxy cache",
+            ));
+        }
         state.healthy_modules.clear();
         state.phase = EnginePhase::Draining;
-        let generation = state.generation;
+        let generation = state
+            .fence
+            .as_ref()
+            .expect("registered fence")
+            .slot_generation;
 
-        let mut client = self.discovery.get_client().await?;
-        let manager_version = client
+        let mut epoch = self
+            .discovery
+            .pin(wr_common::manager_client::RetryClass::NoReplayMutation)
+            .await?;
+        let manager_version = epoch
             .begin_engine_drain(request)
             .await?
             .into_inner()
             .manager_routing_table_version;
-        let proxy_version = self.converge(manager_version).await?;
+        let mut convergence_epoch = self
+            .discovery
+            .pin(wr_common::manager_client::RetryClass::ReadOnly)
+            .await?;
+        let proxy_version = self
+            .converge(&mut convergence_epoch, manager_version)
+            .await?;
         info!(
             engine_id,
             generation, manager_version, proxy_version, "engine drain converged"
@@ -309,6 +465,18 @@ impl NodeService for NodeAgent {
         Ok(Response::new(BeginEngineDrainResponse {
             manager_routing_table_version: manager_version,
             proxy_routing_table_version: proxy_version,
+            accepted_fence: state.fence.clone(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod workflow_class_tests {
+    #[test]
+    fn proxy_manager_workflows_declare_safe_retry_classes() {
+        let source = include_str!("node_service.rs");
+        assert!(source.contains("RetryClass::FreshRegistration"));
+        assert!(source.contains("RetryClass::NoReplayMutation"));
+        assert!(!source.contains(concat!("get_", "client()")));
     }
 }

@@ -1,0 +1,36 @@
+schema_version = 1
+generation = 1
+cluster_id = "default"
+proxy_enrollments = [
+  { principal = "urn:wruntime:default:proxy:proxy-a", node_id = "node-a" },
+]
+node_agent_enrollments = [
+  { principal = "urn:wruntime:default:node-agent:node-a", node_id = "node-a" },
+]
+revoked_leaf_fingerprints = []
+
+[[principals]]
+uri  = "urn:wruntime:default:human:deployer"
+kind = "human"
+
+[[principals]]
+uri  = "urn:wruntime:default:manager:manager-a"
+kind = "manager"
+
+[[principals]]
+uri  = "urn:wruntime:default:proxy:proxy-a"
+kind = "proxy"
+
+[[principals]]
+uri  = "urn:wruntime:default:node-agent:node-a"
+kind = "node-agent"
+
+[[assignments]]
+principal = "urn:wruntime:default:human:deployer"
+role      = "admin"
+[assignments.scope]
+
+[[manager_enrollments]]
+principal  = "urn:wruntime:default:manager:manager-a"
+manager_id = "manager-a"
+endpoint   = "https://127.0.0.1:9000"

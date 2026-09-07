@@ -19,7 +19,12 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
                     AND to_regclass('wr_node_agent_policies') IS NOT NULL
                     AND to_regclass('wr_node_agent_attestations') IS NOT NULL
                     AND to_regclass('wr_node_operation_result_receipts') IS NOT NULL
-                    AND to_regclass('wr_node_release_deletions') IS NOT NULL",
+                    AND to_regclass('wr_node_release_deletions') IS NOT NULL
+                    AND to_regclass('wr_manager_rollouts') IS NOT NULL
+                    AND to_regclass('wr_manager_rollout_guard') IS NOT NULL
+                    AND to_regclass('wr_manager_rollout_members') IS NOT NULL
+                    AND to_regclass('wr_manager_rollout_events') IS NOT NULL
+                    AND to_regclass('wr_node_slot_owners') IS NOT NULL",
             &[],
         )
         .await?
@@ -97,6 +102,25 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema()
                   AND table_name = 'wr_engines' AND column_name = 'job_admin_address'
+            ) AND EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_engines' AND column_name = 'slot_generation'
+                  AND data_type = 'bytea'
+            ) AND EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_node_deployments' AND column_name = 'revision_digest'
+                  AND is_nullable = 'NO'
+            ) AND EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_manager_rollout_members'
+                  AND column_name = 'expected_credential_digest'
+            ) AND EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_managers' AND column_name = 'policy_generation'
             ) AND to_regclass('idx_wr_engines_job_admin_delegates') IS NOT NULL",
             &[],
         )

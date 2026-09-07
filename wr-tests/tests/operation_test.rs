@@ -5,12 +5,13 @@ use helpers::db::manager_pool;
 use tonic::Code;
 use uuid::Uuid;
 use wr_common::wruntime::{
-    BackendProcessState, BeginDeploymentRequest, CleanupReleaseEvidence, DeploymentMetadata,
-    DeploymentRecord, EngineRegistration, ExpectedEngine, FinalizeDeploymentRequest,
-    InstructionTargetKind, LifecycleStatus, ModuleDescriptor, ModuleIdentity, NodeOperationAction,
-    NodeOperationPhase, NodeOperationState, NodeOperationStepKind, ProcessLifecycleState,
-    ReleaseInventoryEntry, ReportNodeObservationRequest, ReportStepResultRequest, RolloutPolicy,
-    ServiceKind, SubmitOperationRequest,
+    BackendProcessState, BeginDeploymentRequest, CleanupReleaseEvidence, DeploymentInventoryV1,
+    DeploymentMetadata, DeploymentRecord, EngineOwnershipFence, EngineRegistration, ExpectedEngine,
+    ExpectedModule, FinalizeDeploymentRequest, InstructionTargetKind, LifecycleStatus,
+    ModuleDescriptor, ModuleIdentity, NodeOperationAction, NodeOperationPhase, NodeOperationState,
+    NodeOperationStepKind, ProcessLifecycleState, ReleaseInventoryEntry,
+    ReportNodeObservationRequest, ReportStepResultRequest, RolloutPolicy, ServiceKind,
+    SubmitOperationRequest,
 };
 
 fn policy(deadline_seconds: u64) -> RolloutPolicy {
@@ -55,6 +56,11 @@ fn resolved_digest() -> String {
     format!("sha256:{}", "b".repeat(64))
 }
 
+fn test_secret_crypto() -> wr_manager::crypto::SecretCrypto {
+    let password = wr_manager::crypto::SecretCrypto::generate_random_password();
+    wr_manager::crypto::SecretCrypto::from_hex(&password).expect("test secret crypto")
+}
+
 async fn stage(
     pool: &deadpool_postgres::Pool,
     node_id: &str,
@@ -68,13 +74,17 @@ async fn stage(
             node_id: node_id.into(),
             attempt_token: token.into(),
             bundle_digest: digest.into(),
-            expected_engines: slots
-                .iter()
-                .map(|slot| ExpectedEngine {
-                    engine_slot: (*slot).into(),
-                    modules: vec![],
-                })
-                .collect(),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: slots
+                    .iter()
+                    .map(|slot| ExpectedEngine {
+                        engine_slot: (*slot).into(),
+                        modules: vec![],
+                        ..Default::default()
+                    })
+                    .collect(),
+            }),
         },
         "operator-a",
     )
@@ -151,13 +161,22 @@ async fn stage_with_module(
             node_id: node_id.into(),
             attempt_token: token.into(),
             bundle_digest: digest.into(),
-            expected_engines: slots
-                .iter()
-                .map(|slot| ExpectedEngine {
-                    engine_slot: (*slot).into(),
-                    modules: vec![module_identity()],
-                })
-                .collect(),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: slots
+                    .iter()
+                    .map(|slot| ExpectedEngine {
+                        engine_slot: (*slot).into(),
+                        modules: vec![ExpectedModule {
+                            identity: Some(module_identity()),
+                            proto_schema_digest: wr_common::deployment_contract::schema_digest(
+                                &module_descriptor().proto_schema,
+                            ),
+                        }],
+                        ..Default::default()
+                    })
+                    .collect(),
+            }),
         },
         "operator-a",
     )
@@ -180,15 +199,126 @@ async fn stage_with_module(
     .record
 }
 
+async fn submit_deployment_operation(
+    pool: &deadpool_postgres::Pool,
+    deployment: &DeploymentRecord,
+) -> Result<String> {
+    let current_revision: i64 = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT current_revision FROM wr_nodes WHERE node_id = $1",
+            &[&deployment.node_id],
+        )
+        .await?
+        .get(0);
+    let operation = wr_manager::operations::submit(
+        pool,
+        "operator-a",
+        &SubmitOperationRequest {
+            node_id: deployment.node_id.clone(),
+            request_token: deployment.attempt_token.clone(),
+            action: if current_revision == 0 {
+                NodeOperationAction::InitialApply as i32
+            } else {
+                NodeOperationAction::Scale as i32
+            },
+            engine_slots: deployment
+                .inventory
+                .as_ref()
+                .expect("deployment inventory")
+                .engines
+                .iter()
+                .map(|engine| engine.engine_slot.clone())
+                .collect(),
+            target_revision: deployment.revision,
+            bundle_digest: deployment.bundle_digest.clone(),
+            policy: Some(policy(300)),
+            resolved_release_digest: deployment.resolved_release_digest.clone(),
+        },
+    )
+    .await?;
+    Ok(operation.operation_id)
+}
+
+async fn finish_deployment_operation(
+    pool: &deadpool_postgres::Pool,
+    deployment: &DeploymentRecord,
+    operation_id: &str,
+) -> Result<()> {
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE wr_node_operations
+             SET state = 'succeeded', phase = 'complete', updated_at = NOW()
+             WHERE operation_id = $1",
+            &[&Uuid::parse_str(operation_id)?],
+        )
+        .await?;
+    wr_manager::db::complete_deployment(pool, &deployment.node_id, deployment.revision, true, "")
+        .await?;
+    Ok(())
+}
+
+async fn commit_deployment(
+    pool: &deadpool_postgres::Pool,
+    deployment: &DeploymentRecord,
+) -> Result<()> {
+    let operation_id = submit_deployment_operation(pool, deployment).await?;
+    finish_deployment_operation(pool, deployment, &operation_id).await
+}
+
+async fn commit_ready_deployment(
+    pool: &deadpool_postgres::Pool,
+    deployment: &DeploymentRecord,
+    engines: &[(&str, &str)],
+) -> Result<()> {
+    let operation_id = submit_deployment_operation(pool, deployment).await?;
+    let mut registrations = Vec::with_capacity(engines.len());
+    for (slot, engine_id) in engines {
+        let fence = register_ready(pool, deployment, slot, engine_id).await?;
+        registrations.push((*engine_id, fence));
+    }
+    finish_deployment_operation(pool, deployment, &operation_id).await?;
+    for (engine_id, fence) in registrations {
+        wr_manager::db::publish_engine_readiness(pool, engine_id, &[module_descriptor()], &fence)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn register_ready(
     pool: &deadpool_postgres::Pool,
     deployment: &DeploymentRecord,
     slot: &str,
     engine_id: &str,
-) -> Result<()> {
+) -> Result<EngineOwnershipFence> {
     let module = module_descriptor();
-    wr_manager::db::register_engine_and_routes(
+    let operation_id: uuid::Uuid = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT operation.operation_id
+             FROM wr_node_operations operation
+             JOIN wr_node_operation_slots slot
+               ON slot.operation_id = operation.operation_id
+              AND slot.engine_slot = $2
+             WHERE operation.node_id = $1
+               AND operation.state IN ('queued', 'running', 'paused')
+               AND (
+                 operation.target_revision = $3
+                 OR (operation.action = 'restart' AND slot.target_revision = $3)
+                 OR (operation.phase = 'restoring_source' AND slot.source_revision = $3)
+               )
+             ORDER BY operation.created_at DESC LIMIT 1",
+            &[&deployment.node_id, &slot, &(deployment.revision as i64)],
+        )
+        .await?
+        .get(0);
+    let activation_id = uuid::Uuid::new_v4().to_string();
+    let commit = wr_manager::db::register_engine_and_routes(
         pool,
+        &test_secret_crypto(),
         &EngineRegistration {
             engine_id: engine_id.into(),
             address: format!("http://127.0.0.1/{}", engine_id),
@@ -204,12 +334,49 @@ async fn register_ready(
                 revision: deployment.revision,
                 bundle_digest: deployment.bundle_digest.clone(),
                 engine_slot: slot.into(),
+                operation_id: operation_id.to_string(),
+                revision_digest: deployment.revision_digest.clone(),
             }),
         },
+        &activation_id,
     )
-    .await?;
-    wr_manager::db::publish_engine_readiness(pool, engine_id, &[module]).await?;
-    Ok(())
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "register {engine_id} for {} revision {}: {error}",
+            deployment.node_id,
+            deployment.revision
+        )
+    })?;
+    wr_manager::db::publish_engine_readiness(pool, engine_id, &[module], &commit.fence).await?;
+    Ok(commit.fence)
+}
+
+async fn engine_fence(
+    pool: &deadpool_postgres::Pool,
+    engine_id: &str,
+) -> Result<EngineOwnershipFence> {
+    let row = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT node_id, engine_slot, revision_digest, activation_id, slot_generation
+             FROM wr_node_slot_owners WHERE engine_id = $1",
+            &[&engine_id],
+        )
+        .await?;
+    let generation = row.get::<_, Vec<u8>>("slot_generation");
+    Ok(EngineOwnershipFence {
+        node_id: row.get("node_id"),
+        slot: row.get("engine_slot"),
+        revision_digest: row.get("revision_digest"),
+        activation_id: row.get::<_, uuid::Uuid>("activation_id").to_string(),
+        slot_generation: u64::from_be_bytes(
+            generation
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("stored slot generation must contain eight bytes"))?,
+        ),
+    })
 }
 
 async fn claim_instruction(
@@ -306,10 +473,14 @@ async fn allocation_to_submission_crash_boundaries_recover_one_actor_target_and_
         node_id: "crash-boundary-node".into(),
         attempt_token: "crash-boundary-token".into(),
         bundle_digest: digest.clone(),
-        expected_engines: vec![ExpectedEngine {
-            engine_slot: "blue".into(),
-            modules: vec![],
-        }],
+        inventory: Some(DeploymentInventoryV1 {
+            schema_version: 1,
+            engines: vec![ExpectedEngine {
+                engine_slot: "blue".into(),
+                modules: vec![],
+                ..Default::default()
+            }],
+        }),
     };
 
     // Crash immediately after allocation: the exact authenticated retry owns
@@ -449,8 +620,7 @@ async fn rolling_upgrade_proves_the_source_proxy_before_stop() -> Result<()> {
         &["blue"],
     )
     .await;
-    wr_manager::db::complete_deployment(&pool, "proxy-source-node", source.revision, true, "")
-        .await?;
+    commit_deployment(&pool, &source).await?;
     let target_digest = format!("sha256:{}", "8".repeat(64));
     let target = stage(
         &pool,
@@ -649,7 +819,7 @@ async fn rollback_supersedes_and_fences_committed_cleanup() -> Result<()> {
         &["blue"],
     )
     .await;
-    wr_manager::db::complete_deployment(&pool, "supersede-node", first.revision, true, "").await?;
+    commit_deployment(&pool, &first).await?;
 
     let second_digest = format!("sha256:{}", "4".repeat(64));
     let second = stage(
@@ -765,7 +935,7 @@ async fn scale_orders_new_then_retained_then_removed_slots_lexically() -> Result
         &["b-retained", "d-removed"],
     )
     .await;
-    wr_manager::db::complete_deployment(&pool, "scale-node", old.revision, true, "").await?;
+    commit_deployment(&pool, &old).await?;
 
     let new_digest = format!("sha256:{}", "2".repeat(64));
     let new = stage(
@@ -811,9 +981,12 @@ async fn drain_reaches_zero_authority_terminal_and_preserves_other_capacity() ->
     let digest = format!("sha256:{}", "a".repeat(64));
     let source =
         stage_with_module(&pool, "drain-node", "source", &digest, &["blue", "green"]).await;
-    wr_manager::db::complete_deployment(&pool, "drain-node", source.revision, true, "").await?;
-    register_ready(&pool, &source, "blue", "drain-blue").await?;
-    register_ready(&pool, &source, "green", "drain-green").await?;
+    commit_ready_deployment(
+        &pool,
+        &source,
+        &[("blue", "drain-blue"), ("green", "drain-green")],
+    )
+    .await?;
     let operation = wr_manager::operations::submit(
         &pool,
         "operator-a",
@@ -853,7 +1026,8 @@ async fn drain_reaches_zero_authority_terminal_and_preserves_other_capacity() ->
     .await?;
     assert_eq!(
         after_source.slots[0].next_step,
-        NodeOperationStepKind::StopBackend as i32
+        NodeOperationStepKind::StopBackend as i32,
+        "operation after source observation: {after_source:?}"
     );
     let coherent = wr_manager::db::get_cluster_status_snapshot(&pool).await?;
     assert!(coherent
@@ -871,7 +1045,8 @@ async fn drain_reaches_zero_authority_terminal_and_preserves_other_capacity() ->
 
     let stop = claim_instruction(&pool, "drain-node", "activation-a").await?;
     assert_eq!(stop.pinned_backend_instance_id, "backend-old");
-    wr_manager::db::deregister_engine(&pool, "drain-blue").await?;
+    let drain_fence = engine_fence(&pool, "drain-blue").await?;
+    wr_manager::db::deregister_engine(&pool, "drain-blue", &drain_fence).await?;
     pool.get()
         .await?
         .execute(
@@ -937,8 +1112,7 @@ async fn restart_recovers_a_lost_start_report_from_exact_replacement_evidence() 
     let pool = manager_pool().await;
     let digest = format!("sha256:{}", "b".repeat(64));
     let source = stage_with_module(&pool, "restart-node", "source", &digest, &["blue"]).await;
-    wr_manager::db::complete_deployment(&pool, "restart-node", source.revision, true, "").await?;
-    register_ready(&pool, &source, "blue", "restart-old").await?;
+    commit_ready_deployment(&pool, &source, &[("blue", "restart-old")]).await?;
     let operation = wr_manager::operations::submit(
         &pool,
         "operator-a",
@@ -968,7 +1142,8 @@ async fn restart_recovers_a_lost_start_report_from_exact_replacement_evidence() 
     )
     .await?;
     let stop = claim_instruction(&pool, "restart-node", "activation-a").await?;
-    wr_manager::db::deregister_engine(&pool, "restart-old").await?;
+    let restart_fence = engine_fence(&pool, "restart-old").await?;
+    wr_manager::db::deregister_engine(&pool, "restart-old", &restart_fence).await?;
     observe(
         &pool,
         &stop,
@@ -1143,7 +1318,14 @@ async fn deployment_requires_module_route_convergence_and_pauses_after_canary() 
         pending.slots[0].conditions[0].code,
         "SERVING_CONVERGENCE_PENDING"
     );
-    wr_manager::db::publish_engine_readiness(&pool, "canary-blue", &[module_descriptor()]).await?;
+    let blue_fence = engine_fence(&pool, "canary-blue").await?;
+    wr_manager::db::publish_engine_readiness(
+        &pool,
+        "canary-blue",
+        &[module_descriptor()],
+        &blue_fence,
+    )
+    .await?;
     assert!(
         wr_manager::operations::claim(&pool, "canary-node", "activation-a", "agent-a")
             .await?
@@ -1172,7 +1354,14 @@ async fn deployment_requires_module_route_convergence_and_pauses_after_canary() 
             .await?
             .is_none()
     );
-    wr_manager::db::publish_engine_readiness(&pool, "canary-green", &[module_descriptor()]).await?;
+    let green_fence = engine_fence(&pool, "canary-green").await?;
+    wr_manager::db::publish_engine_readiness(
+        &pool,
+        "canary-green",
+        &[module_descriptor()],
+        &green_fence,
+    )
+    .await?;
     assert!(
         wr_manager::operations::claim(&pool, "canary-node", "activation-a", "agent-a")
             .await?
@@ -1234,7 +1423,14 @@ async fn route_change_serialization_prevents_commit_from_an_older_snapshot() -> 
         "race-process",
     )
     .await?;
-    wr_manager::db::publish_engine_readiness(&pool, "race-engine", &[module_descriptor()]).await?;
+    let race_fence = engine_fence(&pool, "race-engine").await?;
+    wr_manager::db::publish_engine_readiness(
+        &pool,
+        "race-engine",
+        &[module_descriptor()],
+        &race_fence,
+    )
+    .await?;
 
     let mut writer = pool.get().await?;
     let transaction = writer.transaction().await?;
@@ -1412,9 +1608,10 @@ async fn delivered_stop_fixture(
     wr_common::wruntime::AgentInstruction,
 )> {
     let digest = format!("sha256:{}", "7".repeat(64));
-    let source = stage_with_module(pool, node_id, "source", &digest, &["blue"]).await;
-    wr_manager::db::complete_deployment(pool, node_id, source.revision, true, "").await?;
-    register_ready(pool, &source, "blue", &format!("{node_id}-engine")).await?;
+    let source_token = format!("source-{node_id}");
+    let source = stage_with_module(pool, node_id, &source_token, &digest, &["blue"]).await;
+    let source_engine_id = format!("{node_id}-engine");
+    commit_ready_deployment(pool, &source, &[("blue", &source_engine_id)]).await?;
     let operation = wr_manager::operations::submit(
         pool,
         "operator-a",
@@ -1479,7 +1676,9 @@ async fn delivered_effect_ambiguity_is_inspected_for_cancel_deadline_and_error()
                 );
             }
             "error" => {
-                wr_manager::db::deregister_engine(&pool, &format!("{node_id}-engine")).await?;
+                let engine_id = format!("{node_id}-engine");
+                let fence = engine_fence(&pool, &engine_id).await?;
+                wr_manager::db::deregister_engine(&pool, &engine_id, &fence).await?;
                 wr_manager::operations::report_step(
                     &pool,
                     &result_for(&stop, "HOST_STEP_FAILED"),
@@ -1683,23 +1882,22 @@ async fn rolling_commit_cleanup_requires_typed_retention_evidence() -> Result<()
     let oldest_digest = format!("sha256:{}", "d".repeat(64));
     let oldest =
         stage_with_module(&pool, "cleanup-node", "oldest", &oldest_digest, &["blue"]).await;
-    wr_manager::db::complete_deployment(&pool, "cleanup-node", oldest.revision, true, "").await?;
+    commit_deployment(&pool, &oldest).await?;
     let old_digest = format!("sha256:{}", "e".repeat(64));
     let old = stage_with_module(&pool, "cleanup-node", "old", &old_digest, &["blue"]).await;
-    wr_manager::db::complete_deployment(&pool, "cleanup-node", old.revision, true, "").await?;
+    commit_deployment(&pool, &old).await?;
     let source_digest = format!("sha256:{}", "f".repeat(64));
     let source =
         stage_with_module(&pool, "cleanup-node", "source", &source_digest, &["blue"]).await;
-    wr_manager::db::complete_deployment(&pool, "cleanup-node", source.revision, true, "").await?;
-    register_ready(&pool, &source, "blue", "cleanup-old").await?;
+    commit_ready_deployment(&pool, &source, &[("blue", "cleanup-old")]).await?;
     let history_digest = format!("sha256:{}", "1".repeat(64));
     let history =
         stage_with_module(&pool, "cleanup-node", "history", &history_digest, &["blue"]).await;
-    wr_manager::db::complete_deployment(&pool, "cleanup-node", history.revision, true, "").await?;
+    commit_deployment(&pool, &history).await?;
     let deleted_digest = format!("sha256:{}", "2".repeat(64));
     let deleted =
         stage_with_module(&pool, "cleanup-node", "deleted", &deleted_digest, &["blue"]).await;
-    wr_manager::db::complete_deployment(&pool, "cleanup-node", deleted.revision, true, "").await?;
+    commit_deployment(&pool, &deleted).await?;
     pool.get()
         .await?
         .execute(
@@ -1761,7 +1959,8 @@ async fn rolling_commit_cleanup_requires_typed_retention_evidence() -> Result<()
     )
     .await?;
     let stop = claim_instruction(&pool, "cleanup-node", "activation-a").await?;
-    wr_manager::db::deregister_engine(&pool, "cleanup-old").await?;
+    let cleanup_old_fence = engine_fence(&pool, "cleanup-old").await?;
+    wr_manager::db::deregister_engine(&pool, "cleanup-old", &cleanup_old_fence).await?;
     observe(
         &pool,
         &stop,
@@ -1815,7 +2014,14 @@ async fn rolling_commit_cleanup_requires_typed_retention_evidence() -> Result<()
             .await?
             .is_none()
     );
-    wr_manager::db::publish_engine_readiness(&pool, "cleanup-new", &[module_descriptor()]).await?;
+    let cleanup_new_fence = engine_fence(&pool, "cleanup-new").await?;
+    wr_manager::db::publish_engine_readiness(
+        &pool,
+        "cleanup-new",
+        &[module_descriptor()],
+        &cleanup_new_fence,
+    )
+    .await?;
     assert!(
         wr_manager::operations::claim(&pool, "cleanup-node", "activation-a", "agent-a")
             .await?

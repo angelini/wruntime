@@ -5,11 +5,20 @@ pub const DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS: u64 = 5;
 /// inter-service communication in wruntime.
 pub mod wruntime {
     tonic::include_proto!("wruntime");
+
+    /// Complete protobuf descriptor used by listener-scoped authorization
+    /// completeness tests. This is generated from the canonical proto source.
+    pub const FILE_DESCRIPTOR_SET: &[u8] =
+        tonic::include_file_descriptor_set!("wruntime_descriptor");
 }
 
 pub mod agent_policy;
 #[cfg(feature = "config")]
+pub mod authorization_policy;
+#[cfg(feature = "config")]
 pub mod config;
+#[cfg(feature = "config")]
+pub mod deployment_contract;
 #[cfg(feature = "discovery")]
 pub mod discovery;
 pub mod http_headers;
@@ -21,6 +30,7 @@ pub mod lifecycle;
 pub mod lifecycle_observation;
 #[cfg(any(feature = "signal", test))]
 pub mod lifecycle_service;
+pub mod manager_client;
 pub mod naming;
 pub mod node;
 #[cfg(feature = "pool")]
@@ -29,6 +39,8 @@ pub mod pool;
 pub mod process_lifecycle;
 #[cfg(any(feature = "signal", test))]
 pub mod signal;
+#[cfg(feature = "config")]
+pub mod snapshot_consumer;
 #[cfg(any(feature = "signal", test))]
 pub mod task_group;
 pub mod telemetry;

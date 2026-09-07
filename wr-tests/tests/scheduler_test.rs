@@ -9,9 +9,7 @@ use anyhow::Result;
 use wr_common::wruntime::UpsertScheduleRequest;
 
 async fn due_schedule(
-    c: &mut wr_common::wruntime::manager_service_client::ManagerServiceClient<
-        tonic::transport::Channel,
-    >,
+    c: &mut wr_common::manager_client::ManagerClient<tonic::transport::Channel>,
     ns: &str,
     name: &str,
     ver: &str,

@@ -159,19 +159,20 @@ where
         .query_opt(
             "SELECT operation_id, node_id, request_token, actor, action, state, policy,
                     source_revision, target_revision, bundle_digest, resolved_release_digest,
-                    committed, lease_epoch, lease_expires_at, failure_code, failure_detail,
-                    created_at, updated_at, phase, forward_deadline, forward_fenced,
-                    restoration_requested, agent_instance_id, cleanup_superseded_by,
-                    cleanup_evidence, cleanup_delivered_at, cleanup_reported_at,
-                    cleanup_backend_query_error, proxy_process_instance_id,
-                    restoration_terminal_state, proxy_next_step, proxy_source_revision,
-                    proxy_source_digest, proxy_source_resolved_digest, proxy_target_revision,
-                    proxy_target_digest, proxy_target_resolved_digest, proxy_backend_instance_id,
-                    proxy_changed, proxy_effect_ambiguous, proxy_effect_delivered_at,
-                    proxy_effect_reported, proxy_effect_observed_revision,
-                    proxy_effect_observed_digest, proxy_effect_observed_resolved_digest,
-                    proxy_effect_backend_instance_id, proxy_effect_process_instance_id,
-                    proxy_effect_condition_code, proxy_effect_detail
+                    target_revision_digest, committed, lease_epoch, lease_expires_at,
+                    failure_code, failure_detail, created_at, updated_at, phase,
+                    forward_deadline, forward_fenced, restoration_requested,
+                    agent_instance_id, cleanup_superseded_by, cleanup_evidence,
+                    cleanup_delivered_at, cleanup_reported_at, cleanup_backend_query_error,
+                    proxy_process_instance_id, restoration_terminal_state, proxy_next_step,
+                    proxy_source_revision, proxy_source_digest, proxy_source_resolved_digest,
+                    proxy_target_revision, proxy_target_digest, proxy_target_resolved_digest,
+                    proxy_backend_instance_id, proxy_changed, proxy_effect_ambiguous,
+                    proxy_effect_delivered_at, proxy_effect_reported,
+                    proxy_effect_observed_revision, proxy_effect_observed_digest,
+                    proxy_effect_observed_resolved_digest, proxy_effect_backend_instance_id,
+                    proxy_effect_process_instance_id, proxy_effect_condition_code,
+                    proxy_effect_detail
              FROM wr_node_operations WHERE operation_id = $1",
             &[&operation_id],
         )
@@ -227,6 +228,9 @@ fn operation_from_row(row: &Row, slots: &[Row]) -> Result<NodeOperation, Status>
         source_revision: row.get::<_, i64>("source_revision") as u64,
         target_revision: row.get::<_, i64>("target_revision") as u64,
         bundle_digest: row.get("bundle_digest"),
+        revision_digest: row
+            .get::<_, Option<String>>("target_revision_digest")
+            .unwrap_or_default(),
         slots: slots
             .iter()
             .map(|slot| {
@@ -411,15 +415,15 @@ async fn deployment_inventory<C: GenericClient + Sync>(
         .await
         .map_err(internal)?
         .ok_or_else(|| Status::failed_precondition("deployment snapshot is missing"))?;
-    let record = wr_common::wruntime::DeploymentRecord::decode(
+    let inventory = wr_common::wruntime::DeploymentInventoryV1::decode(
         row.get::<_, Vec<u8>>("expected_inventory").as_slice(),
     )
     .map_err(|error| Status::internal(format!("deployment inventory is invalid: {error}")))?;
     Ok((
         row.get("bundle_digest"),
         row.get("resolved_release_digest"),
-        record
-            .expected_engines
+        inventory
+            .engines
             .into_iter()
             .map(|engine| engine.engine_slot)
             .collect(),
@@ -494,6 +498,7 @@ pub async fn submit(
             | NodeOperationAction::Rollback
     );
     let operation_id = Uuid::new_v4();
+    let mut target_revision_digest: Option<String> = None;
 
     // An urgent rollback fences committed cleanup before the new operation is
     // admitted. History/evidence remain, and the old cleanup can issue no effect.
@@ -537,7 +542,9 @@ pub async fn submit(
             deployment_inventory(&transaction, &request.node_id, target_revision).await?;
         let deployment = transaction
             .query_one(
-                "SELECT attempt_token, bundle_digest, resolved_release_digest, finalized_at, abandoned_at, allocated_by FROM wr_node_deployments
+                "SELECT attempt_token, bundle_digest, resolved_release_digest, finalized_at,
+                        abandoned_at, allocated_by, revision_digest
+                 FROM wr_node_deployments
                  WHERE node_id = $1 AND revision = $2 AND state IN ('pending', 'active') FOR UPDATE",
                 &[&request.node_id, &target_revision],
             )
@@ -572,6 +579,7 @@ pub async fn submit(
                 "staged deployment must be finalized before submission",
             ));
         }
+        target_revision_digest = Some(deployment.get("revision_digest"));
         if deployment.get::<_, String>("bundle_digest") != request.bundle_digest
             || digest != request.bundle_digest
             || deployment.get::<_, String>("resolved_release_digest")
@@ -689,11 +697,11 @@ pub async fn submit(
             "INSERT INTO wr_node_operations
                (operation_id, node_id, request_token, actor, action, state, request_payload,
                 policy, source_revision, target_revision, bundle_digest, resolved_release_digest,
-                forward_deadline, proxy_next_step, proxy_source_revision, proxy_source_digest,
-                proxy_source_resolved_digest, proxy_target_revision, proxy_target_digest,
-                proxy_target_resolved_digest)
-             VALUES ($1, $2, $3, $4, $5, 'queued', $6, $7, $8, $9, $10, $11,
-                     NOW() + make_interval(secs => $12::double precision), $13, $8, $14, $15,
+                target_revision_digest, forward_deadline, proxy_next_step,
+                proxy_source_revision, proxy_source_digest, proxy_source_resolved_digest,
+                proxy_target_revision, proxy_target_digest, proxy_target_resolved_digest)
+             VALUES ($1, $2, $3, $4, $5, 'queued', $6, $7, $8, $9, $10, $11, $12,
+                     NOW() + make_interval(secs => $13::double precision), $14, $8, $15, $16,
                      $9, $10, $11)",
             &[
                 &operation_id,
@@ -707,6 +715,7 @@ pub async fn submit(
                 &target_revision,
                 &request.bundle_digest,
                 &request.resolved_release_digest,
+                &target_revision_digest,
                 &(deadline_seconds as f64),
                 &if deployment_action {
                     if source_revision > 0 {
@@ -1210,10 +1219,13 @@ fn slot_routes_healthy(
         return Ok(false);
     };
     let mut deployment = candidate.record.clone();
-    deployment
-        .expected_engines
+    let Some(inventory) = deployment.inventory.as_mut() else {
+        return Ok(false);
+    };
+    inventory
+        .engines
         .retain(|expected| expected.engine_slot == slot);
-    if deployment.expected_engines.len() != 1 {
+    if inventory.engines.len() != 1 {
         return Ok(false);
     }
     let selected = snapshot
@@ -1269,7 +1281,13 @@ fn stop_preserves_availability(
         deployment.record.node_id == operation.node_id
             && deployment.record.revision == deployment.current_revision
     }) {
-        for expected in &current.record.expected_engines {
+        for expected in current
+            .record
+            .inventory
+            .as_ref()
+            .into_iter()
+            .flat_map(|inventory| &inventory.engines)
+        {
             authoritative.insert(
                 expected.engine_slot.clone(),
                 (
@@ -2513,6 +2531,20 @@ pub async fn claim(
         transaction.commit().await.map_err(internal)?;
         return Ok(None);
     };
+    let revision_digest = if revision == 0 {
+        String::new()
+    } else {
+        transaction
+            .query_opt(
+                "SELECT revision_digest FROM wr_node_deployments
+                 WHERE node_id = $1 AND revision = $2",
+                &[&node_id, &(revision as i64)],
+            )
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| Status::failed_precondition("instruction deployment is missing"))?
+            .get("revision_digest")
+    };
     let cleanup_delete_releases = if step == NodeOperationStepKind::CleanupRelease {
         let stored = transaction
             .query_one(
@@ -2622,6 +2654,7 @@ pub async fn claim(
             pinned_process_instance_id: pinned_process,
             restoration,
             cleanup_delete_releases,
+            revision_digest,
         }),
         lease_seconds: LEASE_SECONDS as u64,
     }))

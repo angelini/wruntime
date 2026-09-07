@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use http::Method;
 use serde::{de::Error as _, Deserialize, Deserializer};
 use wr_common::identity::{ModuleName, Namespace};
-use wr_common::node::{is_loopback_addr, NodeConfig};
+use wr_common::node::{is_loopback_addr, ClientTlsConfig, NodeConfig, ServerTlsConfig};
 
 #[derive(Deserialize, Clone)]
 pub struct ProxyConfig {
@@ -12,8 +12,12 @@ pub struct ProxyConfig {
     pub listen_address: String,
     /// gRPC listen address for the NodeService control plane (engines connect here).
     pub control_address: String,
-    /// Node configuration — this proxy's own address as reachable by peer proxies.
+    /// Transport-neutral local node and peer endpoint metadata.
     pub node: NodeConfig,
+    /// Server identity and client roots for the peer-proxy acceptor.
+    pub endpoint_tls: ServerTlsConfig,
+    /// Enrolled proxy identity and server roots for manager and peer connectors.
+    pub client_tls: ClientTlsConfig,
     /// PostgreSQL connection for manager discovery via `wr_managers` table.
     pub database: DatabaseConfig,
     #[serde(default)]
@@ -355,16 +359,28 @@ impl ProxyConfig {
             v.check(false, format!("invalid node configuration: {error}"));
         }
         v.check(
-            !self.node.tls.cert_path.is_empty(),
-            "node.tls.cert_path is required",
+            !self.endpoint_tls.cert_path.is_empty(),
+            "endpoint_tls.cert_path is required",
         );
         v.check(
-            !self.node.tls.key_path.is_empty(),
-            "node.tls.key_path is required",
+            !self.endpoint_tls.key_path.is_empty(),
+            "endpoint_tls.key_path is required",
         );
         v.check(
-            !self.node.tls.ca_cert_path.is_empty(),
-            "node.tls.ca_cert_path is required",
+            !self.endpoint_tls.client_ca_cert_path.is_empty(),
+            "endpoint_tls.client_ca_cert_path is required",
+        );
+        v.check(
+            !self.client_tls.cert_path.is_empty(),
+            "client_tls.cert_path is required",
+        );
+        v.check(
+            !self.client_tls.key_path.is_empty(),
+            "client_tls.key_path is required",
+        );
+        v.check(
+            !self.client_tls.server_ca_cert_path.is_empty(),
+            "client_tls.server_ca_cert_path is required",
         );
         v.check(
             self.cache.routing_table_ttl_secs > 0,

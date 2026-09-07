@@ -6,9 +6,8 @@ use deadpool_postgres::Pool;
 use tokio::time::sleep;
 use tonic::transport::Channel;
 
-use wr_common::wruntime::{
-    manager_service_client::ManagerServiceClient, ListManagersRequest, ManagerInfo,
-};
+use wr_common::manager_client::ManagerClient as ManagerServiceClient;
+use wr_common::wruntime::{ListManagersRequest, ManagerInfo};
 use wr_engine::worker::JobStatus;
 
 pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);

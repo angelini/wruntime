@@ -198,14 +198,15 @@ async fn status(
     if slot.is_some() && node_id.is_none() {
         bail!("--slot requires --node-id");
     }
-    let response = client::connect_operator(manager)
-        .await?
-        .get_status(GetOperatorStatusRequest {
-            node_id: node_id.unwrap_or_default(),
-            engine_slot: slot.unwrap_or_default(),
-        })
-        .await?
-        .into_inner();
+    let response =
+        client::connect_operator(manager, wr_common::manager_client::RetryClass::ReadOnly)
+            .await?
+            .get_status(GetOperatorStatusRequest {
+                node_id: node_id.unwrap_or_default(),
+                engine_slot: slot.unwrap_or_default(),
+            })
+            .await?
+            .into_inner();
     let cluster = response
         .cluster
         .context("GetStatus omitted cluster status")?;
@@ -312,22 +313,25 @@ async fn mutate(manager: &str, args: MutationArgs, action: NodeOperationAction) 
         .request_token
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let policy = mutation_policy(action, args.deadline, args.allow_downtime);
-    let operation = client::connect_operator(manager)
-        .await?
-        .submit_operation(SubmitOperationRequest {
-            node_id: args.node_id,
-            request_token: token.clone(),
-            action: action as i32,
-            engine_slots: vec![args.slot],
-            target_revision: 0,
-            bundle_digest: String::new(),
-            policy: Some(policy),
-            resolved_release_digest: String::new(),
-        })
-        .await?
-        .into_inner()
-        .operation
-        .context("SubmitOperation omitted operation")?;
+    let operation = client::connect_operator(
+        manager,
+        wr_common::manager_client::RetryClass::DurableCreate,
+    )
+    .await?
+    .submit_operation(SubmitOperationRequest {
+        node_id: args.node_id,
+        request_token: token.clone(),
+        action: action as i32,
+        engine_slots: vec![args.slot],
+        target_revision: 0,
+        bundle_digest: String::new(),
+        policy: Some(policy),
+        resolved_release_digest: String::new(),
+    })
+    .await?
+    .into_inner()
+    .operation
+    .context("SubmitOperation omitted operation")?;
     if !args.json {
         println!("Request token: {token}");
     }

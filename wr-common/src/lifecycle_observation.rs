@@ -139,6 +139,7 @@ mod tests {
             transitioned_at: None,
             reason: 0,
             detail: "raw detail".to_string(),
+            ..Default::default()
         }
     }
 

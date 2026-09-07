@@ -9,9 +9,9 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use wr_common::agent_policy::AGENT_PROTOCOL_VERSION;
 use wr_common::wruntime::{
-    AbandonDeploymentRequest, BeginDeploymentRequest, BeginRollbackRequest, ExpectedEngine,
-    FinalizeDeploymentRequest, ModuleIdentity, NodeOperationAction, RolloutPolicy,
-    SubmitOperationRequest,
+    AbandonDeploymentRequest, BeginDeploymentRequest, BeginRollbackRequest, DeploymentInventoryV1,
+    ExpectedEngine, ExpectedModule, FinalizeDeploymentRequest, ModuleIdentity, NodeOperationAction,
+    RolloutPolicy, SecretRequest, SubmitOperationRequest,
 };
 
 use super::build_helpers::{self, BuildModule};
@@ -293,6 +293,8 @@ fn add_engine_artifacts(
             revision: "{revision}".to_string(),
             bundle_digest: "{bundle_digest}".to_string(),
             engine_slot: engine_slot.clone(),
+            operation_id: "{operation_id}".to_string(),
+            revision_digest: "{revision_digest}".to_string(),
             extra: super::config::empty_extra_fields(),
         });
         let config_template = bundle_config
@@ -438,13 +440,17 @@ fn add_proxy_config(
             proxy_address: format!("http://127.0.0.1:{proxy_port}"),
             control_address: format!("http://127.0.0.1:{control_port}"),
             peer_address: format!("https://127.0.0.1:{peer_port}"),
-            tls: Some(super::config::CliTlsConfig {
-                cert_path: "certs/node.crt".to_string(),
-                key_path: "certs/node.key".to_string(),
-                ca_cert_path: "certs/ca.crt".to_string(),
-                extra: super::config::empty_extra_fields(),
-            }),
         }),
+        endpoint_tls: super::config::CliServerTlsConfig {
+            cert_path: "/etc/wruntime/pki/proxy-endpoint/sets/v1/leaf.pem".to_string(),
+            key_path: "/etc/wruntime/pki/proxy-endpoint/sets/v1/key.pem".to_string(),
+            client_ca_cert_path: "/etc/wruntime/pki/roots/client/ca.crt".to_string(),
+        },
+        client_tls: super::config::CliClientTlsConfig {
+            cert_path: "/etc/wruntime/pki/proxy-client/sets/v1/leaf.pem".to_string(),
+            key_path: "/etc/wruntime/pki/proxy-client/sets/v1/key.pem".to_string(),
+            server_ca_cert_path: "/etc/wruntime/pki/roots/server/ca.crt".to_string(),
+        },
         database: Some(super::config::ProxyDatabaseConfig {
             url: "{db_url}".to_string(),
             manager_liveness_threshold_secs: Some(
@@ -484,7 +490,7 @@ fn engine_docker_extra_copies(
     has_schema_artifacts: bool,
     has_migration_artifacts: bool,
 ) -> Vec<(&'static str, &'static str)> {
-    let mut copies = vec![("certs/", "certs/"), ("modules/", "modules/")];
+    let mut copies = vec![("modules/", "modules/")];
     if has_schema_artifacts {
         copies.push(("schemas/", "schemas/"));
     }
@@ -610,7 +616,7 @@ fn add_deployment_artifacts(
         workdir,
         binary: "bin/wr-proxy",
         config: "config/proxy.toml",
-        extra_copies: vec![("certs/", "certs/")],
+        extra_copies: vec![],
         env_vars: vec![],
         no_otel,
     };
@@ -652,7 +658,7 @@ fn add_deployment_artifacts(
         image: None,
         network_mode: Some("host".into()),
         ports: vec![],
-        volumes: vec![],
+        volumes: vec!["/etc/wruntime/pki:/etc/wruntime/pki:ro".into()],
         depends_on: vec![],
         healthcheck: service_gen::ComposeHealthcheck {
             test: vec![
@@ -677,7 +683,7 @@ fn add_deployment_artifacts(
             image: None,
             network_mode: Some("host".into()),
             ports: vec![],
-            volumes: vec![],
+            volumes: vec!["/etc/wruntime/pki:/etc/wruntime/pki:ro".into()],
             depends_on: vec![service_gen::ComposeDependency {
                 service: "proxy".into(),
                 condition: "service_healthy",
@@ -837,6 +843,43 @@ fn assemble_node_bundle(input: NodeBundleAssembly<'_>) -> Result<Manifest> {
                             .is_some_and(|path| !path.is_empty()),
                     })
                     .collect(),
+                secrets: config
+                    .modules
+                    .iter()
+                    .flat_map(|module| {
+                        module
+                            .extra
+                            .get("env")
+                            .and_then(toml::Value::as_table)
+                            .into_iter()
+                            .flat_map(move |env| {
+                                env.iter().filter_map(move |(key, value)| {
+                                    value
+                                        .as_table()
+                                        .and_then(|table| table.get("secret"))
+                                        .and_then(toml::Value::as_bool)
+                                        .filter(|value| *value)
+                                        .map(|_| (module.namespace.clone(), key.clone()))
+                                })
+                            })
+                    })
+                    .collect(),
+                db_namespaces: config
+                    .modules
+                    .iter()
+                    .filter(|module| module.database)
+                    .map(|module| module.namespace.clone())
+                    .collect(),
+                job_queue_id: config
+                    .job_admin
+                    .as_ref()
+                    .map(|admin| admin.queue_id.clone())
+                    .unwrap_or_default(),
+                job_admin_address: config
+                    .job_admin
+                    .as_ref()
+                    .map(|admin| admin.advertise_address.clone())
+                    .unwrap_or_default(),
             }
         })
         .collect();
@@ -990,14 +1033,6 @@ fn bundle(args: BundleArgs) -> Result<()> {
 
 // --- deploy ---
 
-fn delegation_certificate_sources(cert_dir: &str, host: &str) -> [String; 3] {
-    [
-        format!("{cert_dir}/job-admin-delegation/ca.crt"),
-        format!("{cert_dir}/job-admin-delegation/{host}.crt"),
-        format!("{cert_dir}/job-admin-delegation/{host}.key"),
-    ]
-}
-
 fn staging_release_dir(workdir: &str, revision: u64) -> String {
     format!("{workdir}/wr-node/releases/.{revision}.tmp")
 }
@@ -1070,17 +1105,37 @@ fn expected_engines(manifest: &Manifest) -> Vec<ExpectedEngine> {
             modules: engine
                 .modules
                 .iter()
-                .map(|module| ModuleIdentity {
-                    namespace: module.namespace.clone(),
-                    name: module.name.clone(),
-                    version: module.version.clone(),
+                .map(|module| ExpectedModule {
+                    identity: Some(ModuleIdentity {
+                        namespace: module.namespace.clone(),
+                        name: module.name.clone(),
+                        version: module.version.clone(),
+                    }),
+                    proto_schema_digest: if module.has_schema {
+                        manifest
+                            .checksums
+                            .get(&format!("wr-node/schemas/{}.binpb", module.name))
+                            .map(|digest| format!("sha256:{digest}"))
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    },
                 })
                 .collect(),
+            secrets: engine
+                .secrets
+                .iter()
+                .map(|(namespace, key)| SecretRequest {
+                    namespace: namespace.clone(),
+                    key: key.clone(),
+                })
+                .collect(),
+            db_namespaces: engine.db_namespaces.clone(),
+            job_queue_id: engine.job_queue_id.clone(),
+            job_admin_address: engine.job_admin_address.clone(),
         })
         .collect()
 }
-
-const WORKLOAD_PRIVATE_KEY_MODE: u32 = 0o640;
 
 struct ResolvedStage {
     root: PathBuf,
@@ -1103,6 +1158,56 @@ fn resolved_stage_root() -> PathBuf {
     ))
 }
 
+fn provision_node_tls(
+    cert_dir: &str,
+    remote: &str,
+    ssh_key: Option<&str>,
+    ssh_port: Option<u16>,
+    requires_job_admin_tls: bool,
+) -> Result<()> {
+    for (local, remote_path) in [
+        (
+            format!("{cert_dir}/server-root/ca.crt"),
+            "/etc/wruntime/pki/roots/server/ca.crt",
+        ),
+        (
+            format!("{cert_dir}/client-root/ca.crt"),
+            "/etc/wruntime/pki/roots/client/ca.crt",
+        ),
+    ] {
+        helpers::install_remote_file(
+            Path::new(&local),
+            remote,
+            remote_path,
+            ssh_key,
+            ssh_port,
+            0o444,
+            helpers::RemoteInstallClass::Public,
+            None,
+        )?;
+    }
+    let mut profiles = vec![
+        ("proxy-endpoint", "proxy-endpoint"),
+        ("proxy-client", "proxy-client"),
+    ];
+    if requires_job_admin_tls {
+        profiles.push(("engine-admin-endpoint", "engine-admin-endpoint"));
+    }
+    for (local_name, remote_name) in profiles {
+        let local = PathBuf::from(format!("{cert_dir}/{local_name}"));
+        let digest = helpers::local_tree_digest(&local)?;
+        helpers::install_remote_directory(
+            &local,
+            remote,
+            &format!("/etc/wruntime/pki/{remote_name}/sets/v1"),
+            ssh_key,
+            ssh_port,
+            &digest,
+        )?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Resolution binds the complete deploy contract in one atomic staging operation.
 fn materialize_resolved_release(
     bundle_path: &str,
@@ -1113,7 +1218,6 @@ fn materialize_resolved_release(
     format: DeployFormat,
     db_url: &str,
     peer_port: u16,
-    cert_dir: &str,
     remote: &str,
     host_ip: &str,
 ) -> Result<ResolvedStage> {
@@ -1140,49 +1244,6 @@ fn materialize_resolved_release(
         let resolved = helpers::resolve_template(template, &vars)
             .with_context(|| format!("failed to resolve template in {name}"))?;
         std::fs::write(release.join("config").join(name), resolved)?;
-    }
-    let host_name = helpers::extract_remote_host(remote);
-    std::fs::create_dir_all(release.join("certs"))?;
-    for (source, name, mode) in [
-        (format!("{cert_dir}/ca.crt"), "ca.crt", 0o644),
-        (format!("{cert_dir}/{host_name}.crt"), "node.crt", 0o644),
-        (
-            format!("{cert_dir}/{host_name}.key"),
-            "node.key",
-            WORKLOAD_PRIVATE_KEY_MODE,
-        ),
-    ] {
-        anyhow::ensure!(
-            Path::new(&source).is_file(),
-            "certificate file not found: {source}"
-        );
-        let target = release.join("certs").join(name);
-        std::fs::copy(&source, &target)?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
-    }
-    if configs
-        .iter()
-        .any(|(_, config)| config.contains("[job_admin]"))
-    {
-        let delegation_dir = release.join("certs/job-admin-delegation");
-        std::fs::create_dir_all(&delegation_dir)?;
-        let [delegation_ca, delegation_cert, delegation_key] =
-            delegation_certificate_sources(cert_dir, host_name);
-        for (source, name, mode) in [
-            (delegation_ca, "ca.crt", 0o644),
-            (delegation_cert, "node.crt", 0o644),
-            (delegation_key, "node.key", WORKLOAD_PRIVATE_KEY_MODE),
-        ] {
-            anyhow::ensure!(
-                Path::new(&source).is_file(),
-                "job-admin delegation certificate file not found: {source}"
-            );
-            let target = delegation_dir.join(name);
-            std::fs::copy(&source, &target)?;
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))?;
-        }
     }
     let run_user = helpers::extract_remote_user(remote).unwrap_or("root");
     let systemd = release.join("systemd");
@@ -1306,7 +1367,7 @@ async fn require_compatible_attestation(
     format: DeployFormat,
     manifest: &Manifest,
 ) -> Result<()> {
-    let status = client::connect_operator(manager)
+    let status = client::connect_operator(manager, wr_common::manager_client::RetryClass::ReadOnly)
         .await?
         .get_status(wr_common::wruntime::GetOperatorStatusRequest {
             node_id: node_id.to_string(),
@@ -1384,20 +1445,35 @@ async fn durable_deploy(
             .collect::<Vec<_>>()
             .join(",")
     );
-    let deployment = client::connect_operator(manager)
-        .await?
-        .begin_deployment(BeginDeploymentRequest {
-            node_id: args.node_id.clone(),
-            attempt_token: token.clone(),
-            bundle_digest: manifest.bundle_digest.clone(),
-            expected_engines: expected_engines(&manifest),
-        })
-        .await?
-        .into_inner()
-        .deployment
-        .context("manager returned no deployment record")?;
+    let deployment = client::connect_operator(
+        manager,
+        wr_common::manager_client::RetryClass::DurableCreate,
+    )
+    .await?
+    .begin_deployment(BeginDeploymentRequest {
+        node_id: args.node_id.clone(),
+        attempt_token: token.clone(),
+        bundle_digest: manifest.bundle_digest.clone(),
+        inventory: Some(DeploymentInventoryV1 {
+            schema_version: 1,
+            engines: expected_engines(&manifest),
+        }),
+    })
+    .await?
+    .into_inner()
+    .deployment
+    .context("manager returned no deployment record")?;
     let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
     let host_ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
+    provision_node_tls(
+        &cert_dir,
+        &args.remote,
+        ssh_key.as_deref(),
+        ssh_port,
+        configs
+            .iter()
+            .any(|(_, config)| config.contains("[job_admin]")),
+    )?;
     let stage = materialize_resolved_release(
         &args.bundle,
         &manifest,
@@ -1407,7 +1483,6 @@ async fn durable_deploy(
         format,
         &db_url,
         peer_port,
-        &cert_dir,
         &args.remote,
         &host_ip,
     )?;
@@ -1421,19 +1496,22 @@ async fn durable_deploy(
         &manifest.workdir,
         deployment.revision,
     )?;
-    let finalized = client::connect_operator(manager)
-        .await?
-        .finalize_deployment(FinalizeDeploymentRequest {
-            node_id: args.node_id.clone(),
-            attempt_token: token.clone(),
-            revision: deployment.revision,
-            bundle_digest: manifest.bundle_digest.clone(),
-            resolved_release_digest: stage.digest.clone(),
-        })
-        .await?
-        .into_inner()
-        .deployment
-        .context("FinalizeDeployment omitted deployment")?;
+    let finalized = client::connect_operator(
+        manager,
+        wr_common::manager_client::RetryClass::NoReplayMutation,
+    )
+    .await?
+    .finalize_deployment(FinalizeDeploymentRequest {
+        node_id: args.node_id.clone(),
+        attempt_token: token.clone(),
+        revision: deployment.revision,
+        bundle_digest: manifest.bundle_digest.clone(),
+        resolved_release_digest: stage.digest.clone(),
+    })
+    .await?
+    .into_inner()
+    .deployment
+    .context("FinalizeDeployment omitted deployment")?;
     anyhow::ensure!(
         finalized.resolved_release_digest == stage.digest,
         "manager finalized a conflicting release identity"
@@ -1451,28 +1529,31 @@ async fn durable_deploy(
     let canary = args
         .canary
         .unwrap_or_else(|| slots.first().cloned().unwrap_or_default());
-    let operation = client::connect_operator(manager)
-        .await?
-        .submit_operation(SubmitOperationRequest {
-            node_id: args.node_id,
-            request_token: token,
-            action: action as i32,
-            engine_slots: slots,
-            target_revision: deployment.revision,
-            bundle_digest: manifest.bundle_digest,
-            policy: Some(RolloutPolicy {
-                max_unavailable: args.max_unavailable,
-                canary_slot: canary,
-                pause_after_canary: args.pause_after_canary,
-                allow_downtime: args.allow_downtime,
-                deadline_seconds: args.deadline,
-            }),
-            resolved_release_digest: stage.digest.clone(),
-        })
-        .await?
-        .into_inner()
-        .operation
-        .context("SubmitOperation omitted operation")?;
+    let operation = client::connect_operator(
+        manager,
+        wr_common::manager_client::RetryClass::DurableCreate,
+    )
+    .await?
+    .submit_operation(SubmitOperationRequest {
+        node_id: args.node_id,
+        request_token: token,
+        action: action as i32,
+        engine_slots: slots,
+        target_revision: deployment.revision,
+        bundle_digest: manifest.bundle_digest,
+        policy: Some(RolloutPolicy {
+            max_unavailable: args.max_unavailable,
+            canary_slot: canary,
+            pause_after_canary: args.pause_after_canary,
+            allow_downtime: args.allow_downtime,
+            deadline_seconds: args.deadline,
+        }),
+        resolved_release_digest: stage.digest.clone(),
+    })
+    .await?
+    .into_inner()
+    .operation
+    .context("SubmitOperation omitted operation")?;
     println!("Operation ID: {}", operation.operation_id);
     if args.no_wait {
         super::operations::render_operation(&operation, args.json)
@@ -1499,14 +1580,17 @@ async fn abandon(args: AbandonArgs, manager: &str) -> Result<()> {
     let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy.ssh_key, "WR_SSH_KEY");
     let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy.ssh_port)?
         .map(helpers::DeployPort::get);
-    let response = client::connect_operator(manager)
-        .await?
-        .abandon_deployment(AbandonDeploymentRequest {
-            node_id: args.node_id,
-            attempt_token: args.request_token,
-        })
-        .await?
-        .into_inner();
+    let response = client::connect_operator(
+        manager,
+        wr_common::manager_client::RetryClass::NoReplayMutation,
+    )
+    .await?
+    .abandon_deployment(AbandonDeploymentRequest {
+        node_id: args.node_id,
+        attempt_token: args.request_token,
+    })
+    .await?
+    .into_inner();
     let deployment = response
         .deployment
         .context("AbandonDeployment omitted deployment")?;
@@ -1543,17 +1627,20 @@ async fn durable_rollback(args: RollbackArgs, manager: &str) -> Result<()> {
         .request_token
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     println!("Request token: {token}");
-    let deployment = client::connect_operator(manager)
-        .await?
-        .begin_rollback(BeginRollbackRequest {
-            node_id: args.node_id.clone(),
-            to_revision: args.to.unwrap_or(0),
-            attempt_token: token.clone(),
-        })
-        .await?
-        .into_inner()
-        .deployment
-        .context("manager returned no rollback deployment")?;
+    let deployment = client::connect_operator(
+        manager,
+        wr_common::manager_client::RetryClass::DurableCreate,
+    )
+    .await?
+    .begin_rollback(BeginRollbackRequest {
+        node_id: args.node_id.clone(),
+        to_revision: args.to.unwrap_or(0),
+        attempt_token: token.clone(),
+    })
+    .await?
+    .into_inner()
+    .deployment
+    .context("manager returned no rollback deployment")?;
     let source = release_dir(&workdir, deployment.source_revision);
     let target = release_dir(&workdir, deployment.revision);
     let temporary = staging_release_dir(&workdir, deployment.revision);
@@ -1597,19 +1684,22 @@ PY
         source_revision = deployment.source_revision,
     );
     let resolved_digest = helpers::run_ssh_output(&ssh, &script)?;
-    let finalized = client::connect_operator(manager)
-        .await?
-        .finalize_deployment(FinalizeDeploymentRequest {
-            node_id: args.node_id.clone(),
-            attempt_token: token.clone(),
-            revision: deployment.revision,
-            bundle_digest: deployment.bundle_digest.clone(),
-            resolved_release_digest: resolved_digest.clone(),
-        })
-        .await?
-        .into_inner()
-        .deployment
-        .context("FinalizeDeployment omitted rollback deployment")?;
+    let finalized = client::connect_operator(
+        manager,
+        wr_common::manager_client::RetryClass::NoReplayMutation,
+    )
+    .await?
+    .finalize_deployment(FinalizeDeploymentRequest {
+        node_id: args.node_id.clone(),
+        attempt_token: token.clone(),
+        revision: deployment.revision,
+        bundle_digest: deployment.bundle_digest.clone(),
+        resolved_release_digest: resolved_digest.clone(),
+    })
+    .await?
+    .into_inner()
+    .deployment
+    .context("FinalizeDeployment omitted rollback deployment")?;
     anyhow::ensure!(
         finalized.resolved_release_digest == resolved_digest,
         "rollback finalization identity mismatch"
@@ -1618,36 +1708,41 @@ PY
         bail!("deterministic exit after inactive release finalization");
     }
     let mut slots = deployment
-        .expected_engines
-        .iter()
+        .inventory
+        .as_ref()
+        .into_iter()
+        .flat_map(|inventory| inventory.engines.iter())
         .map(|engine| engine.engine_slot.clone())
         .collect::<Vec<_>>();
     slots.sort();
     let canary = args
         .canary
         .unwrap_or_else(|| slots.first().cloned().unwrap_or_default());
-    let operation = client::connect_operator(manager)
-        .await?
-        .submit_operation(SubmitOperationRequest {
-            node_id: args.node_id,
-            request_token: token,
-            action: NodeOperationAction::Rollback as i32,
-            engine_slots: slots,
-            target_revision: deployment.revision,
-            bundle_digest: deployment.bundle_digest,
-            policy: Some(RolloutPolicy {
-                max_unavailable: args.max_unavailable,
-                canary_slot: canary,
-                pause_after_canary: args.pause_after_canary,
-                allow_downtime: args.allow_downtime,
-                deadline_seconds: args.deadline,
-            }),
-            resolved_release_digest: resolved_digest,
-        })
-        .await?
-        .into_inner()
-        .operation
-        .context("SubmitOperation omitted rollback operation")?;
+    let operation = client::connect_operator(
+        manager,
+        wr_common::manager_client::RetryClass::DurableCreate,
+    )
+    .await?
+    .submit_operation(SubmitOperationRequest {
+        node_id: args.node_id,
+        request_token: token,
+        action: NodeOperationAction::Rollback as i32,
+        engine_slots: slots,
+        target_revision: deployment.revision,
+        bundle_digest: deployment.bundle_digest,
+        policy: Some(RolloutPolicy {
+            max_unavailable: args.max_unavailable,
+            canary_slot: canary,
+            pause_after_canary: args.pause_after_canary,
+            allow_downtime: args.allow_downtime,
+            deadline_seconds: args.deadline,
+        }),
+        resolved_release_digest: resolved_digest,
+    })
+    .await?
+    .into_inner()
+    .operation
+    .context("SubmitOperation omitted rollback operation")?;
     println!("Operation ID: {}", operation.operation_id);
     if args.no_wait {
         super::operations::render_operation(&operation, args.json)
@@ -1753,10 +1848,10 @@ mod tests {
             backend: "systemd".into(),
             bundle_digest: "sha256:bundle".into(),
             files: BTreeMap::from([(
-                "certs/job-admin-delegation/node.key".into(),
+                "config/engine.toml".into(),
                 ResolvedFile {
-                    sha256: "key-digest".into(),
-                    mode: WORKLOAD_PRIVATE_KEY_MODE,
+                    sha256: "config-digest".into(),
+                    mode: 0o644,
                 },
             )]),
         };
@@ -1770,12 +1865,12 @@ mod tests {
         assert!(command
             .contains("$(sudo cat /opt/wruntime/wr-node/releases/.1.tmp/resolved-release.sha256)"));
         assert!(command.contains(
-            "$(sudo sha256sum /opt/wruntime/wr-node/releases/.1.tmp/certs/job-admin-delegation/node.key | cut -d' ' -f1)"
+            "$(sudo sha256sum /opt/wruntime/wr-node/releases/.1.tmp/config/engine.toml | cut -d' ' -f1)"
         ));
         assert!(command.contains(
-            "$(sudo stat -c '%a' /opt/wruntime/wr-node/releases/.1.tmp/certs/job-admin-delegation/node.key)"
+            "$(sudo stat -c '%a' /opt/wruntime/wr-node/releases/.1.tmp/config/engine.toml)"
         ));
-        assert!(command.contains("= '640'"));
+        assert!(command.contains("= '644'"));
         assert!(!command.contains("$(sha256sum"));
         assert!(!command.contains("$(stat"));
         assert_eq!(
@@ -1785,20 +1880,13 @@ mod tests {
     }
 
     #[test]
-    fn protected_script_generates_node_delegation_certificate_under_provisioned_host_name() {
-        assert_eq!(
-            delegation_certificate_sources("certs", "node.example"),
-            [
-                "certs/job-admin-delegation/ca.crt",
-                "certs/job-admin-delegation/node.example.crt",
-                "certs/job-admin-delegation/node.example.key",
-            ]
-        );
-        assert!(
-            include_str!("../../../dev/validate-deployment-lifecycle.sh").contains(
-                "cert generate \"$NODE_HOST\" --ca-dir \"$CERT_DIR/job-admin-delegation\""
-            )
-        );
+    fn protected_script_uses_profile_specific_host_credentials() {
+        let script = include_str!("../../../dev/validate-deployment-lifecycle.sh");
+        assert!(script.contains("cert issue proxy-peer-endpoint"));
+        assert!(script.contains("cert issue proxy"));
+        assert!(script.contains("cert issue node-agent"));
+        assert!(script.contains("cert issue engine-admin-endpoint"));
+        assert!(!script.contains("job-admin-delegation"));
     }
 
     fn temp_bundle_path(name: &str) -> PathBuf {
@@ -1813,12 +1901,11 @@ mod tests {
     fn engine_dockerfile_copies_only_present_optional_artifacts() {
         assert_eq!(
             engine_docker_extra_copies(false, false),
-            vec![("certs/", "certs/"), ("modules/", "modules/")]
+            vec![("modules/", "modules/")]
         );
         assert_eq!(
             engine_docker_extra_copies(true, true),
             vec![
-                ("certs/", "certs/"),
                 ("modules/", "modules/"),
                 ("schemas/", "schemas/"),
                 ("migrations/", "migrations/")
@@ -1987,6 +2074,10 @@ migrations_path = {migrations:?}
                     has_schema: true,
                 },
             ],
+            secrets: Vec::new(),
+            db_namespaces: Vec::new(),
+            job_queue_id: String::new(),
+            job_admin_address: String::new(),
         }];
         let mut right = left.clone();
         right[0].modules.reverse();
@@ -2070,10 +2161,15 @@ proxy_address = "http://127.0.0.1:9555"
 control_address = "http://127.0.0.1:9102"
 peer_address = "https://10.0.0.5:9555"
 
-[node.tls]
-cert_path = "certs/source.crt"
-key_path = "certs/source.key"
-ca_cert_path = "certs/source-ca.crt"
+[endpoint_tls]
+cert_path = "certs/source-endpoint.crt"
+key_path = "certs/source-endpoint.key"
+client_ca_cert_path = "certs/source-client-root.crt"
+
+[client_tls]
+cert_path = "certs/source-client.crt"
+key_path = "certs/source-client.key"
+server_ca_cert_path = "certs/source-server-root.crt"
 
 [circuit_breaker]
 failure_threshold = 7
@@ -2133,17 +2229,14 @@ allowed_hosts = ["api.example.com"]
                 Some("api.example.com")
             );
             assert_eq!(
-                proxy_value["node"]["tls"]["cert_path"].as_str(),
-                Some("certs/node.crt")
+                proxy_value["endpoint_tls"]["cert_path"].as_str(),
+                Some("/etc/wruntime/pki/proxy-endpoint/sets/v1/leaf.pem")
             );
             assert_eq!(
-                proxy_value["node"]["tls"]["key_path"].as_str(),
-                Some("certs/node.key")
+                proxy_value["client_tls"]["cert_path"].as_str(),
+                Some("/etc/wruntime/pki/proxy-client/sets/v1/leaf.pem")
             );
-            assert_eq!(
-                proxy_value["node"]["tls"]["ca_cert_path"].as_str(),
-                Some("certs/ca.crt")
-            );
+            assert!(proxy_value["node"].get("tls").is_none());
 
             let engine_dockerfile =
                 bundle::read_file_from_tarball(path.to_str().unwrap(), "Dockerfile.engine-engine")?;

@@ -152,8 +152,10 @@ fn compose_engines(
                         && deployment.revision == metadata.revision
                         && deployment.bundle_digest == metadata.bundle_digest
                         && deployment
-                            .expected_engines
-                            .iter()
+                            .inventory
+                            .as_ref()
+                            .into_iter()
+                            .flat_map(|inventory| inventory.engines.iter())
                             .any(|expected| expected.engine_slot == metadata.engine_slot)
                 });
                 let selected = snapshot.slot_authorities.iter().find(|authority| {
@@ -425,15 +427,22 @@ fn compose_services(
         .collect();
     let mut desired: BTreeMap<ServiceKey, u32> = BTreeMap::new();
     for deployment in current.values() {
-        for engine in &deployment.expected_engines {
+        for engine in deployment
+            .inventory
+            .as_ref()
+            .into_iter()
+            .flat_map(|inventory| inventory.engines.iter())
+        {
             for module in &engine.modules {
-                *desired
-                    .entry((
-                        module.namespace.clone(),
-                        module.name.clone(),
-                        module.version.clone(),
-                    ))
-                    .or_default() += 1;
+                if let Some(module) = module.identity.as_ref() {
+                    *desired
+                        .entry((
+                            module.namespace.clone(),
+                            module.name.clone(),
+                            module.version.clone(),
+                        ))
+                        .or_default() += 1;
+                }
             }
         }
     }
@@ -683,7 +692,9 @@ mod tests {
 
     #[test]
     fn service_availability_is_partial_and_deterministic() {
-        use wr_common::wruntime::{DeploymentRecord, ExpectedEngine, RoutingRule};
+        use wr_common::wruntime::{
+            DeploymentInventoryV1, DeploymentRecord, ExpectedEngine, ExpectedModule, RoutingRule,
+        };
 
         let module = ModuleIdentity {
             namespace: "store".into(),
@@ -693,16 +704,27 @@ mod tests {
         let deployment = DeploymentRecord {
             node_id: "node-a".into(),
             revision: 1,
-            expected_engines: vec![
-                ExpectedEngine {
-                    engine_slot: "one".into(),
-                    modules: vec![module.clone()],
-                },
-                ExpectedEngine {
-                    engine_slot: "two".into(),
-                    modules: vec![module],
-                },
-            ],
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![
+                    ExpectedEngine {
+                        engine_slot: "one".into(),
+                        modules: vec![ExpectedModule {
+                            identity: Some(module.clone()),
+                            proto_schema_digest: String::new(),
+                        }],
+                        ..Default::default()
+                    },
+                    ExpectedEngine {
+                        engine_slot: "two".into(),
+                        modules: vec![ExpectedModule {
+                            identity: Some(module),
+                            proto_schema_digest: String::new(),
+                        }],
+                        ..Default::default()
+                    },
+                ],
+            }),
             ..Default::default()
         };
         let current = BTreeMap::from([("node-a".to_string(), deployment)]);

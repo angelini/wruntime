@@ -3,13 +3,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tonic::transport::{Channel, Endpoint};
-use wr_common::node::TlsConfig;
-use wr_common::wruntime::job_admin_service_client::JobAdminServiceClient;
+use wr_common::manager_client::{ManagerEpoch, ManagerEpochProvider, RetryClass};
+use wr_common::node::{ClientTlsConfig, TlsConfig};
 use wr_common::wruntime::lifecycle_service_client::LifecycleServiceClient;
-use wr_common::wruntime::manager_service_client::ManagerServiceClient;
-use wr_common::wruntime::node_agent_service_client::NodeAgentServiceClient;
-use wr_common::wruntime::node_service_client::NodeServiceClient;
-use wr_common::wruntime::operator_service_client::OperatorServiceClient;
+use wr_common::wruntime::proxy_node_control_service_client::ProxyNodeControlServiceClient;
 use wr_common::wruntime::{GetClusterStatusRequest, GetClusterStatusResponse, ListManagersRequest};
 
 /// Global TLS config for CLI → manager connections.
@@ -40,60 +37,83 @@ fn endpoint_with_tls(addr: &str, tls: Option<&TlsConfig>) -> Result<Endpoint> {
     Ok(endpoint)
 }
 
-fn endpoint(addr: &str, explicit_tls: Option<&TlsConfig>) -> Result<Endpoint> {
-    endpoint_with_tls(addr, connection_tls_config(explicit_tls))
-}
-
 async fn connect_inner(
     addr: &str,
     explicit_tls: Option<&TlsConfig>,
-) -> Result<ManagerServiceClient<Channel>> {
-    let channel = endpoint(addr, explicit_tls)?
-        .connect()
+    retry_class: RetryClass,
+) -> Result<ManagerEpoch> {
+    let tls_paths = connection_tls_config(explicit_tls)
+        .context("manager connections require an explicit named client identity")?;
+    let uri: http::Uri = addr.parse().context("invalid manager endpoint")?;
+    let server_name = uri
+        .host()
+        .context("manager endpoint requires a host")?
+        .to_string();
+    let tls = wr_common::tls::build_tonic_client_tls(tls_paths)?;
+    let provider = ManagerEpochProvider::new(
+        vec![wr_common::manager_client::ManagerCandidate {
+            endpoint: addr.to_string(),
+            server_name,
+        }],
+        tls,
+        tls_paths.ca_cert_path.clone(),
+        tls_paths.cert_path.clone(),
+    )?;
+    let epoch = provider
+        .pin(retry_class)
         .await
-        .context("failed to connect to manager")?;
-    Ok(ManagerServiceClient::new(channel))
+        .context("failed to pin manager epoch")?;
+    Ok(epoch)
 }
 
 /// Connect to a specific manager address with the standard endpoint timeouts.
 /// Uses the global TLS config if set via [`set_tls_config`].
-pub async fn connect(addr: &str) -> Result<ManagerServiceClient<Channel>> {
-    connect_inner(addr, None).await
+pub async fn connect(addr: &str) -> Result<ManagerEpoch> {
+    connect_with_retry(addr, RetryClass::ReadOnly).await
+}
+
+pub async fn connect_with_retry(addr: &str, retry_class: RetryClass) -> Result<ManagerEpoch> {
+    connect_inner(addr, None, retry_class).await
 }
 
 /// Connect to the role-gated operator API with the configured mTLS identity.
-pub async fn connect_operator(addr: &str) -> Result<OperatorServiceClient<Channel>> {
-    let channel = endpoint(addr, None)?
-        .connect()
-        .await
-        .context("failed to connect to manager operator service")?;
-    Ok(OperatorServiceClient::new(channel))
+pub async fn connect_operator(addr: &str, retry_class: RetryClass) -> Result<ManagerEpoch> {
+    connect_inner(addr, None, retry_class).await
 }
 
-/// Connect to the dedicated operator job-administration listener with caller-owned TLS.
-pub async fn connect_job_admin(
+/// Pin the sole manager listener with an explicit named client identity.
+pub async fn connect_authenticated_with_tls(
     addr: &str,
     tls: &TlsConfig,
-) -> Result<JobAdminServiceClient<Channel>> {
-    let channel = endpoint_with_tls(addr, Some(tls))?
-        .connect()
-        .await
-        .context("failed to connect to manager job administration service")?;
-    Ok(JobAdminServiceClient::new(channel)
-        .max_decoding_message_size(wr_common::lifecycle::MAX_JOB_ADMIN_MESSAGE_BYTES)
-        .max_encoding_message_size(wr_common::lifecycle::MAX_JOB_ADMIN_MESSAGE_BYTES))
+    retry_class: RetryClass,
+) -> Result<ManagerEpoch> {
+    connect_inner(addr, Some(tls), retry_class).await
 }
 
 /// Connect to the pull-based node-agent API with the configured mTLS identity.
 pub async fn connect_node_agent_with_tls(
     addr: &str,
-    tls: Option<&TlsConfig>,
-) -> Result<NodeAgentServiceClient<Channel>> {
-    let channel = endpoint_with_tls(addr, tls)?
-        .connect()
+    tls: Option<&ClientTlsConfig>,
+) -> Result<ManagerEpoch> {
+    let tls = tls.context("node-agent manager connections require a named client identity")?;
+    let uri: http::Uri = addr.parse().context("invalid manager endpoint")?;
+    let server_name = uri
+        .host()
+        .context("manager endpoint requires a host")?
+        .to_string();
+    let provider = ManagerEpochProvider::new(
+        vec![wr_common::manager_client::ManagerCandidate {
+            endpoint: addr.to_string(),
+            server_name,
+        }],
+        wr_common::tls::build_tonic_client_tls(tls)?,
+        tls.server_ca_cert_path.clone(),
+        tls.cert_path.clone(),
+    )?;
+    provider
+        .pin(RetryClass::NoReplayMutation)
         .await
-        .context("failed to connect to manager node-agent service")?;
-    Ok(NodeAgentServiceClient::new(channel))
+        .context("failed to pin node-agent manager epoch")
 }
 
 /// Return the process-global CLI TLS credentials, when initialized.
@@ -115,12 +135,12 @@ pub async fn connect_lifecycle(
 }
 
 /// Connect to the proxy's loopback NodeService without inheriting manager TLS.
-pub async fn connect_node(addr: &str) -> Result<NodeServiceClient<Channel>> {
+pub async fn connect_node(addr: &str) -> Result<ProxyNodeControlServiceClient<Channel>> {
     let channel = endpoint_with_tls(addr, None)?
         .connect()
         .await
         .with_context(|| format!("failed to connect to proxy node endpoint {addr}"))?;
-    Ok(NodeServiceClient::new(channel))
+    Ok(ProxyNodeControlServiceClient::new(channel))
 }
 
 /// Fetch one coherent cluster status snapshot from a seed manager.

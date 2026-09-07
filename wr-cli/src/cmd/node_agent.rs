@@ -18,7 +18,7 @@ use tokio::sync::watch;
 use wr_common::agent_policy::{
     AgentPolicy, AgentPolicyBackend, AGENT_CAPABILITIES, AGENT_PROTOCOL_VERSION,
 };
-use wr_common::node::TlsConfig;
+use wr_common::node::ClientTlsConfig;
 use wr_common::wruntime::{
     AgentInstruction, AttestNodeAgentRequest, BackendKind, ClaimOperationRequest,
     GetOperatorStatusRequest, NodeAgentAttestation, NodeAgentPolicy, NodeOperationStepKind,
@@ -146,11 +146,11 @@ impl AgentConfig {
         }
     }
 
-    fn tls(&self) -> TlsConfig {
-        TlsConfig {
+    fn tls(&self) -> ClientTlsConfig {
+        ClientTlsConfig {
             cert_path: self.client_cert_path.clone(),
             key_path: self.client_key_path.clone(),
-            ca_cert_path: self.ca_cert_path.clone(),
+            server_ca_cert_path: self.ca_cert_path.clone(),
         }
     }
 
@@ -364,16 +364,16 @@ where
     }
 }
 
-struct ProductionManager<'a> {
-    config: &'a AgentConfig,
+struct ProductionManager {
+    manager: tokio::sync::Mutex<wr_common::manager_client::ManagerEpoch>,
 }
 
-impl LeaseManager for ProductionManager<'_> {
+impl LeaseManager for ProductionManager {
     fn renew<'a>(&'a self, lease: &'a LeaseIdentity) -> AgentFuture<'a, ()> {
         Box::pin(async move {
-            let tls = self.config.tls();
-            client::connect_node_agent_with_tls(&self.config.manager_endpoint, Some(&tls))
-                .await?
+            self.manager
+                .lock()
+                .await
                 .renew_operation_lease(RenewOperationLeaseRequest {
                     node_id: lease.node_id.clone(),
                     operation_id: lease.operation_id.clone(),
@@ -387,18 +387,18 @@ impl LeaseManager for ProductionManager<'_> {
     }
 }
 
-impl AgentManager for ProductionManager<'_> {
+impl AgentManager for ProductionManager {
     fn attest<'a>(&'a self, attestation: NodeAgentAttestation) -> AgentFuture<'a, ()> {
         Box::pin(async move {
-            let tls = self.config.tls();
-            let response =
-                client::connect_node_agent_with_tls(&self.config.manager_endpoint, Some(&tls))
-                    .await?
-                    .attest(AttestNodeAgentRequest {
-                        attestation: Some(attestation),
-                    })
-                    .await?
-                    .into_inner();
+            let response = self
+                .manager
+                .lock()
+                .await
+                .attest(AttestNodeAgentRequest {
+                    attestation: Some(attestation),
+                })
+                .await?
+                .into_inner();
             if !response.accepted || !response.conditions.is_empty() {
                 let codes = response
                     .conditions
@@ -418,18 +418,17 @@ impl AgentManager for ProductionManager<'_> {
         agent_instance_id: &'a str,
     ) -> AgentFuture<'a, Option<AgentInstruction>> {
         Box::pin(async move {
-            let tls = self.config.tls();
-            Ok(
-                client::connect_node_agent_with_tls(&self.config.manager_endpoint, Some(&tls))
-                    .await?
-                    .claim_operation(ClaimOperationRequest {
-                        node_id: node_id.to_string(),
-                        agent_instance_id: agent_instance_id.to_string(),
-                    })
-                    .await?
-                    .into_inner()
-                    .instruction,
-            )
+            Ok(self
+                .manager
+                .lock()
+                .await
+                .claim_operation(ClaimOperationRequest {
+                    node_id: node_id.to_string(),
+                    agent_instance_id: agent_instance_id.to_string(),
+                })
+                .await?
+                .into_inner()
+                .instruction)
         })
     }
 
@@ -438,9 +437,9 @@ impl AgentManager for ProductionManager<'_> {
         request: ReportNodeObservationRequest,
     ) -> AgentFuture<'a, ()> {
         Box::pin(async move {
-            let tls = self.config.tls();
-            client::connect_node_agent_with_tls(&self.config.manager_endpoint, Some(&tls))
-                .await?
+            self.manager
+                .lock()
+                .await
                 .report_observation(request)
                 .await?;
             Ok(())
@@ -449,11 +448,7 @@ impl AgentManager for ProductionManager<'_> {
 
     fn report_result<'a>(&'a self, request: ReportStepResultRequest) -> ReportResultFuture<'a> {
         Box::pin(async move {
-            let tls = self.config.tls();
-            let mut manager =
-                client::connect_node_agent_with_tls(&self.config.manager_endpoint, Some(&tls))
-                    .await
-                    .map_err(|error| ReportResultError::Retryable(format!("{error:#}")))?;
+            let mut manager = self.manager.lock().await;
             match manager.report_step_result(request).await {
                 Ok(_) => Ok(()),
                 Err(status)
@@ -1066,7 +1061,7 @@ fn safe_install_path(path: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn wire_policy(
+pub(super) fn wire_policy(
     policy: &AgentPolicy,
     binary_digest: String,
     config_digest: String,
@@ -1133,12 +1128,13 @@ fn attestations_for_node(
 }
 
 async fn node_attestations(manager: &str, node_id: &str) -> Result<Vec<NodeAgentAttestation>> {
-    let attestations = client::connect_operator(manager)
-        .await?
-        .get_status(unfiltered_status_request())
-        .await?
-        .into_inner()
-        .agent_attestations;
+    let attestations =
+        client::connect_operator(manager, wr_common::manager_client::RetryClass::ReadOnly)
+            .await?
+            .get_status(unfiltered_status_request())
+            .await?
+            .into_inner()
+            .agent_attestations;
     Ok(attestations_for_node(attestations, node_id))
 }
 
@@ -1356,12 +1352,15 @@ async fn install(args: AgentInstallArgs, manager: &str, updating: bool) -> Resul
     )? == "match";
 
     if remote_matches {
-        client::connect_operator(manager)
-            .await?
-            .put_node_agent_policy(PutNodeAgentPolicyRequest {
-                policy: Some(wire_policy.clone()),
-            })
-            .await?;
+        client::connect_operator(
+            manager,
+            wr_common::manager_client::RetryClass::NoReplayMutation,
+        )
+        .await?
+        .put_node_agent_policy(PutNodeAgentPolicyRequest {
+            policy: Some(wire_policy.clone()),
+        })
+        .await?;
         if install_action(remote_matches, already_attested) == InstallAction::Noop {
             println!(
                 "[agent] exact bytes and fresh attestation already match; no restart required"
@@ -1394,12 +1393,15 @@ async fn install(args: AgentInstallArgs, manager: &str, updating: bool) -> Resul
             .context("remote node-agent payload checksum mismatch")?;
         // Only after every new byte is durably staged does the manager expectation
         // move. A retry can safely finish activation if interruption follows.
-        client::connect_operator(manager)
-            .await?
-            .put_node_agent_policy(PutNodeAgentPolicyRequest {
-                policy: Some(wire_policy.clone()),
-            })
-            .await?;
+        client::connect_operator(
+            manager,
+            wr_common::manager_client::RetryClass::NoReplayMutation,
+        )
+        .await?
+        .put_node_agent_policy(PutNodeAgentPolicyRequest {
+            policy: Some(wire_policy.clone()),
+        })
+        .await?;
         helpers::run_ssh(&ssh, &remote_activate_command(&manifest.workdir, &material))
             .context("node-agent service restart failed")?;
     }
@@ -1433,7 +1435,7 @@ async fn install(args: AgentInstallArgs, manager: &str, updating: bool) -> Resul
         )
     })?;
     println!("[agent] authenticated activation {instance} is ready");
-    let status = client::connect_operator(manager)
+    let status = client::connect_operator(manager, wr_common::manager_client::RetryClass::ReadOnly)
         .await?
         .get_status(unfiltered_status_request())
         .await?
@@ -1481,14 +1483,13 @@ async fn run_agent(args: AgentRunArgs) -> Result<()> {
         let _ = tokio::signal::ctrl_c().await;
         let _ = shutdown_tx.send(true);
     });
-    run_activation(
-        &ProductionManager { config: &config },
-        &backend,
-        &TokioClock,
-        activation,
-        shutdown_rx,
-    )
-    .await
+    let tls = config.tls();
+    let manager = ProductionManager {
+        manager: tokio::sync::Mutex::new(
+            client::connect_node_agent_with_tls(&config.manager_endpoint, Some(&tls)).await?,
+        ),
+    };
+    run_activation(&manager, &backend, &TokioClock, activation, shutdown_rx).await
 }
 
 pub async fn run(args: AgentArgs, manager: Option<&str>) -> Result<()> {
@@ -2117,5 +2118,18 @@ ca_cert_path = "/etc/wruntime/ca.crt"
         assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
         assert!(executor.cancelled.load(Ordering::SeqCst));
         assert_eq!(manager.result_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn operation_workflow_has_one_manager_epoch_acquisition_site() {
+        let source = include_str!("node_agent.rs");
+        assert_eq!(
+            source
+                .matches(concat!("connect_node_agent", "_with_tls("))
+                .count(),
+            1
+        );
+        assert!(source.contains("execute_instruction(&mut manager"));
+        assert!(source.contains("manager.report_step_result(report)"));
     }
 }

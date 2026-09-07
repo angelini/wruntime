@@ -5,10 +5,9 @@ use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
 use tokio::time::Instant;
 use tracing::{info, warn};
 use wr_common::discovery::ManagerDiscovery;
+use wr_common::manager_client::{ManagerClient as ManagerServiceClient, ManagerEpoch, RetryClass};
 use wr_common::task_group::{TaskCancellation, TaskExit};
-use wr_common::wruntime::{
-    manager_service_client::ManagerServiceClient, GetRoutingTableRequest, RoutingTable,
-};
+use wr_common::wruntime::{GetRoutingTableRequest, RoutingTable};
 
 use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::config::CircuitBreakerConfig;
@@ -111,6 +110,7 @@ pub async fn sync_once(
 /// Synchronize until the local snapshot contains at least `target_version`.
 pub async fn converge_to_version(
     discovery: &ManagerDiscovery,
+    epoch: &mut ManagerEpoch,
     table: &CachedRoutingTable,
     target_version: u64,
     deadline: Instant,
@@ -126,8 +126,13 @@ pub async fn converge_to_version(
             )));
         }
 
-        let mut client = discovery.get_client().await?;
-        sync_once(&mut client, table).await?;
+        if let Err(error) = sync_once(epoch, table).await {
+            if is_transport_failure(&error) {
+                *epoch = discovery.repin(epoch).await?;
+                continue;
+            }
+            return Err(error);
+        }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(20)) => {}
             _ = tokio::time::sleep_until(deadline) => {
@@ -143,27 +148,48 @@ pub async fn converge_to_version(
 /// Background task: polls a manager for the routing table until cancellation.
 pub async fn sync_routing_table(
     discovery: Arc<ManagerDiscovery>,
+    initial_epoch: ManagerEpoch,
     table: CachedRoutingTable,
     ttl_secs: u64,
     mut cancellation: TaskCancellation,
 ) -> anyhow::Result<TaskExit> {
     let mut interval = tokio::time::interval(Duration::from_secs(ttl_secs));
+    let mut epoch = Some(initial_epoch);
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
             _ = interval.tick() => {}
         }
-        match discovery.get_client().await {
-            Ok(mut client) => {
-                if let Err(error) = sync_once(&mut client, &table).await {
-                    warn!(%error, "routing table sync failed");
+        if epoch.is_none() {
+            epoch = discovery.pin(RetryClass::ReadOnly).await.ok();
+        }
+        let Some(retained) = epoch.as_mut() else {
+            warn!("routing table sync: all managers unreachable");
+            continue;
+        };
+        if let Err(error) = sync_once(retained, &table).await {
+            if is_transport_failure(&error) {
+                match discovery.repin(retained).await {
+                    Ok(replacement) => *retained = replacement,
+                    Err(repin_error) => {
+                        warn!(%repin_error, "routing table sync could not repin manager epoch");
+                        epoch = None;
+                    }
                 }
             }
-            Err(error) => {
-                warn!(%error, "routing table sync: all managers unreachable");
-            }
+            warn!(%error, "routing table sync failed");
         }
     }
+}
+
+pub(crate) fn is_transport_failure(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Cancelled
+            | tonic::Code::Unknown
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Unavailable
+    )
 }
 
 #[cfg(test)]

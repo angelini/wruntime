@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use prost_reflect::{DescriptorPool, MessageDescriptor};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use wr_common::discovery::ManagerDiscovery;
 use wr_common::wruntime::GetSchemaRequest;
 
@@ -26,6 +26,7 @@ impl SchemaKey {
 /// Lazily loads and caches immutable module schemas by exact routed version.
 pub struct SchemaCache {
     pools: RwLock<HashMap<SchemaKey, DescriptorPool>>,
+    manager_epoch: Mutex<Option<wr_common::manager_client::ManagerEpoch>>,
     discovery: Option<Arc<ManagerDiscovery>>,
 }
 
@@ -33,6 +34,7 @@ impl SchemaCache {
     pub fn new(discovery: Arc<ManagerDiscovery>) -> Self {
         Self {
             pools: RwLock::new(HashMap::new()),
+            manager_epoch: Mutex::new(None),
             discovery: Some(discovery),
         }
     }
@@ -84,20 +86,36 @@ impl SchemaCache {
             .discovery
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("schema is not cached"))?;
-        let mut client = discovery
-            .get_client()
-            .await
-            .map_err(|error| anyhow::anyhow!("manager unavailable: {error}"))?;
-        let schema_bytes = client
-            .get_schema(GetSchemaRequest {
-                namespace: namespace.to_owned(),
-                module: module.to_owned(),
-                version: version.to_owned(),
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("schema fetch failed: {error}"))?
-            .into_inner()
-            .proto_schema;
+        let request = GetSchemaRequest {
+            namespace: namespace.to_owned(),
+            module: module.to_owned(),
+            version: version.to_owned(),
+        };
+        let mut retained = self.manager_epoch.lock().await;
+        if retained.is_none() {
+            *retained = Some(
+                discovery
+                    .pin(wr_common::manager_client::RetryClass::ReadOnly)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("manager unavailable: {error}"))?,
+            );
+        }
+        let epoch = retained.as_mut().expect("manager epoch was installed");
+        let response = match epoch.get_schema(request.clone()).await {
+            Ok(response) => response,
+            Err(error) if crate::routing::is_transport_failure(&error) => {
+                *epoch = discovery
+                    .repin(epoch)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("schema manager repin failed: {error}"))?;
+                epoch
+                    .get_schema(request)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("schema fetch failed: {error}"))?
+            }
+            Err(error) => return Err(anyhow::anyhow!("schema fetch failed: {error}")),
+        };
+        let schema_bytes = response.into_inner().proto_schema;
 
         self.insert(namespace, module, version, &schema_bytes)
             .await?;
@@ -114,6 +132,7 @@ impl Default for SchemaCache {
     fn default() -> Self {
         Self {
             pools: RwLock::new(HashMap::new()),
+            manager_epoch: Mutex::new(None),
             discovery: None,
         }
     }

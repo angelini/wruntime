@@ -99,7 +99,11 @@ async fn apply(manager: &str, file_path: &str) -> Result<()> {
     let content = std::fs::read_to_string(file_path)?;
     let schedules_file: SchedulesFile = toml::from_str(&content)?;
 
-    let mut client = client::connect(manager).await?;
+    let mut client = client::connect_with_retry(
+        manager,
+        wr_common::manager_client::RetryClass::NoReplayMutation,
+    )
+    .await?;
 
     for entry in &schedules_file.schedule {
         entry.validate()?;
@@ -133,7 +137,11 @@ async fn apply(manager: &str, file_path: &str) -> Result<()> {
 
 /// Apply schedules from parsed entries (used by node deploy integration).
 pub async fn apply_entries(manager: &str, entries: &[ScheduleEntry]) -> Result<()> {
-    let mut client = client::connect(manager).await?;
+    let mut client = client::connect_with_retry(
+        manager,
+        wr_common::manager_client::RetryClass::NoReplayMutation,
+    )
+    .await?;
 
     for entry in entries {
         entry.validate()?;
@@ -231,7 +239,11 @@ async fn delete(
     version: &str,
     job_type: &str,
 ) -> Result<()> {
-    let mut client = client::connect(manager).await?;
+    let mut client = client::connect_with_retry(
+        manager,
+        wr_common::manager_client::RetryClass::NoReplayMutation,
+    )
+    .await?;
     client
         .delete_schedule(DeleteScheduleRequest {
             worker_namespace: namespace.to_string(),

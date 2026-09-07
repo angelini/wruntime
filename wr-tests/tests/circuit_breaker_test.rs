@@ -2,7 +2,7 @@ mod helpers;
 use helpers::{
     manager::{
         manager_trio, register_test_module_ready, register_test_module_ready_with_peer,
-        synced_routing_table_with_config,
+        register_test_replica_set_ready, synced_routing_table_with_config,
     },
     proxy::{http_client, proxy_get, start_proxy_with_cb, EngineSpec, ModuleSpec},
     stubs::{spawn_status_stub, spawn_stub_engine, spawn_switchable_stub},
@@ -326,21 +326,13 @@ async fn test_circuit_breaker_skips_open_replica_for_same_route() -> Result<()> 
         spawn_status_stub(StatusCode::INTERNAL_SERVER_ERROR).await?;
     let (healthy_addr, healthy_shutdown) = spawn_stub_engine().await?;
 
-    register_test_module_ready(
+    register_test_replica_set_ready(
         &pool,
         &mut mgr,
-        "cb-replica-failing",
-        &failing_addr,
-        "cb-replica-ns",
-        "shared-svc",
-        "1.0.0",
-    )
-    .await?;
-    register_test_module_ready(
-        &pool,
-        &mut mgr,
-        "cb-replica-healthy",
-        &healthy_addr,
+        &[
+            ("cb-replica-failing", failing_addr.as_str()),
+            ("cb-replica-healthy", healthy_addr.as_str()),
+        ],
         "cb-replica-ns",
         "shared-svc",
         "1.0.0",

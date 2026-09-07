@@ -452,7 +452,12 @@ fn status_name(value: i32) -> &'static str {
 }
 
 async fn queues(manager: &str, tls: &TlsConfig, format: OutputFormat) -> Result<()> {
-    let mut client = client::connect_job_admin(manager, tls).await?;
+    let mut client = client::connect_authenticated_with_tls(
+        manager,
+        tls,
+        wr_common::manager_client::RetryClass::ReadOnly,
+    )
+    .await?;
     let response = client
         .list_job_queues(ListJobQueuesRequest {})
         .await?
@@ -517,7 +522,12 @@ async fn list(
     cursor: String,
     format: OutputFormat,
 ) -> Result<()> {
-    let mut client = client::connect_job_admin(connection.manager, connection.tls).await?;
+    let mut client = client::connect_authenticated_with_tls(
+        connection.manager,
+        connection.tls,
+        wr_common::manager_client::RetryClass::ReadOnly,
+    )
+    .await?;
     let response = client
         .list_jobs(ListJobsRequest {
             job_queue_id: queue.into(),
@@ -593,7 +603,12 @@ async fn summary(
     filter: Option<JobFilter>,
     format: OutputFormat,
 ) -> Result<()> {
-    let mut client = client::connect_job_admin(manager, tls).await?;
+    let mut client = client::connect_authenticated_with_tls(
+        manager,
+        tls,
+        wr_common::manager_client::RetryClass::ReadOnly,
+    )
+    .await?;
     let summary = client
         .get_job_queue_summary(GetJobQueueSummaryRequest {
             job_queue_id: queue.into(),
@@ -662,7 +677,12 @@ async fn inspect(
     if let Some(path) = result_out {
         validate_binary_output(path, force)?;
     }
-    let mut client = client::connect_job_admin(connection.manager, connection.tls).await?;
+    let mut client = client::connect_authenticated_with_tls(
+        connection.manager,
+        connection.tls,
+        wr_common::manager_client::RetryClass::ReadOnly,
+    )
+    .await?;
     let job = client
         .get_job(GetJobRequest {
             job_queue_id: queue.into(),
@@ -760,7 +780,12 @@ async fn retry(
     job_id: &str,
     format: OutputFormat,
 ) -> Result<()> {
-    let mut client = client::connect_job_admin(manager, tls).await?;
+    let mut client = client::connect_authenticated_with_tls(
+        manager,
+        tls,
+        wr_common::manager_client::RetryClass::NoReplayMutation,
+    )
+    .await?;
     let job = client
         .retry_job(RetryJobRequest {
             job_queue_id: queue.into(),

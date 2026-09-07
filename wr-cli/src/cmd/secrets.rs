@@ -50,7 +50,11 @@ pub async fn run(args: SecretsArgs, manager: &str) -> Result<()> {
 }
 
 async fn set(manager: &str, namespace: &str, key: &str, value: &str) -> Result<()> {
-    let mut client = client::connect(manager).await?;
+    let mut client = client::connect_with_retry(
+        manager,
+        wr_common::manager_client::RetryClass::NoReplayMutation,
+    )
+    .await?;
     client
         .set_secret(SetSecretRequest {
             namespace: namespace.to_string(),
@@ -63,7 +67,11 @@ async fn set(manager: &str, namespace: &str, key: &str, value: &str) -> Result<(
 }
 
 async fn delete(manager: &str, namespace: &str, key: &str) -> Result<()> {
-    let mut client = client::connect(manager).await?;
+    let mut client = client::connect_with_retry(
+        manager,
+        wr_common::manager_client::RetryClass::NoReplayMutation,
+    )
+    .await?;
     client
         .delete_secret(DeleteSecretRequest {
             namespace: namespace.to_string(),

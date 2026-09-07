@@ -53,17 +53,22 @@ pub struct NodeConfig {
     pub control_address: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub peer_address: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls: Option<CliTlsConfig>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
-pub struct CliTlsConfig {
+#[serde(deny_unknown_fields)]
+pub struct CliServerTlsConfig {
     pub cert_path: String,
     pub key_path: String,
-    pub ca_cert_path: String,
-    #[serde(flatten)]
-    pub extra: ExtraFields,
+    pub client_ca_cert_path: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct CliClientTlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
+    pub server_ca_cert_path: String,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -72,6 +77,8 @@ pub struct DeploymentConfig {
     pub revision: String,
     pub bundle_digest: String,
     pub engine_slot: String,
+    pub operation_id: String,
+    pub revision_digest: String,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
@@ -81,7 +88,7 @@ pub struct JobAdminConfig {
     pub listen_address: String,
     pub advertise_address: String,
     pub queue_id: String,
-    pub tls: CliTlsConfig,
+    pub tls: CliServerTlsConfig,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -195,9 +202,11 @@ impl EngineConfig {
         if let Some(ref mut job_admin) = config.job_admin {
             let port = super::helpers::extract_port(&job_admin.advertise_address)?;
             job_admin.advertise_address = format!("https://{{host}}:{}", port.get());
-            job_admin.tls.cert_path = "certs/job-admin-delegation/node.crt".to_string();
-            job_admin.tls.key_path = "certs/job-admin-delegation/node.key".to_string();
-            job_admin.tls.ca_cert_path = "certs/job-admin-delegation/ca.crt".to_string();
+            job_admin.tls.cert_path =
+                "/etc/wruntime/pki/engine-admin-endpoint/sets/v1/leaf.pem".to_string();
+            job_admin.tls.key_path =
+                "/etc/wruntime/pki/engine-admin-endpoint/sets/v1/key.pem".to_string();
+            job_admin.tls.client_ca_cert_path = "/etc/wruntime/pki/roots/client/ca.crt".to_string();
         }
 
         Ok(config)
@@ -215,6 +224,8 @@ pub struct ProxyConfig {
     pub control_address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<ProxyNodeConfig>,
+    pub endpoint_tls: CliServerTlsConfig,
+    pub client_tls: CliClientTlsConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<ProxyDatabaseConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,8 +240,6 @@ pub struct ProxyNodeConfig {
     pub proxy_address: String,
     pub control_address: String,
     pub peer_address: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls: Option<CliTlsConfig>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -255,25 +264,23 @@ pub struct ProxyCacheConfig {
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct ManagerConfig {
+    pub manager_id: String,
     pub listen_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_heartbeat_timeout_secs: Option<u32>,
     pub database: ManagerDatabaseConfig,
     pub cluster: ClusterConfig,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls: Option<CliTlsConfig>,
-    pub job_admin: ManagerJobAdminConfig,
-    pub job_admin_delegation_tls: CliTlsConfig,
+    pub tls: CliServerTlsConfig,
+    pub client_tls: CliClientTlsConfig,
+    pub authorization: ManagerAuthorizationConfig,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
-pub struct ManagerJobAdminConfig {
-    pub listen_address: String,
-    pub tls: CliTlsConfig,
-    #[serde(flatten)]
-    pub extra: ExtraFields,
+#[serde(deny_unknown_fields)]
+pub struct ManagerAuthorizationConfig {
+    pub policy_file: String,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -312,29 +319,21 @@ impl ManagerConfig {
     }
 
     /// Create a bundle-ready copy with deploy-varying database and manager addresses.
-    pub fn to_bundle_config(&self) -> Self {
+    pub fn to_bundle_config(&self, _workdir: &str) -> Self {
         let mut config = self.clone();
+        config.authorization.policy_file = format!(
+            "/var/lib/wruntime/manager-config/{}/authorization.toml",
+            self.manager_id
+        );
         config.database.url = "{db_url}".to_string();
         config.cluster.advertise_grpc_address = Some("{advertise_address}".to_string());
-        let mut tls = config.tls.take().unwrap_or(CliTlsConfig {
-            cert_path: String::new(),
-            key_path: String::new(),
-            ca_cert_path: String::new(),
-            extra: empty_extra_fields(),
-        });
-        tls.cert_path = "certs/manager.crt".to_string();
-        tls.key_path = "certs/manager.key".to_string();
-        tls.ca_cert_path = "certs/ca.crt".to_string();
-        config.tls = Some(tls);
-        config.job_admin.tls.cert_path = "certs/job-admin-operator/manager.crt".to_string();
-        config.job_admin.tls.key_path = "certs/job-admin-operator/manager.key".to_string();
-        config.job_admin.tls.ca_cert_path = "certs/job-admin-operator/ca.crt".to_string();
-        config.job_admin_delegation_tls.cert_path =
-            "certs/job-admin-delegation/manager.crt".to_string();
-        config.job_admin_delegation_tls.key_path =
-            "certs/job-admin-delegation/manager.key".to_string();
-        config.job_admin_delegation_tls.ca_cert_path =
-            "certs/job-admin-delegation/ca.crt".to_string();
+        config.tls.cert_path = "/etc/wruntime/pki/manager-endpoint/sets/v1/leaf.pem".to_string();
+        config.tls.key_path = "/etc/wruntime/pki/manager-endpoint/sets/v1/key.pem".to_string();
+        config.tls.client_ca_cert_path = "/etc/wruntime/pki/roots/client/ca.crt".to_string();
+        config.client_tls.cert_path =
+            "/etc/wruntime/pki/manager-client/sets/v1/leaf.pem".to_string();
+        config.client_tls.key_path = "/etc/wruntime/pki/manager-client/sets/v1/key.pem".to_string();
+        config.client_tls.server_ca_cert_path = "/etc/wruntime/pki/roots/server/ca.crt".to_string();
         config
     }
 }
@@ -374,16 +373,18 @@ impl ProxyConfig {
             config_node.proxy_address = source_node.proxy_address.clone();
             config_node.control_address = source_node.control_address.clone();
             config_node.peer_address = "https://{host}:{peer_port}".to_string();
-            let mut tls = config_node.tls.take().unwrap_or(CliTlsConfig {
-                cert_path: String::new(),
-                key_path: String::new(),
-                ca_cert_path: String::new(),
-                extra: empty_extra_fields(),
-            });
-            tls.cert_path = "certs/node.crt".to_string();
-            tls.key_path = "certs/node.key".to_string();
-            tls.ca_cert_path = "certs/ca.crt".to_string();
-            config_node.tls = Some(tls);
+            config.endpoint_tls.cert_path =
+                "/etc/wruntime/pki/proxy-endpoint/sets/v1/leaf.pem".to_string();
+            config.endpoint_tls.key_path =
+                "/etc/wruntime/pki/proxy-endpoint/sets/v1/key.pem".to_string();
+            config.endpoint_tls.client_ca_cert_path =
+                "/etc/wruntime/pki/roots/client/ca.crt".to_string();
+            config.client_tls.cert_path =
+                "/etc/wruntime/pki/proxy-client/sets/v1/leaf.pem".to_string();
+            config.client_tls.key_path =
+                "/etc/wruntime/pki/proxy-client/sets/v1/key.pem".to_string();
+            config.client_tls.server_ca_cert_path =
+                "/etc/wruntime/pki/roots/server/ca.crt".to_string();
         }
         Ok(config)
     }
@@ -401,7 +402,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
     use wr_engine::config::EngineConfig as RuntimeEngineConfig;
-    use wr_manager::config::ManagerConfig as RuntimeManagerConfig;
+    use wr_manager::config::RawManagerConfig as RuntimeManagerConfig;
     use wr_proxy::config::ProxyConfig as RuntimeProxyConfig;
 
     fn runtime_unique_temp_path(name: &str, ext: &str) -> PathBuf {
@@ -495,7 +496,7 @@ mod tests {
     }
 
     fn parse_manager_bundle_toml(config: &ManagerConfig) -> toml::Value {
-        let toml = config.to_bundle_config().to_toml().unwrap();
+        let toml = config.to_bundle_config("/opt/wruntime").to_toml().unwrap();
         toml::from_str(&toml).unwrap()
     }
 
@@ -522,12 +523,6 @@ max_memory = "1GiB"
 proxy_address = "http://127.0.0.1:9001"
 control_address = "http://127.0.0.1:9002"
 peer_address = "https://127.0.0.1:9443"
-
-[node.tls]
-cert_path = "certs/source.crt"
-key_path = "certs/source.key"
-ca_cert_path = "certs/source-ca.crt"
-verify_name = "node.local"
 
 [blobstore]
 endpoint = "http://127.0.0.1:9000"
@@ -584,10 +579,7 @@ wasm_path = "target/wasm32-wasip2/debug/client.wasm"
             bundle["node"]["peer_address"].as_str(),
             Some("https://{host}:{peer_port}")
         );
-        assert_eq!(
-            bundle["node"]["tls"]["verify_name"].as_str(),
-            Some("node.local")
-        );
+        assert!(bundle["node"].get("tls").is_none());
         assert_eq!(bundle["allow_non_loopback_internal"].as_bool(), Some(true));
         assert_eq!(
             bundle["max_outbound_body_bytes"].as_integer(),
@@ -636,6 +628,7 @@ wasm_path = "target/wasm32-wasip2/debug/client.wasm"
     #[test]
     fn manager_bundle_transform_preserves_runtime_fields() {
         let source = r#"
+manager_id = "manager-a"
 listen_address = "127.0.0.1:9000"
 local_proxy_address = "http://127.0.0.1:9001"
 engine_heartbeat_timeout_secs = 20
@@ -656,24 +649,17 @@ manager_liveness_threshold_secs = 5
 manager_stale_row_reap_threshold_secs = 300
 
 [tls]
-cert_path = "certs/source.crt"
-key_path = "certs/source.key"
-ca_cert_path = "certs/source-ca.crt"
-server_name = "manager.local"
+cert_path = "certs/source-endpoint.crt"
+key_path = "certs/source-endpoint.key"
+client_ca_cert_path = "certs/source-client-root.crt"
 
-[job_admin]
-listen_address = "0.0.0.0:9020"
+[client_tls]
+cert_path = "certs/source-manager-client.crt"
+key_path = "certs/source-manager-client.key"
+server_ca_cert_path = "certs/source-server-root.crt"
 
-[job_admin.tls]
-cert_path = "certs/source-operator-server.crt"
-key_path = "certs/source-operator-server.key"
-ca_cert_path = "certs/source-operator-ca.crt"
-server_name = "jobs.manager.local"
-
-[job_admin_delegation_tls]
-cert_path = "certs/source-delegate.crt"
-key_path = "certs/source-delegate.key"
-ca_cert_path = "certs/source-delegate-ca.crt"
+[authorization]
+policy_file = "policy/source.toml"
 "#;
 
         let config: ManagerConfig = toml::from_str(source).unwrap();
@@ -686,30 +672,21 @@ ca_cert_path = "certs/source-delegate-ca.crt"
         );
         assert_eq!(
             bundle["tls"]["cert_path"].as_str(),
-            Some("certs/manager.crt")
+            Some("/etc/wruntime/pki/manager-endpoint/sets/v1/leaf.pem")
         );
         assert_eq!(
             bundle["tls"]["key_path"].as_str(),
-            Some("certs/manager.key")
-        );
-        assert_eq!(bundle["tls"]["ca_cert_path"].as_str(), Some("certs/ca.crt"));
-        assert_eq!(bundle["tls"]["server_name"].as_str(), Some("manager.local"));
-        assert_eq!(
-            bundle["job_admin"]["listen_address"].as_str(),
-            Some("0.0.0.0:9020")
+            Some("/etc/wruntime/pki/manager-endpoint/sets/v1/key.pem")
         );
         assert_eq!(
-            bundle["job_admin"]["tls"]["cert_path"].as_str(),
-            Some("certs/job-admin-operator/manager.crt")
+            bundle["tls"]["client_ca_cert_path"].as_str(),
+            Some("/etc/wruntime/pki/roots/client/ca.crt")
         );
         assert_eq!(
-            bundle["job_admin"]["tls"]["server_name"].as_str(),
-            Some("jobs.manager.local")
+            bundle["client_tls"]["cert_path"].as_str(),
+            Some("/etc/wruntime/pki/manager-client/sets/v1/leaf.pem")
         );
-        assert_eq!(
-            bundle["job_admin_delegation_tls"]["cert_path"].as_str(),
-            Some("certs/job-admin-delegation/manager.crt")
-        );
+        assert!(bundle.get("job_admin").is_none());
         assert_eq!(
             bundle["local_proxy_address"].as_str(),
             Some("http://127.0.0.1:9001")
@@ -751,11 +728,15 @@ proxy_address = "http://127.0.0.1:9001"
 control_address = "http://127.0.0.1:9002"
 peer_address = "https://127.0.0.1:9443"
 
-[node.tls]
-cert_path = "certs/source.crt"
-key_path = "certs/source.key"
-ca_cert_path = "certs/source-ca.crt"
-server_name = "node.local"
+[endpoint_tls]
+cert_path = "certs/source-endpoint.crt"
+key_path = "certs/source-endpoint.key"
+client_ca_cert_path = "certs/source-client-root.crt"
+
+[client_tls]
+cert_path = "certs/source-client.crt"
+key_path = "certs/source-client.key"
+server_ca_cert_path = "certs/source-server-root.crt"
 
 [circuit_breaker]
 failure_threshold = 7
@@ -790,21 +771,14 @@ allowed_hosts = ["api.example.com"]
             Some("https://{host}:{peer_port}")
         );
         assert_eq!(
-            bundle["node"]["tls"]["cert_path"].as_str(),
-            Some("certs/node.crt")
+            bundle["endpoint_tls"]["cert_path"].as_str(),
+            Some("/etc/wruntime/pki/proxy-endpoint/sets/v1/leaf.pem")
         );
         assert_eq!(
-            bundle["node"]["tls"]["key_path"].as_str(),
-            Some("certs/node.key")
+            bundle["client_tls"]["cert_path"].as_str(),
+            Some("/etc/wruntime/pki/proxy-client/sets/v1/leaf.pem")
         );
-        assert_eq!(
-            bundle["node"]["tls"]["ca_cert_path"].as_str(),
-            Some("certs/ca.crt")
-        );
-        assert_eq!(
-            bundle["node"]["tls"]["server_name"].as_str(),
-            Some("node.local")
-        );
+        assert!(bundle["node"].get("tls").is_none());
         assert_eq!(
             bundle["circuit_breaker"]["failure_threshold"].as_integer(),
             Some(7)
@@ -833,6 +807,16 @@ url = "postgres://localhost/source"
 proxy_address = "http://127.0.0.1:9001"
 control_address = "http://127.0.0.1:9002"
 peer_address = "https://127.0.0.1:9443"
+
+[endpoint_tls]
+cert_path = "endpoint.crt"
+key_path = "endpoint.key"
+client_ca_cert_path = "client-root.crt"
+
+[client_tls]
+cert_path = "client.crt"
+key_path = "client.key"
+server_ca_cert_path = "server-root.crt"
 "#;
         let minimal_config: ProxyConfig = toml::from_str(minimal).unwrap();
         let minimal_bundle = parse_proxy_bundle_toml(&minimal_config);
@@ -843,6 +827,7 @@ peer_address = "https://127.0.0.1:9443"
     #[test]
     fn generated_manager_bundle_toml_validates_with_runtime_config() {
         let source = r#"
+            manager_id = "manager-a"
             listen_address = "0.0.0.0:9000"
             engine_heartbeat_timeout_secs = 45
             local_proxy_address = "http://127.0.0.1:9001"
@@ -853,20 +838,15 @@ peer_address = "https://127.0.0.1:9443"
             [tls]
             cert_path = "certs/source-manager.crt"
             key_path = "certs/source-manager.key"
-            ca_cert_path = "certs/source-ca.crt"
+            client_ca_cert_path = "certs/source-client-root.crt"
 
-            [job_admin]
-            listen_address = "0.0.0.0:9020"
+            [client_tls]
+            cert_path = "certs/source-manager-client.crt"
+            key_path = "certs/source-manager-client.key"
+            server_ca_cert_path = "certs/source-server-root.crt"
 
-            [job_admin.tls]
-            cert_path = "certs/source-operator-server.crt"
-            key_path = "certs/source-operator-server.key"
-            ca_cert_path = "certs/source-operator-ca.crt"
-
-            [job_admin_delegation_tls]
-            cert_path = "certs/source-delegate.crt"
-            key_path = "certs/source-delegate.key"
-            ca_cert_path = "certs/source-delegate-ca.crt"
+            [authorization]
+            policy_file = "policy/source.toml"
 
             [database]
             url = "postgres://postgres@localhost/source"
@@ -881,7 +861,7 @@ peer_address = "https://127.0.0.1:9443"
 
         let bundle_toml = toml::from_str::<ManagerConfig>(source)
             .unwrap()
-            .to_bundle_config()
+            .to_bundle_config("/opt/wruntime")
             .to_toml()
             .unwrap();
         let resolved = resolve_generated_toml(
@@ -892,10 +872,9 @@ peer_address = "https://127.0.0.1:9443"
             ],
         );
 
-        let cfg =
-            runtime_config_from_toml("generated-manager", &resolved, RuntimeManagerConfig::load);
+        let cfg: RuntimeManagerConfig = toml::from_str(&resolved).unwrap();
         assert_eq!(cfg.local_proxy_address, "http://127.0.0.1:9001");
-        assert_eq!(cfg.module_heartbeat_timeout_secs.get(), 45);
+        assert_eq!(cfg.module_heartbeat_timeout_secs, None);
         assert_eq!(cfg.scheduler_lease_secs, 60);
         assert_eq!(cfg.scheduler_retry_base_secs, 7);
         assert_eq!(cfg.scheduler_retry_cap_secs, 70);
@@ -915,10 +894,15 @@ peer_address = "https://127.0.0.1:9443"
             control_address = "http://127.0.0.1:9002"
             peer_address = "https://10.0.0.5:9443"
 
-            [node.tls]
-            cert_path = "certs/source-node.crt"
-            key_path = "certs/source-node.key"
-            ca_cert_path = "certs/source-ca.crt"
+            [endpoint_tls]
+            cert_path = "certs/source-endpoint.crt"
+            key_path = "certs/source-endpoint.key"
+            client_ca_cert_path = "certs/source-client-root.crt"
+
+            [client_tls]
+            cert_path = "certs/source-client.crt"
+            key_path = "certs/source-client.key"
+            server_ca_cert_path = "certs/source-server-root.crt"
 
             [database]
             url = "postgres://postgres@localhost/source"

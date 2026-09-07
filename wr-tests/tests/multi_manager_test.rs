@@ -2,7 +2,8 @@ mod helpers;
 use helpers::{
     db::manager_pool,
     manager::{
-        get_default_rule_health, manager_client, register_test_module_ready, start_manager_cluster,
+        get_default_rule_health, manager_client, register_managed_engine,
+        register_test_module_ready, start_manager_cluster,
     },
     proxy::TEST_SELF_PEER,
     wait::{
@@ -15,10 +16,10 @@ use helpers::{
 use std::time::Duration;
 
 use wr_common::wruntime::{
-    BackendProcessState, BeginDeploymentRequest, EngineRegistration, ExpectedEngine,
-    FinalizeDeploymentRequest, GetClusterStatusRequest, HeartbeatRequest, LifecycleStatus,
-    ListManagersRequest, ModuleDescriptor, NodeOperationAction, NodeOperationStepKind,
-    ProcessLifecycleState, RegisterEngineRequest, ReportNodeObservationRequest,
+    BackendProcessState, BeginDeploymentRequest, DeploymentInventoryV1, EngineRegistration,
+    ExpectedEngine, FinalizeDeploymentRequest, GetClusterStatusRequest, HeartbeatRequest,
+    LifecycleStatus, ListManagersRequest, ModuleDescriptor, NodeOperationAction,
+    NodeOperationStepKind, ProcessLifecycleState, ReportNodeObservationRequest,
     ReportStepResultRequest, RolloutPolicy, ServiceKind, SubmitOperationRequest,
 };
 
@@ -39,10 +40,14 @@ async fn test_operation_survives_manager_loss_and_reconciles_without_repeating_e
             node_id: "takeover-node".into(),
             attempt_token: "takeover-operation".into(),
             bundle_digest: digest.clone(),
-            expected_engines: vec![ExpectedEngine {
-                engine_slot: "blue".into(),
-                modules: vec![],
-            }],
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![ExpectedEngine {
+                    engine_slot: "blue".into(),
+                    modules: vec![],
+                    ..Default::default()
+                }],
+            }),
         },
         "operator-a",
     )
@@ -292,10 +297,14 @@ async fn test_deployment_desired_state_is_visible_across_managers() {
             node_id: "shared-node".into(),
             attempt_token: "shared-attempt".into(),
             bundle_digest: format!("sha256:{}", "3".repeat(64)),
-            expected_engines: vec![ExpectedEngine {
-                engine_slot: "primary".into(),
-                modules: vec![],
-            }],
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![ExpectedEngine {
+                    engine_slot: "primary".into(),
+                    modules: vec![],
+                    ..Default::default()
+                }],
+            }),
         },
         "operator-a",
     )
@@ -455,7 +464,10 @@ async fn test_manager_self_registration() {
     // Both should have non-empty runtime addresses.
     for row in &rows {
         let grpc: String = row.get(1);
-        assert!(grpc.starts_with("http://"), "grpc_address should be a URL");
+        assert!(
+            grpc.starts_with("https://"),
+            "manager grpc_address should use the authenticated listener"
+        );
     }
 }
 
@@ -468,8 +480,10 @@ async fn test_module_health_convergence_across_managers() {
     let managers = start_manager_cluster(pool.clone(), 2, 1).await.unwrap();
 
     let mut c1 = manager_client(&managers[0].addr).await.unwrap();
-    c1.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    let registration = register_managed_engine(
+        &pool,
+        &mut c1,
+        EngineRegistration {
             engine_id: "mm-e1".into(),
             address: "http://127.0.0.1:19500".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -493,10 +507,11 @@ async fn test_module_health_convergence_across_managers() {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await
-    .unwrap();
+    .unwrap()
+    .into_inner();
 
     // Intentional elapsed-time interval: heartbeat only mm-a for longer than the 1s timeout.
     let mut interval = tokio::time::interval(Duration::from_millis(200));
@@ -509,6 +524,8 @@ async fn test_module_health_convergence_across_managers() {
                 version: "1.0.0".into(),
                 proto_schema: vec![],
             }],
+
+            fence: registration.fence.clone(),
         })
         .await
         .unwrap();

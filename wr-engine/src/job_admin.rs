@@ -8,6 +8,7 @@ use tonic::{Request, Response, Status};
 
 use wr_common::lifecycle::JobState as DomainJobState;
 use wr_common::lifecycle_service::{AdmissionGate, AdmissionGuard};
+use wr_common::snapshot_consumer::SnapshotConsumerState;
 use wr_common::wruntime::engine_job_admin_service_server::EngineJobAdminService;
 use wr_common::wruntime::{
     CheckJobQueueRequest, CheckJobQueueResponse, GetJobQueueSummaryRequest,
@@ -24,21 +25,61 @@ pub struct EngineJobAdminApi {
     pool: Arc<Pool>,
     ready: Arc<AtomicBool>,
     admission: AdmissionGate,
+    policy: Arc<tokio::sync::Mutex<SnapshotConsumerState>>,
 }
 
 impl EngineJobAdminApi {
-    pub fn new(
+    pub fn new_authorized(
         queue_id: String,
         pool: Arc<Pool>,
         ready: Arc<AtomicBool>,
         admission: AdmissionGate,
+        policy: Arc<tokio::sync::Mutex<SnapshotConsumerState>>,
     ) -> Self {
         Self {
             queue_id,
             pool,
             ready,
             admission,
+            policy,
         }
+    }
+
+    async fn authorize_manager<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        let cert = request
+            .peer_certs()
+            .and_then(|certs| certs.first().cloned())
+            .ok_or_else(|| {
+                Status::permission_denied("authenticated manager certificate is required")
+            })?;
+        let evidence = wr_common::tls::parse_leaf_evidence(
+            cert.as_ref(),
+            wr_common::tls::LeafProfile::Client,
+            None,
+        )
+        .map_err(|_| Status::permission_denied("invalid manager client identity"))?;
+        let principal = evidence
+            .principal
+            .as_ref()
+            .ok_or_else(|| Status::permission_denied("manager principal is required"))?;
+        if principal.kind() != wr_common::identity::PrincipalKind::Manager {
+            return Err(Status::permission_denied(
+                "caller is not a manager workload",
+            ));
+        }
+        let mut state = self.policy.lock().await;
+        state.expire(std::time::Instant::now());
+        if !state.is_fresh(std::time::Instant::now())
+            || !state.retained().is_some_and(|snapshot| {
+                snapshot.wire.cluster_id == principal.cluster_id().as_str()
+                    && snapshot.admits(principal.as_str(), &evidence.fingerprint)
+            })
+        {
+            return Err(Status::permission_denied(
+                "manager is not enrolled in a fresh engine policy snapshot",
+            ));
+        }
+        Ok(())
     }
 
     fn require_queue(&self, queue_id: &str) -> Result<AdmissionGuard, Status> {
@@ -173,6 +214,7 @@ impl EngineJobAdminService for EngineJobAdminApi {
         &self,
         request: Request<CheckJobQueueRequest>,
     ) -> Result<Response<CheckJobQueueResponse>, Status> {
+        self.authorize_manager(&request).await?;
         let _admission = self.require_queue(&request.into_inner().job_queue_id)?;
         Ok(Response::new(CheckJobQueueResponse { ready: true }))
     }
@@ -181,6 +223,7 @@ impl EngineJobAdminService for EngineJobAdminApi {
         &self,
         request: Request<ListJobsRequest>,
     ) -> Result<Response<ListJobsResponse>, Status> {
+        self.authorize_manager(&request).await?;
         let request = request.into_inner();
         let _admission = self.require_queue(&request.job_queue_id)?;
         let filter = convert_filter(request.filter)?;
@@ -204,6 +247,7 @@ impl EngineJobAdminService for EngineJobAdminApi {
         &self,
         request: Request<GetJobQueueSummaryRequest>,
     ) -> Result<Response<GetJobQueueSummaryResponse>, Status> {
+        self.authorize_manager(&request).await?;
         let request = request.into_inner();
         let _admission = self.require_queue(&request.job_queue_id)?;
         let filter = convert_filter(request.filter)?;
@@ -228,6 +272,7 @@ impl EngineJobAdminService for EngineJobAdminApi {
         &self,
         request: Request<GetJobRequest>,
     ) -> Result<Response<GetJobResponse>, Status> {
+        self.authorize_manager(&request).await?;
         let request = request.into_inner();
         let _admission = self.require_queue(&request.job_queue_id)?;
         let job = job_admin_queue::get_job(&self.pool, &request.job_id)
@@ -242,6 +287,7 @@ impl EngineJobAdminService for EngineJobAdminApi {
         &self,
         request: Request<RetryJobRequest>,
     ) -> Result<Response<RetryJobResponse>, Status> {
+        self.authorize_manager(&request).await?;
         let request = request.into_inner();
         let _admission = self.require_queue(&request.job_queue_id)?;
         let job = job_admin_queue::retry_dead_job(&self.pool, &request.job_id)

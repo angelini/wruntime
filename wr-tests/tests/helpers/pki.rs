@@ -21,7 +21,9 @@ pub struct RoleTestPki {
 /// Generate a CA, one localhost server identity, and distinct mTLS role
 /// identities. Fingerprints are over the exact DER presented to tonic.
 pub fn generate_role_test_pki() -> RoleTestPki {
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType,
+    };
     use std::net::IpAddr;
 
     let mut ca_params = CertificateParams::new(vec![]).unwrap();
@@ -34,13 +36,17 @@ pub fn generate_role_test_pki() -> RoleTestPki {
     let ca_pem = ca_cert.pem();
     let issuer = rcgen::Issuer::from_params(&ca_params, ca_key);
 
-    let identity = |name: &str, server: bool| {
+    let identity = |name: &str, uri: Option<&str>| {
         let mut params = CertificateParams::new(vec![]).unwrap();
-        if server {
+        if let Some(uri) = uri {
+            params.subject_alt_names = vec![SanType::URI(uri.try_into().unwrap())];
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        } else {
             params.subject_alt_names = vec![
                 SanType::DnsName("localhost".try_into().unwrap()),
                 SanType::IpAddress(IpAddr::from([127, 0, 0, 1])),
             ];
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         }
         params
             .distinguished_name
@@ -56,18 +62,23 @@ pub fn generate_role_test_pki() -> RoleTestPki {
 
     RoleTestPki {
         ca_pem,
-        server: identity("manager", true),
-        viewer: identity("viewer", false),
-        operator: identity("operator", false),
-        operator_rotated: identity("operator-rotated", false),
-        agent_a: identity("agent-a", false),
-        agent_b: identity("agent-b", false),
-        unknown: identity("unknown", false),
+        server: identity("manager", None),
+        viewer: identity("viewer", Some("urn:wruntime:cluster-a:human:viewer-a")),
+        operator: identity("operator", Some("urn:wruntime:cluster-a:human:operator-a")),
+        operator_rotated: identity(
+            "operator-rotated",
+            Some("urn:wruntime:cluster-a:human:operator-a"),
+        ),
+        agent_a: identity("agent-a", Some("urn:wruntime:cluster-a:node-agent:node-a")),
+        agent_b: identity("agent-b", Some("urn:wruntime:cluster-a:node-agent:node-b")),
+        unknown: identity("unknown", Some("urn:wruntime:cluster-a:human:unknown")),
     }
 }
 
 pub struct TestPki {
     pub ca_cert_der: Vec<rustls::pki_types::CertificateDer<'static>>,
+    pub server_cert_der: Vec<rustls::pki_types::CertificateDer<'static>>,
+    pub server_key_der: rustls::pki_types::PrivateKeyDer<'static>,
     pub node_cert_der: Vec<rustls::pki_types::CertificateDer<'static>>,
     pub node_key_der: rustls::pki_types::PrivateKeyDer<'static>,
 }
@@ -75,13 +86,24 @@ pub struct TestPki {
 /// Generate a CA + node cert entirely in memory. No files on disk.
 pub struct TestPkiFiles {
     _directory: tempfile::TempDir,
-    pub tls: wr_common::node::TlsConfig,
+    pub server_tls: wr_common::node::ServerTlsConfig,
+    pub client_tls: wr_common::node::ClientTlsConfig,
 }
 
-/// Generate a standalone CA and one localhost certificate as PEM files.
-/// The certificate is suitable for both sides of mTLS in transport tests.
+/// Generate a standalone CA with distinct localhost serverAuth and clientAuth leaves.
 pub fn generate_test_pki_files(name: &str) -> TestPkiFiles {
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
+    let principal = match name {
+        "operator-admin" => "urn:wruntime:cluster-a:human:operator-admin",
+        "runtime" | "overlapping-runtime" => "urn:wruntime:cluster-a:proxy:proxy-a",
+        _ => "urn:wruntime:cluster-a:manager:manager-a",
+    };
+    generate_test_pki_files_for_principal(name, principal)
+}
+
+pub fn generate_test_pki_files_for_principal(name: &str, principal: &str) -> TestPkiFiles {
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType,
+    };
     use std::net::IpAddr;
 
     let directory = tempfile::tempdir().unwrap();
@@ -94,36 +116,58 @@ pub fn generate_test_pki_files(name: &str) -> TestPkiFiles {
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
     let ca_issuer = rcgen::Issuer::from_params(&ca_params, ca_key);
 
-    let mut leaf_params = CertificateParams::new(vec![]).unwrap();
-    leaf_params.subject_alt_names = vec![
+    let mut server_params = CertificateParams::new(vec![]).unwrap();
+    server_params.subject_alt_names = vec![
         SanType::DnsName("localhost".try_into().unwrap()),
         SanType::IpAddress(IpAddr::from([127, 0, 0, 1])),
     ];
-    leaf_params
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    server_params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, name);
-    let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer).unwrap();
+        .push(rcgen::DnType::CommonName, format!("{name}-server"));
+    let server_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let server_cert = server_params.signed_by(&server_key, &ca_issuer).unwrap();
+
+    let mut client_params = CertificateParams::new(vec![]).unwrap();
+    client_params.subject_alt_names = vec![SanType::URI(principal.try_into().unwrap())];
+    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, format!("{name}-client"));
+    let client_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let client_cert = client_params.signed_by(&client_key, &ca_issuer).unwrap();
 
     let ca_path = directory.path().join("ca.crt");
-    let cert_path = directory.path().join("client.crt");
-    let key_path = directory.path().join("client.key");
+    let server_cert_path = directory.path().join("server.crt");
+    let server_key_path = directory.path().join("server.key");
+    let client_cert_path = directory.path().join("client.crt");
+    let client_key_path = directory.path().join("client.key");
     std::fs::write(&ca_path, ca_cert.pem()).unwrap();
-    std::fs::write(&cert_path, leaf_cert.pem()).unwrap();
-    std::fs::write(&key_path, leaf_key.serialize_pem()).unwrap();
+    std::fs::write(&server_cert_path, server_cert.pem()).unwrap();
+    std::fs::write(&server_key_path, server_key.serialize_pem()).unwrap();
+    std::fs::write(&client_cert_path, client_cert.pem()).unwrap();
+    std::fs::write(&client_key_path, client_key.serialize_pem()).unwrap();
 
+    let ca_cert_path = ca_path.to_string_lossy().into_owned();
     TestPkiFiles {
-        tls: wr_common::node::TlsConfig {
-            cert_path: cert_path.to_string_lossy().into_owned(),
-            key_path: key_path.to_string_lossy().into_owned(),
-            ca_cert_path: ca_path.to_string_lossy().into_owned(),
+        server_tls: wr_common::node::ServerTlsConfig {
+            cert_path: server_cert_path.to_string_lossy().into_owned(),
+            key_path: server_key_path.to_string_lossy().into_owned(),
+            client_ca_cert_path: ca_cert_path.clone(),
+        },
+        client_tls: wr_common::node::ClientTlsConfig {
+            cert_path: client_cert_path.to_string_lossy().into_owned(),
+            key_path: client_key_path.to_string_lossy().into_owned(),
+            server_ca_cert_path: ca_cert_path,
         },
         _directory: directory,
     }
 }
 
 pub fn generate_test_pki() -> TestPki {
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType,
+    };
     use std::net::IpAddr;
 
     // CA
@@ -136,12 +180,20 @@ pub fn generate_test_pki() -> TestPki {
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
     let ca_issuer = rcgen::Issuer::from_params(&ca_params, ca_key);
 
-    // Node cert signed by CA
-    let mut node_params = CertificateParams::new(vec![]).unwrap();
-    node_params.subject_alt_names = vec![
+    let mut server_params = CertificateParams::new(vec![]).unwrap();
+    server_params.subject_alt_names = vec![
         SanType::DnsName("localhost".try_into().unwrap()),
         SanType::IpAddress(IpAddr::from([127, 0, 0, 1])),
     ];
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let server_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let server_cert = server_params.signed_by(&server_key, &ca_issuer).unwrap();
+
+    let mut node_params = CertificateParams::new(vec![]).unwrap();
+    node_params.subject_alt_names = vec![SanType::URI(
+        "urn:wruntime:cluster-a:proxy:proxy-a".try_into().unwrap(),
+    )];
+    node_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     node_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "test-node");
@@ -150,6 +202,8 @@ pub fn generate_test_pki() -> TestPki {
 
     TestPki {
         ca_cert_der: vec![ca_cert.der().clone()],
+        server_cert_der: vec![server_cert.der().clone()],
+        server_key_der: rustls::pki_types::PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
         node_cert_der: vec![node_cert.der().clone()],
         node_key_der: rustls::pki_types::PrivateKeyDer::Pkcs8(node_key.serialize_der().into()),
     }

@@ -258,8 +258,15 @@ fn filter(
             .nodes
             .iter()
             .flat_map(|item| item.desired_deployment.iter())
-            .flat_map(|deployment| deployment.expected_engines.iter())
+            .flat_map(|deployment| {
+                deployment
+                    .inventory
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|inventory| inventory.engines.iter())
+            })
             .flat_map(|engine| engine.modules.iter())
+            .filter_map(|module| module.identity.as_ref())
             .map(|module| {
                 (
                     module.namespace.as_str(),
@@ -552,11 +559,18 @@ impl<'a> From<&'a DeploymentRecord> for DeploymentDto<'a> {
             },
             source_revision: value.source_revision,
             expected_engines: value
-                .expected_engines
-                .iter()
+                .inventory
+                .as_ref()
+                .into_iter()
+                .flat_map(|inventory| inventory.engines.iter())
                 .map(|engine| ExpectedEngineDto {
                     engine_slot: &engine.engine_slot,
-                    modules: engine.modules.iter().map(ModuleIdentityDto::from).collect(),
+                    modules: engine
+                        .modules
+                        .iter()
+                        .filter_map(|module| module.identity.as_ref())
+                        .map(ModuleIdentityDto::from)
+                        .collect(),
                 })
                 .collect(),
             created_at: value.created_at.as_ref().map(TimestampDto::from),

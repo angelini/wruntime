@@ -7,14 +7,17 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tabled::builder::Builder;
+use wr_common::authorization_policy::ValidatedPolicy;
 
 use super::build_helpers;
 use super::bundle;
 use super::config::ManagerConfig;
 use super::deploy_config::{self, DeployConfig, DeployFormat};
 use super::helpers;
-use super::service_gen::{self, DockerfileSpec, ServiceUnit};
+use super::service_gen::{self, DockerfileSpec};
 use crate::{client, display};
 
 #[derive(Args)]
@@ -31,8 +34,29 @@ pub enum ManagersCommand {
     Bundle(BundleArgs),
     /// Deploy a manager bundle to a remote host
     Deploy(DeployArgs),
+    /// Deploy or take over a complete digest-qualified manager set
+    DeploySet(super::manager_deploy_set::DeploySetArgs),
+    /// Explicitly restore the bounded previous manager config/activation
+    RestoreConfig(super::manager_deploy_set::RestoreConfigArgs),
     /// Inspect a manager bundle without deploying
     InspectBundle(StatusArgs),
+    /// Validate a local authorization policy.
+    Policy(PolicyArgs),
+}
+
+#[derive(Args)]
+pub struct PolicyArgs {
+    #[command(subcommand)]
+    pub command: PolicyCommand,
+}
+#[derive(Subcommand)]
+pub enum PolicyCommand {
+    Validate(PolicyValidateArgs),
+}
+#[derive(Args)]
+pub struct PolicyValidateArgs {
+    #[arg(long)]
+    pub policy: String,
 }
 
 #[derive(Args)]
@@ -124,7 +148,81 @@ pub async fn run(args: ManagersArgs, manager: Option<&str>) -> Result<()> {
         }
         ManagersCommand::Bundle(bundle_args) => bundle(bundle_args),
         ManagersCommand::Deploy(deploy_args) => deploy(deploy_args).await,
+        ManagersCommand::DeploySet(deploy_args) => {
+            super::manager_deploy_set::run(deploy_args).await
+        }
+        ManagersCommand::RestoreConfig(restore_args) => {
+            super::manager_deploy_set::restore_config(restore_args)
+        }
         ManagersCommand::InspectBundle(status_args) => status(status_args),
+        ManagersCommand::Policy(args) => policy_command(args),
+    }
+}
+
+#[derive(Serialize)]
+struct PolicyValidationOutput {
+    validator_version: u32,
+    schema_version: u32,
+    generation: u64,
+    digest: String,
+    cluster_id: String,
+    manager_ids: Vec<String>,
+    target_set_hash: String,
+    caller_principal_uri: String,
+    caller_leaf_fingerprint: String,
+    caller_can_begin: bool,
+}
+
+fn load_policy_and_caller(path: &str) -> Result<(ValidatedPolicy, wr_common::tls::LeafEvidence)> {
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read authorization policy {path}"))?;
+    let policy = ValidatedPolicy::load(&bytes)?;
+    let tls = client::tls_config().context("global manager client TLS is not initialized")?;
+    let cluster = wr_common::identity::ClusterId::parse(&policy.cluster_id)?;
+    let caller = wr_common::tls::load_client_leaf_evidence(&tls.cert_path, Some(&cluster))?;
+    Ok((policy, caller))
+}
+
+fn policy_output(
+    policy: &ValidatedPolicy,
+    caller: &wr_common::tls::LeafEvidence,
+) -> Result<PolicyValidationOutput> {
+    let principal = caller
+        .principal
+        .as_ref()
+        .context("client certificate has no principal")?;
+    let targets = policy.manager_targets();
+    let manager_ids = targets
+        .iter()
+        .map(|target| target.manager_id.clone())
+        .collect::<Vec<_>>();
+    Ok(PolicyValidationOutput {
+        validator_version: wr_common::authorization_policy::AUTHORIZATION_POLICY_VALIDATOR_VERSION,
+        schema_version: policy.schema_version,
+        generation: policy.generation,
+        digest: policy.digest.clone(),
+        cluster_id: policy.cluster_id.clone(),
+        manager_ids: manager_ids.clone(),
+        target_set_hash: policy.manager_set_hash.clone(),
+        caller_principal_uri: principal.to_string(),
+        caller_leaf_fingerprint: caller.fingerprint.clone(),
+        caller_can_begin: !policy
+            .revoked_leaf_fingerprints
+            .contains(&caller.fingerprint)
+            && policy.authorizes_rollout(principal.as_str(), &manager_ids),
+    })
+}
+
+fn policy_command(args: PolicyArgs) -> Result<()> {
+    match args.command {
+        PolicyCommand::Validate(args) => {
+            let (policy, caller) = load_policy_and_caller(&args.policy)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&policy_output(&policy, &caller)?)?
+            );
+            Ok(())
+        }
     }
 }
 
@@ -183,6 +281,24 @@ fn bundle(args: BundleArgs) -> Result<()> {
     let no_otel = deploy_config::resolve_no_otel(args.no_otel, deploy_cfg.no_otel);
 
     let config = ManagerConfig::from_file(&args.manager_config)?;
+    let source_config_dir = Path::new(&args.manager_config)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let source_policy_path = {
+        let configured = Path::new(&config.authorization.policy_file);
+        if configured.is_absolute() {
+            configured.to_path_buf()
+        } else {
+            source_config_dir.join(configured)
+        }
+    };
+    let policy_bytes = fs::read(&source_policy_path).with_context(|| {
+        format!(
+            "failed to read manager authorization policy {}",
+            source_policy_path.display()
+        )
+    })?;
+    ValidatedPolicy::load(&policy_bytes).context("manager authorization policy is invalid")?;
     let output = args
         .output
         .unwrap_or_else(|| "wr-manager-bundle.tar.gz".to_string());
@@ -216,7 +332,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
     )?;
 
     // Add template config
-    let bundle_config = config.to_bundle_config();
+    let bundle_config = config.to_bundle_config(&workdir);
     bundle::tar_add_bytes_checked(
         &mut tar,
         &mut checksums,
@@ -224,23 +340,28 @@ fn bundle(args: BundleArgs) -> Result<()> {
         bundle_config.to_toml()?.as_bytes(),
         0o644,
     )?;
+    bundle::tar_add_bytes_checked(
+        &mut tar,
+        &mut checksums,
+        "wr-manager/policy/authorization.toml",
+        &policy_bytes,
+        0o444,
+    )?;
 
-    // Systemd unit
-    let unit = ServiceUnit {
-        description: "wruntime manager",
-        binary_path: &format!("{workdir}/wr-manager/bin/wr-manager"),
-        config_path: &format!("{workdir}/wr-manager/config/manager.toml"),
-        working_directory: &format!("{workdir}/wr-manager"),
-        env_vars: manager_runtime_env(),
-        no_otel,
-        after: vec![],
-        requires: vec![],
-    };
+    // The stable launcher is the sole active selector. Rollout staging never
+    // rewrites this script or the unit that invokes it.
+    bundle::tar_add_bytes_checked(
+        &mut tar,
+        &mut checksums,
+        "wr-manager/bin/wr-manager-launch",
+        service_gen::manager_launcher_script().as_bytes(),
+        0o755,
+    )?;
     bundle::tar_add_bytes_checked(
         &mut tar,
         &mut checksums,
         "wr-manager/systemd/wr-manager.service",
-        unit.to_systemd().as_bytes(),
+        service_gen::manager_activation_systemd_unit().as_bytes(),
         0o644,
     )?;
 
@@ -251,7 +372,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
         workdir: &workdir,
         binary: "bin/wr-manager",
         config: "config/manager.toml",
-        extra_copies: vec![],
+        extra_copies: vec![("policy/authorization.toml", "policy/authorization.toml")],
         env_vars: manager_runtime_env(),
         no_otel,
     };
@@ -326,14 +447,6 @@ fn resolve_manager_config_template(
         .context("failed to resolve template in manager.toml")
 }
 
-fn operator_admin_certificate_sources(cert_dir: &str, host: &str) -> [String; 3] {
-    [
-        format!("{cert_dir}/job-admin-operator/ca.crt"),
-        format!("{cert_dir}/job-admin-operator/{host}.crt"),
-        format!("{cert_dir}/job-admin-operator/{host}.key"),
-    ]
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagerDeployPhase {
     PrepareBundle,
@@ -378,7 +491,10 @@ fn manager_docker_compose(workdir: &str, image_prefix: &str) -> String {
             image: Some(format!("{image_prefix}-manager")),
             network_mode: Some("host".into()),
             ports: vec![],
-            volumes: vec![format!("../certs:{workdir}/certs:ro")],
+            volumes: vec![
+                "/etc/wruntime/pki:/etc/wruntime/pki:ro".into(),
+                "/var/lib/wruntime/manager-config:/var/lib/wruntime/manager-config:ro".into(),
+            ],
             depends_on: vec![],
             healthcheck: service_gen::ComposeHealthcheck {
                 test: vec![
@@ -441,6 +557,64 @@ fn validate_manager_activation(
     Ok(observation)
 }
 
+async fn wait_for_manager_epoch_ready(
+    endpoint: &str,
+    tls: &wr_common::node::TlsConfig,
+    expected_instance: &str,
+    expected_identity: &wr_common::manager_client::EpochIdentity,
+    timeout: Duration,
+) -> Result<helpers::LifecycleObservation> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut epoch = client::connect_authenticated_with_tls(
+        endpoint,
+        tls,
+        wr_common::manager_client::RetryClass::ReadOnly,
+    )
+    .await?;
+    loop {
+        match epoch
+            .get_lifecycle_status(wr_common::wruntime::GetLifecycleStatusRequest {})
+            .await
+        {
+            Ok(response) => {
+                let status = response
+                    .into_inner()
+                    .status
+                    .context("manager lifecycle response omitted status")?;
+                let observation =
+                    wr_common::manager_client::EpochObservation::from_lifecycle(&status)?;
+                observation.require_identity(expected_identity)?;
+                if observation.process_ready && observation.process_instance_id == expected_instance
+                {
+                    return Ok(helpers::LifecycleObservation {
+                        state: status.state,
+                        service_kind: status.service_kind,
+                        process_instance_id: observation.process_instance_id,
+                        reason: status.reason,
+                        detail: status.detail,
+                    });
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.code(),
+                    tonic::Code::Cancelled
+                        | tonic::Code::Unknown
+                        | tonic::Code::DeadlineExceeded
+                        | tonic::Code::Unavailable
+                ) =>
+            {
+                epoch = epoch.repin().await?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("manager did not publish the expected authenticated READY epoch before timeout");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 fn combine_manager_readiness_and_tail(
     readiness: Result<helpers::LifecycleObservation>,
     tail_result: Result<()>,
@@ -491,17 +665,28 @@ async fn deploy(args: DeployArgs) -> Result<()> {
             .unwrap_or_else(|| manager_addr.clone());
 
     let config_template = bundle::read_file_from_tarball(&args.bundle, "manager.toml")?;
+    let bundled_config: ManagerConfig = toml::from_str(&config_template)
+        .context("manager bundle contains an invalid manager config")?;
+    let bundled_policy = ValidatedPolicy::load(
+        bundle::read_file_from_tarball(&args.bundle, "wr-manager/policy/authorization.toml")?
+            .as_bytes(),
+    )
+    .context("manager bundle contains an invalid authorization policy")?;
+    let expected_epoch_identity = wr_common::manager_client::EpochIdentity {
+        manager_id: bundled_config.manager_id.clone(),
+        policy_generation: bundled_policy.generation,
+        policy_digest: bundled_policy.digest.clone(),
+    };
     let resolved = resolve_manager_config_template(&config_template, &db_url, &advertise_address)?;
 
     // Generate an activation identity before installing service artifacts. The
     // launched manager must report this exact token, so neither a stale process
     // nor a bind-race winner can satisfy deployment readiness.
     let expected_instance = format!("manager-deploy-{}", uuid::Uuid::new_v4());
-    let remote_host = helpers::extract_remote_host(&args.remote);
     let deploy_tls = wr_common::node::TlsConfig {
-        cert_path: format!("{cert_dir}/{remote_host}.crt"),
-        key_path: format!("{cert_dir}/{remote_host}.key"),
-        ca_cert_path: format!("{cert_dir}/ca.crt"),
+        cert_path: format!("{cert_dir}/human-client/leaf.pem"),
+        key_path: format!("{cert_dir}/human-client/key.pem"),
+        ca_cert_path: format!("{cert_dir}/server-root/ca.crt"),
     };
 
     let mut first_start_timestamp = String::new();
@@ -557,80 +742,70 @@ async fn deploy(args: DeployArgs) -> Result<()> {
                 println!("OK");
             }
             ManagerDeployPhase::ProvisionTls => {
-                // Provision TLS certificates on the remote host
-                print!("[deploy]  provisioning TLS certificates ... ");
-                let remote_cert_dir = format!("{}/wr-manager/certs", manifest.workdir);
-
-                let host = helpers::extract_remote_host(&args.remote);
-                let ca_cert = format!("{cert_dir}/ca.crt");
-                let host_cert = format!("{cert_dir}/{host}.crt");
-                let host_key = format!("{cert_dir}/{host}.key");
-
-                for (local, remote_name) in [
-                    (&ca_cert, "ca.crt"),
-                    (&host_cert, "manager.crt"),
-                    (&host_key, "manager.key"),
+                print!("[deploy]  provisioning protected TLS profiles ... ");
+                for (local, remote) in [
+                    (
+                        format!("{cert_dir}/server-root/ca.crt"),
+                        "/etc/wruntime/pki/roots/server/ca.crt",
+                    ),
+                    (
+                        format!("{cert_dir}/client-root/ca.crt"),
+                        "/etc/wruntime/pki/roots/client/ca.crt",
+                    ),
                 ] {
-                    if !Path::new(local).exists() {
-                        bail!("Certificate file not found: {local}. Run `wr-cli cert generate {host}` first.");
-                    }
-                    let tmp_path = format!("/tmp/{remote_name}");
-                    helpers::scp_file(local, &args.remote, &tmp_path, ssh_key.as_deref(), ssh_port)
-                        .with_context(|| format!("failed to upload {local}"))?;
-                    helpers::run_ssh(
-                        &ssh_base,
-                        &format!("sudo mkdir -p {remote_cert_dir} && sudo mv {tmp_path} {remote_cert_dir}/{remote_name}"),
-                    )?;
-                }
-                let remote_operator_dir = format!("{remote_cert_dir}/job-admin-operator");
-                let [operator_ca, operator_cert, operator_key] =
-                    operator_admin_certificate_sources(&cert_dir, host);
-                for (local, remote_name) in [
-                    (operator_ca, "ca.crt"),
-                    (operator_cert, "manager.crt"),
-                    (operator_key, "manager.key"),
-                ] {
-                    if !Path::new(&local).exists() {
-                        bail!("Operator job-admin certificate file not found: {local}. Run `just certs` or provision the operator-admin PKI first.");
-                    }
-                    let tmp_path = format!("/tmp/job-admin-operator-{remote_name}");
-                    helpers::scp_file(
-                        &local,
+                    helpers::install_remote_file(
+                        Path::new(&local),
                         &args.remote,
-                        &tmp_path,
+                        remote,
                         ssh_key.as_deref(),
                         ssh_port,
-                    )
-                    .with_context(|| format!("failed to upload {local}"))?;
-                    helpers::run_ssh(
-                        &ssh_base,
-                        &format!("sudo mkdir -p {remote_operator_dir} && sudo mv {tmp_path} {remote_operator_dir}/{remote_name}"),
+                        0o444,
+                        helpers::RemoteInstallClass::Public,
+                        None,
                     )?;
                 }
-                let delegation_dir = format!("{cert_dir}/job-admin-delegation");
-                let remote_delegation_dir = format!("{remote_cert_dir}/job-admin-delegation");
-                for (local, remote_name) in [
-                    (format!("{delegation_dir}/ca.crt"), "ca.crt"),
-                    (format!("{delegation_dir}/manager.crt"), "manager.crt"),
-                    (format!("{delegation_dir}/manager.key"), "manager.key"),
+                for (local_name, remote_name) in [
+                    ("manager-endpoint", "manager-endpoint"),
+                    ("manager-client", "manager-client"),
                 ] {
-                    if !Path::new(&local).exists() {
-                        bail!("Job-admin delegation certificate file not found: {local}. Run `just certs` or provision the delegation PKI first.");
-                    }
-                    let tmp_path = format!("/tmp/job-admin-{remote_name}");
-                    helpers::scp_file(
+                    let local = PathBuf::from(format!("{cert_dir}/{local_name}"));
+                    let digest = helpers::local_tree_digest(&local)?;
+                    helpers::install_remote_directory(
                         &local,
                         &args.remote,
-                        &tmp_path,
+                        &format!("/etc/wruntime/pki/{remote_name}/sets/v1"),
                         ssh_key.as_deref(),
                         ssh_port,
-                    )
-                    .with_context(|| format!("failed to upload {local}"))?;
-                    helpers::run_ssh(
-                        &ssh_base,
-                        &format!("sudo mkdir -p {remote_delegation_dir} && sudo mv {tmp_path} {remote_delegation_dir}/{remote_name}"),
+                        &digest,
                     )?;
                 }
+                let policy = bundle::read_file_from_tarball(
+                    &args.bundle,
+                    "wr-manager/policy/authorization.toml",
+                )?;
+                helpers::install_remote_bytes(
+                    policy.as_bytes(),
+                    &args.remote,
+                    &format!(
+                        "/var/lib/wruntime/manager-config/{}/authorization.toml",
+                        bundled_config.manager_id
+                    ),
+                    ssh_key.as_deref(),
+                    ssh_port,
+                    0o600,
+                    helpers::RemoteInstallClass::Sensitive,
+                    None,
+                )?;
+                install_initial_activation_descriptor(&InitialActivationInstall {
+                    remote: &args.remote,
+                    ssh_key: ssh_key.as_deref(),
+                    ssh_port,
+                    format: &format,
+                    manifest: &manifest,
+                    manager_id: &bundled_config.manager_id,
+                    resolved_config: &resolved,
+                    cert_dir: &cert_dir,
+                })?;
                 println!("OK");
             }
             ManagerDeployPhase::CaptureFirstStartTimestamp => {
@@ -671,11 +846,11 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         }
     };
 
-    let readiness = helpers::wait_for_lifecycle_ready(
+    let readiness = wait_for_manager_epoch_ready(
         &manager_addr,
-        Some(&deploy_tls),
-        wr_common::wruntime::ServiceKind::Manager,
+        &deploy_tls,
         &expected_instance,
+        &expected_epoch_identity,
         Duration::from_secs(60),
     )
     .await;
@@ -727,12 +902,16 @@ fn prepare_systemd(
     let workdir = &manifest.workdir;
 
     print!("[deploy]  copying bundle to remote ... ");
-    helpers::scp_file(
-        bundle,
+    let remote_bundle = format!("{workdir}/.manager-bundle-{}.tar.gz", uuid::Uuid::new_v4());
+    helpers::install_remote_file(
+        Path::new(bundle),
         remote,
-        "/tmp/wr-manager-bundle.tar.gz",
+        &remote_bundle,
         ssh_key,
         ssh_port,
+        0o600,
+        helpers::RemoteInstallClass::Public,
+        None,
     )?;
     println!("OK");
 
@@ -740,7 +919,7 @@ fn prepare_systemd(
     let run_user = helpers::extract_remote_user(remote).unwrap_or("root");
     helpers::run_ssh(
         ssh_base,
-        &format!("sudo mkdir -p {workdir} && sudo tar xzf /tmp/wr-manager-bundle.tar.gz -C {workdir} && sudo chown -R {run_user}:{run_user} {workdir}/wr-manager && rm /tmp/wr-manager-bundle.tar.gz"),
+        &format!("sudo mkdir -p {workdir} && sudo tar xzf {remote_bundle} -C {workdir} && sudo chown -R {run_user}:{run_user} {workdir}/wr-manager && sudo rm -f -- {remote_bundle}"),
     )?;
     println!("OK");
 
@@ -758,23 +937,87 @@ fn prepare_docker(
     let workdir = &manifest.workdir;
 
     print!("[deploy]  copying bundle to remote ... ");
-    helpers::scp_file(
-        bundle,
+    let remote_bundle = format!("{workdir}/.manager-bundle-{}.tar.gz", uuid::Uuid::new_v4());
+    helpers::install_remote_file(
+        Path::new(bundle),
         remote,
-        "/tmp/wr-manager-bundle.tar.gz",
+        &remote_bundle,
         ssh_key,
         ssh_port,
+        0o600,
+        helpers::RemoteInstallClass::Public,
+        None,
     )?;
     println!("OK");
 
     print!("[deploy]  unpacking on remote ... ");
     helpers::run_ssh(
         ssh_base,
-        &format!("sudo mkdir -p {workdir} && sudo tar xzf /tmp/wr-manager-bundle.tar.gz -C {workdir} && rm /tmp/wr-manager-bundle.tar.gz"),
+        &format!("sudo mkdir -p {workdir} && sudo tar xzf {remote_bundle} -C {workdir} && sudo rm -f -- {remote_bundle}"),
     )?;
     println!("OK");
 
     Ok(())
+}
+
+struct InitialActivationInstall<'a> {
+    remote: &'a str,
+    ssh_key: Option<&'a str>,
+    ssh_port: Option<u16>,
+    format: &'a DeployFormat,
+    manifest: &'a ManagerManifest,
+    manager_id: &'a str,
+    resolved_config: &'a str,
+    cert_dir: &'a str,
+}
+
+fn install_initial_activation_descriptor(params: &InitialActivationInstall<'_>) -> Result<()> {
+    let manifest = params.manifest;
+    let checksum = |path: &str| -> Result<String> {
+        manifest
+            .checksums
+            .get(path)
+            .map(|digest| format!("sha256:{digest}"))
+            .with_context(|| format!("manager bundle manifest omitted {path}"))
+    };
+    let executable_path = format!("{}/wr-manager/bin/wr-manager", manifest.workdir);
+    let (backend, backend_spec_path, backend_spec_digest) = match params.format {
+        DeployFormat::Systemd => (
+            "systemd",
+            format!("{}/wr-manager/systemd/wr-manager.service", manifest.workdir),
+            checksum("wr-manager/systemd/wr-manager.service")?,
+        ),
+        DeployFormat::Docker => (
+            "compose",
+            format!("{}/wr-manager/docker/docker-compose.yml", manifest.workdir),
+            checksum("wr-manager/docker/docker-compose.yml")?,
+        ),
+    };
+    let credential_set = PathBuf::from(params.cert_dir).join("manager-endpoint");
+    let credential_digest = helpers::local_tree_digest(&credential_set)?;
+    let descriptor = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "manager_id": params.manager_id,
+        "backend": backend,
+        "executable": executable_path,
+        "executable_digest": checksum("wr-manager/bin/wr-manager")?,
+        "backend_spec_path": backend_spec_path,
+        "backend_spec_digest": backend_spec_digest,
+        "config_path": format!("{}/wr-manager/config/manager.toml", manifest.workdir),
+        "config_digest": format!("sha256:{:x}", Sha256::digest(params.resolved_config.as_bytes())),
+        "credential_set_path": "/etc/wruntime/pki/manager-endpoint/sets/v1",
+        "credential_digest": credential_digest,
+    }))?;
+    helpers::install_remote_bytes(
+        &descriptor,
+        params.remote,
+        "/var/lib/wruntime/manager-activation/current-activation.json",
+        params.ssh_key,
+        params.ssh_port,
+        0o600,
+        helpers::RemoteInstallClass::Sensitive,
+        None,
+    )
 }
 
 struct ManagerRuntimeArtifactInstall<'a> {
@@ -908,23 +1151,6 @@ fn status(args: StatusArgs) -> Result<()> {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
-
-    #[test]
-    fn protected_script_generates_manager_operator_certificate_under_provisioned_host_name() {
-        assert_eq!(
-            operator_admin_certificate_sources("certs", "manager.example"),
-            [
-                "certs/job-admin-operator/ca.crt",
-                "certs/job-admin-operator/manager.example.crt",
-                "certs/job-admin-operator/manager.example.key",
-            ]
-        );
-        assert!(
-            include_str!("../../../dev/validate-deployment-lifecycle.sh").contains(
-                "cert generate \"$MANAGER_HOST\" --ca-dir \"$CERT_DIR/job-admin-operator\""
-            )
-        );
-    }
 
     fn manager_test_bundle(payload: &[u8], declared_payload: &[u8]) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -1130,7 +1356,9 @@ advertise_grpc_address = "{advertise_address}"
 
         let compose = manager_docker_compose("/opt/wruntime", "wr");
         assert!(compose.contains("network_mode: host"));
-        assert!(compose.contains("\"../certs:/opt/wruntime/certs:ro\""));
+        assert!(compose.contains("\"/etc/wruntime/pki:/etc/wruntime/pki:ro\""));
+        assert!(compose
+            .contains("\"/var/lib/wruntime/manager-config:/var/lib/wruntime/manager-config:ro\""));
         assert!(!compose.contains("ports:"));
 
         for follow in [false, true] {

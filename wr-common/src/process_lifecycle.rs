@@ -62,6 +62,7 @@ impl From<&LifecycleSnapshot> for wruntime::LifecycleStatus {
             transitioned_at: Some(snapshot.transitioned_at.into()),
             reason: wruntime::LifecycleTransitionReason::from(snapshot.reason) as i32,
             detail: snapshot.detail.clone(),
+            ..Default::default()
         }
     }
 }

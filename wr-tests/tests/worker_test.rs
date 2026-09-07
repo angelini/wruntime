@@ -24,10 +24,6 @@ async fn test_worker_config_parsing() {
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
         peer_address    = "https://127.0.0.1:9443"
-        [node.tls]
-        cert_path    = "c.crt"
-        key_path     = "c.key"
-        ca_cert_path = "ca.crt"
 
         [database]
         url             = "postgres://localhost/test"
@@ -62,10 +58,6 @@ async fn test_worker_config_defaults() {
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
         peer_address    = "https://127.0.0.1:9443"
-        [node.tls]
-        cert_path    = "c.crt"
-        key_path     = "c.key"
-        ca_cert_path = "ca.crt"
 
         [database]
         url = "postgres://localhost/test"
@@ -94,10 +86,6 @@ async fn test_worker_config_rejects_zero_lifecycle_values() {
         proxy_address = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
         peer_address = "https://127.0.0.1:9443"
-        [node.tls]
-        cert_path = "c.crt"
-        key_path = "c.key"
-        ca_cert_path = "ca.crt"
         [database]
         url = "postgres://localhost/test"
         [[module]]
@@ -138,10 +126,6 @@ async fn test_worker_mode_service_default() {
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
         peer_address    = "https://127.0.0.1:9443"
-        [node.tls]
-        cert_path    = "c.crt"
-        key_path     = "c.key"
-        ca_cert_path = "ca.crt"
 
         [[module]]
         name      = "svc"
@@ -931,10 +915,6 @@ async fn test_worker_config_validation_requires_database() {
         proxy_address   = "http://127.0.0.1:9001"
         control_address = "http://127.0.0.1:9002"
         peer_address    = "https://127.0.0.1:9443"
-        [node.tls]
-        cert_path    = "c.crt"
-        key_path     = "c.key"
-        ca_cert_path = "ca.crt"
 
         [[module]]
         name      = "my-worker"

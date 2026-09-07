@@ -45,6 +45,7 @@ fn status(state: ProcessLifecycleState) -> LifecycleStatus {
         transitioned_at: None,
         reason: LifecycleTransitionReason::ProcessStarted as i32,
         detail: String::new(),
+        ..Default::default()
     }
 }
 
@@ -93,8 +94,8 @@ fn typed_state_evaluation_accepts_ready_and_rejects_terminal_or_invalid_state() 
         Err(LifecycleWaitError::InvalidStatus {
             error:
                 wr_common::lifecycle_observation::LifecycleStatusValidationError::UnspecifiedState,
-            status: LifecycleStatus { state: 0, .. },
-        })
+            status,
+        }) if status.state == 0
     ));
 }
 
@@ -141,12 +142,9 @@ async fn state_wait_preserves_the_last_typed_observation_at_deadline() -> Result
     assert!(matches!(
         error,
         LifecycleWaitError::Deadline {
-            last_observation: Some(LifecycleObservation::Status(LifecycleStatus {
-                state,
-                ..
-            })),
+            last_observation: Some(LifecycleObservation::Status(status)),
             ..
-        } if state == ProcessLifecycleState::Starting as i32
+        } if status.state == ProcessLifecycleState::Starting as i32
     ));
     let _ = shutdown.send(());
     Ok(())

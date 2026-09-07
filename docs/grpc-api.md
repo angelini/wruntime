@@ -1,6 +1,6 @@
 # gRPC API (`proto/wruntime.proto`)
 
-The mTLS `wruntime.ManagerService` is the cluster control plane. Engines use the local proxy's `wruntime.NodeService` for lifecycle calls, and worker job submission/status use HTTP RPC through the proxy rather than gRPC.
+The manager's single mTLS endpoint mounts the `wruntime.ClusterService`, `InfrastructureService`, `NodeService`, `JobService`, `PolicyService`, and `LifecycleService` control-plane domains. Engines use the local proxy's `wruntime.NodeService` for lifecycle calls, and worker job submission/status use HTTP RPC through the proxy rather than gRPC.
 
 ## Process lifecycle
 
@@ -42,28 +42,30 @@ Transitions never move backward. Service-specific route withdrawal, admission cl
 
 Beginning and finalizing a deployment set `wr_nodes.target_revision`; neither replaces committed `current_revision`. The durable operation owns activation and commit. Source and target may coexist, but a registration serves only through exact per-slot authority (or the committed fallback where no explicit slot authority exists). After all action-specific backend, lifecycle, deregistration, and route gates pass, the manager atomically commits the target and enters visible committed cleanup. Stable verification codes include `NON_AUTHORITATIVE_REVISION`, `MISSING_ENGINE`, `REVISION_MISMATCH`, `DIGEST_MISMATCH`, `DUPLICATE_ENGINE_SLOT`, `MISSING_MODULE`, `STALE_ENGINE_HEARTBEAT`, `MISSING_MODULE_HEARTBEAT`, `STALE_MODULE_HEARTBEAT`, `MISSING_ROUTE`, and `UNHEALTHY_ROUTE`. `NodeStatus.desired_deployment` is the committed serving snapshot and `target_deployment` is the optional staged snapshot. Condition code/severity and evidence fields are machine-readable; `detail` remains explanatory.
 
-## OperatorService and NodeAgentService
+## Manager service authorization
 
-These dedicated manager-mTLS services are the destructive operator boundary. A valid CA chain alone grants no role: the leaf certificate's lowercase `sha256:` DER fingerprint must map to one configured principal.
+The manager serves six domains—`ClusterService`, `InfrastructureService`, `NodeService`, `JobService`, `PolicyService`, and read-only `LifecycleService`—on one mTLS listener. Stock TLS validates the client root and profile; a shared parser then requires one same-cluster URI SAN and records the leaf SHA-256 fingerprint. Immutable policy is default-deny for every served RPC and applies role, capability, resource scope, and revocation checks. A complete generated-descriptor test prevents an unclassified RPC from being mounted.
+
+`InfrastructureService` owns durable node operations and manager-set rollouts; `NodeService` is restricted to enrolled proxy/node-agent workloads. A valid chain or routing/source header never grants a role.
 
 | Service/RPC | Roles | Semantics |
 | --- | --- | --- |
-| `OperatorService.GetStatus/GetOperation/ListOperations/VerifyDeployment` | `viewer`, `operator` | Side-effect-free composed status, exact deployment verification, and append-only operation history. Lifecycle observation, backend running/exited evidence, and availability remain separate fields. |
-| `OperatorService.BeginDeployment/BeginRollback/SubmitOperation` | `operator` | Binds allocation, staging, and one immutable operation payload to the same authenticated `(actor, request_token)` identity. Actions are initial apply, drain, restart, rolling upgrade, scale, and rollback. |
-| `OperatorService.ResumeOperation/CancelOperation` | `operator` | Resume paused work with a fresh lease. Cancelling uncommitted queued/paused work requests source restoration before terminal cancellation; committed work requires rollback. |
-| `PutNodeAgentPolicy/FinalizeDeployment/AbandonDeployment` | `operator` | Publish the canonical expected agent policy, bind staged bytes only for their allocating actor, or safely abandon that actor's unused allocation. |
-| `NodeAgentService.Attest` | node-bound `node-agent` | Compares activation, protocol, binary/config digests, backend, capabilities, and retention against manager policy. Protocol equality is required. |
-| `ClaimOperation` | same node-bound agent | Returns one manager-derived typed target/effect and monotonically increasing lease epoch. It never returns shell text or a PID. |
-| `RenewOperationLease/ReportStepResult` | same node-bound agent | Fences by node, activation, operation, step, epoch, principal, and unexpired lease. Result fields are evidence; no success boolean advances state. |
-| `ReportObservation` | same node-bound agent | Stores exact lifecycle observation separately from backend process evidence; endpoint absence never synthesizes lifecycle `STOPPED`, and inspection failure is explicit query-error evidence. |
+| `InfrastructureService.GetStatus/GetOperation/ListOperations/VerifyDeployment` | scoped read role | Side-effect-free composed status, exact deployment verification, and append-only operation history. Lifecycle observation, backend running/exited evidence, and availability remain separate fields. |
+| `InfrastructureService.BeginDeployment/BeginRollback/SubmitOperation` | infrastructure operator | Binds allocation, staging, and one immutable operation payload to the same authenticated `(principal, request_token)` identity. Actions are initial apply, drain, restart, rolling upgrade, scale, and rollback. |
+| `InfrastructureService.ResumeOperation/CancelOperation` | infrastructure operator | Resume paused work with a fresh lease. Cancelling uncommitted queued/paused work requests source restoration before terminal cancellation; committed work requires rollback. |
+| `InfrastructureService.PutNodeAgentPolicy/FinalizeDeployment/AbandonDeployment` | infrastructure operator | Publish the canonical expected agent policy, bind staged bytes only for their allocating principal, or safely abandon that principal's unused allocation. |
+| `NodeService.Attest` | node-bound `node-agent` | Compares activation, protocol, binary/config digests, backend, capabilities, and retention against manager policy. Protocol equality is required. |
+| `NodeService.ClaimOperation` | same node-bound agent | Returns one manager-derived typed target/effect and monotonically increasing lease epoch. It never returns shell text or a PID. |
+| `NodeService.RenewOperationLease/ReportStepResult` | same node-bound agent | Fences by node, activation, operation, step, epoch, principal, and unexpired lease. Result fields are evidence; no success boolean advances state. |
+| `NodeService.ReportObservation` | same node-bound agent | Stores exact lifecycle observation separately from backend process evidence; endpoint absence never synthesizes lifecycle `STOPPED`, and inspection failure is explicit query-error evidence. |
 
 One forward/restoration operation is allowed per node; committed cleanup remains visible and may be superseded by rollback. Operations, absolute deadlines, phases, and append-only events survive client, agent, and manager restarts. Typed steps cover proxy and engine release verification, backend stop/start/inspection, atomic selection, lifecycle/route verification, authority switching, source restoration, and manager-derived cleanup. The manager derives advancement from coherent evidence, so a lost acknowledgement or manager takeover reconciles actual state without repeating a backend effect.
 
 Drain asks the backend adapter to send SIGTERM and prove deregistration plus exit; it never exposes `BeginEngineDrain` to operators. Before commit, cancellation or deadline expiry fences forward effects and completes source restoration without the expired forward deadline. Rollouts use staged/committed overlap and exact slot authority; target registration remains non-serving until the manager switches that slot. Defaults are `max_unavailable=1`, lexical canary, automatic continuation, 120 seconds for drain, 300 seconds for restart, and 1800 seconds for deploy/upgrade/scale/rollback. `pause_after_canary` is durable, and one-slot or zero-capacity transitions require explicit `allow_downtime`.
 
-## JobAdminService and EngineJobAdminService
+## JobService and EngineJobAdminService
 
-`JobAdminService` is mounted only on the manager's dedicated operator-admin mTLS listener. That listener serves no `ManagerService`, `OperatorService`, `NodeAgentService`, or lifecycle methods and trusts only certificates issued by the operator-admin CA; ordinary runtime credentials cannot complete its TLS handshake. Authorization is CA membership, so the operator-admin CA must issue no general runtime clients. The manager never connects to `wr__jobs`; it selects a fresh, non-draining registered engine for the explicit queue and delegates over `EngineJobAdminService`. Engine delegation uses a different CA and manager client identity, so an operator certificate cannot invoke an engine directly. Routing headers are never authorization.
+`JobService` shares the manager mTLS listener and requires an explicit policy capability plus queue scope for every RPC. The manager never connects to `wr__jobs`; it selects a fresh, non-draining registered engine for the explicit queue and delegates over `EngineJobAdminService` with its distinct manager `clientAuth` workload certificate. The engine admits only enrolled, non-revoked same-cluster manager principals from its complete snapshot. Human, proxy, node-agent, wrong-cluster, unmapped, revoked, and server-only leaves are denied. Routing headers are never authorization.
 
 | RPC | Result | Semantics |
 | --- | --- | --- |
@@ -77,7 +79,7 @@ Every operation requires `job_queue_id`. Filters support hierarchical worker nam
 
 Stable status mapping is `invalid_argument` for malformed scope/filter/cursor, `not_found` for an unknown queue or job, `failed_precondition` for retrying a non-dead job, `unavailable` for no fresh queue delegate/readiness, and `internal` for redacted database failures. Safe reads may select the next fresh delegate only when connection establishment fails before dispatch. `RetryJob` is never replayed; a timeout or connection loss after dispatch returns `unavailable` with “outcome unknown; inspect before retrying”.
 
-`EngineJobAdminService.CheckJobQueue` is the manager-intended identity/readiness probe. Transport authorization is CA-wide: any client certificate issued by the delegation CA can call this listener, so that CA must issue only manager delegation identities. Engine methods reject a queue mismatch and remain unavailable until embedded job migrations complete. The listener is bound before registration and is owned and joined with the engine process. Shutdown closes job-admin admission, rejects new RPCs, and drains admitted RPCs under the shared absolute shutdown deadline before route withdrawal and deregistration.
+`EngineJobAdminService.CheckJobQueue` is the manager-workload identity/readiness probe. Engine methods reject a queue mismatch and remain unavailable until embedded job migrations and the initial workload-policy snapshot complete. Snapshot expiry fails closed. The listener is bound before registration and is owned and joined with the engine process. Shutdown closes job admission, rejects new RPCs, and drains admitted RPCs under the shared absolute shutdown deadline before route withdrawal and deregistration.
 
 Job payloads and successful results are each bounded to 1 MiB at persistence; combined identity/source/type metadata is bounded to 64 KiB and stored error text to 1 MiB. Submission body collection, worker response collection, engine delegation decoding/encoding, manager forwarding, and CLI decoding use one compatible contract. The unary admin ceiling is 4 MiB so an inspection containing both maximum payload and result remains transportable through both gRPC hops. Oversize submission or persistence is rejected rather than producing an inspectable row that cannot cross the control plane.
 

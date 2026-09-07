@@ -1,6 +1,9 @@
 mod helpers;
 use helpers::{
-    manager::{manager_trio, register_test_module_ready, sync_table, synced_routing_table},
+    manager::{
+        current_engine_fence, manager_trio, register_test_module_ready, sync_table,
+        synced_routing_table,
+    },
     proxy::{proxy_get, start_proxy},
     stubs::spawn_identified_stub,
 };
@@ -322,8 +325,10 @@ async fn test_proxy_failover_after_deregister() -> Result<()> {
     assert!(saw_b, "engine-b should be reachable before failover");
 
     // Deregister engine-a; its rule is immediately marked unhealthy.
+    let fence = current_engine_fence(&pool, "ea").await?;
     mgr.deregister_engine(DeregisterEngineRequest {
         engine_id: "ea".into(),
+        fence: Some(fence),
     })
     .await?;
     sync_table(&mgr_addr, &table).await?;
@@ -365,8 +370,10 @@ async fn test_proxy_503_when_all_instances_unhealthy() -> Result<()> {
     let (s, _) = proxy_get(proxy, "gone-ns", "gone-service", Some("1.0.0")).await?;
     assert_eq!(s, StatusCode::OK, "should be reachable before deregister");
 
+    let fence = current_engine_fence(&pool, "ea").await?;
     mgr.deregister_engine(DeregisterEngineRequest {
         engine_id: "ea".into(),
+        fence: Some(fence),
     })
     .await?;
     sync_table(&mgr_addr, &table).await?;

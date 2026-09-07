@@ -3,18 +3,17 @@ use helpers::{
     db::manager_pool,
     manager::{
         backdate_engine_heartbeat, get_routing_table_version, manager_client, manager_trio,
-        manager_trio_with_monitor, register_test_module_ready,
+        manager_trio_with_monitor, register_managed_engine, register_test_module_ready,
     },
     proxy::TEST_SELF_PEER,
     stubs::spawn_stub_engine,
-    wasm::minimal_file_descriptor_set,
 };
 
 use anyhow::Result;
 
 use wr_common::wruntime::{
     DeleteRoutingRuleRequest, DeregisterEngineRequest, EngineRegistration, GetRoutingTableRequest,
-    ModuleDescriptor, RegisterEngineRequest, RoutingRule,
+    RoutingRule,
 };
 
 /// Build a routing rule with the given ID and destination module.
@@ -124,26 +123,17 @@ async fn test_delete_retries_on_contention() -> Result<()> {
 async fn test_deregister_waits_for_lock() -> Result<()> {
     let (pool, _addr, mut c) = manager_trio().await?;
 
-    // Register an engine with a module so deregister has rules to mark unhealthy.
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
-            engine_id: "dereg-e1".into(),
-            address: "http://127.0.0.1:9400".into(),
-            proxy_address: TEST_SELF_PEER.into(),
-            peer_address: TEST_SELF_PEER.into(),
-            modules: vec![ModuleDescriptor {
-                name: "dereg-svc".into(),
-                namespace: "dereg-ns".into(),
-                version: "1.0.0".into(),
-                proto_schema: minimal_file_descriptor_set(),
-            }],
-            secrets: vec![],
-            db_namespaces: vec![],
-            deployment: None,
-            job_queue_id: String::new(),
-            job_admin_address: String::new(),
-        }),
-    })
+    // Register through manager-owned desired state so deregistration carries
+    // the same ownership fence as production registrations.
+    let fence = register_test_module_ready(
+        &pool,
+        &mut c,
+        "dereg-e1",
+        "http://127.0.0.1:9400",
+        "dereg-ns",
+        "dereg-svc",
+        "1.0.0",
+    )
     .await?;
     c.upsert_routing_rule(make_rule("dereg-r1", "dereg-svc", "dereg-e1"))
         .await?;
@@ -154,6 +144,8 @@ async fn test_deregister_waits_for_lock() -> Result<()> {
     let deregister = tokio::spawn(async move {
         c.deregister_engine(DeregisterEngineRequest {
             engine_id: "dereg-e1".into(),
+
+            fence: Some(fence),
         })
         .await?;
         anyhow::Ok(c)
@@ -319,29 +311,32 @@ async fn test_delete_existing_rule_bumps_version() -> Result<()> {
 
 #[tokio::test]
 async fn test_deregister_no_rules_no_version_bump() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
-    // Register engine without any routing rules.
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    // Register engine without any routing rules through managed desired state.
+    let response = register_managed_engine(
+        &pool,
+        &mut c,
+        EngineRegistration {
             engine_id: "norule-e1".into(),
             address: "http://127.0.0.1:9500".into(),
             proxy_address: TEST_SELF_PEER.into(),
             peer_address: TEST_SELF_PEER.into(),
-            modules: vec![],
-            secrets: vec![],
-            db_namespaces: vec![],
-            deployment: None,
-            job_queue_id: String::new(),
-            job_admin_address: String::new(),
-        }),
-    })
-    .await?;
+            ..Default::default()
+        },
+    )
+    .await?
+    .into_inner();
+    let fence = response
+        .fence
+        .ok_or_else(|| anyhow::anyhow!("managed registration omitted fence"))?;
 
     let v_before = get_routing_table_version(&mut c).await?;
 
     c.deregister_engine(DeregisterEngineRequest {
         engine_id: "norule-e1".into(),
+
+        fence: Some(fence),
     })
     .await?;
 
@@ -358,27 +353,17 @@ async fn test_deregister_no_rules_no_version_bump() -> Result<()> {
 
 #[tokio::test]
 async fn test_deregister_with_rules_bumps_version() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+    let (pool, _addr, mut c) = manager_trio().await?;
 
-    c.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
-            engine_id: "withrule-e1".into(),
-            address: "http://127.0.0.1:9501".into(),
-            proxy_address: TEST_SELF_PEER.into(),
-            peer_address: TEST_SELF_PEER.into(),
-            modules: vec![ModuleDescriptor {
-                name: "wr-svc".into(),
-                namespace: "wr-ns".into(),
-                version: "1.0.0".into(),
-                proto_schema: minimal_file_descriptor_set(),
-            }],
-            secrets: vec![],
-            db_namespaces: vec![],
-            deployment: None,
-            job_queue_id: String::new(),
-            job_admin_address: String::new(),
-        }),
-    })
+    let fence = register_test_module_ready(
+        &pool,
+        &mut c,
+        "withrule-e1",
+        "http://127.0.0.1:9501",
+        "wr-ns",
+        "wr-svc",
+        "1.0.0",
+    )
     .await?;
     c.upsert_routing_rule(make_rule("wr-r1", "wr-svc", "withrule-e1"))
         .await?;
@@ -387,6 +372,8 @@ async fn test_deregister_with_rules_bumps_version() -> Result<()> {
 
     c.deregister_engine(DeregisterEngineRequest {
         engine_id: "withrule-e1".into(),
+
+        fence: Some(fence),
     })
     .await?;
 

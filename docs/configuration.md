@@ -21,89 +21,40 @@ just manager
 `manager.toml`:
 
 ```toml
-listen_address                = "0.0.0.0:9000"
+manager_id = "manager-a"
+listen_address = "0.0.0.0:9000"
 engine_heartbeat_timeout_secs = 30
-# module_heartbeat_timeout_secs = 30  # optional; defaults to engine timeout; must be > 0
-local_proxy_address           = "http://127.0.0.1:9001"  # required — scheduler posts jobs here
 
 [tls]
-cert_path    = "certs/manager.crt"
-key_path     = "certs/manager.key"
-ca_cert_path = "certs/ca.crt"
+cert_path = "/etc/wruntime/pki/manager-manager-a/sets/v1/leaf.pem"
+key_path = "/etc/wruntime/pki/manager-manager-a/sets/v1/key.pem"
+client_ca_cert_path = "/etc/wruntime/pki/roots/client/ca.crt"
 
-# Dedicated JobAdminService listener. Its CA issues only operator-admin clients.
-[job_admin]
-listen_address = "0.0.0.0:9020"
+# Distinct clientAuth workload identity: urn:wruntime:default:manager:manager-a
+[client_tls]
+cert_path = "/etc/wruntime/pki/manager-manager-a-client/sets/v1/leaf.pem"
+key_path = "/etc/wruntime/pki/manager-manager-a-client/sets/v1/key.pem"
+server_ca_cert_path = "/etc/wruntime/pki/roots/server/ca.crt"
 
-[job_admin.tls]
-cert_path    = "certs/job-admin-operator/manager.crt"
-key_path     = "certs/job-admin-operator/manager.key"
-ca_cert_path = "certs/job-admin-operator/ca.crt"
-
-# Manager client identity for the separate engine-delegation trust domain.
-[job_admin_delegation_tls]
-cert_path    = "certs/job-admin-delegation/manager.crt"
-key_path     = "certs/job-admin-delegation/manager.key"
-ca_cert_path = "certs/job-admin-delegation/ca.crt"
+[authorization]
+policy_file = "/var/lib/wruntime/manager-config/manager-a/authorization.toml"
 
 [database]
-url             = "postgres://postgres@localhost:5433/wruntime_example"
+url = "postgres://postgres@localhost:5433/wruntime_example"
 max_connections = 10
 
 [cluster]
-# advertise_grpc_address = "https://manager-1:9000" # optional; defaults to listen_address
-manager_heartbeat_interval_secs       = 1
-manager_liveness_threshold_secs       = 5
+advertise_grpc_address = "https://manager-a:9000"
+manager_heartbeat_interval_secs = 1
+manager_liveness_threshold_secs = 5
 manager_stale_row_reap_threshold_secs = 300
-
-# scheduler_lease_secs       = 30    # optional; lease before another manager may reclaim
-# scheduler_retry_base_secs  = 5     # optional; base backoff, doubles per failure
-# scheduler_retry_cap_secs   = 300   # optional; max backoff cap
-
-# Explicit authorization for OperatorService/NodeAgentService. Fingerprints are
-# SHA-256 over the complete DER leaf certificate. Rotation uses another entry
-# with the same principal, role, and node binding.
-[[operator_principals]]
-fingerprint = "sha256:<64-lowercase-hex>"
-principal = "production-operators"
-role = "operator"
-
-[[operator_principals]]
-fingerprint = "sha256:<64-lowercase-hex>"
-principal = "node-a-agent"
-role = "node-agent"
-node_id = "node-a"
 ```
 
-The `[tls]`, `[job_admin]`, and `[job_admin_delegation_tls]` sections are required. Runtime clients on `listen_address` present certificates from the runtime CA. `operator_principals` applies only to `OperatorService` and `NodeAgentService` on that runtime listener; it accepts `viewer`, `operator`, and `node-agent`, and an empty map denies those role-gated RPCs while leaving existing `ManagerService` behavior unchanged. The distinct `job_admin.listen_address` serves only `JobAdminService` and accepts every client certificate issued by its operator-admin CA; that CA must issue no ordinary runtime certificate. `[job_admin_delegation_tls]` is neither a runtime nor operator credential: it is the manager's client identity and CA used to reach engine `EngineJobAdminService` listeners. Engine transport authorization is CA-wide, so issue the delegation CA only to manager identities. Startup binds both listener sockets and validates all three TLS configurations before readiness.
+Managers expose all six manager domains plus lifecycle on one mTLS listener. The endpoint leaf is `serverAuth`; `[client_tls]` is a separate `clientAuth` manager workload identity. The client root admits only valid profile certificates; authorization then requires one exact same-cluster URI SAN, a mapped role, resource scope, and a non-revoked leaf SHA-256 fingerprint for every RPC. The immutable policy TOML is validated and canonicalized at startup and never hot-reloaded.
 
-Job commands require an explicit dedicated address and credential set; they never fall back to `--manager`, `WR_MANAGER`, or the ordinary `WR_*` TLS paths:
+CLI calls, including `jobs`, use the normal `--manager`, `--ca-cert`, `--client-cert`, and `--client-key` options. Job queue access is a policy capability with queue scope, not a separate listener or CA. Every jobs subcommand accepts `--format table|json`; list cursors remain filter-bound, inspect redacts bytes unless explicit output files are supplied, and retry is never replayed after uncertain transport.
 
-```bash
-export WR_JOB_ADMIN_MANAGER=https://manager.example:9020
-export WR_JOB_ADMIN_CA_CERT=certs/job-admin-operator/ca.crt
-export WR_JOB_ADMIN_CLIENT_CERT=certs/job-admin-operator/operator.crt
-export WR_JOB_ADMIN_CLIENT_KEY=certs/job-admin-operator/operator.key
-
-wr-cli jobs queues
-wr-cli jobs list --queue ecommerce-jobs --status dead --page-size 50
-wr-cli jobs summary --queue ecommerce-jobs --worker-namespace shop
-wr-cli jobs inspect --queue ecommerce-jobs JOB_ID --payload-out payload.bin
-wr-cli jobs retry --queue ecommerce-jobs JOB_ID --yes
-```
-
-The equivalent global flags are `--job-admin-manager`, `--job-admin-ca-cert`, `--job-admin-client-cert`, and `--job-admin-client-key`. Every subcommand accepts `--format table|json`. `list` emits one page and a continuation cursor; provide that cursor with identical filters to continue. `inspect` prints only byte lengths unless explicit output files are supplied, uses create-new writes, and requires `--force` to overwrite.
-
-For fingerprint-mapped runtime roles, issue a dedicated leaf from the runtime CA and hash the complete DER certificate exactly as the manager does:
-
-```bash
-wr-cli cert generate lifecycle-operator --ca-dir certs/
-printf 'sha256:'
-openssl x509 -in certs/lifecycle-operator.crt -outform DER \
-  | sha256sum | cut -d' ' -f1
-```
-
-Place that `sha256:<hex>` value in `operator_principals`, then provision the matching `.crt`/`.key` and runtime `ca.crt` only to that viewer, operator, or node agent. Generate a distinct leaf per principal/host; node-agent entries also require the matching `node_id`. During rotation, add the new fingerprint with the same role and node binding before replacing the files, then remove the old fingerprint after rollout.
+Production trust roots are fixed under `/etc/wruntime/pki/roots/`. Credential sets are immutable directories under `/etc/wruntime/pki/<service-or-slot>/sets/<version>` and remain outside releases and images. Development/test roots must be explicit but use the same structure. Issuance records parent-directory fsync uncertainty and never silently reissues or overwrites a set.
 
 The `[database]` section is required. The manager persists engines, routing rules,
 and schemas to Postgres. Embedded SQL migrations run automatically on startup via
@@ -582,9 +533,9 @@ When an engine registers, the manager automatically creates one default routing 
 ```bash
 # example using grpcurl
 grpcurl \
-  -cacert certs/ca.crt \
-  -cert certs/127.0.0.1.crt \
-  -key certs/127.0.0.1.key \
+  -cacert certs/runtime-server-root/ca.crt \
+  -cert certs/runtime-human-client/leaf.pem \
+  -key certs/runtime-human-client/key.pem \
   -d '{
   "rule_id": "r1",
   "source_module": "order-service",
@@ -595,7 +546,7 @@ grpcurl \
   "engine_id": "<engine-uuid>",
   "engine_address": "http://127.0.0.1:9100",
   "peer_address": "https://127.0.0.1:9443"
-}' 127.0.0.1:9000 wruntime.ManagerService/UpsertRoutingRule
+}' 127.0.0.1:9000 wruntime.ClusterService/UpsertRoutingRule
 ```
 
 `peer_address` tells every proxy which node owns this rule. A proxy whose own explicit `[node].peer_address` matches will route directly to `engine_address`; all other proxies relay to `peer_address` and let that node route locally. The old `proxy_address` routing-rule field is reserved in `proto/wruntime.proto` and must not be used in new rules. `source_module` and `source_namespace` are retained as metadata for future policy work; current routing matches only the destination namespace, module, and optional version, so these source fields do not restrict callers.

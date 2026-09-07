@@ -18,8 +18,9 @@ use anyhow::Result;
 use http::StatusCode;
 
 use wr_common::wruntime::{
-    BeginDeploymentRequest, DeploymentMetadata, EngineRegistration, ExpectedEngine,
-    HeartbeatRequest, ModuleDescriptor, RegisterEngineRequest, RoutingRule,
+    BeginDeploymentRequest, DeploymentInventoryV1, DeploymentMetadata, EngineRegistration,
+    ExpectedEngine, ExpectedModule, FinalizeDeploymentRequest, HeartbeatRequest, ModuleDescriptor,
+    NodeOperationAction, RolloutPolicy, RoutingRule, SubmitOperationRequest,
 };
 
 #[tokio::test]
@@ -32,23 +33,74 @@ async fn staged_registration_remains_non_serving_without_exact_slot_authority() 
             node_id: "staged-authority-node".into(),
             attempt_token: "staged-authority".into(),
             bundle_digest: digest.clone(),
-            expected_engines: vec![ExpectedEngine {
-                engine_slot: "blue".into(),
-                modules: vec![],
-            }],
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![ExpectedEngine {
+                    engine_slot: "blue".into(),
+                    modules: vec![ExpectedModule {
+                        identity: Some(wr_common::wruntime::ModuleIdentity {
+                            namespace: "staged-ns".into(),
+                            name: "staged-service".into(),
+                            version: "1.0.0".into(),
+                        }),
+                        proto_schema_digest: wr_common::deployment_contract::schema_digest(
+                            &minimal_file_descriptor_set(),
+                        ),
+                    }],
+                    ..Default::default()
+                }],
+            }),
         },
         "operator-a",
     )
     .await?
     .record;
+    let finalized = wr_manager::db::finalize_deployment(
+        &pool,
+        &FinalizeDeploymentRequest {
+            node_id: deployment.node_id,
+            attempt_token: deployment.attempt_token,
+            revision: deployment.revision,
+            bundle_digest: digest.clone(),
+            resolved_release_digest: format!("sha256:{}", "b".repeat(64)),
+        },
+        "operator-a",
+    )
+    .await?
+    .record;
+    let operation = wr_manager::operations::submit(
+        &pool,
+        "operator-a",
+        &SubmitOperationRequest {
+            node_id: finalized.node_id.clone(),
+            request_token: "staged-authority".into(),
+            action: NodeOperationAction::InitialApply as i32,
+            engine_slots: vec!["blue".into()],
+            target_revision: finalized.revision,
+            bundle_digest: finalized.bundle_digest.clone(),
+            policy: Some(RolloutPolicy {
+                max_unavailable: 1,
+                canary_slot: "blue".into(),
+                pause_after_canary: false,
+                allow_downtime: true,
+                deadline_seconds: 300,
+            }),
+            resolved_release_digest: finalized.resolved_release_digest.clone(),
+        },
+    )
+    .await?;
     let module = ModuleDescriptor {
         name: "staged-service".into(),
         version: "1.0.0".into(),
         proto_schema: minimal_file_descriptor_set(),
         namespace: "staged-ns".into(),
     };
-    wr_manager::db::register_engine_and_routes(
+    let password = wr_manager::crypto::SecretCrypto::generate_random_password();
+    let crypto = wr_manager::crypto::SecretCrypto::from_hex(&password)?;
+    let activation_id = uuid::Uuid::new_v4().to_string();
+    let registration = wr_manager::db::register_engine_and_routes(
         &pool,
+        &crypto,
         &EngineRegistration {
             engine_id: "staged-engine".into(),
             address: "http://127.0.0.1:19100".into(),
@@ -60,15 +112,24 @@ async fn staged_registration_remains_non_serving_without_exact_slot_authority() 
             job_queue_id: String::new(),
             job_admin_address: String::new(),
             deployment: Some(DeploymentMetadata {
-                node_id: deployment.node_id,
-                revision: deployment.revision,
+                node_id: finalized.node_id,
+                revision: finalized.revision,
                 bundle_digest: digest,
                 engine_slot: "blue".into(),
+                operation_id: operation.operation_id,
+                revision_digest: finalized.revision_digest,
             }),
         },
+        &activation_id,
     )
     .await?;
-    wr_manager::db::publish_engine_readiness(&pool, "staged-engine", &[module]).await?;
+    wr_manager::db::publish_engine_readiness(
+        &pool,
+        "staged-engine",
+        &[module],
+        &registration.fence,
+    )
+    .await?;
     wr_manager::db::update_route_health(&pool, 30.0, 30.0).await?;
     let table = wr_manager::db::get_routing_table(&pool, 0)
         .await?
@@ -84,16 +145,17 @@ async fn staged_registration_remains_non_serving_without_exact_slot_authority() 
 
 #[tokio::test]
 async fn route_health_publication_participates_in_operation_evidence_lock() -> Result<()> {
-    let pool = helpers::db::manager_pool().await;
+    let (pool, _addr, mut manager) = helpers::manager::manager_trio().await?;
     let module = ModuleDescriptor {
         name: "serialized-service".into(),
         version: "1.0.0".into(),
         proto_schema: minimal_file_descriptor_set(),
         namespace: "serialized-ns".into(),
     };
-    wr_manager::db::register_engine_and_routes(
+    let response = helpers::manager::register_managed_engine(
         &pool,
-        &EngineRegistration {
+        &mut manager,
+        EngineRegistration {
             engine_id: "serialized-engine".into(),
             address: "http://127.0.0.1:19101".into(),
             modules: vec![module.clone()],
@@ -107,7 +169,8 @@ async fn route_health_publication_participates_in_operation_evidence_lock() -> R
         },
     )
     .await?;
-    wr_manager::db::publish_engine_readiness(&pool, "serialized-engine", &[module]).await?;
+    let fence = response.into_inner().fence.expect("registration fence");
+    wr_manager::db::publish_engine_readiness(&pool, "serialized-engine", &[module], &fence).await?;
     backdate_engine_heartbeat(&pool, "serialized-engine", 60).await;
 
     let mut holder = pool.get().await?;
@@ -202,7 +265,7 @@ async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
     let (pool, _mgr_addr, mut mgr) = manager_trio_with_monitor(2).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_test_module_ready(
+    let fence = register_test_module_ready(
         &pool,
         &mut mgr,
         "hc-keep-e1",
@@ -224,6 +287,8 @@ async fn test_heartbeat_keeps_module_healthy() -> Result<()> {
                 version: "1.0.0".into(),
                 proto_schema: vec![],
             }],
+
+            fence: Some(fence.clone()),
         })
         .await?;
         interval.tick().await;
@@ -244,7 +309,7 @@ async fn test_engine_health_recovery_after_heartbeat() -> Result<()> {
     let (pool, _mgr_addr, mut mgr) = manager_trio_with_monitor(1).await?;
 
     let (engine_addr, engine_shutdown) = spawn_stub_engine().await?;
-    register_test_module_ready(
+    let fence = register_test_module_ready(
         &pool,
         &mut mgr,
         "hc-rec-e1",
@@ -279,6 +344,8 @@ async fn test_engine_health_recovery_after_heartbeat() -> Result<()> {
             version: "1.0.0".into(),
             proto_schema: vec![],
         }],
+
+        fence: Some(fence.clone()),
     })
     .await?;
 
@@ -398,10 +465,12 @@ async fn test_health_change_bumps_routing_table_version() -> Result<()> {
 
 #[tokio::test]
 async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> {
-    let (_pool, _addr, mut mgr) = manager_trio_with_monitor(1).await?;
+    let (pool, _addr, mut mgr) = manager_trio_with_monitor(1).await?;
 
-    mgr.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    let registration = helpers::manager::register_managed_engine(
+        &pool,
+        &mut mgr,
+        EngineRegistration {
             engine_id: "mh-e1".into(),
             address: "http://127.0.0.1:9800".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -425,8 +494,8 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     // Intentional elapsed-time interval: keep the engine and mod-a fresh while mod-b remains omitted.
@@ -440,6 +509,8 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
                 version: "1.0.0".into(),
                 proto_schema: vec![],
             }],
+
+            fence: registration.get_ref().fence.clone(),
         })
         .await?;
         interval.tick().await;
@@ -489,6 +560,8 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
                 proto_schema: vec![],
             },
         ],
+
+        fence: registration.get_ref().fence.clone(),
     })
     .await?;
     wait_for_default_rule_health(
@@ -515,8 +588,10 @@ async fn test_only_omitted_module_route_unhealthy_then_recovers() -> Result<()> 
 async fn test_engine_stale_marks_all_module_routes_unhealthy() -> Result<()> {
     let (pool, _addr, mut mgr) = manager_trio_with_monitor(1).await?;
 
-    mgr.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    let registration = helpers::manager::register_managed_engine(
+        &pool,
+        &mut mgr,
+        EngineRegistration {
             engine_id: "mh-stale-e1".into(),
             address: "http://127.0.0.1:9810".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -540,8 +615,8 @@ async fn test_engine_stale_marks_all_module_routes_unhealthy() -> Result<()> {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     mgr.heartbeat(HeartbeatRequest {
@@ -560,6 +635,8 @@ async fn test_engine_stale_marks_all_module_routes_unhealthy() -> Result<()> {
                 proto_schema: vec![],
             },
         ],
+
+        fence: registration.get_ref().fence.clone(),
     })
     .await?;
     wr_manager::db::update_route_health(&pool, 30.0, 30.0)
@@ -604,6 +681,7 @@ async fn test_registration_alone_remains_unhealthy_after_sweep() -> Result<()> {
     let (pool, _addr, mut mgr) = manager_trio_with_monitor(30).await?;
 
     register_test_module_raw(
+        &pool,
         &mut mgr,
         "mh-seed-e1",
         "http://127.0.0.1:9820",
@@ -656,7 +734,8 @@ async fn test_reregister_resets_stale_module_readiness() -> Result<()> {
         get_default_rule_health(&mut mgr, "mh-rereg-e1", "mh-ns", "rereg-svc", "1.0.0").await?;
     assert!(healthy, "route starts healthy after ready registration");
 
-    register_test_module_raw(
+    let fence = register_test_module_raw(
+        &pool,
         &mut mgr,
         "mh-rereg-e1",
         "http://127.0.0.1:9825",
@@ -687,6 +766,8 @@ async fn test_reregister_resets_stale_module_readiness() -> Result<()> {
             version: "1.0.0".into(),
             proto_schema: vec![],
         }],
+
+        fence: Some(fence.clone()),
     })
     .await?;
     wr_manager::db::update_route_health(&pool, 30.0, 30.0)
@@ -705,8 +786,10 @@ async fn test_reregister_resets_stale_module_readiness() -> Result<()> {
 async fn test_malformed_module_entry_skipped_not_fatal() -> Result<()> {
     let (pool, _addr, mut mgr) = manager_trio_with_monitor(30).await?;
 
-    mgr.register_engine(RegisterEngineRequest {
-        registration: Some(EngineRegistration {
+    let registration = helpers::manager::register_managed_engine(
+        &pool,
+        &mut mgr,
+        EngineRegistration {
             engine_id: "mh-bad-e1".into(),
             address: "http://127.0.0.1:9830".into(),
             proxy_address: TEST_SELF_PEER.into(),
@@ -730,8 +813,8 @@ async fn test_malformed_module_entry_skipped_not_fatal() -> Result<()> {
             deployment: None,
             job_queue_id: String::new(),
             job_admin_address: String::new(),
-        }),
-    })
+        },
+    )
     .await?;
 
     // One valid entry + one with an empty version. The whole request must succeed.
@@ -752,6 +835,8 @@ async fn test_malformed_module_entry_skipped_not_fatal() -> Result<()> {
                     proto_schema: vec![],
                 },
             ],
+
+            fence: registration.get_ref().fence.clone(),
         })
         .await;
     assert!(resp.is_ok(), "malformed entry must not fail the heartbeat");

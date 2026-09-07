@@ -14,6 +14,7 @@ pub mod invoke;
 pub mod jobs;
 pub mod lifecycle;
 pub mod logs;
+pub mod manager_deploy_set;
 pub mod managers;
 pub mod metrics;
 pub mod node;

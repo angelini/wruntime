@@ -8,13 +8,27 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
+use wr_common::agent_policy::{
+    AgentPolicy, AgentPolicyBackend, AGENT_CAPABILITIES, AGENT_POLICY_VERSION,
+    AGENT_PROTOCOL_VERSION,
+};
 use wr_common::process_lifecycle::PROCESS_INSTANCE_ID_ENV;
-use wr_common::wruntime::ServiceKind;
+use wr_common::wruntime::{
+    AttestNodeAgentRequest, BackendKind, BackendProcessState, BeginDeploymentRequest,
+    ClaimOperationRequest, DeploymentInventoryV1, ExpectedEngine, ExpectedModule,
+    FinalizeDeploymentRequest, GetOperationRequest, InstructionTargetKind, LifecycleStatus,
+    ListEnginesRequest, ModuleIdentity, NodeAgentAttestation, NodeAgentPolicy, NodeOperationAction,
+    NodeOperationState, NodeOperationStepKind, ProcessLifecycleState, PutNodeAgentPolicyRequest,
+    ReportNodeObservationRequest, ReportStepResultRequest, RoutingRule, ServiceKind,
+    SubmitOperationRequest,
+};
 
+use super::config::{DeploymentConfig, EngineConfig};
 use super::helpers::{self, LifecycleObservation, ProxyRoutingBarrierTarget};
 use crate::client;
 
@@ -1175,6 +1189,450 @@ async fn monitor_active(
     finish_owned(group, scenario, signals, primary).await
 }
 
+async fn wait_for_manager_admission(manager_endpoint: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        match helpers::get_manager_routing_table_version(manager_endpoint).await {
+            Ok(_) => return Ok(()),
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                let _ = error;
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            Err(error) => return Err(error.context("manager privileged admission did not open")),
+        }
+    }
+}
+
+async fn prepare_managed_engine_configs(
+    manager_endpoint: &str,
+    config_paths: &[PathBuf],
+) -> Result<(tempfile::TempDir, Vec<PathBuf>)> {
+    if config_paths.is_empty() {
+        return Ok((
+            tempfile::tempdir().context("failed to create foreground config directory")?,
+            Vec::new(),
+        ));
+    }
+    // Local examples use the enrolled proxy-a workload identity for manager
+    // registration calls, so desired state must bind to its node-a enrollment.
+    let node_id = "node-a".to_string();
+    let request_token = Uuid::new_v4().to_string();
+    let operation_token = request_token.clone();
+    let mut configs = Vec::with_capacity(config_paths.len());
+    let mut expected = Vec::with_capacity(config_paths.len());
+    let mut bundle_hash = Sha256::new();
+
+    for (index, path) in config_paths.iter().enumerate() {
+        let bytes = std::fs::read(path).with_context(|| {
+            format!("failed to read foreground engine config {}", path.display())
+        })?;
+        bundle_hash.update((bytes.len() as u64).to_be_bytes());
+        bundle_hash.update(&bytes);
+        let config: EngineConfig = toml::from_slice(&bytes).with_context(|| {
+            format!(
+                "failed to parse foreground engine config {}",
+                path.display()
+            )
+        })?;
+        let engine_slot = format!("engine-{}", index + 1);
+        let mut modules = config
+            .modules
+            .iter()
+            .map(|module| {
+                let proto_schema_digest = module
+                    .schema_path
+                    .as_deref()
+                    .filter(|path| !path.is_empty())
+                    .map(|path| {
+                        std::fs::read(path)
+                            .with_context(|| format!("failed to read module schema {path}"))
+                            .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)))
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok(ExpectedModule {
+                    identity: Some(ModuleIdentity {
+                        namespace: module.namespace.clone(),
+                        name: module.name.clone(),
+                        version: module.version.clone(),
+                    }),
+                    proto_schema_digest,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        modules.sort_by(|left, right| {
+            let left_identity = left.identity.as_ref().expect("constructed identity");
+            let right_identity = right.identity.as_ref().expect("constructed identity");
+            (
+                &left_identity.namespace,
+                &left_identity.name,
+                &left_identity.version,
+                &left.proto_schema_digest,
+            )
+                .cmp(&(
+                    &right_identity.namespace,
+                    &right_identity.name,
+                    &right_identity.version,
+                    &right.proto_schema_digest,
+                ))
+        });
+        modules.dedup_by(|left, right| left == right);
+        let mut db_namespaces = config
+            .modules
+            .iter()
+            .filter(|module| module.database)
+            .map(|module| module.namespace.clone())
+            .collect::<Vec<_>>();
+        db_namespaces.sort();
+        db_namespaces.dedup();
+        expected.push(ExpectedEngine {
+            engine_slot: engine_slot.clone(),
+            modules,
+            secrets: vec![],
+            db_namespaces,
+            job_queue_id: config
+                .job_admin
+                .as_ref()
+                .map(|job| job.queue_id.clone())
+                .unwrap_or_default(),
+            job_admin_address: config
+                .job_admin
+                .as_ref()
+                .map(|job| job.advertise_address.clone())
+                .unwrap_or_default(),
+        });
+        configs.push((config, engine_slot));
+    }
+
+    let bundle_digest = format!("sha256:{:x}", bundle_hash.finalize());
+    let resolved_release_digest = bundle_digest.clone();
+    let mut manager = client::connect_with_retry(
+        manager_endpoint,
+        wr_common::manager_client::RetryClass::DurableCreate,
+    )
+    .await?;
+    let deployment = manager
+        .begin_deployment(BeginDeploymentRequest {
+            node_id: node_id.clone(),
+            attempt_token: request_token,
+            bundle_digest: bundle_digest.clone(),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: expected,
+            }),
+        })
+        .await?
+        .into_inner()
+        .deployment
+        .context("foreground BeginDeployment omitted deployment")?;
+    manager
+        .finalize_deployment(FinalizeDeploymentRequest {
+            node_id: node_id.clone(),
+            attempt_token: operation_token.clone(),
+            revision: deployment.revision,
+            bundle_digest: bundle_digest.clone(),
+            resolved_release_digest: resolved_release_digest.clone(),
+        })
+        .await?;
+    let operation = manager
+        .submit_operation(SubmitOperationRequest {
+            node_id: node_id.clone(),
+            request_token: operation_token,
+            action: NodeOperationAction::InitialApply as i32,
+            engine_slots: configs.iter().map(|(_, slot)| slot.clone()).collect(),
+            target_revision: deployment.revision,
+            bundle_digest,
+            policy: None,
+            resolved_release_digest,
+        })
+        .await?
+        .into_inner()
+        .operation
+        .context("foreground SubmitOperation omitted operation")?;
+
+    let directory = tempfile::tempdir().context("failed to create foreground config directory")?;
+    let mut paths = Vec::with_capacity(configs.len());
+    for (index, (mut config, engine_slot)) in configs.into_iter().enumerate() {
+        config.deployment = Some(DeploymentConfig {
+            node_id: node_id.clone(),
+            revision: deployment.revision.to_string(),
+            bundle_digest: deployment.bundle_digest.clone(),
+            engine_slot,
+            operation_id: operation.operation_id.clone(),
+            revision_digest: deployment.revision_digest.clone(),
+            extra: super::config::empty_extra_fields(),
+        });
+        let path = directory.path().join(format!("engine-{}.toml", index + 1));
+        let rendered = config.to_toml()?.replace(
+            &format!("revision = \"{}\"", deployment.revision),
+            &format!("revision = {}", deployment.revision),
+        );
+        std::fs::write(&path, rendered)?;
+        paths.push(path);
+    }
+    Ok((directory, paths))
+}
+
+fn foreground_agent_policy(manager_endpoint: &str) -> Result<NodeAgentPolicy> {
+    let policy = AgentPolicy {
+        policy_version: AGENT_POLICY_VERSION,
+        node_id: "node-a".into(),
+        manager_endpoint: manager_endpoint.into(),
+        client_cert_path: "/tmp/wruntime-foreground-agent/agent.crt".into(),
+        client_key_path: "/tmp/wruntime-foreground-agent/agent.key".into(),
+        ca_cert_path: "/tmp/wruntime-foreground-agent/ca.crt".into(),
+        deployment_root: "/tmp/wruntime-foreground-deployments".into(),
+        runtime_dir: "/tmp/wruntime-foreground-runtime".into(),
+        backend: AgentPolicyBackend::Systemd,
+        compose_project: String::new(),
+        systemctl_path: "/usr/bin/systemctl".into(),
+        docker_path: String::new(),
+        poll_interval_seconds: 1,
+        renew_interval_seconds: 1,
+        retention_count: 2,
+        protocol_version: AGENT_PROTOCOL_VERSION.into(),
+        capabilities: AGENT_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).into())
+            .collect(),
+    }
+    .normalized()?;
+    let config_digest = policy.canonical_digest()?;
+    let executable = std::env::current_exe().context("failed to locate foreground executable")?;
+    let binary_digest =
+        wr_common::agent_policy::sha256_digest(&std::fs::read(&executable).with_context(|| {
+            format!(
+                "failed to read foreground executable {}",
+                executable.display()
+            )
+        })?);
+    Ok(super::node_agent::wire_policy(
+        &policy,
+        binary_digest,
+        config_digest,
+    ))
+}
+
+async fn complete_foreground_operation(manager_endpoint: &str) -> Result<()> {
+    let policy = foreground_agent_policy(manager_endpoint)?;
+    let mut operator = client::connect_operator(
+        manager_endpoint,
+        wr_common::manager_client::RetryClass::DurableCreate,
+    )
+    .await?;
+    operator
+        .put_node_agent_policy(PutNodeAgentPolicyRequest {
+            policy: Some(policy.clone()),
+        })
+        .await?;
+
+    let tls = wr_common::node::ClientTlsConfig {
+        cert_path: "certs/runtime-node-agent-client/leaf.pem".to_string(),
+        key_path: "certs/runtime-node-agent-client/key.pem".to_string(),
+        server_ca_cert_path: "certs/runtime-server-root/ca.crt".to_string(),
+    };
+    let mut manager = client::connect_node_agent_with_tls(manager_endpoint, Some(&tls)).await?;
+    let attestation = manager
+        .attest(AttestNodeAgentRequest {
+            attestation: Some(NodeAgentAttestation {
+                node_id: policy.node_id.clone(),
+                agent_instance_id: "foreground-agent".into(),
+                protocol_version: policy.protocol_version.clone(),
+                binary_digest: policy.binary_digest.clone(),
+                config_digest: policy.config_digest.clone(),
+                backend: BackendKind::Systemd as i32,
+                capabilities: policy.capabilities.clone(),
+                retention_count: policy.retention_count,
+                ..Default::default()
+            }),
+        })
+        .await?
+        .into_inner();
+    if !attestation.accepted {
+        bail!(
+            "foreground node-agent attestation was rejected: {:?}",
+            attestation.conditions
+        );
+    }
+    let mut operation_id = None;
+    for _ in 0..128 {
+        let claimed = match manager
+            .claim_operation(ClaimOperationRequest {
+                node_id: "node-a".to_string(),
+                agent_instance_id: "foreground-agent".to_string(),
+            })
+            .await
+        {
+            Ok(response) => response.into_inner().instruction,
+            Err(status)
+                if matches!(
+                    status.code(),
+                    tonic::Code::Aborted | tonic::Code::Internal | tonic::Code::Unavailable
+                ) =>
+            {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+            Err(status) => return Err(status.into()),
+        };
+        let Some(instruction) = claimed else {
+            let operation_id = operation_id
+                .clone()
+                .context("foreground node agent received no operation before completion")?;
+            let operation = operator
+                .get_operation(GetOperationRequest { operation_id })
+                .await?
+                .into_inner()
+                .operation
+                .context("foreground GetOperation omitted operation")?;
+            match NodeOperationState::try_from(operation.state)? {
+                NodeOperationState::Succeeded => return Ok(()),
+                NodeOperationState::Queued | NodeOperationState::Running => {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+                state => bail!(
+                    "foreground deployment operation stopped in state {state:?}: {:?}",
+                    operation.conditions
+                ),
+            }
+        };
+        operation_id.get_or_insert_with(|| instruction.operation_id.clone());
+        let target = instruction
+            .target
+            .as_ref()
+            .context("foreground instruction omitted target")?;
+        let target_kind = InstructionTargetKind::try_from(target.kind)?;
+        let step = NodeOperationStepKind::try_from(instruction.step)?;
+        let backend_instance_id = if target_kind == InstructionTargetKind::Proxy {
+            "foreground-proxy-backend".to_string()
+        } else {
+            format!("foreground-backend-{}", target.engine_slot)
+        };
+        let process_instance_id = if target_kind == InstructionTargetKind::Proxy {
+            "foreground-proxy-process".to_string()
+        } else {
+            format!("foreground-process-{}", target.engine_slot)
+        };
+        if target_kind == InstructionTargetKind::Proxy
+            || matches!(
+                step,
+                NodeOperationStepKind::VerifyReleaseMetadata
+                    | NodeOperationStepKind::SelectRelease
+                    | NodeOperationStepKind::StartBackend
+            )
+        {
+            manager
+                .report_step_result(ReportStepResultRequest {
+                    node_id: "node-a".to_string(),
+                    operation_id: instruction.operation_id.clone(),
+                    engine_slot: target.engine_slot.clone(),
+                    lease_epoch: instruction.lease_epoch,
+                    step: instruction.step,
+                    condition_code: String::new(),
+                    detail: "foreground process owner completed step".to_string(),
+                    agent_instance_id: "foreground-agent".to_string(),
+                    observed_revision: target.revision,
+                    observed_digest: target.bundle_digest.clone(),
+                    backend_instance_id: backend_instance_id.clone(),
+                    process_instance_id: process_instance_id.clone(),
+                    backend_query_error: String::new(),
+                    cleanup_evidence: None,
+                    observed_resolved_release_digest: target.resolved_release_digest.clone(),
+                })
+                .await?;
+        }
+        if target_kind == InstructionTargetKind::EngineSlot
+            && matches!(
+                step,
+                NodeOperationStepKind::SelectRelease
+                    | NodeOperationStepKind::StartBackend
+                    | NodeOperationStepKind::VerifyTarget
+            )
+        {
+            let running = matches!(
+                step,
+                NodeOperationStepKind::StartBackend | NodeOperationStepKind::VerifyTarget
+            );
+            manager
+                .report_observation(ReportNodeObservationRequest {
+                    node_id: "node-a".to_string(),
+                    engine_slot: target.engine_slot.clone(),
+                    lifecycle: running.then(|| LifecycleStatus {
+                        state: ProcessLifecycleState::Ready as i32,
+                        service_kind: ServiceKind::Engine as i32,
+                        process_instance_id: process_instance_id.clone(),
+                        ..Default::default()
+                    }),
+                    backend_state: if running {
+                        BackendProcessState::Running as i32
+                    } else {
+                        BackendProcessState::Exited as i32
+                    },
+                    backend_instance_id,
+                    observed_revision: target.revision,
+                    observed_at: None,
+                    observed_digest: target.bundle_digest.clone(),
+                    backend_query_error: String::new(),
+                    operation_id: instruction.operation_id,
+                    agent_instance_id: "foreground-agent".to_string(),
+                    lease_epoch: instruction.lease_epoch,
+                    observed_resolved_release_digest: target.resolved_release_digest.clone(),
+                })
+                .await?;
+        }
+    }
+    bail!("foreground deployment operation did not converge within 128 steps")
+}
+
+async fn activate_foreground_routes(manager_endpoint: &str) -> Result<()> {
+    let mut manager = client::connect_with_retry(
+        manager_endpoint,
+        wr_common::manager_client::RetryClass::ReadOnly,
+    )
+    .await?;
+    let engines = manager
+        .list_engines(ListEnginesRequest {})
+        .await?
+        .into_inner()
+        .engines;
+    for engine in engines {
+        let mut seen = BTreeSet::new();
+        for module in engine.modules {
+            let identity = (
+                module.namespace.clone(),
+                module.name.clone(),
+                module.version.clone(),
+            );
+            if !seen.insert(identity) || module.proto_schema.is_empty() {
+                continue;
+            }
+            let rule_digest = format!(
+                "{:x}",
+                Sha256::digest(format!(
+                    "{}:{}:{}:{}",
+                    engine.engine_id, module.namespace, module.name, module.version
+                ))
+            );
+            manager
+                .upsert_routing_rule(RoutingRule {
+                    rule_id: format!("dev-{}", &rule_digest[..24]),
+                    source_module: String::new(),
+                    source_namespace: String::new(),
+                    destination_module: module.name,
+                    destination_namespace: module.namespace,
+                    destination_version: module.version,
+                    engine_id: engine.engine_id.clone(),
+                    engine_address: engine.address.clone(),
+                    peer_address: engine.peer_address.clone(),
+                    healthy: true,
+                })
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn run(spec: RunSpec) -> Result<()> {
     let spec = spec.validate()?;
     let signals = SignalTracker::start()?;
@@ -1218,6 +1676,10 @@ pub(super) async fn run(spec: RunSpec) -> Result<()> {
         }
     };
 
+    if let Err(error) = wait_for_manager_admission(&manager_endpoint).await {
+        return finish_owned(group, None, &signals, Some(error)).await;
+    }
+
     let proxy_specs = spec
         .proxies
         .into_iter()
@@ -1245,8 +1707,20 @@ pub(super) async fn run(spec: RunSpec) -> Result<()> {
     if signal_is_recorded(&signals.count, &signals.updates) {
         return finish_owned(group, None, &signals, None).await;
     }
-    let engine_specs = spec
-        .engine_configs
+    let (_managed_config_dir, engine_config_paths) =
+        match prepare_managed_engine_configs(&manager_endpoint, &spec.engine_configs).await {
+            Ok(configs) => configs,
+            Err(error) => {
+                return finish_owned(
+                    group,
+                    None,
+                    &signals,
+                    Some(error.context("failed to establish foreground managed deployment")),
+                )
+                .await;
+            }
+        };
+    let engine_specs = engine_config_paths
         .into_iter()
         .enumerate()
         .map(|(index, config)| ServiceSpec {
@@ -1272,6 +1746,24 @@ pub(super) async fn run(spec: RunSpec) -> Result<()> {
 
     if signal_is_recorded(&signals.count, &signals.updates) {
         return finish_owned(group, None, &signals, None).await;
+    }
+    if let Err(error) = complete_foreground_operation(&manager_endpoint).await {
+        return finish_owned(
+            group,
+            None,
+            &signals,
+            Some(error.context("failed to complete foreground managed deployment")),
+        )
+        .await;
+    }
+    if let Err(error) = activate_foreground_routes(&manager_endpoint).await {
+        return finish_owned(
+            group,
+            None,
+            &signals,
+            Some(error.context("failed to activate foreground routing")),
+        )
+        .await;
     }
     let mut manager_signal = signals.updates.clone();
     let target_version = tokio::select! {
@@ -1332,7 +1824,9 @@ mod tests {
     use super::*;
     use tonic::{Request, Response, Status};
     use wr_common::wruntime::lifecycle_service_server::{LifecycleService, LifecycleServiceServer};
-    use wr_common::wruntime::node_service_server::{NodeService, NodeServiceServer};
+    use wr_common::wruntime::proxy_node_control_service_server::{
+        ProxyNodeControlService, ProxyNodeControlServiceServer,
+    };
     use wr_common::wruntime::*;
 
     #[derive(Clone)]
@@ -1418,7 +1912,7 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl NodeService for FixtureNodeStatus {
+    impl ProxyNodeControlService for FixtureNodeStatus {
         async fn register_engine(
             &self,
             _request: Request<RegisterEngineRequest>,
@@ -1478,7 +1972,7 @@ mod tests {
         };
         let task = tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
-                .add_service(NodeServiceServer::new(service))
+                .add_service(ProxyNodeControlServiceServer::new(service))
                 .serve_with_incoming(incoming)
                 .await;
         });
