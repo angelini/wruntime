@@ -117,8 +117,6 @@ BUNDLE_B="$RUN_DIR/node-b.tar.gz"
 MANAGER_ADDR="https://${MANAGER_HOST}:9000"
 MANAGER_REMOTE="${MANAGER_USER}@${MANAGER_HOST}"
 NODE_REMOTE="${NODE_USER}@${NODE_HOST}"
-OPERATOR_CERT_NAME="deployment-operator"
-AGENT_CERT_NAME="deployment-node-agent"
 SSH=(timeout -k 5 60 ssh -i "$WRT_DEPLOY_E2E_SSH_KEY" -o ConnectTimeout=5)
 CLI_ARGS=("$ROOT/target/debug/wr-cli" --manager "$MANAGER_ADDR" --ca-cert "$CERT_DIR/server-root/ca.crt" --client-cert "$CERT_DIR/human-client/leaf.pem" --client-key "$CERT_DIR/human-client/key.pem")
 CLI=(timeout -k 10 600 "${CLI_ARGS[@]}")
@@ -273,31 +271,44 @@ print(node["desired_deployment"]["revision"])
 PY
 }
 digest_from_inspect() { awk '$1 == "digest:" {print $2; exit}' "$1"; }
-certificate_fingerprint() {
-	"${PYTHON[@]}" - "$1" <<'PY'
-import hashlib, pathlib, ssl, sys
-pem = pathlib.Path(sys.argv[1]).read_text()
-der = ssl.PEM_cert_to_DER_cert(pem)
-print(f"sha256:{hashlib.sha256(der).hexdigest()}")
-PY
-}
 write_manager_config() {
 	"${PYTHON[@]}" - "$1" "$2" "$3" "$4" "$5" <<'PY'
-import json, pathlib, sys
-source, output, operator_fingerprint, agent_fingerprint, node_id = sys.argv[1:]
-config = pathlib.Path(source).read_text().rstrip()
-config += f'''\n\n[[operator_principals]]
-fingerprint = {json.dumps(operator_fingerprint)}
-principal = "deployment-e2e-operator"
-role = "operator"
+import json, pathlib, sys, tomllib
+source, output, policy_output, manager_endpoint, node_id = sys.argv[1:]
+source_path = pathlib.Path(source)
+config = source_path.read_text()
+config_value = tomllib.loads(config)
+manager_id = config_value["manager_id"]
+configured_policy = pathlib.Path(config_value["authorization"]["policy_file"])
+policy_source = configured_policy if configured_policy.is_absolute() else source_path.parent / configured_policy
+policy = policy_source.read_text()
+policy_value = tomllib.loads(policy)
+manager_enrollments = [item for item in policy_value["manager_enrollments"] if item["manager_id"] == manager_id]
+if len(manager_enrollments) != 1:
+    raise SystemExit("deployment policy must enroll the configured manager exactly once")
+if len(policy_value["proxy_enrollments"]) != 1 or len(policy_value["node_agent_enrollments"]) != 1:
+    raise SystemExit("deployment policy must contain one proxy and one node-agent enrollment")
+manager_enrollment = manager_enrollments[0]
+proxy_enrollment = policy_value["proxy_enrollments"][0]
+agent_enrollment = policy_value["node_agent_enrollments"][0]
+cluster_id = policy_value["cluster_id"]
+proxy_principal = f"urn:wruntime:{cluster_id}:proxy:{node_id}"
+agent_principal = f"urn:wruntime:{cluster_id}:node-agent:{node_id}"
+quote = json.dumps
 
-[[operator_principals]]
-fingerprint = {json.dumps(agent_fingerprint)}
-principal = "deployment-e2e-node-agent"
-role = "node-agent"
-node_id = {json.dumps(node_id)}
-'''
+def replace_exact(value, old, new, count):
+    if value.count(old) != count:
+        raise SystemExit(f"deployment policy expected {count} occurrences of {old}")
+    return value.replace(old, new)
+
+policy = replace_exact(policy, quote(manager_enrollment["endpoint"]), quote(manager_endpoint), 1)
+policy = replace_exact(policy, quote(proxy_enrollment["principal"]), quote(proxy_principal), 2)
+policy = replace_exact(policy, quote(agent_enrollment["principal"]), quote(agent_principal), 2)
+policy = replace_exact(policy, quote(proxy_enrollment["node_id"]), quote(node_id), 2)
 pathlib.Path(output).write_text(config)
+policy_path = pathlib.Path(policy_output)
+policy_path.parent.mkdir(parents=True, exist_ok=True)
+policy_path.write_text(policy)
 PY
 }
 invoke_echo() {
@@ -452,7 +463,8 @@ run_logged cert-proxy-endpoint target/debug/wr-cli cert issue proxy-peer-endpoin
 run_logged cert-proxy-client target/debug/wr-cli cert issue proxy --ca-dir "$CERT_DIR/client-root" --cluster-id deployment --name "$NODE_ID" --destination "$CERT_DIR/proxy-client"
 run_logged cert-node-agent target/debug/wr-cli cert issue node-agent --ca-dir "$CERT_DIR/client-root" --cluster-id deployment --name "$NODE_ID" --destination "$CERT_DIR/node-agent"
 run_logged cert-engine-admin-endpoint target/debug/wr-cli cert issue engine-admin-endpoint --ca-dir "$CERT_DIR/server-root" --endpoint "$NODE_HOST" --ip "$NODE_HOST" --destination "$CERT_DIR/engine-admin-endpoint"
-run_logged manager-bundle target/debug/wr-cli managers bundle --manager-config wr-tests/deployment/manager.toml --output "$MANAGER_BUNDLE"
+write_manager_config wr-tests/deployment/manager.toml "$MANAGER_CONFIG" "$RUN_DIR/policy/authorization.toml" "$MANAGER_ADDR" "$NODE_ID"
+run_logged manager-bundle target/debug/wr-cli managers bundle --manager-config "$MANAGER_CONFIG" --output "$MANAGER_BUNDLE"
 run_logged manager-inspect target/debug/wr-cli managers inspect-bundle "$MANAGER_BUNDLE"
 cp wr-tests/deployment/engine-a.toml "$RUN_DIR/engine.toml"
 run_logged node-a-bundle target/debug/wr-cli node bundle --engine-config "$RUN_DIR/engine.toml" --proxy-config wr-tests/deployment/proxy.toml --output "$BUNDLE_A"

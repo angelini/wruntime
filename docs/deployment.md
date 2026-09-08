@@ -48,7 +48,7 @@ Bundles are gzip'd tarballs containing cross-compiled binaries, config templates
 wr-manager/
 ├── bin/wr-manager
 ├── config/manager.toml          # template with {db_url}, {advertise_address} placeholders
-├── systemd/wr-manager.service   # template with {secret_key} placeholder
+├── systemd/wr-manager.service   # stable activation-launcher unit
 ├── docker/
 │   ├── Dockerfile.manager
 │   └── docker-compose.yml
@@ -138,11 +138,13 @@ Config files use placeholders that are resolved at deploy time:
 | ---------- | --------------- | --------- |
 | `{db_url}` | `--db-url` / `WR_DB_URL` / config | manager, proxy, engine configs |
 | `{host}` | deploy target (`user@host`) | proxy/engine `[node]` addresses |
-| `{secret_key}` | `--secret-key` / `WR_SECRET_KEY` / config | manager systemd unit / Dockerfile |
+| `{secret_key}` | `--secret-key` / `WR_SECRET_KEY` / config | protected manager runtime environment / Dockerfile |
 | `{peer_port}` | `--peer-port` / `WR_PEER_PORT` / config (default: 9443) | explicit proxy/engine `peer_address` templates |
+| `{operation_id}` | manager-derived deployment allocation identity | engine deployment metadata |
+| `{revision_digest}` | manager-derived canonical revision identity | engine deployment metadata |
 | `{advertise_address}` | `--advertise-address` / `WR_ADVERTISE_ADDRESS` (auto-derived from remote host if omitted) | manager config (`advertise_grpc_address`) |
 
-Unresolved placeholders cause deployment to fail. Manager Docker deployments retain host networking for systemd parity and direct listener addressing.
+Unresolved placeholders cause deployment to fail. Systemd manager deployment atomically installs the encryption key in the root-only `/var/lib/wruntime/manager-secrets/runtime.env` environment file referenced by the stable unit; the key is not embedded in that unit. Manager Docker deployments retain host networking for systemd parity and direct listener addressing.
 
 ### Manager deploy readiness contract
 
@@ -211,7 +213,7 @@ wr-cli node deploy --node-id node-a myapp.tar.gz deploy@10.0.1.1 \
     --manager https://10.0.1.1:9000 --request-token node-a-initial
 ```
 
-Node deploy creates an inactive manager allocation for the stable `--node-id`, verifies the bundle, resolves host values, uploads bytes without touching running workloads, writes digest-covered release metadata, and calls `FinalizeDeployment`. It then requires a fresh compatible agent attestation and submits one durable operation. The manager and agent—not the CLI's SSH session—select, stop, start, verify, switch authority, commit, and clean up. A CLI wait timeout is nonzero but does not cancel durable work.
+Node deploy creates an inactive manager allocation for the stable `--node-id`; that allocation reserves the operation UUID and canonical revision digest embedded in the prelaunch engine configuration. The CLI verifies the bundle, resolves host and manager-derived values, uploads bytes without touching running workloads, writes digest-covered release metadata, and calls `FinalizeDeployment`. It then requires a fresh compatible agent attestation and submits one durable operation. The manager and agent—not the CLI's SSH session—select, stop, start, verify, switch authority, commit, and clean up. A CLI wait timeout is nonzero but does not cancel durable work.
 
 Immutable bundle content is retained under `{workdir}/wr-node/bundles/<digest>/` and revisions under `wr-node/releases/<revision>/`. Each proxy/engine slot selects its own release through `wr-node/slots/<slot>`; no node-wide engine `current` or aggregate activation exists. A staging/finalization interruption leaves serving authority unchanged. An allocation finalized but not submitted is explicit and may be removed only with `node abandon`; once submitted, recovery uses operation status/resume or rollback rather than inference from CLI exit.
 
@@ -335,7 +337,7 @@ Docker deployments use Linux host networking so proxy/engine loopback trust boun
 
 Manager gRPC, peer-proxy traffic, and manager-to-engine job administration use mTLS; loopback engine/proxy traffic remains plain HTTP. Server and client roots are disjoint. Every client leaf has `clientAuth` plus exactly one project URI SAN (`urn:wruntime:<cluster>:<kind>:<name>`), and every server leaf has only `serverAuth` plus its endpoint SANs. A manager's workload leaf is distinct from its endpoint leaf.
 
-Production roots are installed under `/etc/wruntime/pki/roots/`. Immutable credential sets are installed owner-only under `/etc/wruntime/pki/<service-or-slot>/sets/<version>`; private keys and runtime config never live in a release or image. Generate roots and profile leaves with `wr-cli cert init-root` and `wr-cli cert issue`, and validate an uncertain installation with `wr-cli cert verify`. Authorization and revocation use the leaf SHA-256 fingerprint recorded in immutable set metadata. Job access uses the same manager endpoint and policy; there is no operator-admin listener, delegation persona, or CA-wide capability.
+Production roots are installed under `/etc/wruntime/pki/roots/`. Immutable credential sets are installed under `/etc/wruntime/pki/<service-or-slot>/sets/<version>`; they remain root-owned and are read-only to the workload group used by systemd. Private keys and runtime config never live in a release or image. Generate roots and profile leaves with `wr-cli cert init-root` and `wr-cli cert issue`, and validate an uncertain installation with `wr-cli cert verify`. Authorization and revocation use the leaf SHA-256 fingerprint recorded in immutable set metadata. Job access uses the same manager endpoint and policy; there is no operator-admin listener, delegation persona, or CA-wide capability.
 
 ## Remote host requirements
 
@@ -412,11 +414,11 @@ Generated systemd units use `Type=notify`; each process sends `READY=1` only aft
 
 Each signal-driven stop has one absolute 30-second internal deadline; route convergence, admission waits, deregistration, and task joins consume that deadline without resetting it. The foreground runner's 45-second termination-policy boundary leaves 15 seconds after internal shutdown for process exit and escalation; needing SIGKILL or crossing the boundary is a failed graceful shutdown, while the owner still waits to reap before returning. Healthchecks execute the service binary with `--lifecycle-probe <config>` and succeed only in `READY`; a successful TCP connection while `STARTING` is not readiness.
 
-Startup remains tolerant only through bounded, owned retries. A proxy must reach a manager and install an initial routing snapshot before readiness. An engine retries its proxy connection and registration, but startup fails non-zero if those attempts expire, a configured module is unhealthy, or readiness publication cannot converge. The first healthy engine heartbeat is synchronous: the manager returns the routing version containing the atomic readiness update, and the local proxy replies only after installing at least that version. Callers do not need fixed sleeps or manager-health polling.
+Startup remains tolerant only through bounded, owned retries. A proxy must reach a manager and install an initial routing snapshot before readiness. An engine retries its proxy connection and registration, but startup fails non-zero if those attempts expire, a configured module is unhealthy, or readiness publication cannot converge. The first healthy engine heartbeat is synchronous: the manager returns the routing version containing the atomic readiness update, and the local proxy replies only after installing at least that version. If the proxy process is replaced while an engine remains running, the next heartbeat can rebuild the empty proxy cache only after the manager accepts that engine's exact ownership fence; the replacement proxy also converges the returned routing version before acknowledging it. Callers do not need fixed sleeps or manager-health polling.
 
 On engine shutdown, route withdrawal and local proxy convergence happen before HTTP admission closes and before final deregistration. Existing HTTP requests and claimed jobs drain to the shared deadline; new work is rejected deterministically. Proxy shutdown closes data-plane admission and every data listener before joining control and background tasks. Manager shutdown rejects new administrative mutations but retains read-only status and required engine drain/deregister operations during teardown. These are internal `STOPPING` phases; deadline expiry or failed required deregistration is a non-zero process outcome.
 
-`node deploy`, `upgrade`, `scale`, and `rollback` stage/finalize exact node/revision/bundle/resolved-release identity and then submit durable work. The manager owns the absolute operation deadline; the CLI's wait deadline is separate. Backend inspection, lifecycle READY/STOPPING, registration, routing convergence, slot authority, and commit remain distinct evidence, and callers add no readiness sleep. Post-commit cleanup remains visible until its exact manager-approved retention evidence is accepted.
+`node deploy`, `upgrade`, `scale`, and `rollback` stage/finalize exact node/revision/bundle/resolved-release identity and then submit durable work. The manager owns the absolute operation deadline; the CLI's wait deadline is separate. Backend inspection, lifecycle READY/STOPPING, registration, routing convergence, slot authority, and commit remain distinct evidence, and callers add no readiness sleep. A completed verification report waits for its matching fresh observation instead of treating normal result-before-observation delivery as invalid evidence. Post-commit cleanup remains visible until its exact manager-approved retention evidence is accepted.
 
 ## Pre-compilation
 

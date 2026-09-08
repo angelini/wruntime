@@ -238,6 +238,11 @@ async fn submit_deployment_operation(
         },
     )
     .await?;
+    assert_eq!(
+        operation.operation_id,
+        wr_common::deployment_contract::deployment_operation_id(&deployment.revision_digest)?
+    );
+    assert_eq!(operation.operation_id, deployment.operation_id);
     Ok(operation.operation_id)
 }
 
@@ -492,6 +497,11 @@ async fn allocation_to_submission_crash_boundaries_recover_one_actor_target_and_
         .await?
         .record;
     assert_eq!(allocation_retry.revision, allocated.revision);
+    assert_eq!(allocation_retry.operation_id, allocated.operation_id);
+    assert_eq!(
+        allocated.operation_id,
+        wr_common::deployment_contract::deployment_operation_id(&allocated.revision_digest)?
+    );
     let actor_conflict = wr_manager::db::begin_deployment(&pool, &request, "operator-b")
         .await
         .expect_err("a different actor cannot recover the allocation");
@@ -513,6 +523,8 @@ async fn allocation_to_submission_crash_boundaries_recover_one_actor_target_and_
         .await?
         .record;
     assert_eq!(finalization_retry.revision, finalized.revision);
+    assert_eq!(finalization_retry.operation_id, allocated.operation_id);
+    assert_eq!(finalized.operation_id, allocated.operation_id);
     let actor_conflict = wr_manager::db::finalize_deployment(&pool, &finalize, "operator-b")
         .await
         .expect_err("a different actor cannot finalize the allocation");
@@ -533,6 +545,7 @@ async fn allocation_to_submission_crash_boundaries_recover_one_actor_target_and_
     let operation = wr_manager::operations::submit(&pool, "operator-a", &submit).await?;
     let submission_retry = wr_manager::operations::submit(&pool, "operator-a", &submit).await?;
     assert_eq!(submission_retry.operation_id, operation.operation_id);
+    assert_eq!(operation.operation_id, allocated.operation_id);
     let operation_count: i64 = pool
         .get()
         .await?
@@ -909,6 +922,7 @@ async fn rollback_supersedes_and_fences_committed_cleanup() -> Result<()> {
         },
     )
     .await?;
+    assert_eq!(replacement.operation_id, rollback.operation_id);
     let old = wr_manager::operations::get(&pool, &cleanup.operation_id).await?;
     assert_eq!(
         NodeOperationPhase::try_from(old.phase)?,
@@ -1013,6 +1027,16 @@ async fn drain_reaches_zero_authority_terminal_and_preserves_other_capacity() ->
 
     let verify = claim_instruction(&pool, "drain-node", "activation-a").await?;
     assert_eq!(verify.step, NodeOperationStepKind::VerifyTarget as i32);
+    let awaiting_observation = report_ok(&pool, &verify, "backend-old", "process-old").await?;
+    assert_eq!(
+        NodeOperationState::try_from(awaiting_observation.state)?,
+        NodeOperationState::Running,
+        "a successful result must wait for its coherent observation instead of pausing"
+    );
+    assert_eq!(
+        awaiting_observation.slots[0].next_step,
+        NodeOperationStepKind::VerifyTarget as i32
+    );
     let after_source = observe(
         &pool,
         &verify,
@@ -1645,6 +1669,47 @@ async fn delivered_stop_fixture(
     let durable = wr_manager::operations::get(pool, &operation.operation_id).await?;
     assert!(durable.slots[0].effect_ambiguous);
     Ok((source, operation, stop))
+}
+
+#[tokio::test]
+async fn stop_result_waits_for_post_delivery_observation() -> Result<()> {
+    let pool = manager_pool().await;
+    let node_id = "stop-order-node";
+    let (source, operation, stop) = delivered_stop_fixture(&pool, node_id).await?;
+    let fence = engine_fence(&pool, &format!("{node_id}-engine")).await?;
+    wr_manager::db::deregister_engine(&pool, &format!("{node_id}-engine"), &fence).await?;
+
+    let awaiting_observation = report_ok(&pool, &stop, "backend-old", "").await?;
+    assert_eq!(
+        NodeOperationState::try_from(awaiting_observation.state)?,
+        NodeOperationState::Running,
+        "a successful stop result must wait for its post-delivery observation"
+    );
+    assert_eq!(
+        awaiting_observation.slots[0].next_step,
+        NodeOperationStepKind::StopBackend as i32
+    );
+    assert!(awaiting_observation.slots[0].conditions.is_empty());
+
+    let observed = observe(
+        &pool,
+        &stop,
+        "blue",
+        BackendProcessState::Exited,
+        "backend-old",
+        "",
+        source.revision,
+        &source.bundle_digest,
+    )
+    .await?;
+    assert_eq!(
+        observed.slots[0].next_step,
+        NodeOperationStepKind::StartBackend as i32,
+        "fresh exit, registration, and route evidence must advance the stop"
+    );
+    assert_eq!(observed.operation_id, operation.operation_id);
+
+    Ok(())
 }
 
 #[tokio::test]

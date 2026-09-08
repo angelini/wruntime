@@ -4,7 +4,9 @@ use tokio_retry::strategy::ExponentialBackoff;
 use tokio_retry::RetryIf;
 use tonic::Status;
 
-use wr_common::deployment_contract::{canonicalize_inventory, revision_digest};
+use wr_common::deployment_contract::{
+    canonicalize_inventory, deployment_operation_id, revision_digest,
+};
 use wr_common::identity::NamespaceFilter;
 use wr_common::lifecycle_service::{AdmissionGate, ManagerLifecycleState};
 use wr_common::naming::namespace_role;
@@ -1129,6 +1131,12 @@ fn deployment_row(row: &tokio_postgres::Row) -> Result<DeploymentRow, Status> {
     let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
     let activated_at: Option<chrono::DateTime<chrono::Utc>> = row.get("activated_at");
     let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
+    let revision_digest: String = row.get("revision_digest");
+    let operation_id = deployment_operation_id(&revision_digest).map_err(|error| {
+        Status::internal(format!(
+            "stored deployment revision digest is invalid: {error}"
+        ))
+    })?;
     Ok(DeploymentRow {
         record: DeploymentRecord {
             node_id: row.get("node_id"),
@@ -1159,7 +1167,8 @@ fn deployment_row(row: &tokio_postgres::Row) -> Result<DeploymentRow, Status> {
                     nanos: time.timestamp_subsec_nanos() as i32,
                 }),
             inventory_schema_version: row.get::<_, i32>("inventory_schema_version") as u32,
-            revision_digest: row.get("revision_digest"),
+            revision_digest,
+            operation_id,
         },
     })
 }

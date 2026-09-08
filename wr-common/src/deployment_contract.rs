@@ -12,6 +12,7 @@ use crate::wruntime::{DeploymentInventoryV1, ExpectedEngine};
 pub const DEPLOYMENT_INVENTORY_SCHEMA_VERSION: u32 = 1;
 pub const MAX_DEPLOYMENT_INVENTORY_BYTES: usize = 2 * 1024 * 1024;
 const DOMAIN: &[u8] = b"wruntime-deployment-revision-v1";
+const OPERATION_DOMAIN: &[u8] = b"wruntime-deployment-operation-v1";
 
 fn push_u32(out: &mut Vec<u8>, value: usize) -> Result<()> {
     out.extend_from_slice(&u32::try_from(value)?.to_be_bytes());
@@ -201,6 +202,34 @@ pub fn revision_digest(
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
+/// Derive the operation UUID reserved for one manager-owned deployment revision.
+///
+/// Version 8 marks the UUID payload as application-defined while the RFC variant
+/// keeps it interoperable with UUID parsers and PostgreSQL's UUID type.
+pub fn deployment_operation_id(revision_digest: &str) -> Result<String> {
+    ensure!(
+        valid_digest(revision_digest),
+        "normalized revision digest is required"
+    );
+    let hash = Sha256::digest([OPERATION_DOMAIN, revision_digest.as_bytes()].concat());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
+}
+
 pub fn schema_digest(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         String::new()
@@ -260,6 +289,47 @@ mod tests {
         changed.engines[1].modules[0].proto_schema_digest = schema_digest(b"other");
         assert_ne!(a, revision_digest("node-a", 1, &bundle, &changed).unwrap());
     }
+    #[test]
+    fn inventory_requires_a_canonical_job_admin_address() {
+        let mut valid = inventory(false);
+        valid.engines[0].job_queue_id = "primary-jobs".into();
+        valid.engines[0].job_admin_address = "https://192.0.2.10:9150/".into();
+        canonicalize_inventory(valid.clone()).unwrap();
+
+        valid.engines[0].job_admin_address = "https://192.0.2.10:9150".into();
+        let error = canonicalize_inventory(valid).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("job admin address must be canonical"));
+    }
+
+    #[test]
+    fn deployment_operation_id_is_stable_and_revision_bound() {
+        let revision = revision_digest(
+            "node-a",
+            1,
+            &format!("sha256:{}", "a".repeat(64)),
+            &inventory(false),
+        )
+        .unwrap();
+        assert_eq!(
+            deployment_operation_id(&revision).unwrap(),
+            "c0badabe-5def-8426-b3d6-5395e11cfb82"
+        );
+        let other = revision_digest(
+            "node-a",
+            2,
+            &format!("sha256:{}", "a".repeat(64)),
+            &inventory(false),
+        )
+        .unwrap();
+        assert_ne!(
+            deployment_operation_id(&revision).unwrap(),
+            deployment_operation_id(&other).unwrap()
+        );
+        assert!(deployment_operation_id("sha256:not-a-digest").is_err());
+    }
+
     #[test]
     fn duplicates_and_empty_schema_have_distinct_contracts() {
         assert_eq!(schema_digest(&[]), "");

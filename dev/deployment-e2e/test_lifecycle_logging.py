@@ -202,22 +202,23 @@ PY_REDACT
         ):
             self.assertNotIn(obsolete, script)
 
-    def test_deployment_bootstraps_fingerprint_mapped_operator_and_agent(self):
+    def test_deployment_materializes_complete_policy_before_manager_bundle(self):
         script = DEPLOYMENT_LIFECYCLE.read_text()
-        self.assertIn('client-cert "$CERT_DIR/${OPERATOR_CERT_NAME}.crt"', script)
-        self.assertIn('role = "operator"', script)
-        self.assertIn('role = "node-agent"', script)
-        self.assertIn('node_id = {json.dumps(node_id)}', script)
+        self.assertIn("policy = policy_source.read_text()", script)
+        self.assertIn('proxy_principal = f"urn:wruntime:{cluster_id}:proxy:{node_id}"', script)
+        self.assertIn('agent_principal = f"urn:wruntime:{cluster_id}:node-agent:{node_id}"', script)
+        self.assertIn('quote(manager_enrollment["endpoint"]), quote(manager_endpoint), 1', script)
         self.assertLess(
             script.index("write_manager_config wr-tests/deployment/manager.toml"),
             script.index('run_logged manager-bundle'),
         )
+        self.assertIn('--manager-config "$MANAGER_CONFIG"', script)
         self.assertLess(
             script.index('run_to_log "$backend node agent install"'),
             script.index('run_to_log "$backend node A deploy"'),
         )
-        self.assertIn('--agent-cert "$CERT_DIR/${AGENT_CERT_NAME}.crt"', script)
-        self.assertIn('--agent-ca-cert "$CERT_DIR/ca.crt"', script)
+        self.assertIn('--agent-cert "$CERT_DIR/node-agent/leaf.pem"', script)
+        self.assertIn('--agent-ca-cert "$CERT_DIR/server-root/ca.crt"', script)
 
     def test_failure_excerpt_is_bounded(self):
         with tempfile.TemporaryDirectory() as directory:

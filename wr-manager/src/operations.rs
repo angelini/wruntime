@@ -4,6 +4,7 @@ use tokio_postgres::Row;
 use tonic::Status;
 use uuid::Uuid;
 use wr_common::agent_policy::{AgentPolicy, AgentPolicyBackend};
+use wr_common::deployment_contract::deployment_operation_id;
 use wr_common::wruntime::{
     AgentInstruction, BackendKind, BackendProcessState, ClaimOperationResponse,
     CleanupReleaseEvidence, DeploymentCondition, InstructionTarget, InstructionTargetKind,
@@ -497,43 +498,8 @@ pub async fn submit(
             | NodeOperationAction::Scale
             | NodeOperationAction::Rollback
     );
-    let operation_id = Uuid::new_v4();
+    let mut operation_id = (!deployment_action).then(Uuid::new_v4);
     let mut target_revision_digest: Option<String> = None;
-
-    // An urgent rollback fences committed cleanup before the new operation is
-    // admitted. History/evidence remain, and the old cleanup can issue no effect.
-    if action == NodeOperationAction::Rollback {
-        if let Some(cleanup) = transaction
-            .query_opt(
-                "SELECT operation_id FROM wr_node_operations
-                 WHERE node_id = $1 AND committed AND phase = 'committed_cleanup'
-                   AND state IN ('queued', 'running', 'paused') FOR UPDATE",
-                &[&request.node_id],
-            )
-            .await
-            .map_err(internal)?
-        {
-            let cleanup_id: Uuid = cleanup.get("operation_id");
-            transaction
-                .execute(
-                    "UPDATE wr_node_operations SET phase = 'superseded', state = 'succeeded',
-                            lease_expires_at = NULL, claimed_by = NULL, agent_instance_id = NULL,
-                            updated_at = NOW() WHERE operation_id = $1",
-                    &[&cleanup_id],
-                )
-                .await
-                .map_err(internal)?;
-            append_event(
-                &transaction,
-                cleanup_id,
-                actor,
-                "CLEANUP_SUPERSEDED",
-                &operation_id.to_string(),
-                0,
-            )
-            .await?;
-        }
-    }
 
     let (source_digest, source_resolved_digest, source_slots) =
         deployment_inventory(&transaction, &request.node_id, source_revision).await?;
@@ -579,7 +545,12 @@ pub async fn submit(
                 "staged deployment must be finalized before submission",
             ));
         }
-        target_revision_digest = Some(deployment.get("revision_digest"));
+        let revision_digest: String = deployment.get("revision_digest");
+        operation_id = Some(
+            Uuid::parse_str(&deployment_operation_id(&revision_digest).map_err(internal)?)
+                .map_err(internal)?,
+        );
+        target_revision_digest = Some(revision_digest);
         if deployment.get::<_, String>("bundle_digest") != request.bundle_digest
             || digest != request.bundle_digest
             || deployment.get::<_, String>("resolved_release_digest")
@@ -598,6 +569,42 @@ pub async fn submit(
             request.engine_slots.clone(),
         )
     };
+    let operation_id = operation_id.expect("deployment actions derive an operation ID");
+
+    // An urgent rollback fences committed cleanup before the new operation is
+    // admitted. History/evidence remain, and the old cleanup can issue no effect.
+    if action == NodeOperationAction::Rollback {
+        if let Some(cleanup) = transaction
+            .query_opt(
+                "SELECT operation_id FROM wr_node_operations
+                 WHERE node_id = $1 AND committed AND phase = 'committed_cleanup'
+                   AND state IN ('queued', 'running', 'paused') FOR UPDATE",
+                &[&request.node_id],
+            )
+            .await
+            .map_err(internal)?
+        {
+            let cleanup_id: Uuid = cleanup.get("operation_id");
+            transaction
+                .execute(
+                    "UPDATE wr_node_operations SET phase = 'superseded', state = 'succeeded',
+                            lease_expires_at = NULL, claimed_by = NULL, agent_instance_id = NULL,
+                            updated_at = NOW() WHERE operation_id = $1",
+                    &[&cleanup_id],
+                )
+                .await
+                .map_err(internal)?;
+            append_event(
+                &transaction,
+                cleanup_id,
+                actor,
+                "CLEANUP_SUPERSEDED",
+                &operation_id.to_string(),
+                0,
+            )
+            .await?;
+        }
+    }
 
     if action == NodeOperationAction::InitialApply && source_revision != 0 {
         return Err(Status::failed_precondition(
@@ -1605,8 +1612,13 @@ async fn reconcile_slot<C: GenericClient + Sync>(
             let Some(observation) = observation else {
                 return Ok(false);
             };
-            if observation_after_delivery(observation, slot.effect_delivered_at.as_ref())
-                && observation.backend_state == BackendProcessState::Running as i32
+            // The agent reports a completed effect before publishing its
+            // matching observation. Ignore older source evidence until that
+            // post-delivery observation arrives.
+            if !observation_after_delivery(observation, slot.effect_delivered_at.as_ref()) {
+                return Ok(false);
+            }
+            if observation.backend_state == BackendProcessState::Running as i32
                 && observation.backend_instance_id == slot.pinned_backend_instance_id
                 && observation.backend_query_error.is_empty()
             {
@@ -1796,7 +1808,10 @@ async fn reconcile_slot<C: GenericClient + Sync>(
             {
                 let query_failed =
                     observation.is_some_and(|value| !value.backend_query_error.is_empty());
-                if query_failed || slot.effect_reported {
+                // The agent durably reports a completed verification before it
+                // publishes the matching observation. Do not interpret that
+                // intentional ordering as invalid source/target evidence.
+                if observation.is_some() && (query_failed || slot.effect_reported) {
                     pause_with_condition(
                         client,
                         id,

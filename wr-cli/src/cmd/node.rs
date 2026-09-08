@@ -564,7 +564,7 @@ fn add_deployment_artifacts(
         env_vars: vec![],
         no_otel,
         after: vec![],
-        requires: vec![],
+        wants: vec![],
     };
     bundle::tar_add_bytes_checked(
         tar,
@@ -591,7 +591,7 @@ fn add_deployment_artifacts(
             env_vars: vec![],
             no_otel,
             after: vec!["wr-proxy.service"],
-            requires: vec!["wr-proxy.service"],
+            wants: vec!["wr-proxy.service"],
         };
         bundle::tar_add_bytes_checked(
             tar,
@@ -806,6 +806,8 @@ fn assemble_node_bundle(input: NodeBundleAssembly<'_>) -> Result<Manifest> {
         "node_id".to_string(),
         "revision".to_string(),
         "bundle_digest".to_string(),
+        "operation_id".to_string(),
+        "revision_digest".to_string(),
     ];
     add_deployment_artifacts(
         &mut tar,
@@ -1096,43 +1098,50 @@ fn validate_deploy_listener_ports(configs: &[(String, String)], peer_port: u16) 
     Ok(())
 }
 
-fn expected_engines(manifest: &Manifest) -> Vec<ExpectedEngine> {
+fn expected_engines(manifest: &Manifest, host: &str) -> Result<Vec<ExpectedEngine>> {
     manifest
         .engines
         .iter()
-        .map(|engine| ExpectedEngine {
-            engine_slot: engine.engine_slot.clone(),
-            modules: engine
-                .modules
-                .iter()
-                .map(|module| ExpectedModule {
-                    identity: Some(ModuleIdentity {
-                        namespace: module.namespace.clone(),
-                        name: module.name.clone(),
-                        version: module.version.clone(),
-                    }),
-                    proto_schema_digest: if module.has_schema {
-                        manifest
-                            .checksums
-                            .get(&format!("wr-node/schemas/{}.binpb", module.name))
-                            .map(|digest| format!("sha256:{digest}"))
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    },
-                })
-                .collect(),
-            secrets: engine
-                .secrets
-                .iter()
-                .map(|(namespace, key)| SecretRequest {
-                    namespace: namespace.clone(),
-                    key: key.clone(),
-                })
-                .collect(),
-            db_namespaces: engine.db_namespaces.clone(),
-            job_queue_id: engine.job_queue_id.clone(),
-            job_admin_address: engine.job_admin_address.clone(),
+        .map(|engine| {
+            let job_admin_address = if engine.job_admin_address.is_empty() {
+                String::new()
+            } else {
+                super::config::deployed_job_admin_address(&engine.job_admin_address, host)?
+            };
+            Ok(ExpectedEngine {
+                engine_slot: engine.engine_slot.clone(),
+                modules: engine
+                    .modules
+                    .iter()
+                    .map(|module| ExpectedModule {
+                        identity: Some(ModuleIdentity {
+                            namespace: module.namespace.clone(),
+                            name: module.name.clone(),
+                            version: module.version.clone(),
+                        }),
+                        proto_schema_digest: if module.has_schema {
+                            manifest
+                                .checksums
+                                .get(&format!("wr-node/schemas/{}.binpb", module.name))
+                                .map(|digest| format!("sha256:{digest}"))
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        },
+                    })
+                    .collect(),
+                secrets: engine
+                    .secrets
+                    .iter()
+                    .map(|(namespace, key)| SecretRequest {
+                        namespace: namespace.clone(),
+                        key: key.clone(),
+                    })
+                    .collect(),
+                db_namespaces: engine.db_namespaces.clone(),
+                job_queue_id: engine.job_queue_id.clone(),
+                job_admin_address,
+            })
         })
         .collect()
 }
@@ -1156,6 +1165,30 @@ fn resolved_stage_root() -> PathBuf {
         std::process::id(),
         uuid::Uuid::new_v4()
     ))
+}
+
+fn node_tls_profiles(requires_job_admin_tls: bool) -> Vec<&'static str> {
+    let mut profiles = vec!["proxy-endpoint", "proxy-client"];
+    if requires_job_admin_tls {
+        profiles.push("engine-admin-endpoint");
+    }
+    profiles
+}
+
+fn node_tls_runtime_access_command(profiles: &[&str], run_group: &str) -> String {
+    let owner = helpers::shell_quote(&format!("root:{run_group}"));
+    let credential_sets = profiles
+        .iter()
+        .map(|profile| format!("/etc/wruntime/pki/{profile}/sets/v1"))
+        .collect::<Vec<_>>();
+    let credential_sets = credential_sets
+        .iter()
+        .map(|path| helpers::shell_quote(path))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "set -eu; sudo chown {owner} /etc/wruntime/pki/roots/server /etc/wruntime/pki/roots/client /etc/wruntime/pki/roots/server/ca.crt /etc/wruntime/pki/roots/client/ca.crt; sudo chmod 0750 /etc/wruntime/pki/roots/server /etc/wruntime/pki/roots/client; sudo chmod 0440 /etc/wruntime/pki/roots/server/ca.crt /etc/wruntime/pki/roots/client/ca.crt; for set in {credential_sets}; do parent=$(dirname \"$set\"); sudo chown {owner} \"$parent\"; sudo chmod 0750 \"$parent\"; sudo chown -R {owner} \"$set\"; sudo find \"$set\" -type d -exec chmod 0550 {{}} +; sudo find \"$set\" -type f -exec chmod 0440 {{}} +; done"
+    )
 }
 
 fn provision_node_tls(
@@ -1186,26 +1219,25 @@ fn provision_node_tls(
             None,
         )?;
     }
-    let mut profiles = vec![
-        ("proxy-endpoint", "proxy-endpoint"),
-        ("proxy-client", "proxy-client"),
-    ];
-    if requires_job_admin_tls {
-        profiles.push(("engine-admin-endpoint", "engine-admin-endpoint"));
-    }
-    for (local_name, remote_name) in profiles {
-        let local = PathBuf::from(format!("{cert_dir}/{local_name}"));
+    let profiles = node_tls_profiles(requires_job_admin_tls);
+    for profile in &profiles {
+        let local = PathBuf::from(format!("{cert_dir}/{profile}"));
         let digest = helpers::local_tree_digest(&local)?;
         helpers::install_remote_directory(
             &local,
             remote,
-            &format!("/etc/wruntime/pki/{remote_name}/sets/v1"),
+            &format!("/etc/wruntime/pki/{profile}/sets/v1"),
             ssh_key,
             ssh_port,
             &digest,
         )?;
     }
-    Ok(())
+    let run_group = helpers::extract_remote_user(remote).unwrap_or("root");
+    helpers::run_ssh(
+        &helpers::build_ssh_args(remote, ssh_key, ssh_port),
+        &node_tls_runtime_access_command(&profiles, run_group),
+    )
+    .context("failed to grant the workload group read-only TLS access")
 }
 
 #[allow(clippy::too_many_arguments)] // Resolution binds the complete deploy contract in one atomic staging operation.
@@ -1215,12 +1247,18 @@ fn materialize_resolved_release(
     configs: &[(String, String)],
     node_id: &str,
     revision: u64,
+    operation_id: &str,
+    revision_digest: &str,
     format: DeployFormat,
     db_url: &str,
     peer_port: u16,
     remote: &str,
     host_ip: &str,
 ) -> Result<ResolvedStage> {
+    anyhow::ensure!(
+        wr_common::deployment_contract::deployment_operation_id(revision_digest)? == operation_id,
+        "deployment operation ID does not match its canonical revision digest"
+    );
     let root = resolved_stage_root();
     std::fs::create_dir_all(&root)?;
     let archive_file = std::fs::File::open(bundle_path)?;
@@ -1240,6 +1278,8 @@ fn materialize_resolved_release(
     vars.insert("node_id", node_id);
     vars.insert("revision", revision_string.as_str());
     vars.insert("bundle_digest", manifest.bundle_digest.as_str());
+    vars.insert("operation_id", operation_id);
+    vars.insert("revision_digest", revision_digest);
     for (name, template) in configs {
         let resolved = helpers::resolve_template(template, &vars)
             .with_context(|| format!("failed to resolve template in {name}"))?;
@@ -1263,6 +1303,8 @@ fn materialize_resolved_release(
         "node_id": node_id,
         "revision": revision,
         "bundle_digest": manifest.bundle_digest,
+        "operation_id": operation_id,
+        "revision_digest": revision_digest,
         "format": match format { DeployFormat::Systemd => "systemd", DeployFormat::Docker => "docker" },
         "engines": manifest.engines,
     });
@@ -1445,6 +1487,8 @@ async fn durable_deploy(
             .collect::<Vec<_>>()
             .join(",")
     );
+    let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
+    let host_ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
     let deployment = client::connect_operator(
         manager,
         wr_common::manager_client::RetryClass::DurableCreate,
@@ -1456,15 +1500,13 @@ async fn durable_deploy(
         bundle_digest: manifest.bundle_digest.clone(),
         inventory: Some(DeploymentInventoryV1 {
             schema_version: 1,
-            engines: expected_engines(&manifest),
+            engines: expected_engines(&manifest, &host_ip)?,
         }),
     })
     .await?
     .into_inner()
     .deployment
     .context("manager returned no deployment record")?;
-    let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
-    let host_ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
     provision_node_tls(
         &cert_dir,
         &args.remote,
@@ -1480,6 +1522,8 @@ async fn durable_deploy(
         &configs,
         &args.node_id,
         deployment.revision,
+        &deployment.operation_id,
+        &deployment.revision_digest,
         format,
         &db_url,
         peer_port,
@@ -1641,6 +1685,11 @@ async fn durable_rollback(args: RollbackArgs, manager: &str) -> Result<()> {
     .into_inner()
     .deployment
     .context("manager returned no rollback deployment")?;
+    anyhow::ensure!(
+        wr_common::deployment_contract::deployment_operation_id(&deployment.revision_digest)?
+            == deployment.operation_id,
+        "rollback operation ID does not match its canonical revision digest"
+    );
     let source = release_dir(&workdir, deployment.source_revision);
     let target = release_dir(&workdir, deployment.revision);
     let temporary = staging_release_dir(&workdir, deployment.revision);
@@ -1649,20 +1698,31 @@ async fn durable_rollback(args: RollbackArgs, manager: &str) -> Result<()> {
     let harden = remote_release_hardening(&target, run_group);
     let script = format!(
         r#"set -eu
-sudo env SOURCE={source:?} TARGET={target:?} TMP={temporary:?} NODE={node:?} REV={revision} BUNDLE={bundle:?} python3 - <<'PY'
+sudo env SOURCE={source:?} TARGET={target:?} TMP={temporary:?} NODE={node:?} REV={revision} BUNDLE={bundle:?} OPERATION={operation:?} REVISION_DIGEST={revision_digest:?} python3 - <<'PY'
 import hashlib,json,os,pathlib,re,shutil,stat
 source=pathlib.Path(os.environ['SOURCE']); target=pathlib.Path(os.environ['TARGET']); tmp=pathlib.Path(os.environ['TMP'])
 node=os.environ['NODE']; revision=int(os.environ['REV']); bundle=os.environ['BUNDLE']
+operation=os.environ['OPERATION']; revision_digest=os.environ['REVISION_DIGEST']
 if target.exists():
+ value=json.loads((target/'deployment.json').read_text())
+ if value.get('revision')!=revision or value.get('operation_id')!=operation or value.get('revision_digest')!=revision_digest: raise SystemExit('existing rollback release identity mismatch')
  print((target/'resolved-release.sha256').read_text().strip()); raise SystemExit(0)
 shutil.rmtree(tmp, ignore_errors=True); shutil.copytree(source,tmp,symlinks=False)
 for name in ('resolved-release.json','resolved-release.sha256'): (tmp/name).unlink(missing_ok=True)
 for config in (tmp/'config').glob('*.toml'):
  text=config.read_text(); parts=text.split('[deployment]',1)
- if len(parts)==2:
-  head,tail=parts; tail=re.sub(r'(?m)^revision\s*=\s*\d+',f'revision = {revision}',tail,count=1)
-  config.write_text(head+'[deployment]'+tail)
-marker=tmp/'deployment.json'; value=json.loads(marker.read_text()); value['revision']=revision; value['source_revision']={source_revision}; marker.write_text(json.dumps(value,indent=2)+'\n')
+ if len(parts)!=2: raise SystemExit(f'missing deployment metadata in {{config}}')
+ head,tail=parts
+ replacements=[
+  (r'(?m)^revision\s*=\s*\d+',f'revision = {revision}','revision'),
+  (r'(?m)^operation_id\s*=\s*"[^"]*"',f'operation_id = "{operation}"','operation_id'),
+  (r'(?m)^revision_digest\s*=\s*"[^"]*"',f'revision_digest = "{revision_digest}"','revision_digest'),
+ ]
+ for pattern,replacement,name in replacements:
+  tail,count=re.subn(pattern,replacement,tail,count=1)
+  if count!=1: raise SystemExit(f'missing deployment {{name}} in {{config}}')
+ config.write_text(head+'[deployment]'+tail)
+marker=tmp/'deployment.json'; value=json.loads(marker.read_text()); value['revision']=revision; value['operation_id']=operation; value['revision_digest']=revision_digest; value['source_revision']={source_revision}; marker.write_text(json.dumps(value,indent=2)+'\n')
 files={{}}
 for path in sorted(tmp.rglob('*')):
  if path.is_symlink() or (path.exists() and not (path.is_file() or path.is_dir())): raise SystemExit('invalid release entry')
@@ -1681,6 +1741,8 @@ PY
         node = args.node_id,
         revision = deployment.revision,
         bundle = deployment.bundle_digest,
+        operation = deployment.operation_id,
+        revision_digest = deployment.revision_digest,
         source_revision = deployment.source_revision,
     );
     let resolved_digest = helpers::run_ssh_output(&ssh, &script)?;
@@ -1791,6 +1853,8 @@ fn status(args: StatusArgs) -> Result<()> {
             "node_id" => "--node-id",
             "revision" => "manager-assigned activation revision",
             "bundle_digest" => "verified immutable bundle digest",
+            "operation_id" => "manager-derived deployment operation UUID",
+            "revision_digest" => "manager-derived canonical revision digest",
             _ => "unknown",
         };
         println!("  {{{var}}}  {source}");
@@ -1889,6 +1953,22 @@ mod tests {
         assert!(!script.contains("job-admin-delegation"));
     }
 
+    #[test]
+    fn node_tls_access_keeps_credentials_root_owned_and_workload_group_readable() {
+        let profiles = node_tls_profiles(true);
+        let command = node_tls_runtime_access_command(&profiles, "wruntime");
+        assert!(command.contains("chown 'root:wruntime'"));
+        assert!(command.contains("chmod 0750"));
+        assert!(command.contains("chmod 0550"));
+        assert!(command.contains("chmod 0440"));
+        for profile in profiles {
+            assert!(command.contains(&format!("/etc/wruntime/pki/{profile}/sets/v1")));
+        }
+
+        let command = node_tls_runtime_access_command(&node_tls_profiles(false), "wruntime");
+        assert!(!command.contains("engine-admin-endpoint"));
+    }
+
     fn temp_bundle_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1944,6 +2024,19 @@ listen_address = "127.0.0.1:9100"
 proxy_address = "http://127.0.0.1:9001"
 control_address = "http://127.0.0.1:9002"
 peer_address = "https://127.0.0.1:9443"
+
+[database]
+url = "postgres://localhost/wruntime"
+
+[job_admin]
+listen_address = "0.0.0.0:9150"
+advertise_address = "https://127.0.0.1:9150/"
+queue_id = "fixture-jobs"
+
+[job_admin.tls]
+cert_path = "certs/job-admin.crt"
+key_path = "certs/job-admin.key"
+client_ca_cert_path = "certs/client-ca.crt"
 
 [[module]]
 name = "inventory"
@@ -2054,6 +2147,105 @@ migrations_path = {migrations:?}
     }
 
     #[test]
+    fn resolved_release_materialization_binds_operation_and_revision_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "wr-resolved-release-identity-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let bundle_path = root.join("node.tar.gz");
+        assemble_production_fixture(&root, &bundle_path).unwrap();
+        let bundle_path = bundle_path.to_str().unwrap();
+        let manifest = bundle::read_manifest(bundle_path).unwrap();
+        let configs = bundle::read_configs_from_tarball(bundle_path).unwrap();
+        let revision_digest = format!("sha256:{}", "a".repeat(64));
+        let operation_id =
+            wr_common::deployment_contract::deployment_operation_id(&revision_digest).unwrap();
+
+        let stage = materialize_resolved_release(
+            bundle_path,
+            &manifest,
+            &configs,
+            "node-a",
+            7,
+            &operation_id,
+            &revision_digest,
+            DeployFormat::Systemd,
+            "postgres://localhost/wruntime",
+            9443,
+            "deploy@example.test",
+            "192.0.2.10",
+        )
+        .unwrap();
+        let engine = fs::read_to_string(stage.root.join("wr-node/config/engine.toml")).unwrap();
+        assert!(!engine.contains("{operation_id}"));
+        assert!(!engine.contains("{revision_digest}"));
+        let engine: toml::Value = toml::from_str(&engine).unwrap();
+        assert_eq!(
+            engine["deployment"]["operation_id"].as_str(),
+            Some(operation_id.as_str())
+        );
+        assert_eq!(
+            engine["deployment"]["revision_digest"].as_str(),
+            Some(revision_digest.as_str())
+        );
+        let expected = expected_engines(&manifest, "192.0.2.10").unwrap();
+        assert_eq!(expected[0].job_queue_id, "fixture-jobs");
+        assert_eq!(
+            expected[0].job_admin_address,
+            engine["job_admin"]["advertise_address"].as_str().unwrap()
+        );
+        assert_eq!(expected[0].job_admin_address, "https://192.0.2.10:9150/");
+        let marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(stage.root.join("wr-node/deployment.json")).unwrap())
+                .unwrap();
+        assert_eq!(marker["operation_id"], operation_id);
+        assert_eq!(marker["revision_digest"], revision_digest);
+
+        let mismatch = materialize_resolved_release(
+            bundle_path,
+            &manifest,
+            &configs,
+            "node-a",
+            7,
+            "00000000-0000-8000-8000-000000000001",
+            &revision_digest,
+            DeployFormat::Systemd,
+            "postgres://localhost/wruntime",
+            9443,
+            "deploy@example.test",
+            "192.0.2.10",
+        )
+        .err()
+        .expect("mismatched operation identity must fail");
+        assert!(mismatch.to_string().contains("operation ID does not match"));
+
+        let other_revision_digest = format!("sha256:{}", "b".repeat(64));
+        let other_operation_id =
+            wr_common::deployment_contract::deployment_operation_id(&other_revision_digest)
+                .unwrap();
+        let other = materialize_resolved_release(
+            bundle_path,
+            &manifest,
+            &configs,
+            "node-a",
+            7,
+            &other_operation_id,
+            &other_revision_digest,
+            DeployFormat::Systemd,
+            "postgres://localhost/wruntime",
+            9443,
+            "deploy@example.test",
+            "192.0.2.10",
+        )
+        .unwrap();
+        assert_ne!(stage.digest, other.digest);
+        drop((stage, other));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn bundle_digest_is_stable_across_inventory_order() {
         let mut checksums = BTreeMap::new();
         checksums.insert("wr-node/bin/wr-engine".into(), "a".repeat(64));
@@ -2115,6 +2307,8 @@ node_id = "{node_id}"
 revision = {revision}
 bundle_digest = "{bundle_digest}"
 engine_slot = "engine"
+operation_id = "{operation_id}"
+revision_digest = "{revision_digest}"
 "#
             .to_string(),
         )];

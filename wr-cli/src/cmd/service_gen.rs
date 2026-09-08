@@ -21,8 +21,9 @@ pub struct ServiceUnit<'a> {
     pub no_otel: bool,
     /// Extra `After=` dependencies (network.target is always included).
     pub after: Vec<&'a str>,
-    /// `Requires=` dependencies.
-    pub requires: Vec<&'a str>,
+    /// `Wants=` dependencies. Unlike `Requires=`, these do not cascade a
+    /// separately requested proxy stop into the engine unit.
+    pub wants: Vec<&'a str>,
 }
 
 impl ServiceUnit<'_> {
@@ -38,8 +39,8 @@ impl ServiceUnit<'_> {
         } else {
             out.push_str(&format!("After=network.target {}\n", self.after.join(" ")));
         }
-        if !self.requires.is_empty() {
-            out.push_str(&format!("Requires={}\n", self.requires.join(" ")));
+        if !self.wants.is_empty() {
+            out.push_str(&format!("Wants={}\n", self.wants.join(" ")));
         }
         out.push('\n');
 
@@ -76,7 +77,7 @@ impl ServiceUnit<'_> {
 }
 
 pub fn manager_activation_systemd_unit() -> &'static str {
-    "[Unit]\nDescription=wruntime manager\nAfter=network.target\n\n[Service]\nType=notify\nNotifyAccess=main\nExecStart=/usr/local/libexec/wruntime-manager-launch\nRestart=on-failure\nRestartSec=5\nKillSignal=SIGTERM\nTimeoutStopSec=45s\nSendSIGKILL=yes\n\n[Install]\nWantedBy=multi-user.target\n"
+    "[Unit]\nDescription=wruntime manager\nAfter=network.target\n\n[Service]\nType=notify\nNotifyAccess=main\nEnvironmentFile=/var/lib/wruntime/manager-secrets/runtime.env\nExecStart=/usr/local/libexec/wruntime-manager-launch\nRestart=on-failure\nRestartSec=5\nKillSignal=SIGTERM\nTimeoutStopSec=45s\nSendSIGKILL=yes\n\n[Install]\nWantedBy=multi-user.target\n"
 }
 
 /// Stable manager launcher. The systemd unit points only at this shim; rollout
@@ -286,9 +287,12 @@ mod tests {
             env_vars: vec![],
             no_otel: true,
             after: vec!["wr-proxy.service"],
-            requires: vec!["wr-proxy.service"],
+            wants: vec!["wr-proxy.service"],
         }
         .to_systemd();
+        assert!(unit.contains("After=network.target wr-proxy.service\n"));
+        assert!(unit.contains("Wants=wr-proxy.service\n"));
+        assert!(!unit.contains("Requires="));
         assert!(unit.contains("Type=notify\n"));
         assert!(unit.contains("NotifyAccess=main\n"));
         assert!(unit.contains("KillSignal=SIGTERM\n"));
@@ -379,6 +383,10 @@ mod tests {
 
     #[test]
     fn manager_launcher_and_activation_are_digest_gated_and_ordered() {
+        let unit = manager_activation_systemd_unit();
+        assert!(unit.contains("EnvironmentFile=/var/lib/wruntime/manager-secrets/runtime.env"));
+        assert!(!unit.contains("WRT_SECRET_ENCRYPTION_KEY="));
+
         let launcher = manager_launcher_script();
         assert!(launcher.contains("executable_digest"));
         assert!(launcher.contains("backend_spec_digest"));

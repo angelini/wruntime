@@ -166,7 +166,7 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
     );
     let lifecycle = LifecycleOwner::new(ServiceKind::Proxy, "proxy-activation-1");
     let agent = Arc::new(NodeAgent::new(
-        discovery,
+        Arc::clone(&discovery),
         routing.clone(),
         lifecycle.snapshot(),
     ));
@@ -318,8 +318,47 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
         "read-only routing status must reflect the existing convergence snapshot"
     );
 
+    // A replacement proxy starts with no process-local engine cache. The
+    // manager-authenticated ownership fence lets the next engine heartbeat
+    // safely rebuild that cache without replacing the engine activation.
+    let restarted_routing = wr_proxy::routing::new_routing_table(
+        wr_proxy::config::CircuitBreakerConfig::default(),
+        "https://127.0.0.1:9443",
+    );
+    let restarted_lifecycle = LifecycleOwner::new(ServiceKind::Proxy, "proxy-activation-2");
+    let restarted_agent = Arc::new(NodeAgent::new(
+        discovery,
+        restarted_routing,
+        restarted_lifecycle.snapshot(),
+    ));
+    let recovered = restarted_agent
+        .heartbeat(tonic::Request::new(HeartbeatRequest {
+            engine_id: "proxy-e1".into(),
+            healthy_modules: vec![ModuleDescriptor {
+                name: "inventory".into(),
+                namespace: "store".into(),
+                version: "1.0.0".into(),
+                proto_schema: vec![],
+            }],
+            fence: fence.clone(),
+        }))
+        .await?
+        .into_inner();
+    assert!(
+        recovered.proxy_routing_table_version >= recovered.manager_routing_table_version,
+        "heartbeat after proxy restart must recover the fenced engine and converge routing"
+    );
+    assert_eq!(
+        restarted_agent
+            .get_proxy_routing_status(tonic::Request::new(GetProxyRoutingStatusRequest {}))
+            .await?
+            .into_inner()
+            .process_instance_id,
+        "proxy-activation-2"
+    );
+
     let mut tasks = wr_common::task_group::TaskGroup::new();
-    let heartbeat_agent = Arc::clone(&agent);
+    let heartbeat_agent = Arc::clone(&restarted_agent);
     tasks.spawn("test-heartbeat-loop", move |cancellation| {
         heartbeat_agent.run_heartbeat_loop(Duration::from_millis(20), cancellation)
     });
@@ -335,7 +374,7 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
         .get(0);
     assert_eq!(heartbeat_count, 1, "ready heartbeat must reach the manager");
 
-    let withdrawal = agent
+    let withdrawal = restarted_agent
         .begin_engine_drain(tonic::Request::new(BeginEngineDrainRequest {
             engine_id: "proxy-e1".into(),
 
@@ -347,17 +386,17 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
         withdrawal.proxy_routing_table_version >= withdrawal.manager_routing_table_version,
         "drain must synchronously converge route withdrawal"
     );
-    let drained_status = agent
+    let drained_status = restarted_agent
         .get_proxy_routing_status(tonic::Request::new(GetProxyRoutingStatusRequest {}))
         .await?
         .into_inner();
-    assert_eq!(drained_status.process_instance_id, "proxy-activation-1");
+    assert_eq!(drained_status.process_instance_id, "proxy-activation-2");
     assert!(
         drained_status.installed_routing_table_version
             >= ready_status.installed_routing_table_version,
         "routing status must never regress as convergence installs newer tables"
     );
-    let stale = match agent
+    let stale = match restarted_agent
         .heartbeat(tonic::Request::new(HeartbeatRequest {
             engine_id: "proxy-e1".into(),
             healthy_modules: vec![],

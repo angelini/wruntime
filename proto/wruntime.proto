@@ -163,6 +163,7 @@ message DeploymentRecord {
   optional google.protobuf.Timestamp finalized_at = 13;
   uint32 inventory_schema_version = 14;
   string revision_digest = 15;
+  string operation_id = 16; // manager-derived UUID reserved for this deployment revision
 }
 
 message BeginDeploymentRequest {

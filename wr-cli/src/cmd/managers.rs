@@ -137,6 +137,10 @@ struct ManagerManifest {
     checksums: BTreeMap<String, String>,
 }
 
+const MANAGER_LAUNCHER_ARCHIVE_PATH: &str = "wr-manager/bin/wr-manager-launch";
+const MANAGER_LAUNCHER_INSTALL_PATH: &str = "/usr/local/libexec/wruntime-manager-launch";
+const MANAGER_SECRET_ENV_PATH: &str = "/var/lib/wruntime/manager-secrets/runtime.env";
+
 // --- Entry point ---
 
 pub async fn run(args: ManagersArgs, manager: Option<&str>) -> Result<()> {
@@ -254,6 +258,12 @@ fn manager_runtime_env() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+fn manager_systemd_environment(secret_key: &str, lifecycle_instance_id: &str) -> String {
+    format!(
+        "WRT_SECRET_ENCRYPTION_KEY={secret_key}\nWRT_LIFECYCLE_INSTANCE_ID={lifecycle_instance_id}\n"
+    )
+}
+
 fn bundle(args: BundleArgs) -> Result<()> {
     if !Path::new(&args.manager_config).exists() {
         bail!("Manager config not found: {}", args.manager_config);
@@ -353,7 +363,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
     bundle::tar_add_bytes_checked(
         &mut tar,
         &mut checksums,
-        "wr-manager/bin/wr-manager-launch",
+        MANAGER_LAUNCHER_ARCHIVE_PATH,
         service_gen::manager_launcher_script().as_bytes(),
         0o755,
     )?;
@@ -434,6 +444,13 @@ fn bundle(args: BundleArgs) -> Result<()> {
 }
 
 // --- deploy ---
+
+fn validate_manager_secret_key(secret_key: &str) -> Result<()> {
+    if secret_key.len() != 64 || !secret_key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("manager secret encryption key must contain exactly 64 hexadecimal characters");
+    }
+    Ok(())
+}
 
 fn resolve_manager_config_template(
     config_template: &str,
@@ -647,6 +664,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
         "WR_SECRET_KEY",
         "secret_key",
     )?;
+    validate_manager_secret_key(&secret_key)?;
     let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key, "WR_SSH_KEY");
     let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port)?
         .map(helpers::DeployPort::get);
@@ -923,6 +941,27 @@ fn prepare_systemd(
     )?;
     println!("OK");
 
+    print!("[deploy]  installing stable launcher ... ");
+    let launcher = bundle::read_bytes_from_tarball(bundle, MANAGER_LAUNCHER_ARCHIVE_PATH)?;
+    let expected_digest = manifest
+        .checksums
+        .get(MANAGER_LAUNCHER_ARCHIVE_PATH)
+        .map(|digest| format!("sha256:{digest}"))
+        .with_context(|| {
+            format!("manager bundle manifest omitted {MANAGER_LAUNCHER_ARCHIVE_PATH}")
+        })?;
+    helpers::install_remote_bytes(
+        &launcher,
+        remote,
+        MANAGER_LAUNCHER_INSTALL_PATH,
+        ssh_key,
+        ssh_port,
+        0o555,
+        helpers::RemoteInstallClass::Public,
+        Some(&expected_digest),
+    )?;
+    println!("OK");
+
     Ok(())
 }
 
@@ -1061,6 +1100,18 @@ fn install_resolved_manager_runtime_artifacts(
     }
 
     if matches!(params.format, DeployFormat::Systemd) {
+        let runtime_environment =
+            manager_systemd_environment(params.secret_key, params.lifecycle_instance_id);
+        helpers::install_remote_bytes(
+            runtime_environment.as_bytes(),
+            params.remote,
+            MANAGER_SECRET_ENV_PATH,
+            params.ssh_key,
+            params.ssh_port,
+            0o600,
+            helpers::RemoteInstallClass::Sensitive,
+            None,
+        )?;
         let service_path = format!("{workdir}/wr-manager/systemd/wr-manager.service");
         helpers::run_ssh(
             params.ssh_base,
@@ -1190,6 +1241,9 @@ mod tests {
     fn manager_activation_identity_is_installed_in_every_backend() {
         let environment = manager_runtime_env();
         assert!(environment.contains(&("WRT_LIFECYCLE_INSTANCE_ID", "{lifecycle_instance_id}")));
+        let systemd_environment = manager_systemd_environment(&"a".repeat(64), "activation-id");
+        assert!(systemd_environment.contains("WRT_SECRET_ENCRYPTION_KEY="));
+        assert!(systemd_environment.contains("WRT_LIFECYCLE_INSTANCE_ID=activation-id\n"));
         assert!(manager_secret_template_archive_paths()
             .contains(&"wr-manager/systemd/wr-manager.service"));
         assert!(manager_secret_template_archive_paths()
@@ -1259,6 +1313,9 @@ mod tests {
 
     #[test]
     fn manager_deploy_resolution_sets_database_and_advertised_address() {
+        assert!(validate_manager_secret_key(&"a".repeat(64)).is_ok());
+        assert!(validate_manager_secret_key("not-a-secret").is_err());
+
         let template = r#"
 listen_address = "127.0.0.1:9000"
 local_proxy_address = "http://127.0.0.1:9001"
@@ -1300,6 +1357,10 @@ advertise_grpc_address = "{advertise_address}"
             index_of(phases, ManagerDeployPhase::PrepareBundle)
                 < index_of(phases, ManagerDeployPhase::InstallResolvedRuntimeArtifacts)
         );
+        let unit = service_gen::manager_activation_systemd_unit();
+        assert!(unit.contains(&format!("ExecStart={MANAGER_LAUNCHER_INSTALL_PATH}")));
+        assert!(unit.contains(&format!("EnvironmentFile={MANAGER_SECRET_ENV_PATH}")));
+        assert!(!unit.contains("WRT_SECRET_ENCRYPTION_KEY="));
         assert!(
             index_of(phases, ManagerDeployPhase::InstallResolvedRuntimeArtifacts)
                 < index_of(phases, ManagerDeployPhase::UploadResolvedConfig)

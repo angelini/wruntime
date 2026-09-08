@@ -357,26 +357,45 @@ impl ProxyNodeControlService for NodeAgent {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let request = request.into_inner();
         let engine_id = request.engine_id.clone();
-        let slot = self.engine_slot(&engine_id).await?;
+        let fence = request
+            .fence
+            .clone()
+            .ok_or_else(|| Status::permission_denied("ownership fence is required"))?;
+        let slot = match self.engine_slot(&engine_id).await {
+            Ok(slot) => slot,
+            Err(error) if error.code() == tonic::Code::NotFound => {
+                let slot_key = format!("{}/{}", fence.node_id, fence.slot);
+                self.engine_slot_or_insert(&slot_key).await
+            }
+            Err(error) => return Err(error),
+        };
         let _forward = slot.forward.lock().await;
         let mut state = slot.state.lock().await;
-        if matches!(state.phase, EnginePhase::Draining | EnginePhase::Tombstoned) {
-            return Err(Status::failed_precondition("engine is draining"));
-        }
-        if request.fence.as_ref() != state.fence.as_ref() {
-            return Err(Status::permission_denied(
-                "ownership fence does not match proxy cache",
-            ));
-        }
-        state.healthy_modules = request.healthy_modules.clone();
+        let recovering_after_proxy_restart = state.engine_id.is_empty();
+        if !recovering_after_proxy_restart {
+            if state.engine_id != engine_id {
+                return Err(Status::permission_denied(
+                    "engine identity does not match proxy cache",
+                ));
+            }
+            if matches!(state.phase, EnginePhase::Draining | EnginePhase::Tombstoned) {
+                return Err(Status::failed_precondition("engine is draining"));
+            }
+            if request.fence.as_ref() != state.fence.as_ref() {
+                return Err(Status::permission_denied(
+                    "ownership fence does not match proxy cache",
+                ));
+            }
+            state.healthy_modules = request.healthy_modules.clone();
 
-        if state.phase == EnginePhase::Ready {
-            return Ok(Response::new(HeartbeatResponse {
-                manager_routing_table_version: 0,
-                proxy_routing_table_version: self.routing.version().await,
-                accepted_fence: state.fence.clone(),
-                serialized_snapshot: state.serialized_snapshot.clone(),
-            }));
+            if state.phase == EnginePhase::Ready {
+                return Ok(Response::new(HeartbeatResponse {
+                    manager_routing_table_version: 0,
+                    proxy_routing_table_version: self.routing.version().await,
+                    accepted_fence: state.fence.clone(),
+                    serialized_snapshot: state.serialized_snapshot.clone(),
+                }));
+            }
         }
 
         let mut retained = slot.manager_epoch.lock().await;
@@ -392,22 +411,29 @@ impl ProxyNodeControlService for NodeAgent {
             Ok(response) => response,
             Err(error) if routing::is_transport_failure(&error) => {
                 *epoch = self.discovery.repin(epoch).await?;
-                epoch.heartbeat(request).await?
+                epoch.heartbeat(request.clone()).await?
             }
             Err(error) => return Err(error),
         };
         let manager_response = response.into_inner();
-        if manager_response.accepted_fence.as_ref() != state.fence.as_ref() {
+        if manager_response.accepted_fence.as_ref() != Some(&fence) {
             return Err(Status::permission_denied(
                 "manager heartbeat fence does not match proxy cache",
             ));
         }
         let manager_version = manager_response.manager_routing_table_version;
         let proxy_version = self.converge(epoch, manager_version).await?;
+        state.engine_id = engine_id.clone();
+        state.fence = Some(fence);
+        state.healthy_modules = request.healthy_modules;
+        state.serialized_snapshot = manager_response.serialized_snapshot.clone();
         state.phase = EnginePhase::Ready;
         info!(
             engine_id,
-            manager_version, proxy_version, "engine readiness converged"
+            manager_version,
+            proxy_version,
+            recovered = recovering_after_proxy_restart,
+            "engine readiness converged"
         );
         Ok(Response::new(HeartbeatResponse {
             manager_routing_table_version: manager_version,

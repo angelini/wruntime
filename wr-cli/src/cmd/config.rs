@@ -21,6 +21,16 @@ fn option_string_has_value(value: &Option<String>) -> bool {
     !option_string_is_empty(value)
 }
 
+pub(super) fn deployed_job_admin_address(address: &str, host: &str) -> anyhow::Result<String> {
+    let port = super::helpers::extract_port(address)?;
+    let authority_host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    Ok(format!("https://{authority_host}:{}/", port.get()))
+}
+
 // ---------------------------------------------------------------------------
 // Engine config
 // ---------------------------------------------------------------------------
@@ -200,8 +210,8 @@ impl EngineConfig {
             db.url = "{db_url}".to_string();
         }
         if let Some(ref mut job_admin) = config.job_admin {
-            let port = super::helpers::extract_port(&job_admin.advertise_address)?;
-            job_admin.advertise_address = format!("https://{{host}}:{}", port.get());
+            job_admin.advertise_address =
+                deployed_job_admin_address(&job_admin.advertise_address, "{host}")?;
             job_admin.tls.cert_path =
                 "/etc/wruntime/pki/engine-admin-endpoint/sets/v1/leaf.pem".to_string();
             job_admin.tls.key_path =
@@ -404,6 +414,22 @@ mod tests {
     use wr_engine::config::EngineConfig as RuntimeEngineConfig;
     use wr_manager::config::RawManagerConfig as RuntimeManagerConfig;
     use wr_proxy::config::ProxyConfig as RuntimeProxyConfig;
+
+    #[test]
+    fn deployed_job_admin_address_is_canonical_and_ipv6_safe() {
+        assert_eq!(
+            deployed_job_admin_address("https://127.0.0.1:9150", "192.0.2.10").unwrap(),
+            "https://192.0.2.10:9150/"
+        );
+        assert_eq!(
+            deployed_job_admin_address("https://127.0.0.1:9150/", "2001:db8::10").unwrap(),
+            "https://[2001:db8::10]:9150/"
+        );
+        assert_eq!(
+            deployed_job_admin_address("https://127.0.0.1:9150/", "{host}").unwrap(),
+            "https://{host}:9150/"
+        );
+    }
 
     fn runtime_unique_temp_path(name: &str, ext: &str) -> PathBuf {
         let nanos = SystemTime::now()

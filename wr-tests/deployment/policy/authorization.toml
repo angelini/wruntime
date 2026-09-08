@@ -1,8 +1,12 @@
-schema_version            = 1
-generation                = 1
-cluster_id                = "deployment"
-proxy_enrollments         = []
-node_agent_enrollments    = []
+schema_version = 1
+generation = 1
+cluster_id = "deployment"
+proxy_enrollments = [
+  { principal = "urn:wruntime:deployment:proxy:wr-e2e-node", node_id = "wr-e2e-node" },
+]
+node_agent_enrollments = [
+  { principal = "urn:wruntime:deployment:node-agent:wr-e2e-node", node_id = "wr-e2e-node" },
+]
 revoked_leaf_fingerprints = []
 
 [[principals]]
@@ -12,6 +16,14 @@ kind = "human"
 [[principals]]
 uri  = "urn:wruntime:deployment:manager:manager-a"
 kind = "manager"
+
+[[principals]]
+uri  = "urn:wruntime:deployment:proxy:wr-e2e-node"
+kind = "proxy"
+
+[[principals]]
+uri  = "urn:wruntime:deployment:node-agent:wr-e2e-node"
+kind = "node-agent"
 
 [[assignments]]
 principal = "urn:wruntime:deployment:human:deployer"

@@ -524,6 +524,8 @@ struct DeploymentDto<'a> {
     attempt_token: &'a str,
     bundle_digest: &'a str,
     resolved_release_digest: &'a str,
+    revision_digest: &'a str,
+    operation_id: &'a str,
     state: &'static str,
     source_revision: u64,
     expected_engines: Vec<ExpectedEngineDto<'a>>,
@@ -548,6 +550,8 @@ impl<'a> From<&'a DeploymentRecord> for DeploymentDto<'a> {
             attempt_token: &value.attempt_token,
             bundle_digest: &value.bundle_digest,
             resolved_release_digest: &value.resolved_release_digest,
+            revision_digest: &value.revision_digest,
+            operation_id: &value.operation_id,
             state: match DeploymentState::try_from(value.state)
                 .unwrap_or(DeploymentState::Unspecified)
             {
@@ -856,6 +860,8 @@ mod tests {
             attempt_token: "retry-token".into(),
             bundle_digest: "sha256:bundle".into(),
             resolved_release_digest: "sha256:resolved".into(),
+            revision_digest: "sha256:revision".into(),
+            operation_id: "00000000-0000-8000-8000-000000000001".into(),
             finalized_at: Some(prost_types::Timestamp {
                 seconds: 123,
                 nanos: 456,
@@ -875,6 +881,14 @@ mod tests {
         assert_eq!(
             json["target_deployment"]["resolved_release_digest"],
             "sha256:resolved"
+        );
+        assert_eq!(
+            json["target_deployment"]["revision_digest"],
+            "sha256:revision"
+        );
+        assert_eq!(
+            json["target_deployment"]["operation_id"],
+            "00000000-0000-8000-8000-000000000001"
         );
         assert_eq!(
             json["target_deployment"]["finalized_at"],
