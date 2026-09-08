@@ -143,9 +143,7 @@ fn phase_name(value: i32) -> &'static str {
         Phase::Forward => "forward",
         Phase::RestoringSource => "restoring-source",
         Phase::Committing => "committing",
-        Phase::CommittedCleanup => "committed-cleanup",
         Phase::Complete => "complete",
-        Phase::Superseded => "superseded",
         Phase::Unspecified => "unspecified",
     }
 }

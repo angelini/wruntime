@@ -24,6 +24,7 @@ just manager
 manager_id = "manager-a"
 listen_address = "0.0.0.0:9000"
 engine_heartbeat_timeout_secs = 30
+release_cleanup_interval_secs = 30
 
 [tls]
 cert_path = "/etc/wruntime/pki/manager-manager-a/sets/v1/leaf.pem"
@@ -61,6 +62,8 @@ and schemas to Postgres. Embedded SQL migrations run automatically on startup vi
 refinery, serialized across active-active managers by a Postgres advisory lock.
 
 The `[cluster]` section is required. Multiple managers can run active-active against the same Postgres database, which defines the cluster boundary. PostgreSQL manager leases are the sole liveness signal, and freshness uses database-server `NOW()` so host clock skew does not split the live set. Defaults are a 1-second heartbeat, 5-second live threshold, and 300-second stale-row reap threshold. The heartbeat must be positive, the live threshold must exceed it, and row reaping must be at least ten times the live threshold. The long reap window keeps a briefly dead manager visible as stale status evidence without returning it from `ListManagers`; cleanup runs in a separate owned task every 60 seconds so it cannot delay self-heartbeats. Set `advertise_grpc_address` when the manager is behind a load balancer or NAT.
+
+The manager runs immediate startup and periodic per-node release-cleanup reconciliation in its owned task group. `release_cleanup_interval_secs` defaults to 30 and must be in `1..=300`; 30 seconds is the default bounded discovery/status objective while a manager and PostgreSQL are available. Protection-changing transactions fence existing deletion authority immediately, while only this periodic task discovers or materializes replacement work.
 
 The manager also runs a Postgres-backed claim/lease job scheduler that submits scheduled jobs through `local_proxy_address` (the local proxy loopback) using the same routing/mTLS path as normal traffic; delivery is **at-least-once** (jobs must be idempotent). `local_proxy_address` is **required** — startup fails if it is unset or empty. `scheduler_lease_secs` must exceed the worst-case per-tick submission time, or a schedule can be reclaimed by another manager while still legitimately in flight. Schedule `interval_secs`, `timeout_secs`, and `max_attempts` are required non-zero unsigned values; malformed negatives fail TOML/protobuf parsing and zero fails manager validation.
 

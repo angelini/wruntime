@@ -110,7 +110,7 @@ pub fn workload_binding_matches(
     }
 }
 
-pub const MANAGER_RPC_ROWS: [RpcAuthorizationRow; 46] = [
+pub const MANAGER_RPC_ROWS: [RpcAuthorizationRow; 51] = [
     row!("ClusterService", "ListEngines", "cluster.engines.read; H:view/admin, S:status", "node/namespace selectors; engine registry", "rows/count/page by matching tuples", NotApplicable, LargeRead),
     row!("ClusterService", "GetRoutingTable", "cluster.routes.read; H:view/admin, S:status, W:proxy", "namespace selector; routing repository", "scoped human/SA; complete cluster routing for proxy", ProxyEnrolledGlobal, LargeRead),
     row!("ClusterService", "UpsertRoutingRule", "cluster.routes.write; H:admin, S:route", "namespace/rule; routing repository", "n/a", NotApplicable, ConfigWrite),
@@ -140,6 +140,8 @@ pub const MANAGER_RPC_ROWS: [RpcAuthorizationRow; 46] = [
     row!("InfrastructureService", "AdvanceManagerRollout", "infrastructure.manager-rollout.write; while closed only recorded deployment principal", "rollout ID, lease epoch, expected phase/member outcomes; rollout CAS", "committed phase/members", NotApplicable, RolloutControl),
     row!("InfrastructureService", "GetManagerRollout", "rollout read roles while open; recorded principal while closed", "rollout ID; rollout repository", "bounded phase/member status", NotApplicable, RolloutControl),
     row!("InfrastructureService", "PutNodeAgentPolicy", "infrastructure.node-agent-policy.write; H:infra/admin, S:deploy", "bound node; policy repository", "n/a", NotApplicable, ConfigWrite),
+    row!("InfrastructureService", "GetNodeCleanupStatus", "infrastructure.cleanup.read; H:view/infra/admin, S:status/infra", "bound node; cleanup repository", "one bounded summary", NotApplicable, SmallRead),
+    row!("InfrastructureService", "RetryNodeCleanup", "infrastructure.cleanup.write; H:infra/admin, S:infra", "bound node/generation; cleanup repository", "queued generation", NotApplicable, Operation),
     row!("NodeService", "RegisterEngine",  "node.engines.register; W:proxy", "node + operation/revision/slot/activation; desired deployment/owner lookup", "credentials/current policy/fence for owner", ProxyBound, Operation),
     row!("NodeService", "DeregisterEngine", "node.engines.deregister; W:proxy", "complete ownership fence; locked owner lookup", "n/a", ProxyBound, Operation),
     row!("NodeService", "Heartbeat", "node.engines.heartbeat; W:proxy", "complete ownership fence; owner lookup", "matching complete engine snapshot", ProxyBound, Heartbeat),
@@ -147,6 +149,9 @@ pub const MANAGER_RPC_ROWS: [RpcAuthorizationRow; 46] = [
     row!("NodeService", "Attest", "node.attestations.write; W:node-agent", "bound node; agent policy lookup", "attestation decision and conditions", NodeAgentBound, Heartbeat),
     row!("NodeService", "ClaimOperation",  "node.operations.claim; W:node-agent", "bound node; queue selects that node", "returned operation matches node", NodeAgentBound, Operation),
     row!("NodeService", "RenewOperationLease", "node.operations.renew; W:node-agent", "operation/lease epoch; owner/node lookup", "n/a", NodeAgentBound, Heartbeat),
+    row!("NodeService", "ClaimNodeCleanup", "node.cleanup.claim; W:node-agent", "bound node/generation; cleanup repository", "exact authority", NodeAgentBound, Operation),
+    row!("NodeService", "RenewNodeCleanupLease", "node.cleanup.renew; W:node-agent", "bound node/generation/claim; cleanup repository", "lease or superseded", NodeAgentBound, Heartbeat),
+    row!("NodeService", "ReportNodeCleanupResult", "node.cleanup.report; W:node-agent", "bound node/generation/claim; cleanup repository", "accepted or superseded", NodeAgentBound, Operation),
     row!("NodeService", "ReportObservation", "node.observations.write; W:node-agent", "operation/node; node lookup", "n/a", NodeAgentBound, Operation),
     row!("NodeService", "ReportStepResult", "node.steps.write; W:node-agent", "operation/step/lease; owner/node lookup", "n/a", NodeAgentBound, Operation),
     row!("JobService", "ListJobQueues", "jobs.read; H:job-view/job-admin/admin, S:job-view/job-admin", "queue catalog", "rows/counts by whole-grant union", NotApplicable, LargeRead),
@@ -324,9 +329,10 @@ pub fn handler_adapter_binding(service: &str, method: &str) -> Option<HandlerAda
             "wruntime.InfrastructureService",
             "VerifyDeployment" | "FinalizeDeployment" | "AbandonDeployment" | "BeginRollback",
         ) => (E::Node, L::DeploymentRepository, F::None),
-        ("wruntime.InfrastructureService", "PutNodeAgentPolicy") => {
-            (E::Node, L::OperationRepository, F::None)
-        }
+        (
+            "wruntime.InfrastructureService",
+            "PutNodeAgentPolicy" | "GetNodeCleanupStatus" | "RetryNodeCleanup",
+        ) => (E::Node, L::OperationRepository, F::None),
         ("wruntime.InfrastructureService", "BeginManagerRollout") => {
             (E::ManagerSet, L::RolloutRepository, F::BoundedStatus)
         }
@@ -345,12 +351,16 @@ pub fn handler_adapter_binding(service: &str, method: &str) -> Option<HandlerAda
         ("wruntime.NodeService", "Attest") => {
             (E::AttestationNode, L::OperationRepository, F::NodeTuple)
         }
-        ("wruntime.NodeService", "ClaimOperation") => {
+        ("wruntime.NodeService", "ClaimOperation" | "ClaimNodeCleanup") => {
             (E::Node, L::OperationRepository, F::NodeTuple)
         }
         (
             "wruntime.NodeService",
-            "RenewOperationLease" | "ReportObservation" | "ReportStepResult",
+            "RenewOperationLease"
+            | "ReportObservation"
+            | "ReportStepResult"
+            | "RenewNodeCleanupLease"
+            | "ReportNodeCleanupResult",
         ) => (E::OperationId, L::OperationRepository, F::None),
         ("wruntime.JobService", "ListJobQueues") => (E::None, L::JobDelegate, F::JobQueueTuple),
         ("wruntime.JobService", "ListJobs" | "GetJobQueueSummary" | "GetJob" | "RetryJob") => {
@@ -428,12 +438,12 @@ fn roles_for_row(row: &RpcAuthorizationRow, kind: PrincipalKind) -> &'static [Po
         ("wruntime.ClusterService", _, PrincipalKind::ServiceAccount) => &[R::Status],
         (
             "wruntime.InfrastructureService",
-            "SubmitOperation" | "ResumeOperation" | "CancelOperation",
+            "SubmitOperation" | "ResumeOperation" | "CancelOperation" | "RetryNodeCleanup",
             PrincipalKind::Human,
         ) => &[R::Admin, R::Infra],
         (
             "wruntime.InfrastructureService",
-            "SubmitOperation" | "ResumeOperation" | "CancelOperation",
+            "SubmitOperation" | "ResumeOperation" | "CancelOperation" | "RetryNodeCleanup",
             PrincipalKind::ServiceAccount,
         ) => &[R::Infra],
         (

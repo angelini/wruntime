@@ -17,8 +17,8 @@ use wr_common::agent_policy::{
     AGENT_PROTOCOL_VERSION,
 };
 use wr_common::wruntime::{
-    AgentInstruction, BackendKind, CleanupReleaseEvidence, InstructionTarget,
-    InstructionTargetKind, NodeAgentAttestation, NodeAgentPolicy, NodeOperationStepKind,
+    AgentInstruction, BackendKind, CleanupReleaseEvidence, NodeAgentAttestation, NodeAgentPolicy,
+    NodeCleanupInstruction, ReleaseInventoryEntry, ReportNodeCleanupResultRequest,
     ReportNodeObservationRequest, ReportStepResultRequest,
 };
 
@@ -148,7 +148,7 @@ pub enum CleanupResultLoss {
 }
 
 pub struct FakeCleanupManager {
-    instruction: AgentInstruction,
+    instruction: NodeCleanupInstruction,
     loss: CleanupResultLoss,
     accepted_payload: Mutex<Option<Vec<u8>>>,
     first_report: AtomicBool,
@@ -206,22 +206,32 @@ impl AgentManager for FakeCleanupManager {
         _node_id: &'a str,
         _agent_instance_id: &'a str,
     ) -> AgentFuture<'a, Option<AgentInstruction>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn claim_cleanup<'a>(
+        &'a self,
+        _node_id: &'a str,
+        _agent_instance_id: &'a str,
+    ) -> AgentFuture<'a, Option<NodeCleanupInstruction>> {
         Box::pin(async move {
             let claim = self.claims.fetch_add(1, Ordering::SeqCst);
             if claim == 0 {
                 Ok(Some(self.instruction.clone()))
             } else {
-                // This is the real cleanup rule: delivery without a recorded
-                // result produces no instruction. It is deliberately not an
-                // acknowledgement of the pending report.
                 self.claims_while_result_pending
                     .fetch_add(1, Ordering::SeqCst);
-                // End a mutant runner promptly: the assertions still prove
-                // that reaching this real-manager `None` branch is forbidden.
                 let _ = self.shutdown.send(true);
                 Ok(None)
             }
         })
+    }
+
+    fn renew_cleanup<'a>(
+        &'a self,
+        _instruction: &'a NodeCleanupInstruction,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
     }
 
     fn report_observation<'a>(
@@ -231,7 +241,18 @@ impl AgentManager for FakeCleanupManager {
         Box::pin(async { Ok(()) })
     }
 
-    fn report_result<'a>(&'a self, request: ReportStepResultRequest) -> ReportResultFuture<'a> {
+    fn report_result<'a>(&'a self, _request: ReportStepResultRequest) -> ReportResultFuture<'a> {
+        Box::pin(async {
+            Err(ReportResultError::Rejected(
+                "generic result was not expected".into(),
+            ))
+        })
+    }
+
+    fn report_cleanup<'a>(
+        &'a self,
+        request: ReportNodeCleanupResultRequest,
+    ) -> ReportResultFuture<'a> {
         Box::pin(async move {
             self.reports.fetch_add(1, Ordering::SeqCst);
             let payload = request.encode_to_vec();
@@ -258,36 +279,55 @@ pub struct FakeCleanupBackend {
 impl InstructionExecutor for FakeCleanupBackend {
     fn execute<'a>(
         &'a self,
-        _instruction: &'a AgentInstruction,
+        instruction: &'a AgentInstruction,
         _cancelled: watch::Receiver<bool>,
     ) -> BackendFuture<'a, StepEvidence> {
         Box::pin(async move {
             self.effects.fetch_add(1, Ordering::SeqCst);
-            Ok(StepEvidence {
-                cleanup_evidence: Some(CleanupReleaseEvidence {
-                    retained_releases: vec![],
-                }),
-                ..Default::default()
+            if instruction.step == wr_common::wruntime::NodeOperationStepKind::InspectBackend as i32
+            {
+                Ok(StepEvidence {
+                    observed_revision: 1,
+                    observed_digest: format!("sha256:{}", "a".repeat(64)),
+                    backend_state: Some(wr_common::wruntime::BackendProcessState::Exited),
+                    backend_instance_id: "backend-1".into(),
+                    process_instance_id: "process-1".into(),
+                    ..Default::default()
+                })
+            } else {
+                Ok(StepEvidence::default())
+            }
+        })
+    }
+
+    fn execute_cleanup<'a>(
+        &'a self,
+        _instruction: &'a NodeCleanupInstruction,
+        _cancelled: watch::Receiver<bool>,
+    ) -> BackendFuture<'a, CleanupReleaseEvidence> {
+        Box::pin(async move {
+            self.effects.fetch_add(1, Ordering::SeqCst);
+            Ok(CleanupReleaseEvidence {
+                retained_releases: vec![],
             })
         })
     }
 }
 
-pub fn cleanup_instruction() -> AgentInstruction {
-    AgentInstruction {
-        operation_id: "00000000-0000-0000-0000-000000000009".into(),
+pub fn cleanup_instruction() -> NodeCleanupInstruction {
+    NodeCleanupInstruction {
         node_id: "node-a".into(),
-        lease_epoch: 7,
-        step: NodeOperationStepKind::CleanupRelease as i32,
         agent_instance_id: "activation-a".into(),
-        target: Some(InstructionTarget {
-            kind: InstructionTargetKind::ReleaseCleanup as i32,
+        generation: 9,
+        lease_epoch: 7,
+        claim_instance: "00000000-0000-0000-0000-000000000009".into(),
+        payload_digest: format!("sha256:{}", "a".repeat(64)),
+        delete_releases: vec![ReleaseInventoryEntry {
             revision: 1,
-            bundle_digest:
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            ..Default::default()
-        }),
-        restoration: true,
-        ..Default::default()
+            bundle_digest: format!("sha256:{}", "b".repeat(64)),
+            resolved_release_digest: format!("sha256:{}", "c".repeat(64)),
+        }],
+        expected_inventory: vec![],
+        deadline: None,
     }
 }

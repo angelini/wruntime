@@ -1537,7 +1537,6 @@ async fn complete_foreground_operation(manager_endpoint: &str) -> Result<()> {
                     backend_instance_id: backend_instance_id.clone(),
                     process_instance_id: process_instance_id.clone(),
                     backend_query_error: String::new(),
-                    cleanup_evidence: None,
                     observed_resolved_release_digest: target.resolved_release_digest.clone(),
                     termination_evidence: None,
                 })

@@ -1101,6 +1101,7 @@ pub struct ClusterStatusSnapshot {
     pub observations: Vec<SlotObservation>,
     pub agent_attestations: Vec<NodeAgentAttestation>,
     pub agent_policies: Vec<NodeAgentPolicy>,
+    pub cleanup_summaries: Vec<wr_common::wruntime::NodeCleanupSummary>,
 }
 
 fn deployment_revision(value: u64) -> Result<i64, Status> {
@@ -1298,6 +1299,8 @@ pub async fn begin_deployment(
     )
     .await
     .internal()?;
+    crate::operations::fence_cleanup_authority(&txn, &request.node_id, "DEPLOYMENT_ALLOCATED")
+        .await?;
     for engine in &inventory.engines {
         txn.execute(
             "INSERT INTO wr_node_slot_owners (node_id, engine_slot, slot_generation)
@@ -1381,6 +1384,8 @@ pub async fn finalize_deployment(
         )
         .await
         .internal()?;
+        crate::operations::fence_cleanup_authority(&txn, &request.node_id, "DEPLOYMENT_FINALIZED")
+            .await?;
     }
     let deployment = get_deployment_in_transaction(&txn, &request.node_id, revision)
         .await?
@@ -1466,6 +1471,7 @@ pub async fn abandon_deployment(
     )
     .await
     .internal()?;
+    crate::operations::fence_cleanup_authority(&txn, node_id, "DEPLOYMENT_ABANDONED").await?;
     let deployment = get_deployment_in_transaction(&txn, node_id, revision)
         .await?
         .expect("abandoned deployment remains present");
@@ -1700,6 +1706,7 @@ where
     let observations = crate::operations::observations_from_client(txn, "", "").await?;
     let agent_attestations = crate::operations::attestations_from_client(txn, "").await?;
     let agent_policies = crate::operations::policies_from_client(txn).await?;
+    let cleanup_summaries = crate::operations::cleanup_summaries_from_client(txn).await?;
     Ok(ClusterStatusSnapshot {
         observed_at,
         routing_version,
@@ -1713,6 +1720,7 @@ where
         observations,
         agent_attestations,
         agent_policies,
+        cleanup_summaries,
     })
 }
 

@@ -181,6 +181,44 @@ PY_REDACT
                 if primary:
                     self.assertIn("Primary run failed with 23", result.stderr)
 
+    def test_deployment_uses_only_durable_node_lifecycle_commands(self):
+        script = DEPLOYMENT_LIFECYCLE.read_text()
+        for command in ("node deploy", "node upgrade", "node scale", "engines drain", "node rollback"):
+            self.assertIn(command, script)
+        self.assertIn("--exit-after-finalization", script)
+        self.assertEqual(script.count("--allow-downtime"), 4)
+        self.assertIn('operations list --node-id "$NODE_ID" --include-terminal --json', script)
+        self.assertIn('len(matches) != 1', script)
+        for obsolete in (
+            "node stop",
+            "assert_node_stop_record",
+            "wr-node/current",
+            "lifecycle stop",
+            "engine-lifecycle-tunnel",
+            "engine-exit-probe",
+            "systemctl show wr-engine",
+            "status exited --services engine-engine",
+        ):
+            self.assertNotIn(obsolete, script)
+
+    def test_deployment_materializes_complete_policy_before_manager_bundle(self):
+        script = DEPLOYMENT_LIFECYCLE.read_text()
+        self.assertIn("policy = policy_source.read_text()", script)
+        self.assertIn('proxy_principal = f"urn:wruntime:{cluster_id}:proxy:{node_id}"', script)
+        self.assertIn('agent_principal = f"urn:wruntime:{cluster_id}:node-agent:{node_id}"', script)
+        self.assertIn('quote(manager_enrollment["endpoint"]), quote(manager_endpoint), 1', script)
+        self.assertLess(
+            script.index('run_logged cert-manager-client'),
+            script.index('run_logged manager-bundle'),
+        )
+        self.assertIn('--manager-config "$MANAGER_CONFIG"', script)
+        self.assertLess(
+            script.index('run_to_log "$backend node agent install"'),
+            script.index('run_to_log "$backend node A deploy"'),
+        )
+        self.assertIn('--agent-cert "$CERT_DIR/node-agent/leaf.pem"', script)
+        self.assertIn('--agent-ca-cert "$CERT_DIR/server-root/ca.crt"', script)
+
     def test_failure_excerpt_is_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "long.log"

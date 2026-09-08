@@ -21,8 +21,8 @@ use tokio::process::Command;
 use tokio::sync::watch;
 use wr_common::wruntime::{
     AgentInstruction, BackendProcessState, BackendStopDisposition, BackendTerminationEvidence,
-    CleanupReleaseEvidence, InstructionTargetKind, LifecycleStatus, NodeOperationStepKind,
-    ProcessLifecycleState, ReleaseInventoryEntry, ServiceKind,
+    CleanupReleaseEvidence, InstructionTargetKind, LifecycleStatus, NodeCleanupInstruction,
+    NodeOperationStepKind, ProcessLifecycleState, ReleaseInventoryEntry, ServiceKind,
 };
 
 use super::bundle_integrity::{verify_resolved_release, BundleManifest};
@@ -160,6 +160,14 @@ pub trait InstructionExecutor: Send + Sync {
         instruction: &'a AgentInstruction,
         cancelled: watch::Receiver<bool>,
     ) -> BackendFuture<'a, StepEvidence>;
+
+    fn execute_cleanup<'a>(
+        &'a self,
+        _instruction: &'a NodeCleanupInstruction,
+        _cancelled: watch::Receiver<bool>,
+    ) -> BackendFuture<'a, CleanupReleaseEvidence> {
+        Box::pin(async { anyhow::bail!("cleanup execution is unsupported") })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1183,10 +1191,30 @@ impl HostBackend {
 }
 
 impl InstructionExecutor for HostBackend {
+    fn execute_cleanup<'a>(
+        &'a self,
+        instruction: &'a NodeCleanupInstruction,
+        mut cancelled: watch::Receiver<bool>,
+    ) -> BackendFuture<'a, CleanupReleaseEvidence> {
+        Box::pin(async move {
+            let backend = self.clone();
+            let allowlist = instruction.delete_releases.clone();
+            let mut cleanup = tokio::task::spawn_blocking(move || backend.cleanup(&allowlist));
+            tokio::select! {
+                result = &mut cleanup => result.context("cleanup worker panicked")?,
+                changed = cancelled.changed() => {
+                    let _ = changed;
+                    let _ = cleanup.await.context("cleanup worker panicked")??;
+                    bail!("cleanup completed after lease cancellation; manager inspection is required")
+                }
+            }
+        })
+    }
+
     fn execute<'a>(
         &'a self,
         instruction: &'a AgentInstruction,
-        mut cancelled: watch::Receiver<bool>,
+        cancelled: watch::Receiver<bool>,
     ) -> BackendFuture<'a, StepEvidence> {
         Box::pin(async move {
             let step = NodeOperationStepKind::try_from(instruction.step)
@@ -1200,26 +1228,6 @@ impl InstructionExecutor for HostBackend {
                 NodeOperationStepKind::SwitchAuthority | NodeOperationStepKind::VerifyServing
             ) {
                 bail!("manager returned an internal-only instruction");
-            }
-            if step == NodeOperationStepKind::CleanupRelease {
-                let backend = self.clone();
-                let allowlist = instruction.cleanup_delete_releases.clone();
-                let mut cleanup = tokio::task::spawn_blocking(move || backend.cleanup(&allowlist));
-                let evidence = tokio::select! {
-                    result = &mut cleanup => result.context("cleanup worker panicked")??,
-                    changed = cancelled.changed() => {
-                        let _ = changed;
-                        // spawn_blocking cannot be safely aborted mid-filesystem mutation.
-                        // Keep the activation alive until deletion and inventory hashing are
-                        // conclusive, so a replacement cannot pass the local activation lock.
-                        let _ = cleanup.await.context("cleanup worker panicked")??;
-                        bail!("cleanup completed after lease cancellation; manager inspection is required")
-                    }
-                };
-                return Ok(StepEvidence {
-                    cleanup_evidence: Some(evidence),
-                    ..Default::default()
-                });
             }
             let target_kind = InstructionTargetKind::try_from(target.kind)
                 .unwrap_or(InstructionTargetKind::Unspecified);
@@ -1657,8 +1665,7 @@ impl InstructionExecutor for HostBackend {
                 NodeOperationStepKind::Unspecified
                 | NodeOperationStepKind::VerifyProxy
                 | NodeOperationStepKind::SwitchAuthority
-                | NodeOperationStepKind::VerifyServing
-                | NodeOperationStepKind::CleanupRelease => {
+                | NodeOperationStepKind::VerifyServing => {
                     bail!("manager returned an unsupported instruction")
                 }
             }
@@ -2456,54 +2463,29 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_beyond_renewal_interval_waits_for_conclusive_worker_exit() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        use crate::cmd::node_agent::{
-            execute_fenced, AgentFuture, LeaseIdentity, LeaseManager, TokioClock,
-        };
-
-        struct RejectRenewal(AtomicUsize);
-        impl LeaseManager for RejectRenewal {
-            fn renew<'a>(&'a self, _lease: &'a LeaseIdentity) -> AgentFuture<'a, ()> {
-                Box::pin(async move {
-                    self.0.fetch_add(1, Ordering::SeqCst);
-                    bail!("test lease expired")
-                })
-            }
-        }
-
         let root = temp_root("cleanup-fence");
         let digest = stage_release(&root, 1, false);
         let backend = test_backend(&root).with_cleanup_delay(Duration::from_millis(100));
-        let manager = RejectRenewal(AtomicUsize::new(0));
-        let (_shutdown, receiver) = watch::channel(false);
+        let (cancel, receiver) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.send(true).unwrap();
+        });
         let started = std::time::Instant::now();
-        let outcome = execute_fenced(
-            &manager,
-            &backend,
-            &TokioClock,
-            &AgentInstruction {
-                cleanup_delete_releases: vec![ReleaseInventoryEntry {
-                    revision: 1,
-                    bundle_digest: digest,
-                    resolved_release_digest: resolved_digest(&root, 1),
-                }],
-                ..instruction(
-                    NodeOperationStepKind::CleanupRelease,
-                    1,
-                    String::new(),
-                    String::new(),
-                )
-            },
-            Duration::from_millis(10),
-            receiver,
-        )
-        .await;
-        assert!(matches!(
-            outcome,
-            crate::cmd::node_agent::FencedExecution::LeaseLost(_)
-        ));
-        assert_eq!(manager.0.load(Ordering::SeqCst), 1);
+        let outcome = backend
+            .execute_cleanup(
+                &NodeCleanupInstruction {
+                    delete_releases: vec![ReleaseInventoryEntry {
+                        revision: 1,
+                        bundle_digest: digest,
+                        resolved_release_digest: resolved_digest(&root, 1),
+                    }],
+                    ..Default::default()
+                },
+                receiver,
+            )
+            .await;
+        assert!(outcome.is_err());
         assert!(started.elapsed() >= Duration::from_millis(100));
         assert!(!root.join("wr-node/releases/1").exists());
         std::fs::remove_dir_all(root).unwrap();

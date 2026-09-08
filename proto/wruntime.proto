@@ -372,6 +372,7 @@ message EngineStatus {
   uint64 heartbeat_age_seconds = 8;
   repeated ModuleStatus modules = 9;
   repeated DeploymentCondition conditions = 10;
+  NodeCleanupSummary release_cleanup = 11;
 }
 
 message RouteStatus {
@@ -400,6 +401,7 @@ message NodeStatus {
   repeated EngineStatus engines = 5;
   repeated DeploymentCondition conditions = 6;
   DeploymentRecord target_deployment = 7; // optional staged deployment
+  NodeCleanupSummary release_cleanup = 8;
 }
 
 message GetClusterStatusRequest {}
@@ -441,17 +443,43 @@ enum NodeOperationState {
   NODE_OPERATION_STATE_CANCELLED = 6;
 }
 
-// Operation phase is intentionally separate from terminal/lease state. In particular,
-// restoration is deadline-free but lease-fenced and cleanup is visibly
-// committed even while paused.
+enum NodeCleanupState {
+  NODE_CLEANUP_STATE_UNSPECIFIED = 0;
+  NODE_CLEANUP_STATE_CLEAN = 1;
+  NODE_CLEANUP_STATE_NEEDS_RECONCILE = 2;
+  NODE_CLEANUP_STATE_PENDING = 3;
+  NODE_CLEANUP_STATE_CLAIMED = 4;
+  NODE_CLEANUP_STATE_PAUSED = 5;
+}
+
+enum NodeCleanupResultDisposition {
+  NODE_CLEANUP_RESULT_DISPOSITION_UNSPECIFIED = 0;
+  NODE_CLEANUP_RESULT_DISPOSITION_ACCEPTED = 1;
+  NODE_CLEANUP_RESULT_DISPOSITION_SUPERSEDED = 2;
+}
+
+message NodeCleanupSummary {
+  string node_id = 1;
+  NodeCleanupState state = 2;
+  uint64 generation = 3;
+  uint32 candidate_count = 4;
+  optional google.protobuf.Timestamp last_reconciled_at = 5;
+  optional google.protobuf.Timestamp next_action_at = 6;
+  uint32 inventory_count = 7;
+  string diagnostic_code = 8;
+  string diagnostic_detail = 9;
+}
+
+// Operation phase is intentionally separate from terminal/lease state.
+// Restoration is deadline-free but lease-fenced; release cleanup is a separate lifecycle.
 enum NodeOperationPhase {
+  reserved 4, 6;
+  reserved "NODE_OPERATION_PHASE_COMMITTED_CLEANUP", "NODE_OPERATION_PHASE_SUPERSEDED";
   NODE_OPERATION_PHASE_UNSPECIFIED = 0;
   NODE_OPERATION_PHASE_FORWARD = 1;
   NODE_OPERATION_PHASE_RESTORING_SOURCE = 2;
   NODE_OPERATION_PHASE_COMMITTING = 3;
-  NODE_OPERATION_PHASE_COMMITTED_CLEANUP = 4;
   NODE_OPERATION_PHASE_COMPLETE = 5;
-  NODE_OPERATION_PHASE_SUPERSEDED = 6;
 }
 
 enum NodeOperationStepKind {
@@ -465,7 +493,8 @@ enum NodeOperationStepKind {
   NODE_OPERATION_STEP_KIND_SWITCH_AUTHORITY = 7;
   NODE_OPERATION_STEP_KIND_VERIFY_SERVING = 8;
   NODE_OPERATION_STEP_KIND_RESTORE_SOURCE = 9;
-  NODE_OPERATION_STEP_KIND_CLEANUP_RELEASE = 10;
+  reserved 10;
+  reserved "NODE_OPERATION_STEP_KIND_CLEANUP_RELEASE";
   // Read-only backend inspection after takeover or ambiguous effect delivery.
   NODE_OPERATION_STEP_KIND_INSPECT_BACKEND = 11;
 }
@@ -581,12 +610,9 @@ message NodeOperation {
   bool forward_fenced = 20;
   bool restoration_requested = 21;
   string agent_instance_id = 22;
-  string cleanup_superseded_by = 23;
-  CleanupReleaseEvidence cleanup_evidence = 24;
-  optional google.protobuf.Timestamp cleanup_reported_at = 25;
-  string cleanup_backend_query_error = 26;
+  reserved 23, 24, 25, 26, 28;
+  reserved "cleanup_superseded_by", "cleanup_evidence", "cleanup_reported_at", "cleanup_backend_query_error", "cleanup_delivered_at";
   NodeOperationState restoration_terminal_state = 27;
-  optional google.protobuf.Timestamp cleanup_delivered_at = 28;
   string proxy_process_instance_id = 29;
   string resolved_release_digest = 30;
   NodeOperationStepKind proxy_next_step = 31;
@@ -742,9 +768,8 @@ message AgentInstruction {
   string pinned_backend_instance_id = 11;
   string pinned_process_instance_id = 12;
   bool restoration = 13;
-  // Manager-derived exact deletion allow-list for committed cleanup. The
-  // agent validates each revision/digest/path but never derives retention.
-  repeated ReleaseInventoryEntry cleanup_delete_releases = 14;
+  reserved 14;
+  reserved "cleanup_delete_releases";
   string revision_digest = 15;
 }
 message ClaimOperationResponse {
@@ -784,6 +809,65 @@ message ReleaseInventoryEntry {
 message CleanupReleaseEvidence {
   repeated ReleaseInventoryEntry retained_releases = 1;
 }
+
+message GetNodeCleanupStatusRequest { string node_id = 1; }
+message GetNodeCleanupStatusResponse { NodeCleanupSummary cleanup = 1; }
+message RetryNodeCleanupRequest {
+  string node_id = 1;
+  uint64 observed_generation = 2;
+}
+message RetryNodeCleanupResponse { NodeCleanupSummary cleanup = 1; }
+message ClaimNodeCleanupRequest {
+  string node_id = 1;
+  string agent_instance_id = 2;
+}
+message NodeCleanupAuthority {
+  repeated ReleaseInventoryEntry delete_releases = 1;
+  repeated ReleaseInventoryEntry known_inventory = 2;
+}
+message NodeCleanupInstruction {
+  string node_id = 1;
+  string agent_instance_id = 2;
+  uint64 generation = 3;
+  uint64 lease_epoch = 4;
+  string claim_instance = 5;
+  string payload_digest = 6;
+  repeated ReleaseInventoryEntry delete_releases = 7;
+  repeated ReleaseInventoryEntry expected_inventory = 8;
+  optional google.protobuf.Timestamp deadline = 9;
+}
+message ClaimNodeCleanupResponse {
+  NodeCleanupInstruction instruction = 1;
+  uint64 lease_seconds = 2;
+}
+message RenewNodeCleanupLeaseRequest {
+  string node_id = 1;
+  string agent_instance_id = 2;
+  uint64 generation = 3;
+  uint64 lease_epoch = 4;
+  string claim_instance = 5;
+}
+message RenewNodeCleanupLeaseResponse {
+  optional google.protobuf.Timestamp lease_expires_at = 1;
+  bool superseded = 2;
+}
+message ReportNodeCleanupResultRequest {
+  string node_id = 1;
+  string agent_instance_id = 2;
+  uint64 generation = 3;
+  uint64 lease_epoch = 4;
+  string claim_instance = 5;
+  string payload_digest = 6;
+  repeated ReleaseInventoryEntry deleted_releases = 7;
+  repeated ReleaseInventoryEntry resulting_inventory = 8;
+  string condition_code = 9;
+  string detail = 10;
+}
+message ReportNodeCleanupResultResponse {
+  NodeCleanupResultDisposition disposition = 1;
+  NodeCleanupSummary cleanup = 2;
+}
+
 message ReportStepResultRequest {
   string node_id = 1;
   string operation_id = 2;
@@ -798,7 +882,8 @@ message ReportStepResultRequest {
   string backend_instance_id = 11;
   string process_instance_id = 12;
   string backend_query_error = 13;
-  CleanupReleaseEvidence cleanup_evidence = 14;
+  reserved 14;
+  reserved "cleanup_evidence";
   string observed_resolved_release_digest = 15;
   BackendTerminationEvidence termination_evidence = 16;
 }
@@ -1231,6 +1316,8 @@ service InfrastructureService {
   rpc AbandonDeployment(AbandonDeploymentRequest) returns (AbandonDeploymentResponse);
   rpc BeginRollback(BeginRollbackRequest) returns (BeginRollbackResponse);
   rpc PutNodeAgentPolicy(PutNodeAgentPolicyRequest) returns (PutNodeAgentPolicyResponse);
+  rpc GetNodeCleanupStatus(GetNodeCleanupStatusRequest) returns (GetNodeCleanupStatusResponse);
+  rpc RetryNodeCleanup(RetryNodeCleanupRequest) returns (RetryNodeCleanupResponse);
   rpc BeginManagerRollout(BeginManagerRolloutRequest) returns (BeginManagerRolloutResponse);
   rpc LeaseManagerRollout(LeaseManagerRolloutRequest) returns (LeaseManagerRolloutResponse);
   rpc AdvanceManagerRollout(AdvanceManagerRolloutRequest) returns (AdvanceManagerRolloutResponse);
@@ -1245,6 +1332,9 @@ service NodeService {
   rpc Attest(AttestNodeAgentRequest) returns (AttestNodeAgentResponse);
   rpc ClaimOperation(ClaimOperationRequest) returns (ClaimOperationResponse);
   rpc RenewOperationLease(RenewOperationLeaseRequest) returns (RenewOperationLeaseResponse);
+  rpc ClaimNodeCleanup(ClaimNodeCleanupRequest) returns (ClaimNodeCleanupResponse);
+  rpc RenewNodeCleanupLease(RenewNodeCleanupLeaseRequest) returns (RenewNodeCleanupLeaseResponse);
+  rpc ReportNodeCleanupResult(ReportNodeCleanupResultRequest) returns (ReportNodeCleanupResultResponse);
   rpc ReportObservation(ReportNodeObservationRequest) returns (ReportNodeObservationResponse);
   rpc ReportStepResult(ReportStepResultRequest) returns (ReportStepResultResponse);
 }

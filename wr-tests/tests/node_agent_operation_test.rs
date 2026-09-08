@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use helpers::node_agent::{
-    cleanup_instruction, CleanupResultLoss, FakeBlockedBackend, FakeCleanupBackend,
-    FakeCleanupManager, FakeClock, FakeManager,
+    CleanupResultLoss, FakeBlockedBackend, FakeCleanupBackend, FakeCleanupManager, FakeClock,
+    FakeManager,
 };
 use tokio::sync::watch;
 use wr_cli::cmd::node_agent::{
@@ -208,11 +208,7 @@ impl AgentManager for RestartRecoveryManager {
             match (agent_instance_id, claim) {
                 ("activation-old", 0) => Ok(Some(self.instruction.clone())),
                 ("activation-new", 1) => Ok(Some(AgentInstruction {
-                    step: if self.instruction.step == NodeOperationStepKind::CleanupRelease as i32 {
-                        NodeOperationStepKind::CleanupRelease as i32
-                    } else {
-                        NodeOperationStepKind::InspectBackend as i32
-                    },
+                    step: NodeOperationStepKind::InspectBackend as i32,
                     agent_instance_id: "activation-new".into(),
                     lease_epoch: 8,
                     ..self.instruction.clone()
@@ -355,8 +351,7 @@ async fn node_agent_operation_test_restart_correlates_stored_result_without_old_
 {
     let recovery = recovery_directory("result-restart");
     let (first_shutdown, first_receiver) = watch::channel(false);
-    let mut cleanup_instruction = cleanup_instruction();
-    cleanup_instruction.agent_instance_id = "activation-old".into();
+    let cleanup_instruction = instruction("activation-old", 7);
     let first_manager = RestartRecoveryManager {
         instruction: cleanup_instruction.clone(),
         claims: AtomicUsize::new(0),
@@ -401,8 +396,8 @@ async fn node_agent_operation_test_restart_correlates_stored_result_without_old_
     .await
     .unwrap();
     assert_eq!(retry_cleanup.effects.load(Ordering::SeqCst), 1);
-    assert_eq!(second_manager.observations.load(Ordering::SeqCst), 0);
-    assert_eq!(second_manager.stale_results.load(Ordering::SeqCst), 1);
+    assert_eq!(second_manager.observations.load(Ordering::SeqCst), 1);
+    assert_eq!(second_manager.stale_results.load(Ordering::SeqCst), 0);
     assert_eq!(std::fs::read_dir(&recovery).unwrap().count(), 0);
     std::fs::remove_dir(recovery).unwrap();
 }

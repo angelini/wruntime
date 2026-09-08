@@ -9,15 +9,16 @@ use anyhow::Result;
 
 use wr_common::wruntime::{
     AbandonDeploymentRequest, AttestNodeAgentRequest, BackendProcessState, BeginDeploymentRequest,
-    BeginEngineDrainRequest, ClaimOperationRequest, DeploymentInventoryV1, DeploymentMetadata,
-    DeploymentState, DeregisterEngineRequest, EngineOwnershipFence, EngineRegistration,
-    ExpectedEngine, ExpectedModule, FinalizeDeploymentRequest, GetClusterStatusRequest,
-    GetOperatorStatusRequest, GetRoutingTableRequest, GetSchemaRequest, HeartbeatRequest,
-    ListEnginesRequest, ModuleDescriptor, ModuleIdentity, NodeOperationAction,
-    NodeOperationStepKind, PutNodeAgentPolicyRequest, RegisterEngineRequest,
-    ReportNodeObservationRequest, ReportStepResultRequest, ResumeOperationRequest, RolloutPolicy,
-    RoutingRule, SecretRequest, StatusSeverity, SubmitOperationRequest, VerifyDeploymentRequest,
-    VerifyDeploymentResponse,
+    BeginEngineDrainRequest, ClaimNodeCleanupRequest, ClaimOperationRequest, DeploymentInventoryV1,
+    DeploymentMetadata, DeploymentState, DeregisterEngineRequest, EngineOwnershipFence,
+    EngineRegistration, ExpectedEngine, ExpectedModule, FinalizeDeploymentRequest,
+    GetClusterStatusRequest, GetNodeCleanupStatusRequest, GetOperatorStatusRequest,
+    GetRoutingTableRequest, GetSchemaRequest, HeartbeatRequest, ListEnginesRequest,
+    ModuleDescriptor, ModuleIdentity, NodeOperationAction, NodeOperationStepKind,
+    PutNodeAgentPolicyRequest, RegisterEngineRequest, RenewNodeCleanupLeaseRequest,
+    ReportNodeCleanupResultRequest, ReportNodeObservationRequest, ReportStepResultRequest,
+    ResumeOperationRequest, RetryNodeCleanupRequest, RolloutPolicy, RoutingRule, SecretRequest,
+    StatusSeverity, SubmitOperationRequest, VerifyDeploymentRequest, VerifyDeploymentResponse,
 };
 
 async fn verify_deployment(
@@ -1645,6 +1646,21 @@ async fn role_gated_services_enforce_real_mtls_identity_and_node_binding() -> Re
         .await
         .expect_err("viewer mutation must be denied");
     assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    let readable = viewer
+        .get_node_cleanup_status(GetNodeCleanupStatusRequest {
+            node_id: "node-a".into(),
+        })
+        .await
+        .expect_err("cleanup read is authorized for viewers but absent state is not found");
+    assert_eq!(readable.code(), tonic::Code::NotFound);
+    let denied = viewer
+        .retry_node_cleanup(RetryNodeCleanupRequest {
+            node_id: "node-a".into(),
+            observed_generation: 1,
+        })
+        .await
+        .expect_err("viewer cleanup retry must be denied");
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
     let denied = viewer
         .begin_deployment(BeginDeploymentRequest {
             node_id: "viewer-node".into(),
@@ -1692,6 +1708,37 @@ async fn role_gated_services_enforce_real_mtls_identity_and_node_binding() -> Re
         })
         .await
         .expect_err("node-a certificate must not act for node-b");
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    let denied = agent
+        .claim_node_cleanup(ClaimNodeCleanupRequest {
+            node_id: "node-b".into(),
+            agent_instance_id: "activation-a".into(),
+        })
+        .await
+        .expect_err("cleanup claim must enforce certificate node binding");
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    let denied = agent
+        .renew_node_cleanup_lease(RenewNodeCleanupLeaseRequest {
+            node_id: "node-b".into(),
+            agent_instance_id: "activation-a".into(),
+            generation: 1,
+            lease_epoch: 1,
+            claim_instance: uuid::Uuid::new_v4().to_string(),
+        })
+        .await
+        .expect_err("cleanup renewal must enforce certificate node binding");
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    let denied = agent
+        .report_node_cleanup_result(ReportNodeCleanupResultRequest {
+            node_id: "node-b".into(),
+            agent_instance_id: "activation-a".into(),
+            generation: 1,
+            lease_epoch: 1,
+            claim_instance: uuid::Uuid::new_v4().to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("cleanup report must enforce certificate node binding");
     assert_eq!(denied.code(), tonic::Code::PermissionDenied);
 
     Ok(())

@@ -18,28 +18,31 @@ use wr_common::wruntime::{
     AttestNodeAgentResponse, BeginDeploymentRequest, BeginDeploymentResponse,
     BeginEngineDrainRequest, BeginEngineDrainResponse, BeginManagerRolloutRequest,
     BeginManagerRolloutResponse, BeginRollbackRequest, BeginRollbackResponse,
-    CancelOperationRequest, CancelOperationResponse, ClaimOperationRequest, ClaimOperationResponse,
+    CancelOperationRequest, CancelOperationResponse, ClaimNodeCleanupRequest,
+    ClaimNodeCleanupResponse, ClaimOperationRequest, ClaimOperationResponse,
     DeleteRoutingRuleRequest, DeleteRoutingRuleResponse, DeleteScheduleRequest,
     DeleteScheduleResponse, DeleteSecretRequest, DeleteSecretResponse, DeploymentCondition,
     DeregisterEngineRequest, DeregisterEngineResponse, FinalizeDeploymentRequest,
     FinalizeDeploymentResponse, GetClusterStatusRequest, GetClusterStatusResponse,
     GetLifecycleStatusRequest, GetLifecycleStatusResponse, GetManagerRolloutRequest,
-    GetManagerRolloutResponse, GetOperationRequest, GetOperationResponse, GetOperatorStatusRequest,
-    GetOperatorStatusResponse, GetPolicyStatusRequest, GetPolicyStatusResponse,
-    GetRoutingTableRequest, GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse,
-    GetWorkloadSnapshotRequest, GetWorkloadSnapshotResponse, HeartbeatRequest, HeartbeatResponse,
-    LeaseManagerRolloutRequest, LeaseManagerRolloutResponse, ListEnginesRequest,
-    ListEnginesResponse, ListManagersRequest, ListManagersResponse, ListOperationsRequest,
-    ListOperationsResponse, ListSchedulesRequest, ListSchedulesResponse, ListSecretsRequest,
-    ListSecretsResponse, ManagerInfo, NodeOperationAction, PolicyCapHeadroom,
-    PutNodeAgentPolicyRequest, PutNodeAgentPolicyResponse, RegisterEngineRequest,
-    RegisterEngineResponse, RenewOperationLeaseRequest, RenewOperationLeaseResponse,
-    ReportNodeObservationRequest, ReportNodeObservationResponse, ReportStepResultRequest,
-    ReportStepResultResponse, ResumeOperationRequest, ResumeOperationResponse, RoutingRule,
-    Schedule, SecretEntry, SetSecretRequest, SetSecretResponse, SlotAuthorityStatus,
-    SubmitOperationRequest, SubmitOperationResponse, UpsertRoutingRuleResponse,
-    UpsertScheduleRequest, UpsertScheduleResponse, VerifyDeploymentRequest,
-    VerifyDeploymentResponse,
+    GetManagerRolloutResponse, GetNodeCleanupStatusRequest, GetNodeCleanupStatusResponse,
+    GetOperationRequest, GetOperationResponse, GetOperatorStatusRequest, GetOperatorStatusResponse,
+    GetPolicyStatusRequest, GetPolicyStatusResponse, GetRoutingTableRequest,
+    GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse, GetWorkloadSnapshotRequest,
+    GetWorkloadSnapshotResponse, HeartbeatRequest, HeartbeatResponse, LeaseManagerRolloutRequest,
+    LeaseManagerRolloutResponse, ListEnginesRequest, ListEnginesResponse, ListManagersRequest,
+    ListManagersResponse, ListOperationsRequest, ListOperationsResponse, ListSchedulesRequest,
+    ListSchedulesResponse, ListSecretsRequest, ListSecretsResponse, ManagerInfo,
+    NodeOperationAction, PolicyCapHeadroom, PutNodeAgentPolicyRequest, PutNodeAgentPolicyResponse,
+    RegisterEngineRequest, RegisterEngineResponse, RenewNodeCleanupLeaseRequest,
+    RenewNodeCleanupLeaseResponse, RenewOperationLeaseRequest, RenewOperationLeaseResponse,
+    ReportNodeCleanupResultRequest, ReportNodeCleanupResultResponse, ReportNodeObservationRequest,
+    ReportNodeObservationResponse, ReportStepResultRequest, ReportStepResultResponse,
+    ResumeOperationRequest, ResumeOperationResponse, RetryNodeCleanupRequest,
+    RetryNodeCleanupResponse, RoutingRule, Schedule, SecretEntry, SetSecretRequest,
+    SetSecretResponse, SlotAuthorityStatus, SubmitOperationRequest, SubmitOperationResponse,
+    UpsertRoutingRuleResponse, UpsertScheduleRequest, UpsertScheduleResponse,
+    VerifyDeploymentRequest, VerifyDeploymentResponse,
 };
 
 use crate::auth::PrincipalPolicy;
@@ -1129,6 +1132,40 @@ impl OperatorApi {
         }))
     }
 
+    async fn get_node_cleanup_status(
+        &self,
+        mut request: Request<GetNodeCleanupStatusRequest>,
+    ) -> Result<Response<GetNodeCleanupStatusResponse>, Status> {
+        let _admission = self.require_admission()?;
+        let node_id = request.get_ref().node_id.clone();
+        self.policy
+            .authorize_infrastructure_read(&mut request, Some(&node_id))?;
+        let cleanup = crate::operations::get_node_cleanup_status(&self.pool, &node_id).await?;
+        Ok(Response::new(GetNodeCleanupStatusResponse {
+            cleanup: Some(cleanup),
+        }))
+    }
+
+    async fn retry_node_cleanup(
+        &self,
+        mut request: Request<RetryNodeCleanupRequest>,
+    ) -> Result<Response<RetryNodeCleanupResponse>, Status> {
+        let _admission = self.require_admission()?;
+        let node_id = request.get_ref().node_id.clone();
+        self.policy
+            .authorize_infrastructure_write(&mut request, &node_id)?;
+        let request = request.into_inner();
+        let cleanup = crate::operations::retry_node_cleanup(
+            &self.pool,
+            &node_id,
+            request.observed_generation,
+        )
+        .await?;
+        Ok(Response::new(RetryNodeCleanupResponse {
+            cleanup: Some(cleanup),
+        }))
+    }
+
     async fn finalize_deployment(
         &self,
         mut request: Request<FinalizeDeploymentRequest>,
@@ -1252,6 +1289,57 @@ impl NodeAgentApi {
                     instruction: None,
                     lease_seconds: 0,
                 });
+        Ok(Response::new(response))
+    }
+
+    async fn claim_node_cleanup(
+        &self,
+        mut request: Request<ClaimNodeCleanupRequest>,
+    ) -> Result<Response<ClaimNodeCleanupResponse>, Status> {
+        let _admission = self.require_admission()?;
+        let node_id = request.get_ref().node_id.clone();
+        let agent_instance_id = request.get_ref().agent_instance_id.clone();
+        let principal = self.policy.authorize_agent(&mut request, &node_id)?;
+        let response = crate::operations::claim_node_cleanup(
+            &self.pool,
+            &node_id,
+            &agent_instance_id,
+            &principal.name,
+        )
+        .await?
+        .unwrap_or(ClaimNodeCleanupResponse {
+            instruction: None,
+            lease_seconds: 0,
+        });
+        Ok(Response::new(response))
+    }
+
+    async fn renew_node_cleanup_lease(
+        &self,
+        mut request: Request<RenewNodeCleanupLeaseRequest>,
+    ) -> Result<Response<RenewNodeCleanupLeaseResponse>, Status> {
+        let _admission = self.require_admission()?;
+        let node_id = request.get_ref().node_id.clone();
+        let principal = self.policy.authorize_agent(&mut request, &node_id)?;
+        let response =
+            crate::operations::renew_node_cleanup(&self.pool, request.get_ref(), &principal.name)
+                .await?;
+        Ok(Response::new(response))
+    }
+
+    async fn report_node_cleanup_result(
+        &self,
+        mut request: Request<ReportNodeCleanupResultRequest>,
+    ) -> Result<Response<ReportNodeCleanupResultResponse>, Status> {
+        let _admission = self.require_admission()?;
+        let node_id = request.get_ref().node_id.clone();
+        let principal = self.policy.authorize_agent(&mut request, &node_id)?;
+        let response = crate::operations::report_node_cleanup_result(
+            &self.pool,
+            request.get_ref(),
+            &principal.name,
+        )
+        .await?;
         Ok(Response::new(response))
     }
 
@@ -1870,6 +1958,18 @@ impl InfrastructureApi {
     ) -> Result<Response<PutNodeAgentPolicyResponse>, Status> {
         self.operator.put_node_agent_policy(request).await
     }
+    async fn get_node_cleanup_status(
+        &self,
+        request: Request<GetNodeCleanupStatusRequest>,
+    ) -> Result<Response<GetNodeCleanupStatusResponse>, Status> {
+        self.operator.get_node_cleanup_status(request).await
+    }
+    async fn retry_node_cleanup(
+        &self,
+        request: Request<RetryNodeCleanupRequest>,
+    ) -> Result<Response<RetryNodeCleanupResponse>, Status> {
+        self.operator.retry_node_cleanup(request).await
+    }
     async fn begin_manager_rollout(
         &self,
         request: Request<BeginManagerRolloutRequest>,
@@ -2095,6 +2195,22 @@ impl InfrastructureService for AuthorizedInfrastructureService {
             .ok_or_else(|| Status::invalid_argument("policy is required"))?;
         self.authorize_node(&mut r, "PutNodeAgentPolicy", Some(&node))?;
         self.inner.put_node_agent_policy(r).await
+    }
+    async fn get_node_cleanup_status(
+        &self,
+        mut r: Request<GetNodeCleanupStatusRequest>,
+    ) -> Result<Response<GetNodeCleanupStatusResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize_node(&mut r, "GetNodeCleanupStatus", Some(&node))?;
+        self.inner.get_node_cleanup_status(r).await
+    }
+    async fn retry_node_cleanup(
+        &self,
+        mut r: Request<RetryNodeCleanupRequest>,
+    ) -> Result<Response<RetryNodeCleanupResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize_node(&mut r, "RetryNodeCleanup", Some(&node))?;
+        self.inner.retry_node_cleanup(r).await
     }
     async fn begin_manager_rollout(
         &self,
@@ -2366,6 +2482,24 @@ impl ManagerNodeApi {
     ) -> Result<Response<ClaimOperationResponse>, Status> {
         self.agent.claim_operation(request).await
     }
+    async fn claim_node_cleanup(
+        &self,
+        request: Request<ClaimNodeCleanupRequest>,
+    ) -> Result<Response<ClaimNodeCleanupResponse>, Status> {
+        self.agent.claim_node_cleanup(request).await
+    }
+    async fn renew_node_cleanup_lease(
+        &self,
+        request: Request<RenewNodeCleanupLeaseRequest>,
+    ) -> Result<Response<RenewNodeCleanupLeaseResponse>, Status> {
+        self.agent.renew_node_cleanup_lease(request).await
+    }
+    async fn report_node_cleanup_result(
+        &self,
+        request: Request<ReportNodeCleanupResultRequest>,
+    ) -> Result<Response<ReportNodeCleanupResultResponse>, Status> {
+        self.agent.report_node_cleanup_result(request).await
+    }
     async fn renew_operation_lease(
         &self,
         request: Request<RenewOperationLeaseRequest>,
@@ -2499,6 +2633,30 @@ impl NodeService for AuthorizedNodeService {
         let node = r.get_ref().node_id.clone();
         self.authorize(&mut r, "ClaimOperation", Some(&node))?;
         self.inner.claim_operation(r).await
+    }
+    async fn claim_node_cleanup(
+        &self,
+        mut r: Request<ClaimNodeCleanupRequest>,
+    ) -> Result<Response<ClaimNodeCleanupResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize(&mut r, "ClaimNodeCleanup", Some(&node))?;
+        self.inner.claim_node_cleanup(r).await
+    }
+    async fn renew_node_cleanup_lease(
+        &self,
+        mut r: Request<RenewNodeCleanupLeaseRequest>,
+    ) -> Result<Response<RenewNodeCleanupLeaseResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize(&mut r, "RenewNodeCleanupLease", Some(&node))?;
+        self.inner.renew_node_cleanup_lease(r).await
+    }
+    async fn report_node_cleanup_result(
+        &self,
+        mut r: Request<ReportNodeCleanupResultRequest>,
+    ) -> Result<Response<ReportNodeCleanupResultResponse>, Status> {
+        let node = r.get_ref().node_id.clone();
+        self.authorize(&mut r, "ReportNodeCleanupResult", Some(&node))?;
+        self.inner.report_node_cleanup_result(r).await
     }
     async fn renew_operation_lease(
         &self,

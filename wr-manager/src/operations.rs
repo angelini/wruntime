@@ -1,5 +1,6 @@
 use deadpool_postgres::{GenericClient, Pool};
 use prost::Message;
+use sha2::{Digest, Sha256};
 use tokio_postgres::Row;
 use tonic::Status;
 use uuid::Uuid;
@@ -7,10 +8,12 @@ use wr_common::agent_policy::{AgentPolicy, AgentPolicyBackend};
 use wr_common::deployment_contract::deployment_operation_id;
 use wr_common::wruntime::{
     AgentInstruction, BackendKind, BackendProcessState, BackendTerminationEvidence,
-    ClaimOperationResponse, CleanupReleaseEvidence, DeploymentCondition, InstructionTarget,
-    InstructionTargetKind, NodeAgentAttestation, NodeAgentPolicy, NodeOperation,
-    NodeOperationAction, NodeOperationPhase, NodeOperationState, NodeOperationStepKind,
-    OperationEvent, OperationSlotProgress, ProcessLifecycleState, ReportNodeObservationRequest,
+    ClaimNodeCleanupResponse, ClaimOperationResponse, DeploymentCondition, InstructionTarget,
+    InstructionTargetKind, NodeAgentAttestation, NodeAgentPolicy, NodeCleanupAuthority,
+    NodeCleanupInstruction, NodeCleanupResultDisposition, NodeCleanupState, NodeCleanupSummary,
+    NodeOperation, NodeOperationAction, NodeOperationPhase, NodeOperationState,
+    NodeOperationStepKind, OperationEvent, OperationSlotProgress, ProcessLifecycleState,
+    ReportNodeCleanupResultRequest, ReportNodeCleanupResultResponse, ReportNodeObservationRequest,
     ReportStepResultRequest, RolloutPolicy, ServiceKind, SlotAuthorityStatus, SlotObservation,
     SubmitOperationRequest,
 };
@@ -20,6 +23,53 @@ const EVIDENCE_FRESH_SECONDS: i64 = 15;
 
 fn internal(error: impl std::fmt::Debug) -> Status {
     Status::internal(format!("database operation failed: {error:?}"))
+}
+
+pub async fn fence_cleanup_authority<C>(
+    client: &C,
+    node_id: &str,
+    reason: &str,
+) -> Result<bool, Status>
+where
+    C: GenericClient + Sync,
+{
+    let row = client
+        .query_opt(
+            "UPDATE wr_node_release_cleanup
+             SET generation = generation + 1, state = 'needs_reconcile',
+                 authority_payload = NULL, payload_digest = '', candidate_count = 0,
+                 agent_instance_id = NULL, claimed_by = NULL, claim_instance = NULL,
+                 lease_expires_at = NULL, delivered_at = NULL,
+                 next_reconcile_at = NOW(), diagnostic_code = '', diagnostic_detail = '',
+                 updated_at = NOW()
+             WHERE node_id = $1
+             RETURNING generation - 1 AS old_generation, generation",
+            &[&node_id],
+        )
+        .await
+        .map_err(internal)?;
+    let Some(row) = row else { return Ok(false) };
+    let old_generation: i64 = row.get("old_generation");
+    let generation: i64 = row.get("generation");
+    client
+        .execute(
+            "UPDATE wr_node_release_cleanup_generations
+             SET outcome = 'superseded', completed_at = NOW()
+             WHERE node_id = $1 AND generation = $2 AND outcome = 'materialized'",
+            &[&node_id, &old_generation],
+        )
+        .await
+        .map_err(internal)?;
+    client
+        .execute(
+            "INSERT INTO wr_node_release_cleanup_events
+               (node_id, generation, event_code, detail)
+             VALUES ($1, $2, 'AUTHORITY_FENCED', $3)",
+            &[&node_id, &generation, &reason],
+        )
+        .await
+        .map_err(internal)?;
+    Ok(true)
 }
 
 async fn acquire_evidence_lock<C>(client: &C) -> Result<(), Status>
@@ -84,9 +134,7 @@ fn parse_phase(value: &str) -> Result<NodeOperationPhase, Status> {
         "forward" => Ok(NodeOperationPhase::Forward),
         "restoring_source" => Ok(NodeOperationPhase::RestoringSource),
         "committing" => Ok(NodeOperationPhase::Committing),
-        "committed_cleanup" => Ok(NodeOperationPhase::CommittedCleanup),
         "complete" => Ok(NodeOperationPhase::Complete),
-        "superseded" => Ok(NodeOperationPhase::Superseded),
         _ => Err(Status::internal("stored operation has an invalid phase")),
     }
 }
@@ -102,7 +150,6 @@ fn step_name(step: NodeOperationStepKind) -> &'static str {
         NodeOperationStepKind::SwitchAuthority => "switch_authority",
         NodeOperationStepKind::VerifyServing => "verify_serving",
         NodeOperationStepKind::RestoreSource => "restore_source",
-        NodeOperationStepKind::CleanupRelease => "cleanup_release",
         NodeOperationStepKind::InspectBackend => "inspect_backend",
         NodeOperationStepKind::Unspecified => "complete",
     }
@@ -119,7 +166,6 @@ fn parse_step(value: &str) -> Result<NodeOperationStepKind, Status> {
         "switch_authority" => Ok(NodeOperationStepKind::SwitchAuthority),
         "verify_serving" => Ok(NodeOperationStepKind::VerifyServing),
         "restore_source" => Ok(NodeOperationStepKind::RestoreSource),
-        "cleanup_release" => Ok(NodeOperationStepKind::CleanupRelease),
         "inspect_backend" => Ok(NodeOperationStepKind::InspectBackend),
         "complete" => Ok(NodeOperationStepKind::Unspecified),
         _ => Err(Status::internal("stored operation has an invalid step")),
@@ -164,9 +210,8 @@ where
                     target_revision_digest, committed, lease_epoch, lease_expires_at,
                     failure_code, failure_detail, created_at, updated_at, phase,
                     forward_deadline, forward_fenced, restoration_requested,
-                    agent_instance_id, cleanup_superseded_by, cleanup_evidence,
-                    cleanup_delivered_at, cleanup_reported_at, cleanup_backend_query_error,
-                    proxy_process_instance_id, restoration_terminal_state, proxy_next_step,
+                    agent_instance_id, proxy_process_instance_id,
+                    restoration_terminal_state, proxy_next_step,
                     proxy_source_revision, proxy_source_digest, proxy_source_resolved_digest,
                     proxy_target_revision, proxy_target_digest, proxy_target_resolved_digest,
                     proxy_backend_instance_id, proxy_changed, proxy_effect_ambiguous,
@@ -209,17 +254,6 @@ fn operation_from_row(row: &Row, slots: &[Row]) -> Result<NodeOperation, Status>
     let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
     let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
     let forward_deadline: chrono::DateTime<chrono::Utc> = row.get("forward_deadline");
-    let cleanup_superseded_by: Option<Uuid> = row.get("cleanup_superseded_by");
-    let cleanup_evidence = row
-        .get::<_, Option<Vec<u8>>>("cleanup_evidence")
-        .map(|bytes| CleanupReleaseEvidence::decode(bytes.as_slice()))
-        .transpose()
-        .map_err(|error| {
-            Status::internal(format!("stored cleanup evidence is invalid: {error}"))
-        })?;
-    let cleanup_delivered_at: Option<chrono::DateTime<chrono::Utc>> =
-        row.get("cleanup_delivered_at");
-    let cleanup_reported_at: Option<chrono::DateTime<chrono::Utc>> = row.get("cleanup_reported_at");
     Ok(NodeOperation {
         operation_id: row.get::<_, Uuid>("operation_id").to_string(),
         node_id: row.get("node_id"),
@@ -298,18 +332,11 @@ fn operation_from_row(row: &Row, slots: &[Row]) -> Result<NodeOperation, Status>
         agent_instance_id: row
             .get::<_, Option<String>>("agent_instance_id")
             .unwrap_or_default(),
-        cleanup_superseded_by: cleanup_superseded_by
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        cleanup_evidence,
-        cleanup_reported_at: cleanup_reported_at.map(timestamp),
-        cleanup_backend_query_error: row.get("cleanup_backend_query_error"),
         restoration_terminal_state: row
             .get::<_, Option<String>>("restoration_terminal_state")
             .map(|value| parse_state(&value).map(|state| state as i32))
             .transpose()?
             .unwrap_or(NodeOperationState::Unspecified as i32),
-        cleanup_delivered_at: cleanup_delivered_at.map(timestamp),
         proxy_process_instance_id: row.get("proxy_process_instance_id"),
         resolved_release_digest: row.get("resolved_release_digest"),
         proxy_next_step: parse_step(row.get::<_, String>("proxy_next_step").as_str())? as i32,
@@ -590,41 +617,6 @@ pub async fn submit(
     };
     let operation_id = operation_id.expect("deployment actions derive an operation ID");
 
-    // An urgent rollback fences committed cleanup before the new operation is
-    // admitted. History/evidence remain, and the old cleanup can issue no effect.
-    if action == NodeOperationAction::Rollback {
-        if let Some(cleanup) = transaction
-            .query_opt(
-                "SELECT operation_id FROM wr_node_operations
-                 WHERE node_id = $1 AND committed AND phase = 'committed_cleanup'
-                   AND state IN ('queued', 'running', 'paused') FOR UPDATE",
-                &[&request.node_id],
-            )
-            .await
-            .map_err(internal)?
-        {
-            let cleanup_id: Uuid = cleanup.get("operation_id");
-            transaction
-                .execute(
-                    "UPDATE wr_node_operations SET phase = 'superseded', state = 'succeeded',
-                            lease_expires_at = NULL, claimed_by = NULL, agent_instance_id = NULL,
-                            updated_at = NOW() WHERE operation_id = $1",
-                    &[&cleanup_id],
-                )
-                .await
-                .map_err(internal)?;
-            append_event(
-                &transaction,
-                cleanup_id,
-                actor,
-                "CLEANUP_SUPERSEDED",
-                &operation_id.to_string(),
-                0,
-            )
-            .await?;
-        }
-    }
-
     if action == NodeOperationAction::InitialApply && source_revision != 0 {
         return Err(Status::failed_precondition(
             "initial apply requires a node with no committed revision",
@@ -761,17 +753,6 @@ pub async fn submit(
             .await
             .map_err(internal)?;
     }
-    if action == NodeOperationAction::Rollback {
-        transaction
-            .execute(
-                "UPDATE wr_node_operations SET cleanup_superseded_by = $2
-                 WHERE node_id = $1 AND phase = 'superseded'
-                   AND cleanup_superseded_by IS NULL",
-                &[&request.node_id, &operation_id],
-            )
-            .await
-            .map_err(internal)?;
-    }
     for (rollout_order, slot) in slots.into_iter().enumerate() {
         let source = if source_slots.contains(&slot) {
             source_revision
@@ -840,6 +821,7 @@ pub async fn submit(
         0,
     )
     .await?;
+    fence_cleanup_authority(&transaction, &request.node_id, "OPERATION_SUBMITTED").await?;
     let operation = load_operation(&transaction, operation_id).await?;
     transaction.commit().await.map_err(internal)?;
     Ok(operation)
@@ -974,23 +956,7 @@ pub async fn resume(pool: &Pool, operation_id: &str, actor: &str) -> Result<Node
         .query_opt(
             "UPDATE wr_node_operations SET state = 'queued', updated_at = NOW(),
                     lease_expires_at = NULL, claimed_by = NULL, agent_instance_id = NULL,
-                    failure_code = '', failure_detail = '',
-                    cleanup_delete_allowlist = CASE
-                        WHEN phase = 'committed_cleanup'
-                             AND (cleanup_delivered_at IS NULL OR cleanup_reported_at IS NOT NULL)
-                        THEN NULL ELSE cleanup_delete_allowlist END,
-                    cleanup_delivered_at = CASE
-                        WHEN phase = 'committed_cleanup' AND cleanup_reported_at IS NOT NULL
-                        THEN NULL ELSE cleanup_delivered_at END,
-                    cleanup_evidence = CASE
-                        WHEN phase = 'committed_cleanup' AND cleanup_reported_at IS NOT NULL
-                        THEN NULL ELSE cleanup_evidence END,
-                    cleanup_reported_at = CASE
-                        WHEN phase = 'committed_cleanup' AND cleanup_reported_at IS NOT NULL
-                        THEN NULL ELSE cleanup_reported_at END,
-                    cleanup_backend_query_error = CASE
-                        WHEN phase = 'committed_cleanup' AND cleanup_reported_at IS NOT NULL
-                        THEN '' ELSE cleanup_backend_query_error END
+                    failure_code = '', failure_detail = ''
              WHERE operation_id = $1 AND state = 'paused' RETURNING lease_epoch",
             &[&id],
         )
@@ -1360,6 +1326,15 @@ async fn switch_authority<C: GenericClient + Sync>(
         )
         .await
         .map_err(internal)?;
+    let authority_changed: bool = client
+        .query_one(
+            "SELECT NOT EXISTS(SELECT 1 FROM wr_node_slot_authority
+             WHERE node_id = $1 AND engine_slot = $2 AND authoritative AND revision = $3)",
+            &[&node_id, &slot, &revision],
+        )
+        .await
+        .map_err(internal)?
+        .get(0);
     client
         .execute(
             "UPDATE wr_node_slot_authority SET authoritative = FALSE, updated_at = NOW()
@@ -1403,6 +1378,9 @@ async fn switch_authority<C: GenericClient + Sync>(
             )
             .await
             .map_err(internal)?;
+    }
+    if authority_changed {
+        fence_cleanup_authority(client, node_id, "SLOT_AUTHORITY_CHANGED").await?;
     }
     Ok(())
 }
@@ -2011,12 +1989,6 @@ async fn reconcile<C: GenericClient + Sync>(
     }
     let phase =
         NodeOperationPhase::try_from(operation.phase).unwrap_or(NodeOperationPhase::Unspecified);
-    if matches!(
-        phase,
-        NodeOperationPhase::CommittedCleanup | NodeOperationPhase::Superseded
-    ) {
-        return Ok(());
-    }
     if NodeOperationStepKind::try_from(operation.proxy_next_step)
         .unwrap_or(NodeOperationStepKind::Unspecified)
         != NodeOperationStepKind::Unspecified
@@ -2125,21 +2097,14 @@ async fn reconcile<C: GenericClient + Sync>(
             )
             .await
             .map_err(internal)?;
-        let next_phase = if operation.source_revision == 0 {
-            "complete"
-        } else {
-            "committed_cleanup"
-        };
+        fence_cleanup_authority(client, &operation.node_id, "SERVING_COMMIT").await?;
         client
             .execute(
                 "UPDATE wr_node_operations SET committed = TRUE, committed_at = NOW(),
-                        phase = $2, state = CASE WHEN $2 = 'complete' THEN 'succeeded' ELSE state END,
-                        lease_expires_at = CASE WHEN $2 = 'complete' THEN NULL ELSE lease_expires_at END,
-                        claimed_by = CASE WHEN $2 = 'complete' THEN NULL ELSE claimed_by END,
-                        agent_instance_id = CASE WHEN $2 = 'complete' THEN NULL ELSE agent_instance_id END,
-                        updated_at = NOW()
+                        phase = 'complete', state = 'succeeded', lease_expires_at = NULL,
+                        claimed_by = NULL, agent_instance_id = NULL, updated_at = NOW()
                  WHERE operation_id = $1",
-                &[&id, &next_phase],
+                &[&id],
             )
             .await
             .map_err(internal)?;
@@ -2175,10 +2140,16 @@ async fn reconcile<C: GenericClient + Sync>(
     Ok(())
 }
 
-async fn manager_cleanup_delete_allowlist<C>(
+struct CleanupPolicySnapshot {
+    fingerprint: String,
+    known: Vec<wr_common::wruntime::ReleaseInventoryEntry>,
+    delete: Vec<wr_common::wruntime::ReleaseInventoryEntry>,
+}
+
+async fn manager_cleanup_policy<C>(
     client: &C,
     node_id: &str,
-) -> Result<Vec<wr_common::wruntime::ReleaseInventoryEntry>, Status>
+) -> Result<CleanupPolicySnapshot, Status>
 where
     C: GenericClient + Sync,
 {
@@ -2202,7 +2173,7 @@ where
     let staged = node.get::<_, Option<i64>>("target_revision");
     let rows = client
         .query(
-            "SELECT revision, bundle_digest, resolved_release_digest, state
+            "SELECT revision, bundle_digest, resolved_release_digest, state, abandoned_at
              FROM wr_node_deployments WHERE node_id = $1 ORDER BY revision DESC",
             &[&node_id],
         )
@@ -2251,10 +2222,7 @@ where
     for row in client
         .query(
             "SELECT source_revision, target_revision FROM wr_node_operations
-             WHERE node_id = $1 AND (
-                 state IN ('queued', 'running', 'paused')
-                 OR phase IN ('committed_cleanup', 'superseded')
-             )",
+             WHERE node_id = $1 AND state IN ('queued', 'running', 'paused')",
             &[&node_id],
         )
         .await
@@ -2269,6 +2237,17 @@ where
             }
         }
     }
+    protected.extend(
+        rows.iter()
+            .filter(|row| {
+                matches!(row.get::<_, String>("state").as_str(), "pending" | "active")
+                    && row
+                        .get::<_, Option<chrono::DateTime<chrono::Utc>>>("abandoned_at")
+                        .is_none()
+                    && known.contains_key(&row.get::<_, i64>("revision"))
+            })
+            .map(|row| row.get::<_, i64>("revision")),
+    );
     protected.extend(
         client
             .query(
@@ -2293,9 +2272,8 @@ where
             .into_iter()
             .map(|row| row.get::<_, i64>("revision")),
     );
-    Ok(known
+    let known = known
         .into_iter()
-        .filter(|(revision, _)| !protected.contains(revision))
         .map(|(revision, (bundle_digest, resolved_release_digest))| {
             wr_common::wruntime::ReleaseInventoryEntry {
                 revision: revision as u64,
@@ -2303,7 +2281,25 @@ where
                 resolved_release_digest,
             }
         })
-        .collect())
+        .collect::<Vec<_>>();
+    let delete = known
+        .iter()
+        .filter(|release| !protected.contains(&(release.revision as i64)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut fingerprint_input = Vec::new();
+    fingerprint_input.extend_from_slice(&(retention_count as u64).to_be_bytes());
+    for revision in &protected {
+        fingerprint_input.extend_from_slice(&revision.to_be_bytes());
+    }
+    for release in &known {
+        fingerprint_input.extend_from_slice(&release.encode_to_vec());
+    }
+    Ok(CleanupPolicySnapshot {
+        fingerprint: format!("sha256:{:x}", Sha256::digest(&fingerprint_input)),
+        known,
+        delete,
+    })
 }
 
 pub async fn claim(
@@ -2451,30 +2447,7 @@ pub async fn claim(
         delivered,
         ambiguous,
         target_kind,
-    ) = if phase == NodeOperationPhase::CommittedCleanup {
-        (
-            String::new(),
-            NodeOperationStepKind::CleanupRelease,
-            operation.source_revision,
-            operation
-                .slots
-                .iter()
-                .find(|slot| slot.source_revision > 0)
-                .map(|slot| slot.source_digest.clone())
-                .unwrap_or_default(),
-            operation
-                .slots
-                .iter()
-                .find(|slot| slot.source_revision > 0)
-                .map(|slot| slot.source_resolved_release_digest.clone())
-                .unwrap_or_default(),
-            String::new(),
-            String::new(),
-            operation.cleanup_delivered_at.is_some(),
-            false,
-            InstructionTargetKind::ReleaseCleanup,
-        )
-    } else if proxy_pending {
+    ) = if proxy_pending {
         let proving_source = proxy_step == NodeOperationStepKind::VerifyTarget;
         let uses_source = phase == NodeOperationPhase::RestoringSource
             || matches!(
@@ -2564,63 +2537,21 @@ pub async fn claim(
             .ok_or_else(|| Status::failed_precondition("instruction deployment is missing"))?
             .get("revision_digest")
     };
-    let cleanup_delete_releases = if step == NodeOperationStepKind::CleanupRelease {
-        let stored = transaction
-            .query_one(
-                "SELECT cleanup_delete_allowlist FROM wr_node_operations WHERE operation_id = $1",
-                &[&id],
-            )
-            .await
-            .map_err(internal)?
-            .get::<_, Option<Vec<u8>>>("cleanup_delete_allowlist");
-        match stored {
-            Some(bytes) => {
-                CleanupReleaseEvidence::decode(bytes.as_slice())
-                    .map_err(|error| {
-                        Status::internal(format!("stored cleanup allow-list is invalid: {error}"))
-                    })?
-                    .retained_releases
-            }
-            None => manager_cleanup_delete_allowlist(&transaction, node_id).await?,
-        }
-    } else {
-        Vec::new()
-    };
     let mutating_effect = matches!(
         step,
         NodeOperationStepKind::StopBackend
             | NodeOperationStepKind::SelectRelease
             | NodeOperationStepKind::StartBackend
             | NodeOperationStepKind::RestoreSource
-            | NodeOperationStepKind::CleanupRelease
     );
-    // Cleanup deletion is exactly manager-allow-listed and locally idempotent.
-    // After activation loss, reissue that same authority so the replacement can
-    // prove the resulting inventory; other ambiguous mutations require inspect.
-    let inspection =
-        (mutating_effect && delivered && step != NodeOperationStepKind::CleanupRelease)
-            || ambiguous;
+    let inspection = (mutating_effect && delivered) || ambiguous;
     let instruction_step = if inspection {
         NodeOperationStepKind::InspectBackend
     } else {
         step
     };
     if mutating_effect && !inspection {
-        if step == NodeOperationStepKind::CleanupRelease {
-            let encoded_allowlist = CleanupReleaseEvidence {
-                retained_releases: cleanup_delete_releases.clone(),
-            }
-            .encode_to_vec();
-            transaction
-                .execute(
-                    "UPDATE wr_node_operations SET cleanup_delivered_at = NOW(),
-                            cleanup_delete_allowlist = $2, updated_at = NOW()
-                     WHERE operation_id = $1",
-                    &[&id, &encoded_allowlist],
-                )
-                .await
-                .map_err(internal)?;
-        } else if target_kind == InstructionTargetKind::Proxy {
+        if target_kind == InstructionTargetKind::Proxy {
             transaction
                 .execute(
                     "UPDATE wr_node_operations
@@ -2672,7 +2603,6 @@ pub async fn claim(
             pinned_backend_instance_id: pinned_backend,
             pinned_process_instance_id: pinned_process,
             restoration,
-            cleanup_delete_releases,
             revision_digest,
         }),
         lease_seconds: LEASE_SECONDS as u64,
@@ -2871,6 +2801,20 @@ pub async fn report_observation(
         .ok_or_else(|| {
             Status::aborted("observation has a stale, expired, or activation-mismatched lease")
         })?;
+    let prior_observation = transaction
+        .query_opt(
+            "SELECT observed_revision, observed_digest, observed_resolved_digest
+             FROM wr_node_slot_observations WHERE node_id = $1 AND engine_slot = $2 FOR UPDATE",
+            &[&request.node_id, &request.engine_slot],
+        )
+        .await
+        .map_err(internal)?;
+    let protection_changed = prior_observation.as_ref().is_none_or(|row| {
+        row.get::<_, i64>("observed_revision") != revision
+            || row.get::<_, String>("observed_digest") != request.observed_digest
+            || row.get::<_, String>("observed_resolved_digest")
+                != request.observed_resolved_release_digest
+    });
     if operation.get::<_, String>("phase") == "forward"
         && deadline_expired(&transaction, id).await?
     {
@@ -2926,221 +2870,13 @@ pub async fn report_observation(
         )
         .await
         .map_err(internal)?;
+    if protection_changed {
+        fence_cleanup_authority(&transaction, &request.node_id, "OBSERVATION_CHANGED").await?;
+    }
     reconcile(&transaction, id, agent).await?;
     let result = load_operation(&transaction, id).await?;
     transaction.commit().await.map_err(internal)?;
     Ok(result)
-}
-
-async fn reconcile_cleanup<C: GenericClient + Sync>(
-    client: &C,
-    id: Uuid,
-    actor: &str,
-) -> Result<(), Status> {
-    let snapshot = crate::db::capture_cluster_status_snapshot(client).await?;
-    let operation = snapshot
-        .active_operations
-        .iter()
-        .find(|operation| operation.operation_id == id.to_string())
-        .ok_or_else(|| Status::failed_precondition("cleanup operation is not active"))?;
-    if NodeOperationPhase::try_from(operation.phase).ok()
-        != Some(NodeOperationPhase::CommittedCleanup)
-    {
-        return Err(Status::failed_precondition(
-            "operation is not in committed cleanup",
-        ));
-    }
-    let mut failure = None;
-    if !operation.cleanup_backend_query_error.is_empty() {
-        failure = Some((
-            "CLEANUP_QUERY_ERROR",
-            operation.cleanup_backend_query_error.as_str(),
-        ));
-    }
-    let evidence_fresh = operation
-        .cleanup_reported_at
-        .as_ref()
-        .is_some_and(|reported| {
-            chrono::DateTime::from_timestamp(reported.seconds, reported.nanos as u32).is_some_and(
-                |time| {
-                    snapshot.observed_at.signed_duration_since(time)
-                        <= chrono::Duration::seconds(EVIDENCE_FRESH_SECONDS)
-                },
-            )
-        });
-    if failure.is_none() && (!evidence_fresh || operation.cleanup_evidence.is_none()) {
-        failure = Some((
-            "CLEANUP_EVIDENCE_MISSING",
-            "fresh typed resulting release inventory is required",
-        ));
-    }
-    let mut known = snapshot
-        .deployments
-        .iter()
-        .filter(|deployment| deployment.record.node_id == operation.node_id)
-        .map(|deployment| {
-            (
-                deployment.record.revision,
-                (
-                    deployment.record.bundle_digest.clone(),
-                    deployment.record.resolved_release_digest.clone(),
-                ),
-            )
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    for deletion in client
-        .query(
-            "SELECT revision FROM wr_node_release_deletions WHERE node_id = $1",
-            &[&operation.node_id],
-        )
-        .await
-        .map_err(internal)?
-    {
-        known.remove(&(deletion.get::<_, i64>("revision") as u64));
-    }
-    let allowlist_bytes = client
-        .query_one(
-            "SELECT cleanup_delete_allowlist FROM wr_node_operations WHERE operation_id = $1",
-            &[&id],
-        )
-        .await
-        .map_err(internal)?
-        .get::<_, Option<Vec<u8>>>("cleanup_delete_allowlist")
-        .ok_or_else(|| Status::failed_precondition("cleanup deletion allow-list is missing"))?;
-    let allowlist = CleanupReleaseEvidence::decode(allowlist_bytes.as_slice())
-        .map_err(|error| {
-            Status::internal(format!("stored cleanup allow-list is invalid: {error}"))
-        })?
-        .retained_releases;
-    let mut deletions = std::collections::BTreeMap::new();
-    for release in &allowlist {
-        if deletions
-            .insert(
-                release.revision,
-                (
-                    release.bundle_digest.clone(),
-                    release.resolved_release_digest.clone(),
-                ),
-            )
-            .is_some()
-            || known.get(&release.revision)
-                != Some(&(
-                    release.bundle_digest.clone(),
-                    release.resolved_release_digest.clone(),
-                ))
-        {
-            failure = Some((
-                "CLEANUP_ALLOWLIST_INVALID",
-                "persisted cleanup allow-list contains a duplicate or unknown revision/digest",
-            ));
-            break;
-        }
-    }
-    let mut retained = std::collections::BTreeMap::new();
-    if let Some(evidence) = operation.cleanup_evidence.as_ref() {
-        for release in &evidence.retained_releases {
-            if retained
-                .insert(
-                    release.revision,
-                    (
-                        release.bundle_digest.clone(),
-                        release.resolved_release_digest.clone(),
-                    ),
-                )
-                .is_some()
-                || known.get(&release.revision)
-                    != Some(&(
-                        release.bundle_digest.clone(),
-                        release.resolved_release_digest.clone(),
-                    ))
-            {
-                failure = Some((
-                    "CLEANUP_INVENTORY_INVALID",
-                    "resulting inventory contains a duplicate or unknown revision/digest",
-                ));
-                break;
-            }
-        }
-    }
-    let expected_retained = known
-        .iter()
-        .filter(|(revision, _)| !deletions.contains_key(revision))
-        .map(|(revision, digest)| (*revision, digest.clone()))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    if failure.is_none() && retained != expected_retained {
-        failure = Some((
-            "CLEANUP_INVENTORY_MISMATCH",
-            "resulting inventory does not exactly match the manager-authorized deletion set",
-        ));
-    }
-    if let Some((code, detail)) = failure {
-        client
-            .execute(
-                "UPDATE wr_node_operations SET state = 'paused', failure_code = $2,
-                        failure_detail = $3, lease_expires_at = NULL, claimed_by = NULL,
-                        agent_instance_id = NULL, updated_at = NOW() WHERE operation_id = $1",
-                &[&id, &code, &detail],
-            )
-            .await
-            .map_err(internal)?;
-        append_event(
-            client,
-            id,
-            actor,
-            code,
-            detail,
-            operation.lease_epoch as i64,
-        )
-        .await?;
-    } else {
-        for release in &allowlist {
-            client
-                .execute(
-                    "INSERT INTO wr_node_release_deletions
-                       (node_id, revision, bundle_digest, resolved_release_digest, operation_id)
-                     VALUES ($1, $2, $3, $4, $5)
-                     ON CONFLICT (node_id, revision) DO NOTHING",
-                    &[
-                        &operation.node_id,
-                        &(release.revision as i64),
-                        &release.bundle_digest,
-                        &release.resolved_release_digest,
-                        &id,
-                    ],
-                )
-                .await
-                .map_err(internal)?;
-            append_event(
-                client,
-                id,
-                actor,
-                "RELEASE_DELETED",
-                &format!("{}:{}", release.revision, release.bundle_digest),
-                operation.lease_epoch as i64,
-            )
-            .await?;
-        }
-        client
-            .execute(
-                "UPDATE wr_node_operations SET state = 'succeeded', phase = 'complete',
-                        lease_expires_at = NULL, claimed_by = NULL, agent_instance_id = NULL,
-                        failure_code = '', failure_detail = '', updated_at = NOW()
-                 WHERE operation_id = $1",
-                &[&id],
-            )
-            .await
-            .map_err(internal)?;
-        append_event(
-            client,
-            id,
-            actor,
-            "CLEANUP_SUCCEEDED",
-            "typed release inventory satisfies retention and protection policy",
-            operation.lease_epoch as i64,
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 pub async fn report_step(
@@ -3234,49 +2970,7 @@ pub async fn report_step(
             "forward operation deadline expired",
         ));
     }
-    if phase == "committed_cleanup" {
-        if reported_step != NodeOperationStepKind::CleanupRelease {
-            return Err(Status::aborted(
-                "committed cleanup result has the wrong typed step",
-            ));
-        }
-        if !request.condition_code.is_empty() {
-            transaction
-                .execute(
-                    "UPDATE wr_node_operations SET state = 'paused', failure_code = $2,
-                            failure_detail = $3, lease_expires_at = NULL, claimed_by = NULL,
-                            agent_instance_id = NULL, updated_at = NOW() WHERE operation_id = $1",
-                    &[&id, &request.condition_code, &request.detail],
-                )
-                .await
-                .map_err(internal)?;
-            append_event(
-                &transaction,
-                id,
-                agent,
-                &request.condition_code,
-                &request.detail,
-                epoch,
-            )
-            .await?;
-        } else {
-            let evidence = request
-                .cleanup_evidence
-                .as_ref()
-                .map(Message::encode_to_vec);
-            transaction
-                .execute(
-                    "UPDATE wr_node_operations
-                     SET cleanup_evidence = $2, cleanup_reported_at = NOW(),
-                         cleanup_backend_query_error = $3, updated_at = NOW()
-                     WHERE operation_id = $1",
-                    &[&id, &evidence, &request.backend_query_error],
-                )
-                .await
-                .map_err(internal)?;
-            reconcile_cleanup(&transaction, id, agent).await?;
-        }
-    } else if request.engine_slot.is_empty() {
+    if request.engine_slot.is_empty() {
         let expected = parse_step(operation.get::<_, String>("proxy_next_step").as_str())?;
         if expected == NodeOperationStepKind::Unspecified || expected != reported_step {
             return Err(Status::aborted(format!(
@@ -3589,6 +3283,584 @@ pub async fn report_step(
     Ok(result)
 }
 
+fn cleanup_state(value: &str) -> Result<NodeCleanupState, Status> {
+    match value {
+        "clean" => Ok(NodeCleanupState::Clean),
+        "needs_reconcile" => Ok(NodeCleanupState::NeedsReconcile),
+        "pending" => Ok(NodeCleanupState::Pending),
+        "claimed" => Ok(NodeCleanupState::Claimed),
+        "paused" => Ok(NodeCleanupState::Paused),
+        _ => Err(Status::internal("stored cleanup state is invalid")),
+    }
+}
+
+fn cleanup_summary_from_row(row: &Row) -> Result<NodeCleanupSummary, Status> {
+    let inventory = row
+        .get::<_, Option<Vec<u8>>>("known_inventory")
+        .map(|bytes| NodeCleanupAuthority::decode(bytes.as_slice()))
+        .transpose()
+        .map_err(|error| Status::internal(format!("stored cleanup inventory is invalid: {error}")))?
+        .map(|value| value.known_inventory.len() as u32)
+        .unwrap_or_default();
+    Ok(NodeCleanupSummary {
+        node_id: row.get("node_id"),
+        state: cleanup_state(row.get::<_, String>("state").as_str())? as i32,
+        generation: row.get::<_, i64>("generation") as u64,
+        candidate_count: row.get::<_, i32>("candidate_count") as u32,
+        last_reconciled_at: row
+            .get::<_, Option<chrono::DateTime<chrono::Utc>>>("last_reconciled_at")
+            .map(timestamp),
+        next_action_at: row
+            .get::<_, Option<chrono::DateTime<chrono::Utc>>>("next_reconcile_at")
+            .map(timestamp),
+        inventory_count: inventory,
+        diagnostic_code: row.get("diagnostic_code"),
+        diagnostic_detail: row.get("diagnostic_detail"),
+    })
+}
+
+const CLEANUP_ROW_COLUMNS: &str = "node_id, generation, state, protection_fingerprint, authority_payload, payload_digest, known_inventory, candidate_count, agent_instance_id, claimed_by, claim_instance, lease_epoch, lease_expires_at, delivered_at, last_reconciled_at, next_reconcile_at, last_attempt_at, diagnostic_code, diagnostic_detail";
+
+pub async fn get_node_cleanup_status(
+    pool: &Pool,
+    node_id: &str,
+) -> Result<NodeCleanupSummary, Status> {
+    if node_id.is_empty() {
+        return Err(Status::invalid_argument("node_id is required"));
+    }
+    let client = pool.get().await.map_err(internal)?;
+    let query =
+        format!("SELECT {CLEANUP_ROW_COLUMNS} FROM wr_node_release_cleanup WHERE node_id = $1");
+    let row = client
+        .query_opt(&query, &[&node_id])
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| Status::not_found("node cleanup state not found"))?;
+    cleanup_summary_from_row(&row)
+}
+
+pub async fn retry_node_cleanup(
+    pool: &Pool,
+    node_id: &str,
+    observed_generation: u64,
+) -> Result<NodeCleanupSummary, Status> {
+    let generation = i64::try_from(observed_generation)
+        .map_err(|_| Status::invalid_argument("observed generation is too large"))?;
+    let mut client = pool.get().await.map_err(internal)?;
+    let transaction = client.transaction().await.map_err(internal)?;
+    let query = format!(
+        "UPDATE wr_node_release_cleanup SET generation = generation + 1,
+             state = 'needs_reconcile', authority_payload = NULL, payload_digest = '',
+             candidate_count = 0, agent_instance_id = NULL, claimed_by = NULL,
+             claim_instance = NULL, lease_expires_at = NULL, delivered_at = NULL,
+             next_reconcile_at = NOW(), diagnostic_code = '', diagnostic_detail = '', updated_at = NOW()
+         WHERE node_id = $1 AND generation = $2 AND state = 'paused'
+         RETURNING {CLEANUP_ROW_COLUMNS}"
+    );
+    let row = transaction
+        .query_opt(&query, &[&node_id, &generation])
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| {
+            Status::failed_precondition("cleanup generation changed or is not paused")
+        })?;
+    transaction.execute(
+        "UPDATE wr_node_release_cleanup_generations SET outcome = 'superseded', completed_at = NOW()
+         WHERE node_id = $1 AND generation = $2 AND outcome IN ('materialized', 'paused')",
+        &[&node_id, &generation],
+    ).await.map_err(internal)?;
+    let summary = cleanup_summary_from_row(&row)?;
+    transaction.commit().await.map_err(internal)?;
+    Ok(summary)
+}
+
+pub async fn reconcile_node_cleanup_batch(
+    pool: &Pool,
+    _manager_id: &str,
+    batch_size: i64,
+) -> Result<u64, Status> {
+    let mut client = pool.get().await.map_err(internal)?;
+    let transaction = client.transaction().await.map_err(internal)?;
+    // SKIP LOCKED scanners must observe rows committed by a concurrent scanner
+    // instead of failing the whole periodic pass with SQLSTATE 40001.
+    transaction
+        .batch_execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .await
+        .map_err(internal)?;
+    transaction
+        .execute(
+            "INSERT INTO wr_node_release_cleanup (node_id)
+         SELECT node_id FROM wr_nodes ON CONFLICT (node_id) DO NOTHING",
+            &[],
+        )
+        .await
+        .map_err(internal)?;
+    let rows = transaction
+        .query(
+            "SELECT node_id, generation, state, protection_fingerprint, known_inventory, lease_expires_at
+         FROM wr_node_release_cleanup
+         WHERE state = 'needs_reconcile'
+            OR (state <> 'paused' AND (next_reconcile_at IS NULL OR next_reconcile_at <= NOW()))
+         ORDER BY last_reconciled_at ASC NULLS FIRST LIMIT $1 FOR UPDATE SKIP LOCKED",
+            &[&batch_size],
+        )
+        .await
+        .map_err(internal)?;
+    for row in &rows {
+        let node_id: String = row.get("node_id");
+        let mut generation: i64 = row.get("generation");
+        let state: String = row.get("state");
+        let policy = match manager_cleanup_policy(&transaction, &node_id).await {
+            Ok(policy) => policy,
+            Err(error) => {
+                transaction.execute(
+                    "UPDATE wr_node_release_cleanup SET state = 'paused', diagnostic_code = 'POLICY_QUERY_FAILED',
+                     diagnostic_detail = $2, last_reconciled_at = NOW(), next_reconcile_at = NOW() + INTERVAL '30 seconds', updated_at = NOW()
+                     WHERE node_id = $1",
+                    &[&node_id, &error.message()],
+                ).await.map_err(internal)?;
+                continue;
+            }
+        };
+        let fingerprint_changed =
+            row.get::<_, String>("protection_fingerprint") != policy.fingerprint;
+        let lease_expired = state == "claimed"
+            && row
+                .get::<_, Option<chrono::DateTime<chrono::Utc>>>("lease_expires_at")
+                .is_none_or(|lease| lease <= chrono::Utc::now());
+        if state != "needs_reconcile" && (fingerprint_changed || lease_expired) {
+            transaction.execute(
+                "UPDATE wr_node_release_cleanup SET generation = generation + 1,
+                 state = 'needs_reconcile', authority_payload = NULL, payload_digest = '', candidate_count = 0,
+                 agent_instance_id = NULL, claimed_by = NULL, claim_instance = NULL,
+                 lease_expires_at = NULL, delivered_at = NULL, updated_at = NOW() WHERE node_id = $1",
+                &[&node_id],
+            ).await.map_err(internal)?;
+            transaction.execute(
+                "UPDATE wr_node_release_cleanup_generations SET outcome = 'superseded', completed_at = NOW()
+                 WHERE node_id = $1 AND generation = $2 AND outcome = 'materialized'",
+                &[&node_id, &generation],
+            ).await.map_err(internal)?;
+            generation += 1;
+        } else if matches!(state.as_str(), "pending" | "claimed") {
+            transaction.execute(
+                "UPDATE wr_node_release_cleanup SET last_reconciled_at = NOW(),
+                 next_reconcile_at = NOW() + INTERVAL '30 seconds', updated_at = NOW() WHERE node_id = $1",
+                &[&node_id],
+            ).await.map_err(internal)?;
+            continue;
+        }
+        let prior_inventory = row
+            .get::<_, Option<Vec<u8>>>("known_inventory")
+            .map(|bytes| NodeCleanupAuthority::decode(bytes.as_slice()))
+            .transpose()
+            .map_err(|error| {
+                Status::internal(format!("stored cleanup inventory is invalid: {error}"))
+            })?
+            .map(|value| value.known_inventory);
+        let delete = match prior_inventory.as_ref() {
+            None => Vec::new(),
+            Some(inventory) => inventory
+                .iter()
+                .filter(|item| policy.delete.contains(item))
+                .cloned()
+                .collect(),
+        };
+        if prior_inventory.is_some() && delete.is_empty() {
+            transaction.execute(
+                "UPDATE wr_node_release_cleanup SET state = 'clean', protection_fingerprint = $2,
+                 authority_payload = NULL, payload_digest = '', candidate_count = 0,
+                 last_reconciled_at = NOW(), next_reconcile_at = NOW() + INTERVAL '30 seconds',
+                 diagnostic_code = '', diagnostic_detail = '', updated_at = NOW() WHERE node_id = $1",
+                &[&node_id, &policy.fingerprint],
+            ).await.map_err(internal)?;
+            continue;
+        }
+        let authority = NodeCleanupAuthority {
+            delete_releases: delete,
+            known_inventory: prior_inventory.unwrap_or_default(),
+        };
+        let payload = authority.encode_to_vec();
+        let digest = format!("sha256:{:x}", Sha256::digest(&payload));
+        transaction.execute(
+            "INSERT INTO wr_node_release_cleanup_generations
+               (node_id, generation, protection_fingerprint, authority_payload, payload_digest, known_inventory)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (node_id, generation) DO UPDATE SET
+               protection_fingerprint = EXCLUDED.protection_fingerprint,
+               authority_payload = EXCLUDED.authority_payload, payload_digest = EXCLUDED.payload_digest,
+               known_inventory = EXCLUDED.known_inventory, outcome = 'materialized', completed_at = NULL",
+            &[&node_id, &generation, &policy.fingerprint, &payload, &digest, &row.get::<_, Option<Vec<u8>>>("known_inventory")],
+        ).await.map_err(internal)?;
+        transaction.execute(
+            "UPDATE wr_node_release_cleanup SET state = 'pending', protection_fingerprint = $2,
+             authority_payload = $3, payload_digest = $4, candidate_count = $5,
+             agent_instance_id = NULL, claimed_by = NULL, claim_instance = NULL,
+             lease_expires_at = NULL, delivered_at = NULL, last_reconciled_at = NOW(),
+             next_reconcile_at = NOW() + INTERVAL '30 seconds', diagnostic_code = '', diagnostic_detail = '', updated_at = NOW()
+             WHERE node_id = $1 AND generation = $6",
+            &[&node_id, &policy.fingerprint, &payload, &digest, &(authority.delete_releases.len() as i32), &generation],
+        ).await.map_err(internal)?;
+    }
+    let count = rows.len() as u64;
+    transaction.commit().await.map_err(internal)?;
+    Ok(count)
+}
+
+async fn cleanup_attested<C: GenericClient + Sync>(
+    client: &C,
+    node_id: &str,
+    agent_instance_id: &str,
+    principal: &str,
+) -> Result<bool, Status> {
+    Ok(client
+        .query_opt(
+            "SELECT 1 FROM wr_node_agent_attestations a
+         JOIN wr_node_agent_policies p ON p.node_id = a.node_id
+         WHERE a.node_id = $1 AND a.agent_instance_id = $2 AND a.authenticated_principal = $3
+           AND a.protocol_version = p.protocol_version AND a.binary_digest = p.binary_digest
+           AND a.config_digest = p.config_digest AND a.backend = p.backend
+           AND a.retention_count = p.retention_count AND a.capabilities = p.capabilities
+           AND a.observed_at >= NOW() - INTERVAL '30 seconds'",
+            &[&node_id, &agent_instance_id, &principal],
+        )
+        .await
+        .map_err(internal)?
+        .is_some())
+}
+
+pub async fn claim_node_cleanup(
+    pool: &Pool,
+    node_id: &str,
+    agent_instance_id: &str,
+    principal: &str,
+) -> Result<Option<ClaimNodeCleanupResponse>, Status> {
+    if node_id.is_empty() || agent_instance_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "node_id and agent_instance_id are required",
+        ));
+    }
+    let mut client = pool.get().await.map_err(internal)?;
+    let transaction = client.transaction().await.map_err(internal)?;
+    transaction
+        .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .map_err(internal)?;
+    if !cleanup_attested(&transaction, node_id, agent_instance_id, principal).await? {
+        return Err(Status::failed_precondition(
+            "fresh authenticated node-agent attestation is required",
+        ));
+    }
+    let query = format!(
+        "SELECT {CLEANUP_ROW_COLUMNS} FROM wr_node_release_cleanup WHERE node_id = $1 FOR UPDATE"
+    );
+    let Some(row) = transaction
+        .query_opt(&query, &[&node_id])
+        .await
+        .map_err(internal)?
+    else {
+        transaction.commit().await.map_err(internal)?;
+        return Ok(None);
+    };
+    let state: String = row.get("state");
+    if state != "pending"
+        && !(state == "claimed"
+            && row.get::<_, Option<String>>("agent_instance_id").as_deref()
+                == Some(agent_instance_id)
+            && row.get::<_, Option<String>>("claimed_by").as_deref() == Some(principal)
+            && row
+                .get::<_, Option<chrono::DateTime<chrono::Utc>>>("lease_expires_at")
+                .is_some_and(|time| time > chrono::Utc::now()))
+    {
+        transaction.commit().await.map_err(internal)?;
+        return Ok(None);
+    }
+    let policy = manager_cleanup_policy(&transaction, node_id).await?;
+    if policy.fingerprint != row.get::<_, String>("protection_fingerprint") {
+        fence_cleanup_authority(&transaction, node_id, "CLAIM_POLICY_CHANGED").await?;
+        transaction.commit().await.map_err(internal)?;
+        return Ok(None);
+    }
+    let authority_bytes: Vec<u8> = row
+        .get::<_, Option<Vec<u8>>>("authority_payload")
+        .ok_or_else(|| Status::internal("pending cleanup authority is missing"))?;
+    let authority = NodeCleanupAuthority::decode(authority_bytes.as_slice()).map_err(|error| {
+        Status::internal(format!("stored cleanup authority is invalid: {error}"))
+    })?;
+    let claim_instance = if state == "claimed" {
+        row.get::<_, Option<Uuid>>("claim_instance")
+            .expect("claimed cleanup has claim instance")
+    } else {
+        Uuid::new_v4()
+    };
+    let epoch: i64 = if state == "claimed" {
+        row.get("lease_epoch")
+    } else {
+        row.get::<_, i64>("lease_epoch") + 1
+    };
+    transaction.execute(
+        "UPDATE wr_node_release_cleanup SET state = 'claimed', agent_instance_id = $2,
+         claimed_by = $3, claim_instance = $4, lease_epoch = $5,
+         lease_expires_at = NOW() + make_interval(secs => $6), delivered_at = COALESCE(delivered_at, NOW()),
+         last_attempt_at = NOW(), updated_at = NOW() WHERE node_id = $1",
+        &[&node_id, &agent_instance_id, &principal, &claim_instance, &epoch, &LEASE_SECONDS],
+    ).await.map_err(internal)?;
+    let generation: i64 = row.get("generation");
+    let payload_digest: String = row.get("payload_digest");
+    transaction.commit().await.map_err(internal)?;
+    Ok(Some(ClaimNodeCleanupResponse {
+        instruction: Some(NodeCleanupInstruction {
+            node_id: node_id.to_string(),
+            agent_instance_id: agent_instance_id.to_string(),
+            generation: generation as u64,
+            lease_epoch: epoch as u64,
+            claim_instance: claim_instance.to_string(),
+            payload_digest,
+            delete_releases: authority.delete_releases,
+            expected_inventory: authority.known_inventory,
+            deadline: Some(timestamp(
+                chrono::Utc::now() + chrono::Duration::seconds(LEASE_SECONDS as i64),
+            )),
+        }),
+        lease_seconds: LEASE_SECONDS as u64,
+    }))
+}
+
+pub async fn renew_node_cleanup(
+    pool: &Pool,
+    request: &wr_common::wruntime::RenewNodeCleanupLeaseRequest,
+    principal: &str,
+) -> Result<wr_common::wruntime::RenewNodeCleanupLeaseResponse, Status> {
+    let generation = i64::try_from(request.generation)
+        .map_err(|_| Status::invalid_argument("generation is too large"))?;
+    let epoch = i64::try_from(request.lease_epoch)
+        .map_err(|_| Status::invalid_argument("lease epoch is too large"))?;
+    let claim = Uuid::parse_str(&request.claim_instance)
+        .map_err(|_| Status::invalid_argument("claim_instance must be a UUID"))?;
+    let client = pool.get().await.map_err(internal)?;
+    let row = client.query_opt(
+        "UPDATE wr_node_release_cleanup SET lease_expires_at = NOW() + make_interval(secs => $7), updated_at = NOW()
+         WHERE node_id = $1 AND generation = $2 AND state = 'claimed' AND lease_epoch = $3
+           AND claim_instance = $4 AND agent_instance_id = $5 AND claimed_by = $6 AND lease_expires_at > NOW()
+         RETURNING lease_expires_at",
+        &[&request.node_id, &generation, &epoch, &claim, &request.agent_instance_id, &principal, &LEASE_SECONDS],
+    ).await.map_err(internal)?;
+    Ok(wr_common::wruntime::RenewNodeCleanupLeaseResponse {
+        lease_expires_at: row
+            .as_ref()
+            .map(|row| timestamp(row.get("lease_expires_at"))),
+        superseded: row.is_none(),
+    })
+}
+
+fn canonical_releases(
+    values: &[wr_common::wruntime::ReleaseInventoryEntry],
+) -> Result<std::collections::BTreeMap<u64, (String, String)>, Status> {
+    let mut result = std::collections::BTreeMap::new();
+    for value in values {
+        if value.revision == 0
+            || value.bundle_digest.is_empty()
+            || value.resolved_release_digest.is_empty()
+            || result
+                .insert(
+                    value.revision,
+                    (
+                        value.bundle_digest.clone(),
+                        value.resolved_release_digest.clone(),
+                    ),
+                )
+                .is_some()
+        {
+            return Err(Status::failed_precondition(
+                "cleanup result contains invalid or duplicate release identity",
+            ));
+        }
+    }
+    Ok(result)
+}
+
+pub async fn report_node_cleanup_result(
+    pool: &Pool,
+    request: &ReportNodeCleanupResultRequest,
+    principal: &str,
+) -> Result<ReportNodeCleanupResultResponse, Status> {
+    let generation = i64::try_from(request.generation)
+        .map_err(|_| Status::invalid_argument("generation is too large"))?;
+    let epoch = i64::try_from(request.lease_epoch)
+        .map_err(|_| Status::invalid_argument("lease epoch is too large"))?;
+    let claim = Uuid::parse_str(&request.claim_instance)
+        .map_err(|_| Status::invalid_argument("claim_instance must be a UUID"))?;
+    let payload = request.encode_to_vec();
+    let mut client = pool.get().await.map_err(internal)?;
+    let transaction = client.transaction().await.map_err(internal)?;
+    if let Some(receipt) = transaction.query_opt(
+        "SELECT authenticated_principal, result_payload FROM wr_node_release_cleanup_result_receipts
+         WHERE node_id = $1 AND generation = $2 AND agent_instance_id = $3 AND lease_epoch = $4 AND claim_instance = $5",
+        &[&request.node_id, &generation, &request.agent_instance_id, &epoch, &claim],
+    ).await.map_err(internal)? {
+        if receipt.get::<_, String>("authenticated_principal") != principal || receipt.get::<_, Vec<u8>>("result_payload") != payload {
+            return Err(Status::aborted("cleanup result retry conflicts with stored receipt"));
+        }
+        let summary = get_cleanup_summary_in(&transaction, &request.node_id).await?;
+        transaction.commit().await.map_err(internal)?;
+        return Ok(ReportNodeCleanupResultResponse { disposition: NodeCleanupResultDisposition::Accepted as i32, cleanup: Some(summary) });
+    }
+    let query = format!(
+        "SELECT {CLEANUP_ROW_COLUMNS} FROM wr_node_release_cleanup WHERE node_id = $1 FOR UPDATE"
+    );
+    let row = transaction
+        .query_opt(&query, &[&request.node_id])
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| Status::not_found("node cleanup state not found"))?;
+    let current = row.get::<_, i64>("generation") == generation
+        && row.get::<_, String>("state") == "claimed"
+        && row.get::<_, i64>("lease_epoch") == epoch
+        && row.get::<_, Option<Uuid>>("claim_instance") == Some(claim)
+        && row.get::<_, Option<String>>("agent_instance_id").as_deref()
+            == Some(request.agent_instance_id.as_str())
+        && row.get::<_, Option<String>>("claimed_by").as_deref() == Some(principal)
+        && row
+            .get::<_, Option<chrono::DateTime<chrono::Utc>>>("lease_expires_at")
+            .is_some_and(|time| time > chrono::Utc::now());
+    if !current {
+        let summary = cleanup_summary_from_row(&row)?;
+        transaction.commit().await.map_err(internal)?;
+        return Ok(ReportNodeCleanupResultResponse {
+            disposition: NodeCleanupResultDisposition::Superseded as i32,
+            cleanup: Some(summary),
+        });
+    }
+    if row.get::<_, String>("payload_digest") != request.payload_digest {
+        return Err(Status::failed_precondition(
+            "cleanup payload digest does not match issued authority",
+        ));
+    }
+    let authority = NodeCleanupAuthority::decode(
+        row.get::<_, Option<Vec<u8>>>("authority_payload")
+            .expect("claimed authority")
+            .as_slice(),
+    )
+    .map_err(|error| Status::internal(format!("stored cleanup authority is invalid: {error}")))?;
+    if request.condition_code.is_empty() {
+        let deleted = canonical_releases(&request.deleted_releases)?;
+        let issued = canonical_releases(&authority.delete_releases)?;
+        if deleted != issued {
+            return Err(Status::failed_precondition(
+                "deleted releases do not exactly match issued authority",
+            ));
+        }
+        let resulting = canonical_releases(&request.resulting_inventory)?;
+        if authority.known_inventory.is_empty() {
+            let policy = manager_cleanup_policy(&transaction, &request.node_id).await?;
+            let catalog = canonical_releases(&policy.known)?;
+            if resulting
+                .iter()
+                .any(|(revision, identity)| catalog.get(revision) != Some(identity))
+            {
+                return Err(Status::failed_precondition(
+                    "complete inventory contains an unknown release identity",
+                ));
+            }
+        } else {
+            let mut expected = canonical_releases(&authority.known_inventory)?;
+            for revision in issued.keys() {
+                expected.remove(revision);
+            }
+            if resulting != expected {
+                return Err(Status::failed_precondition("resulting inventory does not equal issued inventory minus authorized deletions"));
+            }
+        }
+        for release in &request.deleted_releases {
+            transaction
+                .execute(
+                    "INSERT INTO wr_node_release_deletions
+                   (node_id, revision, bundle_digest, resolved_release_digest, cleanup_generation)
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (node_id, revision) DO NOTHING",
+                    &[
+                        &request.node_id,
+                        &(release.revision as i64),
+                        &release.bundle_digest,
+                        &release.resolved_release_digest,
+                        &generation,
+                    ],
+                )
+                .await
+                .map_err(internal)?;
+        }
+        let inventory = NodeCleanupAuthority {
+            delete_releases: Vec::new(),
+            known_inventory: request.resulting_inventory.clone(),
+        }
+        .encode_to_vec();
+        transaction.execute(
+            "UPDATE wr_node_release_cleanup SET state = 'clean', known_inventory = $2,
+             authority_payload = NULL, payload_digest = '', candidate_count = 0,
+             agent_instance_id = NULL, claimed_by = NULL, claim_instance = NULL,
+             lease_expires_at = NULL, diagnostic_code = '', diagnostic_detail = '', updated_at = NOW()
+             WHERE node_id = $1",
+            &[&request.node_id, &inventory],
+        ).await.map_err(internal)?;
+        transaction.execute(
+            "UPDATE wr_node_release_cleanup_generations SET outcome = 'succeeded', completed_at = NOW() WHERE node_id = $1 AND generation = $2",
+            &[&request.node_id, &generation],
+        ).await.map_err(internal)?;
+    } else {
+        transaction
+            .execute(
+                "UPDATE wr_node_release_cleanup SET state = 'paused', agent_instance_id = NULL,
+             claimed_by = NULL, claim_instance = NULL, lease_expires_at = NULL,
+             diagnostic_code = $2, diagnostic_detail = $3, updated_at = NOW() WHERE node_id = $1",
+                &[&request.node_id, &request.condition_code, &request.detail],
+            )
+            .await
+            .map_err(internal)?;
+        transaction.execute(
+            "UPDATE wr_node_release_cleanup_generations SET outcome = 'paused', completed_at = NOW() WHERE node_id = $1 AND generation = $2",
+            &[&request.node_id, &generation],
+        ).await.map_err(internal)?;
+    }
+    transaction.execute(
+        "INSERT INTO wr_node_release_cleanup_result_receipts
+           (node_id, generation, agent_instance_id, lease_epoch, claim_instance, authenticated_principal, payload_digest, result_payload)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        &[&request.node_id, &generation, &request.agent_instance_id, &epoch, &claim, &principal, &request.payload_digest, &payload],
+    ).await.map_err(internal)?;
+    let summary = get_cleanup_summary_in(&transaction, &request.node_id).await?;
+    transaction.commit().await.map_err(internal)?;
+    Ok(ReportNodeCleanupResultResponse {
+        disposition: NodeCleanupResultDisposition::Accepted as i32,
+        cleanup: Some(summary),
+    })
+}
+
+async fn get_cleanup_summary_in<C: GenericClient + Sync>(
+    client: &C,
+    node_id: &str,
+) -> Result<NodeCleanupSummary, Status> {
+    let query =
+        format!("SELECT {CLEANUP_ROW_COLUMNS} FROM wr_node_release_cleanup WHERE node_id = $1");
+    let row = client
+        .query_one(&query, &[&node_id])
+        .await
+        .map_err(internal)?;
+    cleanup_summary_from_row(&row)
+}
+
+pub(crate) async fn cleanup_summaries_from_client<C: GenericClient + Sync>(
+    client: &C,
+) -> Result<Vec<NodeCleanupSummary>, Status> {
+    let query =
+        format!("SELECT {CLEANUP_ROW_COLUMNS} FROM wr_node_release_cleanup ORDER BY node_id");
+    client
+        .query(&query, &[])
+        .await
+        .map_err(internal)?
+        .iter()
+        .map(cleanup_summary_from_row)
+        .collect()
+}
+
 fn canonical_agent_policy(policy: &NodeAgentPolicy) -> Result<AgentPolicy, Status> {
     let backend = match BackendKind::try_from(policy.backend).unwrap_or(BackendKind::Unspecified) {
         BackendKind::Systemd => AgentPolicyBackend::Systemd,
@@ -3743,16 +4015,7 @@ pub async fn put_agent_policy(
         .await
         .map_err(internal)?;
     if policy_changed {
-        transaction
-            .execute(
-                "UPDATE wr_node_operations SET cleanup_delete_allowlist = NULL, updated_at = NOW()
-                 WHERE node_id = $1 AND phase = 'committed_cleanup'
-                   AND state IN ('queued', 'running', 'paused')
-                   AND (cleanup_delivered_at IS NULL OR cleanup_reported_at IS NOT NULL)",
-                &[&canonical.node_id],
-            )
-            .await
-            .map_err(internal)?;
+        fence_cleanup_authority(&transaction, &canonical.node_id, "AGENT_POLICY_UPDATED").await?;
         for row in transaction
             .query(
                 "UPDATE wr_node_operations SET state = 'paused', failure_code = 'AGENT_POLICY_UPDATED',

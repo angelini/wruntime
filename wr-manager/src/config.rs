@@ -11,6 +11,7 @@ use wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS;
 
 pub const DEFAULT_MANAGER_HEARTBEAT_INTERVAL_SECS: u64 = 1;
 pub const DEFAULT_MANAGER_STALE_ROW_REAP_THRESHOLD_SECS: u64 = 300;
+pub const DEFAULT_RELEASE_CLEANUP_INTERVAL_SECS: u64 = 30;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeartbeatTimeoutSecs(NonZeroU64);
@@ -48,6 +49,8 @@ pub struct ManagerConfig {
     pub scheduler_retry_base_secs: u64,
     /// Maximum backoff (seconds) cap for consecutive failures.
     pub scheduler_retry_cap_secs: u64,
+    /// Interval and discovery objective for per-node release cleanup.
+    pub release_cleanup_interval_secs: u64,
     /// PostgreSQL connection pool configuration.
     pub database: DatabaseConfig,
     /// Cluster configuration for multi-manager HA.
@@ -113,6 +116,9 @@ fn default_scheduler_retry_base_secs() -> u64 {
 fn default_scheduler_retry_cap_secs() -> u64 {
     300
 }
+fn default_release_cleanup_interval_secs() -> u64 {
+    DEFAULT_RELEASE_CLEANUP_INTERVAL_SECS
+}
 
 fn default_max_connections() -> usize {
     10
@@ -134,6 +140,8 @@ pub struct RawManagerConfig {
     pub scheduler_retry_base_secs: u64,
     #[serde(default = "default_scheduler_retry_cap_secs")]
     pub scheduler_retry_cap_secs: u64,
+    #[serde(default = "default_release_cleanup_interval_secs")]
+    pub release_cleanup_interval_secs: u64,
     pub database: DatabaseConfig,
     pub cluster: ClusterConfig,
     pub tls: ServerTlsConfig,
@@ -182,6 +190,10 @@ impl RawManagerConfig {
         v.check(
             self.scheduler_retry_cap_secs >= self.scheduler_retry_base_secs,
             "scheduler_retry_cap_secs must be >= scheduler_retry_base_secs",
+        );
+        v.check(
+            (1..=300).contains(&self.release_cleanup_interval_secs),
+            "release_cleanup_interval_secs must be in 1..=300",
         );
         v.check(!self.database.url.is_empty(), "database.url is required");
         v.check(
@@ -316,6 +328,7 @@ impl ManagerConfig {
             scheduler_lease_secs: raw.scheduler_lease_secs,
             scheduler_retry_base_secs: raw.scheduler_retry_base_secs,
             scheduler_retry_cap_secs: raw.scheduler_retry_cap_secs,
+            release_cleanup_interval_secs: raw.release_cleanup_interval_secs,
             database: raw.database,
             cluster: raw.cluster,
             tls: raw.tls,
@@ -340,6 +353,7 @@ mod tests {
             scheduler_lease_secs: 30,
             scheduler_retry_base_secs: 5,
             scheduler_retry_cap_secs: 300,
+            release_cleanup_interval_secs: DEFAULT_RELEASE_CLEANUP_INTERVAL_SECS,
             database: DatabaseConfig {
                 url: "postgres://localhost/wruntime".into(),
                 max_connections: 10,

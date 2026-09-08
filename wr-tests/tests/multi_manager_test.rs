@@ -18,9 +18,10 @@ use std::time::Duration;
 use wr_common::wruntime::{
     BackendProcessState, BeginDeploymentRequest, DeploymentInventoryV1, EngineRegistration,
     ExpectedEngine, FinalizeDeploymentRequest, GetClusterStatusRequest, HeartbeatRequest,
-    LifecycleStatus, ListManagersRequest, ModuleDescriptor, NodeOperationAction,
-    NodeOperationStepKind, ProcessLifecycleState, ReportNodeObservationRequest,
-    ReportStepResultRequest, RolloutPolicy, ServiceKind, SubmitOperationRequest,
+    LifecycleStatus, ListManagersRequest, ModuleDescriptor, NodeCleanupResultDisposition,
+    NodeOperationAction, NodeOperationStepKind, ProcessLifecycleState,
+    ReportNodeCleanupResultRequest, ReportNodeObservationRequest, ReportStepResultRequest,
+    RolloutPolicy, ServiceKind, SubmitOperationRequest,
 };
 
 // ── Multi-manager integration tests ──────────────────────────────────────────
@@ -767,4 +768,149 @@ async fn test_stale_manager_lease_is_unlisted_without_reaping_row() {
         1,
         "reaping uses its own configured threshold"
     );
+}
+
+#[tokio::test]
+async fn cleanup_reconciliation_batches_are_concurrent_and_ordered() {
+    let pool = manager_pool().await;
+    for node in ["cleanup-batch-a", "cleanup-batch-b"] {
+        let policy = helpers::node_agent::systemd_policy(node, 2);
+        wr_manager::operations::put_agent_policy(&pool, "operator-a", &policy)
+            .await
+            .unwrap();
+    }
+    wr_manager::operations::reconcile_node_cleanup_batch(&pool, "seed", 10)
+        .await
+        .unwrap();
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE wr_node_release_cleanup SET state = 'needs_reconcile', next_reconcile_at = NOW(),
+             last_reconciled_at = CASE node_id WHEN 'cleanup-batch-a' THEN NOW() - INTERVAL '2 minutes'
+             ELSE NOW() - INTERVAL '1 minute' END
+             WHERE node_id IN ('cleanup-batch-a', 'cleanup-batch-b')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let (first, second) = tokio::join!(
+        wr_manager::operations::reconcile_node_cleanup_batch(&pool, "manager-a", 1),
+        wr_manager::operations::reconcile_node_cleanup_batch(&pool, "manager-b", 1),
+    );
+    assert_eq!(first.unwrap() + second.unwrap(), 2);
+    let rows = pool
+        .get()
+        .await
+        .unwrap()
+        .query(
+            "SELECT node_id, state FROM wr_node_release_cleanup
+             WHERE node_id IN ('cleanup-batch-a', 'cleanup-batch-b') ORDER BY node_id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|row| row.get::<_, String>("state") == "pending"));
+}
+
+#[tokio::test]
+async fn cleanup_takeover_fences_expired_and_late_manager_results() {
+    let pool = manager_pool().await;
+    let node = "cleanup-takeover-node";
+    let policy = helpers::node_agent::systemd_policy(node, 2);
+    wr_manager::operations::put_agent_policy(&pool, "operator-a", &policy)
+        .await
+        .unwrap();
+    wr_manager::operations::attest(
+        &pool,
+        "agent-a",
+        &helpers::node_agent::attestation(&policy, "activation-a"),
+    )
+    .await
+    .unwrap();
+    wr_manager::operations::reconcile_node_cleanup_batch(&pool, "manager-a", 10)
+        .await
+        .unwrap();
+    let old = wr_manager::operations::claim_node_cleanup(&pool, node, "activation-a", "agent-a")
+        .await
+        .unwrap()
+        .unwrap()
+        .instruction
+        .unwrap();
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE wr_node_release_cleanup SET lease_expires_at = NOW() - INTERVAL '1 second',
+             next_reconcile_at = NOW() WHERE node_id = $1",
+            &[&node],
+        )
+        .await
+        .unwrap();
+    wr_manager::operations::reconcile_node_cleanup_batch(&pool, "manager-b", 10)
+        .await
+        .unwrap();
+    let replacement =
+        wr_manager::operations::claim_node_cleanup(&pool, node, "activation-a", "agent-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .instruction
+            .unwrap();
+    assert!(replacement.generation > old.generation);
+    let late = wr_manager::operations::report_node_cleanup_result(
+        &pool,
+        &ReportNodeCleanupResultRequest {
+            node_id: node.into(),
+            agent_instance_id: old.agent_instance_id,
+            generation: old.generation,
+            lease_epoch: old.lease_epoch,
+            claim_instance: old.claim_instance,
+            payload_digest: old.payload_digest,
+            ..Default::default()
+        },
+        "agent-a",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        late.disposition,
+        NodeCleanupResultDisposition::Superseded as i32
+    );
+
+    let deployment = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
+            node_id: node.into(),
+            attempt_token: "cleanup-between-ticks".into(),
+            bundle_digest: format!("sha256:{}", "c".repeat(64)),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![ExpectedEngine {
+                    engine_slot: "blue".into(),
+                    modules: vec![],
+                    ..Default::default()
+                }],
+            }),
+        },
+        "operator-a",
+    )
+    .await
+    .unwrap();
+    assert!(deployment.record.revision > 0);
+    let fenced_generation: i64 = pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT generation FROM wr_node_release_cleanup WHERE node_id = $1",
+            &[&node],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(fenced_generation > replacement.generation as i64);
 }

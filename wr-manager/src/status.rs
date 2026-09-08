@@ -299,6 +299,47 @@ fn compose_engines(
                     &right.version,
                 ))
             });
+            let cleanup = metadata.and_then(|metadata| {
+                snapshot
+                    .cleanup_summaries
+                    .iter()
+                    .find(|item| item.node_id == metadata.node_id)
+                    .cloned()
+            });
+            if let Some(cleanup) = &cleanup {
+                let paused = cleanup.state == wr_common::wruntime::NodeCleanupState::Paused as i32;
+                let overdue =
+                    cleanup.last_reconciled_at.as_ref().is_none_or(|value| {
+                        chrono::DateTime::from_timestamp(value.seconds, value.nanos as u32)
+                            .is_none_or(|time| {
+                                snapshot
+                                    .observed_at
+                                    .signed_duration_since(time)
+                                    .num_seconds()
+                                    > 30
+                            })
+                    }) && cleanup.state != wr_common::wruntime::NodeCleanupState::Clean as i32;
+                if paused || overdue {
+                    conditions.push(condition(
+                        if paused {
+                            "release_cleanup_paused"
+                        } else {
+                            "release_cleanup_overdue"
+                        },
+                        StatusSeverity::Degraded,
+                        if cleanup.diagnostic_detail.is_empty() {
+                            "release cleanup maintenance requires attention"
+                        } else {
+                            &cleanup.diagnostic_detail
+                        },
+                        metadata
+                            .map(|item| item.node_id.as_str())
+                            .unwrap_or_default(),
+                        "clean",
+                        format!("generation {}", cleanup.generation),
+                    ));
+                }
+            }
             let base_severity = if conditions.is_empty() {
                 StatusSeverity::Healthy
             } else {
@@ -320,6 +361,7 @@ fn compose_engines(
                 heartbeat_age_seconds: age_seconds(snapshot.observed_at, record.last_heartbeat),
                 modules,
                 conditions,
+                release_cleanup: cleanup,
             }
         })
         .collect::<Vec<_>>();
@@ -383,6 +425,43 @@ fn compose_nodes(
                     ),
                 )]
             };
+            let cleanup = snapshot
+                .cleanup_summaries
+                .iter()
+                .find(|item| item.node_id == node_id)
+                .cloned();
+            if let Some(cleanup) = &cleanup {
+                let paused = cleanup.state == wr_common::wruntime::NodeCleanupState::Paused as i32;
+                let overdue =
+                    cleanup.last_reconciled_at.as_ref().is_none_or(|value| {
+                        chrono::DateTime::from_timestamp(value.seconds, value.nanos as u32)
+                            .is_none_or(|time| {
+                                snapshot
+                                    .observed_at
+                                    .signed_duration_since(time)
+                                    .num_seconds()
+                                    > 30
+                            })
+                    }) && cleanup.state != wr_common::wruntime::NodeCleanupState::Clean as i32;
+                if paused || overdue {
+                    conditions.push(condition(
+                        if paused {
+                            "release_cleanup_paused"
+                        } else {
+                            "release_cleanup_overdue"
+                        },
+                        StatusSeverity::Degraded,
+                        if cleanup.diagnostic_detail.is_empty() {
+                            "release cleanup maintenance requires attention"
+                        } else {
+                            &cleanup.diagnostic_detail
+                        },
+                        &node_id,
+                        "clean",
+                        format!("generation {}", cleanup.generation),
+                    ));
+                }
+            }
             conditions.sort_by(|left, right| {
                 (&left.code, &left.affected_identity).cmp(&(&right.code, &right.affected_identity))
             });
@@ -409,6 +488,7 @@ fn compose_nodes(
                 engines: node_engines,
                 conditions,
                 target_deployment: target,
+                release_cleanup: cleanup,
             })
         })
         .collect()
@@ -691,6 +771,84 @@ mod tests {
     }
 
     #[test]
+    fn release_cleanup_degrades_node_and_engine_without_marking_them_unhealthy() {
+        use wr_common::wruntime::{
+            DeploymentInventoryV1, DeploymentMetadata, DeploymentRecord, DeploymentState,
+            EngineRegistration, ExpectedEngine, NodeCleanupState, NodeCleanupSummary,
+        };
+
+        let now = chrono::Utc::now();
+        let deployment = DeploymentRecord {
+            node_id: "cleanup-status-node".into(),
+            revision: 1,
+            bundle_digest: "sha256:bundle".into(),
+            resolved_release_digest: "sha256:resolved".into(),
+            state: DeploymentState::Succeeded as i32,
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![ExpectedEngine {
+                    engine_slot: "blue".into(),
+                    modules: vec![],
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        let snapshot = ClusterStatusSnapshot {
+            observed_at: now,
+            routing_version: 1,
+            deployments: vec![db::StatusDeploymentRecord {
+                record: deployment.clone(),
+                current_revision: 1,
+                target_revision: None,
+            }],
+            engines: vec![db::StatusEngineRecord {
+                registration: EngineRegistration {
+                    engine_id: "cleanup-status-engine".into(),
+                    deployment: Some(DeploymentMetadata {
+                        node_id: deployment.node_id.clone(),
+                        revision: deployment.revision,
+                        bundle_digest: deployment.bundle_digest.clone(),
+                        engine_slot: "blue".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                registered_at: now,
+                last_heartbeat: now,
+            }],
+            module_heartbeats: vec![],
+            routes: vec![],
+            managers: vec![],
+            slot_authorities: vec![],
+            active_operations: vec![],
+            observations: vec![],
+            agent_attestations: vec![],
+            agent_policies: vec![],
+            cleanup_summaries: vec![NodeCleanupSummary {
+                node_id: deployment.node_id.clone(),
+                state: NodeCleanupState::Paused as i32,
+                generation: 4,
+                diagnostic_detail: "inventory unavailable".into(),
+                ..Default::default()
+            }],
+        };
+        let current = BTreeMap::from([(deployment.node_id.clone(), deployment)]);
+        let engines = compose_engines(&snapshot, &current, 10.0, 10.0);
+        let cleanup_engine = &engines[0];
+        assert_eq!(cleanup_engine.severity, StatusSeverity::Degraded as i32);
+        assert_eq!(cleanup_engine.conditions[0].code, "release_cleanup_paused");
+        let nodes = compose_nodes(&snapshot, &engines, 10.0, 10.0).unwrap();
+        let cleanup_node = &nodes[0];
+        assert_eq!(cleanup_node.severity, StatusSeverity::Degraded as i32);
+        assert!(cleanup_node
+            .conditions
+            .iter()
+            .any(|condition| condition.code == "release_cleanup_paused"
+                && condition.severity == StatusSeverity::Degraded as i32));
+    }
+
+    #[test]
     fn service_availability_is_partial_and_deterministic() {
         use wr_common::wruntime::{
             DeploymentInventoryV1, DeploymentRecord, ExpectedEngine, ExpectedModule, RoutingRule,
@@ -768,6 +926,7 @@ mod tests {
             observations: Vec::new(),
             agent_attestations: Vec::new(),
             agent_policies: Vec::new(),
+            cleanup_summaries: Vec::new(),
         };
 
         let services = compose_services(&snapshot, &current, &engines);

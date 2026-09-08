@@ -47,6 +47,26 @@ pub async fn monitor_heartbeats_owned(
     }
 }
 
+pub async fn reconcile_release_cleanup_owned(
+    pool: Pool,
+    manager_id: String,
+    interval: Duration,
+    mut cancellation: TaskCancellation,
+) -> anyhow::Result<TaskExit> {
+    let mut tick = tokio::time::interval(interval);
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => return Ok(TaskExit::Cancelled),
+            _ = tick.tick() => {}
+        }
+        if let Err(error) =
+            crate::operations::reconcile_node_cleanup_batch(&pool, &manager_id, 100).await
+        {
+            warn!(%error, "release cleanup reconciliation failed");
+        }
+    }
+}
+
 async fn update_health(pool: &Pool, engine_timeout: f64, module_timeout: f64) {
     match db::update_route_health(pool, engine_timeout, module_timeout).await {
         Ok((stale, recovered)) => {

@@ -20,10 +20,11 @@ use wr_common::agent_policy::{
 };
 use wr_common::node::ClientTlsConfig;
 use wr_common::wruntime::{
-    AgentInstruction, AttestNodeAgentRequest, BackendKind, ClaimOperationRequest,
-    GetOperatorStatusRequest, NodeAgentAttestation, NodeAgentPolicy, NodeOperationStepKind,
-    PutNodeAgentPolicyRequest, RenewOperationLeaseRequest, ReportNodeObservationRequest,
-    ReportStepResultRequest,
+    AgentInstruction, AttestNodeAgentRequest, BackendKind, ClaimNodeCleanupRequest,
+    ClaimOperationRequest, GetOperatorStatusRequest, NodeAgentAttestation, NodeAgentPolicy,
+    NodeCleanupInstruction, NodeOperationStepKind, PutNodeAgentPolicyRequest,
+    RenewNodeCleanupLeaseRequest, RenewOperationLeaseRequest, ReportNodeCleanupResultRequest,
+    ReportNodeObservationRequest, ReportStepResultRequest,
 };
 
 use super::bundle;
@@ -246,6 +247,29 @@ impl std::fmt::Display for ReportResultError {
 
 pub trait AgentManager: LeaseManager {
     fn attest<'a>(&'a self, attestation: NodeAgentAttestation) -> AgentFuture<'a, ()>;
+    fn claim_cleanup<'a>(
+        &'a self,
+        _node_id: &'a str,
+        _agent_instance_id: &'a str,
+    ) -> AgentFuture<'a, Option<NodeCleanupInstruction>> {
+        Box::pin(async { Ok(None) })
+    }
+    fn renew_cleanup<'a>(
+        &'a self,
+        _instruction: &'a NodeCleanupInstruction,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async { bail!("cleanup lease renewal is unsupported") })
+    }
+    fn report_cleanup<'a>(
+        &'a self,
+        _request: ReportNodeCleanupResultRequest,
+    ) -> ReportResultFuture<'a> {
+        Box::pin(async {
+            Err(ReportResultError::Rejected(
+                "cleanup reporting is unsupported".into(),
+            ))
+        })
+    }
     fn claim<'a>(
         &'a self,
         node_id: &'a str,
@@ -364,6 +388,54 @@ where
     }
 }
 
+async fn execute_cleanup_fenced<M, E, C>(
+    manager: &M,
+    executor: &E,
+    clock: &C,
+    instruction: &NodeCleanupInstruction,
+    renew_every: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> FencedExecution
+where
+    M: AgentManager,
+    E: InstructionExecutor,
+    C: AgentClock,
+{
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let mut execution = Box::pin(executor.execute_cleanup(instruction, cancel_rx));
+    let mut renewal: AgentFuture<'_, ()> = Box::pin(async {
+        clock.sleep(renew_every).await;
+        manager.renew_cleanup(instruction).await
+    });
+    loop {
+        enum Fence {
+            Lease(String),
+            Shutdown,
+        }
+        let fence = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { Some(Fence::Shutdown) } else { None }
+            }
+            result = &mut execution => return FencedExecution::Completed(result.map(|evidence| StepEvidence { cleanup_evidence: Some(evidence), ..Default::default() })),
+            renewed = &mut renewal => match renewed {
+                Ok(()) => {
+                    renewal = Box::pin(async { clock.sleep(renew_every).await; manager.renew_cleanup(instruction).await });
+                    None
+                }
+                Err(error) => Some(Fence::Lease(format!("{error:#}"))),
+            }
+        };
+        let Some(fence) = fence else { continue };
+        let _ = cancel_tx.send(true);
+        let _ = execution.await;
+        return match fence {
+            Fence::Lease(detail) => FencedExecution::LeaseLost(detail),
+            Fence::Shutdown => FencedExecution::Shutdown,
+        };
+    }
+}
+
 struct ProductionManager {
     manager: tokio::sync::Mutex<wr_common::manager_client::ManagerEpoch>,
 }
@@ -429,6 +501,79 @@ impl AgentManager for ProductionManager {
                 .await?
                 .into_inner()
                 .instruction)
+        })
+    }
+
+    fn claim_cleanup<'a>(
+        &'a self,
+        node_id: &'a str,
+        agent_instance_id: &'a str,
+    ) -> AgentFuture<'a, Option<NodeCleanupInstruction>> {
+        Box::pin(async move {
+            Ok(self
+                .manager
+                .lock()
+                .await
+                .claim_node_cleanup(ClaimNodeCleanupRequest {
+                    node_id: node_id.to_string(),
+                    agent_instance_id: agent_instance_id.to_string(),
+                })
+                .await?
+                .into_inner()
+                .instruction)
+        })
+    }
+
+    fn renew_cleanup<'a>(&'a self, instruction: &'a NodeCleanupInstruction) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            let response = self
+                .manager
+                .lock()
+                .await
+                .renew_node_cleanup_lease(RenewNodeCleanupLeaseRequest {
+                    node_id: instruction.node_id.clone(),
+                    agent_instance_id: instruction.agent_instance_id.clone(),
+                    generation: instruction.generation,
+                    lease_epoch: instruction.lease_epoch,
+                    claim_instance: instruction.claim_instance.clone(),
+                })
+                .await?
+                .into_inner();
+            if response.superseded {
+                bail!("cleanup generation was superseded")
+            }
+            Ok(())
+        })
+    }
+
+    fn report_cleanup<'a>(
+        &'a self,
+        request: ReportNodeCleanupResultRequest,
+    ) -> ReportResultFuture<'a> {
+        Box::pin(async move {
+            match self
+                .manager
+                .lock()
+                .await
+                .report_node_cleanup_result(request)
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(status)
+                    if matches!(
+                        status.code(),
+                        tonic::Code::InvalidArgument
+                            | tonic::Code::PermissionDenied
+                            | tonic::Code::Unauthenticated
+                            | tonic::Code::FailedPrecondition
+                            | tonic::Code::Aborted
+                            | tonic::Code::AlreadyExists
+                    ) =>
+                {
+                    Err(ReportResultError::Rejected(status.to_string()))
+                }
+                Err(status) => Err(ReportResultError::Retryable(status.to_string())),
+            }
         })
     }
 
@@ -578,7 +723,6 @@ fn result_request(
         backend_instance_id: evidence.backend_instance_id.clone(),
         process_instance_id: evidence.process_instance_id.clone(),
         backend_query_error: evidence.backend_query_error.clone(),
-        cleanup_evidence: evidence.cleanup_evidence.clone(),
         observed_resolved_release_digest: evidence.observed_resolved_release_digest.clone(),
         termination_evidence: (instruction.step == NodeOperationStepKind::StopBackend as i32)
             .then(|| evidence.termination.clone())
@@ -616,6 +760,89 @@ fn recovery_record_bytes(
     bytes.extend_from_slice(digest.as_bytes());
     bytes.push(b'\n');
     bytes
+}
+
+const CLEANUP_RECOVERY_MAGIC: &[u8] = b"WR-CLEANUP-RECOVERY-V1\n";
+const CLEANUP_RECOVERY_FILE: &str = "cleanup.state";
+
+fn cleanup_recovery_bytes(instruction: &NodeCleanupInstruction) -> Vec<u8> {
+    let instruction = instruction.encode_to_vec();
+    let mut bytes = Vec::with_capacity(CLEANUP_RECOVERY_MAGIC.len() + instruction.len() + 77);
+    bytes.extend_from_slice(CLEANUP_RECOVERY_MAGIC);
+    bytes.extend_from_slice(&(instruction.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&instruction);
+    let digest = wr_common::agent_policy::sha256_digest(&bytes);
+    bytes.extend_from_slice(digest.as_bytes());
+    bytes.push(b'\n');
+    bytes
+}
+
+fn load_cleanup_recovery(config: &ActivationConfig) -> Result<Option<NodeCleanupInstruction>> {
+    let Some(directory) = config.recovery_dir.as_ref() else {
+        return Ok(None);
+    };
+    let path = directory.join(CLEANUP_RECOVERY_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("cleanup recovery metadata is unreadable"),
+    };
+    if bytes.len() < CLEANUP_RECOVERY_MAGIC.len() + 4 + 72
+        || !bytes.starts_with(CLEANUP_RECOVERY_MAGIC)
+        || *bytes.last().unwrap_or(&0) != b'\n'
+    {
+        bail!("cleanup recovery metadata has an invalid envelope");
+    }
+    let digest_start = bytes.len() - 72;
+    let expected = std::str::from_utf8(&bytes[digest_start..bytes.len() - 1])?;
+    if wr_common::agent_policy::sha256_digest(&bytes[..digest_start]) != expected {
+        bail!("cleanup recovery metadata digest mismatch");
+    }
+    let start = CLEANUP_RECOVERY_MAGIC.len();
+    let length = u32::from_be_bytes(bytes[start..start + 4].try_into().unwrap()) as usize;
+    if start + 4 + length != digest_start {
+        bail!("cleanup recovery instruction length is invalid");
+    }
+    let instruction = NodeCleanupInstruction::decode(&bytes[start + 4..digest_start])
+        .context("cleanup recovery instruction is invalid")?;
+    if instruction.node_id != config.node_id {
+        bail!("cleanup recovery belongs to a different node");
+    }
+    Ok(Some(instruction))
+}
+
+fn persist_cleanup_recovery(
+    config: &ActivationConfig,
+    instruction: &NodeCleanupInstruction,
+) -> Result<()> {
+    let Some(directory) = config.recovery_dir.as_ref() else {
+        return Ok(());
+    };
+    let target = directory.join(CLEANUP_RECOVERY_FILE);
+    let temporary = directory.join(format!(".cleanup.{}.tmp", config.agent_instance_id));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(&cleanup_recovery_bytes(instruction))?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, &target)?;
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn remove_cleanup_recovery(config: &ActivationConfig) -> Result<()> {
+    let Some(directory) = config.recovery_dir.as_ref() else {
+        return Ok(());
+    };
+    match std::fs::remove_file(directory.join(CLEANUP_RECOVERY_FILE)) {
+        Ok(()) => File::open(directory)?.sync_all()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to remove cleanup recovery metadata"),
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -707,6 +934,9 @@ fn load_recovery_records(config: &ActivationConfig) -> Result<BTreeMap<String, R
         if !entry.file_type()?.is_file() {
             bail!("recovery_dir contains a non-file entry");
         }
+        if entry.file_name() == CLEANUP_RECOVERY_FILE {
+            continue;
+        }
         let metadata = entry.metadata()?;
         if metadata.permissions().mode() & 0o077 != 0 {
             bail!("local recovery metadata must be owner-only");
@@ -794,6 +1024,7 @@ where
     // never replayed under this new activation: the manager must correlate the
     // durable delivery and return an inspection (or a safe read-only step).
     let mut recovery_records = load_recovery_records(&config)?;
+    let mut cleanup_recovery = load_cleanup_recovery(&config)?;
     let mut attested = false;
     let mut pending_observation: Option<(ReportNodeObservationRequest, i32)> = None;
     let mut pending_result: Option<ReportStepResultRequest> = None;
@@ -896,6 +1127,106 @@ where
         {
             Ok(Some(instruction)) => instruction,
             Ok(None) => {
+                match manager
+                    .claim_cleanup(&config.node_id, &config.agent_instance_id)
+                    .await
+                {
+                    Ok(Some(cleanup)) => {
+                        if cleanup.node_id != config.node_id
+                            || cleanup.agent_instance_id != config.agent_instance_id
+                            || cleanup.generation == 0
+                            || cleanup.lease_epoch == 0
+                            || cleanup.claim_instance.is_empty()
+                            || cleanup.payload_digest.is_empty()
+                        {
+                            bail!("manager returned a mismatched cleanup fence");
+                        }
+                        if cleanup_recovery.as_ref().is_some_and(|prior| {
+                            prior.generation != cleanup.generation
+                                || prior.payload_digest != cleanup.payload_digest
+                                || prior.delete_releases != cleanup.delete_releases
+                        }) {
+                            remove_cleanup_recovery(&config)?;
+                        }
+                        persist_cleanup_recovery(&config, &cleanup)?;
+                        cleanup_recovery = Some(cleanup.clone());
+                        match execute_cleanup_fenced(
+                            manager,
+                            executor,
+                            clock,
+                            &cleanup,
+                            config.renew,
+                            shutdown.clone(),
+                        )
+                        .await
+                        {
+                            FencedExecution::Completed(result) => {
+                                let (deleted_releases, resulting_inventory, condition_code, detail) =
+                                    match result {
+                                        Ok(evidence) => (
+                                            cleanup.delete_releases.clone(),
+                                            evidence
+                                                .cleanup_evidence
+                                                .map(|value| value.retained_releases)
+                                                .unwrap_or_default(),
+                                            String::new(),
+                                            String::new(),
+                                        ),
+                                        Err(error) => (
+                                            Vec::new(),
+                                            Vec::new(),
+                                            "HOST_CLEANUP_FAILED".to_string(),
+                                            format!("{error:#}"),
+                                        ),
+                                    };
+                                let report = ReportNodeCleanupResultRequest {
+                                    node_id: cleanup.node_id.clone(),
+                                    agent_instance_id: cleanup.agent_instance_id.clone(),
+                                    generation: cleanup.generation,
+                                    lease_epoch: cleanup.lease_epoch,
+                                    claim_instance: cleanup.claim_instance.clone(),
+                                    payload_digest: cleanup.payload_digest.clone(),
+                                    deleted_releases,
+                                    resulting_inventory,
+                                    condition_code,
+                                    detail,
+                                };
+                                loop {
+                                    match manager.report_cleanup(report.clone()).await {
+                                        Ok(()) => {
+                                            remove_cleanup_recovery(&config)?;
+                                            cleanup_recovery = None;
+                                            break;
+                                        }
+                                        Err(ReportResultError::Retryable(detail)) => {
+                                            eprintln!("node-agent cleanup acknowledgement was not received; retrying exact report: {detail}");
+                                            if retry_pause(clock, config.poll, shutdown.clone())
+                                                .await
+                                            {
+                                                return Ok(());
+                                            }
+                                        }
+                                        Err(ReportResultError::Rejected(detail)) => {
+                                            eprintln!("node-agent cleanup generation was rejected or superseded: {detail}");
+                                            remove_cleanup_recovery(&config)?;
+                                            cleanup_recovery = None;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            FencedExecution::LeaseLost(detail) => eprintln!(
+                                "node-agent cleanup lease lost; generation is fenced: {detail}"
+                            ),
+                            FencedExecution::Shutdown => return Ok(()),
+                            FencedExecution::DeadlineExpired => {
+                                unreachable!("cleanup uses only renewable generation fencing")
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("node-agent cleanup claim failed; retrying: {error:#}"),
+                }
                 if retry_pause(clock, config.poll, shutdown.clone()).await {
                     return Ok(());
                 }
@@ -915,6 +1246,9 @@ where
             || instruction.lease_epoch == 0
         {
             bail!("manager returned a mismatched instruction fence");
+        }
+        if cleanup_recovery.take().is_some() {
+            remove_cleanup_recovery(&config)?;
         }
         let step = NodeOperationStepKind::try_from(instruction.step)
             .unwrap_or(NodeOperationStepKind::Unspecified);
@@ -937,19 +1271,8 @@ where
                     | NodeOperationStepKind::SelectRelease
                     | NodeOperationStepKind::StartBackend
                     | NodeOperationStepKind::RestoreSource
-                    | NodeOperationStepKind::CleanupRelease
             );
-            let exact_cleanup_retry = NodeOperationStepKind::try_from(record.instruction.step)
-                .unwrap_or(NodeOperationStepKind::Unspecified)
-                == NodeOperationStepKind::CleanupRelease
-                && step == NodeOperationStepKind::CleanupRelease
-                && record.instruction.target == instruction.target
-                && record.instruction.cleanup_delete_releases
-                    == instruction.cleanup_delete_releases;
-            if delivered_mutation
-                && step != NodeOperationStepKind::InspectBackend
-                && !exact_cleanup_retry
-            {
+            if delivered_mutation && step != NodeOperationStepKind::InspectBackend {
                 bail!(
                     "manager attempted to replay a recovery-ambiguous mutation without inspection"
                 );

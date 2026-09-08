@@ -6,13 +6,13 @@ use tonic::Code;
 use uuid::Uuid;
 use wr_common::wruntime::{
     BackendKind, BackendProcessState, BackendStopDisposition, BackendTerminationEvidence,
-    BeginDeploymentRequest, CleanupReleaseEvidence, DeploymentInventoryV1, DeploymentMetadata,
-    DeploymentRecord, EngineOwnershipFence, EngineRegistration, ExpectedEngine, ExpectedModule,
+    BeginDeploymentRequest, DeploymentInventoryV1, DeploymentMetadata, DeploymentRecord,
+    EngineOwnershipFence, EngineRegistration, ExpectedEngine, ExpectedModule,
     FinalizeDeploymentRequest, InstructionTargetKind, LifecycleStatus, ModuleDescriptor,
-    ModuleIdentity, NodeOperationAction, NodeOperationPhase, NodeOperationState,
-    NodeOperationStepKind, ProcessLifecycleState, ReleaseInventoryEntry,
-    ReportNodeObservationRequest, ReportStepResultRequest, RolloutPolicy, ServiceKind,
-    SubmitOperationRequest,
+    ModuleIdentity, NodeCleanupResultDisposition, NodeCleanupState, NodeOperationAction,
+    NodeOperationPhase, NodeOperationState, NodeOperationStepKind, ProcessLifecycleState,
+    ReleaseInventoryEntry, ReportNodeCleanupResultRequest, ReportNodeObservationRequest,
+    ReportStepResultRequest, RolloutPolicy, ServiceKind, SubmitOperationRequest,
 };
 
 fn policy(deadline_seconds: u64) -> RolloutPolicy {
@@ -127,7 +127,6 @@ fn result_for(
         backend_instance_id: String::new(),
         process_instance_id: "proxy-process".into(),
         backend_query_error: String::new(),
-        cleanup_evidence: None,
         observed_resolved_release_digest: target.resolved_release_digest.clone(),
         termination_evidence: None,
     }
@@ -845,75 +844,45 @@ async fn forward_deadline_irreversibly_enters_deadline_free_restoration() -> Res
 }
 
 #[tokio::test]
-async fn rollback_supersedes_and_fences_committed_cleanup() -> Result<()> {
+async fn rollback_does_not_rewrite_terminal_rollout_success() -> Result<()> {
     let pool = manager_pool().await;
-    let first_digest = format!("sha256:{}", "3".repeat(64));
     let first = stage(
         &pool,
-        "supersede-node",
-        "first-allocation",
-        &first_digest,
+        "rollback-terminal-node",
+        "initial-terminal",
+        &format!("sha256:{}", "3".repeat(64)),
         &["blue"],
     )
     .await;
     commit_deployment(&pool, &first).await?;
-
-    let second_digest = format!("sha256:{}", "4".repeat(64));
     let second = stage(
         &pool,
-        "supersede-node",
-        "upgrade-op",
-        &second_digest,
+        "rollback-terminal-node",
+        "upgrade-terminal",
+        &format!("sha256:{}", "4".repeat(64)),
         &["blue"],
     )
     .await;
-    let cleanup = wr_manager::operations::submit(
-        &pool,
-        "operator-a",
-        &SubmitOperationRequest {
-            node_id: "supersede-node".into(),
-            request_token: "upgrade-op".into(),
-            action: NodeOperationAction::RollingUpgrade as i32,
-            engine_slots: vec!["blue".into()],
-            target_revision: second.revision,
-            bundle_digest: second_digest,
-            policy: Some(policy(1_800)),
-            resolved_release_digest: resolved_digest(),
-        },
-    )
-    .await?;
-    let cleanup_id = uuid::Uuid::parse_str(&cleanup.operation_id)?;
-    let client = pool.get().await?;
-    client
-        .execute(
-            "UPDATE wr_node_operations SET committed = TRUE, committed_at = NOW(),
-                    phase = 'committed_cleanup', state = 'paused'
-             WHERE operation_id = $1",
-            &[&cleanup_id],
-        )
-        .await?;
-    let second_revision = second.revision as i64;
-    client
-        .execute(
-            "UPDATE wr_nodes SET current_revision = $1, target_revision = NULL
-             WHERE node_id = 'supersede-node'",
-            &[&second_revision],
-        )
-        .await?;
-    client
-        .execute(
-            "UPDATE wr_node_deployments SET state = 'succeeded', completed_at = NOW()
-             WHERE node_id = 'supersede-node' AND revision = $1",
-            &[&second_revision],
-        )
-        .await?;
-    drop(client);
+    commit_deployment(&pool, &second).await?;
+    let terminal = wr_manager::operations::list(&pool, "rollback-terminal-node", true)
+        .await?
+        .into_iter()
+        .find(|operation| operation.target_revision == second.revision)
+        .expect("committed rollout history");
+    assert_eq!(
+        NodeOperationPhase::try_from(terminal.phase)?,
+        NodeOperationPhase::Complete
+    );
+    assert_eq!(
+        NodeOperationState::try_from(terminal.state)?,
+        NodeOperationState::Succeeded
+    );
 
     let rollback = wr_manager::db::begin_rollback(
         &pool,
-        "supersede-node",
+        "rollback-terminal-node",
         first.revision,
-        "rollback-op",
+        "later-rollback",
         "operator-a",
     )
     .await?
@@ -921,8 +890,8 @@ async fn rollback_supersedes_and_fences_committed_cleanup() -> Result<()> {
     let rollback = wr_manager::db::finalize_deployment(
         &pool,
         &FinalizeDeploymentRequest {
-            node_id: "supersede-node".into(),
-            attempt_token: "rollback-op".into(),
+            node_id: "rollback-terminal-node".into(),
+            attempt_token: "later-rollback".into(),
             revision: rollback.revision,
             bundle_digest: rollback.bundle_digest.clone(),
             resolved_release_digest: resolved_digest(),
@@ -931,33 +900,32 @@ async fn rollback_supersedes_and_fences_committed_cleanup() -> Result<()> {
     )
     .await?
     .record;
-    let replacement = wr_manager::operations::submit(
+    let submitted = wr_manager::operations::submit(
         &pool,
         "operator-a",
         &SubmitOperationRequest {
-            node_id: "supersede-node".into(),
-            request_token: "rollback-op".into(),
+            node_id: "rollback-terminal-node".into(),
+            request_token: "later-rollback".into(),
             action: NodeOperationAction::Rollback as i32,
             engine_slots: vec!["blue".into()],
             target_revision: rollback.revision,
-            bundle_digest: rollback.bundle_digest,
+            bundle_digest: rollback.bundle_digest.clone(),
             policy: Some(policy(1_800)),
             resolved_release_digest: resolved_digest(),
         },
     )
     .await?;
-    assert_eq!(replacement.operation_id, rollback.operation_id);
-    let old = wr_manager::operations::get(&pool, &cleanup.operation_id).await?;
+    assert_eq!(submitted.operation_id, rollback.operation_id);
+
+    let unchanged = wr_manager::operations::get(&pool, &terminal.operation_id).await?;
     assert_eq!(
-        NodeOperationPhase::try_from(old.phase)?,
-        NodeOperationPhase::Superseded
+        NodeOperationPhase::try_from(unchanged.phase)?,
+        NodeOperationPhase::Complete
     );
-    assert_eq!(old.cleanup_superseded_by, replacement.operation_id);
     assert_eq!(
-        NodeOperationState::try_from(old.state)?,
+        NodeOperationState::try_from(unchanged.state)?,
         NodeOperationState::Succeeded
     );
-
     Ok(())
 }
 
@@ -2012,295 +1980,341 @@ async fn agent_policy_update_fences_durable_work_until_explicit_resume() -> Resu
 }
 
 #[tokio::test]
-async fn rolling_commit_cleanup_requires_typed_retention_evidence() -> Result<()> {
+async fn periodic_node_cleanup_has_independent_generation_and_receipt_lifecycle() -> Result<()> {
+    use wr_common::wruntime::{
+        NodeCleanupResultDisposition, NodeCleanupState, ReportNodeCleanupResultRequest,
+    };
+
     let pool = manager_pool().await;
-    let oldest_digest = format!("sha256:{}", "d".repeat(64));
-    let oldest =
-        stage_with_module(&pool, "cleanup-node", "oldest", &oldest_digest, &["blue"]).await;
-    commit_deployment(&pool, &oldest).await?;
-    let old_digest = format!("sha256:{}", "e".repeat(64));
-    let old = stage_with_module(&pool, "cleanup-node", "old", &old_digest, &["blue"]).await;
-    commit_deployment(&pool, &old).await?;
-    let source_digest = format!("sha256:{}", "f".repeat(64));
-    let source =
-        stage_with_module(&pool, "cleanup-node", "source", &source_digest, &["blue"]).await;
-    commit_ready_deployment(&pool, &source, &[("blue", "cleanup-old")]).await?;
-    let history_digest = format!("sha256:{}", "1".repeat(64));
-    let history =
-        stage_with_module(&pool, "cleanup-node", "history", &history_digest, &["blue"]).await;
-    commit_deployment(&pool, &history).await?;
-    let deleted_digest = format!("sha256:{}", "2".repeat(64));
-    let deleted =
-        stage_with_module(&pool, "cleanup-node", "deleted", &deleted_digest, &["blue"]).await;
-    commit_deployment(&pool, &deleted).await?;
-    pool.get()
-        .await?
-        .execute(
-            "UPDATE wr_nodes SET current_revision = $2, target_revision = NULL WHERE node_id = $1",
-            &[&"cleanup-node", &(source.revision as i64)],
-        )
-        .await?;
-    let target_digest = format!("sha256:{}", "0".repeat(64));
-    let target = stage_with_module(
+    configure_agent(&pool, "cleanup-node", "activation-cleanup").await;
+    assert_eq!(
+        wr_manager::operations::reconcile_node_cleanup_batch(&pool, "manager-a", 10).await?,
+        1
+    );
+    let claimed = wr_manager::operations::claim_node_cleanup(
         &pool,
         "cleanup-node",
-        "cleanup-op",
-        &target_digest,
-        &["blue"],
+        "activation-cleanup",
+        "agent-a",
     )
-    .await;
-    let operation = wr_manager::operations::submit(
+    .await?
+    .expect("periodic pass materialized inventory authority");
+    let instruction = claimed.instruction.expect("cleanup instruction");
+    assert!(
+        instruction.delete_releases.is_empty(),
+        "first generation is inventory-only"
+    );
+    let request = ReportNodeCleanupResultRequest {
+        node_id: instruction.node_id.clone(),
+        agent_instance_id: instruction.agent_instance_id.clone(),
+        generation: instruction.generation,
+        lease_epoch: instruction.lease_epoch,
+        claim_instance: instruction.claim_instance.clone(),
+        payload_digest: instruction.payload_digest.clone(),
+        deleted_releases: vec![],
+        resulting_inventory: vec![],
+        condition_code: String::new(),
+        detail: String::new(),
+    };
+    let accepted =
+        wr_manager::operations::report_node_cleanup_result(&pool, &request, "agent-a").await?;
+    assert_eq!(
+        accepted.disposition,
+        NodeCleanupResultDisposition::Accepted as i32
+    );
+    assert_eq!(
+        accepted.cleanup.as_ref().unwrap().state,
+        NodeCleanupState::Clean as i32
+    );
+    let duplicate =
+        wr_manager::operations::report_node_cleanup_result(&pool, &request, "agent-a").await?;
+    assert_eq!(
+        duplicate.disposition,
+        NodeCleanupResultDisposition::Accepted as i32
+    );
+    let receipts: i64 = pool.get().await?.query_one(
+        "SELECT COUNT(*) FROM wr_node_release_cleanup_result_receipts WHERE node_id = 'cleanup-node'",
+        &[],
+    ).await?.get(0);
+    assert_eq!(receipts, 1, "lost acknowledgement replay is idempotent");
+
+    let client = pool.get().await?;
+    client.execute("UPDATE wr_node_release_cleanup SET state = 'paused', diagnostic_code = 'TEST_PAUSE' WHERE node_id = 'cleanup-node'", &[]).await?;
+    let retried =
+        wr_manager::operations::retry_node_cleanup(&pool, "cleanup-node", instruction.generation)
+            .await?;
+    assert_eq!(retried.state, NodeCleanupState::NeedsReconcile as i32);
+    assert_eq!(retried.generation, instruction.generation + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_retention_protects_only_unabandoned_staged_allocations() -> Result<()> {
+    let pool = manager_pool().await;
+    let node = "cleanup-retention-node";
+    configure_agent_with_retention(&pool, node, "cleanup-retention-agent", 1).await;
+    let mut deployments = Vec::new();
+    for (index, digit) in ['1', '2', '3', '4', '5', '6'].into_iter().enumerate() {
+        let deployment = stage(
+            &pool,
+            node,
+            &format!("cleanup-retention-{index}"),
+            &format!("sha256:{}", digit.to_string().repeat(64)),
+            &["blue"],
+        )
+        .await;
+        commit_deployment(&pool, &deployment).await?;
+        deployments.push(deployment);
+    }
+    let inventory = deployments
+        .iter()
+        .map(|deployment| ReleaseInventoryEntry {
+            revision: deployment.revision,
+            bundle_digest: deployment.bundle_digest.clone(),
+            resolved_release_digest: deployment.resolved_release_digest.clone(),
+        })
+        .collect::<Vec<_>>();
+    wr_manager::operations::reconcile_node_cleanup_batch(&pool, "manager-a", 10).await?;
+    let first = wr_manager::operations::claim_node_cleanup(
         &pool,
-        "operator-a",
-        &SubmitOperationRequest {
-            node_id: "cleanup-node".into(),
-            request_token: "cleanup-op".into(),
-            action: NodeOperationAction::RollingUpgrade as i32,
-            engine_slots: vec!["blue".into()],
-            target_revision: target.revision,
-            bundle_digest: target.bundle_digest.clone(),
-            policy: Some(policy(300)),
-            resolved_release_digest: resolved_digest(),
+        node,
+        "cleanup-retention-agent",
+        "agent-a",
+    )
+    .await?
+    .expect("inventory generation")
+    .instruction
+    .expect("inventory instruction");
+    wr_manager::operations::report_node_cleanup_result(
+        &pool,
+        &ReportNodeCleanupResultRequest {
+            node_id: node.into(),
+            agent_instance_id: first.agent_instance_id,
+            generation: first.generation,
+            lease_epoch: first.lease_epoch,
+            claim_instance: first.claim_instance,
+            payload_digest: first.payload_digest,
+            resulting_inventory: inventory.clone(),
+            ..Default::default()
         },
+        "agent-a",
     )
     .await?;
-    pool.get()
-        .await?
+
+    let client = pool.get().await?;
+    client
         .execute(
-            "INSERT INTO wr_node_release_deletions
-               (node_id, revision, bundle_digest, operation_id)
-             VALUES ($1, $2, $3, $4)",
+            "UPDATE wr_node_deployments SET state = CASE revision
+               WHEN $2 THEN 'pending' WHEN $3 THEN 'active' WHEN $4 THEN 'pending' ELSE state END,
+             abandoned_at = CASE WHEN revision = $2 THEN NOW() ELSE NULL END,
+             abandoned_by = CASE WHEN revision = $2 THEN 'operator-a' ELSE NULL END,
+             operation_id = CASE WHEN revision = $2 THEN NULL ELSE operation_id END
+             WHERE node_id = $1",
             &[
-                &"cleanup-node",
-                &(deleted.revision as i64),
-                &deleted.bundle_digest,
-                &Uuid::parse_str(&operation.operation_id)?,
+                &node,
+                &(deployments[1].revision as i64),
+                &(deployments[2].revision as i64),
+                &(deployments[3].revision as i64),
             ],
         )
         .await?;
-    configure_agent_with_retention(&pool, "cleanup-node", "activation-a", 1).await;
-    let verify_release = claim_instruction(&pool, "cleanup-node", "activation-a").await?;
-    report_ok(&pool, &verify_release, "", "").await?;
-    let verify_source = claim_instruction(&pool, "cleanup-node", "activation-a").await?;
-    observe(
-        &pool,
-        &verify_source,
-        "blue",
-        BackendProcessState::Running,
-        "backend-old",
-        "process-old",
-        source.revision,
-        &source.bundle_digest,
+    drop(client);
+    wr_manager::operations::fence_cleanup_authority(
+        &pool.get().await?,
+        node,
+        "TEST_RETENTION_CHANGE",
     )
     .await?;
-    let stop = claim_instruction(&pool, "cleanup-node", "activation-a").await?;
-    let cleanup_old_fence = engine_fence(&pool, "cleanup-old").await?;
-    wr_manager::db::deregister_engine(&pool, "cleanup-old", &cleanup_old_fence).await?;
-    observe(
+    wr_manager::operations::reconcile_node_cleanup_batch(&pool, "manager-a", 10).await?;
+    let instruction = wr_manager::operations::claim_node_cleanup(
         &pool,
-        &stop,
-        "blue",
-        BackendProcessState::Exited,
-        "backend-old",
-        "",
-        source.revision,
-        &source.bundle_digest,
+        node,
+        "cleanup-retention-agent",
+        "agent-a",
     )
-    .await?;
-    let select = claim_instruction(&pool, "cleanup-node", "activation-a").await?;
-    report_ok(&pool, &select, "", "").await?;
-    observe(
-        &pool,
-        &select,
-        "blue",
-        BackendProcessState::Exited,
-        "backend-old",
-        "",
-        target.revision,
-        &target.bundle_digest,
-    )
-    .await?;
-    let start = claim_instruction(&pool, "cleanup-node", "activation-a").await?;
-    register_ready(&pool, &target, "blue", "cleanup-new").await?;
-    observe(
-        &pool,
-        &start,
-        "blue",
-        BackendProcessState::Running,
-        "backend-new",
-        "process-new",
-        target.revision,
-        &target.bundle_digest,
-    )
-    .await?;
-    observe(
-        &pool,
-        &start,
-        "blue",
-        BackendProcessState::Running,
-        "backend-new",
-        "process-new",
-        target.revision,
-        &target.bundle_digest,
-    )
-    .await?;
-    assert!(
-        wr_manager::operations::claim(&pool, "cleanup-node", "activation-a", "agent-a")
-            .await?
-            .is_none()
-    );
-    let cleanup_new_fence = engine_fence(&pool, "cleanup-new").await?;
-    wr_manager::db::publish_engine_readiness(
-        &pool,
-        "cleanup-new",
-        &[module_descriptor()],
-        &cleanup_new_fence,
-    )
-    .await?;
-    assert!(
-        wr_manager::operations::claim(&pool, "cleanup-node", "activation-a", "agent-a")
-            .await?
-            .is_none()
-    );
-    let cleanup = claim_instruction(&pool, "cleanup-node", "activation-a").await?;
-    assert_eq!(cleanup.step, NodeOperationStepKind::CleanupRelease as i32);
-    assert_eq!(
-        cleanup.cleanup_delete_releases,
-        vec![
-            ReleaseInventoryEntry {
-                revision: oldest.revision,
-                bundle_digest: oldest.bundle_digest.clone(),
-                resolved_release_digest: oldest.resolved_release_digest.clone(),
-            },
-            ReleaseInventoryEntry {
-                revision: old.revision,
-                bundle_digest: old.bundle_digest.clone(),
-                resolved_release_digest: old.resolved_release_digest.clone(),
-            },
-        ],
-        "deleted history must not consume the retention slot held by the newest extant history"
-    );
-    let mut failed_inspection = result_for(&cleanup, "");
-    failed_inspection.backend_query_error = "release inventory query failed".into();
-    let paused = wr_manager::operations::report_step(&pool, &failed_inspection, "agent-a").await?;
-    assert_eq!(
-        NodeOperationState::try_from(paused.state)?,
-        NodeOperationState::Paused
-    );
-    assert_eq!(paused.conditions[0].code, "CLEANUP_QUERY_ERROR");
-    assert!(paused.cleanup_evidence.is_none());
-    wr_manager::operations::put_agent_policy(
-        &pool,
-        "operator-a",
-        &helpers::node_agent::systemd_policy("cleanup-node", 3),
-    )
-    .await?;
-    let stored_allowlist: Option<Vec<u8>> = pool
-        .get()
-        .await?
-        .query_one(
-            "SELECT cleanup_delete_allowlist FROM wr_node_operations WHERE operation_id = $1",
-            &[&Uuid::parse_str(&operation.operation_id)?],
-        )
-        .await?
-        .get(0);
-    assert!(
-        stored_allowlist.is_none(),
-        "a changed retention policy must revoke reported/undelivered cleanup authority"
-    );
-    configure_agent_with_retention(&pool, "cleanup-node", "activation-b", 3).await;
-    wr_manager::operations::resume(&pool, &operation.operation_id, "operator-a").await?;
-    let cleanup = claim_instruction(&pool, "cleanup-node", "activation-b").await?;
-    assert_eq!(
-        cleanup.cleanup_delete_releases,
-        vec![ReleaseInventoryEntry {
-            revision: oldest.revision,
-            bundle_digest: oldest.bundle_digest.clone(),
-            resolved_release_digest: oldest.resolved_release_digest.clone(),
-        }],
-        "resume must recompute cleanup authority from the replacement retention policy"
-    );
-    let mut cleanup_result = result_for(&cleanup, "");
-    cleanup_result.cleanup_evidence = Some(CleanupReleaseEvidence {
-        retained_releases: vec![
-            ReleaseInventoryEntry {
-                revision: target.revision,
-                bundle_digest: target.bundle_digest.clone(),
-                resolved_release_digest: target.resolved_release_digest.clone(),
-            },
-            ReleaseInventoryEntry {
-                revision: source.revision,
-                bundle_digest: source.bundle_digest.clone(),
-                resolved_release_digest: source.resolved_release_digest.clone(),
-            },
-            ReleaseInventoryEntry {
-                revision: history.revision,
-                bundle_digest: history.bundle_digest.clone(),
-                resolved_release_digest: history.resolved_release_digest.clone(),
-            },
-            ReleaseInventoryEntry {
-                revision: old.revision,
-                bundle_digest: old.bundle_digest.clone(),
-                resolved_release_digest: old.resolved_release_digest.clone(),
-            },
-        ],
-    });
-    let terminal = wr_manager::operations::report_step(&pool, &cleanup_result, "agent-a").await?;
-    assert_eq!(
-        NodeOperationState::try_from(terminal.state)?,
-        NodeOperationState::Succeeded
-    );
-    assert_eq!(
-        NodeOperationPhase::try_from(terminal.phase)?,
-        NodeOperationPhase::Complete
-    );
-    assert!(terminal.committed);
-    assert!(terminal.cleanup_evidence.is_some());
-    assert_eq!(terminal.operation_id, operation.operation_id);
-    let receipt_count_before_duplicate: i64 = pool
-        .get()
-        .await?
-        .query_one(
-            "SELECT COUNT(*) FROM wr_node_operation_result_receipts
-             WHERE operation_id = $1",
-            &[&Uuid::parse_str(&operation.operation_id)?],
-        )
-        .await?
-        .get(0);
-
-    let duplicate = wr_manager::operations::report_step(&pool, &cleanup_result, "agent-a").await?;
-    assert_eq!(
-        NodeOperationState::try_from(duplicate.state)?,
-        NodeOperationState::Succeeded,
-        "an exact retry must be acknowledged after atomic acceptance"
-    );
-    let mut conflicting = cleanup_result;
-    conflicting.backend_query_error = "conflicting retry".into();
-    let rejected = wr_manager::operations::report_step(&pool, &conflicting, "agent-a")
-        .await
-        .expect_err("a conflicting accepted-result retry must fail closed");
-    assert_eq!(rejected.code(), Code::Aborted);
-    let receipt_count_after_duplicate: i64 = pool
-        .get()
-        .await?
-        .query_one(
-            "SELECT COUNT(*) FROM wr_node_operation_result_receipts
-             WHERE operation_id = $1",
-            &[&Uuid::parse_str(&operation.operation_id)?],
-        )
-        .await?
-        .get(0);
-    assert_eq!(
-        receipt_count_after_duplicate, receipt_count_before_duplicate,
-        "duplicate acknowledgement must not advance twice"
-    );
-    let deletion_events = wr_manager::operations::events(&pool, &operation.operation_id)
-        .await?
-        .into_iter()
-        .filter(|event| event.event_code == "RELEASE_DELETED")
+    .await?
+    .expect("retention generation")
+    .instruction
+    .expect("retention instruction");
+    let deleted = instruction
+        .delete_releases
+        .iter()
+        .map(|release| release.revision)
         .collect::<Vec<_>>();
-    assert_eq!(deletion_events.len(), 1);
-    assert!(deletion_events[0].detail.contains(&oldest.bundle_digest));
+    assert_eq!(
+        deleted,
+        vec![deployments[0].revision, deployments[1].revision],
+        "old history and abandoned pending allocation are deletable; active, unabandoned pending, newest history, and current stay protected"
+    );
+    Ok(())
+}
 
+#[tokio::test]
+async fn cleanup_fencing_coalesces_and_reports_against_issued_snapshot() -> Result<()> {
+    let pool = manager_pool().await;
+    let node = "cleanup-fencing-node";
+    configure_agent_with_retention(&pool, node, "cleanup-fencing-agent", 1).await;
+    let old = stage(
+        &pool,
+        node,
+        "cleanup-fencing-old",
+        &format!("sha256:{}", "a".repeat(64)),
+        &["blue"],
+    )
+    .await;
+    commit_deployment(&pool, &old).await?;
+    let middle = stage(
+        &pool,
+        node,
+        "cleanup-fencing-middle",
+        &format!("sha256:{}", "b".repeat(64)),
+        &["blue"],
+    )
+    .await;
+    commit_deployment(&pool, &middle).await?;
+    let current = stage(
+        &pool,
+        node,
+        "cleanup-fencing-current",
+        &format!("sha256:{}", "c".repeat(64)),
+        &["blue"],
+    )
+    .await;
+    commit_deployment(&pool, &current).await?;
+    let inventory = [&old, &middle, &current]
+        .into_iter()
+        .map(|deployment| ReleaseInventoryEntry {
+            revision: deployment.revision,
+            bundle_digest: deployment.bundle_digest.clone(),
+            resolved_release_digest: deployment.resolved_release_digest.clone(),
+        })
+        .collect::<Vec<_>>();
+    wr_manager::operations::reconcile_node_cleanup_batch(&pool, "manager-a", 10).await?;
+    let discover =
+        wr_manager::operations::claim_node_cleanup(&pool, node, "cleanup-fencing-agent", "agent-a")
+            .await?
+            .unwrap()
+            .instruction
+            .unwrap();
+    wr_manager::operations::report_node_cleanup_result(
+        &pool,
+        &ReportNodeCleanupResultRequest {
+            node_id: node.into(),
+            agent_instance_id: discover.agent_instance_id,
+            generation: discover.generation,
+            lease_epoch: discover.lease_epoch,
+            claim_instance: discover.claim_instance,
+            payload_digest: discover.payload_digest,
+            resulting_inventory: inventory.clone(),
+            ..Default::default()
+        },
+        "agent-a",
+    )
+    .await?;
+    wr_manager::operations::fence_cleanup_authority(&pool.get().await?, node, "FIRST_CHANGE")
+        .await?;
+    wr_manager::operations::reconcile_node_cleanup_batch(&pool, "manager-a", 10).await?;
+    let stale =
+        wr_manager::operations::claim_node_cleanup(&pool, node, "cleanup-fencing-agent", "agent-a")
+            .await?
+            .unwrap()
+            .instruction
+            .unwrap();
+    wr_manager::operations::fence_cleanup_authority(&pool.get().await?, node, "SECOND_CHANGE")
+        .await?;
+    wr_manager::operations::fence_cleanup_authority(&pool.get().await?, node, "THIRD_CHANGE")
+        .await?;
+    wr_manager::operations::reconcile_node_cleanup_batch(&pool, "manager-b", 10).await?;
+    let newest =
+        wr_manager::operations::claim_node_cleanup(&pool, node, "cleanup-fencing-agent", "agent-a")
+            .await?
+            .unwrap()
+            .instruction
+            .unwrap();
+    assert!(newest.generation > stale.generation);
+    assert_eq!(newest.delete_releases, stale.delete_releases);
+    assert_eq!(newest.expected_inventory, stale.expected_inventory);
+
+    let stale_result = wr_manager::operations::report_node_cleanup_result(
+        &pool,
+        &ReportNodeCleanupResultRequest {
+            node_id: node.into(),
+            agent_instance_id: stale.agent_instance_id,
+            generation: stale.generation,
+            lease_epoch: stale.lease_epoch,
+            claim_instance: stale.claim_instance,
+            payload_digest: stale.payload_digest,
+            deleted_releases: stale.delete_releases,
+            resulting_inventory: vec![inventory[1].clone(), inventory[2].clone()],
+            ..Default::default()
+        },
+        "agent-a",
+    )
+    .await?;
+    assert_eq!(
+        stale_result.disposition,
+        NodeCleanupResultDisposition::Superseded as i32
+    );
+    let invalid = wr_manager::operations::report_node_cleanup_result(
+        &pool,
+        &ReportNodeCleanupResultRequest {
+            node_id: node.into(),
+            agent_instance_id: newest.agent_instance_id.clone(),
+            generation: newest.generation,
+            lease_epoch: newest.lease_epoch,
+            claim_instance: newest.claim_instance.clone(),
+            payload_digest: newest.payload_digest.clone(),
+            deleted_releases: vec![],
+            resulting_inventory: inventory.clone(),
+            ..Default::default()
+        },
+        "agent-a",
+    )
+    .await
+    .expect_err("result must exactly account for the issued deletion set");
+    assert_eq!(invalid.code(), Code::FailedPrecondition);
+
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE wr_node_deployments SET state = 'active' WHERE node_id = $1 AND revision = $2",
+            &[&node, &(old.revision as i64)],
+        )
+        .await?;
+    let accepted = wr_manager::operations::report_node_cleanup_result(
+        &pool,
+        &ReportNodeCleanupResultRequest {
+            node_id: node.into(),
+            agent_instance_id: newest.agent_instance_id,
+            generation: newest.generation,
+            lease_epoch: newest.lease_epoch,
+            claim_instance: newest.claim_instance,
+            payload_digest: newest.payload_digest,
+            deleted_releases: newest.delete_releases,
+            resulting_inventory: vec![inventory[1].clone(), inventory[2].clone()],
+            ..Default::default()
+        },
+        "agent-a",
+    )
+    .await?;
+    assert_eq!(
+        accepted.disposition,
+        NodeCleanupResultDisposition::Accepted as i32,
+        "report handling must validate the immutable issued snapshot rather than recomputing policy"
+    );
+
+    configure_agent(&pool, "cleanup-query-node", "cleanup-query-agent").await;
+    pool.get()
+        .await?
+        .execute(
+            "DELETE FROM wr_node_agent_policies WHERE node_id = 'cleanup-query-node'",
+            &[],
+        )
+        .await?;
+    wr_manager::operations::reconcile_node_cleanup_batch(&pool, "manager-a", 10).await?;
+    let paused =
+        wr_manager::operations::get_node_cleanup_status(&pool, "cleanup-query-node").await?;
+    assert_eq!(paused.state, NodeCleanupState::Paused as i32);
+    assert_eq!(paused.diagnostic_code, "POLICY_QUERY_FAILED");
     Ok(())
 }

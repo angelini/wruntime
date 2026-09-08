@@ -278,6 +278,8 @@ pub struct ManagerConfig {
     pub listen_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_heartbeat_timeout_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_cleanup_interval_secs: Option<u64>,
     pub database: ManagerDatabaseConfig,
     pub cluster: ClusterConfig,
     pub tls: CliServerTlsConfig,

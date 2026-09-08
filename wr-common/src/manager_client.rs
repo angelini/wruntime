@@ -580,11 +580,41 @@ where
     ) -> Result<tonic::Response<GetManagerRolloutResponse>, tonic::Status> {
         self.infrastructure.get_manager_rollout(request).await
     }
+    pub async fn get_node_cleanup_status(
+        &mut self,
+        request: impl tonic::IntoRequest<GetNodeCleanupStatusRequest>,
+    ) -> Result<tonic::Response<GetNodeCleanupStatusResponse>, tonic::Status> {
+        self.infrastructure.get_node_cleanup_status(request).await
+    }
+    pub async fn retry_node_cleanup(
+        &mut self,
+        request: impl tonic::IntoRequest<RetryNodeCleanupRequest>,
+    ) -> Result<tonic::Response<RetryNodeCleanupResponse>, tonic::Status> {
+        self.infrastructure.retry_node_cleanup(request).await
+    }
     pub async fn claim_operation(
         &mut self,
         request: impl tonic::IntoRequest<ClaimOperationRequest>,
     ) -> Result<tonic::Response<ClaimOperationResponse>, tonic::Status> {
         self.node.claim_operation(request).await
+    }
+    pub async fn claim_node_cleanup(
+        &mut self,
+        request: impl tonic::IntoRequest<ClaimNodeCleanupRequest>,
+    ) -> Result<tonic::Response<ClaimNodeCleanupResponse>, tonic::Status> {
+        self.node.claim_node_cleanup(request).await
+    }
+    pub async fn renew_node_cleanup_lease(
+        &mut self,
+        request: impl tonic::IntoRequest<RenewNodeCleanupLeaseRequest>,
+    ) -> Result<tonic::Response<RenewNodeCleanupLeaseResponse>, tonic::Status> {
+        self.node.renew_node_cleanup_lease(request).await
+    }
+    pub async fn report_node_cleanup_result(
+        &mut self,
+        request: impl tonic::IntoRequest<ReportNodeCleanupResultRequest>,
+    ) -> Result<tonic::Response<ReportNodeCleanupResultResponse>, tonic::Status> {
+        self.node.report_node_cleanup_result(request).await
     }
     pub async fn renew_operation_lease(
         &mut self,

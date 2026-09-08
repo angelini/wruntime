@@ -10,8 +10,9 @@ use flate2::Compression;
 use wr_common::agent_policy::AGENT_PROTOCOL_VERSION;
 use wr_common::wruntime::{
     AbandonDeploymentRequest, BeginDeploymentRequest, BeginRollbackRequest, DeploymentInventoryV1,
-    ExpectedEngine, ExpectedModule, FinalizeDeploymentRequest, ModuleIdentity, NodeOperationAction,
-    RolloutPolicy, SecretRequest, SubmitOperationRequest,
+    ExpectedEngine, ExpectedModule, FinalizeDeploymentRequest, GetNodeCleanupStatusRequest,
+    ModuleIdentity, NodeCleanupState, NodeCleanupSummary, NodeOperationAction,
+    RetryNodeCleanupRequest, RolloutPolicy, SecretRequest, SubmitOperationRequest,
 };
 
 use super::build_helpers::{self, BuildModule};
@@ -50,6 +51,8 @@ pub enum NodeCommand {
     Abandon(AbandonArgs),
     /// Run the node-local fenced lifecycle executor.
     Agent(super::node_agent::AgentArgs),
+    /// Inspect or retry manager-owned release cleanup.
+    Cleanup(CleanupArgs),
     /// Inspect a bundle without deploying
     InspectBundle(StatusArgs),
 }
@@ -204,6 +207,81 @@ pub struct AbandonArgs {
 }
 
 #[derive(Args)]
+pub struct CleanupArgs {
+    #[command(subcommand)]
+    command: CleanupCommand,
+}
+
+#[derive(Subcommand)]
+enum CleanupCommand {
+    Status {
+        node_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Retry {
+        node_id: String,
+        #[arg(long)]
+        generation: u64,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct CleanupDto<'a> {
+    node_id: &'a str,
+    state: &'static str,
+    generation: u64,
+    candidate_count: u32,
+    inventory_count: u32,
+    diagnostic_code: &'a str,
+    diagnostic_detail: &'a str,
+}
+
+fn cleanup_state_name(value: i32) -> &'static str {
+    match NodeCleanupState::try_from(value).unwrap_or(NodeCleanupState::Unspecified) {
+        NodeCleanupState::Clean => "clean",
+        NodeCleanupState::NeedsReconcile => "needs-reconcile",
+        NodeCleanupState::Pending => "pending",
+        NodeCleanupState::Claimed => "claimed",
+        NodeCleanupState::Paused => "paused",
+        NodeCleanupState::Unspecified => "unspecified",
+    }
+}
+
+fn cleanup_output(summary: &NodeCleanupSummary, json: bool) -> Result<String> {
+    let dto = CleanupDto {
+        node_id: &summary.node_id,
+        state: cleanup_state_name(summary.state),
+        generation: summary.generation,
+        candidate_count: summary.candidate_count,
+        inventory_count: summary.inventory_count,
+        diagnostic_code: &summary.diagnostic_code,
+        diagnostic_detail: &summary.diagnostic_detail,
+    };
+    if json {
+        Ok(serde_json::to_string_pretty(&dto)?)
+    } else {
+        Ok(format!(
+            "Node {} cleanup={} generation={} candidates={} inventory={} diagnostic={} {}",
+            dto.node_id,
+            dto.state,
+            dto.generation,
+            dto.candidate_count,
+            dto.inventory_count,
+            dto.diagnostic_code,
+            dto.diagnostic_detail
+        ))
+    }
+}
+
+fn render_cleanup(summary: &NodeCleanupSummary, json: bool) -> Result<()> {
+    println!("{}", cleanup_output(summary, json)?);
+    Ok(())
+}
+
+#[derive(Args)]
 pub struct StatusArgs {
     /// Path to the bundle tarball
     bundle: String,
@@ -246,6 +324,42 @@ pub async fn run(args: NodeArgs, manager: Option<&str>) -> Result<()> {
             abandon(abandon_args, manager).await
         }
         NodeCommand::Agent(agent_args) => super::node_agent::run(agent_args, manager).await,
+        NodeCommand::Cleanup(cleanup_args) => {
+            let manager =
+                manager.ok_or_else(|| anyhow::anyhow!("--manager is required for node cleanup"))?;
+            let mut client = client::connect_operator(
+                manager,
+                wr_common::manager_client::RetryClass::NoReplayMutation,
+            )
+            .await?;
+            match cleanup_args.command {
+                CleanupCommand::Status { node_id, json } => {
+                    let summary = client
+                        .get_node_cleanup_status(GetNodeCleanupStatusRequest { node_id })
+                        .await?
+                        .into_inner()
+                        .cleanup
+                        .context("manager omitted cleanup summary")?;
+                    render_cleanup(&summary, json)
+                }
+                CleanupCommand::Retry {
+                    node_id,
+                    generation,
+                    json,
+                } => {
+                    let summary = client
+                        .retry_node_cleanup(RetryNodeCleanupRequest {
+                            node_id,
+                            observed_generation: generation,
+                        })
+                        .await?
+                        .into_inner()
+                        .cleanup
+                        .context("manager omitted cleanup summary")?;
+                    render_cleanup(&summary, json)
+                }
+            }
+        }
         NodeCommand::InspectBundle(status_args) => status(status_args),
     }
 }
@@ -2448,6 +2562,32 @@ allowed_hosts = ["api.example.com"]
         })();
         let _ = fs::remove_file(&path);
         result.unwrap();
+    }
+
+    #[test]
+    fn cleanup_status_output_is_stable_for_humans_and_json() {
+        let summary = NodeCleanupSummary {
+            node_id: "node-a".into(),
+            state: NodeCleanupState::Paused as i32,
+            generation: 7,
+            candidate_count: 2,
+            inventory_count: 4,
+            diagnostic_code: "QUERY_FAILED".into(),
+            diagnostic_detail: "inventory unavailable".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cleanup_output(&summary, false).unwrap(),
+            "Node node-a cleanup=paused generation=7 candidates=2 inventory=4 diagnostic=QUERY_FAILED inventory unavailable"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&cleanup_output(&summary, true).unwrap()).unwrap();
+        assert_eq!(json["node_id"], "node-a");
+        assert_eq!(json["state"], "paused");
+        assert_eq!(json["generation"], 7);
+        assert_eq!(json["candidate_count"], 2);
+        assert_eq!(json["inventory_count"], 4);
+        assert_eq!(json["diagnostic_code"], "QUERY_FAILED");
     }
 
     #[test]

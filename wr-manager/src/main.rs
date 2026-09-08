@@ -338,6 +338,15 @@ async fn run_service(config_path: &str) -> Result<()> {
 
     {
         let pool = db_pool.clone();
+        let id = manager_id.clone();
+        let interval = Duration::from_secs(config.release_cleanup_interval_secs);
+        tasks.spawn("manager-release-cleanup", move |cancellation| {
+            state::reconcile_release_cleanup_owned(pool, id, interval, cancellation)
+        });
+    }
+
+    {
+        let pool = db_pool.clone();
         let engine_timeout = config.engine_heartbeat_timeout_secs;
         let module_timeout = config.module_heartbeat_timeout_secs.get();
         tasks.spawn("manager-route-monitor", move |cancellation| {
