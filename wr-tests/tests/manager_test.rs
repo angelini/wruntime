@@ -14,11 +14,12 @@ use wr_common::wruntime::{
     EngineRegistration, ExpectedEngine, ExpectedModule, FinalizeDeploymentRequest,
     GetClusterStatusRequest, GetNodeCleanupStatusRequest, GetOperatorStatusRequest,
     GetRoutingTableRequest, GetSchemaRequest, HeartbeatRequest, ListEnginesRequest,
-    ModuleDescriptor, ModuleIdentity, NodeOperationAction, NodeOperationStepKind,
-    PutNodeAgentPolicyRequest, RegisterEngineRequest, RenewNodeCleanupLeaseRequest,
-    ReportNodeCleanupResultRequest, ReportNodeObservationRequest, ReportStepResultRequest,
-    ResumeOperationRequest, RetryNodeCleanupRequest, RolloutPolicy, RoutingRule, SecretRequest,
-    StatusSeverity, SubmitOperationRequest, VerifyDeploymentRequest, VerifyDeploymentResponse,
+    ModuleDescriptor, ModuleIdentity, NodeOperationAction, NodeOperationState,
+    NodeOperationStepKind, NodeSlotTransitionKind, PutNodeAgentPolicyRequest,
+    RegisterEngineRequest, RenewNodeCleanupLeaseRequest, ReportNodeCleanupResultRequest,
+    ReportNodeObservationRequest, ReportStepResultRequest, ResumeOperationRequest,
+    RetryNodeCleanupRequest, RolloutPolicy, RoutingRule, SecretRequest, StatusSeverity,
+    SubmitOperationRequest, VerifyDeploymentRequest, VerifyDeploymentResponse,
 };
 
 async fn verify_deployment(
@@ -1286,22 +1287,16 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
             .submit_operation(SubmitOperationRequest {
                 node_id: "node-a".into(),
                 request_token: attempt_token.into(),
-                action: if revision == 1 {
-                    NodeOperationAction::InitialApply as i32
-                } else {
-                    NodeOperationAction::RollingUpgrade as i32
-                },
-                engine_slots: vec!["primary".into()],
+                action: NodeOperationAction::Deployment as i32,
                 target_revision: revision,
                 bundle_digest: digest.into(),
                 policy: Some(RolloutPolicy {
                     max_unavailable: 1,
-                    canary_slot: "primary".into(),
-                    pause_after_canary: false,
                     allow_downtime: true,
                     deadline_seconds: 300,
                 }),
                 resolved_release_digest,
+                engine_slot: String::new(),
             })
             .await?
             .into_inner()
@@ -1615,6 +1610,343 @@ async fn test_concurrent_deployment_revision_allocation_is_unique() -> Result<()
 }
 
 #[tokio::test]
+async fn explicit_operation_intents_reject_ambiguous_fields() -> Result<()> {
+    let pool = helpers::db::manager_pool().await;
+    let server = start_authorized_manager(pool).await?;
+    let mut operator = server.operator_client(Some(&server.pki.operator)).await?;
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let resolved = format!("sha256:{}", "b".repeat(64));
+
+    let deployment_with_slot = operator
+        .submit_operation(SubmitOperationRequest {
+            node_id: "node-a".into(),
+            request_token: "deployment-with-slot".into(),
+            action: NodeOperationAction::Deployment as i32,
+            target_revision: 1,
+            bundle_digest: digest.clone(),
+            policy: None,
+            resolved_release_digest: resolved.clone(),
+            engine_slot: "blue".into(),
+        })
+        .await
+        .expect_err("deployment must not accept restart inventory");
+    assert_eq!(deployment_with_slot.code(), tonic::Code::InvalidArgument);
+
+    for request in [
+        SubmitOperationRequest {
+            node_id: "node-a".into(),
+            request_token: "restart-empty".into(),
+            action: NodeOperationAction::Restart as i32,
+            policy: None,
+            ..Default::default()
+        },
+        SubmitOperationRequest {
+            node_id: "node-a".into(),
+            request_token: "restart-target".into(),
+            action: NodeOperationAction::Restart as i32,
+            target_revision: 1,
+            bundle_digest: digest.clone(),
+            resolved_release_digest: resolved.clone(),
+            engine_slot: "blue".into(),
+            policy: None,
+        },
+    ] {
+        let error = operator
+            .submit_operation(request)
+            .await
+            .expect_err("ambiguous restart must be rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    let unknown = operator
+        .submit_operation(SubmitOperationRequest {
+            node_id: "node-a".into(),
+            request_token: "restart-unknown".into(),
+            action: NodeOperationAction::Restart as i32,
+            engine_slot: "blue".into(),
+            policy: None,
+            ..Default::default()
+        })
+        .await
+        .expect_err("restart slot must belong to committed desired inventory");
+    assert_eq!(unknown.code(), tonic::Code::FailedPrecondition);
+    Ok(())
+}
+
+#[tokio::test]
+async fn exact_revision_submission_is_immediately_successful_and_idempotent() -> Result<()> {
+    let pool = helpers::db::manager_pool().await;
+    let digest = format!("sha256:{}", "c".repeat(64));
+    let resolved = format!("sha256:{}", "d".repeat(64));
+    let historical_actor = "urn:wruntime:cluster-a:human:operator-a";
+    let deployment = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
+            node_id: "node-exact".into(),
+            attempt_token: "historical-allocation".into(),
+            bundle_digest: digest.clone(),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![ExpectedEngine {
+                    engine_slot: "blue".into(),
+                    ..Default::default()
+                }],
+            }),
+        },
+        historical_actor,
+    )
+    .await?
+    .record;
+    wr_manager::db::finalize_deployment(
+        &pool,
+        &FinalizeDeploymentRequest {
+            node_id: "node-exact".into(),
+            attempt_token: "historical-allocation".into(),
+            revision: deployment.revision,
+            bundle_digest: digest.clone(),
+            resolved_release_digest: resolved.clone(),
+        },
+        historical_actor,
+    )
+    .await?;
+    let client = pool.get().await?;
+    let revision = deployment.revision as i64;
+    client
+        .execute(
+            "UPDATE wr_node_deployments SET state = 'succeeded', completed_at = NOW()
+             WHERE node_id = 'node-exact' AND revision = $1",
+            &[&revision],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE wr_nodes SET current_revision = $1, target_revision = NULL
+             WHERE node_id = 'node-exact'",
+            &[&revision],
+        )
+        .await?;
+    client
+        .execute(
+            "INSERT INTO wr_node_slot_authority(node_id, engine_slot, revision, authoritative)
+             VALUES ('node-exact', 'blue', $1, TRUE)",
+            &[&revision],
+        )
+        .await?;
+    drop(client);
+
+    let request = SubmitOperationRequest {
+        node_id: "node-exact".into(),
+        request_token: "new-exact-request".into(),
+        action: NodeOperationAction::Deployment as i32,
+        target_revision: deployment.revision,
+        bundle_digest: digest,
+        policy: Some(RolloutPolicy {
+            max_unavailable: 1,
+            allow_downtime: false,
+            deadline_seconds: 300,
+        }),
+        resolved_release_digest: resolved,
+        engine_slot: String::new(),
+    };
+    let new_actor = "urn:wruntime:cluster-a:human:operator-b";
+    let operation = wr_manager::operations::submit(&pool, new_actor, &request).await?;
+    assert_eq!(operation.state, NodeOperationState::Succeeded as i32);
+    assert!(operation.committed);
+    let slot = operation
+        .targets
+        .iter()
+        .find(|target| target.transition == NodeSlotTransitionKind::Unchanged as i32)
+        .expect("unchanged slot progress");
+    assert!(slot.complete);
+    assert!(slot
+        .details
+        .as_ref()
+        .is_some_and(|details| matches!(details, wr_common::wruntime::operation_target_progress::Details::EngineDetails(value) if value.serving_converged)));
+    let replay = wr_manager::operations::submit(&pool, new_actor, &request).await?;
+    assert_eq!(replay.operation_id, operation.operation_id);
+    let mut changed = request.clone();
+    changed.policy.as_mut().unwrap().allow_downtime = true;
+    let conflict = wr_manager::operations::submit(&pool, new_actor, &changed)
+        .await
+        .expect_err("changed payload under the same token must fail");
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_desired_inventory_has_explicit_downtime_semantics() -> Result<()> {
+    let pool = helpers::db::manager_pool().await;
+    let actor = "urn:wruntime:cluster-a:human:operator-a";
+
+    let empty_digest = format!("sha256:{}", "e".repeat(64));
+    let empty_resolved = format!("sha256:{}", "f".repeat(64));
+    let empty = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
+            node_id: "node-empty".into(),
+            attempt_token: "empty-source".into(),
+            bundle_digest: empty_digest.clone(),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![],
+            }),
+        },
+        actor,
+    )
+    .await?
+    .record;
+    wr_manager::db::finalize_deployment(
+        &pool,
+        &FinalizeDeploymentRequest {
+            node_id: "node-empty".into(),
+            attempt_token: "empty-source".into(),
+            revision: empty.revision,
+            bundle_digest: empty_digest.clone(),
+            resolved_release_digest: empty_resolved.clone(),
+        },
+        actor,
+    )
+    .await?;
+    let client = pool.get().await?;
+    client
+        .execute(
+            "UPDATE wr_node_deployments SET state = 'succeeded', completed_at = NOW()
+             WHERE node_id = 'node-empty' AND revision = $1",
+            &[&(empty.revision as i64)],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE wr_nodes SET current_revision = $1, target_revision = NULL
+             WHERE node_id = 'node-empty'",
+            &[&(empty.revision as i64)],
+        )
+        .await?;
+    drop(client);
+    let zero_to_zero = wr_manager::operations::submit(
+        &pool,
+        actor,
+        &SubmitOperationRequest {
+            node_id: "node-empty".into(),
+            request_token: "empty-noop".into(),
+            action: NodeOperationAction::Deployment as i32,
+            target_revision: empty.revision,
+            bundle_digest: empty_digest,
+            policy: Some(RolloutPolicy {
+                max_unavailable: 99,
+                allow_downtime: false,
+                deadline_seconds: 300,
+            }),
+            resolved_release_digest: empty_resolved,
+            engine_slot: String::new(),
+        },
+    )
+    .await?;
+    assert_eq!(zero_to_zero.state, NodeOperationState::Succeeded as i32);
+
+    let source_digest = format!("sha256:{}", "1".repeat(64));
+    let source_resolved = format!("sha256:{}", "2".repeat(64));
+    let source = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
+            node_id: "node-remove".into(),
+            attempt_token: "remove-source".into(),
+            bundle_digest: source_digest.clone(),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![ExpectedEngine {
+                    engine_slot: "blue".into(),
+                    ..Default::default()
+                }],
+            }),
+        },
+        actor,
+    )
+    .await?
+    .record;
+    wr_manager::db::finalize_deployment(
+        &pool,
+        &FinalizeDeploymentRequest {
+            node_id: "node-remove".into(),
+            attempt_token: "remove-source".into(),
+            revision: source.revision,
+            bundle_digest: source_digest,
+            resolved_release_digest: source_resolved,
+        },
+        actor,
+    )
+    .await?;
+    let client = pool.get().await?;
+    client
+        .execute(
+            "UPDATE wr_node_deployments SET state = 'succeeded', completed_at = NOW()
+             WHERE node_id = 'node-remove' AND revision = $1",
+            &[&(source.revision as i64)],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE wr_nodes SET current_revision = $1, target_revision = NULL
+             WHERE node_id = 'node-remove'",
+            &[&(source.revision as i64)],
+        )
+        .await?;
+    drop(client);
+
+    let target_digest = format!("sha256:{}", "3".repeat(64));
+    let target_resolved = format!("sha256:{}", "4".repeat(64));
+    let target = wr_manager::db::begin_deployment(
+        &pool,
+        &BeginDeploymentRequest {
+            node_id: "node-remove".into(),
+            attempt_token: "remove-target".into(),
+            bundle_digest: target_digest.clone(),
+            inventory: Some(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: vec![],
+            }),
+        },
+        actor,
+    )
+    .await?
+    .record;
+    wr_manager::db::finalize_deployment(
+        &pool,
+        &FinalizeDeploymentRequest {
+            node_id: "node-remove".into(),
+            attempt_token: "remove-target".into(),
+            revision: target.revision,
+            bundle_digest: target_digest.clone(),
+            resolved_release_digest: target_resolved.clone(),
+        },
+        actor,
+    )
+    .await?;
+    let removal = wr_manager::operations::submit(
+        &pool,
+        actor,
+        &SubmitOperationRequest {
+            node_id: "node-remove".into(),
+            request_token: "remove-target".into(),
+            action: NodeOperationAction::Deployment as i32,
+            target_revision: target.revision,
+            bundle_digest: target_digest,
+            policy: Some(RolloutPolicy {
+                max_unavailable: 1,
+                allow_downtime: false,
+                deadline_seconds: 300,
+            }),
+            resolved_release_digest: target_resolved,
+            engine_slot: String::new(),
+        },
+    )
+    .await
+    .expect_err("N-to-zero must require explicit downtime acknowledgement");
+    assert_eq!(removal.code(), tonic::Code::FailedPrecondition);
+    Ok(())
+}
+
+#[tokio::test]
 async fn role_gated_services_enforce_real_mtls_identity_and_node_binding() -> Result<()> {
     let pool = helpers::db::manager_pool().await;
     let server = start_authorized_manager(pool).await?;
@@ -1631,17 +1963,15 @@ async fn role_gated_services_enforce_real_mtls_identity_and_node_binding() -> Re
             node_id: "node-a".into(),
             request_token: "viewer-denied".into(),
             action: NodeOperationAction::Restart as i32,
-            engine_slots: vec!["blue".into()],
             target_revision: 0,
             bundle_digest: String::new(),
             policy: Some(RolloutPolicy {
                 max_unavailable: 1,
-                canary_slot: "blue".into(),
-                pause_after_canary: false,
                 allow_downtime: true,
                 deadline_seconds: 300,
             }),
             resolved_release_digest: String::new(),
+            engine_slot: "blue".into(),
         })
         .await
         .expect_err("viewer mutation must be denied");
@@ -1749,8 +2079,19 @@ async fn rotated_operator_identity_and_attestation_policy_are_applied_over_mtls(
     let pool = helpers::db::manager_pool().await;
     let server = start_authorized_manager(pool.clone()).await?;
     let policy = helpers::node_agent::systemd_policy("node-a", 2);
+    let mut missing_retention = policy.clone();
+    missing_retention.retention_count = None;
+    let missing = server
+        .operator_client(Some(&server.pki.operator))
+        .await?
+        .put_node_agent_policy(PutNodeAgentPolicyRequest {
+            policy: Some(missing_retention),
+        })
+        .await
+        .expect_err("initial policy requires operator cleanup retention");
+    assert_eq!(missing.code(), tonic::Code::InvalidArgument);
     let mut inconsistent_policy = policy.clone();
-    inconsistent_policy.retention_count += 1;
+    inconsistent_policy.retention_count = Some(0);
     let rejected = server
         .operator_client(Some(&server.pki.operator))
         .await?
@@ -1758,7 +2099,7 @@ async fn rotated_operator_identity_and_attestation_policy_are_applied_over_mtls(
             policy: Some(inconsistent_policy),
         })
         .await
-        .expect_err("manager must recompute the canonical config digest");
+        .expect_err("manager must reject invalid cleanup retention");
     assert_eq!(rejected.code(), tonic::Code::InvalidArgument);
     for identity in [&server.pki.operator, &server.pki.operator_rotated] {
         server
@@ -1769,6 +2110,19 @@ async fn rotated_operator_identity_and_attestation_policy_are_applied_over_mtls(
             })
             .await?;
     }
+    let mut compatibility_only = policy.clone();
+    compatibility_only.retention_count = None;
+    let preserved = server
+        .operator_client(Some(&server.pki.operator))
+        .await?
+        .put_node_agent_policy(PutNodeAgentPolicyRequest {
+            policy: Some(compatibility_only),
+        })
+        .await?
+        .into_inner()
+        .policy
+        .expect("stored policy");
+    assert_eq!(preserved.retention_count, Some(2));
     let actor: String = pool
         .get()
         .await?
@@ -1830,15 +2184,9 @@ async fn rotated_operator_identity_and_attestation_policy_are_applied_over_mtls(
     let mut binary = helpers::node_agent::attestation(&policy, "activation-binary");
     binary.binary_digest = format!("sha256:{}", "b".repeat(64));
     mismatches.push(("BINARY_MISMATCH", binary));
-    let mut config = helpers::node_agent::attestation(&policy, "activation-config");
-    config.config_digest = format!("sha256:{}", "c".repeat(64));
-    mismatches.push(("CONFIG_MISMATCH", config));
     let mut backend = helpers::node_agent::attestation(&policy, "activation-backend");
     backend.backend = wr_common::wruntime::BackendKind::Docker as i32;
     mismatches.push(("BACKEND_MISMATCH", backend));
-    let mut retention = helpers::node_agent::attestation(&policy, "activation-retention");
-    retention.retention_count += 1;
-    mismatches.push(("RETENTION_MISMATCH", retention));
     let mut capability = helpers::node_agent::attestation(&policy, "activation-capability");
     capability.capabilities.pop();
     mismatches.push(("CAPABILITY_MISMATCH", capability));
@@ -1856,9 +2204,14 @@ async fn rotated_operator_identity_and_attestation_policy_are_applied_over_mtls(
             .any(|condition| condition.code == expected_code));
     }
 
+    let mut compatible_superset = helpers::node_agent::attestation(&policy, "activation-a");
+    compatible_superset
+        .capabilities
+        .push("harmless-extra-v1".into());
+    compatible_superset.capabilities.reverse();
     let accepted = agent
         .attest(AttestNodeAgentRequest {
-            attestation: Some(helpers::node_agent::attestation(&policy, "activation-a")),
+            attestation: Some(compatible_superset),
         })
         .await?
         .into_inner();
@@ -1910,18 +2263,16 @@ async fn resumed_agent_receives_epoch_bound_inspection_through_node_agent_rpc() 
         .submit_operation(SubmitOperationRequest {
             node_id: "node-a".into(),
             request_token: "rpc-resume".into(),
-            action: NodeOperationAction::InitialApply as i32,
-            engine_slots: vec!["blue".into()],
+            action: NodeOperationAction::Deployment as i32,
             target_revision: deployment.revision,
             bundle_digest: digest.clone(),
             policy: Some(RolloutPolicy {
                 max_unavailable: 1,
-                canary_slot: "blue".into(),
-                pause_after_canary: false,
                 allow_downtime: true,
                 deadline_seconds: 300,
             }),
             resolved_release_digest: format!("sha256:{}", "8".repeat(64)),
+            engine_slot: String::new(),
         })
         .await?
         .into_inner()
@@ -1956,7 +2307,10 @@ async fn resumed_agent_receives_epoch_bound_inspection_through_node_agent_rpc() 
             .expect("proxy operation instruction");
         assert_eq!(instruction.step, expected as i32);
         let target = instruction.target.as_ref().expect("proxy target");
-        assert!(target.engine_slot.is_empty());
+        assert!(matches!(
+            target.identity,
+            Some(wr_common::wruntime::instruction_target::Identity::Proxy(_))
+        ));
         agent
             .report_step_result(ReportStepResultRequest {
                 node_id: "node-a".into(),
@@ -1969,6 +2323,7 @@ async fn resumed_agent_receives_epoch_bound_inspection_through_node_agent_rpc() 
                 observed_resolved_release_digest: target.resolved_release_digest.clone(),
                 backend_instance_id: "proxy-backend".into(),
                 process_instance_id: "proxy-process".into(),
+                target: Some(target.clone()),
                 ..Default::default()
             })
             .await?;
@@ -1991,13 +2346,13 @@ async fn resumed_agent_receives_epoch_bound_inspection_through_node_agent_rpc() 
         .report_step_result(ReportStepResultRequest {
             node_id: "node-a".into(),
             operation_id: operation.operation_id.clone(),
-            engine_slot: "blue".into(),
             lease_epoch: verify_release.lease_epoch,
             step: verify_release.step,
             agent_instance_id: "activation-a".into(),
             observed_revision: target.revision,
             observed_digest: target.bundle_digest.clone(),
             observed_resolved_release_digest: target.resolved_release_digest.clone(),
+            target: Some(target.clone()),
             ..Default::default()
         })
         .await?;
@@ -2049,7 +2404,11 @@ async fn resumed_agent_receives_epoch_bound_inspection_through_node_agent_rpc() 
     assert_eq!(inspection.operation_id, operation.operation_id);
     assert_eq!(inspection.agent_instance_id, "activation-b");
     assert!(inspection.lease_epoch > select.lease_epoch);
-    assert_eq!(inspection.target.as_ref().unwrap().engine_slot, "blue");
+    assert!(matches!(
+        inspection.target.as_ref().unwrap().identity.as_ref(),
+        Some(wr_common::wruntime::instruction_target::Identity::EngineSlotTarget(identity))
+            if identity.engine_slot == "blue"
+    ));
     agent
         .report_observation(ReportNodeObservationRequest {
             node_id: "node-a".into(),

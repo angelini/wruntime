@@ -12,10 +12,7 @@ use wr_cli::cmd::node_agent::{
     ReportResultFuture,
 };
 use wr_cli::cmd::node_backend::{BackendFuture, InstructionExecutor, StepEvidence};
-use wr_common::agent_policy::{
-    AgentPolicy, AgentPolicyBackend, AGENT_CAPABILITIES, AGENT_POLICY_VERSION,
-    AGENT_PROTOCOL_VERSION,
-};
+use wr_common::agent_policy::{AGENT_CAPABILITIES, AGENT_PROTOCOL_VERSION};
 use wr_common::wruntime::{
     AgentInstruction, BackendKind, CleanupReleaseEvidence, NodeAgentAttestation, NodeAgentPolicy,
     NodeCleanupInstruction, ReleaseInventoryEntry, ReportNodeCleanupResultRequest,
@@ -23,48 +20,16 @@ use wr_common::wruntime::{
 };
 
 pub fn systemd_policy(node_id: &str, retention_count: u32) -> NodeAgentPolicy {
-    let policy = AgentPolicy {
-        policy_version: AGENT_POLICY_VERSION,
+    NodeAgentPolicy {
         node_id: node_id.into(),
-        manager_endpoint: "https://manager.example:9000".into(),
-        client_cert_path: "/opt/wruntime/wr-agent/certs/agent.crt".into(),
-        client_key_path: "/opt/wruntime/wr-agent/certs/agent.key".into(),
-        ca_cert_path: "/opt/wruntime/wr-agent/certs/ca.crt".into(),
-        deployment_root: "/opt/wruntime".into(),
-        runtime_dir: "/run/wruntime".into(),
-        backend: AgentPolicyBackend::Systemd,
-        compose_project: String::new(),
-        systemctl_path: "/usr/bin/systemctl".into(),
-        docker_path: String::new(),
-        poll_interval_seconds: 5,
-        renew_interval_seconds: 5,
-        retention_count,
         protocol_version: AGENT_PROTOCOL_VERSION.into(),
+        backend: BackendKind::Systemd as i32,
+        retention_count: Some(retention_count),
+        binary_digest: format!("sha256:{}", "a".repeat(64)),
         capabilities: AGENT_CAPABILITIES
             .iter()
             .map(|value| (*value).into())
             .collect(),
-    };
-    NodeAgentPolicy {
-        node_id: node_id.into(),
-        protocol_version: policy.protocol_version.clone(),
-        config_digest: policy.canonical_digest().expect("canonical test policy"),
-        backend: BackendKind::Systemd as i32,
-        retention_count,
-        policy_version: policy.policy_version,
-        binary_digest: format!("sha256:{}", "a".repeat(64)),
-        manager_endpoint: policy.manager_endpoint,
-        client_cert_path: policy.client_cert_path,
-        client_key_path: policy.client_key_path,
-        ca_cert_path: policy.ca_cert_path,
-        deployment_root: policy.deployment_root,
-        runtime_dir: policy.runtime_dir,
-        compose_project: policy.compose_project,
-        systemctl_path: policy.systemctl_path,
-        docker_path: policy.docker_path,
-        poll_interval_seconds: policy.poll_interval_seconds,
-        renew_interval_seconds: policy.renew_interval_seconds,
-        capabilities: policy.capabilities,
     }
 }
 
@@ -74,10 +39,8 @@ pub fn attestation(policy: &NodeAgentPolicy, activation: &str) -> NodeAgentAttes
         agent_instance_id: activation.into(),
         protocol_version: policy.protocol_version.clone(),
         binary_digest: policy.binary_digest.clone(),
-        config_digest: policy.config_digest.clone(),
         backend: policy.backend,
         capabilities: policy.capabilities.clone(),
-        retention_count: policy.retention_count,
         ..Default::default()
     }
 }

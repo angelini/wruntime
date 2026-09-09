@@ -13,19 +13,16 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
-use wr_common::agent_policy::{
-    AgentPolicy, AgentPolicyBackend, AGENT_CAPABILITIES, AGENT_POLICY_VERSION,
-    AGENT_PROTOCOL_VERSION,
-};
+use wr_common::agent_policy::AgentPolicyBackend;
 use wr_common::process_lifecycle::PROCESS_INSTANCE_ID_ENV;
 use wr_common::wruntime::{
-    AttestNodeAgentRequest, BackendKind, BackendProcessState, BeginDeploymentRequest,
-    ClaimOperationRequest, DeploymentInventoryV1, ExpectedEngine, ExpectedModule,
-    FinalizeDeploymentRequest, GetOperationRequest, InstructionTargetKind, LifecycleStatus,
-    ListEnginesRequest, ModuleIdentity, NodeAgentAttestation, NodeAgentPolicy, NodeOperationAction,
-    NodeOperationState, NodeOperationStepKind, ProcessLifecycleState, PutNodeAgentPolicyRequest,
-    ReportNodeObservationRequest, ReportStepResultRequest, RoutingRule, ServiceKind,
-    SubmitOperationRequest,
+    instruction_target, AttestNodeAgentRequest, BackendKind, BackendProcessState,
+    BeginDeploymentRequest, ClaimOperationRequest, DeploymentInventoryV1, ExpectedEngine,
+    ExpectedModule, FinalizeDeploymentRequest, GetOperationRequest, InstructionTargetKind,
+    LifecycleStatus, ListEnginesRequest, ModuleIdentity, NodeAgentAttestation, NodeAgentPolicy,
+    NodeOperationAction, NodeOperationState, NodeOperationStepKind, ProcessLifecycleState,
+    PutNodeAgentPolicyRequest, ReportNodeObservationRequest, ReportStepResultRequest, RoutingRule,
+    ServiceKind, SubmitOperationRequest,
 };
 
 use super::config::{DeploymentConfig, EngineConfig};
@@ -1338,12 +1335,12 @@ async fn prepare_managed_engine_configs(
         .submit_operation(SubmitOperationRequest {
             node_id: node_id.clone(),
             request_token: operation_token,
-            action: NodeOperationAction::InitialApply as i32,
-            engine_slots: configs.iter().map(|(_, slot)| slot.clone()).collect(),
+            action: NodeOperationAction::Deployment as i32,
             target_revision: deployment.revision,
             bundle_digest,
             policy: None,
             resolved_release_digest,
+            engine_slot: String::new(),
         })
         .await?
         .into_inner()
@@ -1373,31 +1370,7 @@ async fn prepare_managed_engine_configs(
     Ok((directory, paths))
 }
 
-fn foreground_agent_policy(manager_endpoint: &str) -> Result<NodeAgentPolicy> {
-    let policy = AgentPolicy {
-        policy_version: AGENT_POLICY_VERSION,
-        node_id: "node-a".into(),
-        manager_endpoint: manager_endpoint.into(),
-        client_cert_path: "/tmp/wruntime-foreground-agent/agent.crt".into(),
-        client_key_path: "/tmp/wruntime-foreground-agent/agent.key".into(),
-        ca_cert_path: "/tmp/wruntime-foreground-agent/ca.crt".into(),
-        deployment_root: "/tmp/wruntime-foreground-deployments".into(),
-        runtime_dir: "/tmp/wruntime-foreground-runtime".into(),
-        backend: AgentPolicyBackend::Systemd,
-        compose_project: String::new(),
-        systemctl_path: "/usr/bin/systemctl".into(),
-        docker_path: String::new(),
-        poll_interval_seconds: 1,
-        renew_interval_seconds: 1,
-        retention_count: 2,
-        protocol_version: AGENT_PROTOCOL_VERSION.into(),
-        capabilities: AGENT_CAPABILITIES
-            .iter()
-            .map(|capability| (*capability).into())
-            .collect(),
-    }
-    .normalized()?;
-    let config_digest = policy.canonical_digest()?;
+fn foreground_agent_policy(_manager_endpoint: &str) -> Result<NodeAgentPolicy> {
     let executable = std::env::current_exe().context("failed to locate foreground executable")?;
     let binary_digest =
         wr_common::agent_policy::sha256_digest(&std::fs::read(&executable).with_context(|| {
@@ -1407,9 +1380,10 @@ fn foreground_agent_policy(manager_endpoint: &str) -> Result<NodeAgentPolicy> {
             )
         })?);
     Ok(super::node_agent::wire_policy(
-        &policy,
+        "node-a",
+        AgentPolicyBackend::Systemd,
         binary_digest,
-        config_digest,
+        Some(2),
     ))
 }
 
@@ -1439,10 +1413,8 @@ async fn complete_foreground_operation(manager_endpoint: &str) -> Result<()> {
                 agent_instance_id: "foreground-agent".into(),
                 protocol_version: policy.protocol_version.clone(),
                 binary_digest: policy.binary_digest.clone(),
-                config_digest: policy.config_digest.clone(),
                 backend: BackendKind::Systemd as i32,
                 capabilities: policy.capabilities.clone(),
-                retention_count: policy.retention_count,
                 ..Default::default()
             }),
         })
@@ -1503,16 +1475,26 @@ async fn complete_foreground_operation(manager_endpoint: &str) -> Result<()> {
             .as_ref()
             .context("foreground instruction omitted target")?;
         let target_kind = InstructionTargetKind::try_from(target.kind)?;
+        let engine_slot = match (target_kind, target.identity.as_ref()) {
+            (InstructionTargetKind::Proxy, Some(instruction_target::Identity::Proxy(_))) => {
+                String::new()
+            }
+            (
+                InstructionTargetKind::EngineSlot,
+                Some(instruction_target::Identity::EngineSlotTarget(identity)),
+            ) if !identity.engine_slot.is_empty() => identity.engine_slot.clone(),
+            _ => anyhow::bail!("foreground instruction target kind and identity mismatch"),
+        };
         let step = NodeOperationStepKind::try_from(instruction.step)?;
         let backend_instance_id = if target_kind == InstructionTargetKind::Proxy {
             "foreground-proxy-backend".to_string()
         } else {
-            format!("foreground-backend-{}", target.engine_slot)
+            format!("foreground-backend-{engine_slot}")
         };
         let process_instance_id = if target_kind == InstructionTargetKind::Proxy {
             "foreground-proxy-process".to_string()
         } else {
-            format!("foreground-process-{}", target.engine_slot)
+            format!("foreground-process-{engine_slot}")
         };
         if target_kind == InstructionTargetKind::Proxy
             || matches!(
@@ -1526,7 +1508,6 @@ async fn complete_foreground_operation(manager_endpoint: &str) -> Result<()> {
                 .report_step_result(ReportStepResultRequest {
                     node_id: "node-a".to_string(),
                     operation_id: instruction.operation_id.clone(),
-                    engine_slot: target.engine_slot.clone(),
                     lease_epoch: instruction.lease_epoch,
                     step: instruction.step,
                     condition_code: String::new(),
@@ -1539,6 +1520,7 @@ async fn complete_foreground_operation(manager_endpoint: &str) -> Result<()> {
                     backend_query_error: String::new(),
                     observed_resolved_release_digest: target.resolved_release_digest.clone(),
                     termination_evidence: None,
+                    target: Some(target.clone()),
                 })
                 .await?;
         }
@@ -1557,7 +1539,7 @@ async fn complete_foreground_operation(manager_endpoint: &str) -> Result<()> {
             manager
                 .report_observation(ReportNodeObservationRequest {
                     node_id: "node-a".to_string(),
-                    engine_slot: target.engine_slot.clone(),
+                    engine_slot: engine_slot.clone(),
                     lifecycle: running.then(|| LifecycleStatus {
                         state: ProcessLifecycleState::Ready as i32,
                         service_kind: ServiceKind::Engine as i32,

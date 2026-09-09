@@ -10,6 +10,8 @@ import unittest
 HELPERS = Path(__file__).with_name("lifecycle_logging.sh")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_HELPERS = REPO_ROOT / "examples" / "helpers.sh"
+DEPLOYMENT_LIFECYCLE = REPO_ROOT / "dev" / "validate-deployment-lifecycle.sh"
+LIFECYCLE_CONTRACT = Path(__file__).with_name("lifecycle_contract.sh")
 
 
 class LifecycleLoggingTests(unittest.TestCase):
@@ -183,14 +185,19 @@ PY_REDACT
 
     def test_deployment_uses_only_durable_node_lifecycle_commands(self):
         script = DEPLOYMENT_LIFECYCLE.read_text()
-        for command in ("node deploy", "node upgrade", "node scale", "engines drain", "node rollback"):
+        for command in ("node deploy", "engines restart", "node rollback"):
             self.assertIn(command, script)
         self.assertIn("--exit-after-finalization", script)
-        self.assertEqual(script.count("--allow-downtime"), 4)
-        self.assertIn('operations list --node-id "$NODE_ID" --include-terminal --json', script)
-        self.assertIn('len(matches) != 1', script)
+        self.assertEqual(script.count("--allow-downtime"), 2)
+        self.assertIn("node inventory contraction", script)
+        contract = LIFECYCLE_CONTRACT.read_text()
+        self.assertIn('operations list --node-id "$node_id" --include-terminal --json', contract)
+        self.assertIn('len(matches) != 1', contract)
         for obsolete in (
             "node stop",
+            "node upgrade",
+            "node scale",
+            "engines drain",
             "assert_node_stop_record",
             "wr-node/current",
             "lifecycle stop",
@@ -213,11 +220,16 @@ PY_REDACT
         )
         self.assertIn('--manager-config "$MANAGER_CONFIG"', script)
         self.assertLess(
-            script.index('run_to_log "$backend node agent install"'),
+            script.index('run_to_log "$backend node agent fixture provisioning and initial activation"'),
+            script.index('run_to_log "$backend node agent binary update restart and fresh activation"'),
+        )
+        self.assertLess(
+            script.index('run_to_log "$backend node agent binary update restart and fresh activation"'),
             script.index('run_to_log "$backend node A deploy"'),
         )
-        self.assertIn('--agent-cert "$CERT_DIR/node-agent/leaf.pem"', script)
-        self.assertIn('--agent-ca-cert "$CERT_DIR/server-root/ca.crt"', script)
+        invocation = script.split('run_to_log "$backend node agent binary update restart and fresh activation"', 1)[1].split("job_admin queues", 1)[0]
+        for forbidden in ("--agent-cert", "--agent-key", "--agent-ca-cert", "--retention-count", "--systemctl-path", "--docker-path"):
+            self.assertNotIn(forbidden, invocation)
 
     def test_failure_excerpt_is_bounded(self):
         with tempfile.TemporaryDirectory() as directory:

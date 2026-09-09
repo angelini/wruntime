@@ -20,15 +20,51 @@ use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::watch;
 use wr_common::wruntime::{
-    AgentInstruction, BackendProcessState, BackendStopDisposition, BackendTerminationEvidence,
-    CleanupReleaseEvidence, InstructionTargetKind, LifecycleStatus, NodeCleanupInstruction,
-    NodeOperationStepKind, ProcessLifecycleState, ReleaseInventoryEntry, ServiceKind,
+    instruction_target, AgentInstruction, BackendProcessState, BackendStopDisposition,
+    BackendTerminationEvidence, CleanupReleaseEvidence, InstructionTarget, InstructionTargetKind,
+    LifecycleStatus, NodeCleanupInstruction, NodeOperationStepKind, ProcessLifecycleState,
+    ReleaseInventoryEntry, ServiceKind,
 };
 
 use super::bundle_integrity::{verify_resolved_release, BundleManifest};
 use crate::client;
 
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+pub(crate) enum WorkloadTarget<'a> {
+    Proxy,
+    EngineSlot(&'a str),
+}
+
+pub(crate) fn workload_target(target: &InstructionTarget) -> Result<WorkloadTarget<'_>> {
+    match (
+        InstructionTargetKind::try_from(target.kind).unwrap_or(InstructionTargetKind::Unspecified),
+        target.identity.as_ref(),
+    ) {
+        (InstructionTargetKind::Proxy, Some(instruction_target::Identity::Proxy(_))) => {
+            Ok(WorkloadTarget::Proxy)
+        }
+        (
+            InstructionTargetKind::EngineSlot,
+            Some(instruction_target::Identity::EngineSlotTarget(identity)),
+        ) if !identity.engine_slot.is_empty() && identity.engine_slot != "proxy" => {
+            Ok(WorkloadTarget::EngineSlot(&identity.engine_slot))
+        }
+        _ => bail!("instruction target kind and identity mismatch"),
+    }
+}
+
+struct ValidatedTarget<'a> {
+    target: &'a InstructionTarget,
+    engine_slot: String,
+}
+
+impl std::ops::Deref for ValidatedTarget<'_> {
+    type Target = InstructionTarget;
+    fn deref(&self) -> &Self::Target {
+        self.target
+    }
+}
 
 const COMMAND_BUDGET: Duration = Duration::from_secs(45);
 const STOP_BUDGET: Duration = Duration::from_secs(90);
@@ -177,16 +213,12 @@ pub struct HostBackendConfig {
     pub systemctl_path: Option<PathBuf>,
     pub docker_path: Option<PathBuf>,
     pub compose_project: Option<String>,
-    pub retention_count: usize,
 }
 
 impl HostBackendConfig {
     pub fn validate(&self) -> Result<()> {
         if !self.deployment_root.is_absolute() || self.deployment_root == Path::new("/") {
             bail!("deployment_root must be a non-root absolute path");
-        }
-        if self.retention_count == 0 {
-            bail!("retention_count must be positive");
         }
         match self.backend {
             BackendType::Systemd => validate_binary(
@@ -1219,10 +1251,18 @@ impl InstructionExecutor for HostBackend {
         Box::pin(async move {
             let step = NodeOperationStepKind::try_from(instruction.step)
                 .unwrap_or(NodeOperationStepKind::Unspecified);
-            let target = instruction
+            let raw_target = instruction
                 .target
                 .as_ref()
                 .context("manager instruction omitted its typed target")?;
+            let validated = workload_target(raw_target)?;
+            let target = ValidatedTarget {
+                target: raw_target,
+                engine_slot: match validated {
+                    WorkloadTarget::Proxy => String::new(),
+                    WorkloadTarget::EngineSlot(slot) => slot.to_string(),
+                },
+            };
             if matches!(
                 step,
                 NodeOperationStepKind::SwitchAuthority | NodeOperationStepKind::VerifyServing
@@ -2111,7 +2151,6 @@ mod tests {
                 systemctl_path: None,
                 docker_path: Some(PathBuf::from("/usr/bin/docker")),
                 compose_project: Some("wruntime-test".into()),
-                retention_count: 1,
             },
             Box::new(TestPathAttestor),
         )
@@ -2186,7 +2225,6 @@ mod tests {
                 systemctl_path: Some(root.join("systemctl")),
                 docker_path: None,
                 compose_project: None,
-                retention_count: 1,
             },
             Box::new(TestPathAttestor),
         )
@@ -2284,11 +2322,17 @@ mod tests {
             lease_epoch: 1,
             step: step as i32,
             target: Some(wr_common::wruntime::InstructionTarget {
-                engine_slot: "blue".into(),
+                kind: wr_common::wruntime::InstructionTargetKind::EngineSlot as i32,
+                identity: Some(
+                    wr_common::wruntime::instruction_target::Identity::EngineSlotTarget(
+                        wr_common::wruntime::EngineSlotTargetIdentity {
+                            engine_slot: "blue".into(),
+                        },
+                    ),
+                ),
                 revision,
                 bundle_digest: digest,
                 resolved_release_digest,
-                kind: wr_common::wruntime::InstructionTargetKind::EngineSlot as i32,
             }),
             ..Default::default()
         }
@@ -2317,7 +2361,10 @@ mod tests {
             let mut verify = instruction(step, 1, digest.clone(), resolved_digest(&root, 1));
             verify.target.as_mut().unwrap().kind =
                 wr_common::wruntime::InstructionTargetKind::Proxy as i32;
-            verify.target.as_mut().unwrap().engine_slot.clear();
+            verify.target.as_mut().unwrap().identity =
+                Some(wr_common::wruntime::instruction_target::Identity::Proxy(
+                    wr_common::wruntime::ProxyTargetIdentity {},
+                ));
             let error = backend.execute(&verify, receiver).await.unwrap_err();
             assert!(
                 error

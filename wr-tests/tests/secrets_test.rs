@@ -575,14 +575,12 @@ async fn test_concurrent_db_credential_registration_same_password() -> Result<()
         .submit_operation(SubmitOperationRequest {
             node_id: "node-a".into(),
             request_token: "concurrent-db-deployment".into(),
-            action: NodeOperationAction::InitialApply as i32,
-            engine_slots: slots.clone(),
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
             target_revision: deployment.revision,
             bundle_digest: bundle_digest.clone(),
             policy: Some(RolloutPolicy {
                 max_unavailable: N as u32,
-                canary_slot: slots[0].clone(),
-                pause_after_canary: false,
                 allow_downtime: true,
                 deadline_seconds: 300,
             }),

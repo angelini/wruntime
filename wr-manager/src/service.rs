@@ -780,74 +780,55 @@ impl OperatorApi {
         }
         let action = NodeOperationAction::try_from(request.action)
             .unwrap_or(NodeOperationAction::Unspecified);
-        if action == NodeOperationAction::Unspecified {
-            return Err(Status::invalid_argument("operation action is required"));
-        }
-        request.engine_slots.sort();
-        let permits_empty_inventory = action == NodeOperationAction::Scale;
-        if (!permits_empty_inventory && request.engine_slots.is_empty())
-            || request
-                .engine_slots
-                .iter()
-                .any(|slot| !Manager::valid_deployment_token(slot))
-            || request
-                .engine_slots
-                .windows(2)
-                .any(|pair| pair[0] == pair[1])
-        {
-            return Err(Status::invalid_argument(
-                "engine_slots must contain unique URL-safe stable slot identities",
-            ));
-        }
         let deployment_action = matches!(
             action,
-            NodeOperationAction::InitialApply
-                | NodeOperationAction::RollingUpgrade
-                | NodeOperationAction::Scale
-                | NodeOperationAction::Rollback
+            NodeOperationAction::Deployment | NodeOperationAction::Rollback
         );
-        if deployment_action
-            && (request.target_revision == 0
-                || !Manager::valid_bundle_digest(&request.bundle_digest)
-                || !Manager::valid_bundle_digest(&request.resolved_release_digest))
-        {
-            return Err(Status::invalid_argument(
-                "deployment operations require target_revision, source bundle digest, and resolved release digest",
-            ));
+        match action {
+            NodeOperationAction::Deployment | NodeOperationAction::Rollback => {
+                if request.target_revision == 0
+                    || !Manager::valid_bundle_digest(&request.bundle_digest)
+                    || !Manager::valid_bundle_digest(&request.resolved_release_digest)
+                {
+                    return Err(Status::invalid_argument(
+                        "deployment operations require target_revision, source bundle digest, and resolved release digest",
+                    ));
+                }
+                if !request.engine_slot.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "deployment operations must not specify engine_slot",
+                    ));
+                }
+            }
+            NodeOperationAction::Restart => {
+                if !Manager::valid_deployment_token(&request.engine_slot) {
+                    return Err(Status::invalid_argument(
+                        "restart requires one URL-safe stable engine_slot",
+                    ));
+                }
+                if request.target_revision != 0
+                    || !request.bundle_digest.is_empty()
+                    || !request.resolved_release_digest.is_empty()
+                {
+                    return Err(Status::invalid_argument(
+                        "restart must not specify target deployment identity",
+                    ));
+                }
+            }
+            NodeOperationAction::Unspecified => {
+                return Err(Status::invalid_argument("operation action is required"));
+            }
         }
         let policy = request
             .policy
-            .get_or_insert_with(|| wr_common::wruntime::RolloutPolicy {
+            .get_or_insert(wr_common::wruntime::RolloutPolicy {
                 max_unavailable: 1,
-                canary_slot: request.engine_slots.first().cloned().unwrap_or_default(),
-                pause_after_canary: false,
                 allow_downtime: false,
-                deadline_seconds: match action {
-                    NodeOperationAction::Drain => 120,
-                    NodeOperationAction::Restart => 300,
-                    _ => 1800,
-                },
+                deadline_seconds: if deployment_action { 1800 } else { 300 },
             });
-        if policy.max_unavailable == 0
-            || (!request.engine_slots.is_empty()
-                && policy.max_unavailable as usize > request.engine_slots.len())
-            || policy.deadline_seconds == 0
-        {
+        if policy.max_unavailable == 0 || policy.deadline_seconds == 0 {
             return Err(Status::invalid_argument(
-                "policy requires a positive bounded max_unavailable and deadline_seconds",
-            ));
-        }
-        if !policy.canary_slot.is_empty() && !request.engine_slots.contains(&policy.canary_slot) {
-            return Err(Status::invalid_argument(
-                "canary_slot is not in engine_slots",
-            ));
-        }
-        if action == NodeOperationAction::Scale
-            && request.engine_slots.is_empty()
-            && !policy.allow_downtime
-        {
-            return Err(Status::failed_precondition(
-                "scale-to-zero requires explicit allow_downtime",
+                "policy requires positive max_unavailable and deadline_seconds",
             ));
         }
         Ok(())

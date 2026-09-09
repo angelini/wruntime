@@ -37,8 +37,6 @@ pub enum EnginesCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Gracefully stop one stable engine slot through the durable executor.
-    Drain(MutationArgs),
     /// Gracefully stop and start one stable engine slot.
     Restart(MutationArgs),
 }
@@ -75,8 +73,7 @@ pub async fn run(args: EnginesArgs, manager: &str) -> Result<()> {
             slot,
             json,
         } => status(manager, node_id, slot, json).await,
-        EnginesCommand::Drain(args) => mutate(manager, args, NodeOperationAction::Drain).await,
-        EnginesCommand::Restart(args) => mutate(manager, args, NodeOperationAction::Restart).await,
+        EnginesCommand::Restart(args) => mutate(manager, args).await,
     }
 }
 
@@ -289,45 +286,48 @@ async fn status(
     Ok(())
 }
 
-fn mutation_policy(
-    action: NodeOperationAction,
-    deadline: Option<u64>,
-    allow_downtime: bool,
-) -> RolloutPolicy {
-    let default_deadline = if action == NodeOperationAction::Drain {
-        120
-    } else {
-        300
-    };
+fn restart_policy(deadline: Option<u64>, allow_downtime: bool) -> RolloutPolicy {
     RolloutPolicy {
         max_unavailable: 1,
-        canary_slot: String::new(),
-        pause_after_canary: false,
         allow_downtime,
-        deadline_seconds: deadline.unwrap_or(default_deadline),
+        deadline_seconds: deadline.unwrap_or(300),
     }
 }
 
-async fn mutate(manager: &str, args: MutationArgs, action: NodeOperationAction) -> Result<()> {
+fn restart_request(
+    node_id: String,
+    request_token: String,
+    engine_slot: String,
+    policy: RolloutPolicy,
+) -> SubmitOperationRequest {
+    SubmitOperationRequest {
+        node_id,
+        request_token,
+        action: NodeOperationAction::Restart as i32,
+        target_revision: 0,
+        bundle_digest: String::new(),
+        policy: Some(policy),
+        resolved_release_digest: String::new(),
+        engine_slot,
+    }
+}
+
+async fn mutate(manager: &str, args: MutationArgs) -> Result<()> {
     let token = args
         .request_token
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let policy = mutation_policy(action, args.deadline, args.allow_downtime);
+    let policy = restart_policy(args.deadline, args.allow_downtime);
     let operation = client::connect_operator(
         manager,
         wr_common::manager_client::RetryClass::DurableCreate,
     )
     .await?
-    .submit_operation(SubmitOperationRequest {
-        node_id: args.node_id,
-        request_token: token.clone(),
-        action: action as i32,
-        engine_slots: vec![args.slot],
-        target_revision: 0,
-        bundle_digest: String::new(),
-        policy: Some(policy),
-        resolved_release_digest: String::new(),
-    })
+    .submit_operation(restart_request(
+        args.node_id,
+        token.clone(),
+        args.slot,
+        policy,
+    ))
     .await?
     .into_inner()
     .operation
@@ -352,13 +352,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mutation_policy_requires_explicit_downtime_and_preserves_deadlines() {
-        let drain = mutation_policy(NodeOperationAction::Drain, None, false);
-        assert!(!drain.allow_downtime);
-        assert_eq!(drain.deadline_seconds, 120);
+    fn restart_policy_requires_explicit_downtime_and_preserves_deadlines() {
+        let default = restart_policy(None, false);
+        assert!(!default.allow_downtime);
+        assert_eq!(default.deadline_seconds, 300);
 
-        let explicit = mutation_policy(NodeOperationAction::Restart, Some(45), true);
+        let explicit = restart_policy(Some(45), true);
         assert!(explicit.allow_downtime);
         assert_eq!(explicit.deadline_seconds, 45);
+    }
+
+    #[test]
+    fn restart_request_is_singular_and_has_no_deployment_identity() {
+        let request = restart_request(
+            "node-a".into(),
+            "token-a".into(),
+            "blue".into(),
+            restart_policy(Some(45), true),
+        );
+        assert_eq!(request.action, NodeOperationAction::Restart as i32);
+        assert_eq!(request.engine_slot, "blue");
+        assert_eq!(request.target_revision, 0);
+        assert!(request.bundle_digest.is_empty());
+        assert!(request.resolved_release_digest.is_empty());
+        let policy = request.policy.unwrap();
+        assert!(policy.allow_downtime);
+        assert_eq!(policy.deadline_seconds, 45);
     }
 }

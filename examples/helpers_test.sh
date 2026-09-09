@@ -12,6 +12,15 @@ CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}" \
 for credential in runtime-manager-endpoint runtime-proxy-endpoint job-admin-engine-endpoint runtime-human-client runtime-manager-client runtime-proxy-client; do
 	"$CERT_CLI" cert verify "${TEST_CERTS_DIR}/${credential}" >/dev/null
 done
+valid_credential="${TEST_CERTS_DIR}/runtime-human-client"
+valid_before="${TEST_CERTS_DIR}/valid-before"
+cp -R "$valid_credential" "$valid_before"
+ensure_example_credential "$valid_credential" human \
+	--cluster-id default --name deployer --ca-dir "${TEST_CERTS_DIR}/runtime-client-root" >/dev/null
+if ! diff -r "$valid_before" "$valid_credential" >/dev/null; then
+	echo "helper mutated a valid reusable credential" >&2
+	exit 1
+fi
 if grep -Eq 'cert (init-ca|generate)' "$REPO_ROOT/examples/helpers.sh"; then
 	echo "helper retains removed certificate bootstrap commands" >&2
 	exit 1
@@ -19,9 +28,32 @@ fi
 stale_credential="${RUN_ROOT}/config/stale-credential"
 cp -R "${TEST_CERTS_DIR}/runtime-human-client" "$stale_credential"
 printf 'invalid metadata\n' >"${stale_credential}/metadata.json"
+stale_before="${RUN_ROOT}/config/stale-before"
+cp -R "$stale_credential" "$stale_before"
 if ensure_example_credential "$stale_credential" human \
 	--cluster-id default --name deployer --ca-dir "${TEST_CERTS_DIR}/runtime-client-root" >/dev/null 2>&1; then
-	echo "helper overwrote a stale immutable credential instead of failing closed" >&2
+	echo "helper accepted a stale immutable credential" >&2
+	exit 1
+fi
+if ! diff -r "$stale_before" "$stale_credential" >/dev/null; then
+	echo "helper mutated a stale immutable credential while failing closed" >&2
+	exit 1
+fi
+
+wrong_root="${RUN_ROOT}/config/wrong-client-root"
+wrong_root_credential="${RUN_ROOT}/config/wrong-root-credential"
+"$CERT_CLI" cert init-root client --output "$wrong_root" >/dev/null
+"$CERT_CLI" cert issue human --cluster-id default --name deployer \
+	--ca-dir "$wrong_root" --destination "$wrong_root_credential" >/dev/null
+wrong_root_before="${RUN_ROOT}/config/wrong-root-before"
+cp -R "$wrong_root_credential" "$wrong_root_before"
+if ensure_example_credential "$wrong_root_credential" human \
+	--cluster-id default --name deployer --ca-dir "${TEST_CERTS_DIR}/runtime-client-root" >/dev/null 2>&1; then
+	echo "helper accepted a credential issued by the wrong active root" >&2
+	exit 1
+fi
+if ! diff -r "$wrong_root_before" "$wrong_root_credential" >/dev/null; then
+	echo "helper mutated a wrong-root credential while failing closed" >&2
 	exit 1
 fi
 

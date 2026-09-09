@@ -222,14 +222,12 @@ async fn test_proxy_register_engine_forwards_without_creating_rules() -> Result<
         .submit_operation(SubmitOperationRequest {
             node_id: "node-a".into(),
             request_token: "proxy-register-deployment".into(),
-            action: NodeOperationAction::InitialApply as i32,
-            engine_slots: vec!["primary".into()],
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
             target_revision: deployment.revision,
             bundle_digest: bundle_digest.clone(),
             policy: Some(RolloutPolicy {
                 max_unavailable: 1,
-                canary_slot: "primary".into(),
-                pause_after_canary: false,
                 allow_downtime: true,
                 deadline_seconds: 300,
             }),

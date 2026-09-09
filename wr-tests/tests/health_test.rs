@@ -74,14 +74,12 @@ async fn staged_registration_remains_non_serving_without_exact_slot_authority() 
         &SubmitOperationRequest {
             node_id: finalized.node_id.clone(),
             request_token: "staged-authority".into(),
-            action: NodeOperationAction::InitialApply as i32,
-            engine_slots: vec!["blue".into()],
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
             target_revision: finalized.revision,
             bundle_digest: finalized.bundle_digest.clone(),
             policy: Some(RolloutPolicy {
                 max_unavailable: 1,
-                canary_slot: "blue".into(),
-                pause_after_canary: false,
                 allow_downtime: true,
                 deadline_seconds: 300,
             }),

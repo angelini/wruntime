@@ -39,14 +39,10 @@ pub struct NodeArgs {
 pub enum NodeCommand {
     /// Build and package a host-agnostic deployment bundle
     Bundle(BundleArgs),
-    /// Deploy a bundle to a remote host
+    /// Reconcile a remote node to a bundle's complete desired inventory
     Deploy(DeployArgs),
     /// Activate a retained prior bundle revision as a new desired revision
     Rollback(RollbackArgs),
-    /// Submit a rolling upgrade for an already verified, pre-staged release.
-    Upgrade(DeployArgs),
-    /// Submit an inventory-changing rollout for an already verified, pre-staged release.
-    Scale(DeployArgs),
     /// Safely abandon an unsubmitted inactive allocation and its exact bytes.
     Abandon(AbandonArgs),
     /// Run the node-local fenced lifecycle executor.
@@ -127,10 +123,6 @@ pub struct DeployArgs {
     #[arg(long, default_value_t = 1)]
     max_unavailable: u32,
     #[arg(long)]
-    canary: Option<String>,
-    #[arg(long)]
-    pause_after_canary: bool,
-    #[arg(long)]
     allow_downtime: bool,
     #[arg(long, default_value_t = 1800)]
     deadline: u64,
@@ -171,10 +163,6 @@ pub struct RollbackArgs {
     request_token: Option<String>,
     #[arg(long, default_value_t = 1)]
     max_unavailable: u32,
-    #[arg(long)]
-    canary: Option<String>,
-    #[arg(long)]
-    pause_after_canary: bool,
     #[arg(long)]
     allow_downtime: bool,
     #[arg(long, default_value_t = 1800)]
@@ -301,22 +289,12 @@ pub async fn run(args: NodeArgs, manager: Option<&str>) -> Result<()> {
         NodeCommand::Deploy(deploy_args) => {
             let mgr =
                 manager.ok_or_else(|| anyhow::anyhow!("--manager is required for node deploy"))?;
-            durable_deploy(deploy_args, mgr, NodeOperationAction::InitialApply).await
+            durable_deploy(deploy_args, mgr).await
         }
         NodeCommand::Rollback(rollback_args) => {
             let mgr = manager
                 .ok_or_else(|| anyhow::anyhow!("--manager is required for node rollback"))?;
             durable_rollback(rollback_args, mgr).await
-        }
-        NodeCommand::Upgrade(deploy_args) => {
-            let manager =
-                manager.ok_or_else(|| anyhow::anyhow!("--manager is required for node upgrade"))?;
-            durable_deploy(deploy_args, manager, NodeOperationAction::RollingUpgrade).await
-        }
-        NodeCommand::Scale(deploy_args) => {
-            let manager =
-                manager.ok_or_else(|| anyhow::anyhow!("--manager is required for node scale"))?;
-            durable_deploy(deploy_args, manager, NodeOperationAction::Scale).await
         }
         NodeCommand::Abandon(abandon_args) => {
             let manager =
@@ -1532,9 +1510,9 @@ async fn require_compatible_attestation(
         .await?
         .into_inner();
     let expected_backend = match format {
-        DeployFormat::Systemd => wr_common::wruntime::BackendKind::Systemd,
-        DeployFormat::Docker => wr_common::wruntime::BackendKind::Docker,
-    } as i32;
+        DeployFormat::Systemd => wr_common::agent_policy::AgentPolicyBackend::Systemd,
+        DeployFormat::Docker => wr_common::agent_policy::AgentPolicyBackend::Docker,
+    };
     let expected_binary = format!(
         "sha256:{}",
         manifest
@@ -1542,27 +1520,70 @@ async fn require_compatible_attestation(
             .get("wr-node/agent/wr-cli")
             .context("bundle omits the digest-covered node-agent binary")?
     );
-    let fresh = chrono::Utc::now().timestamp();
+    let expected = super::node_agent::wire_policy(node_id, expected_backend, expected_binary, None);
     anyhow::ensure!(
         status.agent_attestations.iter().any(|attestation| {
-            attestation.protocol_version == AGENT_PROTOCOL_VERSION
-                && attestation.backend == expected_backend
-                && attestation.binary_digest == expected_binary
-                && attestation
-                    .observed_at
-                    .as_ref()
-                    .is_some_and(|time| fresh.saturating_sub(time.seconds) <= 30)
+            super::node_agent::attestation_matches_policy(attestation, &expected)
         }),
         "fresh compatible installed node-agent attestation is required before submission"
     );
     Ok(())
 }
 
-async fn durable_deploy(
-    args: DeployArgs,
-    manager: &str,
-    action: NodeOperationAction,
-) -> Result<()> {
+fn rollout_policy(
+    max_unavailable: u32,
+    allow_downtime: bool,
+    deadline_seconds: u64,
+) -> RolloutPolicy {
+    RolloutPolicy {
+        max_unavailable,
+        allow_downtime,
+        deadline_seconds,
+    }
+}
+
+fn deployment_request(
+    node_id: String,
+    request_token: String,
+    target_revision: u64,
+    bundle_digest: String,
+    resolved_release_digest: String,
+    policy: RolloutPolicy,
+) -> SubmitOperationRequest {
+    SubmitOperationRequest {
+        node_id,
+        request_token,
+        action: NodeOperationAction::Deployment as i32,
+        target_revision,
+        bundle_digest,
+        policy: Some(policy),
+        resolved_release_digest,
+        engine_slot: String::new(),
+    }
+}
+
+fn rollback_request(
+    node_id: String,
+    request_token: String,
+    target_revision: u64,
+    bundle_digest: String,
+    resolved_release_digest: String,
+    policy: RolloutPolicy,
+) -> SubmitOperationRequest {
+    SubmitOperationRequest {
+        action: NodeOperationAction::Rollback as i32,
+        ..deployment_request(
+            node_id,
+            request_token,
+            target_revision,
+            bundle_digest,
+            resolved_release_digest,
+            policy,
+        )
+    }
+}
+
+async fn durable_deploy(args: DeployArgs, manager: &str) -> Result<()> {
     anyhow::ensure!(
         Path::new(&args.bundle).is_file(),
         "Bundle not found: {}",
@@ -1678,36 +1699,19 @@ async fn durable_deploy(
         bail!("deterministic exit after inactive release finalization");
     }
     require_compatible_attestation(manager, &args.node_id, format, &manifest).await?;
-    let mut slots = manifest
-        .engines
-        .iter()
-        .map(|engine| engine.engine_slot.clone())
-        .collect::<Vec<_>>();
-    slots.sort();
-    let canary = args
-        .canary
-        .unwrap_or_else(|| slots.first().cloned().unwrap_or_default());
     let operation = client::connect_operator(
         manager,
         wr_common::manager_client::RetryClass::DurableCreate,
     )
     .await?
-    .submit_operation(SubmitOperationRequest {
-        node_id: args.node_id,
-        request_token: token,
-        action: action as i32,
-        engine_slots: slots,
-        target_revision: deployment.revision,
-        bundle_digest: manifest.bundle_digest,
-        policy: Some(RolloutPolicy {
-            max_unavailable: args.max_unavailable,
-            canary_slot: canary,
-            pause_after_canary: args.pause_after_canary,
-            allow_downtime: args.allow_downtime,
-            deadline_seconds: args.deadline,
-        }),
-        resolved_release_digest: stage.digest.clone(),
-    })
+    .submit_operation(deployment_request(
+        args.node_id,
+        token,
+        deployment.revision,
+        manifest.bundle_digest,
+        stage.digest.clone(),
+        rollout_policy(args.max_unavailable, args.allow_downtime, args.deadline),
+    ))
     .await?
     .into_inner()
     .operation
@@ -1883,38 +1887,19 @@ PY
     if args.exit_after_finalization {
         bail!("deterministic exit after inactive release finalization");
     }
-    let mut slots = deployment
-        .inventory
-        .as_ref()
-        .into_iter()
-        .flat_map(|inventory| inventory.engines.iter())
-        .map(|engine| engine.engine_slot.clone())
-        .collect::<Vec<_>>();
-    slots.sort();
-    let canary = args
-        .canary
-        .unwrap_or_else(|| slots.first().cloned().unwrap_or_default());
     let operation = client::connect_operator(
         manager,
         wr_common::manager_client::RetryClass::DurableCreate,
     )
     .await?
-    .submit_operation(SubmitOperationRequest {
-        node_id: args.node_id,
-        request_token: token,
-        action: NodeOperationAction::Rollback as i32,
-        engine_slots: slots,
-        target_revision: deployment.revision,
-        bundle_digest: deployment.bundle_digest,
-        policy: Some(RolloutPolicy {
-            max_unavailable: args.max_unavailable,
-            canary_slot: canary,
-            pause_after_canary: args.pause_after_canary,
-            allow_downtime: args.allow_downtime,
-            deadline_seconds: args.deadline,
-        }),
-        resolved_release_digest: resolved_digest,
-    })
+    .submit_operation(rollback_request(
+        args.node_id,
+        token,
+        deployment.revision,
+        deployment.bundle_digest,
+        resolved_digest,
+        rollout_policy(args.max_unavailable, args.allow_downtime, args.deadline),
+    ))
     .await?
     .into_inner()
     .operation
@@ -2016,6 +2001,39 @@ mod tests {
     use super::*;
     use crate::cmd::bundle_integrity::{ResolvedFile, RESOLVED_MANIFEST_VERSION};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn deployment_and_rollback_requests_use_finalized_identity_without_caller_inventory() {
+        let policy = rollout_policy(2, true, 900);
+        let deployment = deployment_request(
+            "node-a".into(),
+            "token-a".into(),
+            42,
+            "sha256:bundle".into(),
+            "sha256:resolved".into(),
+            policy,
+        );
+        assert_eq!(deployment.action, NodeOperationAction::Deployment as i32);
+        assert_eq!(deployment.target_revision, 42);
+        assert_eq!(deployment.bundle_digest, "sha256:bundle");
+        assert_eq!(deployment.resolved_release_digest, "sha256:resolved");
+        assert!(deployment.engine_slot.is_empty());
+        assert_eq!(deployment.policy, Some(policy));
+
+        let rollback = rollback_request(
+            "node-a".into(),
+            "token-b".into(),
+            43,
+            "sha256:prior-bundle".into(),
+            "sha256:prior-resolved".into(),
+            policy,
+        );
+        assert_eq!(rollback.action, NodeOperationAction::Rollback as i32);
+        assert_eq!(rollback.target_revision, 43);
+        assert_eq!(rollback.bundle_digest, "sha256:prior-bundle");
+        assert_eq!(rollback.resolved_release_digest, "sha256:prior-resolved");
+        assert!(rollback.engine_slot.is_empty());
+    }
 
     #[test]
     fn remote_resolved_verification_reads_root_owned_payloads_with_sudo() {

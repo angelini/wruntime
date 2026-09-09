@@ -18,10 +18,10 @@ use std::time::Duration;
 use wr_common::wruntime::{
     BackendProcessState, BeginDeploymentRequest, DeploymentInventoryV1, EngineRegistration,
     ExpectedEngine, FinalizeDeploymentRequest, GetClusterStatusRequest, HeartbeatRequest,
-    LifecycleStatus, ListManagersRequest, ModuleDescriptor, NodeCleanupResultDisposition,
-    NodeOperationAction, NodeOperationStepKind, ProcessLifecycleState,
-    ReportNodeCleanupResultRequest, ReportNodeObservationRequest, ReportStepResultRequest,
-    RolloutPolicy, ServiceKind, SubmitOperationRequest,
+    InstructionTargetKind, LifecycleStatus, ListManagersRequest, ModuleDescriptor,
+    NodeCleanupResultDisposition, NodeOperationAction, NodeOperationStepKind,
+    ProcessLifecycleState, ReportNodeCleanupResultRequest, ReportNodeObservationRequest,
+    ReportStepResultRequest, RolloutPolicy, ServiceKind, SubmitOperationRequest,
 };
 
 // ── Multi-manager integration tests ──────────────────────────────────────────
@@ -86,15 +86,13 @@ async fn test_operation_survives_manager_loss_and_reconciles_without_repeating_e
         &SubmitOperationRequest {
             node_id: "takeover-node".into(),
             request_token: "takeover-operation".into(),
-            action: NodeOperationAction::InitialApply as i32,
-            engine_slots: vec!["blue".into()],
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
             target_revision: deployment.revision,
             bundle_digest: digest.clone(),
             resolved_release_digest: resolved.clone(),
             policy: Some(RolloutPolicy {
                 max_unavailable: 1,
-                canary_slot: String::new(),
-                pause_after_canary: false,
                 allow_downtime: true,
                 deadline_seconds: 300,
             }),
@@ -111,25 +109,23 @@ async fn test_operation_survives_manager_loss_and_reconciles_without_repeating_e
         .unwrap();
     assert_eq!(select.step, NodeOperationStepKind::SelectRelease as i32);
     let target = select.target.as_ref().unwrap();
-    wr_manager::operations::report_step(
-        &pool,
-        &ReportStepResultRequest {
-            node_id: select.node_id.clone(),
-            operation_id: select.operation_id.clone(),
-            lease_epoch: select.lease_epoch,
-            step: select.step,
-            agent_instance_id: select.agent_instance_id.clone(),
-            observed_revision: target.revision,
-            observed_digest: target.bundle_digest.clone(),
-            observed_resolved_release_digest: target.resolved_release_digest.clone(),
-            backend_instance_id: "proxy-old".into(),
-            process_instance_id: "proxy-process-old".into(),
-            ..Default::default()
-        },
-        "agent-a",
-    )
-    .await
-    .unwrap();
+    let select_result = ReportStepResultRequest {
+        node_id: select.node_id.clone(),
+        operation_id: select.operation_id.clone(),
+        lease_epoch: select.lease_epoch,
+        step: select.step,
+        agent_instance_id: select.agent_instance_id.clone(),
+        observed_revision: target.revision,
+        observed_digest: target.bundle_digest.clone(),
+        observed_resolved_release_digest: target.resolved_release_digest.clone(),
+        backend_instance_id: "proxy-old".into(),
+        process_instance_id: "proxy-process-old".into(),
+        target: Some(target.clone()),
+        ..Default::default()
+    };
+    wr_manager::operations::report_step(&pool, &select_result, "agent-a")
+        .await
+        .unwrap();
     let start = wr_manager::operations::claim(&pool, "takeover-node", "activation-a", "agent-a")
         .await
         .unwrap()
@@ -144,10 +140,20 @@ async fn test_operation_survives_manager_loss_and_reconciles_without_repeating_e
     let events_before = wr_manager::operations::events(&pool, &submitted.operation_id)
         .await
         .unwrap();
-    assert!(before.proxy_effect_delivered_at.is_some());
+    assert!(before
+        .targets
+        .iter()
+        .find(|target| { target.kind == InstructionTargetKind::Proxy as i32 })
+        .unwrap()
+        .effect_delivered_at
+        .is_some());
 
     managers[0].abort_service();
     assert!(manager_client(&managers[1].addr).await.is_ok());
+    let duplicate = wr_manager::operations::report_step(&pool, &select_result, "agent-a")
+        .await
+        .expect("the surviving manager must acknowledge the exact accepted receipt");
+    assert_eq!(duplicate.operation_id, submitted.operation_id);
     pool.get()
         .await
         .unwrap()
@@ -165,6 +171,7 @@ async fn test_operation_survives_manager_loss_and_reconciles_without_repeating_e
             lease_epoch: start.lease_epoch,
             step: start.step,
             agent_instance_id: start.agent_instance_id.clone(),
+            target: start.target.clone(),
             ..Default::default()
         },
         "agent-a",
@@ -243,7 +250,13 @@ async fn test_operation_survives_manager_loss_and_reconciles_without_repeating_e
         .await
         .unwrap();
     assert_eq!(after.forward_deadline, deadline);
-    assert!(after.proxy_effect_delivered_at.is_some());
+    assert!(after
+        .targets
+        .iter()
+        .find(|target| { target.kind == InstructionTargetKind::Proxy as i32 })
+        .unwrap()
+        .effect_delivered_at
+        .is_some());
     let events_after = wr_manager::operations::events(&pool, &submitted.operation_id)
         .await
         .unwrap();

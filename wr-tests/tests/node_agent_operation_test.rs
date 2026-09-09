@@ -1,7 +1,5 @@
 mod helpers;
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -21,10 +19,9 @@ use wr_common::wruntime::{
     ReportStepResultRequest,
 };
 
-fn activation_with(instance: &str, recovery_dir: Option<PathBuf>) -> ActivationConfig {
+fn activation_with(instance: &str) -> ActivationConfig {
     ActivationConfig {
         agent_instance_id: instance.into(),
-        recovery_dir,
         ..activation()
     }
 }
@@ -34,10 +31,7 @@ fn activation() -> ActivationConfig {
         node_id: "node-a".into(),
         agent_instance_id: "activation-a".into(),
         binary_digest: format!("sha256:{}", "b".repeat(64)),
-        config_digest: format!("sha256:{}", "c".repeat(64)),
         backend: BackendType::Systemd,
-        retention_count: 3,
-        recovery_dir: None,
         poll: Duration::from_secs(1),
         renew: Duration::from_secs(60),
     }
@@ -52,7 +46,13 @@ fn instruction(instance: &str, epoch: u64) -> AgentInstruction {
         agent_instance_id: instance.into(),
         target: Some(InstructionTarget {
             kind: InstructionTargetKind::EngineSlot as i32,
-            engine_slot: "blue".into(),
+            identity: Some(
+                wr_common::wruntime::instruction_target::Identity::EngineSlotTarget(
+                    wr_common::wruntime::EngineSlotTargetIdentity {
+                        engine_slot: "blue".into(),
+                    },
+                ),
+            ),
             revision: 1,
             bundle_digest:
                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
@@ -63,6 +63,17 @@ fn instruction(instance: &str, epoch: u64) -> AgentInstruction {
         pinned_process_instance_id: "process-1".into(),
         ..Default::default()
     }
+}
+
+fn proxy_instruction(instance: &str, epoch: u64, step: NodeOperationStepKind) -> AgentInstruction {
+    let mut instruction = instruction(instance, epoch);
+    instruction.step = step as i32;
+    let target = instruction.target.as_mut().unwrap();
+    target.kind = InstructionTargetKind::Proxy as i32;
+    target.identity = Some(wr_common::wruntime::instruction_target::Identity::Proxy(
+        wr_common::wruntime::ProxyTargetIdentity {},
+    ));
+    instruction
 }
 
 #[tokio::test]
@@ -177,25 +188,27 @@ async fn node_agent_operation_test_cleanup_result_loss_after_acceptance_is_dupli
     assert_cleanup_result_loss(CleanupResultLoss::AfterAcceptance).await;
 }
 
-struct RestartRecoveryManager {
+struct FreshActivationManager {
     instruction: AgentInstruction,
     claims: AtomicUsize,
     observations: AtomicUsize,
-    stale_results: AtomicUsize,
-    retry_results: bool,
-    accept_results: bool,
+    query_errors: AtomicUsize,
+    results: AtomicUsize,
     shutdown: watch::Sender<bool>,
 }
 
-impl LeaseManager for RestartRecoveryManager {
+impl LeaseManager for FreshActivationManager {
     fn renew<'a>(&'a self, _lease: &'a LeaseIdentity) -> AgentFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
 }
 
-impl AgentManager for RestartRecoveryManager {
-    fn attest<'a>(&'a self, _attestation: NodeAgentAttestation) -> AgentFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+impl AgentManager for FreshActivationManager {
+    fn attest<'a>(&'a self, attestation: NodeAgentAttestation) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            assert_eq!(attestation.agent_instance_id, "activation-new");
+            Ok(())
+        })
     }
 
     fn claim<'a>(
@@ -204,16 +217,16 @@ impl AgentManager for RestartRecoveryManager {
         agent_instance_id: &'a str,
     ) -> AgentFuture<'a, Option<AgentInstruction>> {
         Box::pin(async move {
-            let claim = self.claims.fetch_add(1, Ordering::SeqCst);
-            match (agent_instance_id, claim) {
-                ("activation-old", 0) => Ok(Some(self.instruction.clone())),
-                ("activation-new", 1) => Ok(Some(AgentInstruction {
+            assert_eq!(agent_instance_id, "activation-new");
+            if self.claims.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(Some(AgentInstruction {
                     step: NodeOperationStepKind::InspectBackend as i32,
                     agent_instance_id: "activation-new".into(),
                     lease_epoch: 8,
                     ..self.instruction.clone()
-                })),
-                _ => Ok(None),
+                }))
+            } else {
+                Ok(None)
             }
         })
     }
@@ -226,6 +239,9 @@ impl AgentManager for RestartRecoveryManager {
             assert_eq!(request.agent_instance_id, "activation-new");
             assert_eq!(request.lease_epoch, 8);
             self.observations.fetch_add(1, Ordering::SeqCst);
+            if !request.backend_query_error.is_empty() {
+                self.query_errors.fetch_add(1, Ordering::SeqCst);
+            }
             let _ = self.shutdown.send(true);
             Ok(())
         })
@@ -233,30 +249,21 @@ impl AgentManager for RestartRecoveryManager {
 
     fn report_result<'a>(
         &'a self,
-        request: ReportStepResultRequest,
+        _request: ReportStepResultRequest,
     ) -> wr_cli::cmd::node_agent::ReportResultFuture<'a> {
         Box::pin(async move {
-            self.stale_results.fetch_add(1, Ordering::SeqCst);
-            if self.retry_results {
-                let _ = self.shutdown.send(true);
-                Err(ReportResultError::Retryable(
-                    "injected result acknowledgement loss".into(),
-                ))
-            } else if self.accept_results {
-                assert_eq!(request.agent_instance_id, "activation-new");
-                assert_eq!(request.lease_epoch, 8);
-                let _ = self.shutdown.send(true);
-                Ok(())
-            } else {
-                Err(ReportResultError::Rejected(
-                    "old-activation result must never be replayed".into(),
-                ))
-            }
+            self.results.fetch_add(1, Ordering::SeqCst);
+            Err(ReportResultError::Rejected(
+                "a fresh activation must not replay an old result".into(),
+            ))
         })
     }
 }
 
-struct InspectRecoveryBackend(AtomicUsize);
+struct InspectRecoveryBackend {
+    inspections: AtomicUsize,
+    query_error: bool,
+}
 
 impl InstructionExecutor for InspectRecoveryBackend {
     fn execute<'a>(
@@ -269,168 +276,236 @@ impl InstructionExecutor for InspectRecoveryBackend {
                 NodeOperationStepKind::try_from(instruction.step).unwrap(),
                 NodeOperationStepKind::InspectBackend
             );
-            self.0.fetch_add(1, Ordering::SeqCst);
+            self.inspections.fetch_add(1, Ordering::SeqCst);
             Ok(StepEvidence {
                 observed_revision: 1,
                 observed_digest:
                     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-                backend_state: Some(BackendProcessState::Exited),
+                backend_state: Some(if self.query_error {
+                    BackendProcessState::QueryError
+                } else {
+                    BackendProcessState::Exited
+                }),
                 backend_instance_id: "backend-1".into(),
                 process_instance_id: "process-1".into(),
+                backend_query_error: if self.query_error {
+                    "backend inspection unavailable".into()
+                } else {
+                    String::new()
+                },
                 ..Default::default()
             })
         })
     }
 }
 
-fn recovery_directory(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "wr-agent-recovery-{label}-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir(&path).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-    path
-}
-
-#[tokio::test]
-async fn node_agent_operation_test_restart_loads_and_inspects_recovery_without_replaying_result() {
-    let recovery = recovery_directory("restart");
-    let (manager_shutdown, manager_receiver) = watch::channel(false);
-    let manager = RestartRecoveryManager {
+async fn assert_fresh_activation_uses_manager_inspection(query_error: bool) {
+    let (shutdown, receiver) = watch::channel(false);
+    let manager = FreshActivationManager {
         instruction: instruction("activation-old", 7),
         claims: AtomicUsize::new(0),
         observations: AtomicUsize::new(0),
-        stale_results: AtomicUsize::new(0),
-        retry_results: false,
-        accept_results: false,
-        shutdown: manager_shutdown,
+        query_errors: AtomicUsize::new(0),
+        results: AtomicUsize::new(0),
+        shutdown,
     };
-    let blocked = FakeBlockedBackend::default();
-    let (first_shutdown, first_receiver) = watch::channel(false);
-    let first = run_activation(
-        &manager,
-        &blocked,
-        &TokioClock,
-        activation_with("activation-old", Some(recovery.clone())),
-        first_receiver,
-    );
-    tokio::pin!(first);
-    tokio::select! {
-        result = &mut first => panic!("blocked recovery effect exited before restart: {result:?}"),
-        () = tokio::time::sleep(Duration::from_millis(10)) => {
-            assert_eq!(blocked.effects_started.load(Ordering::SeqCst), 1);
-            first_shutdown.send(true).unwrap();
-        }
-    }
-    first.await.unwrap();
-    assert_eq!(blocked.effects_started.load(Ordering::SeqCst), 1);
-    assert_eq!(blocked.effects_reaped.load(Ordering::SeqCst), 1);
-    assert_eq!(std::fs::read_dir(&recovery).unwrap().count(), 1);
+    let inspector = InspectRecoveryBackend {
+        inspections: AtomicUsize::new(0),
+        query_error,
+    };
 
-    let inspector = InspectRecoveryBackend(AtomicUsize::new(0));
     run_activation(
         &manager,
         &inspector,
         &TokioClock,
-        activation_with("activation-new", Some(recovery.clone())),
-        manager_receiver,
-    )
-    .await
-    .unwrap();
-    assert_eq!(inspector.0.load(Ordering::SeqCst), 1);
-    assert_eq!(manager.observations.load(Ordering::SeqCst), 1);
-    assert_eq!(manager.stale_results.load(Ordering::SeqCst), 0);
-    assert_eq!(std::fs::read_dir(&recovery).unwrap().count(), 0);
-    std::fs::remove_dir(recovery).unwrap();
-}
-
-#[tokio::test]
-async fn node_agent_operation_test_restart_correlates_stored_result_without_old_activation_replay()
-{
-    let recovery = recovery_directory("result-restart");
-    let (first_shutdown, first_receiver) = watch::channel(false);
-    let cleanup_instruction = instruction("activation-old", 7);
-    let first_manager = RestartRecoveryManager {
-        instruction: cleanup_instruction.clone(),
-        claims: AtomicUsize::new(0),
-        observations: AtomicUsize::new(0),
-        stale_results: AtomicUsize::new(0),
-        retry_results: true,
-        accept_results: false,
-        shutdown: first_shutdown,
-    };
-    let cleanup = FakeCleanupBackend::default();
-    run_activation(
-        &first_manager,
-        &cleanup,
-        &TokioClock,
-        activation_with("activation-old", Some(recovery.clone())),
-        first_receiver,
-    )
-    .await
-    .unwrap();
-    assert_eq!(cleanup.effects.load(Ordering::SeqCst), 1);
-    assert_eq!(first_manager.stale_results.load(Ordering::SeqCst), 1);
-    assert_eq!(std::fs::read_dir(&recovery).unwrap().count(), 1);
-
-    let (second_shutdown, second_receiver) = watch::channel(false);
-    let second_manager = RestartRecoveryManager {
-        instruction: cleanup_instruction,
-        claims: AtomicUsize::new(1),
-        observations: AtomicUsize::new(0),
-        stale_results: AtomicUsize::new(0),
-        retry_results: false,
-        accept_results: true,
-        shutdown: second_shutdown,
-    };
-    let retry_cleanup = FakeCleanupBackend::default();
-    run_activation(
-        &second_manager,
-        &retry_cleanup,
-        &TokioClock,
-        activation_with("activation-new", Some(recovery.clone())),
-        second_receiver,
-    )
-    .await
-    .unwrap();
-    assert_eq!(retry_cleanup.effects.load(Ordering::SeqCst), 1);
-    assert_eq!(second_manager.observations.load(Ordering::SeqCst), 1);
-    assert_eq!(second_manager.stale_results.load(Ordering::SeqCst), 0);
-    assert_eq!(std::fs::read_dir(&recovery).unwrap().count(), 0);
-    std::fs::remove_dir(recovery).unwrap();
-}
-
-#[tokio::test]
-async fn node_agent_operation_test_corrupt_recovery_fails_before_attestation_or_claim() {
-    let recovery = recovery_directory("corrupt");
-    let path = recovery.join("00000000-0000-0000-0000-000000000001.state");
-    std::fs::write(&path, b"corrupt").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let (shutdown, receiver) = watch::channel(false);
-    let manager = RestartRecoveryManager {
-        instruction: instruction("activation-old", 7),
-        claims: AtomicUsize::new(0),
-        observations: AtomicUsize::new(0),
-        stale_results: AtomicUsize::new(0),
-        retry_results: false,
-        accept_results: false,
-        shutdown,
-    };
-    let error = run_activation(
-        &manager,
-        &InspectRecoveryBackend(AtomicUsize::new(0)),
-        &TokioClock,
-        activation_with("activation-new", Some(recovery.clone())),
+        activation_with("activation-new"),
         receiver,
     )
     .await
-    .unwrap_err();
-    assert!(error.to_string().contains("invalid envelope"));
-    assert_eq!(manager.claims.load(Ordering::SeqCst), 0);
-    std::fs::remove_file(path).unwrap();
-    std::fs::remove_dir(recovery).unwrap();
+    .unwrap();
+
+    assert_eq!(inspector.inspections.load(Ordering::SeqCst), 1);
+    assert_eq!(manager.observations.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        manager.query_errors.load(Ordering::SeqCst),
+        usize::from(query_error)
+    );
+    assert_eq!(manager.results.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn node_agent_operation_test_fresh_activation_after_delivery_inspects_without_old_result() {
+    assert_fresh_activation_uses_manager_inspection(false).await;
+}
+
+struct PostExecutionRecoveryManager {
+    old_claims: AtomicUsize,
+    fresh_claims: AtomicUsize,
+    old_results: AtomicUsize,
+    fresh_results: AtomicUsize,
+    observations: AtomicUsize,
+    old_shutdown: watch::Sender<bool>,
+    fresh_shutdown: watch::Sender<bool>,
+}
+
+impl LeaseManager for PostExecutionRecoveryManager {
+    fn renew<'a>(&'a self, _lease: &'a LeaseIdentity) -> AgentFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl AgentManager for PostExecutionRecoveryManager {
+    fn attest<'a>(&'a self, _attestation: NodeAgentAttestation) -> AgentFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn claim<'a>(
+        &'a self,
+        _node_id: &'a str,
+        agent_instance_id: &'a str,
+    ) -> AgentFuture<'a, Option<AgentInstruction>> {
+        Box::pin(async move {
+            match agent_instance_id {
+                "activation-old" if self.old_claims.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    Ok(Some(proxy_instruction(
+                        "activation-old",
+                        7,
+                        NodeOperationStepKind::StartBackend,
+                    )))
+                }
+                "activation-new" if self.fresh_claims.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    Ok(Some(proxy_instruction(
+                        "activation-new",
+                        8,
+                        NodeOperationStepKind::InspectBackend,
+                    )))
+                }
+                _ => Ok(None),
+            }
+        })
+    }
+
+    fn report_observation<'a>(
+        &'a self,
+        _request: ReportNodeObservationRequest,
+    ) -> AgentFuture<'a, ()> {
+        Box::pin(async move {
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    fn report_result<'a>(
+        &'a self,
+        request: ReportStepResultRequest,
+    ) -> wr_cli::cmd::node_agent::ReportResultFuture<'a> {
+        Box::pin(async move {
+            match request.agent_instance_id.as_str() {
+                "activation-old" => {
+                    assert_eq!(request.step, NodeOperationStepKind::StartBackend as i32);
+                    self.old_results.fetch_add(1, Ordering::SeqCst);
+                    let _ = self.old_shutdown.send(true);
+                    Err(ReportResultError::Retryable(
+                        "injected post-execution response loss".into(),
+                    ))
+                }
+                "activation-new" => {
+                    assert_eq!(request.step, NodeOperationStepKind::InspectBackend as i32);
+                    assert!(matches!(
+                        request.target.and_then(|target| target.identity),
+                        Some(wr_common::wruntime::instruction_target::Identity::Proxy(_))
+                    ));
+                    self.fresh_results.fetch_add(1, Ordering::SeqCst);
+                    let _ = self.fresh_shutdown.send(true);
+                    Ok(())
+                }
+                other => panic!("unexpected result activation {other}"),
+            }
+        })
+    }
+}
+
+#[derive(Default)]
+struct PostExecutionRecoveryBackend {
+    mutations: AtomicUsize,
+    inspections: AtomicUsize,
+}
+
+impl InstructionExecutor for PostExecutionRecoveryBackend {
+    fn execute<'a>(
+        &'a self,
+        instruction: &'a AgentInstruction,
+        _cancelled: watch::Receiver<bool>,
+    ) -> BackendFuture<'a, StepEvidence> {
+        Box::pin(async move {
+            match NodeOperationStepKind::try_from(instruction.step).unwrap() {
+                NodeOperationStepKind::StartBackend => {
+                    self.mutations.fetch_add(1, Ordering::SeqCst);
+                }
+                NodeOperationStepKind::InspectBackend => {
+                    self.inspections.fetch_add(1, Ordering::SeqCst);
+                }
+                step => panic!("unexpected recovery step {step:?}"),
+            }
+            Ok(StepEvidence {
+                observed_revision: 1,
+                observed_digest:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                backend_state: Some(BackendProcessState::Running),
+                backend_instance_id: "proxy-backend-1".into(),
+                process_instance_id: "proxy-process-1".into(),
+                ..Default::default()
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn node_agent_operation_test_fresh_activation_after_execution_reports_proxy_inspection() {
+    let (old_shutdown, old_receiver) = watch::channel(false);
+    let (fresh_shutdown, fresh_receiver) = watch::channel(false);
+    let manager = PostExecutionRecoveryManager {
+        old_claims: AtomicUsize::new(0),
+        fresh_claims: AtomicUsize::new(0),
+        old_results: AtomicUsize::new(0),
+        fresh_results: AtomicUsize::new(0),
+        observations: AtomicUsize::new(0),
+        old_shutdown,
+        fresh_shutdown,
+    };
+    let backend = PostExecutionRecoveryBackend::default();
+
+    run_activation(
+        &manager,
+        &backend,
+        &FakeClock,
+        activation_with("activation-old"),
+        old_receiver,
+    )
+    .await
+    .unwrap();
+    assert_eq!(backend.mutations.load(Ordering::SeqCst), 1);
+    assert_eq!(manager.old_results.load(Ordering::SeqCst), 1);
+
+    run_activation(
+        &manager,
+        &backend,
+        &FakeClock,
+        activation_with("activation-new"),
+        fresh_receiver,
+    )
+    .await
+    .unwrap();
+    assert_eq!(backend.mutations.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.inspections.load(Ordering::SeqCst), 1);
+    assert_eq!(manager.fresh_results.load(Ordering::SeqCst), 1);
+    assert_eq!(manager.observations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn node_agent_operation_test_fresh_activation_reports_inconclusive_inspection_without_mutation(
+) {
+    assert_fresh_activation_uses_manager_inspection(true).await;
 }
 
 #[test]

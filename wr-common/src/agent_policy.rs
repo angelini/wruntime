@@ -1,8 +1,7 @@
-//! Canonical, non-secret host node-agent policy.
+//! Strict, non-secret host node-agent configuration and shared compatibility helpers.
 //!
-//! The exact bytes produced here are the only supported `agent.toml` encoding.
-//! Manager expectations, installer output, and process attestation all use the
-//! same normalized record and SHA-256 digest.
+//! The complete configuration is parsed and validated locally. Manager authorization
+//! deliberately uses only the narrow compatibility fields exposed by the protobuf.
 
 use std::path::{Component, Path};
 
@@ -46,7 +45,6 @@ pub struct AgentPolicy {
     pub docker_path: String,
     pub poll_interval_seconds: u64,
     pub renew_interval_seconds: u64,
-    pub retention_count: u32,
     pub protocol_version: String,
     pub capabilities: Vec<String>,
 }
@@ -54,8 +52,7 @@ pub struct AgentPolicy {
 impl AgentPolicy {
     pub fn normalized(&self) -> Result<Self> {
         let mut policy = self.clone();
-        policy.capabilities.sort();
-        policy.capabilities.dedup();
+        policy.capabilities = normalize_capabilities(&policy.capabilities)?;
         policy.validate()?;
         Ok(policy)
     }
@@ -108,22 +105,23 @@ impl AgentPolicy {
         if self.renew_interval_seconds >= 15 {
             bail!("renew interval must stay below the manager lease interval");
         }
-        if self.retention_count == 0 {
-            bail!("retention-count must be positive");
-        }
         if self.protocol_version != AGENT_PROTOCOL_VERSION {
             bail!("node-agent protocol version must exactly match this binary");
         }
-        let supported = AGENT_CAPABILITIES
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect::<Vec<_>>();
-        if self.capabilities != supported {
+        let supported = normalize_capabilities(
+            &AGENT_CAPABILITIES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )?;
+        if normalize_capabilities(&self.capabilities)? != supported {
             bail!("node-agent capabilities must exactly match this binary");
         }
         Ok(())
     }
 
+    /// Canonical local configuration encoding. These bytes are never an
+    /// authorization or manager compatibility input.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
         let policy = self.normalized()?;
         Ok(toml::to_string(&policy)
@@ -131,12 +129,6 @@ impl AgentPolicy {
             .into_bytes())
     }
 
-    pub fn canonical_digest(&self) -> Result<String> {
-        Ok(sha256_digest(&self.canonical_bytes()?))
-    }
-
-    /// Parse only the canonical encoding. This rejects unknown/omitted fields
-    /// and alternate TOML renderings before any digest is accepted.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
         let text = std::str::from_utf8(bytes).context("node-agent policy is not UTF-8")?;
         let policy: Self = toml::from_str(text).context("node-agent policy is invalid")?;
@@ -146,6 +138,37 @@ impl AgentPolicy {
         }
         policy.normalized()
     }
+}
+
+pub fn normalize_capabilities(values: &[String]) -> Result<Vec<String>> {
+    let mut normalized = values.to_vec();
+    for capability in &normalized {
+        validate_identity(capability, "capability")?;
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+pub fn missing_capabilities(required: &[String], advertised: &[String]) -> Result<Vec<String>> {
+    let required = normalize_capabilities(required)?;
+    let advertised = normalize_capabilities(advertised)?;
+    Ok(required
+        .into_iter()
+        .filter(|capability| advertised.binary_search(capability).is_err())
+        .collect())
+}
+
+pub fn validate_sha256_digest(value: &str, name: &str) -> Result<()> {
+    if !value.starts_with("sha256:")
+        || value.len() != 71
+        || !value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("{name} must be an exact SHA-256 digest");
+    }
+    Ok(())
 }
 
 pub fn sha256_digest(bytes: &[u8]) -> String {
@@ -159,7 +182,7 @@ pub fn sha256_digest(bytes: &[u8]) -> String {
     encoded
 }
 
-fn validate_identity(value: &str, name: &str) -> Result<()> {
+pub fn validate_identity(value: &str, name: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 128
         || !value
@@ -207,7 +230,6 @@ mod tests {
             docker_path: String::new(),
             poll_interval_seconds: 5,
             renew_interval_seconds: 5,
-            retention_count: 3,
             protocol_version: AGENT_PROTOCOL_VERSION.into(),
             capabilities: AGENT_CAPABILITIES
                 .iter()
@@ -217,74 +239,41 @@ mod tests {
     }
 
     #[test]
-    fn canonical_policy_is_stable_and_every_field_is_digest_bound() {
+    fn local_policy_is_strict_but_capability_order_is_set_based() {
         let baseline = policy();
         let bytes = baseline.canonical_bytes().unwrap();
-        assert_eq!(bytes, baseline.canonical_bytes().unwrap());
         assert_eq!(baseline, AgentPolicy::from_canonical_bytes(&bytes).unwrap());
-        let digest = baseline.canonical_digest().unwrap();
+        let mut reordered = baseline.clone();
+        reordered.capabilities.reverse();
+        reordered.capabilities.push(AGENT_CAPABILITIES[0].into());
+        assert_eq!(
+            reordered.normalized().unwrap(),
+            baseline.normalized().unwrap()
+        );
 
-        type PolicyMutation = Box<dyn Fn(&mut AgentPolicy)>;
-        let mutations: Vec<PolicyMutation> = vec![
-            Box::new(|p| p.node_id = "node-b".into()),
-            Box::new(|p| p.manager_endpoint = "https://other.example:9000".into()),
-            Box::new(|p| p.client_cert_path.push_str(".new")),
-            Box::new(|p| p.client_key_path.push_str(".new")),
-            Box::new(|p| p.ca_cert_path.push_str(".new")),
-            Box::new(|p| p.deployment_root = "/srv/wruntime".into()),
-            Box::new(|p| p.runtime_dir = "/run/wruntime-other".into()),
-            Box::new(|p| p.systemctl_path = "/bin/systemctl".into()),
-            Box::new(|p| p.poll_interval_seconds = 6),
-            Box::new(|p| p.renew_interval_seconds = 6),
-            Box::new(|p| p.retention_count = 4),
-        ];
-        for mutate in mutations {
-            let mut changed = baseline.clone();
-            mutate(&mut changed);
-            assert_ne!(changed.canonical_digest().unwrap(), digest);
+        for invalidate in [
+            |value: &mut AgentPolicy| value.node_id.clear(),
+            |value: &mut AgentPolicy| value.protocol_version = "other".into(),
+            |value: &mut AgentPolicy| value.renew_interval_seconds = 15,
+            |value: &mut AgentPolicy| value.client_key_path = "relative".into(),
+        ] as [fn(&mut AgentPolicy); 4]
+        {
+            let mut invalid = baseline.clone();
+            invalidate(&mut invalid);
+            assert!(invalid.validate().is_err());
         }
-        let mut docker = baseline.clone();
-        docker.backend = AgentPolicyBackend::Docker;
-        docker.systemctl_path.clear();
-        docker.docker_path = "/usr/bin/docker".into();
-        docker.compose_project = "wruntime-node".into();
-        assert_ne!(docker.canonical_digest().unwrap(), digest);
-        let docker_digest = docker.canonical_digest().unwrap();
-        docker.compose_project = "wruntime-other".into();
-        assert_ne!(docker.canonical_digest().unwrap(), docker_digest);
-        docker.compose_project = "wruntime-node".into();
-        docker.docker_path = "/opt/bin/docker".into();
-        assert_ne!(docker.canonical_digest().unwrap(), docker_digest);
-
-        let mut invalid = baseline.clone();
-        invalid.protocol_version = "mixed-version".into();
-        assert!(invalid.canonical_digest().is_err());
-        invalid = baseline.clone();
-        invalid.capabilities.pop();
-        assert!(invalid.canonical_digest().is_err());
-        invalid = baseline;
-        invalid.policy_version += 1;
-        assert!(invalid.canonical_digest().is_err());
     }
 
     #[test]
-    fn parser_rejects_unknown_omitted_and_noncanonical_input() {
-        let canonical = String::from_utf8(policy().canonical_bytes().unwrap()).unwrap();
-        assert!(AgentPolicy::from_canonical_bytes(
-            canonical
-                .replace("node-id =", "unknown = 1\nnode-id =")
-                .as_bytes()
-        )
-        .is_err());
-        assert!(AgentPolicy::from_canonical_bytes(
-            canonical
-                .lines()
-                .filter(|line| !line.starts_with("retention-count ="))
-                .collect::<Vec<_>>()
-                .join("\n")
-                .as_bytes()
-        )
-        .is_err());
-        assert!(AgentPolicy::from_canonical_bytes(format!("\n{canonical}").as_bytes()).is_err());
+    fn narrow_contract_helpers_are_deterministic() {
+        let required = vec!["b".into(), "a".into(), "a".into()];
+        let advertised = vec!["c".into(), "b".into()];
+        assert_eq!(normalize_capabilities(&required).unwrap(), vec!["a", "b"]);
+        assert_eq!(
+            missing_capabilities(&required, &advertised).unwrap(),
+            vec!["a"]
+        );
+        assert!(validate_sha256_digest(&format!("sha256:{}", "a".repeat(64)), "binary").is_ok());
+        assert!(validate_sha256_digest("sha256:ABC", "binary").is_err());
     }
 }

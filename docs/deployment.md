@@ -26,12 +26,11 @@ cargo install cargo-zigbuild
 | `wr-cli managers inspect-bundle` | Inspect a manager bundle without deploying |
 | `wr-cli managers list` | List active managers in the cluster |
 | `wr-cli node bundle` | Package proxy + engine binaries, WASM modules, and schemas |
-| `wr-cli node agent install/update` | Deterministically install the independent host agent and wait for exact attestation |
-| `wr-cli node deploy` | Stage/finalize a bundle and submit its initial durable operation |
-| `wr-cli node rollback` | Stage a retained successful bundle as a new revision and submit rollback |
-| `wr-cli node upgrade` / `node scale` | Stage/finalize a bundle and submit a durable rollout |
+| `wr-cli node agent install/update` | Atomically update only an already provisioned host-agent binary, restart it, and wait for a new compatible attestation |
+| `wr-cli node deploy` | Stage/finalize a complete desired inventory and reconcile initial, replacement, scale, or mixed changes |
+| `wr-cli node rollback` | Stage a retained successful bundle as a new revision and submit explicit rollback |
 | `wr-cli engines status` | Compose lifecycle, availability, revision authority, backend evidence, and active operation status |
-| `wr-cli engines drain` / `engines restart` | Submit one durable stable-slot lifecycle operation |
+| `wr-cli engines restart` | Restart one committed desired slot without changing its revision or inventory |
 | `wr-cli operations get/list/resume/cancel` | Inspect and administer durable operation history |
 | `wr-cli node abandon` | Remove an unsubmitted inactive allocation after manager safety checks |
 | `wr-cli node inspect-bundle` | Verify and inspect a node bundle without deploying |
@@ -179,10 +178,11 @@ wr-cli node bundle --engine-config engine.toml
 Add `--proxy-config examples/config/proxy.toml` (or set `proxy_config` in `wr-deploy.toml`) when the source proxy config has runtime sections such as egress allowlists, external routes, or non-default circuit-breaker settings that must be preserved in the bundle.
 
 ```bash
-# 4. Install the independent host agent and wait for exact attestation
-wr-cli node agent install --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.1 --manager https://10.0.1.1:9000
+# 4. After provisioning config, credentials, directories, backend, service unit,
+#    executable, and initial manager policy, update the agent binary.
+wr-cli node agent install --node-id node-a --format systemd wr-node-bundle.tar.gz deploy@10.0.1.1 --manager https://10.0.1.1:9000
 
-# 5. Stage/finalize the release and submit its durable initial apply
+# 5. Stage/finalize the complete desired inventory and submit reconciliation
 wr-cli node deploy --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.1 --manager https://10.0.1.1:9000 --request-token node-a-initial
 
 # 6. Inspect immutable bundle content without querying runtime health
@@ -206,7 +206,7 @@ wr-cli node bundle \
     --target aarch64-unknown-linux-gnu \
     --output myapp.tar.gz
 
-wr-cli node agent install --node-id node-a myapp.tar.gz deploy@10.0.1.1 \
+wr-cli node agent install --node-id node-a --format systemd myapp.tar.gz deploy@10.0.1.1 \
     --manager https://10.0.1.1:9000
 wr-cli node deploy --node-id node-a myapp.tar.gz deploy@10.0.1.1 \
     --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
@@ -227,31 +227,36 @@ Rollback verifies retained source content, allocates and finalizes a new monoton
 
 ## Operator lifecycle operations
 
-Destructive commands address stable `node_id` plus engine slot, never ephemeral `engine_id`:
+Maintenance addresses stable `node_id` plus engine slot, never ephemeral `engine_id`:
 
 ```bash
 wr-cli engines status --node-id node-a --slot blue --json
-wr-cli engines drain --node-id node-a --slot blue --request-token incident-42
 wr-cli engines restart --node-id node-a --slot blue --wait-timeout 300
 wr-cli operations list --node-id node-a --include-terminal --json
 wr-cli operations resume <operation-id>
 wr-cli operations cancel <operation-id>
 ```
 
-Drain defaults to a two-minute durable deadline and restart to five minutes. Draining or restarting the last serving slot requires explicit `--allow-downtime`. Waiting is default. `--wait-timeout` limits only the CLI; timeout is nonzero and prints the operation ID and last observation while durable work continues. `--no-wait` returns after submission. Omitting `--request-token` generates and prints a UUID. Reusing the same actor/token/payload follows the same operation; conflicting reuse fails.
+Restart defaults to a five-minute durable deadline and preserves the committed revision and desired inventory. Restarting the final serving slot requires explicit `--allow-downtime`. Waiting is default. `--wait-timeout` limits only the CLI; timeout is nonzero and prints the operation ID and last observation while durable work continues. `--no-wait` returns after submission. Omitting `--request-token` generates and prints a UUID. Reusing the same actor/token/payload follows the same operation; conflicting reuse fails.
 
-Upgrade and scale use the same bundle-oriented staging/finalization boundary:
+Use `node deploy` for every complete desired-inventory change—first deployment, revision replacement, expansion, contraction, or a mixed transition:
 
 ```bash
-wr-cli node upgrade --node-id node-a wr-node-v2.tar.gz deploy@10.0.1.1 \
-  --request-token node-a-v2 --max-unavailable 1 --canary blue
-wr-cli node scale --node-id node-a wr-node-scaled.tar.gz deploy@10.0.1.1 \
-  --request-token node-a-scale --max-unavailable 1
+wr-cli node deploy --node-id node-a wr-node-v2.tar.gz deploy@10.0.1.1 \
+  --request-token node-a-v2 --max-unavailable 1
+wr-cli node deploy --node-id node-a wr-node-scaled.tar.gz deploy@10.0.1.1 \
+  --request-token node-a-inventory-change --max-unavailable 1
 ```
 
-The default is `max_unavailable=1`, lexical first-slot canary, automatic continuation, and a 30-minute durable deadline for deploy-family operations. `--canary`, `--pause-after-canary`, and `--allow-downtime` make deviations explicit; reducing a one-slot or zero-capacity topology requires downtime acknowledgement. `--wait-timeout` is caller-only and `--no-wait` returns after submission. A paused canary or expired lease requires `operations resume`. Cancellation before commit first restores source authority and processes without the expired forward deadline; committed work is corrected by a separately authorized rollback.
+The bundle's finalized inventory is authoritative; callers do not select initial, upgrade, scale, or canary mechanics. The manager progresses additions, retained replacements, and removals sequentially in deterministic groups. The default is `max_unavailable=1` and a 30-minute durable deadline. Reducing the final serving slot or targeting an empty inventory requires `--allow-downtime`. Submitting the exact committed revision with a new authenticated actor/token creates an immediately successful operation and performs no host, deployment, or authority mutation. `--wait-timeout` is caller-only and `--no-wait` returns after submission. Cancellation before commit restores the complete source inventory and authority without the expired forward deadline; committed work is corrected only by separately authorized rollback.
 
-The host agent verifies digest-covered release metadata, confines paths below `deployment_root`, atomically selects `wr-node/slots/<slot>`, and invokes only fixed systemd units or Compose services. It has no listener. Stop sends SIGTERM through that backend; the engine's 30-second shutdown emits `STOPPING`, withdraws routes, converges the proxy, drains, and deregisters. The manager requires action-specific lifecycle, routing, registration, and backend evidence. Endpoint disappearance alone is never final-exit proof, and an inspection failure is unknown rather than exited.
+The host agent verifies digest-covered release metadata, confines paths below `deployment_root`, atomically selects `wr-node/slots/<slot>`, and invokes only fixed systemd units or Compose services. It has no listener and no root-owned recovery-state directory or journal. The generated unit grants write access to workload state, the runtime directory, and backend-owned unit/socket paths only. Stop sends SIGTERM through that backend; the engine's 30-second shutdown emits `STOPPING`, withdraws routes, converges the proxy, drains, and deregisters. The manager commits delivery ambiguity before returning a mutation. A live agent retries an unacknowledged exact tagged result in memory before claiming more work; after agent replacement, the fresh activation never replays that result and instead receives typed backend inspection from durable manager state. Endpoint disappearance alone is never final-exit proof, and missing or query-error inspection evidence is unknown and pauses rather than authorizing another mutation.
+
+### Unified-target schema cutover
+
+Migration V31 is a coordinated, quiesced binary/schema cutover. Stop new operation submissions and agent claims, verify there are zero queued/running/paused node operations, and take the required database restore point before applying migrations. V31 aborts rather than resetting in-flight state; it converts terminal proxy, engine, typed-detail, termination-evidence, and receipt history exactly and then removes the split schema.
+
+Before V31 commits, rollback uses the old binaries with the unchanged schema. After V31 commits, old binaries are incompatible: keep claims stopped and either roll forward with matching manager/agent binaries or restore the database and old binaries together. Mixed-version operation processing is unsupported.
 
 ## Multi-node cluster setup
 
@@ -275,13 +280,13 @@ wr-cli managers deploy manager.tar.gz deploy@10.0.1.1
 # --- Node A ---
 
 wr-cli node bundle --engine-config examples/multi-node/node-a/engine-1.toml --output node-a.tar.gz
-wr-cli node agent install --node-id node-a node-a.tar.gz deploy@10.0.1.50
+wr-cli node agent install --node-id node-a --format systemd node-a.tar.gz deploy@10.0.1.50
 wr-cli node deploy --node-id node-a node-a.tar.gz deploy@10.0.1.50 --request-token node-a-initial
 
 # --- Node B ---
 
 wr-cli node bundle --engine-config examples/multi-node/node-b/engine-1.toml --output node-b.tar.gz
-wr-cli node agent install --node-id node-b node-b.tar.gz deploy@10.0.1.51
+wr-cli node agent install --node-id node-b --format systemd node-b.tar.gz deploy@10.0.1.51
 wr-cli node deploy --node-id node-b node-b.tar.gz deploy@10.0.1.51 --request-token node-b-initial
 ```
 
@@ -341,7 +346,7 @@ Production roots are installed under `/etc/wruntime/pki/roots/`. Immutable crede
 
 ## Remote host requirements
 
-Bootstrap, agent install/update, inactive staging, and diagnostic commands use privileged operations over SSH via `sudo`. Workload effects do not. The deploy user must have **passwordless sudo** configured on each target host:
+External provisioning owns bootstrap, node-agent config and credentials, directories, backend prerequisites, and the hardened service unit. The product's agent install/update helper uses privileged SSH only to stage, verify, atomically replace the existing agent executable, and restart the existing service; it never transfers private material or repairs missing topology. Inactive release staging and diagnostic commands also use bounded privileged operations. Workload effects do not. The deploy user must have **passwordless sudo** configured on each target host:
 
 ```bash
 echo "deploy ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/deploy
@@ -400,13 +405,12 @@ Repository examples keep artifact construction outside foreground execution: the
 Operators address stable deployment identity and submit durable intent:
 
 ```bash
-wr-cli engines drain --node-id node-a --slot inventory --request-token maintenance-42 --json
 wr-cli engines restart --node-id node-a --slot inventory --request-token restart-42 --json
 ```
 
 Only the continuously fenced node agent maps the typed target to `wr-engine-<slot>.service` or the fixed Compose service. It records backend instance identity, sends the backend's graceful SIGTERM action, and inspects until the exact instance exits. Manager reconciliation separately requires `STOPPING`, route withdrawal, deregistration, and backend final exit where the action calls for them. A restarted process must have the requested revision/digests and a fresh process/backend identity before authority can return.
 
-SSH remains available for installing/updating the host agent, pre-staging immutable bytes, and bounded diagnostics. It is never used to execute workload stop/start/select/cleanup effects. If the agent loses its activation lease or cannot inspect the backend, the operation pauses with explicit evidence; a replacement activation begins with inspection and cannot blindly repeat the prior effect.
+SSH remains available for binary-only host-agent updates on an existing provisioned baseline, pre-staging immutable bytes, and bounded diagnostics. It is never used to execute workload stop/start/select/cleanup effects. If the agent loses its activation lease or cannot inspect the backend, the operation pauses with explicit evidence; a replacement activation begins with inspection and cannot blindly repeat the prior effect.
 
 ## Semantic startup and bounded shutdown
 
@@ -418,7 +422,7 @@ Startup remains tolerant only through bounded, owned retries. A proxy must reach
 
 On engine shutdown, route withdrawal and local proxy convergence happen before HTTP admission closes and before final deregistration. Existing HTTP requests and claimed jobs drain to the shared deadline; new work is rejected deterministically. Proxy shutdown closes data-plane admission and every data listener before joining control and background tasks. Manager shutdown rejects new administrative mutations but retains read-only status and required engine drain/deregister operations during teardown. These are internal `STOPPING` phases; deadline expiry or failed required deregistration is a non-zero process outcome.
 
-`node deploy`, `upgrade`, `scale`, and `rollback` stage/finalize exact node/revision/bundle/resolved-release identity and then submit durable work. The manager owns the absolute operation deadline; the CLI's wait deadline is separate. Backend inspection, lifecycle READY/STOPPING, registration, routing convergence, slot authority, and commit remain distinct evidence, and callers add no readiness sleep. A completed verification report waits for its matching fresh observation instead of treating normal result-before-observation delivery as invalid evidence. Post-commit cleanup is visible through the dedicated node cleanup status and never changes the already-committed operation result. Overdue or paused cleanup projects `DEGRADED`, not `UNHEALTHY`, while serving remains healthy.
+`node deploy` and `rollback` stage/finalize exact node/revision/bundle/resolved-release identity and then submit durable work. The manager owns the absolute operation deadline; the CLI's wait deadline is separate. Backend inspection, lifecycle READY/STOPPING, registration, routing convergence, slot authority, and commit remain distinct evidence, and callers add no readiness sleep. A completed verification report waits for its matching fresh observation instead of treating normal result-before-observation delivery as invalid evidence. Post-commit cleanup is visible through the dedicated node cleanup status and never changes the already-committed operation result. Overdue or paused cleanup projects `DEGRADED`, not `UNHEALTHY`, while serving remains healthy.
 
 ## Pre-compilation
 

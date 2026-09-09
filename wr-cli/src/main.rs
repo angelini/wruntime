@@ -77,7 +77,7 @@ enum Commands {
     Schedules(cmd::schedules::SchedulesArgs),
     /// Manage namespace-scoped secrets
     Secrets(cmd::secrets::SecretsArgs),
-    /// Remote node deployment and lifecycle (bundle, deploy, upgrade, scale, rollback, agent)
+    /// Remote node deployment and lifecycle (bundle, reconcile deployment, rollback, agent)
     Node(cmd::node::NodeArgs),
     /// Inspect, resume, or cancel durable node operations
     Operations(cmd::operations::OperationsArgs),
@@ -148,6 +148,79 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_cli_retains_deploy_rollback_and_restart_only() {
+        assert!(Cli::try_parse_from([
+            "wr-cli",
+            "node",
+            "deploy",
+            "bundle.tar.gz",
+            "operator@example",
+            "--node-id",
+            "node-a",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "wr-cli",
+            "node",
+            "rollback",
+            "operator@example",
+            "--node-id",
+            "node-a",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "wr-cli",
+            "engines",
+            "restart",
+            "--node-id",
+            "node-a",
+            "--slot",
+            "blue",
+            "--allow-downtime",
+        ])
+        .is_ok());
+
+        for removed in ["upgrade", "scale"] {
+            assert!(Cli::try_parse_from([
+                "wr-cli",
+                "node",
+                removed,
+                "bundle.tar.gz",
+                "operator@example",
+                "--node-id",
+                "node-a",
+            ])
+            .is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "wr-cli",
+            "engines",
+            "drain",
+            "--node-id",
+            "node-a",
+            "--slot",
+            "blue",
+        ])
+        .is_err());
+        for removed_flag in ["--canary", "--pause-after-canary"] {
+            let mut args = vec![
+                "wr-cli",
+                "node",
+                "deploy",
+                "bundle.tar.gz",
+                "operator@example",
+                "--node-id",
+                "node-a",
+                removed_flag,
+            ];
+            if removed_flag == "--canary" {
+                args.push("blue");
+            }
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 
     #[test]
     fn obsolete_job_admin_listener_flags_are_rejected() {

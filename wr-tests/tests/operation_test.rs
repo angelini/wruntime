@@ -10,16 +10,15 @@ use wr_common::wruntime::{
     EngineOwnershipFence, EngineRegistration, ExpectedEngine, ExpectedModule,
     FinalizeDeploymentRequest, InstructionTargetKind, LifecycleStatus, ModuleDescriptor,
     ModuleIdentity, NodeCleanupResultDisposition, NodeCleanupState, NodeOperationAction,
-    NodeOperationPhase, NodeOperationState, NodeOperationStepKind, ProcessLifecycleState,
-    ReleaseInventoryEntry, ReportNodeCleanupResultRequest, ReportNodeObservationRequest,
-    ReportStepResultRequest, RolloutPolicy, ServiceKind, SubmitOperationRequest,
+    NodeOperationPhase, NodeOperationState, NodeOperationStepKind, NodeSlotTransitionKind,
+    ProcessLifecycleState, ReleaseInventoryEntry, ReportNodeCleanupResultRequest,
+    ReportNodeObservationRequest, ReportStepResultRequest, RolloutPolicy, ServiceKind,
+    SubmitOperationRequest,
 };
 
 fn policy(deadline_seconds: u64) -> RolloutPolicy {
     RolloutPolicy {
         max_unavailable: 1,
-        canary_slot: String::new(),
-        pause_after_canary: false,
         allow_downtime: true,
         deadline_seconds,
     }
@@ -116,7 +115,6 @@ fn result_for(
     ReportStepResultRequest {
         node_id: instruction.node_id.clone(),
         operation_id: instruction.operation_id.clone(),
-        engine_slot: target.engine_slot.clone(),
         lease_epoch: instruction.lease_epoch,
         step: instruction.step,
         condition_code: condition_code.into(),
@@ -129,6 +127,46 @@ fn result_for(
         backend_query_error: String::new(),
         observed_resolved_release_digest: target.resolved_release_digest.clone(),
         termination_evidence: None,
+        target: Some(target.clone()),
+    }
+}
+
+fn engine_targets(
+    operation: &wr_common::wruntime::NodeOperation,
+) -> Vec<&wr_common::wruntime::OperationTargetProgress> {
+    operation
+        .targets
+        .iter()
+        .filter(|target| target.kind == InstructionTargetKind::EngineSlot as i32)
+        .collect()
+}
+
+fn progress_engine_slot(target: &wr_common::wruntime::OperationTargetProgress) -> &str {
+    match target.identity.as_ref() {
+        Some(wr_common::wruntime::operation_target_progress::Identity::EngineSlot(identity)) => {
+            &identity.engine_slot
+        }
+        _ => panic!("expected engine target identity"),
+    }
+}
+
+fn engine_detail(
+    target: &wr_common::wruntime::OperationTargetProgress,
+) -> &wr_common::wruntime::EngineTargetDetails {
+    match target.details.as_ref() {
+        Some(wr_common::wruntime::operation_target_progress::Details::EngineDetails(detail)) => {
+            detail
+        }
+        _ => panic!("expected engine target details"),
+    }
+}
+
+fn target_engine_slot(target: &wr_common::wruntime::InstructionTarget) -> &str {
+    match target.identity.as_ref() {
+        Some(wr_common::wruntime::instruction_target::Identity::EngineSlotTarget(identity)) => {
+            &identity.engine_slot
+        }
+        _ => panic!("expected engine-slot instruction target"),
     }
 }
 
@@ -204,34 +242,14 @@ async fn submit_deployment_operation(
     pool: &deadpool_postgres::Pool,
     deployment: &DeploymentRecord,
 ) -> Result<String> {
-    let current_revision: i64 = pool
-        .get()
-        .await?
-        .query_one(
-            "SELECT current_revision FROM wr_nodes WHERE node_id = $1",
-            &[&deployment.node_id],
-        )
-        .await?
-        .get(0);
     let operation = wr_manager::operations::submit(
         pool,
         "operator-a",
         &SubmitOperationRequest {
             node_id: deployment.node_id.clone(),
             request_token: deployment.attempt_token.clone(),
-            action: if current_revision == 0 {
-                NodeOperationAction::InitialApply as i32
-            } else {
-                NodeOperationAction::Scale as i32
-            },
-            engine_slots: deployment
-                .inventory
-                .as_ref()
-                .expect("deployment inventory")
-                .engines
-                .iter()
-                .map(|engine| engine.engine_slot.clone())
-                .collect(),
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
             target_revision: deployment.revision,
             bundle_digest: deployment.bundle_digest.clone(),
             policy: Some(policy(300)),
@@ -306,9 +324,9 @@ async fn register_ready(
         .query_one(
             "SELECT operation.operation_id
              FROM wr_node_operations operation
-             JOIN wr_node_operation_slots slot
+             JOIN wr_node_operation_targets slot
                ON slot.operation_id = operation.operation_id
-              AND slot.engine_slot = $2
+              AND slot.target_kind = 'engine_slot' AND slot.target_key = $2
              WHERE operation.node_id = $1
                AND operation.state IN ('queued', 'running', 'paused')
                AND (
@@ -536,8 +554,8 @@ async fn allocation_to_submission_crash_boundaries_recover_one_actor_target_and_
     let submit = SubmitOperationRequest {
         node_id: request.node_id,
         request_token: request.attempt_token,
-        action: NodeOperationAction::InitialApply as i32,
-        engine_slots: vec!["blue".into()],
+        action: NodeOperationAction::Deployment as i32,
+        engine_slot: String::new(),
         target_revision: finalized.revision,
         bundle_digest: digest,
         policy: Some(policy(300)),
@@ -569,8 +587,8 @@ async fn durable_operation_is_idempotent_and_fences_activation_and_epoch() -> Re
     let request = SubmitOperationRequest {
         node_id: "operation-node".into(),
         request_token: "same-request".into(),
-        action: NodeOperationAction::InitialApply as i32,
-        engine_slots: vec!["blue".into()],
+        action: NodeOperationAction::Deployment as i32,
+        engine_slot: String::new(),
         target_revision: deployment.revision,
         bundle_digest: digest,
         policy: Some(policy(300)),
@@ -581,7 +599,11 @@ async fn durable_operation_is_idempotent_and_fences_activation_and_epoch() -> Re
     assert_eq!(first.operation_id, duplicate.operation_id);
 
     let mut conflicting = request.clone();
-    conflicting.engine_slots = vec!["green".into()];
+    conflicting
+        .policy
+        .as_mut()
+        .expect("policy")
+        .deadline_seconds += 1;
     let conflict = wr_manager::operations::submit(&pool, "operator-a", &conflicting)
         .await
         .expect_err("conflicting token reuse must fail");
@@ -623,7 +645,7 @@ async fn durable_operation_is_idempotent_and_fences_activation_and_epoch() -> Re
 }
 
 #[tokio::test]
-async fn rolling_upgrade_proves_the_source_proxy_before_stop() -> Result<()> {
+async fn deployment_replacement_proves_the_source_proxy_before_stop() -> Result<()> {
     let pool = manager_pool().await;
     let source_digest = format!("sha256:{}", "7".repeat(64));
     let source = stage(
@@ -650,8 +672,8 @@ async fn rolling_upgrade_proves_the_source_proxy_before_stop() -> Result<()> {
         &SubmitOperationRequest {
             node_id: "proxy-source-node".into(),
             request_token: "upgrade-allocation".into(),
-            action: NodeOperationAction::RollingUpgrade as i32,
-            engine_slots: vec!["blue".into()],
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
             target_revision: target.revision,
             bundle_digest: target.bundle_digest.clone(),
             policy: Some(policy(300)),
@@ -703,8 +725,10 @@ async fn rolling_upgrade_proves_the_source_proxy_before_stop() -> Result<()> {
     let reported = wr_manager::operations::report_step(&pool, &stopped, "agent-a").await?;
     assert_eq!(
         reported
-            .termination_evidence
-            .as_ref()
+            .targets
+            .iter()
+            .find(|target| target.kind == InstructionTargetKind::Proxy as i32)
+            .and_then(|target| target.termination_evidence.as_ref())
             .map(|evidence| evidence.disposition),
         Some(BackendStopDisposition::Graceful as i32)
     );
@@ -720,8 +744,8 @@ async fn reported_success_cannot_bypass_manager_evidence_or_grant_authority() ->
     let request = SubmitOperationRequest {
         node_id: "evidence-node".into(),
         request_token: "evidence-op".into(),
-        action: NodeOperationAction::InitialApply as i32,
-        engine_slots: vec!["blue".into()],
+        action: NodeOperationAction::Deployment as i32,
+        engine_slot: String::new(),
         target_revision: deployment.revision,
         bundle_digest: digest,
         policy: Some(policy(300)),
@@ -746,12 +770,15 @@ async fn reported_success_cannot_bypass_manager_evidence_or_grant_authority() ->
                 .instruction
                 .expect("instruction");
         assert_eq!(instruction.step, expected as i32);
-        let operation =
-            wr_manager::operations::report_step(&pool, &result_for(&instruction, ""), "agent-a")
-                .await?;
+        let result = result_for(&instruction, "");
+        let operation = wr_manager::operations::report_step(&pool, &result, "agent-a").await?;
+        let duplicate = wr_manager::operations::report_step(&pool, &result, "agent-a").await?;
+        assert_eq!(duplicate.state, operation.state);
+        assert_eq!(duplicate.phase, operation.phase);
+        assert_eq!(duplicate.targets, operation.targets);
         if expected == NodeOperationStepKind::SelectRelease {
             assert_eq!(
-                operation.slots[0].next_step,
+                engine_targets(&operation)[0].next_step,
                 NodeOperationStepKind::SelectRelease as i32,
                 "a trusted empty result cannot substitute for selected revision/digest evidence"
             );
@@ -790,8 +817,8 @@ async fn forward_deadline_irreversibly_enters_deadline_free_restoration() -> Res
         &SubmitOperationRequest {
             node_id: "deadline-node".into(),
             request_token: "deadline-op".into(),
-            action: NodeOperationAction::InitialApply as i32,
-            engine_slots: vec!["blue".into()],
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
             target_revision: deployment.revision,
             bundle_digest: digest,
             policy: Some(policy(1)),
@@ -907,7 +934,7 @@ async fn rollback_does_not_rewrite_terminal_rollout_success() -> Result<()> {
             node_id: "rollback-terminal-node".into(),
             request_token: "later-rollback".into(),
             action: NodeOperationAction::Rollback as i32,
-            engine_slots: vec!["blue".into()],
+            engine_slot: String::new(),
             target_revision: rollback.revision,
             bundle_digest: rollback.bundle_digest.clone(),
             policy: Some(policy(1_800)),
@@ -930,7 +957,8 @@ async fn rollback_does_not_rewrite_terminal_rollout_success() -> Result<()> {
 }
 
 #[tokio::test]
-async fn scale_orders_new_then_retained_then_removed_slots_lexically() -> Result<()> {
+async fn desired_diff_orders_new_then_retained_then_removed_independent_of_legacy_selector(
+) -> Result<()> {
     let pool = manager_pool().await;
     let old_digest = format!("sha256:{}", "1".repeat(64));
     let old = stage(
@@ -958,8 +986,8 @@ async fn scale_orders_new_then_retained_then_removed_slots_lexically() -> Result
         &SubmitOperationRequest {
             node_id: "scale-node".into(),
             request_token: "scale-op".into(),
-            action: NodeOperationAction::Scale as i32,
-            engine_slots: vec!["b-retained".into(), "a-new".into()],
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
             target_revision: new.revision,
             bundle_digest: new_digest,
             policy: Some(policy(1_800)),
@@ -968,56 +996,177 @@ async fn scale_orders_new_then_retained_then_removed_slots_lexically() -> Result
     )
     .await?;
     assert_eq!(
-        operation
-            .slots
+        engine_targets(&operation)
             .iter()
-            .map(|slot| slot.engine_slot.as_str())
+            .map(|target| progress_engine_slot(target))
             .collect::<Vec<_>>(),
         vec!["a-new", "b-retained", "d-removed"]
     );
-    assert_eq!(operation.slots[0].source_revision, 0);
-    assert_eq!(operation.slots[2].target_revision, 0);
+    assert_eq!(engine_targets(&operation)[0].source_revision, 0);
+    assert_eq!(engine_targets(&operation)[2].target_revision, 0);
+    assert_eq!(
+        engine_targets(&operation)
+            .iter()
+            .map(|target| NodeSlotTransitionKind::try_from(target.transition))
+            .collect::<Result<Vec<_>, _>>()?,
+        vec![
+            NodeSlotTransitionKind::Addition,
+            NodeSlotTransitionKind::Replacement,
+            NodeSlotTransitionKind::Removal,
+        ]
+    );
+    let events = wr_manager::operations::events(&pool, &operation.operation_id).await?;
+    assert!(events.iter().any(|event| event
+        .detail
+        .contains("desired transitions: additions=1, replacements=1, unchanged=0, removals=1")));
 
     Ok(())
 }
 
 #[tokio::test]
-async fn drain_reaches_zero_authority_terminal_and_preserves_other_capacity() -> Result<()> {
+async fn exact_committed_revision_is_an_isolated_no_effect_transaction() -> Result<()> {
     let pool = manager_pool().await;
-    let digest = format!("sha256:{}", "a".repeat(64));
-    let source =
-        stage_with_module(&pool, "drain-node", "source", &digest, &["blue", "green"]).await;
-    commit_ready_deployment(
+    let digest = format!("sha256:{}", "3".repeat(64));
+    let committed = stage(
         &pool,
-        &source,
-        &[("blue", "drain-blue"), ("green", "drain-green")],
+        "no-effect-node",
+        "committed-allocation",
+        &digest,
+        &["blue", "green"],
+    )
+    .await;
+    commit_deployment(&pool, &committed).await?;
+
+    let client = pool.get().await?;
+    let node_before: (i64, Option<i64>) = client
+        .query_one(
+            "SELECT current_revision, target_revision FROM wr_nodes WHERE node_id = $1",
+            &[&committed.node_id],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1)))?;
+    let deployment_before: (String, Option<String>, Option<Uuid>) = client
+        .query_one(
+            "SELECT state, allocation_actor, operation_id FROM wr_node_deployments
+             WHERE node_id = $1 AND revision = $2",
+            &[&committed.node_id, &(committed.revision as i64)],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1), row.get(2)))?;
+    let authority_before = wr_manager::operations::authorities(&pool, &committed.node_id).await?;
+    drop(client);
+
+    let operation = wr_manager::operations::submit(
+        &pool,
+        "operator-b",
+        &SubmitOperationRequest {
+            node_id: committed.node_id.clone(),
+            request_token: "independent-no-effect-request".into(),
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
+            target_revision: committed.revision,
+            bundle_digest: committed.bundle_digest.clone(),
+            policy: Some(policy(300)),
+            resolved_release_digest: committed.resolved_release_digest.clone(),
+        },
     )
     .await?;
+
+    assert_ne!(operation.operation_id, committed.operation_id);
+    assert_eq!(
+        NodeOperationState::try_from(operation.state)?,
+        NodeOperationState::Succeeded
+    );
+    assert_eq!(
+        NodeOperationPhase::try_from(operation.phase)?,
+        NodeOperationPhase::Complete
+    );
+    assert!(operation.committed);
+    assert!(operation.targets.iter().all(|target| {
+        target.complete && target.next_step == NodeOperationStepKind::Unspecified as i32
+    }));
+    assert!(engine_targets(&operation).iter().all(|target| {
+        target.source_revision == committed.revision
+            && target.target_revision == committed.revision
+            && engine_detail(target).serving_converged
+    }));
+
+    configure_agent(&pool, &committed.node_id, "no-effect-activation").await;
+    assert!(wr_manager::operations::claim(
+        &pool,
+        &committed.node_id,
+        "no-effect-activation",
+        "agent-a"
+    )
+    .await?
+    .is_none());
+
+    let client = pool.get().await?;
+    let node_after: (i64, Option<i64>) = client
+        .query_one(
+            "SELECT current_revision, target_revision FROM wr_nodes WHERE node_id = $1",
+            &[&committed.node_id],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1)))?;
+    let deployment_after: (String, Option<String>, Option<Uuid>) = client
+        .query_one(
+            "SELECT state, allocation_actor, operation_id FROM wr_node_deployments
+             WHERE node_id = $1 AND revision = $2",
+            &[&committed.node_id, &(committed.revision as i64)],
+        )
+        .await
+        .map(|row| (row.get(0), row.get(1), row.get(2)))?;
+    assert_eq!(node_after, node_before);
+    assert_eq!(deployment_after, deployment_before);
+    assert_eq!(
+        wr_manager::operations::authorities(&pool, &committed.node_id).await?,
+        authority_before
+    );
+
+    let events = wr_manager::operations::events(&pool, &operation.operation_id).await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_code, "OPERATION_NO_EFFECT");
+    Ok(())
+}
+
+#[tokio::test]
+async fn deployment_to_zero_commits_only_after_exact_removal_evidence() -> Result<()> {
+    let pool = manager_pool().await;
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let source = stage_with_module(&pool, "removal-node", "source", &digest, &["blue"]).await;
+    commit_ready_deployment(&pool, &source, &[("blue", "removal-blue")]).await?;
+    let target = stage_with_module(
+        &pool,
+        "removal-node",
+        "removal-op",
+        &format!("sha256:{}", "b".repeat(64)),
+        &[],
+    )
+    .await;
     let operation = wr_manager::operations::submit(
         &pool,
         "operator-a",
         &SubmitOperationRequest {
-            node_id: "drain-node".into(),
-            request_token: "drain-op".into(),
-            action: NodeOperationAction::Drain as i32,
-            engine_slots: vec!["blue".into()],
-            target_revision: 0,
-            bundle_digest: String::new(),
-            resolved_release_digest: String::new(),
+            node_id: "removal-node".into(),
+            request_token: "removal-op".into(),
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
+            target_revision: target.revision,
+            bundle_digest: target.bundle_digest.clone(),
+            resolved_release_digest: target.resolved_release_digest.clone(),
             policy: Some(RolloutPolicy {
                 max_unavailable: 1,
-                canary_slot: "blue".into(),
-                pause_after_canary: false,
-                allow_downtime: false,
+                allow_downtime: true,
                 deadline_seconds: 300,
             }),
         },
     )
     .await?;
-    assert_eq!(operation.slots[0].target_revision, 0);
-    configure_agent(&pool, "drain-node", "activation-a").await;
+    assert_eq!(engine_targets(&operation)[0].target_revision, 0);
+    configure_agent(&pool, "removal-node", "activation-a").await;
 
-    let verify = claim_instruction(&pool, "drain-node", "activation-a").await?;
+    let verify = claim_instruction(&pool, "removal-node", "activation-a").await?;
     assert_eq!(verify.step, NodeOperationStepKind::VerifyTarget as i32);
     let awaiting_observation = report_ok(&pool, &verify, "backend-old", "process-old").await?;
     assert_eq!(
@@ -1026,7 +1175,7 @@ async fn drain_reaches_zero_authority_terminal_and_preserves_other_capacity() ->
         "a successful result must wait for its coherent observation instead of pausing"
     );
     assert_eq!(
-        awaiting_observation.slots[0].next_step,
+        engine_targets(&awaiting_observation)[0].next_step,
         NodeOperationStepKind::VerifyTarget as i32
     );
     let after_source = observe(
@@ -1041,7 +1190,7 @@ async fn drain_reaches_zero_authority_terminal_and_preserves_other_capacity() ->
     )
     .await?;
     assert_eq!(
-        after_source.slots[0].next_step,
+        engine_targets(&after_source)[0].next_step,
         NodeOperationStepKind::StopBackend as i32,
         "operation after source observation: {after_source:?}"
     );
@@ -1053,36 +1202,39 @@ async fn drain_reaches_zero_authority_terminal_and_preserves_other_capacity() ->
     assert!(coherent
         .observations
         .iter()
-        .any(|observation| observation.node_id == "drain-node"));
+        .any(|observation| observation.node_id == "removal-node"));
     assert!(coherent
         .agent_attestations
         .iter()
-        .any(|attestation| attestation.node_id == "drain-node"));
+        .any(|attestation| attestation.node_id == "removal-node"));
 
-    let stop = claim_instruction(&pool, "drain-node", "activation-a").await?;
+    let stop = claim_instruction(&pool, "removal-node", "activation-a").await?;
     assert_eq!(stop.pinned_backend_instance_id, "backend-old");
-    let drain_fence = engine_fence(&pool, "drain-blue").await?;
-    wr_manager::db::deregister_engine(&pool, "drain-blue", &drain_fence).await?;
+    let removal_fence = engine_fence(&pool, "removal-blue").await?;
+    wr_manager::db::deregister_engine(&pool, "removal-blue", &removal_fence).await?;
     pool.get()
         .await?
         .execute(
             "UPDATE wr_node_slot_observations
              SET lifecycle_status = NULL, backend_state = 'exited',
                  observed_at = NOW() - INTERVAL '1 minute'
-             WHERE node_id = 'drain-node' AND engine_slot = 'blue'",
+             WHERE node_id = 'removal-node' AND engine_slot = 'blue'",
             &[],
         )
         .await?;
-    let inspection = claim_instruction(&pool, "drain-node", "activation-a").await?;
+    let inspection = claim_instruction(&pool, "removal-node", "activation-a").await?;
     assert_eq!(
         inspection.step,
         NodeOperationStepKind::InspectBackend as i32
     );
     assert_eq!(inspection.operation_id, operation.operation_id);
-    assert_eq!(inspection.target.as_ref().unwrap().engine_slot, "blue");
+    assert_eq!(
+        target_engine_slot(inspection.target.as_ref().unwrap()),
+        "blue"
+    );
     let still_stopping = wr_manager::operations::get(&pool, &operation.operation_id).await?;
     assert_eq!(
-        still_stopping.slots[0].next_step,
+        engine_targets(&still_stopping)[0].next_step,
         NodeOperationStepKind::StopBackend as i32
     );
     observe(
@@ -1097,25 +1249,28 @@ async fn drain_reaches_zero_authority_terminal_and_preserves_other_capacity() ->
     )
     .await?;
     assert!(
-        wr_manager::operations::claim(&pool, "drain-node", "activation-a", "agent-a")
+        wr_manager::operations::claim(&pool, "removal-node", "activation-a", "agent-a")
             .await?
             .is_none(),
         "zero-authority switch is manager-owned"
     );
     assert!(
-        wr_manager::operations::claim(&pool, "drain-node", "activation-a", "agent-a")
+        wr_manager::operations::claim(&pool, "removal-node", "activation-a", "agent-a")
             .await?
             .is_none(),
-        "completed drain emits no further host effect"
+        "completed removal emits no further host effect"
     );
     let terminal = wr_manager::operations::get(&pool, &operation.operation_id).await?;
     assert_eq!(
         NodeOperationState::try_from(terminal.state)?,
         NodeOperationState::Succeeded
     );
-    assert_eq!(terminal.slots[0].authoritative_revision, 0);
-    assert!(terminal.slots[0].complete);
-    assert!(wr_manager::operations::authorities(&pool, "drain-node")
+    assert_eq!(
+        engine_detail(engine_targets(&terminal)[0]).authoritative_revision,
+        0
+    );
+    assert!(engine_targets(&terminal)[0].complete);
+    assert!(wr_manager::operations::authorities(&pool, "removal-node")
         .await?
         .iter()
         .all(|authority| authority.engine_slot != "blue"));
@@ -1136,7 +1291,7 @@ async fn restart_recovers_a_lost_start_report_from_exact_replacement_evidence() 
             node_id: "restart-node".into(),
             request_token: "restart-op".into(),
             action: NodeOperationAction::Restart as i32,
-            engine_slots: vec!["blue".into()],
+            engine_slot: "blue".into(),
             target_revision: 0,
             bundle_digest: String::new(),
             policy: Some(policy(300)),
@@ -1211,8 +1366,14 @@ async fn restart_recovers_a_lost_start_report_from_exact_replacement_evidence() 
         NodeOperationState::try_from(terminal.state)?,
         NodeOperationState::Succeeded
     );
-    assert_eq!(terminal.slots[0].pinned_backend_instance_id, "backend-new");
-    assert_eq!(terminal.slots[0].pinned_process_instance_id, "process-new");
+    assert_eq!(
+        engine_targets(&terminal)[0].pinned_backend_instance_id,
+        "backend-new"
+    );
+    assert_eq!(
+        engine_targets(&terminal)[0].pinned_process_instance_id,
+        "process-new"
+    );
 
     Ok(())
 }
@@ -1281,13 +1442,13 @@ async fn drive_initial_slot_to_serving_gate(
 }
 
 #[tokio::test]
-async fn deployment_requires_module_route_convergence_and_pauses_after_canary() -> Result<()> {
+async fn deployment_requires_route_convergence_then_progresses_sequentially() -> Result<()> {
     let pool = manager_pool().await;
     let digest = format!("sha256:{}", "c".repeat(64));
     let target = stage_with_module(
         &pool,
-        "canary-node",
-        "canary-op",
+        "sequential-node",
+        "sequential-op",
         &digest,
         &["blue", "green"],
     )
@@ -1296,95 +1457,87 @@ async fn deployment_requires_module_route_convergence_and_pauses_after_canary() 
         &pool,
         "operator-a",
         &SubmitOperationRequest {
-            node_id: "canary-node".into(),
-            request_token: "canary-op".into(),
-            action: NodeOperationAction::InitialApply as i32,
-            engine_slots: vec!["blue".into(), "green".into()],
+            node_id: "sequential-node".into(),
+            request_token: "sequential-op".into(),
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
             target_revision: target.revision,
             bundle_digest: target.bundle_digest.clone(),
             resolved_release_digest: resolved_digest(),
             policy: Some(RolloutPolicy {
                 max_unavailable: 1,
-                canary_slot: "blue".into(),
-                pause_after_canary: true,
                 allow_downtime: true,
                 deadline_seconds: 300,
             }),
         },
     )
     .await?;
-    configure_agent(&pool, "canary-node", "activation-a").await;
+    configure_agent(&pool, "sequential-node", "activation-a").await;
     drive_initial_slot_to_serving_gate(
         &pool,
         &target,
         "blue",
         "activation-a",
-        "canary-blue",
+        "sequential-blue",
         "backend-blue",
         "process-blue",
     )
     .await?;
     assert!(
-        wr_manager::operations::claim(&pool, "canary-node", "activation-a", "agent-a")
+        wr_manager::operations::claim(&pool, "sequential-node", "activation-a", "agent-a")
             .await?
             .is_none()
     );
     let pending = wr_manager::operations::get(&pool, &operation.operation_id).await?;
     assert_eq!(
-        pending.slots[0].conditions[0].code,
+        engine_targets(&pending)[0].conditions[0].code,
         "SERVING_CONVERGENCE_PENDING"
     );
-    let blue_fence = engine_fence(&pool, "canary-blue").await?;
+    let blue_fence = engine_fence(&pool, "sequential-blue").await?;
     wr_manager::db::publish_engine_readiness(
         &pool,
-        "canary-blue",
+        "sequential-blue",
         &[module_descriptor()],
         &blue_fence,
     )
     .await?;
-    assert!(
-        wr_manager::operations::claim(&pool, "canary-node", "activation-a", "agent-a")
-            .await?
-            .is_none()
-    );
-    let paused = wr_manager::operations::get(&pool, &operation.operation_id).await?;
+    let progressing = wr_manager::operations::get(&pool, &operation.operation_id).await?;
     assert_eq!(
-        NodeOperationState::try_from(paused.state)?,
-        NodeOperationState::Paused
+        NodeOperationState::try_from(progressing.state)?,
+        NodeOperationState::Running
     );
-    assert_eq!(paused.conditions[0].code, "CANARY_PAUSED");
+    assert!(progressing.conditions.is_empty());
 
-    wr_manager::operations::resume(&pool, &operation.operation_id, "operator-a").await?;
     drive_initial_slot_to_serving_gate(
         &pool,
         &target,
         "green",
         "activation-a",
-        "canary-green",
+        "sequential-green",
         "backend-green",
         "process-green",
     )
     .await?;
     assert!(
-        wr_manager::operations::claim(&pool, "canary-node", "activation-a", "agent-a")
+        wr_manager::operations::claim(&pool, "sequential-node", "activation-a", "agent-a")
             .await?
             .is_none()
     );
-    let green_fence = engine_fence(&pool, "canary-green").await?;
+    let green_fence = engine_fence(&pool, "sequential-green").await?;
     wr_manager::db::publish_engine_readiness(
         &pool,
-        "canary-green",
+        "sequential-green",
         &[module_descriptor()],
         &green_fence,
     )
     .await?;
     assert!(
-        wr_manager::operations::claim(&pool, "canary-node", "activation-a", "agent-a")
+        wr_manager::operations::claim(&pool, "sequential-node", "activation-a", "agent-a")
             .await?
             .is_none()
     );
     assert!(
-        wr_manager::operations::claim(&pool, "canary-node", "activation-a", "agent-a")
+        wr_manager::operations::claim(&pool, "sequential-node", "activation-a", "agent-a")
             .await?
             .is_none()
     );
@@ -1398,7 +1551,7 @@ async fn deployment_requires_module_route_convergence_and_pauses_after_canary() 
         .get()
         .await?
         .query_one(
-            "SELECT current_revision FROM wr_nodes WHERE node_id = 'canary-node'",
+            "SELECT current_revision FROM wr_nodes WHERE node_id = 'sequential-node'",
             &[],
         )
         .await?
@@ -1419,8 +1572,8 @@ async fn route_change_serialization_prevents_commit_from_an_older_snapshot() -> 
         &SubmitOperationRequest {
             node_id: "race-node".into(),
             request_token: "race-op".into(),
-            action: NodeOperationAction::InitialApply as i32,
-            engine_slots: vec!["blue".into()],
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
             target_revision: target.revision,
             bundle_digest: target.bundle_digest.clone(),
             policy: Some(policy(300)),
@@ -1489,13 +1642,13 @@ async fn route_change_serialization_prevents_commit_from_an_older_snapshot() -> 
     );
     let pending = wr_manager::operations::get(&pool, &operation.operation_id).await?;
     assert!(!pending.committed);
-    assert!(!pending.slots[0].complete);
+    assert!(!engine_targets(&pending)[0].complete);
     assert_eq!(
-        pending.slots[0].next_step,
+        engine_targets(&pending)[0].next_step,
         NodeOperationStepKind::VerifyServing as i32
     );
     assert_eq!(
-        pending.slots[0].conditions[0].code,
+        engine_targets(&pending)[0].conditions[0].code,
         "SERVING_CONVERGENCE_PENDING"
     );
 
@@ -1520,8 +1673,8 @@ async fn restoration_targets_only_changed_slots_and_completes_from_observation()
         &SubmitOperationRequest {
             node_id: "restore-node".into(),
             request_token: "restore-op".into(),
-            action: NodeOperationAction::InitialApply as i32,
-            engine_slots: vec!["blue".into(), "green".into()],
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
             target_revision: target.revision,
             bundle_digest: target.bundle_digest.clone(),
             policy: Some(policy(300)),
@@ -1553,16 +1706,15 @@ async fn restoration_targets_only_changed_slots_and_completes_from_observation()
         NodeOperationPhase::try_from(failed.phase)?,
         NodeOperationPhase::RestoringSource
     );
-    let blue = failed
-        .slots
+    let targets = engine_targets(&failed);
+    let blue = targets
         .iter()
-        .find(|slot| slot.engine_slot == "blue")
-        .expect("blue slot");
-    let green = failed
-        .slots
+        .find(|target| progress_engine_slot(target) == "blue")
+        .expect("blue target");
+    let green = targets
         .iter()
-        .find(|slot| slot.engine_slot == "green")
-        .expect("green slot");
+        .find(|target| progress_engine_slot(target) == "green")
+        .expect("green target");
     assert!(blue.changed && !blue.complete);
     assert!(!green.changed && green.complete);
 
@@ -1635,7 +1787,7 @@ async fn delivered_stop_fixture(
             node_id: node_id.into(),
             request_token: format!("ambiguous-stop-{node_id}"),
             action: NodeOperationAction::Restart as i32,
-            engine_slots: vec!["blue".into()],
+            engine_slot: "blue".into(),
             target_revision: 0,
             bundle_digest: String::new(),
             policy: Some(policy(300)),
@@ -1659,7 +1811,7 @@ async fn delivered_stop_fixture(
     let stop = claim_instruction(pool, node_id, "activation-a").await?;
     assert_eq!(stop.step, NodeOperationStepKind::StopBackend as i32);
     let durable = wr_manager::operations::get(pool, &operation.operation_id).await?;
-    assert!(durable.slots[0].effect_ambiguous);
+    assert!(engine_targets(&durable)[0].effect_ambiguous);
     Ok((source, operation, stop))
 }
 
@@ -1687,7 +1839,7 @@ async fn stop_result_waits_for_post_delivery_observation() -> Result<()> {
     let awaiting_observation =
         wr_manager::operations::report_step(&pool, &stop_result, "agent-a").await?;
     assert_eq!(
-        awaiting_observation.slots[0]
+        engine_targets(&awaiting_observation)[0]
             .termination_evidence
             .as_ref()
             .map(|evidence| evidence.disposition),
@@ -1699,10 +1851,12 @@ async fn stop_result_waits_for_post_delivery_observation() -> Result<()> {
         "a successful stop result must wait for its post-delivery observation"
     );
     assert_eq!(
-        awaiting_observation.slots[0].next_step,
+        engine_targets(&awaiting_observation)[0].next_step,
         NodeOperationStepKind::StopBackend as i32
     );
-    assert!(awaiting_observation.slots[0].conditions.is_empty());
+    assert!(engine_targets(&awaiting_observation)[0]
+        .conditions
+        .is_empty());
 
     let observed = observe(
         &pool,
@@ -1716,7 +1870,7 @@ async fn stop_result_waits_for_post_delivery_observation() -> Result<()> {
     )
     .await?;
     assert_eq!(
-        observed.slots[0].next_step,
+        engine_targets(&observed)[0].next_step,
         NodeOperationStepKind::StartBackend as i32,
         "fresh exit, registration, and route evidence must advance the stop"
     );
@@ -1731,14 +1885,14 @@ async fn stop_result_waits_for_post_delivery_observation() -> Result<()> {
     );
     let retry = wr_manager::operations::report_step(&pool, &stop_result, "agent-a").await?;
     assert_eq!(
-        retry.slots[0].termination_evidence,
-        awaiting_observation.slots[0].termination_evidence
+        engine_targets(&retry)[0].termination_evidence,
+        engine_targets(&awaiting_observation)[0].termination_evidence
     );
     pool.get()
         .await?
         .execute(
-            "UPDATE wr_node_operation_slots SET effect_termination_evidence = $1
-             WHERE operation_id = $2 AND engine_slot = 'blue'",
+            "UPDATE wr_node_operation_targets SET effect_termination_evidence = $1
+             WHERE operation_id = $2 AND target_kind = 'engine_slot' AND target_key = 'blue'",
             &[&vec![0xff_u8], &Uuid::parse_str(&operation.operation_id)?],
         )
         .await?;
@@ -1796,15 +1950,18 @@ async fn delivered_effect_ambiguity_is_inspected_for_cancel_deadline_and_error()
             NodeOperationPhase::try_from(restoring.phase)?,
             NodeOperationPhase::RestoringSource
         );
-        assert!(restoring.slots[0].effect_ambiguous);
-        assert!(!restoring.slots[0].complete);
+        assert!(engine_targets(&restoring)[0].effect_ambiguous);
+        assert!(!engine_targets(&restoring)[0].complete);
         let inspection = claim_instruction(&pool, &node_id, "activation-a").await?;
         assert_eq!(
             inspection.step,
             NodeOperationStepKind::InspectBackend as i32
         );
         assert_eq!(inspection.operation_id, operation.operation_id);
-        assert_eq!(inspection.target.as_ref().unwrap().engine_slot, "blue");
+        assert_eq!(
+            target_engine_slot(inspection.target.as_ref().unwrap()),
+            "blue"
+        );
         if mode == "error" {
             observe(
                 &pool,
@@ -1857,7 +2014,7 @@ async fn delivered_effect_ambiguity_is_inspected_for_cancel_deadline_and_error()
             NodeOperationState::Failed
         };
         assert_eq!(NodeOperationState::try_from(terminal.state)?, expected);
-        assert!(!terminal.slots[0].effect_ambiguous);
+        assert!(!engine_targets(&terminal)[0].effect_ambiguous);
     }
     Ok(())
 }
@@ -1873,8 +2030,8 @@ async fn lease_loss_requires_fresh_state_before_a_mutating_effect_is_reissued() 
         &SubmitOperationRequest {
             node_id: "resume-node".into(),
             request_token: "resume-op".into(),
-            action: NodeOperationAction::InitialApply as i32,
-            engine_slots: vec!["blue".into()],
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
             target_revision: target.revision,
             bundle_digest: target.bundle_digest.clone(),
             policy: Some(policy(300)),
@@ -1942,8 +2099,8 @@ async fn agent_policy_update_fences_durable_work_until_explicit_resume() -> Resu
         &SubmitOperationRequest {
             node_id: "update-node".into(),
             request_token: "update-op".into(),
-            action: NodeOperationAction::InitialApply as i32,
-            engine_slots: vec!["blue".into()],
+            action: NodeOperationAction::Deployment as i32,
+            engine_slot: String::new(),
             target_revision: target.revision,
             bundle_digest: digest,
             policy: Some(policy(300)),
@@ -1959,6 +2116,15 @@ async fn agent_policy_update_fences_durable_work_until_explicit_resume() -> Resu
         &helpers::node_agent::systemd_policy("update-node", 2),
     )
     .await?;
+    let still_running = wr_manager::operations::get(&pool, &operation.operation_id).await?;
+    assert_eq!(
+        NodeOperationState::try_from(still_running.state)?,
+        NodeOperationState::Running,
+        "retention-only policy changes must not fence active work"
+    );
+    let mut compatibility_change = helpers::node_agent::systemd_policy("update-node", 2);
+    compatibility_change.binary_digest = format!("sha256:{}", "b".repeat(64));
+    wr_manager::operations::put_agent_policy(&pool, "operator-a", &compatibility_change).await?;
     let paused = wr_manager::operations::get(&pool, &operation.operation_id).await?;
     assert_eq!(
         NodeOperationState::try_from(paused.state)?,

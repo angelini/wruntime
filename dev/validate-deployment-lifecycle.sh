@@ -567,6 +567,45 @@ DIGEST_B_ONE="$(manifest_value upgrade-one bundle_digest)"
 verify_manifest
 lifecycle_artifact prepare "$SCENARIO_MANIFEST" "$(sha256sum "$SCENARIO_MANIFEST" | awk '{print $1}')"
 
+provision_node_agent_fixture() {
+	local backend="$1" fixture="$RUN_DIR/node-agent-$1" binary_digest backend_config
+	mkdir -p "$fixture"
+	tar -xOf "$BASELINE_ONE" wr-node/agent/wr-cli >"$fixture/wr-cli"
+	# A valid ELF tolerates trailing bytes. Give the provisioned baseline a distinct
+	# digest so the updater must stage and atomically replace it with bundle bytes.
+	printf '\0' >>"$fixture/wr-cli"
+	tar -xOf "$BASELINE_ONE" wr-node/agent/wr-node-agent.service >"$fixture/wr-node-agent.service"
+	chmod 700 "$fixture/wr-cli"
+	if [ "$backend" = systemd ]; then
+		backend_config=$'backend = "systemd"\ncompose-project = ""\nsystemctl-path = "/usr/bin/systemctl"\ndocker-path = ""'
+	else
+		backend_config=$'backend = "docker"\ncompose-project = "wruntime-node"\nsystemctl-path = ""\ndocker-path = "/usr/bin/docker"'
+	fi
+	cat >"$fixture/agent.toml" <<EOF
+policy-version = 1
+node-id = "$NODE_ID"
+manager-endpoint = "$MANAGER_ADDR"
+client-cert-path = "$WORKDIR/wr-agent/certs/agent.crt"
+client-key-path = "$WORKDIR/wr-agent/certs/agent.key"
+ca-cert-path = "$WORKDIR/wr-agent/certs/ca.crt"
+deployment-root = "$WORKDIR"
+runtime-dir = "/run/wruntime"
+$backend_config
+poll-interval-seconds = 5
+renew-interval-seconds = 5
+protocol-version = "operator-engine-lifecycle-v1"
+capabilities = ["continuous-lease-v1", "manager-authorized-retention-v1", "release-metadata-v1", "typed-backend-v1"]
+EOF
+	binary_digest="sha256:$(sha256sum "$fixture/wr-cli" | cut -d' ' -f1)"
+	timeout -k 5 60 scp -i "$WRT_DEPLOY_E2E_SSH_KEY" \
+		"$fixture/wr-cli" "$fixture/agent.toml" "$fixture/wr-node-agent.service" \
+		"$CERT_DIR/node-agent/leaf.pem" "$CERT_DIR/node-agent/key.pem" \
+		"$CERT_DIR/server-root/ca.crt" "$NODE_REMOTE:/tmp/"
+	"${SSH[@]}" "$NODE_REMOTE" "sudo install -d -o root -g root -m 0755 '$WORKDIR' '$WORKDIR/wr-node' '$WORKDIR/wr-node/slots'; sudo install -d -o root -g root -m 0700 '$WORKDIR/wr-agent' '$WORKDIR/wr-agent/certs' /run/wruntime; sudo install -o root -g root -m 0755 /tmp/wr-cli '$WORKDIR/wr-agent/wr-cli'; sudo install -o root -g root -m 0600 /tmp/agent.toml '$WORKDIR/wr-agent/agent.toml'; sudo install -o root -g root -m 0600 /tmp/leaf.pem '$WORKDIR/wr-agent/certs/agent.crt'; sudo install -o root -g root -m 0600 /tmp/key.pem '$WORKDIR/wr-agent/certs/agent.key'; sudo install -o root -g root -m 0600 /tmp/ca.crt '$WORKDIR/wr-agent/certs/ca.crt'; sudo install -o root -g root -m 0644 /tmp/wr-node-agent.service /etc/systemd/system/wr-node-agent.service"
+	PGCONNECT_TIMEOUT=5 psql "$WRT_DEPLOY_E2E_DB_URL" -Xv ON_ERROR_STOP=1 -c "SET search_path=wr_system,public; INSERT INTO wr_nodes(node_id) VALUES ('$NODE_ID') ON CONFLICT DO NOTHING; INSERT INTO wr_node_agent_policies(node_id,protocol_version,backend,retention_count,actor,binary_digest,capabilities) VALUES ('$NODE_ID','operator-engine-lifecycle-v1','$backend',3,'deployment-e2e','$binary_digest',ARRAY['continuous-lease-v1','manager-authorized-retention-v1','release-metadata-v1','typed-backend-v1']) ON CONFLICT(node_id) DO UPDATE SET protocol_version=EXCLUDED.protocol_version,backend=EXCLUDED.backend,retention_count=EXCLUDED.retention_count,actor=EXCLUDED.actor,binary_digest=EXCLUDED.binary_digest,capabilities=EXCLUDED.capabilities,updated_at=NOW();"
+	"${SSH[@]}" "$NODE_REMOTE" "sudo systemctl daemon-reload && sudo systemctl enable --now wr-node-agent.service && sudo systemctl is-active --quiet wr-node-agent.service"
+}
+
 lifecycle() {
 	local backend="$1"
 	local pass="$LOG_BASE/$backend"
@@ -590,12 +629,10 @@ lifecycle() {
 		--advertise-address "$MANAGER_ADDR"
 	status_json "$pass/manager-status.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/manager-status.json" manager --address "$MANAGER_ADDR" >"$pass/manager-assert.json"
-	run_to_log "$backend node agent install" "$pass/node-agent-install.log" \
+	run_to_log "$backend node agent fixture provisioning and initial activation" "$pass/node-agent-provision.log" provision_node_agent_fixture "$backend"
+	run_to_log "$backend node agent binary update restart and fresh activation" "$pass/node-agent-install.log" \
 		"${CLI[@]}" node agent install "$BASELINE_ONE" "$NODE_REMOTE" --node-id "$NODE_ID" \
-		--format "$backend" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" \
-		--agent-cert "$CERT_DIR/node-agent/leaf.pem" \
-		--agent-key "$CERT_DIR/node-agent/key.pem" \
-		--agent-ca-cert "$CERT_DIR/server-root/ca.crt"
+		--format "$backend" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY"
 	job_admin queues --format json >"$pass/job-queues-empty.json"
 	if "$ROOT/target/debug/wr-cli" --manager "$MANAGER_ADDR" \
 		--ca-cert "$CERT_DIR/server-root/ca.crt" \
@@ -615,27 +652,13 @@ lifecycle() {
 	assert_job_queues "$pass/job-queues-a.json"
 	job_admin summary --queue deployment-jobs --format json >"$pass/job-summary-a.json"
 	assert_job_summary "$pass/job-summary-a.json"
-	local revision_one_a revision_b_one
-	revision_one_a="$(revision_from "$pass/status-a.json")"
+	local revision_a revision_b revision_contracted
+	revision_a="$(revision_from "$pass/status-a.json")"
 	invoke_echo "hello-$backend-a" "$pass/invoke-a.json"
 
-	local scale_out_token="$backend-scale-out"
-	run_to_log "$backend node scale out" "$pass/scale-out.log" \
-		lifecycle_run_deploy_operation "$backend-scale-out" "${CLI_ARGS[@]}" node scale --node-id "$NODE_ID" "$BASELINE_TWO" "$NODE_REMOTE" --format "$backend" \
-		--request-token "$scale_out_token" --db-url "$WRT_DEPLOY_E2E_DB_URL" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
-	status_json "$pass/status-scale-out.json"
-	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-scale-out.json" desired --node-id "$NODE_ID" --digest "$DIGEST_A_TWO" --version 1.0.0 --engine-slot engine-1 --engine-slot engine-2 >"$pass/assert-scale-out.json"
-	lifecycle_capture_operation_detail "$NODE_ID" "$scale_out_token" "$pass/operation-scale-out.json" "${CLI_ARGS[@]}"
-	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-scale-out.json" --node-id "$NODE_ID" --request-token "$scale_out_token" --action scale --target-digest "$DIGEST_A_TWO" --slot-order engine-2 --slot-order engine-1 --stopped-engine-slot engine-1 >"$pass/assert-operation-scale-out.json"
-	invoke_echo "hello-$backend-scale-out" "$pass/invoke-scale-out.json"
-
-	start_tunnel "$pass/upgrade-tunnel.log"
-	invoke_echo_over_tunnel "probe-$backend" "$pass/invoke-pre-upgrade.json"
-	start_probe "probe-$backend" "$pass/upgrade-probe.jsonl"
-
-	local failed_status retry_token="$backend-finalized-retry" staged_revision upgrade_submitted_at upgrade_completed_at
-	if lifecycle_run_deploy_operation "$backend-upgrade-finalize" "${CLI_ARGS[@]}" node upgrade --node-id "$NODE_ID" "$UPGRADE_TWO" "$NODE_REMOTE" --format "$backend" \
-		--request-token "$retry_token" --exit-after-finalization \
+	local failed_status retry_token="$backend-finalized-retry" staged_revision
+	if lifecycle_run_deploy_operation "$backend-deploy-finalize" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$UPGRADE_TWO" "$NODE_REMOTE" --format "$backend" \
+		--request-token "$retry_token" --allow-downtime --exit-after-finalization \
 		--db-url "$WRT_DEPLOY_E2E_DB_URL" \
 		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR" >"$pass/interrupted-after-finalization.log" 2>&1; then
 		failed_status=0
@@ -658,67 +681,57 @@ print(target["revision"])
 PY
 )"
 
-	upgrade_submitted_at="$("${PYTHON[@]}" -c 'import time; print(time.time())')"
-	run_to_log "$backend node B same-token retry" "$pass/upgrade-b.log" \
-		lifecycle_run_deploy_operation "$backend-upgrade-retry" "${CLI_ARGS[@]}" node upgrade --node-id "$NODE_ID" "$UPGRADE_TWO" "$NODE_REMOTE" --format "$backend" \
-		--request-token "$retry_token" --db-url "$WRT_DEPLOY_E2E_DB_URL" \
+	run_to_log "$backend node B same-token retry" "$pass/deploy-b.log" \
+		lifecycle_run_deploy_operation "$backend-deploy-retry" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$UPGRADE_TWO" "$NODE_REMOTE" --format "$backend" \
+		--request-token "$retry_token" --allow-downtime --db-url "$WRT_DEPLOY_E2E_DB_URL" \
 		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
 	status_json "$pass/status-b.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-b.json" desired --node-id "$NODE_ID" --digest "$DIGEST_B_TWO" --version 2.0.0 --engine-slot engine-1 --engine-slot engine-2 >"$pass/assert-b.json"
-	[ "$(revision_from "$pass/status-b.json")" -eq "$staged_revision" ]
-	upgrade_completed_at="$("${PYTHON[@]}" -c 'import time; print(time.time())')"
-	lifecycle_capture_operation_detail "$NODE_ID" "$retry_token" \
-		"$pass/operation-upgrade.json" "${CLI_ARGS[@]}"
-	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-upgrade.json" \
-		--node-id "$NODE_ID" --request-token "$retry_token" --action rolling-upgrade \
+	revision_b="$(revision_from "$pass/status-b.json")"
+	[ "$revision_b" -eq "$staged_revision" ]
+	lifecycle_capture_operation_detail "$NODE_ID" "$retry_token" "$pass/operation-deploy-b.json" "${CLI_ARGS[@]}"
+	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-deploy-b.json" \
+		--node-id "$NODE_ID" --request-token "$retry_token" --action deployment \
 		--target-revision "$staged_revision" --target-digest "$DIGEST_B_TWO" \
-		--slot-order engine-1 --slot-order engine-2 --stopped-engine-slot engine-1 --stopped-engine-slot engine-2 --expect-proxy-stop >"$pass/assert-operation-upgrade.json"
-	invoke_echo_over_tunnel "probe-$backend" "$pass/invoke-post-upgrade.json"
-	stop_probe
-	"${PYTHON[@]}" dev/deployment-e2e/traffic_probe.py evaluate --log "$pass/upgrade-probe.jsonl" --submitted-at "$upgrade_submitted_at" --completed-at "$upgrade_completed_at" >"$pass/upgrade-probe-summary.json"
-	stop_tunnel
+		--slot-order engine-2 --slot-order engine-1 --stopped-engine-slot engine-1 --expect-proxy-stop >"$pass/assert-operation-deploy-b.json"
+	invoke_echo "hello-$backend-b" "$pass/invoke-b.json"
 
-	local scale_in_token="$backend-scale-in"
-	run_to_log "$backend node scale in" "$pass/scale-in.log" \
-		lifecycle_run_deploy_operation "$backend-scale-in" "${CLI_ARGS[@]}" node scale --node-id "$NODE_ID" "$UPGRADE_ONE" "$NODE_REMOTE" --format "$backend" \
-		--request-token "$scale_in_token" --db-url "$WRT_DEPLOY_E2E_DB_URL" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
-	status_json "$pass/status-scale-in.json"
-	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-scale-in.json" desired --node-id "$NODE_ID" --digest "$DIGEST_B_ONE" --version 2.0.0 --engine-slot engine-1 >"$pass/assert-scale-in.json"
-	revision_b_one="$(revision_from "$pass/status-scale-in.json")"
-	lifecycle_capture_operation_detail "$NODE_ID" "$scale_in_token" "$pass/operation-scale-in.json" "${CLI_ARGS[@]}"
-	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-scale-in.json" --node-id "$NODE_ID" --request-token "$scale_in_token" --action scale --target-digest "$DIGEST_B_ONE" --slot-order engine-1 --slot-order engine-2 --stopped-engine-slot engine-1 --stopped-engine-slot engine-2 >"$pass/assert-operation-scale-in.json"
-	invoke_echo "hello-$backend-scale-in" "$pass/invoke-scale-in.json"
+	run_to_log "$backend durable engine restart" "$pass/restart.log" \
+		lifecycle_run_deploy_operation "$backend-restart" "${CLI_ARGS[@]}" engines restart --node-id "$NODE_ID" --slot engine-1 \
+		--request-token "$backend-restart" --wait-timeout 300 --json
+	lifecycle_capture_operation_detail "$NODE_ID" "$backend-restart" "$pass/operation-restart.json" "${CLI_ARGS[@]}"
+	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-restart.json" \
+		--node-id "$NODE_ID" --request-token "$backend-restart" --action restart \
+		--slot-order engine-1 --stopped-engine-slot engine-1 >"$pass/assert-operation-restart.json"
+	invoke_echo "hello-$backend-restart" "$pass/invoke-restart.json"
 
-	run_to_log "$backend durable engine drain" "$pass/drain.log" \
-		lifecycle_run_deploy_operation "$backend-drain" "${CLI_ARGS[@]}" engines drain --node-id "$NODE_ID" --slot engine-1 --allow-downtime \
-		--request-token "$backend-drain" --json
-	lifecycle_capture_operation_detail "$NODE_ID" "$backend-drain" \
-		"$pass/operation-drain.json" "${CLI_ARGS[@]}"
-	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-drain.json" \
-		--node-id "$NODE_ID" --request-token "$backend-drain" --action drain \
-		--slot-order engine-1 --stopped-engine-slot engine-1 >"$pass/assert-operation-drain.json"
-	"${CLI[@]}" cluster wait --node "$NODE_ID" --severity unhealthy \
-		--timeout-secs 30 >"$pass/expect-unhealthy.json"
-	"${PYTHON[@]}" - "$pass/expect-unhealthy.json" "$pass/status-unhealthy.json" <<'PY'
-import json, pathlib, sys
-value = json.load(open(sys.argv[1]))
-pathlib.Path(sys.argv[2]).write_text(json.dumps(value["snapshot"], indent=2) + "\n")
-PY
-	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-unhealthy.json" unhealthy \
-		--node-id "$NODE_ID" --version 2.0.0 --desired-routes 1 --healthy-routes 0 --unhealthy-routes 1 >"$pass/assert-unhealthy.json"
+	run_to_log "$backend node inventory contraction" "$pass/contract.log" \
+		lifecycle_run_deploy_operation "$backend-contract" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$BASELINE_ONE" "$NODE_REMOTE" --format "$backend" \
+		--request-token "$backend-contract" --db-url "$WRT_DEPLOY_E2E_DB_URL" \
+		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
+	status_json "$pass/status-contract.json"
+	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-contract.json" desired --node-id "$NODE_ID" --digest "$DIGEST_A_ONE" --version 1.0.0 --engine-slot engine-1 >"$pass/assert-contract.json"
+	revision_contracted="$(revision_from "$pass/status-contract.json")"
+	lifecycle_capture_operation_detail "$NODE_ID" "$backend-contract" "$pass/operation-contract.json" "${CLI_ARGS[@]}"
+	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-contract.json" \
+		--node-id "$NODE_ID" --request-token "$backend-contract" --action deployment \
+		--target-digest "$DIGEST_A_ONE" --slot-order engine-1 --slot-order engine-2 \
+		--stopped-engine-slot engine-1 --stopped-engine-slot engine-2 --expect-proxy-stop >"$pass/assert-operation-contract.json"
+	invoke_echo "hello-$backend-contract" "$pass/invoke-contract.json"
 
 	local rollback_token="$backend-rollback"
 	run_to_log "$backend node rollback" "$pass/rollback.log" \
-		lifecycle_run_deploy_operation "$backend-rollback" "${CLI_ARGS[@]}" node rollback "$NODE_REMOTE" --node-id "$NODE_ID" --to "$revision_one_a" \
-		--request-token "$rollback_token" --allow-downtime --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY"
-	lifecycle_capture_operation_detail "$NODE_ID" "$rollback_token" \
-		"$pass/operation-rollback.json" "${CLI_ARGS[@]}"
+		lifecycle_run_deploy_operation "$backend-rollback" "${CLI_ARGS[@]}" node rollback "$NODE_REMOTE" --node-id "$NODE_ID" --to "$revision_b" \
+		--request-token "$rollback_token" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY"
+	lifecycle_capture_operation_detail "$NODE_ID" "$rollback_token" "$pass/operation-rollback.json" "${CLI_ARGS[@]}"
 	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-rollback.json" \
 		--node-id "$NODE_ID" --request-token "$rollback_token" --action rollback \
-		--target-digest "$DIGEST_A_ONE" --slot-order engine-1 --stopped-engine-slot engine-1 --expect-proxy-stop >"$pass/assert-operation-rollback.json"
+		--target-digest "$DIGEST_B_TWO" --slot-order engine-2 --slot-order engine-1 \
+		--stopped-engine-slot engine-1 --expect-proxy-stop >"$pass/assert-operation-rollback.json"
 	status_json "$pass/status-rollback.json"
-	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-rollback.json" rollback --node-id "$NODE_ID" --source-revision "$revision_one_a" --after-revision "$revision_b_one" --digest "$DIGEST_A_ONE" --version 1.0.0 --engine-slot engine-1 >"$pass/assert-rollback.json"
+	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-rollback.json" rollback --node-id "$NODE_ID" --source-revision "$revision_b" --after-revision "$revision_contracted" --digest "$DIGEST_B_TWO" --version 2.0.0 --engine-slot engine-1 --engine-slot engine-2 >"$pass/assert-rollback.json"
 	invoke_echo "hello-$backend-rollback" "$pass/invoke-rollback.json"
+	[ "$revision_a" -lt "$revision_b" ]
 
 	if [ "$backend" = systemd ]; then
 		local initial_selector manager_a_trace manager_b_trace

@@ -159,9 +159,9 @@ pub async fn register_engine_and_routes(
                 slot.target_revision AS slot_target_revision,
                 slot.target_digest AS slot_target_digest
          FROM wr_node_operations operation
-         JOIN wr_node_operation_slots slot
+         JOIN wr_node_operation_targets slot
            ON slot.operation_id = operation.operation_id
-          AND slot.engine_slot = $3
+          AND slot.target_kind = 'engine_slot' AND slot.target_key = $3
          WHERE operation.operation_id=$1 AND operation.node_id=$2
            AND operation.state IN ('queued','running','paused')
          FOR UPDATE",

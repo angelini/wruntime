@@ -406,31 +406,8 @@ pub async fn register_managed_engine(
         });
         existing_registrations.push(existing);
     }
-    let has_committed_revision = db
-        .query_opt(
-            "SELECT current_revision FROM wr_nodes WHERE node_id = $1",
-            &[&node_id],
-        )
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!(
-                "test fixture current revision query failed: {error}"
-            ))
-        })?
-        .is_some_and(|row| row.get::<_, i64>(0) > 0);
-    let action = if !has_committed_revision {
-        NodeOperationAction::InitialApply
-    } else if existing_registrations.is_empty() {
-        NodeOperationAction::RollingUpgrade
-    } else {
-        NodeOperationAction::Scale
-    };
     engines.push(expected_engine);
     engines.sort_by(|a, b| a.engine_slot.cmp(&b.engine_slot));
-    let engine_slots = engines
-        .iter()
-        .map(|engine| engine.engine_slot.clone())
-        .collect();
     let attempt_token = uuid::Uuid::new_v4().simple().to_string();
     let deployment = client
         .begin_deployment(BeginDeploymentRequest {
@@ -460,18 +437,16 @@ pub async fn register_managed_engine(
         .submit_operation(SubmitOperationRequest {
             node_id: node_id.clone(),
             request_token: attempt_token,
-            action: action as i32,
-            engine_slots,
+            action: NodeOperationAction::Deployment as i32,
             target_revision: deployment.revision,
             bundle_digest: bundle_digest.clone(),
             policy: Some(RolloutPolicy {
                 max_unavailable: 1,
-                canary_slot: engine_slot.clone(),
-                pause_after_canary: false,
                 allow_downtime: true,
                 deadline_seconds: 300,
             }),
             resolved_release_digest,
+            engine_slot: String::new(),
         })
         .await?
         .into_inner()
@@ -735,18 +710,16 @@ pub async fn register_test_replica_set_ready(
         .submit_operation(SubmitOperationRequest {
             node_id: node_id.clone(),
             request_token: attempt_token,
-            action: NodeOperationAction::InitialApply as i32,
-            engine_slots: engines.iter().map(|(id, _)| (*id).to_string()).collect(),
+            action: NodeOperationAction::Deployment as i32,
             target_revision: deployment.revision,
             bundle_digest: bundle_digest.clone(),
             policy: Some(RolloutPolicy {
                 max_unavailable: 1,
-                canary_slot: engines[0].0.to_string(),
-                pause_after_canary: false,
                 allow_downtime: true,
                 deadline_seconds: 300,
             }),
             resolved_release_digest,
+            engine_slot: String::new(),
         })
         .await?
         .into_inner()

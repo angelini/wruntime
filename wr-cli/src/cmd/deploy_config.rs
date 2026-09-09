@@ -61,8 +61,6 @@ pub struct DeployConfig {
     pub agent_poll_seconds: Option<u64>,
     /// Agent lease-renewal interval in seconds.
     pub agent_renew_seconds: Option<u64>,
-    /// Number of historical successful releases retained after commit.
-    pub agent_retention_count: Option<u32>,
 }
 
 impl DeployConfig {

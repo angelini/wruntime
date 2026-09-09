@@ -12,7 +12,9 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
                     AND to_regclass('wr_nodes') IS NOT NULL
                     AND to_regclass('wr_node_deployments') IS NOT NULL
                     AND to_regclass('wr_node_operations') IS NOT NULL
-                    AND to_regclass('wr_node_operation_slots') IS NOT NULL
+                    AND to_regclass('wr_node_operation_targets') IS NOT NULL
+                    AND to_regclass('wr_node_operation_engine_target_details') IS NOT NULL
+                    AND to_regclass('wr_node_operation_slots') IS NULL
                     AND to_regclass('wr_node_operation_events') IS NOT NULL
                     AND to_regclass('wr_node_slot_authority') IS NOT NULL
                     AND to_regclass('wr_node_slot_observations') IS NOT NULL
@@ -76,7 +78,12 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
             ) AND EXISTS(
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema()
-                  AND table_name = 'wr_node_operation_slots' AND column_name = 'source_digest'
+                  AND table_name = 'wr_node_operation_targets' AND column_name = 'source_digest'
+            ) AND EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_node_operation_engine_target_details'
+                  AND column_name = 'transition_kind' AND is_nullable = 'NO'
             ) AND EXISTS(
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema()
@@ -89,6 +96,18 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema()
                   AND table_name = 'wr_node_agent_policies' AND column_name = 'capabilities'
+            ) AND EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_node_agent_policies' AND column_name = 'retention_count'
+            ) AND NOT EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_node_agent_policies' AND column_name = 'config_digest'
+            ) AND NOT EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_node_agent_attestations' AND column_name IN ('config_digest', 'retention_count')
             ) AND NOT EXISTS(
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema()
@@ -269,9 +288,9 @@ async fn test_v16_to_v17_preserves_operation_and_event_history() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_v29_terminalizes_legacy_cleanup_and_preserves_provenance() -> Result<()> {
-    let pool = manager_pool_in_schema("mig_v29_cleanup_upgrade").await;
-    let client = pool.get().await.context("V29 upgrade connection")?;
+async fn test_v30_terminalizes_legacy_cleanup_and_preserves_provenance() -> Result<()> {
+    let pool = manager_pool_in_schema("mig_v30_cleanup_upgrade").await;
+    let client = pool.get().await.context("V30 upgrade connection")?;
     for sql in [
         include_str!("../../wr-manager/migrations/V1__initial.sql"),
         include_str!("../../wr-manager/migrations/V2__secrets.sql"),
@@ -342,7 +361,12 @@ async fn test_v29_terminalizes_legacy_cleanup_and_preserves_provenance() -> Resu
 
     client
         .batch_execute(include_str!(
-            "../../wr-manager/migrations/V29__node_release_cleanup.sql"
+            "../../wr-manager/migrations/V29__node_operation_termination_evidence.sql"
+        ))
+        .await?;
+    client
+        .batch_execute(include_str!(
+            "../../wr-manager/migrations/V30__node_release_cleanup.sql"
         ))
         .await?;
 
@@ -388,6 +412,216 @@ async fn test_v29_terminalizes_legacy_cleanup_and_preserves_provenance() -> Resu
         .get(0);
     assert_eq!(retired_columns, 0);
 
+    let proxy_termination_evidence = vec![0x08, 0x01];
+    let engine_termination_evidence = vec![0x08, 0x02];
+    client
+        .execute(
+            "UPDATE wr_node_operations SET proxy_effect_termination_evidence = $2
+             WHERE operation_id = $1",
+            &[&operation_id, &proxy_termination_evidence],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE wr_node_operation_slots SET effect_termination_evidence = $2
+             WHERE operation_id = $1 AND engine_slot = 'blue'",
+            &[&operation_id, &engine_termination_evidence],
+        )
+        .await?;
+
+    let active_id = uuid::Uuid::new_v4();
+    client
+        .execute(
+            "INSERT INTO wr_node_operations
+               (operation_id, node_id, request_token, actor, action, state,
+                request_payload, policy, phase, forward_deadline)
+             VALUES ($1, 'legacy-cleanup-node', 'active-v30', 'operator-a',
+                     'restart', 'queued', '\\x01', '\\x02', 'forward',
+                     NOW() + INTERVAL '5 minutes')",
+            &[&active_id],
+        )
+        .await?;
+    let rejected = client
+        .batch_execute(include_str!(
+            "../../wr-manager/migrations/V31__node_operation_targets.sql"
+        ))
+        .await
+        .expect_err("V31 must reject nonterminal operations");
+    assert!(rejected.as_db_error().is_some_and(|error| {
+        error
+            .message()
+            .contains("requires all node operations to be terminal")
+    }));
+    client
+        .execute(
+            "UPDATE wr_node_operations SET state = 'failed', phase = 'complete'
+             WHERE operation_id = $1",
+            &[&active_id],
+        )
+        .await?;
+    client
+        .batch_execute(include_str!(
+            "../../wr-manager/migrations/V31__node_operation_targets.sql"
+        ))
+        .await?;
+    let converted: i64 = client
+        .query_one(
+            "SELECT count(*) FROM wr_node_operation_targets WHERE operation_id = $1",
+            &[&operation_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(converted, 2);
+    let converted_evidence = client
+        .query(
+            "SELECT target_kind, effect_termination_evidence
+             FROM wr_node_operation_targets WHERE operation_id = $1 ORDER BY target_kind",
+            &[&operation_id],
+        )
+        .await?;
+    assert_eq!(
+        converted_evidence[0].get::<_, Option<Vec<u8>>>("effect_termination_evidence"),
+        Some(engine_termination_evidence)
+    );
+    assert_eq!(
+        converted_evidence[1].get::<_, Option<Vec<u8>>>("effect_termination_evidence"),
+        Some(proxy_termination_evidence)
+    );
+    assert!(client
+        .query_one(
+            "SELECT to_regclass('wr_node_operation_slots') IS NULL
+                    AND EXISTS (
+                        SELECT 1 FROM wr_node_release_deletions
+                        WHERE node_id = 'legacy-cleanup-node' AND revision = 7
+                          AND operation_id = $1 AND cleanup_generation IS NULL
+                    )",
+            &[&operation_id],
+        )
+        .await?
+        .get::<_, bool>(0));
+
+    client
+        .execute(
+            "INSERT INTO wr_node_agent_policies
+           (node_id, protocol_version, config_digest, backend, retention_count, actor,
+            policy_version, binary_digest, manager_endpoint, client_cert_path, client_key_path,
+            ca_cert_path, deployment_root, runtime_dir, compose_project, systemctl_path,
+            docker_path, poll_interval_seconds, renew_interval_seconds, capabilities)
+         VALUES ('legacy-cleanup-node', 'operator-engine-lifecycle-v1', 'sha256:config',
+                 'systemd', 7, 'operator-a', 1, $1, 'https://manager:9000', '/a', '/b',
+                 '/c', '/opt/wruntime', '/run/wruntime', '', '/usr/bin/systemctl', '', 5, 5,
+                 ARRAY['typed-backend-v1','continuous-lease-v1','typed-backend-v1'])",
+            &[&format!("sha256:{}", "a".repeat(64))],
+        )
+        .await?;
+    client
+        .execute(
+            "INSERT INTO wr_node_agent_attestations
+           (node_id, agent_instance_id, authenticated_principal, protocol_version,
+            binary_digest, config_digest, backend, capabilities, observed_at, retention_count)
+         VALUES ('legacy-cleanup-node', 'activation-v31', 'agent-a',
+                 'operator-engine-lifecycle-v1', $1, 'sha256:config', 'systemd',
+                 ARRAY['typed-backend-v1','continuous-lease-v1','typed-backend-v1'], NOW(), 7)",
+            &[&format!("sha256:{}", "a".repeat(64))],
+        )
+        .await?;
+    client
+        .batch_execute(include_str!(
+            "../../wr-manager/migrations/V32__narrow_node_agent_attestation.sql"
+        ))
+        .await?;
+    let narrow = client
+        .query_one(
+            "SELECT p.retention_count, p.capabilities, a.capabilities
+         FROM wr_node_agent_policies p JOIN wr_node_agent_attestations a USING (node_id)
+         WHERE p.node_id = 'legacy-cleanup-node'",
+            &[],
+        )
+        .await?;
+    assert_eq!(narrow.get::<_, i32>("retention_count"), 7);
+    assert_eq!(
+        narrow.get::<_, Vec<String>>(1),
+        vec!["continuous-lease-v1", "typed-backend-v1"]
+    );
+    assert_eq!(
+        narrow.get::<_, Vec<String>>(2),
+        vec!["continuous-lease-v1", "typed-backend-v1"]
+    );
+    let broad_absent: bool = client.query_one(
+        "SELECT NOT EXISTS (
+             SELECT 1 FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'wr_node_agent_policies'
+               AND column_name IN ('config_digest','manager_endpoint','deployment_root','runtime_dir')
+         ) AND NOT EXISTS (
+             SELECT 1 FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'wr_node_agent_attestations'
+               AND column_name IN ('config_digest','retention_count')
+         )",
+        &[],
+    ).await?.get(0);
+    assert!(broad_absent);
+
+    let rejected = client
+        .batch_execute(include_str!(
+            "../../wr-manager/migrations/V33__node_operation_action_matrix.sql"
+        ))
+        .await
+        .expect_err("V33 must reject ambiguous legacy action history");
+    assert!(rejected.as_db_error().is_some_and(|error| {
+        error
+            .message()
+            .contains("cannot cut over legacy node operation actions")
+    }));
+    client
+        .execute(
+            "UPDATE wr_node_operations SET action = 'restart' WHERE operation_id = $1",
+            &[&operation_id],
+        )
+        .await?;
+    client
+        .batch_execute(include_str!(
+            "../../wr-manager/migrations/V33__node_operation_action_matrix.sql"
+        ))
+        .await?;
+    let transition: String = client
+        .query_one(
+            "SELECT transition_kind FROM wr_node_operation_engine_target_details
+             WHERE operation_id = $1 AND target_key = 'blue'",
+            &[&operation_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(transition, "restart");
+    for action in ["deployment", "rollback"] {
+        client
+            .execute(
+                "INSERT INTO wr_node_operations
+                   (operation_id, node_id, request_token, actor, action, state,
+                    request_payload, policy, phase, forward_deadline)
+                 VALUES ($1, 'legacy-cleanup-node', $2, 'operator-a', $3, 'failed',
+                         '\\x01', '\\x02', 'complete', NOW() + INTERVAL '5 minutes')",
+                &[&uuid::Uuid::new_v4(), &format!("valid-{action}"), &action],
+            )
+            .await?;
+    }
+    let invalid_action = client
+        .execute(
+            "UPDATE wr_node_operations SET action = 'drain' WHERE operation_id = $1",
+            &[&operation_id],
+        )
+        .await
+        .expect_err("retired actions must be rejected");
+    assert!(invalid_action.as_db_error().is_some());
+    let invalid_transition = client
+        .execute(
+            "UPDATE wr_node_operation_engine_target_details SET transition_kind = 'invalid'
+             WHERE operation_id = $1 AND target_key = 'blue'",
+            &[&operation_id],
+        )
+        .await
+        .expect_err("unknown transitions must be rejected");
+    assert!(invalid_transition.as_db_error().is_some());
+
     Ok(())
 }
 
@@ -432,6 +666,19 @@ async fn test_run_migrations_second_run_is_noop() -> Result<()> {
         .context("second run")?;
 
     assert_manager_schema_ready(&client).await?;
+    let tail: Vec<i32> = client
+        .query_one(
+            "SELECT array_agg(version::integer ORDER BY applied_on, version)
+             FROM refinery_schema_history WHERE version IN (29, 30, 31, 32, 33)",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        tail,
+        vec![29, 30, 31, 32, 33],
+        "V33 must follow preserved V29 through V32"
+    );
 
     Ok(())
 }

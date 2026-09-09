@@ -140,7 +140,7 @@ pub fn manager_activation_command(
 /// own active control process.
 pub fn node_agent_systemd_unit(workdir: &str) -> String {
     format!(
-        "[Unit]\nDescription=wruntime node lifecycle agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=root\nGroup=root\nUMask=0077\nWorkingDirectory={workdir}/wr-agent\nExecStart={workdir}/wr-agent/wr-cli node agent run --config {workdir}/wr-agent/agent.toml\nEnvironment=PATH=\nEnvironment=LANG=C.UTF-8\nNoNewPrivileges=true\nPrivateTmp=true\nPrivateDevices=true\nProtectHome=true\nProtectSystem=strict\nProtectControlGroups=true\nProtectKernelTunables=true\nProtectKernelModules=true\nProtectKernelLogs=true\nProtectClock=true\nProtectHostname=true\nProtectProc=invisible\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nRestrictNamespaces=true\nRestrictSUIDSGID=true\nLockPersonality=true\nRestrictRealtime=true\nSystemCallArchitectures=native\nRuntimeDirectory=wruntime\nRuntimeDirectoryMode=0700\nReadWritePaths={workdir}/wr-node {workdir}/wr-agent/state /run/wruntime /etc/systemd/system -/run/docker.sock -/var/run/docker.sock\nRestart=on-failure\nRestartSec=5\nKillSignal=SIGTERM\nTimeoutStopSec=45s\nSendSIGKILL=yes\n\n[Install]\nWantedBy=multi-user.target\n"
+        "[Unit]\nDescription=wruntime node lifecycle agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=root\nGroup=root\nUMask=0077\nWorkingDirectory={workdir}/wr-agent\nExecStart={workdir}/wr-agent/wr-cli node agent run --config {workdir}/wr-agent/agent.toml\nEnvironment=PATH=\nEnvironment=LANG=C.UTF-8\nNoNewPrivileges=true\nPrivateTmp=true\nPrivateDevices=true\nProtectHome=true\nProtectSystem=strict\nProtectControlGroups=true\nProtectKernelTunables=true\nProtectKernelModules=true\nProtectKernelLogs=true\nProtectClock=true\nProtectHostname=true\nProtectProc=invisible\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nRestrictNamespaces=true\nRestrictSUIDSGID=true\nLockPersonality=true\nRestrictRealtime=true\nSystemCallArchitectures=native\nRuntimeDirectory=wruntime\nRuntimeDirectoryMode=0700\nReadWritePaths={workdir}/wr-node /run/wruntime /etc/systemd/system -/run/docker.sock -/var/run/docker.sock\nRestart=on-failure\nRestartSec=5\nKillSignal=SIGTERM\nTimeoutStopSec=45s\nSendSIGKILL=yes\n\n[Install]\nWantedBy=multi-user.target\n"
     )
 }
 
@@ -373,7 +373,8 @@ mod tests {
         assert!(unit.contains("PrivateDevices=true\n"));
         assert!(unit.contains("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n"));
         assert!(unit.contains("RuntimeDirectory=wruntime\nRuntimeDirectoryMode=0700\n"));
-        assert!(unit.contains("ReadWritePaths=/opt/wruntime/wr-node /opt/wruntime/wr-agent/state /run/wruntime /etc/systemd/system -/run/docker.sock -/var/run/docker.sock\n"));
+        assert!(unit.contains("ReadWritePaths=/opt/wruntime/wr-node /run/wruntime /etc/systemd/system -/run/docker.sock -/var/run/docker.sock\n"));
+        assert!(!unit.contains("wr-agent/state"));
         assert!(!unit.contains("ReadWritePaths=/etc "));
         assert!(unit.contains("/opt/wruntime/wr-agent/wr-cli node agent run"));
         assert!(!unit.contains("{run_user}"));

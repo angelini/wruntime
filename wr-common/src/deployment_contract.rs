@@ -46,7 +46,7 @@ pub fn canonicalize_inventory(
         "deployment inventory schema_version must be 1"
     );
     ensure!(
-        !inventory.engines.is_empty() && inventory.engines.len() <= 1_024,
+        inventory.engines.len() <= 1_024,
         "deployment inventory engine count is out of range"
     );
     let mut total = 0usize;
@@ -289,6 +289,19 @@ mod tests {
         changed.engines[1].modules[0].proto_schema_digest = schema_digest(b"other");
         assert_ne!(a, revision_digest("node-a", 1, &bundle, &changed).unwrap());
     }
+    #[test]
+    fn empty_desired_inventory_is_canonical() {
+        assert_eq!(
+            canonicalize_inventory(DeploymentInventoryV1 {
+                schema_version: DEPLOYMENT_INVENTORY_SCHEMA_VERSION,
+                engines: vec![],
+            })
+            .unwrap()
+            .engines,
+            vec![]
+        );
+    }
+
     #[test]
     fn inventory_requires_a_canonical_job_admin_address() {
         let mut valid = inventory(false);

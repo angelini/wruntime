@@ -4,18 +4,22 @@ use sha2::{Digest, Sha256};
 use tokio_postgres::Row;
 use tonic::Status;
 use uuid::Uuid;
-use wr_common::agent_policy::{AgentPolicy, AgentPolicyBackend};
+use wr_common::agent_policy::{
+    missing_capabilities, normalize_capabilities, validate_identity, validate_sha256_digest,
+    AGENT_PROTOCOL_VERSION,
+};
 use wr_common::deployment_contract::deployment_operation_id;
 use wr_common::wruntime::{
-    AgentInstruction, BackendKind, BackendProcessState, BackendTerminationEvidence,
-    ClaimNodeCleanupResponse, ClaimOperationResponse, DeploymentCondition, InstructionTarget,
-    InstructionTargetKind, NodeAgentAttestation, NodeAgentPolicy, NodeCleanupAuthority,
-    NodeCleanupInstruction, NodeCleanupResultDisposition, NodeCleanupState, NodeCleanupSummary,
-    NodeOperation, NodeOperationAction, NodeOperationPhase, NodeOperationState,
-    NodeOperationStepKind, OperationEvent, OperationSlotProgress, ProcessLifecycleState,
-    ReportNodeCleanupResultRequest, ReportNodeCleanupResultResponse, ReportNodeObservationRequest,
-    ReportStepResultRequest, RolloutPolicy, ServiceKind, SlotAuthorityStatus, SlotObservation,
-    SubmitOperationRequest,
+    instruction_target, operation_target_progress, AgentInstruction, BackendKind,
+    BackendProcessState, BackendTerminationEvidence, ClaimNodeCleanupResponse,
+    ClaimOperationResponse, DeploymentCondition, EngineSlotTargetIdentity, EngineTargetDetails,
+    InstructionTarget, InstructionTargetKind, NodeAgentAttestation, NodeAgentPolicy,
+    NodeCleanupAuthority, NodeCleanupInstruction, NodeCleanupResultDisposition, NodeCleanupState,
+    NodeCleanupSummary, NodeOperation, NodeOperationAction, NodeOperationPhase, NodeOperationState,
+    NodeOperationStepKind, NodeSlotTransitionKind, OperationEvent, OperationTargetProgress,
+    ProcessLifecycleState, ProxyTargetDetails, ProxyTargetIdentity, ReportNodeCleanupResultRequest,
+    ReportNodeCleanupResultResponse, ReportNodeObservationRequest, ReportStepResultRequest,
+    RolloutPolicy, ServiceKind, SlotAuthorityStatus, SlotObservation, SubmitOperationRequest,
 };
 
 const LEASE_SECONDS: f64 = 15.0;
@@ -95,11 +99,8 @@ fn timestamp(value: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
 
 fn action_name(action: NodeOperationAction) -> &'static str {
     match action {
-        NodeOperationAction::InitialApply => "initial_apply",
-        NodeOperationAction::Drain => "drain",
+        NodeOperationAction::Deployment => "deployment",
         NodeOperationAction::Restart => "restart",
-        NodeOperationAction::RollingUpgrade => "rolling_upgrade",
-        NodeOperationAction::Scale => "scale",
         NodeOperationAction::Rollback => "rollback",
         NodeOperationAction::Unspecified => "unspecified",
     }
@@ -107,11 +108,8 @@ fn action_name(action: NodeOperationAction) -> &'static str {
 
 fn parse_action(value: &str) -> Result<NodeOperationAction, Status> {
     match value {
-        "initial_apply" => Ok(NodeOperationAction::InitialApply),
-        "drain" => Ok(NodeOperationAction::Drain),
+        "deployment" => Ok(NodeOperationAction::Deployment),
         "restart" => Ok(NodeOperationAction::Restart),
-        "rolling_upgrade" => Ok(NodeOperationAction::RollingUpgrade),
-        "scale" => Ok(NodeOperationAction::Scale),
         "rollback" => Ok(NodeOperationAction::Rollback),
         _ => Err(Status::internal("stored operation has an invalid action")),
     }
@@ -172,6 +170,37 @@ fn parse_step(value: &str) -> Result<NodeOperationStepKind, Status> {
     }
 }
 
+fn target_step_compatible(kind: InstructionTargetKind, step: NodeOperationStepKind) -> bool {
+    use NodeOperationStepKind as Step;
+    match kind {
+        InstructionTargetKind::Proxy => matches!(
+            step,
+            Step::InspectBackend
+                | Step::VerifyTarget
+                | Step::VerifyProxy
+                | Step::StopBackend
+                | Step::SelectRelease
+                | Step::StartBackend
+                | Step::RestoreSource
+                | Step::Unspecified
+        ),
+        InstructionTargetKind::EngineSlot => matches!(
+            step,
+            Step::VerifyReleaseMetadata
+                | Step::InspectBackend
+                | Step::StopBackend
+                | Step::SelectRelease
+                | Step::StartBackend
+                | Step::VerifyTarget
+                | Step::SwitchAuthority
+                | Step::VerifyServing
+                | Step::RestoreSource
+                | Step::Unspecified
+        ),
+        InstructionTargetKind::Unspecified | InstructionTargetKind::ReleaseCleanup => false,
+    }
+}
+
 fn backend_name(value: BackendKind) -> Result<&'static str, Status> {
     match value {
         BackendKind::Systemd => Ok("systemd"),
@@ -199,6 +228,225 @@ fn operation_condition(code: String, detail: String) -> DeploymentCondition {
     }
 }
 
+fn target_from_row(row: &Row) -> Result<OperationTargetProgress, Status> {
+    let kind: String = row.get("target_kind");
+    let key: String = row.get("target_key");
+    let (kind, identity, details, transition) = match kind.as_str() {
+        "proxy" if key == "proxy" => (
+            InstructionTargetKind::Proxy,
+            operation_target_progress::Identity::Proxy(Default::default()),
+            operation_target_progress::Details::ProxyDetails(ProxyTargetDetails {}),
+            NodeSlotTransitionKind::Unspecified,
+        ),
+        "engine_slot" if !key.is_empty() && key != "proxy" => (
+            InstructionTargetKind::EngineSlot,
+            operation_target_progress::Identity::EngineSlot(EngineSlotTargetIdentity {
+                engine_slot: key,
+            }),
+            operation_target_progress::Details::EngineDetails(EngineTargetDetails {
+                rollout_order: row
+                    .get::<_, Option<i32>>("rollout_order")
+                    .ok_or_else(|| Status::internal("engine target detail is missing"))?
+                    as u32,
+                authoritative_revision: row
+                    .get::<_, Option<i64>>("authoritative_revision")
+                    .ok_or_else(|| Status::internal("engine target detail is missing"))?
+                    as u64,
+                authority_switched: row
+                    .get::<_, Option<bool>>("authority_switched")
+                    .ok_or_else(|| Status::internal("engine target detail is missing"))?,
+                serving_converged: row
+                    .get::<_, Option<bool>>("serving_converged")
+                    .ok_or_else(|| Status::internal("engine target detail is missing"))?,
+            }),
+            parse_transition(
+                row.get::<_, Option<String>>("transition_kind")
+                    .ok_or_else(|| Status::internal("engine target transition is missing"))?
+                    .as_str(),
+            )?
+            .proto(),
+        ),
+        _ => {
+            return Err(Status::internal(
+                "stored operation target identity is invalid",
+            ))
+        }
+    };
+    let code: String = row.get("condition_code");
+    let detail: String = row.get("condition_detail");
+    Ok(OperationTargetProgress {
+        kind: kind as i32,
+        identity: Some(identity),
+        next_step: parse_step(row.get::<_, String>("next_step").as_str())? as i32,
+        completed_steps: row.get::<_, i32>("completed_steps") as u32,
+        complete: row.get("complete"),
+        conditions: if code.is_empty() {
+            vec![]
+        } else {
+            vec![operation_condition(code, detail)]
+        },
+        source_revision: row.get::<_, i64>("source_revision") as u64,
+        source_digest: row.get("source_digest"),
+        source_resolved_release_digest: row.get("source_resolved_digest"),
+        target_revision: row.get::<_, i64>("target_revision") as u64,
+        target_digest: row.get("target_digest"),
+        target_resolved_release_digest: row.get("target_resolved_digest"),
+        pinned_backend_instance_id: row.get("pinned_backend_instance_id"),
+        pinned_process_instance_id: row.get("pinned_process_instance_id"),
+        changed: row.get("changed"),
+        effect_delivered_at: row
+            .get::<_, Option<chrono::DateTime<chrono::Utc>>>("effect_delivered_at")
+            .map(timestamp),
+        effect_reported: row.get("effect_reported"),
+        effect_observed_revision: row.get::<_, i64>("effect_observed_revision") as u64,
+        effect_observed_digest: row.get("effect_observed_digest"),
+        effect_observed_resolved_release_digest: row.get("effect_observed_resolved_digest"),
+        effect_backend_instance_id: row.get("effect_backend_instance_id"),
+        effect_process_instance_id: row.get("effect_process_instance_id"),
+        effect_condition_code: row.get("effect_condition_code"),
+        effect_detail: row.get("effect_detail"),
+        effect_ambiguous: row.get("effect_ambiguous"),
+        details: Some(details),
+        transition: transition as i32,
+        termination_evidence: decode_termination_evidence(row.get("effect_termination_evidence"))?,
+    })
+}
+
+fn instruction_target_key(target: &InstructionTarget) -> Result<(&'static str, &str), Status> {
+    match (
+        InstructionTargetKind::try_from(target.kind).unwrap_or(InstructionTargetKind::Unspecified),
+        target.identity.as_ref(),
+    ) {
+        (InstructionTargetKind::Proxy, Some(instruction_target::Identity::Proxy(_))) => {
+            Ok(("proxy", "proxy"))
+        }
+        (
+            InstructionTargetKind::EngineSlot,
+            Some(instruction_target::Identity::EngineSlotTarget(identity)),
+        ) if !identity.engine_slot.is_empty() && identity.engine_slot != "proxy" => {
+            Ok(("engine_slot", &identity.engine_slot))
+        }
+        _ => Err(Status::invalid_argument(
+            "target kind and identity mismatch",
+        )),
+    }
+}
+
+fn target_key(target: &OperationTargetProgress) -> Result<(&'static str, &str), Status> {
+    match (
+        InstructionTargetKind::try_from(target.kind).unwrap_or(InstructionTargetKind::Unspecified),
+        target.identity.as_ref(),
+        target.details.as_ref(),
+    ) {
+        (
+            InstructionTargetKind::Proxy,
+            Some(operation_target_progress::Identity::Proxy(_)),
+            Some(operation_target_progress::Details::ProxyDetails(_)),
+        ) => Ok(("proxy", "proxy")),
+        (
+            InstructionTargetKind::EngineSlot,
+            Some(operation_target_progress::Identity::EngineSlot(identity)),
+            Some(operation_target_progress::Details::EngineDetails(_)),
+        ) if !identity.engine_slot.is_empty() => Ok(("engine_slot", &identity.engine_slot)),
+        _ => Err(Status::internal(
+            "operation target kind, identity, and details mismatch",
+        )),
+    }
+}
+
+fn engine_slot(target: &OperationTargetProgress) -> Result<&str, Status> {
+    let (kind, key) = target_key(target)?;
+    if kind != "engine_slot" {
+        return Err(Status::internal("expected an engine operation target"));
+    }
+    Ok(key)
+}
+
+fn engine_details(target: &OperationTargetProgress) -> Result<&EngineTargetDetails, Status> {
+    match target.details.as_ref() {
+        Some(operation_target_progress::Details::EngineDetails(details)) => Ok(details),
+        _ => Err(Status::internal("engine target detail is missing")),
+    }
+}
+
+fn proxy_target(operation: &NodeOperation) -> Result<&OperationTargetProgress, Status> {
+    operation
+        .targets
+        .iter()
+        .find(|target| target.kind == InstructionTargetKind::Proxy as i32)
+        .ok_or_else(|| Status::internal("operation proxy target is missing"))
+}
+
+#[derive(Clone)]
+struct OperationSlotProgress {
+    engine_slot: String,
+    transition: DerivedTransition,
+    authoritative_revision: u64,
+    next_step: i32,
+    complete: bool,
+    source_revision: u64,
+    source_digest: String,
+    target_revision: u64,
+    target_digest: String,
+    pinned_backend_instance_id: String,
+    pinned_process_instance_id: String,
+
+    effect_delivered_at: Option<prost_types::Timestamp>,
+    effect_reported: bool,
+    effect_backend_instance_id: String,
+    effect_process_instance_id: String,
+    effect_condition_code: String,
+    rollout_order: u32,
+    effect_ambiguous: bool,
+    source_resolved_release_digest: String,
+    target_resolved_release_digest: String,
+}
+
+fn operation_slots(operation: &NodeOperation) -> Result<Vec<OperationSlotProgress>, Status> {
+    operation
+        .targets
+        .iter()
+        .filter(|target| target.kind == InstructionTargetKind::EngineSlot as i32)
+        .map(|target| {
+            let details = engine_details(target)?;
+            Ok(OperationSlotProgress {
+                engine_slot: engine_slot(target)?.to_string(),
+                transition: match NodeSlotTransitionKind::try_from(target.transition)
+                    .unwrap_or(NodeSlotTransitionKind::Unspecified)
+                {
+                    NodeSlotTransitionKind::Addition => DerivedTransition::Addition,
+                    NodeSlotTransitionKind::Replacement => DerivedTransition::Replacement,
+                    NodeSlotTransitionKind::Unchanged => DerivedTransition::Unchanged,
+                    NodeSlotTransitionKind::Removal => DerivedTransition::Removal,
+                    NodeSlotTransitionKind::Restart => DerivedTransition::Restart,
+                    NodeSlotTransitionKind::Unspecified => {
+                        return Err(Status::internal("engine target transition is missing"))
+                    }
+                },
+                authoritative_revision: details.authoritative_revision,
+                next_step: target.next_step,
+                complete: target.complete,
+                source_revision: target.source_revision,
+                source_digest: target.source_digest.clone(),
+                target_revision: target.target_revision,
+                target_digest: target.target_digest.clone(),
+                pinned_backend_instance_id: target.pinned_backend_instance_id.clone(),
+                pinned_process_instance_id: target.pinned_process_instance_id.clone(),
+
+                effect_delivered_at: target.effect_delivered_at,
+                effect_reported: target.effect_reported,
+                effect_backend_instance_id: target.effect_backend_instance_id.clone(),
+                effect_process_instance_id: target.effect_process_instance_id.clone(),
+                effect_condition_code: target.effect_condition_code.clone(),
+                rollout_order: details.rollout_order,
+                effect_ambiguous: target.effect_ambiguous,
+                source_resolved_release_digest: target.source_resolved_release_digest.clone(),
+                target_resolved_release_digest: target.target_resolved_release_digest.clone(),
+            })
+        })
+        .collect()
+}
+
 async fn load_operation<C>(client: &C, operation_id: Uuid) -> Result<NodeOperation, Status>
 where
     C: GenericClient + Sync,
@@ -210,42 +458,42 @@ where
                     target_revision_digest, committed, lease_epoch, lease_expires_at,
                     failure_code, failure_detail, created_at, updated_at, phase,
                     forward_deadline, forward_fenced, restoration_requested,
-                    agent_instance_id, proxy_process_instance_id,
-                    restoration_terminal_state, proxy_next_step,
-                    proxy_source_revision, proxy_source_digest, proxy_source_resolved_digest,
-                    proxy_target_revision, proxy_target_digest, proxy_target_resolved_digest,
-                    proxy_backend_instance_id, proxy_changed, proxy_effect_ambiguous,
-                    proxy_effect_delivered_at, proxy_effect_reported,
-                    proxy_effect_observed_revision, proxy_effect_observed_digest,
-                    proxy_effect_observed_resolved_digest, proxy_effect_backend_instance_id,
-                    proxy_effect_process_instance_id, proxy_effect_condition_code,
-                    proxy_effect_detail, proxy_effect_termination_evidence
+                    agent_instance_id, restoration_terminal_state
              FROM wr_node_operations WHERE operation_id = $1",
             &[&operation_id],
         )
         .await
         .map_err(internal)?
         .ok_or_else(|| Status::not_found("operation not found"))?;
-    let slots = client
+    let targets = client
         .query(
-            "SELECT engine_slot, rollout_order, authoritative_revision, next_step, completed_steps, complete,
-                    condition_code, condition_detail, source_revision, source_digest,
-                    source_resolved_digest, target_revision, target_digest, target_resolved_digest,
-                    pinned_backend_instance_id, pinned_process_instance_id, authority_switched,
-                    serving_converged, changed, effect_ambiguous, effect_delivered_at,
-                    effect_reported, effect_observed_revision, effect_observed_digest,
-                    effect_observed_resolved_digest, effect_backend_instance_id,
-                    effect_process_instance_id, effect_condition_code, effect_detail,
-                    effect_termination_evidence
-             FROM wr_node_operation_slots WHERE operation_id = $1 ORDER BY rollout_order",
+            "SELECT t.target_kind, t.target_key, t.next_step, t.completed_steps, t.complete,
+                    t.condition_code, t.condition_detail, t.source_revision, t.source_digest,
+                    t.source_resolved_digest, t.target_revision, t.target_digest,
+                    t.target_resolved_digest, t.pinned_backend_instance_id,
+                    t.pinned_process_instance_id, t.changed, t.effect_ambiguous,
+                    t.effect_delivered_at, t.effect_reported, t.effect_observed_revision,
+                    t.effect_observed_digest, t.effect_observed_resolved_digest,
+                    t.effect_backend_instance_id, t.effect_process_instance_id,
+                    t.effect_condition_code, t.effect_detail, t.effect_termination_evidence,
+                    d.rollout_order,
+                    d.authoritative_revision, d.authority_switched, d.serving_converged,
+                    d.transition_kind
+             FROM wr_node_operation_targets t
+             LEFT JOIN wr_node_operation_engine_target_details d
+               ON (d.operation_id, d.target_kind, d.target_key) =
+                  (t.operation_id, t.target_kind, t.target_key)
+             WHERE t.operation_id = $1
+             ORDER BY CASE t.target_kind WHEN 'proxy' THEN 0 ELSE 1 END,
+                      d.rollout_order NULLS FIRST, t.target_key",
             &[&operation_id],
         )
         .await
         .map_err(internal)?;
-    operation_from_row(&row, &slots)
+    operation_from_row(&row, &targets)
 }
 
-fn operation_from_row(row: &Row, slots: &[Row]) -> Result<NodeOperation, Status> {
+fn operation_from_row(row: &Row, targets: &[Row]) -> Result<NodeOperation, Status> {
     let policy = RolloutPolicy::decode(row.get::<_, Vec<u8>>("policy").as_slice())
         .map_err(|error| Status::internal(format!("stored rollout policy is invalid: {error}")))?;
     let failure_code: String = row.get("failure_code");
@@ -254,12 +502,35 @@ fn operation_from_row(row: &Row, slots: &[Row]) -> Result<NodeOperation, Status>
     let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
     let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
     let forward_deadline: chrono::DateTime<chrono::Utc> = row.get("forward_deadline");
+    let action = parse_action(row.get::<_, String>("action").as_str())?;
+    let targets = targets
+        .iter()
+        .map(target_from_row)
+        .collect::<Result<Vec<_>, Status>>()?;
+    for target in targets
+        .iter()
+        .filter(|target| target.kind == InstructionTargetKind::EngineSlot as i32)
+    {
+        let stored = match NodeSlotTransitionKind::try_from(target.transition)
+            .unwrap_or(NodeSlotTransitionKind::Unspecified)
+        {
+            NodeSlotTransitionKind::Addition => DerivedTransition::Addition,
+            NodeSlotTransitionKind::Replacement => DerivedTransition::Replacement,
+            NodeSlotTransitionKind::Unchanged => DerivedTransition::Unchanged,
+            NodeSlotTransitionKind::Removal => DerivedTransition::Removal,
+            NodeSlotTransitionKind::Restart => DerivedTransition::Restart,
+            NodeSlotTransitionKind::Unspecified => {
+                return Err(Status::internal("engine target transition is missing"))
+            }
+        };
+        validate_stored_transition(action, stored, target)?;
+    }
     Ok(NodeOperation {
         operation_id: row.get::<_, Uuid>("operation_id").to_string(),
         node_id: row.get("node_id"),
         request_token: row.get("request_token"),
         actor: row.get("actor"),
-        action: parse_action(row.get::<_, String>("action").as_str())? as i32,
+        action: action as i32,
         state: parse_state(row.get::<_, String>("state").as_str())? as i32,
         policy: Some(policy),
         source_revision: row.get::<_, i64>("source_revision") as u64,
@@ -268,53 +539,7 @@ fn operation_from_row(row: &Row, slots: &[Row]) -> Result<NodeOperation, Status>
         revision_digest: row
             .get::<_, Option<String>>("target_revision_digest")
             .unwrap_or_default(),
-        slots: slots
-            .iter()
-            .map(|slot| {
-                let code: String = slot.get("condition_code");
-                let detail: String = slot.get("condition_detail");
-                Ok(OperationSlotProgress {
-                    engine_slot: slot.get("engine_slot"),
-                    authoritative_revision: slot.get::<_, i64>("authoritative_revision") as u64,
-                    next_step: parse_step(slot.get::<_, String>("next_step").as_str())? as i32,
-                    completed_steps: slot.get::<_, i32>("completed_steps") as u32,
-                    complete: slot.get("complete"),
-                    conditions: if code.is_empty() {
-                        vec![]
-                    } else {
-                        vec![operation_condition(code, detail)]
-                    },
-                    source_revision: slot.get::<_, i64>("source_revision") as u64,
-                    source_digest: slot.get("source_digest"),
-                    target_revision: slot.get::<_, i64>("target_revision") as u64,
-                    target_digest: slot.get("target_digest"),
-                    pinned_backend_instance_id: slot.get("pinned_backend_instance_id"),
-                    pinned_process_instance_id: slot.get("pinned_process_instance_id"),
-                    authority_switched: slot.get("authority_switched"),
-                    serving_converged: slot.get("serving_converged"),
-                    changed: slot.get("changed"),
-                    effect_ambiguous: slot.get("effect_ambiguous"),
-                    effect_delivered_at: slot
-                        .get::<_, Option<chrono::DateTime<chrono::Utc>>>("effect_delivered_at")
-                        .map(timestamp),
-                    effect_reported: slot.get("effect_reported"),
-                    effect_observed_revision: slot.get::<_, i64>("effect_observed_revision") as u64,
-                    effect_observed_digest: slot.get("effect_observed_digest"),
-                    effect_backend_instance_id: slot.get("effect_backend_instance_id"),
-                    effect_process_instance_id: slot.get("effect_process_instance_id"),
-                    effect_condition_code: slot.get("effect_condition_code"),
-                    effect_detail: slot.get("effect_detail"),
-                    rollout_order: slot.get::<_, i32>("rollout_order") as u32,
-                    source_resolved_release_digest: slot.get("source_resolved_digest"),
-                    target_resolved_release_digest: slot.get("target_resolved_digest"),
-                    effect_observed_resolved_release_digest: slot
-                        .get("effect_observed_resolved_digest"),
-                    termination_evidence: decode_termination_evidence(
-                        slot.get("effect_termination_evidence"),
-                    )?,
-                })
-            })
-            .collect::<Result<Vec<_>, Status>>()?,
+        targets,
         committed: row.get("committed"),
         lease_epoch: row.get::<_, i64>("lease_epoch") as u64,
         lease_expires_at: lease_expires_at.map(timestamp),
@@ -337,33 +562,7 @@ fn operation_from_row(row: &Row, slots: &[Row]) -> Result<NodeOperation, Status>
             .map(|value| parse_state(&value).map(|state| state as i32))
             .transpose()?
             .unwrap_or(NodeOperationState::Unspecified as i32),
-        proxy_process_instance_id: row.get("proxy_process_instance_id"),
         resolved_release_digest: row.get("resolved_release_digest"),
-        proxy_next_step: parse_step(row.get::<_, String>("proxy_next_step").as_str())? as i32,
-        proxy_source_revision: row.get::<_, i64>("proxy_source_revision") as u64,
-        proxy_source_digest: row.get("proxy_source_digest"),
-        proxy_source_resolved_release_digest: row.get("proxy_source_resolved_digest"),
-        proxy_target_revision: row.get::<_, i64>("proxy_target_revision") as u64,
-        proxy_target_digest: row.get("proxy_target_digest"),
-        proxy_target_resolved_release_digest: row.get("proxy_target_resolved_digest"),
-        proxy_backend_instance_id: row.get("proxy_backend_instance_id"),
-        proxy_changed: row.get("proxy_changed"),
-        proxy_effect_ambiguous: row.get("proxy_effect_ambiguous"),
-        proxy_effect_delivered_at: row
-            .get::<_, Option<chrono::DateTime<chrono::Utc>>>("proxy_effect_delivered_at")
-            .map(timestamp),
-        proxy_effect_reported: row.get("proxy_effect_reported"),
-        proxy_effect_observed_revision: row.get::<_, i64>("proxy_effect_observed_revision") as u64,
-        proxy_effect_observed_digest: row.get("proxy_effect_observed_digest"),
-        proxy_effect_observed_resolved_release_digest: row
-            .get("proxy_effect_observed_resolved_digest"),
-        proxy_effect_backend_instance_id: row.get("proxy_effect_backend_instance_id"),
-        proxy_effect_process_instance_id: row.get("proxy_effect_process_instance_id"),
-        proxy_effect_condition_code: row.get("proxy_effect_condition_code"),
-        proxy_effect_detail: row.get("proxy_effect_detail"),
-        termination_evidence: decode_termination_evidence(
-            row.get("proxy_effect_termination_evidence"),
-        )?,
     })
 }
 
@@ -398,49 +597,149 @@ async fn append_event<C: GenericClient + Sync>(
     Ok(())
 }
 
-fn first_forward_step(
-    action: NodeOperationAction,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DerivedTransition {
+    Addition,
+    Replacement,
+    Unchanged,
+    Removal,
+    Restart,
+}
+
+impl DerivedTransition {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Addition => "addition",
+            Self::Replacement => "replacement",
+            Self::Unchanged => "unchanged",
+            Self::Removal => "removal",
+            Self::Restart => "restart",
+        }
+    }
+
+    fn proto(self) -> NodeSlotTransitionKind {
+        match self {
+            Self::Addition => NodeSlotTransitionKind::Addition,
+            Self::Replacement => NodeSlotTransitionKind::Replacement,
+            Self::Unchanged => NodeSlotTransitionKind::Unchanged,
+            Self::Removal => NodeSlotTransitionKind::Removal,
+            Self::Restart => NodeSlotTransitionKind::Restart,
+        }
+    }
+}
+
+fn parse_transition(value: &str) -> Result<DerivedTransition, Status> {
+    match value {
+        "addition" => Ok(DerivedTransition::Addition),
+        "replacement" => Ok(DerivedTransition::Replacement),
+        "unchanged" => Ok(DerivedTransition::Unchanged),
+        "removal" => Ok(DerivedTransition::Removal),
+        "restart" => Ok(DerivedTransition::Restart),
+        _ => Err(Status::internal(
+            "stored operation target has an invalid transition kind",
+        )),
+    }
+}
+
+fn derive_transition(
     source_revision: i64,
+    source_digest: &str,
+    source_resolved_digest: &str,
     target_revision: i64,
-) -> NodeOperationStepKind {
-    match action {
+    target_digest: &str,
+    target_resolved_digest: &str,
+) -> DerivedTransition {
+    match (source_revision > 0, target_revision > 0) {
+        (false, true) => DerivedTransition::Addition,
+        (true, false) => DerivedTransition::Removal,
+        (true, true)
+            if source_revision == target_revision
+                && source_digest == target_digest
+                && source_resolved_digest == target_resolved_digest =>
+        {
+            DerivedTransition::Unchanged
+        }
+        (true, true) => DerivedTransition::Replacement,
+        (false, false) => DerivedTransition::Unchanged,
+    }
+}
+
+fn validate_stored_transition(
+    action: NodeOperationAction,
+    stored: DerivedTransition,
+    target: &OperationTargetProgress,
+) -> Result<(), Status> {
+    let source_revision = target.source_revision as i64;
+    let target_revision = target.target_revision as i64;
+    let expected = match action {
+        NodeOperationAction::Restart => {
+            if source_revision <= 0
+                || source_revision != target_revision
+                || target.source_digest != target.target_digest
+                || target.source_resolved_release_digest != target.target_resolved_release_digest
+            {
+                return Err(Status::internal(
+                    "stored restart transition changes immutable desired identity",
+                ));
+            }
+            DerivedTransition::Restart
+        }
+        NodeOperationAction::Deployment | NodeOperationAction::Rollback => derive_transition(
+            source_revision,
+            &target.source_digest,
+            &target.source_resolved_release_digest,
+            target_revision,
+            &target.target_digest,
+            &target.target_resolved_release_digest,
+        ),
+        NodeOperationAction::Unspecified => {
+            return Err(Status::internal("stored operation has an invalid action"))
+        }
+    };
+    if stored != expected {
+        return Err(Status::internal(
+            "stored operation transition conflicts with immutable target snapshots",
+        ));
+    }
+    Ok(())
+}
+
+fn first_forward_step(transition: DerivedTransition) -> Option<NodeOperationStepKind> {
+    match transition {
+        DerivedTransition::Addition | DerivedTransition::Replacement => {
+            Some(NodeOperationStepKind::VerifyReleaseMetadata)
+        }
         // A read-only source proof pins the exact process/backend identities
         // before any destructive stop instruction may be emitted.
-        NodeOperationAction::Drain | NodeOperationAction::Restart => {
-            NodeOperationStepKind::VerifyTarget
+        DerivedTransition::Removal | DerivedTransition::Restart => {
+            Some(NodeOperationStepKind::VerifyTarget)
         }
-        NodeOperationAction::Scale if source_revision > 0 && target_revision == 0 => {
-            NodeOperationStepKind::VerifyTarget
-        }
-        NodeOperationAction::InitialApply
-        | NodeOperationAction::RollingUpgrade
-        | NodeOperationAction::Scale
-        | NodeOperationAction::Rollback => NodeOperationStepKind::VerifyReleaseMetadata,
-        NodeOperationAction::Unspecified => NodeOperationStepKind::Unspecified,
+        DerivedTransition::Unchanged => None,
     }
 }
 
 fn next_forward_step(
-    action: NodeOperationAction,
+    transition: DerivedTransition,
     step: NodeOperationStepKind,
-    source_revision: i64,
-    target_revision: i64,
 ) -> Option<NodeOperationStepKind> {
     use NodeOperationStepKind as Step;
-    match (action, step) {
-        (NodeOperationAction::Drain, Step::StopBackend) => Some(Step::SwitchAuthority),
-        (NodeOperationAction::Restart, Step::StopBackend) => Some(Step::StartBackend),
-        (NodeOperationAction::Scale, Step::StopBackend) if target_revision == 0 => {
-            Some(Step::SwitchAuthority)
+    match (transition, step) {
+        (DerivedTransition::Addition, Step::VerifyReleaseMetadata) => Some(Step::SelectRelease),
+        (DerivedTransition::Replacement, Step::VerifyReleaseMetadata) => Some(Step::VerifyTarget),
+        (DerivedTransition::Removal, Step::StopBackend) => Some(Step::SwitchAuthority),
+        (DerivedTransition::Restart, Step::StopBackend) => Some(Step::StartBackend),
+        (DerivedTransition::Replacement, Step::StopBackend) => Some(Step::SelectRelease),
+        (DerivedTransition::Addition | DerivedTransition::Replacement, Step::SelectRelease) => {
+            Some(Step::StartBackend)
         }
-        (_, Step::VerifyReleaseMetadata) if source_revision > 0 => Some(Step::VerifyTarget),
-        (_, Step::VerifyReleaseMetadata) => Some(Step::SelectRelease),
-        (_, Step::StopBackend) => Some(Step::SelectRelease),
-        (_, Step::SelectRelease) => Some(Step::StartBackend),
-        (_, Step::StartBackend) => Some(Step::VerifyTarget),
-        (_, Step::SwitchAuthority) if target_revision == 0 => None,
-        (_, Step::SwitchAuthority) => Some(Step::VerifyServing),
-        (_, Step::VerifyServing) => None,
+        (DerivedTransition::Addition | DerivedTransition::Replacement, Step::StartBackend)
+        | (DerivedTransition::Restart, Step::StartBackend) => Some(Step::VerifyTarget),
+        (DerivedTransition::Addition | DerivedTransition::Replacement, Step::SwitchAuthority) => {
+            Some(Step::VerifyServing)
+        }
+        (DerivedTransition::Removal, Step::SwitchAuthority)
+        | (DerivedTransition::Addition | DerivedTransition::Replacement, Step::VerifyServing)
+        | (DerivedTransition::Restart, Step::VerifyServing) => None,
         _ => None,
     }
 }
@@ -524,31 +823,157 @@ pub async fn submit(
     if action == NodeOperationAction::Unspecified {
         return Err(Status::invalid_argument("operation action is required"));
     }
-    let policy = request.policy.clone().unwrap_or(RolloutPolicy {
+    let policy = request.policy.unwrap_or(RolloutPolicy {
         max_unavailable: 1,
-        canary_slot: String::new(),
-        pause_after_canary: false,
         allow_downtime: false,
-        deadline_seconds: match action {
-            NodeOperationAction::Drain => 120,
-            NodeOperationAction::Restart => 300,
-            _ => 1800,
+        deadline_seconds: if action == NodeOperationAction::Restart {
+            300
+        } else {
+            1800
         },
     });
     let target_revision = i64::try_from(request.target_revision)
         .map_err(|_| Status::invalid_argument("target_revision is too large"))?;
     let deployment_action = matches!(
         action,
-        NodeOperationAction::InitialApply
-            | NodeOperationAction::RollingUpgrade
-            | NodeOperationAction::Scale
-            | NodeOperationAction::Rollback
+        NodeOperationAction::Deployment | NodeOperationAction::Rollback
     );
     let mut operation_id = (!deployment_action).then(Uuid::new_v4);
     let mut target_revision_digest: Option<String> = None;
+    let deadline_seconds = i64::try_from(policy.deadline_seconds)
+        .map_err(|_| Status::invalid_argument("deadline_seconds is too large"))?;
 
     let (source_digest, source_resolved_digest, source_slots) =
         deployment_inventory(&transaction, &request.node_id, source_revision).await?;
+
+    // An exact committed revision is a new idempotent operator request, but it
+    // has no rollout effects. Validate it against the committed snapshot before
+    // touching staged allocation state, node targets, authority, or cleanup.
+    if action == NodeOperationAction::Deployment && target_revision == source_revision {
+        let committed = transaction
+            .query_opt(
+                "SELECT bundle_digest, resolved_release_digest, revision_digest
+                 FROM wr_node_deployments
+                 WHERE node_id = $1 AND revision = $2 AND state = 'succeeded' FOR SHARE",
+                &[&request.node_id, &source_revision],
+            )
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                Status::failed_precondition("committed deployment snapshot is missing")
+            })?;
+        let committed_digest: String = committed.get("bundle_digest");
+        let committed_resolved_digest: String = committed.get("resolved_release_digest");
+        if request.bundle_digest != committed_digest
+            || request.resolved_release_digest != committed_resolved_digest
+            || source_digest != committed_digest
+            || source_resolved_digest != committed_resolved_digest
+        {
+            return Err(Status::failed_precondition(
+                "operation digest does not match the committed deployment",
+            ));
+        }
+        let mut committed_slots = source_slots.clone();
+        committed_slots.sort();
+        committed_slots.dedup();
+
+        let operation_id = Uuid::new_v4();
+        let revision_digest: String = committed.get("revision_digest");
+        transaction
+            .execute(
+                "INSERT INTO wr_node_operations
+                   (operation_id, node_id, request_token, actor, action, state, phase,
+                    request_payload, policy, source_revision, target_revision, bundle_digest,
+                    resolved_release_digest, target_revision_digest, forward_deadline,
+                    committed, committed_at)
+                 VALUES ($1, $2, $3, $4, $5, 'succeeded', 'complete', $6, $7, $8, $8,
+                         $9, $10, $11, NOW() + make_interval(secs => $12::double precision),
+                         TRUE, NOW())",
+                &[
+                    &operation_id,
+                    &request.node_id,
+                    &request.request_token,
+                    &actor,
+                    &action_name(action),
+                    &payload,
+                    &policy.encode_to_vec(),
+                    &source_revision,
+                    &committed_digest,
+                    &committed_resolved_digest,
+                    &revision_digest,
+                    &(deadline_seconds as f64),
+                ],
+            )
+            .await
+            .map_err(internal)?;
+        transaction
+            .execute(
+                "INSERT INTO wr_node_operation_targets
+                   (operation_id, node_id, target_kind, target_key, next_step, complete,
+                    source_revision, source_digest, source_resolved_digest,
+                    target_revision, target_digest, target_resolved_digest)
+                 VALUES ($1, $2, 'proxy', 'proxy', 'complete', TRUE,
+                         $3, $4, $5, $3, $4, $5)",
+                &[
+                    &operation_id,
+                    &request.node_id,
+                    &source_revision,
+                    &committed_digest,
+                    &committed_resolved_digest,
+                ],
+            )
+            .await
+            .map_err(internal)?;
+        for (rollout_order, slot) in committed_slots.into_iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO wr_node_operation_targets
+                       (operation_id, node_id, target_kind, target_key, next_step, complete,
+                        source_revision, source_digest, source_resolved_digest,
+                        target_revision, target_digest, target_resolved_digest)
+                     VALUES ($1, $2, 'engine_slot', $3, 'complete', TRUE,
+                             $4, $5, $6, $4, $5, $6)",
+                    &[
+                        &operation_id,
+                        &request.node_id,
+                        &slot,
+                        &source_revision,
+                        &committed_digest,
+                        &committed_resolved_digest,
+                    ],
+                )
+                .await
+                .map_err(internal)?;
+            transaction
+                .execute(
+                    "INSERT INTO wr_node_operation_engine_target_details
+                       (operation_id, target_key, rollout_order, authoritative_revision,
+                        serving_converged, transition_kind)
+                     VALUES ($1, $2, $3, $4, TRUE, 'unchanged')",
+                    &[
+                        &operation_id,
+                        &slot,
+                        &(rollout_order as i32),
+                        &source_revision,
+                    ],
+                )
+                .await
+                .map_err(internal)?;
+        }
+        append_event(
+            &transaction,
+            operation_id,
+            actor,
+            "OPERATION_NO_EFFECT",
+            &format!("exact committed revision {source_revision} is already converged"),
+            0,
+        )
+        .await?;
+        let operation = load_operation(&transaction, operation_id).await?;
+        transaction.commit().await.map_err(internal)?;
+        return Ok(operation);
+    }
+
     let (target_digest, target_resolved_digest, target_slots) = if deployment_action {
         let (digest, resolved_digest, slots) =
             deployment_inventory(&transaction, &request.node_id, target_revision).await?;
@@ -612,78 +1037,123 @@ pub async fn submit(
         (
             source_digest.clone(),
             source_resolved_digest.clone(),
-            request.engine_slots.clone(),
+            vec![request.engine_slot.clone()],
         )
     };
-    let operation_id = operation_id.expect("deployment actions derive an operation ID");
+    let operation_id = operation_id.expect("all supported actions derive an operation ID");
 
-    if action == NodeOperationAction::InitialApply && source_revision != 0 {
-        return Err(Status::failed_precondition(
-            "initial apply requires a node with no committed revision",
-        ));
-    }
-    if matches!(
-        action,
-        NodeOperationAction::RollingUpgrade | NodeOperationAction::Scale
-    ) && source_revision == 0
+    if action == NodeOperationAction::Restart
+        && (source_slots.is_empty() || !source_slots.contains(&request.engine_slot))
     {
         return Err(Status::failed_precondition(
-            "upgrade and scale require a committed source revision",
+            "restart requires a slot from the committed deployment",
         ));
     }
-    if action == NodeOperationAction::RollingUpgrade && source_slots != target_slots {
-        return Err(Status::failed_precondition(
-            "rolling upgrade cannot change the immutable slot inventory",
-        ));
-    }
-    let mut requested = request.engine_slots.clone();
-    requested.sort();
-    requested.dedup();
-    let mut expected_target = target_slots.clone();
-    expected_target.sort();
-    expected_target.dedup();
-    if deployment_action && requested != expected_target {
-        return Err(Status::failed_precondition(
-            "operation slots do not match the staged deployment inventory",
-        ));
-    }
-    if matches!(
-        action,
-        NodeOperationAction::Drain | NodeOperationAction::Restart
-    ) && (source_slots.is_empty() || requested.iter().any(|slot| !source_slots.contains(slot)))
-    {
-        return Err(Status::failed_precondition(
-            "drain and restart require slots from the committed deployment",
-        ));
-    }
-    let withdraws_last_source = source_slots.len() == 1
-        && match action {
-            NodeOperationAction::Drain | NodeOperationAction::Restart => true,
-            NodeOperationAction::RollingUpgrade | NodeOperationAction::Rollback => {
-                target_slots.len() <= 1
-            }
-            NodeOperationAction::Scale => target_slots.is_empty(),
-            NodeOperationAction::InitialApply | NodeOperationAction::Unspecified => false,
-        };
+    let withdraws_last_source = if deployment_action {
+        !source_slots.is_empty() && target_slots.is_empty()
+    } else {
+        source_slots.len() == 1
+    };
     if withdraws_last_source && !policy.allow_downtime {
         return Err(Status::failed_precondition(
             "withdrawing the last healthy source slot requires allow_downtime",
         ));
     }
-    let slots = ordered_operation_slots(
-        action,
-        &source_slots,
-        &target_slots,
-        if deployment_action {
-            None
-        } else {
-            Some(requested)
-        },
-        &policy.canary_slot,
-    );
-    if slots.is_empty() && action != NodeOperationAction::Scale {
+    let mut slots = if deployment_action {
+        source_slots
+            .iter()
+            .chain(target_slots.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        vec![request.engine_slot.clone()]
+    };
+    slots.sort();
+    slots.dedup();
+    if slots.is_empty() && !deployment_action {
         return Err(Status::invalid_argument("operation has no affected slots"));
     }
+    let affected_slots = if action == NodeOperationAction::Restart {
+        slots.len()
+    } else {
+        slots
+            .iter()
+            .filter(|slot| {
+                derive_transition(
+                    if source_slots.contains(slot) {
+                        source_revision
+                    } else {
+                        0
+                    },
+                    if source_slots.contains(slot) {
+                        source_digest.as_str()
+                    } else {
+                        ""
+                    },
+                    if source_slots.contains(slot) {
+                        source_resolved_digest.as_str()
+                    } else {
+                        ""
+                    },
+                    if target_slots.contains(slot) {
+                        target_revision
+                    } else {
+                        0
+                    },
+                    if target_slots.contains(slot) {
+                        target_digest.as_str()
+                    } else {
+                        ""
+                    },
+                    if target_slots.contains(slot) {
+                        target_resolved_digest.as_str()
+                    } else {
+                        ""
+                    },
+                ) != DerivedTransition::Unchanged
+            })
+            .count()
+    };
+    if affected_slots > 0 && policy.max_unavailable as usize > affected_slots {
+        return Err(Status::invalid_argument(
+            "max_unavailable exceeds the number of affected slots",
+        ));
+    }
+    // New capacity lands first, retained transitions proceed next, and
+    // removals happen last. Ordering is derived from immutable inventories,
+    // never from the caller's temporary legacy deployment selector.
+    slots.sort_by_key(|slot| {
+        let source = source_slots.contains(slot);
+        let target = target_slots.contains(slot);
+        let transition = if action == NodeOperationAction::Restart {
+            DerivedTransition::Restart
+        } else {
+            derive_transition(
+                if source { source_revision } else { 0 },
+                if source { source_digest.as_str() } else { "" },
+                if source {
+                    source_resolved_digest.as_str()
+                } else {
+                    ""
+                },
+                if target { target_revision } else { 0 },
+                if target { target_digest.as_str() } else { "" },
+                if target {
+                    target_resolved_digest.as_str()
+                } else {
+                    ""
+                },
+            )
+        };
+        let group = match transition {
+            DerivedTransition::Addition => 0,
+            DerivedTransition::Replacement
+            | DerivedTransition::Unchanged
+            | DerivedTransition::Restart => 1,
+            DerivedTransition::Removal => 2,
+        };
+        (group, slot.clone())
+    });
     if deployment_action {
         transaction
             .execute(
@@ -693,19 +1163,14 @@ pub async fn submit(
             .await
             .map_err(internal)?;
     }
-    let deadline_seconds = i64::try_from(policy.deadline_seconds)
-        .map_err(|_| Status::invalid_argument("deadline_seconds is too large"))?;
     transaction
         .execute(
             "INSERT INTO wr_node_operations
                (operation_id, node_id, request_token, actor, action, state, request_payload,
                 policy, source_revision, target_revision, bundle_digest, resolved_release_digest,
-                target_revision_digest, forward_deadline, proxy_next_step,
-                proxy_source_revision, proxy_source_digest, proxy_source_resolved_digest,
-                proxy_target_revision, proxy_target_digest, proxy_target_resolved_digest)
+                target_revision_digest, forward_deadline)
              VALUES ($1, $2, $3, $4, $5, 'queued', $6, $7, $8, $9, $10, $11, $12,
-                     NOW() + make_interval(secs => $13::double precision), $14, $8, $15, $16,
-                     $9, $10, $11)",
+                     NOW() + make_interval(secs => $13::double precision))",
             &[
                 &operation_id,
                 &request.node_id,
@@ -720,19 +1185,6 @@ pub async fn submit(
                 &request.resolved_release_digest,
                 &target_revision_digest,
                 &(deadline_seconds as f64),
-                &if deployment_action {
-                    if source_revision > 0 {
-                        // Explicit source proof must produce a result. Reserve
-                        // inspect_backend for observation-only ambiguity recovery.
-                        "verify_target"
-                    } else {
-                        "select_release"
-                    }
-                } else {
-                    "complete"
-                },
-                &source_digest,
-                &source_resolved_digest,
             ],
         )
         .await
@@ -743,6 +1195,38 @@ pub async fn submit(
                 internal(error)
             }
         })?;
+    let proxy_first = if deployment_action {
+        if source_revision > 0 {
+            // Explicit source proof must produce a result. Reserve inspection
+            // for observation-only ambiguity recovery.
+            "verify_target"
+        } else {
+            "select_release"
+        }
+    } else {
+        "complete"
+    };
+    transaction
+        .execute(
+            "INSERT INTO wr_node_operation_targets
+               (operation_id, node_id, target_kind, target_key, next_step, complete,
+                source_revision, source_digest, source_resolved_digest,
+                target_revision, target_digest, target_resolved_digest)
+             VALUES ($1, $2, 'proxy', 'proxy', $3, $3 = 'complete', $4, $5, $6, $7, $8, $9)",
+            &[
+                &operation_id,
+                &request.node_id,
+                &proxy_first,
+                &source_revision,
+                &source_digest,
+                &source_resolved_digest,
+                &target_revision,
+                &request.bundle_digest,
+                &request.resolved_release_digest,
+            ],
+        )
+        .await
+        .map_err(internal)?;
     if deployment_action {
         transaction
             .execute(
@@ -765,26 +1249,52 @@ pub async fn submit(
             } else {
                 0
             }
-        } else if action == NodeOperationAction::Drain {
-            0
         } else {
             source_revision
         };
-        let first = first_forward_step(action, source, target);
+        let transition = if action == NodeOperationAction::Restart {
+            DerivedTransition::Restart
+        } else {
+            derive_transition(
+                source,
+                if source > 0 {
+                    source_digest.as_str()
+                } else {
+                    ""
+                },
+                if source > 0 {
+                    source_resolved_digest.as_str()
+                } else {
+                    ""
+                },
+                target,
+                if target > 0 {
+                    target_digest.as_str()
+                } else {
+                    ""
+                },
+                if target > 0 {
+                    target_resolved_digest.as_str()
+                } else {
+                    ""
+                },
+            )
+        };
+        let first = first_forward_step(transition);
+        let complete = first.is_none();
         transaction
             .execute(
-                "INSERT INTO wr_node_operation_slots
-                   (operation_id, node_id, engine_slot, rollout_order,
-                    authoritative_revision, next_step, source_revision, source_digest,
-                    source_resolved_digest, target_revision, target_digest, target_resolved_digest)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                "INSERT INTO wr_node_operation_targets
+                   (operation_id, node_id, target_kind, target_key, next_step, complete,
+                    source_revision, source_digest, source_resolved_digest,
+                    target_revision, target_digest, target_resolved_digest)
+                 VALUES ($1, $2, 'engine_slot', $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                 &[
                     &operation_id,
                     &request.node_id,
                     &slot,
-                    &(rollout_order as i32),
-                    &source,
-                    &step_name(first),
+                    &first.map(step_name).unwrap_or("complete"),
+                    &complete,
                     &source,
                     &if source > 0 {
                         source_digest.as_str()
@@ -811,13 +1321,85 @@ pub async fn submit(
             )
             .await
             .map_err(internal)?;
+        transaction
+            .execute(
+                "INSERT INTO wr_node_operation_engine_target_details
+                   (operation_id, target_key, rollout_order, authoritative_revision,
+                    serving_converged, transition_kind)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &operation_id,
+                    &slot,
+                    &(rollout_order as i32),
+                    &source,
+                    &complete,
+                    &transition.name(),
+                ],
+            )
+            .await
+            .map_err(internal)?;
     }
+    let transition_detail = if deployment_action {
+        let mut additions = 0;
+        let mut replacements = 0;
+        let mut unchanged = 0;
+        let mut removals = 0;
+        for slot in source_slots
+            .iter()
+            .chain(target_slots.iter())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            match derive_transition(
+                if source_slots.contains(slot) {
+                    source_revision
+                } else {
+                    0
+                },
+                if source_slots.contains(slot) {
+                    source_digest.as_str()
+                } else {
+                    ""
+                },
+                if source_slots.contains(slot) {
+                    source_resolved_digest.as_str()
+                } else {
+                    ""
+                },
+                if target_slots.contains(slot) {
+                    target_revision
+                } else {
+                    0
+                },
+                if target_slots.contains(slot) {
+                    target_digest.as_str()
+                } else {
+                    ""
+                },
+                if target_slots.contains(slot) {
+                    target_resolved_digest.as_str()
+                } else {
+                    ""
+                },
+            ) {
+                DerivedTransition::Addition => additions += 1,
+                DerivedTransition::Replacement => replacements += 1,
+                DerivedTransition::Unchanged => unchanged += 1,
+                DerivedTransition::Removal => removals += 1,
+                DerivedTransition::Restart => unreachable!("restart is not inventory-derived"),
+            }
+        }
+        format!(
+            "desired transitions: additions={additions}, replacements={replacements}, unchanged={unchanged}, removals={removals}"
+        )
+    } else {
+        format!("restart transition: slot={}", request.engine_slot)
+    };
     append_event(
         &transaction,
         operation_id,
         actor,
         "OPERATION_SUBMITTED",
-        action_name(action),
+        &transition_detail,
         0,
     )
     .await?;
@@ -909,10 +1491,6 @@ async fn enter_restoration<C: GenericClient + Sync>(
             "UPDATE wr_node_operations
              SET state = 'queued', phase = 'restoring_source', forward_fenced = TRUE,
                  restoration_requested = TRUE, restoration_terminal_state = $2,
-                 proxy_next_step = CASE WHEN proxy_changed OR proxy_effect_ambiguous
-                                        THEN 'restore_source' ELSE 'complete' END,
-                 proxy_effect_delivered_at = NULL, proxy_effect_reported = FALSE,
-                 proxy_effect_condition_code = '', proxy_effect_detail = '',
                  failure_code = $3, failure_detail = $4, lease_expires_at = NULL,
                  claimed_by = NULL, agent_instance_id = NULL, updated_at = NOW()
              WHERE operation_id = $1 AND NOT committed
@@ -929,7 +1507,7 @@ async fn enter_restoration<C: GenericClient + Sync>(
     };
     client
         .execute(
-            "UPDATE wr_node_operation_slots
+            "UPDATE wr_node_operation_targets
              SET complete = NOT (changed OR effect_ambiguous),
                  next_step = CASE
                      WHEN changed OR effect_ambiguous THEN 'restore_source'
@@ -1017,8 +1595,9 @@ async fn set_slot_condition<C: GenericClient + Sync>(
 ) -> Result<(), Status> {
     client
         .execute(
-            "UPDATE wr_node_operation_slots SET condition_code = $3, condition_detail = $4,
-                    updated_at = NOW() WHERE operation_id = $1 AND engine_slot = $2",
+            "UPDATE wr_node_operation_targets SET condition_code = $3, condition_detail = $4,
+                    updated_at = NOW() WHERE operation_id = $1
+                      AND target_kind = 'engine_slot' AND target_key = $2",
             &[&id, &slot, &code, &detail],
         )
         .await
@@ -1274,7 +1853,7 @@ fn stop_preserves_availability(
             );
         }
     }
-    for candidate in &operation.slots {
+    for candidate in operation_slots(operation)? {
         if candidate.authoritative_revision == 0 {
             authoritative.remove(&candidate.engine_slot);
         } else {
@@ -1395,21 +1974,29 @@ async fn advance_slot<C: GenericClient + Sync>(
     let complete = next.is_none();
     client
         .execute(
-            "UPDATE wr_node_operation_slots
+            "UPDATE wr_node_operation_targets
              SET completed_steps = completed_steps + 1, next_step = $3, complete = $4,
-                 authoritative_revision = $5, effect_ambiguous = FALSE,
-                 effect_delivered_at = NULL, effect_reported = FALSE,
+                 effect_ambiguous = FALSE, effect_delivered_at = NULL, effect_reported = FALSE,
                  effect_observed_revision = 0, effect_observed_digest = '',
-                 effect_backend_instance_id = '', effect_process_instance_id = '',
-                 condition_code = '', condition_detail = '', updated_at = NOW()
-             WHERE operation_id = $1 AND engine_slot = $2",
+                 effect_observed_resolved_digest = '', effect_backend_instance_id = '',
+                 effect_process_instance_id = '', condition_code = '', condition_detail = '',
+                 updated_at = NOW()
+             WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2",
             &[
                 &id,
                 &slot,
                 &next.map(step_name).unwrap_or("complete"),
                 &complete,
-                &authoritative_revision,
             ],
+        )
+        .await
+        .map_err(internal)?;
+    client
+        .execute(
+            "UPDATE wr_node_operation_engine_target_details
+             SET authoritative_revision = $3
+             WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2",
+            &[&id, &slot, &authoritative_revision],
         )
         .await
         .map_err(internal)?;
@@ -1423,8 +2010,7 @@ async fn reconcile_slot<C: GenericClient + Sync>(
     operation: &NodeOperation,
     slot: &OperationSlotProgress,
 ) -> Result<bool, Status> {
-    let action =
-        NodeOperationAction::try_from(operation.action).unwrap_or(NodeOperationAction::Unspecified);
+    let transition = slot.transition;
     let phase =
         NodeOperationPhase::try_from(operation.phase).unwrap_or(NodeOperationPhase::Unspecified);
     let step = NodeOperationStepKind::try_from(slot.next_step)
@@ -1520,10 +2106,10 @@ async fn reconcile_slot<C: GenericClient + Sync>(
         } else if slot.effect_ambiguous && conclusive {
             client
                 .execute(
-                    "UPDATE wr_node_operation_slots
+                    "UPDATE wr_node_operation_targets
                      SET changed = TRUE, effect_ambiguous = FALSE,
                          effect_delivered_at = NULL, condition_code = '', condition_detail = ''
-                     WHERE operation_id = $1 AND engine_slot = $2",
+                     WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2",
                     &[&id, &slot.engine_slot],
                 )
                 .await
@@ -1567,12 +2153,7 @@ async fn reconcile_slot<C: GenericClient + Sync>(
         .await?;
         return Ok(false);
     }
-    let next = next_forward_step(
-        action,
-        step,
-        slot.source_revision as i64,
-        slot.target_revision as i64,
-    );
+    let next = next_forward_step(transition, step);
     match step {
         NodeOperationStepKind::VerifyReleaseMetadata | NodeOperationStepKind::VerifyProxy => {
             if !slot.effect_reported {
@@ -1606,9 +2187,9 @@ async fn reconcile_slot<C: GenericClient + Sync>(
             {
                 client
                     .execute(
-                        "UPDATE wr_node_operation_slots
+                        "UPDATE wr_node_operation_targets
                          SET effect_delivered_at = NULL, effect_ambiguous = FALSE
-                         WHERE operation_id = $1 AND engine_slot = $2",
+                         WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2",
                         &[&id, &slot.engine_slot],
                     )
                     .await
@@ -1644,8 +2225,8 @@ async fn reconcile_slot<C: GenericClient + Sync>(
             }
             client
                 .execute(
-                    "UPDATE wr_node_operation_slots SET changed = TRUE
-                     WHERE operation_id = $1 AND engine_slot = $2",
+                    "UPDATE wr_node_operation_targets SET changed = TRUE
+                     WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2",
                     &[&id, &slot.engine_slot],
                 )
                 .await
@@ -1668,9 +2249,9 @@ async fn reconcile_slot<C: GenericClient + Sync>(
             }) {
                 client
                     .execute(
-                        "UPDATE wr_node_operation_slots
+                        "UPDATE wr_node_operation_targets
                          SET effect_delivered_at = NULL, effect_ambiguous = FALSE
-                         WHERE operation_id = $1 AND engine_slot = $2",
+                         WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2",
                         &[&id, &slot.engine_slot],
                     )
                     .await
@@ -1688,8 +2269,8 @@ async fn reconcile_slot<C: GenericClient + Sync>(
             if slot.target_revision != slot.source_revision {
                 client
                     .execute(
-                        "UPDATE wr_node_operation_slots SET changed = TRUE
-                         WHERE operation_id = $1 AND engine_slot = $2",
+                        "UPDATE wr_node_operation_targets SET changed = TRUE
+                         WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2",
                         &[&id, &slot.engine_slot],
                     )
                     .await
@@ -1730,9 +2311,9 @@ async fn reconcile_slot<C: GenericClient + Sync>(
                 }) {
                     client
                         .execute(
-                            "UPDATE wr_node_operation_slots
+                            "UPDATE wr_node_operation_targets
                              SET effect_delivered_at = NULL, effect_ambiguous = FALSE
-                             WHERE operation_id = $1 AND engine_slot = $2",
+                             WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2",
                             &[&id, &slot.engine_slot],
                         )
                         .await
@@ -1832,9 +2413,9 @@ async fn reconcile_slot<C: GenericClient + Sync>(
                 }
                 client
                     .execute(
-                        "UPDATE wr_node_operation_slots
+                        "UPDATE wr_node_operation_targets
                          SET pinned_backend_instance_id = $3, pinned_process_instance_id = $4
-                         WHERE operation_id = $1 AND engine_slot = $2",
+                         WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2",
                         &[
                             &id,
                             &slot.engine_slot,
@@ -1873,9 +2454,9 @@ async fn reconcile_slot<C: GenericClient + Sync>(
             }
             client
                 .execute(
-                    "UPDATE wr_node_operation_slots
+                    "UPDATE wr_node_operation_targets
                      SET pinned_backend_instance_id = $3, pinned_process_instance_id = $4
-                     WHERE operation_id = $1 AND engine_slot = $2",
+                     WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2",
                     &[
                         &id,
                         &slot.engine_slot,
@@ -1909,9 +2490,13 @@ async fn reconcile_slot<C: GenericClient + Sync>(
             .await?;
             client
                 .execute(
-                    "UPDATE wr_node_operation_slots
-                     SET authority_switched = TRUE, changed = TRUE
-                     WHERE operation_id = $1 AND engine_slot = $2",
+                    "WITH detail AS (
+                         UPDATE wr_node_operation_engine_target_details
+                         SET authority_switched = TRUE
+                         WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2
+                     )
+                     UPDATE wr_node_operation_targets SET changed = TRUE
+                     WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2",
                     &[&id, &slot.engine_slot],
                 )
                 .await
@@ -1945,8 +2530,8 @@ async fn reconcile_slot<C: GenericClient + Sync>(
             }
             client
                 .execute(
-                    "UPDATE wr_node_operation_slots SET serving_converged = TRUE
-                     WHERE operation_id = $1 AND engine_slot = $2",
+                    "UPDATE wr_node_operation_engine_target_details SET serving_converged = TRUE
+                     WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2",
                     &[&id, &slot.engine_slot],
                 )
                 .await
@@ -1989,57 +2574,17 @@ async fn reconcile<C: GenericClient + Sync>(
     }
     let phase =
         NodeOperationPhase::try_from(operation.phase).unwrap_or(NodeOperationPhase::Unspecified);
-    if NodeOperationStepKind::try_from(operation.proxy_next_step)
-        .unwrap_or(NodeOperationStepKind::Unspecified)
-        != NodeOperationStepKind::Unspecified
-    {
+    if !proxy_target(operation)?.complete {
         return Ok(());
     }
-    if let Some(slot) = operation
-        .slots
+    let slots = operation_slots(operation)?;
+    if let Some(slot) = slots
         .iter()
         .filter(|slot| !slot.complete)
         .min_by_key(|slot| slot.rollout_order)
     {
         if !reconcile_slot(client, id, &snapshot, operation, slot).await? {
             return Ok(());
-        }
-        let updated = load_operation(client, id).await?;
-        let updated_slot = updated
-            .slots
-            .iter()
-            .find(|candidate| candidate.engine_slot == slot.engine_slot)
-            .expect("operation slot remains durable");
-        if phase == NodeOperationPhase::Forward
-            && slot.rollout_order == 0
-            && updated_slot.complete
-            && updated.slots.iter().any(|candidate| !candidate.complete)
-            && operation
-                .policy
-                .as_ref()
-                .is_some_and(|policy| policy.pause_after_canary)
-        {
-            client
-                .execute(
-                    "UPDATE wr_node_operations SET state = 'paused',
-                            failure_code = 'CANARY_PAUSED',
-                            failure_detail = 'explicit resume is required after canary',
-                            lease_expires_at = NULL, claimed_by = NULL,
-                            agent_instance_id = NULL, updated_at = NOW()
-                     WHERE operation_id = $1",
-                    &[&id],
-                )
-                .await
-                .map_err(internal)?;
-            append_event(
-                client,
-                id,
-                actor,
-                "CANARY_PAUSED",
-                "explicit resume is required after canary",
-                operation.lease_epoch as i64,
-            )
-            .await?;
         }
         return Ok(());
     }
@@ -2072,13 +2617,7 @@ async fn reconcile<C: GenericClient + Sync>(
     }
     let action =
         NodeOperationAction::try_from(operation.action).unwrap_or(NodeOperationAction::Unspecified);
-    let commits = matches!(
-        action,
-        NodeOperationAction::InitialApply
-            | NodeOperationAction::RollingUpgrade
-            | NodeOperationAction::Scale
-            | NodeOperationAction::Rollback
-    );
+    let commits = action != NodeOperationAction::Restart && operation.target_revision > 0;
     if commits {
         let target = operation.target_revision as i64;
         client
@@ -2327,10 +2866,8 @@ pub async fn claim(
                AND a.authenticated_principal = $3
                AND a.protocol_version = p.protocol_version
                AND a.binary_digest = p.binary_digest
-               AND a.config_digest = p.config_digest
                AND a.backend = p.backend
-               AND a.retention_count = p.retention_count
-               AND a.capabilities = p.capabilities
+               AND p.capabilities <@ a.capabilities
                AND a.observed_at >= NOW() - INTERVAL '30 seconds'",
             &[&node_id, &agent_instance_id, &agent],
         )
@@ -2432,10 +2969,10 @@ pub async fn claim(
     }
     let phase =
         NodeOperationPhase::try_from(operation.phase).unwrap_or(NodeOperationPhase::Unspecified);
-    let proxy_step = NodeOperationStepKind::try_from(operation.proxy_next_step)
+    let proxy = proxy_target(&operation)?;
+    let proxy_step = NodeOperationStepKind::try_from(proxy.next_step)
         .unwrap_or(NodeOperationStepKind::Unspecified);
-    let proxy_pending =
-        proxy_step != NodeOperationStepKind::Unspecified && step_name(proxy_step) != "complete";
+    let proxy_pending = !proxy.complete;
     let (
         slot_name,
         step,
@@ -2459,27 +2996,30 @@ pub async fn claim(
             String::new(),
             proxy_step,
             if uses_source {
-                operation.proxy_source_revision
+                proxy.source_revision
             } else {
-                operation.proxy_target_revision
+                proxy.target_revision
             },
             if uses_source {
-                operation.proxy_source_digest.clone()
+                proxy.source_digest.clone()
             } else {
-                operation.proxy_target_digest.clone()
+                proxy.target_digest.clone()
             },
             if uses_source {
-                operation.proxy_source_resolved_release_digest.clone()
+                proxy.source_resolved_release_digest.clone()
             } else {
-                operation.proxy_target_resolved_release_digest.clone()
+                proxy.target_resolved_release_digest.clone()
             },
-            operation.proxy_backend_instance_id.clone(),
-            operation.proxy_process_instance_id.clone(),
-            operation.proxy_effect_delivered_at.is_some(),
-            operation.proxy_effect_ambiguous,
+            proxy.pinned_backend_instance_id.clone(),
+            proxy.pinned_process_instance_id.clone(),
+            proxy.effect_delivered_at.is_some(),
+            proxy.effect_ambiguous,
             InstructionTargetKind::Proxy,
         )
-    } else if let Some(slot) = operation.slots.iter().find(|slot| !slot.complete) {
+    } else if let Some(slot) = operation_slots(&operation)?
+        .iter()
+        .find(|slot| !slot.complete)
+    {
         let step = NodeOperationStepKind::try_from(slot.next_step)
             .unwrap_or(NodeOperationStepKind::Unspecified);
         if matches!(
@@ -2550,13 +3090,19 @@ pub async fn claim(
     } else {
         step
     };
+    if !target_step_compatible(target_kind, instruction_step) {
+        return Err(Status::internal(
+            "stored target kind and step are incompatible",
+        ));
+    }
     if mutating_effect && !inspection {
         if target_kind == InstructionTargetKind::Proxy {
             transaction
                 .execute(
-                    "UPDATE wr_node_operations
-                     SET proxy_effect_delivered_at = NOW(), proxy_effect_ambiguous = TRUE,
-                         updated_at = NOW() WHERE operation_id = $1",
+                    "UPDATE wr_node_operation_targets
+                     SET effect_delivered_at = NOW(), effect_ambiguous = TRUE,
+                         updated_at = NOW()
+                     WHERE operation_id = $1 AND target_kind = 'proxy'",
                     &[&id],
                 )
                 .await
@@ -2564,9 +3110,9 @@ pub async fn claim(
         } else {
             transaction
                 .execute(
-                    "UPDATE wr_node_operation_slots
+                    "UPDATE wr_node_operation_targets
                      SET effect_delivered_at = NOW(), effect_ambiguous = TRUE, updated_at = NOW()
-                     WHERE operation_id = $1 AND engine_slot = $2",
+                     WHERE operation_id = $1 AND target_kind = 'engine_slot' AND target_key = $2",
                     &[&id, &slot_name],
                 )
                 .await
@@ -2595,10 +3141,20 @@ pub async fn claim(
             agent_instance_id: agent_instance_id.to_string(),
             target: Some(InstructionTarget {
                 kind: target_kind as i32,
-                engine_slot: slot_name,
                 revision,
                 bundle_digest: digest,
                 resolved_release_digest: resolved_digest,
+                identity: Some(match target_kind {
+                    InstructionTargetKind::Proxy => {
+                        instruction_target::Identity::Proxy(ProxyTargetIdentity {})
+                    }
+                    InstructionTargetKind::EngineSlot => {
+                        instruction_target::Identity::EngineSlotTarget(EngineSlotTargetIdentity {
+                            engine_slot: slot_name,
+                        })
+                    }
+                    _ => return Err(Status::internal("invalid workload target kind")),
+                }),
             }),
             pinned_backend_instance_id: pinned_backend,
             pinned_process_instance_id: pinned_process,
@@ -2680,9 +3236,10 @@ where
                     observed_resolved_digest, backend_query_error, operation_id,
                     agent_instance_id, lease_epoch,
                     (SELECT effect_termination_evidence
-                       FROM wr_node_operation_slots effects
+                       FROM wr_node_operation_targets effects
                       WHERE effects.operation_id = wr_node_slot_observations.operation_id
-                        AND effects.engine_slot = wr_node_slot_observations.engine_slot)
+                        AND effects.target_kind = 'engine_slot'
+                        AND effects.target_key = wr_node_slot_observations.engine_slot)
                         AS termination_evidence
              FROM wr_node_slot_observations
              WHERE ($1 = '' OR node_id = $1) AND ($2 = '' OR engine_slot = $2)
@@ -2890,6 +3447,18 @@ pub async fn report_step(
         .map_err(|_| Status::invalid_argument("lease epoch is too large"))?;
     let reported_step =
         NodeOperationStepKind::try_from(request.step).unwrap_or(NodeOperationStepKind::Unspecified);
+    let report_target = request
+        .target
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("result target is required"))?;
+    let (target_kind, target_key) = instruction_target_key(report_target)?;
+    let target_kind_value = InstructionTargetKind::try_from(report_target.kind)
+        .unwrap_or(InstructionTargetKind::Unspecified);
+    if !target_step_compatible(target_kind_value, reported_step) {
+        return Err(Status::invalid_argument(
+            "target kind does not support the reported step",
+        ));
+    }
     let result_payload = request.encode_to_vec();
     let termination_evidence = request
         .termination_evidence
@@ -2908,14 +3477,16 @@ pub async fn report_step(
             "SELECT authenticated_principal, result_payload
              FROM wr_node_operation_result_receipts
              WHERE operation_id = $1 AND node_id = $2 AND agent_instance_id = $3
-               AND lease_epoch = $4 AND step = $5 AND engine_slot = $6 FOR UPDATE",
+               AND lease_epoch = $4 AND step = $5
+               AND target_kind = $6 AND target_key = $7 FOR UPDATE",
             &[
                 &id,
                 &request.node_id,
                 &request.agent_instance_id,
                 &epoch,
                 &request.step,
-                &request.engine_slot,
+                &target_kind,
+                &target_key,
             ],
         )
         .await
@@ -2934,13 +3505,13 @@ pub async fn report_step(
     }
     let operation = transaction
         .query_opt(
-            "SELECT phase, proxy_process_instance_id, proxy_next_step,
-                    proxy_source_revision, proxy_source_digest, proxy_source_resolved_digest,
-                    proxy_target_revision, proxy_target_digest, proxy_target_resolved_digest
-             FROM wr_node_operations
-             WHERE operation_id = $1 AND node_id = $2 AND state = 'running'
-               AND lease_epoch = $3 AND claimed_by = $4 AND agent_instance_id = $5
-               AND lease_expires_at > NOW() FOR UPDATE",
+            "SELECT o.phase, p.pinned_process_instance_id AS proxy_process_instance_id
+             FROM wr_node_operations o
+             JOIN wr_node_operation_targets p
+               ON p.operation_id = o.operation_id AND p.target_kind = 'proxy'
+             WHERE o.operation_id = $1 AND o.node_id = $2 AND o.state = 'running'
+               AND o.lease_epoch = $3 AND o.claimed_by = $4 AND o.agent_instance_id = $5
+               AND o.lease_expires_at > NOW() FOR UPDATE OF o, p",
             &[
                 &id,
                 &request.node_id,
@@ -2970,8 +3541,19 @@ pub async fn report_step(
             "forward operation deadline expired",
         ));
     }
-    if request.engine_slot.is_empty() {
-        let expected = parse_step(operation.get::<_, String>("proxy_next_step").as_str())?;
+    if target_kind == "proxy" {
+        let proxy = transaction
+            .query_one(
+                "SELECT next_step, source_revision, source_digest, source_resolved_digest,
+                        target_revision, target_digest, target_resolved_digest
+                 FROM wr_node_operation_targets
+                 WHERE operation_id = $1 AND target_kind = 'proxy' AND target_key = 'proxy'
+                   AND NOT complete FOR UPDATE",
+                &[&id],
+            )
+            .await
+            .map_err(internal)?;
+        let expected = parse_step(proxy.get::<_, String>("next_step").as_str())?;
         if expected == NodeOperationStepKind::Unspecified || expected != reported_step {
             return Err(Status::aborted(format!(
                 "stale proxy result: expected {}, received {}",
@@ -2979,8 +3561,8 @@ pub async fn report_step(
                 step_name(reported_step)
             )));
         }
-        let source_revision: i64 = operation.get("proxy_source_revision");
-        let target_revision: i64 = operation.get("proxy_target_revision");
+        let source_revision: i64 = proxy.get("source_revision");
+        let target_revision: i64 = proxy.get("target_revision");
         let proving_source = reported_step == NodeOperationStepKind::VerifyTarget;
         let uses_source = matches!(
             reported_step,
@@ -2992,14 +3574,14 @@ pub async fn report_step(
             if uses_source {
                 (
                     source_revision,
-                    operation.get("proxy_source_digest"),
-                    operation.get("proxy_source_resolved_digest"),
+                    proxy.get("source_digest"),
+                    proxy.get("source_resolved_digest"),
                 )
             } else {
                 (
                     target_revision,
-                    operation.get("proxy_target_digest"),
-                    operation.get("proxy_target_resolved_digest"),
+                    proxy.get("target_digest"),
+                    proxy.get("target_resolved_digest"),
                 )
             };
         let mut condition_code = request.condition_code.clone();
@@ -3027,9 +3609,13 @@ pub async fn report_step(
         if !condition_code.is_empty() {
             transaction
                 .execute(
-                    "UPDATE wr_node_operations SET state = 'paused', failure_code = $2,
-                            failure_detail = $3, proxy_effect_condition_code = $2,
-                            proxy_effect_detail = $3, lease_expires_at = NULL,
+                    "WITH target AS (
+                         UPDATE wr_node_operation_targets
+                         SET effect_condition_code = $2, effect_detail = $3, updated_at = NOW()
+                         WHERE operation_id = $1 AND target_kind = 'proxy'
+                     )
+                     UPDATE wr_node_operations SET state = 'paused', failure_code = $2,
+                            failure_detail = $3, lease_expires_at = NULL,
                             claimed_by = NULL, agent_instance_id = NULL, updated_at = NOW()
                      WHERE operation_id = $1",
                     &[&id, &condition_code, &detail],
@@ -3057,24 +3643,22 @@ pub async fn report_step(
             );
             transaction
                 .execute(
-                    "UPDATE wr_node_operations
-                     SET proxy_next_step = $2, proxy_changed = proxy_changed OR $3,
-                         proxy_effect_ambiguous = FALSE, proxy_effect_reported = TRUE,
-                         proxy_effect_observed_revision = $4,
-                         proxy_effect_observed_digest = $5,
-                         proxy_effect_observed_resolved_digest = $6,
-                         proxy_effect_backend_instance_id = $7,
-                         proxy_effect_process_instance_id = $8,
-                         proxy_backend_instance_id = CASE
-                             WHEN $7 <> '' THEN $7 ELSE proxy_backend_instance_id END,
-                         proxy_process_instance_id = CASE
-                             WHEN $8 <> '' THEN $8 ELSE proxy_process_instance_id END,
-                         proxy_effect_condition_code = '', proxy_effect_detail = '',
-                         proxy_effect_delivered_at = NULL,
-                         proxy_effect_termination_evidence = CASE
-                             WHEN $9 THEN $10 ELSE proxy_effect_termination_evidence END,
+                    "UPDATE wr_node_operation_targets
+                     SET next_step = $2, complete = $2 = 'complete', changed = changed OR $3,
+                         effect_ambiguous = FALSE, effect_reported = TRUE,
+                         effect_observed_revision = $4, effect_observed_digest = $5,
+                         effect_observed_resolved_digest = $6,
+                         effect_backend_instance_id = $7, effect_process_instance_id = $8,
+                         pinned_backend_instance_id = CASE
+                             WHEN $7 <> '' THEN $7 ELSE pinned_backend_instance_id END,
+                         pinned_process_instance_id = CASE
+                             WHEN $8 <> '' THEN $8 ELSE pinned_process_instance_id END,
+                         effect_condition_code = '', effect_detail = '',
+                         effect_delivered_at = NULL,
+                         effect_termination_evidence = CASE
+                             WHEN $9 THEN $10 ELSE effect_termination_evidence END,
                          updated_at = NOW()
-                     WHERE operation_id = $1",
+                     WHERE operation_id = $1 AND target_kind = 'proxy'",
                     &[
                         &id,
                         &step_name(next),
@@ -3100,9 +3684,10 @@ pub async fn report_step(
                 "SELECT next_step, source_revision, source_digest, source_resolved_digest,
                         target_revision, target_digest, target_resolved_digest,
                         pinned_backend_instance_id, pinned_process_instance_id
-                 FROM wr_node_operation_slots
-                 WHERE operation_id = $1 AND engine_slot = $2 AND NOT complete FOR UPDATE",
-                &[&id, &request.engine_slot],
+                 FROM wr_node_operation_targets
+                 WHERE operation_id = $1 AND target_kind = 'engine_slot'
+                   AND target_key = $2 AND NOT complete FOR UPDATE",
+                &[&id, &target_key],
             )
             .await
             .map_err(internal)?
@@ -3209,17 +3794,18 @@ pub async fn report_step(
         };
         transaction
             .execute(
-                "UPDATE wr_node_operation_slots
+                "UPDATE wr_node_operation_targets
                  SET effect_reported = TRUE, effect_condition_code = $3, effect_detail = $4,
                      effect_observed_revision = $5, effect_observed_digest = $6,
                      effect_observed_resolved_digest = $9,
                      effect_backend_instance_id = $7, effect_process_instance_id = $8,
                      effect_termination_evidence = CASE
                          WHEN $10 THEN $11 ELSE effect_termination_evidence END,
-                     updated_at = NOW() WHERE operation_id = $1 AND engine_slot = $2",
+                     updated_at = NOW() WHERE operation_id = $1
+                       AND target_kind = 'engine_slot' AND target_key = $2",
                 &[
                     &id,
-                    &request.engine_slot,
+                    &target_key,
                     &condition_code,
                     &detail,
                     &i64::try_from(request.observed_revision)
@@ -3237,12 +3823,12 @@ pub async fn report_step(
         if reported_step == NodeOperationStepKind::VerifyProxy && condition_code.is_empty() {
             transaction
                 .execute(
-                    "UPDATE wr_node_operations
-                     SET proxy_process_instance_id = CASE
-                         WHEN proxy_process_instance_id = '' THEN $2
-                         ELSE proxy_process_instance_id END,
+                    "UPDATE wr_node_operation_targets
+                     SET pinned_process_instance_id = CASE
+                         WHEN pinned_process_instance_id = '' THEN $2
+                         ELSE pinned_process_instance_id END,
                          updated_at = NOW()
-                     WHERE operation_id = $1",
+                     WHERE operation_id = $1 AND target_kind = 'proxy'",
                     &[&id, &request.process_instance_id],
                 )
                 .await
@@ -3253,7 +3839,7 @@ pub async fn report_step(
             id,
             agent,
             "EFFECT_REPORTED",
-            &format!("{}:{}", request.engine_slot, step_name(reported_step)),
+            &format!("{}:{}", target_key, step_name(reported_step)),
             epoch,
         )
         .await?;
@@ -3262,16 +3848,17 @@ pub async fn report_step(
     transaction
         .execute(
             "INSERT INTO wr_node_operation_result_receipts
-               (operation_id, node_id, agent_instance_id, lease_epoch, step, engine_slot,
-                authenticated_principal, result_payload)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+               (operation_id, node_id, agent_instance_id, lease_epoch, step,
+                target_kind, target_key, authenticated_principal, result_payload)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             &[
                 &id,
                 &request.node_id,
                 &request.agent_instance_id,
                 &epoch,
                 &request.step,
-                &request.engine_slot,
+                &target_kind,
+                &target_key,
                 &agent,
                 &result_payload,
             ],
@@ -3519,8 +4106,7 @@ async fn cleanup_attested<C: GenericClient + Sync>(
          JOIN wr_node_agent_policies p ON p.node_id = a.node_id
          WHERE a.node_id = $1 AND a.agent_instance_id = $2 AND a.authenticated_principal = $3
            AND a.protocol_version = p.protocol_version AND a.binary_digest = p.binary_digest
-           AND a.config_digest = p.config_digest AND a.backend = p.backend
-           AND a.retention_count = p.retention_count AND a.capabilities = p.capabilities
+           AND a.backend = p.backend AND p.capabilities <@ a.capabilities
            AND a.observed_at >= NOW() - INTERVAL '30 seconds'",
             &[&node_id, &agent_instance_id, &principal],
         )
@@ -3861,85 +4447,22 @@ pub(crate) async fn cleanup_summaries_from_client<C: GenericClient + Sync>(
         .collect()
 }
 
-fn canonical_agent_policy(policy: &NodeAgentPolicy) -> Result<AgentPolicy, Status> {
-    let backend = match BackendKind::try_from(policy.backend).unwrap_or(BackendKind::Unspecified) {
-        BackendKind::Systemd => AgentPolicyBackend::Systemd,
-        BackendKind::Docker => AgentPolicyBackend::Docker,
-        BackendKind::Unspecified => {
-            return Err(Status::invalid_argument("agent backend is required"))
-        }
-    };
-    let canonical = AgentPolicy {
-        policy_version: policy.policy_version,
-        node_id: policy.node_id.clone(),
-        manager_endpoint: policy.manager_endpoint.clone(),
-        client_cert_path: policy.client_cert_path.clone(),
-        client_key_path: policy.client_key_path.clone(),
-        ca_cert_path: policy.ca_cert_path.clone(),
-        deployment_root: policy.deployment_root.clone(),
-        runtime_dir: policy.runtime_dir.clone(),
-        backend,
-        compose_project: policy.compose_project.clone(),
-        systemctl_path: policy.systemctl_path.clone(),
-        docker_path: policy.docker_path.clone(),
-        poll_interval_seconds: policy.poll_interval_seconds,
-        renew_interval_seconds: policy.renew_interval_seconds,
-        retention_count: policy.retention_count,
-        protocol_version: policy.protocol_version.clone(),
-        capabilities: policy.capabilities.clone(),
-    }
-    .normalized()
-    .map_err(|error| Status::invalid_argument(format!("invalid node-agent policy: {error:#}")))?;
-    let expected_digest = canonical.canonical_digest().map_err(|error| {
-        Status::invalid_argument(format!("invalid node-agent policy: {error:#}"))
-    })?;
-    if policy.config_digest != expected_digest {
+fn canonical_agent_policy(policy: &NodeAgentPolicy) -> Result<(String, Vec<String>), Status> {
+    validate_identity(&policy.node_id, "node_id")
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    if policy.protocol_version != AGENT_PROTOCOL_VERSION {
         return Err(Status::invalid_argument(
-            "config_digest does not match the canonical node-agent policy",
+            "node-agent protocol version must exactly match this manager",
         ));
     }
-    if !policy.binary_digest.starts_with("sha256:")
-        || policy.binary_digest.len() != 71
-        || !policy.binary_digest[7..]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(Status::invalid_argument(
-            "binary_digest must be an exact SHA-256 digest",
-        ));
-    }
-    Ok(canonical)
-}
-
-fn policy_proto(
-    policy: AgentPolicy,
-    binary_digest: String,
-    config_digest: String,
-) -> NodeAgentPolicy {
-    NodeAgentPolicy {
-        node_id: policy.node_id,
-        protocol_version: policy.protocol_version,
-        config_digest,
-        backend: match policy.backend {
-            AgentPolicyBackend::Systemd => BackendKind::Systemd,
-            AgentPolicyBackend::Docker => BackendKind::Docker,
-        } as i32,
-        retention_count: policy.retention_count,
-        policy_version: policy.policy_version,
-        binary_digest,
-        manager_endpoint: policy.manager_endpoint,
-        client_cert_path: policy.client_cert_path,
-        client_key_path: policy.client_key_path,
-        ca_cert_path: policy.ca_cert_path,
-        deployment_root: policy.deployment_root,
-        runtime_dir: policy.runtime_dir,
-        compose_project: policy.compose_project,
-        systemctl_path: policy.systemctl_path,
-        docker_path: policy.docker_path,
-        poll_interval_seconds: policy.poll_interval_seconds,
-        renew_interval_seconds: policy.renew_interval_seconds,
-        capabilities: policy.capabilities,
-    }
+    validate_sha256_digest(&policy.binary_digest, "binary_digest")
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let backend =
+        backend_name(BackendKind::try_from(policy.backend).unwrap_or(BackendKind::Unspecified))?
+            .to_string();
+    let capabilities = normalize_capabilities(&policy.capabilities)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok((backend, capabilities))
 }
 
 pub async fn put_agent_policy(
@@ -3947,75 +4470,66 @@ pub async fn put_agent_policy(
     actor: &str,
     policy: &NodeAgentPolicy,
 ) -> Result<NodeAgentPolicy, Status> {
-    let canonical = canonical_agent_policy(policy)?;
-    let config_digest = canonical.canonical_digest().map_err(|error| {
-        Status::invalid_argument(format!("invalid node-agent policy: {error:#}"))
-    })?;
-    let backend = match canonical.backend {
-        AgentPolicyBackend::Systemd => "systemd",
-        AgentPolicyBackend::Docker => "docker",
-    };
-    let retention = i32::try_from(canonical.retention_count)
-        .map_err(|_| Status::invalid_argument("retention_count is too large"))?;
-    let policy_version = i32::try_from(canonical.policy_version)
-        .map_err(|_| Status::invalid_argument("policy_version is too large"))?;
-    let poll = i64::try_from(canonical.poll_interval_seconds)
-        .map_err(|_| Status::invalid_argument("poll interval is too large"))?;
-    let renew = i64::try_from(canonical.renew_interval_seconds)
-        .map_err(|_| Status::invalid_argument("renew interval is too large"))?;
+    let (backend, capabilities) = canonical_agent_policy(policy)?;
+    let explicit_retention = policy
+        .retention_count
+        .map(|value| {
+            if value == 0 {
+                Err(Status::invalid_argument("retention_count must be positive"))
+            } else {
+                i32::try_from(value)
+                    .map_err(|_| Status::invalid_argument("retention_count is too large"))
+            }
+        })
+        .transpose()?;
     let mut client = pool.get().await.map_err(internal)?;
     let transaction = client.transaction().await.map_err(internal)?;
     let prior = transaction
         .query_opt(
-            "SELECT config_digest, binary_digest FROM wr_node_agent_policies WHERE node_id = $1 FOR UPDATE",
-            &[&canonical.node_id],
+            "SELECT protocol_version, binary_digest, backend, capabilities, retention_count
+             FROM wr_node_agent_policies WHERE node_id = $1 FOR UPDATE",
+            &[&policy.node_id],
         )
         .await
         .map_err(internal)?;
+    let retention = match (explicit_retention, prior.as_ref()) {
+        (Some(value), _) => value,
+        (None, Some(row)) => row.get("retention_count"),
+        (None, None) => {
+            return Err(Status::invalid_argument(
+                "retention_count is required when creating a node-agent policy",
+            ))
+        }
+    };
     let policy_changed = prior.as_ref().is_some_and(|row| {
-        row.get::<_, String>("config_digest") != config_digest
+        row.get::<_, String>("protocol_version") != policy.protocol_version
             || row.get::<_, String>("binary_digest") != policy.binary_digest
+            || row.get::<_, String>("backend") != backend
+            || row.get::<_, Vec<String>>("capabilities") != capabilities
     });
     transaction
         .execute(
             "INSERT INTO wr_nodes(node_id) VALUES ($1) ON CONFLICT(node_id) DO NOTHING",
-            &[&canonical.node_id],
+            &[&policy.node_id],
         )
         .await
         .map_err(internal)?;
     transaction
         .execute(
             "INSERT INTO wr_node_agent_policies
-               (node_id, protocol_version, config_digest, backend, retention_count, actor,
-                policy_version, binary_digest, manager_endpoint, client_cert_path, client_key_path,
-                ca_cert_path, deployment_root, runtime_dir, compose_project, systemctl_path,
-                docker_path, poll_interval_seconds, renew_interval_seconds, capabilities)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                     $15, $16, $17, $18, $19, $20)
+               (node_id, protocol_version, backend, retention_count, actor, binary_digest, capabilities)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT(node_id) DO UPDATE SET protocol_version = EXCLUDED.protocol_version,
-               config_digest = EXCLUDED.config_digest, backend = EXCLUDED.backend,
-               retention_count = EXCLUDED.retention_count, actor = EXCLUDED.actor,
-               policy_version = EXCLUDED.policy_version, binary_digest = EXCLUDED.binary_digest,
-               manager_endpoint = EXCLUDED.manager_endpoint, client_cert_path = EXCLUDED.client_cert_path,
-               client_key_path = EXCLUDED.client_key_path, ca_cert_path = EXCLUDED.ca_cert_path,
-               deployment_root = EXCLUDED.deployment_root, runtime_dir = EXCLUDED.runtime_dir,
-               compose_project = EXCLUDED.compose_project, systemctl_path = EXCLUDED.systemctl_path,
-               docker_path = EXCLUDED.docker_path, poll_interval_seconds = EXCLUDED.poll_interval_seconds,
-               renew_interval_seconds = EXCLUDED.renew_interval_seconds,
+               backend = EXCLUDED.backend, retention_count = EXCLUDED.retention_count,
+               actor = EXCLUDED.actor, binary_digest = EXCLUDED.binary_digest,
                capabilities = EXCLUDED.capabilities, updated_at = NOW()",
-            &[
-                &canonical.node_id, &canonical.protocol_version, &config_digest, &backend, &retention,
-                &actor, &policy_version, &policy.binary_digest, &canonical.manager_endpoint,
-                &canonical.client_cert_path, &canonical.client_key_path, &canonical.ca_cert_path,
-                &canonical.deployment_root, &canonical.runtime_dir, &canonical.compose_project,
-                &canonical.systemctl_path, &canonical.docker_path, &poll, &renew,
-                &canonical.capabilities,
-            ],
+            &[&policy.node_id, &policy.protocol_version, &backend, &retention, &actor,
+              &policy.binary_digest, &capabilities],
         )
         .await
         .map_err(internal)?;
     if policy_changed {
-        fence_cleanup_authority(&transaction, &canonical.node_id, "AGENT_POLICY_UPDATED").await?;
+        fence_cleanup_authority(&transaction, &policy.node_id, "AGENT_POLICY_UPDATED").await?;
         for row in transaction
             .query(
                 "UPDATE wr_node_operations SET state = 'paused', failure_code = 'AGENT_POLICY_UPDATED',
@@ -4024,7 +4538,7 @@ pub async fn put_agent_policy(
                         updated_at = NOW()
                  WHERE node_id = $1 AND state = 'running'
                  RETURNING operation_id, lease_epoch",
-                &[&canonical.node_id],
+                &[&policy.node_id],
             )
             .await
             .map_err(internal)?
@@ -4041,11 +4555,14 @@ pub async fn put_agent_policy(
         }
     }
     transaction.commit().await.map_err(internal)?;
-    Ok(policy_proto(
-        canonical,
-        policy.binary_digest.clone(),
-        config_digest,
-    ))
+    Ok(NodeAgentPolicy {
+        node_id: policy.node_id.clone(),
+        protocol_version: policy.protocol_version.clone(),
+        backend: policy.backend,
+        retention_count: Some(retention as u32),
+        binary_digest: policy.binary_digest.clone(),
+        capabilities,
+    })
 }
 
 pub async fn attest(
@@ -4053,24 +4570,22 @@ pub async fn attest(
     principal: &str,
     attestation: &NodeAgentAttestation,
 ) -> Result<Vec<DeploymentCondition>, Status> {
-    if attestation.node_id.is_empty()
-        || attestation.agent_instance_id.is_empty()
-        || attestation.protocol_version.is_empty()
-        || attestation.binary_digest.is_empty()
-        || attestation.config_digest.is_empty()
-    {
-        return Err(Status::invalid_argument(
-            "complete attestation identity and digests are required",
-        ));
-    }
+    validate_identity(&attestation.node_id, "node_id")
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    validate_identity(&attestation.agent_instance_id, "agent_instance_id")
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    validate_sha256_digest(&attestation.binary_digest, "binary_digest")
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let capabilities = normalize_capabilities(&attestation.capabilities)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let backend = backend_name(
         BackendKind::try_from(attestation.backend).unwrap_or(BackendKind::Unspecified),
     )?;
     let client = pool.get().await.map_err(internal)?;
     let policy = client
         .query_opt(
-            "SELECT protocol_version, binary_digest, config_digest, backend, retention_count,
-                    capabilities FROM wr_node_agent_policies WHERE node_id = $1",
+            "SELECT protocol_version, binary_digest, backend, capabilities
+             FROM wr_node_agent_policies WHERE node_id = $1",
             &[&attestation.node_id],
         )
         .await
@@ -4081,12 +4596,6 @@ pub async fn attest(
             conditions.push(operation_condition(
                 "PROTOCOL_MISMATCH".into(),
                 "agent protocol does not match manager policy".into(),
-            ));
-        }
-        if policy.get::<_, String>("config_digest") != attestation.config_digest {
-            conditions.push(operation_condition(
-                "CONFIG_MISMATCH".into(),
-                "agent config digest does not match manager policy".into(),
             ));
         }
         if policy.get::<_, String>("backend") != backend {
@@ -4101,16 +4610,13 @@ pub async fn attest(
                 "agent binary digest does not match manager policy".into(),
             ));
         }
-        if policy.get::<_, i32>("retention_count") as u32 != attestation.retention_count {
-            conditions.push(operation_condition(
-                "RETENTION_MISMATCH".into(),
-                "agent retention value does not match manager policy".into(),
-            ));
-        }
-        if policy.get::<_, Vec<String>>("capabilities") != attestation.capabilities {
+        let missing =
+            missing_capabilities(&policy.get::<_, Vec<String>>("capabilities"), &capabilities)
+                .map_err(internal)?;
+        if !missing.is_empty() {
             conditions.push(operation_condition(
                 "CAPABILITY_MISMATCH".into(),
-                "agent capabilities do not match manager policy".into(),
+                format!("missing required capabilities: {}", missing.join(", ")),
             ));
         }
     } else {
@@ -4123,25 +4629,14 @@ pub async fn attest(
         .execute(
             "INSERT INTO wr_node_agent_attestations
                (node_id, agent_instance_id, authenticated_principal, protocol_version,
-                binary_digest, config_digest, backend, capabilities, observed_at, retention_count)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9)
+                binary_digest, backend, capabilities, observed_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
              ON CONFLICT(node_id, agent_instance_id) DO UPDATE SET
                authenticated_principal = EXCLUDED.authenticated_principal,
                protocol_version = EXCLUDED.protocol_version, binary_digest = EXCLUDED.binary_digest,
-               config_digest = EXCLUDED.config_digest, backend = EXCLUDED.backend,
-               capabilities = EXCLUDED.capabilities, observed_at = NOW(),
-               retention_count = EXCLUDED.retention_count",
-            &[
-                &attestation.node_id,
-                &attestation.agent_instance_id,
-                &principal,
-                &attestation.protocol_version,
-                &attestation.binary_digest,
-                &attestation.config_digest,
-                &backend,
-                &attestation.capabilities,
-                &(attestation.retention_count as i32),
-            ],
+               backend = EXCLUDED.backend, capabilities = EXCLUDED.capabilities, observed_at = NOW()",
+            &[&attestation.node_id, &attestation.agent_instance_id, &principal,
+              &attestation.protocol_version, &attestation.binary_digest, &backend, &capabilities],
         )
         .await
         .map_err(internal)?;
@@ -4154,11 +4649,7 @@ where
 {
     Ok(client
         .query(
-            "SELECT node_id, protocol_version, config_digest, backend, retention_count,
-                    policy_version, binary_digest, manager_endpoint, client_cert_path,
-                    client_key_path, ca_cert_path, deployment_root, runtime_dir, compose_project,
-                    systemctl_path, docker_path, poll_interval_seconds, renew_interval_seconds,
-                    capabilities
+            "SELECT node_id, protocol_version, backend, retention_count, binary_digest, capabilities
              FROM wr_node_agent_policies ORDER BY node_id",
             &[],
         )
@@ -4168,22 +4659,9 @@ where
         .map(|row| NodeAgentPolicy {
             node_id: row.get("node_id"),
             protocol_version: row.get("protocol_version"),
-            config_digest: row.get("config_digest"),
             backend: parse_backend(row.get::<_, String>("backend").as_str()) as i32,
-            retention_count: row.get::<_, i32>("retention_count") as u32,
-            policy_version: row.get::<_, i32>("policy_version") as u32,
+            retention_count: Some(row.get::<_, i32>("retention_count") as u32),
             binary_digest: row.get("binary_digest"),
-            manager_endpoint: row.get("manager_endpoint"),
-            client_cert_path: row.get("client_cert_path"),
-            client_key_path: row.get("client_key_path"),
-            ca_cert_path: row.get("ca_cert_path"),
-            deployment_root: row.get("deployment_root"),
-            runtime_dir: row.get("runtime_dir"),
-            compose_project: row.get("compose_project"),
-            systemctl_path: row.get("systemctl_path"),
-            docker_path: row.get("docker_path"),
-            poll_interval_seconds: row.get::<_, i64>("poll_interval_seconds") as u64,
-            renew_interval_seconds: row.get::<_, i64>("renew_interval_seconds") as u64,
             capabilities: row.get("capabilities"),
         })
         .collect())
@@ -4199,8 +4677,7 @@ where
     Ok(client
         .query(
             "SELECT node_id, agent_instance_id, authenticated_principal, protocol_version,
-                    binary_digest, config_digest, backend, capabilities, observed_at,
-                    retention_count
+                    binary_digest, backend, capabilities, observed_at
              FROM wr_node_agent_attestations WHERE ($1 = '' OR node_id = $1)
              ORDER BY node_id, observed_at DESC",
             &[&node_id],
@@ -4213,12 +4690,10 @@ where
             agent_instance_id: row.get("agent_instance_id"),
             protocol_version: row.get("protocol_version"),
             binary_digest: row.get("binary_digest"),
-            config_digest: row.get("config_digest"),
             backend: parse_backend(row.get::<_, String>("backend").as_str()) as i32,
             capabilities: row.get("capabilities"),
             observed_at: Some(timestamp(row.get("observed_at"))),
             authenticated_principal: row.get("authenticated_principal"),
-            retention_count: row.get::<_, i32>("retention_count") as u32,
         })
         .collect())
 }
@@ -4253,109 +4728,107 @@ pub async fn authorities(pool: &Pool, node_id: &str) -> Result<Vec<SlotAuthority
         .collect())
 }
 
-fn ordered_operation_slots(
-    action: NodeOperationAction,
-    source_slots: &[String],
-    target_slots: &[String],
-    requested: Option<Vec<String>>,
-    canary_slot: &str,
-) -> Vec<String> {
-    let mut slots = requested.unwrap_or_else(|| {
-        source_slots
-            .iter()
-            .chain(target_slots.iter())
-            .cloned()
-            .collect()
-    });
-    slots.sort();
-    slots.dedup();
-    // Scale-out capacity lands first, retained slots roll next, and scale-in
-    // removals happen last. The canary is first only within its safety group.
-    slots.sort_by_key(|slot| {
-        let group = if action == NodeOperationAction::Scale {
-            match (source_slots.contains(slot), target_slots.contains(slot)) {
-                (false, true) => 0,
-                (true, true) => 1,
-                (true, false) => 2,
-                (false, false) => 3,
-            }
-        } else {
-            0
-        };
-        (group, slot != canary_slot, slot.clone())
-    });
-    slots
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn scale_orders_add_before_retain_and_retain_before_remove() {
-        let one = vec!["engine-1".to_string()];
-        let two = vec!["engine-1".to_string(), "engine-2".to_string()];
+    fn exact_inventory_identity_derives_transition_kind() {
         assert_eq!(
-            ordered_operation_slots(NodeOperationAction::Scale, &one, &two, None, "engine-1"),
-            ["engine-2", "engine-1"]
+            derive_transition(0, "", "", 2, "target", "target-release"),
+            DerivedTransition::Addition
         );
         assert_eq!(
-            ordered_operation_slots(NodeOperationAction::Scale, &two, &one, None, "engine-1"),
-            ["engine-1", "engine-2"]
+            derive_transition(1, "source", "source-release", 0, "", ""),
+            DerivedTransition::Removal
         );
-    }
-
-    #[test]
-    fn equal_slot_upgrade_keeps_stable_inventory_order() {
-        let slots = vec!["engine-1".to_string(), "engine-2".to_string()];
         assert_eq!(
-            ordered_operation_slots(
-                NodeOperationAction::RollingUpgrade,
-                &slots,
-                &slots,
-                None,
-                "engine-1",
-            ),
-            slots
+            derive_transition(1, "same", "same-release", 1, "same", "same-release"),
+            DerivedTransition::Unchanged
+        );
+        assert_eq!(
+            derive_transition(1, "same", "same-release", 2, "same", "same-release"),
+            DerivedTransition::Replacement,
+            "a new immutable revision is replacement even when content digests match"
         );
     }
 
     #[test]
-    fn action_specific_sequences_are_not_one_generic_list() {
+    fn corrupt_stored_transition_combinations_fail_closed() {
+        let target = |source_revision,
+                      source_digest: &str,
+                      source_resolved_digest: &str,
+                      target_revision,
+                      target_digest: &str,
+                      target_resolved_digest: &str| OperationTargetProgress {
+            source_revision,
+            source_digest: source_digest.into(),
+            source_resolved_release_digest: source_resolved_digest.into(),
+            target_revision,
+            target_digest: target_digest.into(),
+            target_resolved_release_digest: target_resolved_digest.into(),
+            ..Default::default()
+        };
+        assert!(validate_stored_transition(
+            NodeOperationAction::Deployment,
+            DerivedTransition::Removal,
+            &target(0, "", "", 2, "target", "target-release"),
+        )
+        .is_err());
+        assert!(validate_stored_transition(
+            NodeOperationAction::Restart,
+            DerivedTransition::Restart,
+            &target(1, "source", "source-release", 2, "target", "target-release"),
+        )
+        .is_err());
+        assert!(validate_stored_transition(
+            NodeOperationAction::Restart,
+            DerivedTransition::Restart,
+            &target(1, "same", "same-release", 1, "same", "same-release"),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn derived_transitions_have_distinct_release_verified_sequences() {
+        use NodeOperationStepKind as Step;
+
         assert_eq!(
-            next_forward_step(
-                NodeOperationAction::Drain,
-                NodeOperationStepKind::StopBackend,
-                1,
-                0,
-            ),
-            Some(NodeOperationStepKind::SwitchAuthority)
+            first_forward_step(DerivedTransition::Addition),
+            Some(Step::VerifyReleaseMetadata)
         );
         assert_eq!(
-            next_forward_step(
-                NodeOperationAction::Drain,
-                NodeOperationStepKind::SwitchAuthority,
-                1,
-                0,
-            ),
-            None
+            next_forward_step(DerivedTransition::Addition, Step::VerifyReleaseMetadata),
+            Some(Step::SelectRelease)
         );
         assert_eq!(
-            next_forward_step(
-                NodeOperationAction::Restart,
-                NodeOperationStepKind::StopBackend,
-                1,
-                1,
-            ),
-            Some(NodeOperationStepKind::StartBackend)
+            first_forward_step(DerivedTransition::Replacement),
+            Some(Step::VerifyReleaseMetadata)
         );
         assert_eq!(
-            first_forward_step(NodeOperationAction::Scale, 1, 0),
-            NodeOperationStepKind::VerifyTarget
+            next_forward_step(DerivedTransition::Replacement, Step::VerifyReleaseMetadata),
+            Some(Step::VerifyTarget)
         );
         assert_eq!(
-            first_forward_step(NodeOperationAction::InitialApply, 0, 1),
-            NodeOperationStepKind::VerifyReleaseMetadata
+            next_forward_step(DerivedTransition::Replacement, Step::StopBackend),
+            Some(Step::SelectRelease)
         );
+        assert_eq!(
+            first_forward_step(DerivedTransition::Removal),
+            Some(Step::VerifyTarget)
+        );
+        assert_eq!(
+            next_forward_step(DerivedTransition::Removal, Step::StopBackend),
+            Some(Step::SwitchAuthority)
+        );
+        assert_eq!(
+            first_forward_step(DerivedTransition::Restart),
+            Some(Step::VerifyTarget)
+        );
+        assert_eq!(
+            next_forward_step(DerivedTransition::Restart, Step::StopBackend),
+            Some(Step::StartBackend)
+        );
+        assert_eq!(first_forward_step(DerivedTransition::Unchanged), None);
     }
 }

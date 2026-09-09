@@ -424,13 +424,12 @@ message GetClusterStatusResponse {
 // Operator actions are durable deployment/node intent. They never identify a
 // PID and never mutate LifecycleService directly.
 enum NodeOperationAction {
+  reserved 1, 2, 4, 5;
+  reserved "NODE_OPERATION_ACTION_INITIAL_APPLY", "NODE_OPERATION_ACTION_DRAIN", "NODE_OPERATION_ACTION_ROLLING_UPGRADE", "NODE_OPERATION_ACTION_SCALE";
   NODE_OPERATION_ACTION_UNSPECIFIED = 0;
-  NODE_OPERATION_ACTION_INITIAL_APPLY = 1;
-  NODE_OPERATION_ACTION_DRAIN = 2;
   NODE_OPERATION_ACTION_RESTART = 3;
-  NODE_OPERATION_ACTION_ROLLING_UPGRADE = 4;
-  NODE_OPERATION_ACTION_SCALE = 5;
   NODE_OPERATION_ACTION_ROLLBACK = 6;
+  NODE_OPERATION_ACTION_DEPLOYMENT = 7;
 }
 
 enum NodeOperationState {
@@ -499,6 +498,15 @@ enum NodeOperationStepKind {
   NODE_OPERATION_STEP_KIND_INSPECT_BACKEND = 11;
 }
 
+enum NodeSlotTransitionKind {
+  NODE_SLOT_TRANSITION_KIND_UNSPECIFIED = 0;
+  NODE_SLOT_TRANSITION_KIND_ADDITION = 1;
+  NODE_SLOT_TRANSITION_KIND_REPLACEMENT = 2;
+  NODE_SLOT_TRANSITION_KIND_UNCHANGED = 3;
+  NODE_SLOT_TRANSITION_KIND_REMOVAL = 4;
+  NODE_SLOT_TRANSITION_KIND_RESTART = 5;
+}
+
 enum InstructionTargetKind {
   INSTRUCTION_TARGET_KIND_UNSPECIFIED = 0;
   INSTRUCTION_TARGET_KIND_PROXY = 1;
@@ -539,52 +547,73 @@ message BackendTerminationEvidence {
   optional int32 signal = 9;
 }
 
+message ProxyTargetIdentity {}
+message EngineSlotTargetIdentity { string engine_slot = 1; }
+
 message InstructionTarget {
   InstructionTargetKind kind = 1;
-  string engine_slot = 2;
+  reserved 2;
+  reserved "engine_slot";
   uint64 revision = 3;
   string bundle_digest = 4;
   string resolved_release_digest = 5;
+  oneof identity {
+    ProxyTargetIdentity proxy = 6;
+    EngineSlotTargetIdentity engine_slot_target = 7;
+  }
 }
 
 message RolloutPolicy {
+  reserved 2, 3;
+  reserved "canary_slot", "pause_after_canary";
   uint32 max_unavailable = 1;
-  string canary_slot = 2;
-  bool pause_after_canary = 3;
   bool allow_downtime = 4;
   uint64 deadline_seconds = 5;
 }
 
-message OperationSlotProgress {
-  string engine_slot = 1;
+message ProxyTargetDetails {}
+message EngineTargetDetails {
+  uint32 rollout_order = 1;
   uint64 authoritative_revision = 2;
-  NodeOperationStepKind next_step = 3;
-  uint32 completed_steps = 4;
-  bool complete = 5;
-  repeated DeploymentCondition conditions = 6;
-  uint64 source_revision = 7;
-  string source_digest = 8;
-  uint64 target_revision = 9;
-  string target_digest = 10;
-  string pinned_backend_instance_id = 11;
-  string pinned_process_instance_id = 12;
-  bool authority_switched = 13;
-  bool serving_converged = 14;
-  bool changed = 15;
-  optional google.protobuf.Timestamp effect_delivered_at = 16;
-  bool effect_reported = 17;
-  uint64 effect_observed_revision = 18;
-  string effect_observed_digest = 19;
-  string effect_backend_instance_id = 20;
-  string effect_process_instance_id = 21;
-  string effect_condition_code = 22;
-  string effect_detail = 23;
-  uint32 rollout_order = 24;
-  bool effect_ambiguous = 25;
-  string source_resolved_release_digest = 26;
-  string target_resolved_release_digest = 27;
-  string effect_observed_resolved_release_digest = 28;
-  BackendTerminationEvidence termination_evidence = 29;
+  bool authority_switched = 3;
+  bool serving_converged = 4;
+}
+
+message OperationTargetProgress {
+  InstructionTargetKind kind = 1;
+  oneof identity {
+    ProxyTargetIdentity proxy = 2;
+    EngineSlotTargetIdentity engine_slot = 3;
+  }
+  NodeOperationStepKind next_step = 4;
+  uint32 completed_steps = 5;
+  bool complete = 6;
+  repeated DeploymentCondition conditions = 7;
+  uint64 source_revision = 8;
+  string source_digest = 9;
+  string source_resolved_release_digest = 10;
+  uint64 target_revision = 11;
+  string target_digest = 12;
+  string target_resolved_release_digest = 13;
+  string pinned_backend_instance_id = 14;
+  string pinned_process_instance_id = 15;
+  bool changed = 16;
+  optional google.protobuf.Timestamp effect_delivered_at = 17;
+  bool effect_reported = 18;
+  uint64 effect_observed_revision = 19;
+  string effect_observed_digest = 20;
+  string effect_observed_resolved_release_digest = 21;
+  string effect_backend_instance_id = 22;
+  string effect_process_instance_id = 23;
+  string effect_condition_code = 24;
+  string effect_detail = 25;
+  bool effect_ambiguous = 26;
+  oneof details {
+    ProxyTargetDetails proxy_details = 27;
+    EngineTargetDetails engine_details = 28;
+  }
+  NodeSlotTransitionKind transition = 29;
+  BackendTerminationEvidence termination_evidence = 30;
 }
 
 message NodeOperation {
@@ -598,7 +627,8 @@ message NodeOperation {
   uint64 source_revision = 8;
   uint64 target_revision = 9;
   string bundle_digest = 10;
-  repeated OperationSlotProgress slots = 11;
+  reserved 11;
+  reserved "slots";
   bool committed = 12;
   uint64 lease_epoch = 13;
   optional google.protobuf.Timestamp lease_expires_at = 14;
@@ -610,32 +640,13 @@ message NodeOperation {
   bool forward_fenced = 20;
   bool restoration_requested = 21;
   string agent_instance_id = 22;
-  reserved 23, 24, 25, 26, 28;
+  reserved 23, 24, 25, 26, 28, 29, 31 to 49;
   reserved "cleanup_superseded_by", "cleanup_evidence", "cleanup_reported_at", "cleanup_backend_query_error", "cleanup_delivered_at";
+  reserved "proxy_process_instance_id", "proxy_next_step", "proxy_source_revision", "proxy_source_digest", "proxy_source_resolved_release_digest", "proxy_target_revision", "proxy_target_digest", "proxy_target_resolved_release_digest", "proxy_backend_instance_id", "proxy_changed", "proxy_effect_ambiguous", "proxy_effect_delivered_at", "proxy_effect_reported", "proxy_effect_observed_revision", "proxy_effect_observed_digest", "proxy_effect_observed_resolved_release_digest", "proxy_effect_backend_instance_id", "proxy_effect_process_instance_id", "proxy_effect_condition_code", "proxy_effect_detail";
   NodeOperationState restoration_terminal_state = 27;
-  string proxy_process_instance_id = 29;
   string resolved_release_digest = 30;
-  NodeOperationStepKind proxy_next_step = 31;
-  uint64 proxy_source_revision = 32;
-  string proxy_source_digest = 33;
-  string proxy_source_resolved_release_digest = 34;
-  uint64 proxy_target_revision = 35;
-  string proxy_target_digest = 36;
-  string proxy_target_resolved_release_digest = 37;
-  string proxy_backend_instance_id = 38;
-  bool proxy_changed = 39;
-  bool proxy_effect_ambiguous = 40;
-  optional google.protobuf.Timestamp proxy_effect_delivered_at = 41;
-  bool proxy_effect_reported = 42;
-  uint64 proxy_effect_observed_revision = 43;
-  string proxy_effect_observed_digest = 44;
-  string proxy_effect_observed_resolved_release_digest = 45;
-  string proxy_effect_backend_instance_id = 46;
-  string proxy_effect_process_instance_id = 47;
-  string proxy_effect_condition_code = 48;
-  string proxy_effect_detail = 49;
   string revision_digest = 50;
-  BackendTerminationEvidence termination_evidence = 51;
+  repeated OperationTargetProgress targets = 51;
 }
 
 message OperationEvent {
@@ -649,14 +660,16 @@ message OperationEvent {
 }
 
 message SubmitOperationRequest {
+  reserved 4;
+  reserved "engine_slots";
   string node_id = 1;
   string request_token = 2;
   NodeOperationAction action = 3;
-  repeated string engine_slots = 4;
   uint64 target_revision = 5;
   string bundle_digest = 6;
   RolloutPolicy policy = 7;
   string resolved_release_digest = 8;
+  string engine_slot = 9;
 }
 message SubmitOperationResponse { NodeOperation operation = 1; }
 message GetOperationRequest { string operation_id = 1; }
@@ -705,35 +718,24 @@ message NodeAgentAttestation {
   string agent_instance_id = 2;
   string protocol_version = 3;
   string binary_digest = 4;
-  string config_digest = 5;
+  reserved 5, 10;
+  reserved "config_digest", "retention_count";
   BackendKind backend = 6;
   repeated string capabilities = 7;
   optional google.protobuf.Timestamp observed_at = 8;
   string authenticated_principal = 9;
-  uint32 retention_count = 10;
 }
-// Complete canonical non-secret host policy. The manager recomputes
-// config_digest from every semantic field rather than trusting an installer
-// rendering. Credential paths are included; credential contents never are.
+// Narrow compatibility expectation. retention_count is operator-owned cleanup
+// policy, not attestation evidence or a claim-eligibility input. Omission on an
+// update preserves the stored value; initial creation requires it.
 message NodeAgentPolicy {
   string node_id = 1;
   string protocol_version = 2;
-  string config_digest = 3;
+  reserved 3, 6, 8 to 18;
+  reserved "config_digest", "policy_version", "manager_endpoint", "client_cert_path", "client_key_path", "ca_cert_path", "deployment_root", "runtime_dir", "compose_project", "systemctl_path", "docker_path", "poll_interval_seconds", "renew_interval_seconds";
   BackendKind backend = 4;
-  uint32 retention_count = 5;
-  uint32 policy_version = 6;
+  optional uint32 retention_count = 5;
   string binary_digest = 7;
-  string manager_endpoint = 8;
-  string client_cert_path = 9;
-  string client_key_path = 10;
-  string ca_cert_path = 11;
-  string deployment_root = 12;
-  string runtime_dir = 13;
-  string compose_project = 14;
-  string systemctl_path = 15;
-  string docker_path = 16;
-  uint64 poll_interval_seconds = 17;
-  uint64 renew_interval_seconds = 18;
   repeated string capabilities = 19;
 }
 message PutNodeAgentPolicyRequest { NodeAgentPolicy policy = 1; }
@@ -871,7 +873,8 @@ message ReportNodeCleanupResultResponse {
 message ReportStepResultRequest {
   string node_id = 1;
   string operation_id = 2;
-  string engine_slot = 3;
+  reserved 3;
+  reserved "engine_slot";
   uint64 lease_epoch = 4;
   NodeOperationStepKind step = 5;
   string condition_code = 6;
@@ -885,7 +888,8 @@ message ReportStepResultRequest {
   reserved 14;
   reserved "cleanup_evidence";
   string observed_resolved_release_digest = 15;
-  BackendTerminationEvidence termination_evidence = 16;
+  InstructionTarget target = 16;
+  BackendTerminationEvidence termination_evidence = 17;
 }
 message ReportStepResultResponse { NodeOperation operation = 1; }
 
