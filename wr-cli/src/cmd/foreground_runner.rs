@@ -1539,6 +1539,7 @@ async fn complete_foreground_operation(manager_endpoint: &str) -> Result<()> {
                     backend_query_error: String::new(),
                     cleanup_evidence: None,
                     observed_resolved_release_digest: target.resolved_release_digest.clone(),
+                    termination_evidence: None,
                 })
                 .await?;
         }

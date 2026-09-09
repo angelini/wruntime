@@ -90,6 +90,22 @@ class AssertionTests(unittest.TestCase):
         result = assert_cluster.assert_unhealthy(status, args)
         self.assertEqual(result["condition_codes"], ["MISSING_ENGINE"])
 
+    def test_unhealthy_requires_explicit_drained_route_counts(self):
+        status = healthy_status()
+        status["nodes"][0]["severity"] = "unhealthy"
+        status["nodes"][0]["conditions"] = [{"code": "MISSING_ENGINE", "detail": "ignored"}]
+        status["services"][0]["healthy_routes"] = 0
+        status["services"][0]["unhealthy_routes"] = 1
+        status["services"][0]["routes"][0]["healthy"] = False
+        args = assert_cluster.parser().parse_args([
+            "unhealthy", "--node-id", "wr-e2e-node", "--version", "1.0.0",
+            "--desired-routes", "1", "--healthy-routes", "0", "--unhealthy-routes", "1",
+        ])
+        self.assertEqual(assert_cluster.assert_unhealthy(status, args)["severity"], "unhealthy")
+        status["services"][0]["unhealthy_routes"] = 0
+        with self.assertRaisesRegex(assert_cluster.AssertionFailure, "route counts"):
+            assert_cluster.assert_unhealthy(status, args)
+
     def test_unhealthy_defaults_accept_deregistration_with_an_old_revision(self):
         status = healthy_status()
         status["nodes"][0]["severity"] = "unhealthy"
@@ -113,6 +129,33 @@ class AssertionTests(unittest.TestCase):
         args = argparse.Namespace(node_id="wr-e2e-node", digest="sha256:a", version="1.0.0", engine_slot="engine")
         with self.assertRaisesRegex(assert_cluster.AssertionFailure, "route counts"):
             assert_cluster.assert_desired(status, args)
+
+    def test_repeated_slots_require_exact_multi_engine_inventory(self):
+        status = healthy_status()
+        second = copy.deepcopy(status["nodes"][0]["engines"][0])
+        second["engine_id"] = "engine-id-b"
+        second["deployment"]["engine_slot"] = "engine-b"
+        status["nodes"][0]["engines"].append(second)
+        status["engines"].append(second)
+        status["nodes"][0]["desired_deployment"]["expected_engines"].append({
+            "engine_slot": "engine-b",
+            "modules": [{"namespace": "deployment", "name": "echo", "version": "1.0.0"}],
+        })
+        status["services"][0]["desired_routes"] = 2
+        status["services"][0]["healthy_routes"] = 2
+        status["services"][0]["routes"].append({"desired": True, "healthy": True, "conditions": []})
+        args = argparse.Namespace(node_id="wr-e2e-node", digest="sha256:a", version="1.0.0", engine_slot=["engine", "engine-b"])
+        self.assertEqual(assert_cluster.assert_desired(status, args)["engine_slots"], ["engine", "engine-b"])
+        omitted = copy.deepcopy(status)
+        omitted["nodes"][0]["engines"].pop()
+        with self.assertRaisesRegex(assert_cluster.AssertionFailure, "inventory is not exact"):
+            assert_cluster.assert_desired(omitted, args)
+        extra_args = argparse.Namespace(node_id="wr-e2e-node", digest="sha256:a", version="1.0.0", engine_slot=["engine"])
+        with self.assertRaisesRegex(assert_cluster.AssertionFailure, "inventory is not exact"):
+            assert_cluster.assert_desired(status, extra_args)
+        duplicate_args = argparse.Namespace(node_id="wr-e2e-node", digest="sha256:a", version="1.0.0", engine_slot=["engine", "engine"])
+        with self.assertRaisesRegex(assert_cluster.AssertionFailure, "duplicate expected"):
+            assert_cluster.assert_desired(status, duplicate_args)
 
     def test_extra_authoritative_module_fails_exact_inventory(self):
         status = healthy_status()

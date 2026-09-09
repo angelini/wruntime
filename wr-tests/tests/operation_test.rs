@@ -5,10 +5,11 @@ use helpers::db::manager_pool;
 use tonic::Code;
 use uuid::Uuid;
 use wr_common::wruntime::{
-    BackendProcessState, BeginDeploymentRequest, CleanupReleaseEvidence, DeploymentInventoryV1,
-    DeploymentMetadata, DeploymentRecord, EngineOwnershipFence, EngineRegistration, ExpectedEngine,
-    ExpectedModule, FinalizeDeploymentRequest, InstructionTargetKind, LifecycleStatus,
-    ModuleDescriptor, ModuleIdentity, NodeOperationAction, NodeOperationPhase, NodeOperationState,
+    BackendKind, BackendProcessState, BackendStopDisposition, BackendTerminationEvidence,
+    BeginDeploymentRequest, CleanupReleaseEvidence, DeploymentInventoryV1, DeploymentMetadata,
+    DeploymentRecord, EngineOwnershipFence, EngineRegistration, ExpectedEngine, ExpectedModule,
+    FinalizeDeploymentRequest, InstructionTargetKind, LifecycleStatus, ModuleDescriptor,
+    ModuleIdentity, NodeOperationAction, NodeOperationPhase, NodeOperationState,
     NodeOperationStepKind, ProcessLifecycleState, ReleaseInventoryEntry,
     ReportNodeObservationRequest, ReportStepResultRequest, RolloutPolicy, ServiceKind,
     SubmitOperationRequest,
@@ -128,6 +129,7 @@ fn result_for(
         backend_query_error: String::new(),
         cleanup_evidence: None,
         observed_resolved_release_digest: target.resolved_release_digest.clone(),
+        termination_evidence: None,
     }
 }
 
@@ -685,6 +687,28 @@ async fn rolling_upgrade_proves_the_source_proxy_before_stop() -> Result<()> {
     );
     assert_eq!(stop.pinned_backend_instance_id, "proxy-backend-old");
     assert_eq!(stop.pinned_process_instance_id, "proxy-process-old");
+    let mut stopped = result_for(&stop, "");
+    stopped.backend_instance_id = "proxy-backend-old".into();
+    stopped.process_instance_id = "proxy-process-old".into();
+    stopped.termination_evidence = Some(BackendTerminationEvidence {
+        backend: BackendKind::Systemd as i32,
+        backend_instance_id: "proxy-backend-old".into(),
+        process_instance_id: "proxy-process-old".into(),
+        graceful_termination_requested: true,
+        kill_escalated: false,
+        disposition: BackendStopDisposition::Graceful as i32,
+        terminal_result: "success".into(),
+        exit_code: Some(0),
+        signal: None,
+    });
+    let reported = wr_manager::operations::report_step(&pool, &stopped, "agent-a").await?;
+    assert_eq!(
+        reported
+            .termination_evidence
+            .as_ref()
+            .map(|evidence| evidence.disposition),
+        Some(BackendStopDisposition::Graceful as i32)
+    );
 
     Ok(())
 }
@@ -1679,7 +1703,28 @@ async fn stop_result_waits_for_post_delivery_observation() -> Result<()> {
     let fence = engine_fence(&pool, &format!("{node_id}-engine")).await?;
     wr_manager::db::deregister_engine(&pool, &format!("{node_id}-engine"), &fence).await?;
 
-    let awaiting_observation = report_ok(&pool, &stop, "backend-old", "").await?;
+    let mut stop_result = result_for(&stop, "");
+    stop_result.backend_instance_id = "backend-old".into();
+    stop_result.termination_evidence = Some(BackendTerminationEvidence {
+        backend: BackendKind::Systemd as i32,
+        backend_instance_id: "backend-old".into(),
+        process_instance_id: "process-old".into(),
+        graceful_termination_requested: true,
+        kill_escalated: false,
+        disposition: BackendStopDisposition::Graceful as i32,
+        terminal_result: "success".into(),
+        exit_code: Some(0),
+        signal: None,
+    });
+    let awaiting_observation =
+        wr_manager::operations::report_step(&pool, &stop_result, "agent-a").await?;
+    assert_eq!(
+        awaiting_observation.slots[0]
+            .termination_evidence
+            .as_ref()
+            .map(|evidence| evidence.disposition),
+        Some(BackendStopDisposition::Graceful as i32)
+    );
     assert_eq!(
         NodeOperationState::try_from(awaiting_observation.state)?,
         NodeOperationState::Running,
@@ -1708,6 +1753,31 @@ async fn stop_result_waits_for_post_delivery_observation() -> Result<()> {
         "fresh exit, registration, and route evidence must advance the stop"
     );
     assert_eq!(observed.operation_id, operation.operation_id);
+    let stored_observation = wr_manager::operations::observations(&pool, node_id, "blue").await?;
+    assert_eq!(
+        stored_observation[0]
+            .termination_evidence
+            .as_ref()
+            .map(|evidence| evidence.disposition),
+        Some(BackendStopDisposition::Graceful as i32)
+    );
+    let retry = wr_manager::operations::report_step(&pool, &stop_result, "agent-a").await?;
+    assert_eq!(
+        retry.slots[0].termination_evidence,
+        awaiting_observation.slots[0].termination_evidence
+    );
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE wr_node_operation_slots SET effect_termination_evidence = $1
+             WHERE operation_id = $2 AND engine_slot = 'blue'",
+            &[&vec![0xff_u8], &Uuid::parse_str(&operation.operation_id)?],
+        )
+        .await?;
+    let malformed = wr_manager::operations::get(&pool, &operation.operation_id)
+        .await
+        .expect_err("malformed stored termination evidence must fail explicitly");
+    assert_eq!(malformed.code(), Code::Internal);
 
     Ok(())
 }

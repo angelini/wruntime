@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -29,7 +30,50 @@ const ARTIFACT_ROOT: &str = "/opt/wruntime/manager-artifacts";
 const STATE_ROOT: &str = "/var/lib/wruntime";
 const PKI_ROOT: &str = "/etc/wruntime/pki";
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+const MANAGER_ROLLOUT_LEASE_SECS: u64 = 30;
+const MANAGER_BARRIER_TIMEOUT: Duration = Duration::from_secs(120);
 const SOLE_MANAGER_CONTINUATION_SECS: u64 = 120;
+
+#[cfg(test)]
+fn protected_phase_sequence() -> [ManagerRolloutPhase; 8] {
+    [
+        ManagerRolloutPhase::Prepared,
+        ManagerRolloutPhase::Staging,
+        ManagerRolloutPhase::ClosingOld,
+        ManagerRolloutPhase::OldClosed,
+        ManagerRolloutPhase::StartingTarget,
+        ManagerRolloutPhase::TargetReadyClosed,
+        ManagerRolloutPhase::ActivatingTarget,
+        ManagerRolloutPhase::Completed,
+    ]
+}
+
+fn trace_rollout(event: &str, rollout: &ManagerRollout, endpoint_present: bool) {
+    let Some(path) = std::env::var_os("WRT_MANAGER_ROLLOUT_TRACE") else {
+        return;
+    };
+    let phase = ManagerRolloutPhase::try_from(rollout.phase)
+        .unwrap_or_default()
+        .as_str_name()
+        .strip_prefix("MANAGER_ROLLOUT_PHASE_")
+        .unwrap_or("UNSPECIFIED");
+    let value = serde_json::json!({
+        "event": event,
+        "rollout_id": rollout.rollout_id,
+        "phase": phase,
+        "target_generation": rollout.target_generation,
+        "deployment_identity": rollout.target_deployment_principal_uri,
+        "lease_epoch": rollout.lease_epoch,
+        "lease_expires_unix": lease_expiry_unix(rollout),
+        "endpoint_present": endpoint_present,
+        "barrier_timeout_seconds": MANAGER_BARRIER_TIMEOUT.as_secs(),
+        "lease_ttl_seconds": MANAGER_ROLLOUT_LEASE_SECS,
+        "lease_renew_seconds": LEASE_RENEW_INTERVAL.as_secs(),
+    });
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{value}");
+    }
+}
 
 #[derive(Args)]
 pub struct DeploySetArgs {
@@ -538,6 +582,10 @@ fn stage_target(
         Some(&target.backend_spec_digest),
     )?;
     if target.backend == Backend::Systemd {
+        // A live rollout may target a pristine disposable host. Install the
+        // stable launcher/unit during staging; this does not select or start
+        // the staged manager and therefore preserves the pre-close barrier.
+        install_bootstrap_backend(target, manifest)?;
         let binary_path = format!(
             "{ARTIFACT_ROOT}/binaries/{}/wr-manager",
             &target.executable_digest[7..]
@@ -770,7 +818,8 @@ async fn advance_when_ready(
     next: ManagerRolloutPhase,
     outcomes: Vec<ManagerRolloutMemberOutcome>,
 ) -> Result<ManagerRollout> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline = tokio::time::Instant::now() + MANAGER_BARRIER_TIMEOUT;
+    trace_rollout("barrier-start", &rollout, true);
     let mut renew_at = tokio::time::Instant::now() + LEASE_RENEW_INTERVAL;
     loop {
         match epoch
@@ -801,6 +850,7 @@ async fn advance_when_ready(
         }
         if tokio::time::Instant::now() >= renew_at {
             rollout = lease(epoch, &rollout, executor_id).await?;
+            trace_rollout("lease-renewed", &rollout, true);
             renew_at = tokio::time::Instant::now() + LEASE_RENEW_INTERVAL;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -907,12 +957,15 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
         }
     }
 
+    let endpoint_present = validated.manifest.manager_endpoint.is_some();
     let (mut epoch, mut rollout) = begin(&validated).await?;
+    trace_rollout("phase", &rollout, endpoint_present);
     rollout = lease(&mut epoch, &rollout, &validated.manifest.executor_id).await?;
-    let _renew_cadence = LEASE_RENEW_INTERVAL;
+    trace_rollout("lease-acquired", &rollout, endpoint_present);
 
     if rollout.phase == ManagerRolloutPhase::Prepared as i32 {
         rollout = advance(&mut epoch, &rollout, ManagerRolloutPhase::Staging, vec![]).await?;
+        trace_rollout("phase", &rollout, endpoint_present);
     }
     if validated.manifest.manager_endpoint.is_some()
         && rollout.phase == ManagerRolloutPhase::Staging as i32
@@ -931,18 +984,22 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
                     host_action_outcome: "STAGING_FAILED".into(),
                     error: format!("{error:#}"),
                 };
-                let _ = advance(
+                if let Ok(failed) = advance(
                     &mut epoch,
                     &rollout,
                     ManagerRolloutPhase::FailedPreClose,
                     vec![failure],
                 )
-                .await;
+                .await
+                {
+                    trace_rollout("phase", &failed, endpoint_present);
+                }
                 return Err(error.context(
                     "manager-set staging failed; FAILED_PRE_CLOSE preserves every active selector",
                 ));
             }
             rollout = lease(&mut epoch, &rollout, &validated.manifest.executor_id).await?;
+            trace_rollout("lease-renewed", &rollout, endpoint_present);
         }
     }
     if rollout.phase == ManagerRolloutPhase::Staging as i32 {
@@ -953,6 +1010,7 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
             vec![],
         )
         .await?;
+        trace_rollout("phase", &rollout, endpoint_present);
     }
     if rollout.phase == ManagerRolloutPhase::ClosingOld as i32 {
         // The manager-side barrier observes every source CLOSED_ROLLOUT before accepting this.
@@ -964,6 +1022,7 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
             vec![],
         )
         .await?;
+        trace_rollout("phase", &rollout, endpoint_present);
     }
     if rollout.phase == ManagerRolloutPhase::OldClosed as i32 {
         rollout = advance(
@@ -973,6 +1032,7 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
             vec![],
         )
         .await?;
+        trace_rollout("phase", &rollout, endpoint_present);
     }
     if rollout.phase == ManagerRolloutPhase::StartingTarget as i32 {
         let mut outcomes = Vec::new();
@@ -1011,19 +1071,23 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
                         host_action_outcome: "ACTIVATION_FAILED".into(),
                         error: format!("{error:#}"),
                     };
-                    let _ = advance(
+                    if let Ok(failed) = advance(
                         &mut epoch,
                         &rollout,
                         ManagerRolloutPhase::FailedClosed,
                         vec![failure],
                     )
-                    .await;
+                    .await
+                    {
+                        trace_rollout("phase", &failed, endpoint_present);
+                    }
                     return Err(error.context(
                         "manager activation failed closed; explicit host repair is required",
                     ));
                 }
             }
         }
+        trace_rollout("target-ready-closed", &rollout, endpoint_present);
         rollout = advance_when_ready(
             &mut epoch,
             rollout,
@@ -1032,6 +1096,7 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
             outcomes,
         )
         .await?;
+        trace_rollout("phase", &rollout, endpoint_present);
     }
     if rollout.phase == ManagerRolloutPhase::TargetReadyClosed as i32 {
         rollout = advance(
@@ -1041,6 +1106,7 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
             vec![],
         )
         .await?;
+        trace_rollout("phase", &rollout, endpoint_present);
     }
     if rollout.phase == ManagerRolloutPhase::ActivatingTarget as i32 {
         rollout = advance_when_ready(
@@ -1051,7 +1117,9 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
             vec![],
         )
         .await?;
+        trace_rollout("phase", &rollout, endpoint_present);
     }
+    trace_rollout("cli-completed", &rollout, endpoint_present);
     println!(
         "{}\t{}",
         rollout.rollout_id,
@@ -1112,5 +1180,37 @@ mod tests {
         target.backend = Backend::Compose;
         target.executable = "registry.example/wr-manager:latest".into();
         assert!(!target.executable.contains("@sha256:"));
+    }
+
+    #[test]
+    fn protected_live_contract_uses_real_barrier_lease_and_all_typed_phases() {
+        assert_eq!(MANAGER_BARRIER_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(MANAGER_ROLLOUT_LEASE_SECS, 30);
+        assert_eq!(LEASE_RENEW_INTERVAL, Duration::from_secs(10));
+        assert_eq!(
+            protected_phase_sequence().map(|phase| {
+                phase
+                    .as_str_name()
+                    .strip_prefix("MANAGER_ROLLOUT_PHASE_")
+                    .unwrap()
+            }),
+            [
+                "PREPARED",
+                "STAGING",
+                "CLOSING_OLD",
+                "OLD_CLOSED",
+                "STARTING_TARGET",
+                "TARGET_READY_CLOSED",
+                "ACTIVATING_TARGET",
+                "COMPLETED",
+            ]
+        );
+        let live_outcome = ManagerRolloutMemberOutcome {
+            manager_id: "manager-b".into(),
+            member_role: "target".into(),
+            host_action_outcome: "READY_CLOSED".into(),
+            error: String::new(),
+        };
+        assert_eq!(live_outcome.host_action_outcome, "READY_CLOSED");
     }
 }

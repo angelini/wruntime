@@ -35,36 +35,63 @@ def node(status: dict[str, Any], node_id: str) -> dict[str, Any]:
     return one(status.get("nodes", []), f"node {node_id!r}", lambda item: item.get("node_id") == node_id)
 
 
-def expected_module(deployment: dict[str, Any], slot: str, version: str) -> dict[str, Any]:
+def expected_slots(args) -> list[str]:
+    value = args.engine_slot
+    slots = [value] if isinstance(value, str) else list(value or ["engine"])
+    if len(slots) != len(set(slots)):
+        raise AssertionFailure("duplicate expected engine slot")
+    return slots
+
+
+def expected_modules(deployment: dict[str, Any], slots: list[str], version: str) -> None:
     engines = deployment.get("expected_engines", [])
-    engine = one(engines, f"desired engine slot {slot!r}", lambda item: item.get("engine_slot") == slot)
-    if len(engines) != 1:
+    if len(engines) != len(slots) or {item.get("engine_slot") for item in engines} != set(slots):
         raise AssertionFailure("desired deployment engine inventory is not exact")
-    modules = engine.get("modules", [])
-    module = one(
-        modules,
-        f"deployment.echo@{version}",
-        lambda item: item.get("namespace") == "deployment" and item.get("name") == "echo" and item.get("version") == version,
-    )
-    if len(modules) != 1:
-        raise AssertionFailure("desired deployment module inventory is not exact")
-    return module
+    for slot in slots:
+        engine = one(engines, f"desired engine slot {slot!r}", lambda item: item.get("engine_slot") == slot)
+        modules = engine.get("modules", [])
+        one(
+            modules,
+            f"deployment.echo@{version}",
+            lambda item: item.get("namespace") == "deployment" and item.get("name") == "echo" and item.get("version") == version,
+        )
+        if len(modules) != 1:
+            raise AssertionFailure("desired deployment module inventory is not exact")
 
 
-def assert_routes(status: dict[str, Any], version: str) -> None:
-    service = one(
-        status.get("services", []),
-        f"deployment.echo@{version} service",
-        lambda item: isinstance(item.get("service"), dict)
+def assert_routes(
+    status: dict[str, Any],
+    version: str,
+    desired_routes: int,
+    healthy_routes: int | None = None,
+    unhealthy_routes: int = 0,
+) -> None:
+    echo_services = [
+        item for item in status.get("services", [])
+        if isinstance(item.get("service"), dict)
         and item["service"].get("namespace") == "deployment"
         and item["service"].get("name") == "echo"
-        and item["service"].get("version") == version,
+    ]
+    service = one(
+        echo_services,
+        f"deployment.echo@{version} service",
+        lambda item: item["service"].get("version") == version,
     )
-    if service.get("desired_routes") != 1 or service.get("healthy_routes") != 1 or service.get("unhealthy_routes") != 0:
-        raise AssertionFailure("desired echo route counts are not exactly 1 healthy and 0 unhealthy")
-    desired = [route for route in service.get("routes", []) if route.get("desired")]
-    if len(desired) != 1 or not desired[0].get("healthy"):
-        raise AssertionFailure("authoritative desired echo route is not healthy")
+    if len(echo_services) != 1:
+        raise AssertionFailure("echo service version inventory is not exact")
+    healthy_routes = desired_routes if healthy_routes is None else healthy_routes
+    if (
+        service.get("desired_routes") != desired_routes
+        or service.get("healthy_routes") != healthy_routes
+        or service.get("unhealthy_routes") != unhealthy_routes
+    ):
+        raise AssertionFailure("desired echo route counts do not match the exact inventory")
+    routes = service.get("routes", [])
+    desired = [route for route in routes if route.get("desired")]
+    if len(routes) != desired_routes or len(desired) != desired_routes:
+        raise AssertionFailure("authoritative desired echo route inventory is not exact")
+    if sum(route.get("healthy") is True for route in desired) != healthy_routes:
+        raise AssertionFailure("authoritative desired echo route health is not exact")
 
 
 def assert_manager(status: dict[str, Any], address: str) -> dict[str, Any]:
@@ -81,33 +108,42 @@ def assert_desired(status: dict[str, Any], args) -> dict[str, Any]:
         raise AssertionFailure("node has no desired deployment")
     if desired.get("state") != "succeeded" or desired.get("bundle_digest") != args.digest:
         raise AssertionFailure("desired deployment state or digest mismatch")
-    expected_module(desired, args.engine_slot, args.version)
+    slots = expected_slots(args)
+    expected_modules(desired, slots, args.version)
     revision = desired.get("revision")
     engines = [
         engine for engine in selected.get("engines", [])
         if isinstance(engine.get("deployment"), dict)
-        and engine["deployment"].get("engine_slot") == args.engine_slot
         and engine["deployment"].get("revision") == revision
         and engine["deployment"].get("bundle_digest") == args.digest
         and engine.get("authoritative_for_desired_revision")
     ]
-    engine = one(engines, "authoritative desired engine", lambda _: True)
-    if engine.get("severity") != "healthy" or not engine.get("last_heartbeat"):
-        raise AssertionFailure("authoritative engine is not freshly healthy")
-    modules = engine.get("modules", [])
-    module = one(
-        modules, "authoritative echo module",
-        lambda item: isinstance(item.get("module"), dict)
-        and item["module"].get("namespace") == "deployment"
-        and item["module"].get("name") == "echo"
-        and item["module"].get("version") == args.version,
-    )
-    if len(modules) != 1:
-        raise AssertionFailure("authoritative engine module inventory is not exact")
-    if module.get("severity") != "healthy" or not module.get("last_healthy"):
-        raise AssertionFailure("authoritative echo module is not freshly healthy")
-    assert_routes(status, args.version)
-    return {"revision": revision, "digest": args.digest, "version": args.version}
+    observed_slots = [
+        engine.get("deployment", {}).get("engine_slot")
+        for engine in selected.get("engines", [])
+        if isinstance(engine.get("deployment"), dict)
+    ]
+    if len(observed_slots) != len(set(observed_slots)) or set(observed_slots) != set(slots):
+        raise AssertionFailure("observed engine inventory is not exact (duplicate, extra, or stale slots)")
+    if len(engines) != len(slots) or {engine["deployment"]["engine_slot"] for engine in engines} != set(slots):
+        raise AssertionFailure("authoritative desired engine inventory is not exact")
+    for engine in engines:
+        if engine.get("severity") != "healthy" or not engine.get("last_heartbeat"):
+            raise AssertionFailure("authoritative engine is not freshly healthy")
+        modules = engine.get("modules", [])
+        module = one(
+            modules, "authoritative echo module",
+            lambda item: isinstance(item.get("module"), dict)
+            and item["module"].get("namespace") == "deployment"
+            and item["module"].get("name") == "echo"
+            and item["module"].get("version") == args.version,
+        )
+        if len(modules) != 1:
+            raise AssertionFailure("authoritative engine module inventory is not exact")
+        if module.get("severity") != "healthy" or not module.get("last_healthy"):
+            raise AssertionFailure("authoritative echo module is not freshly healthy")
+    assert_routes(status, args.version, len(slots))
+    return {"revision": revision, "digest": args.digest, "version": args.version, "engine_slots": slots}
 
 
 def assert_failed(status: dict[str, Any], args) -> dict[str, Any]:
@@ -170,6 +206,8 @@ def assert_unhealthy(status: dict[str, Any], args) -> dict[str, Any]:
     expected = set(args.condition)
     if not observed.intersection(expected):
         raise AssertionFailure(f"none of the expected condition codes were present: {sorted(expected)}")
+    if getattr(args, "version", None) is not None:
+        assert_routes(status, args.version, args.desired_routes, args.healthy_routes, args.unhealthy_routes)
     return {"severity": "unhealthy", "condition_codes": sorted(observed.intersection(expected))}
 
 
@@ -200,7 +238,7 @@ def parser() -> argparse.ArgumentParser:
         if name in {"desired", "rollback"}:
             command.add_argument("--digest", required=True)
             command.add_argument("--version", required=True)
-            command.add_argument("--engine-slot", default="engine")
+            command.add_argument("--engine-slot", action="append")
     failed = commands.choices["failed"]
     failed.add_argument("--serving-digest", required=True)
     failed.add_argument("--failed-digest", required=True)
@@ -215,6 +253,10 @@ def parser() -> argparse.ArgumentParser:
         action="append",
         default=["MISSING_ENGINE", "REVISION_MISMATCH", "STALE_ENGINE_HEARTBEAT", "STALE_MODULE_HEARTBEAT"],
     )
+    unhealthy.add_argument("--version")
+    unhealthy.add_argument("--desired-routes", type=int, default=1)
+    unhealthy.add_argument("--healthy-routes", type=int, default=0)
+    unhealthy.add_argument("--unhealthy-routes", type=int, default=1)
     rollback = commands.choices["rollback"]
     rollback.add_argument("--source-revision", required=True, type=int)
     rollback.add_argument("--after-revision", required=True, type=int)

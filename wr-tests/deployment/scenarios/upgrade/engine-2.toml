@@ -1,0 +1,26 @@
+listen_address = "127.0.0.1:9101"
+
+[node]
+proxy_address   = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_address    = "https://127.0.0.1:9443"
+
+[database]
+url = "postgres://postgres@127.0.0.1:5432/wruntime_deployment_e2e"
+
+[job_admin]
+listen_address    = "0.0.0.0:9151"
+advertise_address = "https://127.0.0.1:9151/"
+queue_id          = "deployment-jobs"
+
+[job_admin.tls]
+cert_path           = "certs/job-admin-delegation/node.crt"
+key_path            = "certs/job-admin-delegation/node.key"
+client_ca_cert_path = "certs/client-root/ca.crt"
+
+[[module]]
+name        = "echo"
+namespace   = "deployment"
+version     = "2.0.0"
+wasm_path   = "examples/multi-node/echo/target/wasm32-wasip2/debug/echo.wasm"
+schema_path = "examples/multi-node/echo/schemas/echo.binpb"

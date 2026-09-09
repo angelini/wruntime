@@ -6,12 +6,13 @@ use uuid::Uuid;
 use wr_common::agent_policy::{AgentPolicy, AgentPolicyBackend};
 use wr_common::deployment_contract::deployment_operation_id;
 use wr_common::wruntime::{
-    AgentInstruction, BackendKind, BackendProcessState, ClaimOperationResponse,
-    CleanupReleaseEvidence, DeploymentCondition, InstructionTarget, InstructionTargetKind,
-    NodeAgentAttestation, NodeAgentPolicy, NodeOperation, NodeOperationAction, NodeOperationPhase,
-    NodeOperationState, NodeOperationStepKind, OperationEvent, OperationSlotProgress,
-    ProcessLifecycleState, ReportNodeObservationRequest, ReportStepResultRequest, RolloutPolicy,
-    ServiceKind, SlotAuthorityStatus, SlotObservation, SubmitOperationRequest,
+    AgentInstruction, BackendKind, BackendProcessState, BackendTerminationEvidence,
+    ClaimOperationResponse, CleanupReleaseEvidence, DeploymentCondition, InstructionTarget,
+    InstructionTargetKind, NodeAgentAttestation, NodeAgentPolicy, NodeOperation,
+    NodeOperationAction, NodeOperationPhase, NodeOperationState, NodeOperationStepKind,
+    OperationEvent, OperationSlotProgress, ProcessLifecycleState, ReportNodeObservationRequest,
+    ReportStepResultRequest, RolloutPolicy, ServiceKind, SlotAuthorityStatus, SlotObservation,
+    SubmitOperationRequest,
 };
 
 const LEASE_SECONDS: f64 = 15.0;
@@ -173,7 +174,7 @@ where
                     proxy_effect_observed_revision, proxy_effect_observed_digest,
                     proxy_effect_observed_resolved_digest, proxy_effect_backend_instance_id,
                     proxy_effect_process_instance_id, proxy_effect_condition_code,
-                    proxy_effect_detail
+                    proxy_effect_detail, proxy_effect_termination_evidence
              FROM wr_node_operations WHERE operation_id = $1",
             &[&operation_id],
         )
@@ -189,7 +190,8 @@ where
                     serving_converged, changed, effect_ambiguous, effect_delivered_at,
                     effect_reported, effect_observed_revision, effect_observed_digest,
                     effect_observed_resolved_digest, effect_backend_instance_id,
-                    effect_process_instance_id, effect_condition_code, effect_detail
+                    effect_process_instance_id, effect_condition_code, effect_detail,
+                    effect_termination_evidence
              FROM wr_node_operation_slots WHERE operation_id = $1 ORDER BY rollout_order",
             &[&operation_id],
         )
@@ -273,6 +275,9 @@ fn operation_from_row(row: &Row, slots: &[Row]) -> Result<NodeOperation, Status>
                     target_resolved_release_digest: slot.get("target_resolved_digest"),
                     effect_observed_resolved_release_digest: slot
                         .get("effect_observed_resolved_digest"),
+                    termination_evidence: decode_termination_evidence(
+                        slot.get("effect_termination_evidence"),
+                    )?,
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?,
@@ -329,7 +334,21 @@ fn operation_from_row(row: &Row, slots: &[Row]) -> Result<NodeOperation, Status>
         proxy_effect_process_instance_id: row.get("proxy_effect_process_instance_id"),
         proxy_effect_condition_code: row.get("proxy_effect_condition_code"),
         proxy_effect_detail: row.get("proxy_effect_detail"),
+        termination_evidence: decode_termination_evidence(
+            row.get("proxy_effect_termination_evidence"),
+        )?,
     })
+}
+
+fn decode_termination_evidence(
+    bytes: Option<Vec<u8>>,
+) -> Result<Option<BackendTerminationEvidence>, Status> {
+    bytes
+        .map(|bytes| BackendTerminationEvidence::decode(bytes.as_slice()))
+        .transpose()
+        .map_err(|error| {
+            Status::internal(format!("stored termination evidence is invalid: {error}"))
+        })
 }
 
 async fn append_event<C: GenericClient + Sync>(
@@ -659,35 +678,20 @@ pub async fn submit(
             "withdrawing the last healthy source slot requires allow_downtime",
         ));
     }
-    let mut slots = if deployment_action {
-        source_slots
-            .iter()
-            .chain(target_slots.iter())
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        requested
-    };
-    slots.sort();
-    slots.dedup();
+    let slots = ordered_operation_slots(
+        action,
+        &source_slots,
+        &target_slots,
+        if deployment_action {
+            None
+        } else {
+            Some(requested)
+        },
+        &policy.canary_slot,
+    );
     if slots.is_empty() && action != NodeOperationAction::Scale {
         return Err(Status::invalid_argument("operation has no affected slots"));
     }
-    // Scale-out capacity lands first, retained slots roll next, and scale-in
-    // removals happen last. The canary is first only within its safety group.
-    slots.sort_by_key(|slot| {
-        let group = if action == NodeOperationAction::Scale {
-            match (source_slots.contains(slot), target_slots.contains(slot)) {
-                (false, true) => 0,
-                (true, true) => 1,
-                (true, false) => 2,
-                (false, false) => 3,
-            }
-        } else {
-            0
-        };
-        (group, slot != &policy.canary_slot, slot.clone())
-    });
     if deployment_action {
         transaction
             .execute(
@@ -2744,7 +2748,12 @@ where
             "SELECT node_id, engine_slot, lifecycle_status, backend_state,
                     backend_instance_id, observed_revision, observed_at, observed_digest,
                     observed_resolved_digest, backend_query_error, operation_id,
-                    agent_instance_id, lease_epoch
+                    agent_instance_id, lease_epoch,
+                    (SELECT effect_termination_evidence
+                       FROM wr_node_operation_slots effects
+                      WHERE effects.operation_id = wr_node_slot_observations.operation_id
+                        AND effects.engine_slot = wr_node_slot_observations.engine_slot)
+                        AS termination_evidence
              FROM wr_node_slot_observations
              WHERE ($1 = '' OR node_id = $1) AND ($2 = '' OR engine_slot = $2)
              ORDER BY node_id, engine_slot",
@@ -2793,6 +2802,7 @@ where
                 agent_instance_id: row.get("agent_instance_id"),
                 lease_epoch: row.get::<_, i64>("lease_epoch") as u64,
                 observed_resolved_release_digest: row.get("observed_resolved_digest"),
+                termination_evidence: decode_termination_evidence(row.get("termination_evidence"))?,
             })
         })
         .collect()
@@ -3145,6 +3155,11 @@ pub async fn report_step(
     let reported_step =
         NodeOperationStepKind::try_from(request.step).unwrap_or(NodeOperationStepKind::Unspecified);
     let result_payload = request.encode_to_vec();
+    let termination_evidence = request
+        .termination_evidence
+        .as_ref()
+        .map(Message::encode_to_vec);
+    let is_stop_result = reported_step == NodeOperationStepKind::StopBackend;
     let mut client = pool.get().await.map_err(internal)?;
     let transaction = client.transaction().await.map_err(internal)?;
     transaction
@@ -3361,7 +3376,10 @@ pub async fn report_step(
                          proxy_process_instance_id = CASE
                              WHEN $8 <> '' THEN $8 ELSE proxy_process_instance_id END,
                          proxy_effect_condition_code = '', proxy_effect_detail = '',
-                         proxy_effect_delivered_at = NULL, updated_at = NOW()
+                         proxy_effect_delivered_at = NULL,
+                         proxy_effect_termination_evidence = CASE
+                             WHEN $9 THEN $10 ELSE proxy_effect_termination_evidence END,
+                         updated_at = NOW()
                      WHERE operation_id = $1",
                     &[
                         &id,
@@ -3374,6 +3392,8 @@ pub async fn report_step(
                         &request.observed_resolved_release_digest,
                         &request.backend_instance_id,
                         &request.process_instance_id,
+                        &is_stop_result,
+                        &termination_evidence,
                     ],
                 )
                 .await
@@ -3500,6 +3520,8 @@ pub async fn report_step(
                      effect_observed_revision = $5, effect_observed_digest = $6,
                      effect_observed_resolved_digest = $9,
                      effect_backend_instance_id = $7, effect_process_instance_id = $8,
+                     effect_termination_evidence = CASE
+                         WHEN $10 THEN $11 ELSE effect_termination_evidence END,
                      updated_at = NOW() WHERE operation_id = $1 AND engine_slot = $2",
                 &[
                     &id,
@@ -3512,6 +3534,8 @@ pub async fn report_step(
                     &request.backend_instance_id,
                     &request.process_instance_id,
                     &request.observed_resolved_release_digest,
+                    &is_stop_result,
+                    &termination_evidence,
                 ],
             )
             .await
@@ -3966,9 +3990,72 @@ pub async fn authorities(pool: &Pool, node_id: &str) -> Result<Vec<SlotAuthority
         .collect())
 }
 
+fn ordered_operation_slots(
+    action: NodeOperationAction,
+    source_slots: &[String],
+    target_slots: &[String],
+    requested: Option<Vec<String>>,
+    canary_slot: &str,
+) -> Vec<String> {
+    let mut slots = requested.unwrap_or_else(|| {
+        source_slots
+            .iter()
+            .chain(target_slots.iter())
+            .cloned()
+            .collect()
+    });
+    slots.sort();
+    slots.dedup();
+    // Scale-out capacity lands first, retained slots roll next, and scale-in
+    // removals happen last. The canary is first only within its safety group.
+    slots.sort_by_key(|slot| {
+        let group = if action == NodeOperationAction::Scale {
+            match (source_slots.contains(slot), target_slots.contains(slot)) {
+                (false, true) => 0,
+                (true, true) => 1,
+                (true, false) => 2,
+                (false, false) => 3,
+            }
+        } else {
+            0
+        };
+        (group, slot != canary_slot, slot.clone())
+    });
+    slots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scale_orders_add_before_retain_and_retain_before_remove() {
+        let one = vec!["engine-1".to_string()];
+        let two = vec!["engine-1".to_string(), "engine-2".to_string()];
+        assert_eq!(
+            ordered_operation_slots(NodeOperationAction::Scale, &one, &two, None, "engine-1"),
+            ["engine-2", "engine-1"]
+        );
+        assert_eq!(
+            ordered_operation_slots(NodeOperationAction::Scale, &two, &one, None, "engine-1"),
+            ["engine-1", "engine-2"]
+        );
+    }
+
+    #[test]
+    fn equal_slot_upgrade_keeps_stable_inventory_order() {
+        let slots = vec!["engine-1".to_string(), "engine-2".to_string()];
+        assert_eq!(
+            ordered_operation_slots(
+                NodeOperationAction::RollingUpgrade,
+                &slots,
+                &slots,
+                None,
+                "engine-1",
+            ),
+            slots
+        );
+    }
 
     #[test]
     fn action_specific_sequences_are_not_one_generic_list() {

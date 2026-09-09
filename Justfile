@@ -277,7 +277,21 @@ deployment-e2e-python-test:
     uv run --project dev/deployment-e2e --locked python -m unittest -v \
         dev/deployment-e2e/test_proxmox.py \
         dev/deployment-e2e/test_assert_cluster.py \
-        dev/deployment-e2e/test_lifecycle_logging.py
+        dev/deployment-e2e/test_assert_operation.py \
+        dev/deployment-e2e/test_lifecycle_logging.py \
+        dev/deployment-e2e/test_lifecycle_contract.py
+
+# Authoritative fast deployment contract gate; never contacts protected hosts.
+deployment-e2e-contract-test:
+    just deployment-e2e-python-test
+    cargo test -p wr-cli cmd::node_backend
+    cargo test -p wr-cli cmd::node
+    cargo test -p wr-cli cmd::operations
+    cargo test -p wr-cli cmd::manager_deploy_set
+    cargo test -p wr-manager operations
+    just test-one operation_test
+    just test-one manager_test
+    just test-one multi_manager_test
 
 # Test same-host exclusion for fixed-port local E2E runners
 test-local-e2e-lock:
@@ -305,7 +319,8 @@ test-lifecycle-runners:
 deployment-e2e-preflight:
     uv run --project dev/deployment-e2e --locked python dev/deployment-e2e/proxmox.py preflight
 
-# Run both deployment lifecycle backends serially against disposable VMs
+# Protected gate: node lifecycle under systemd+Docker and manager A→B→A under systemd.
+# Compose manager deploy-set remains unqualified pending immutable image distribution.
 deployment-e2e:
     bash dev/validate-deployment-lifecycle.sh
 

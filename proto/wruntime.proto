@@ -490,6 +490,26 @@ enum BackendProcessState {
   BACKEND_PROCESS_STATE_QUERY_ERROR = 3;
 }
 
+// Backend-neutral proof collected for the exact process identity pinned before
+// a stop effect. UNKNOWN is deliberately fail-closed for incomplete facts.
+enum BackendStopDisposition {
+  BACKEND_STOP_DISPOSITION_UNKNOWN = 0;
+  BACKEND_STOP_DISPOSITION_GRACEFUL = 1;
+  BACKEND_STOP_DISPOSITION_FORCED = 2;
+}
+
+message BackendTerminationEvidence {
+  BackendKind backend = 1;
+  string backend_instance_id = 2;
+  string process_instance_id = 3;
+  bool graceful_termination_requested = 4;
+  bool kill_escalated = 5;
+  BackendStopDisposition disposition = 6;
+  string terminal_result = 7;
+  optional int32 exit_code = 8;
+  optional int32 signal = 9;
+}
+
 message InstructionTarget {
   InstructionTargetKind kind = 1;
   string engine_slot = 2;
@@ -535,6 +555,7 @@ message OperationSlotProgress {
   string source_resolved_release_digest = 26;
   string target_resolved_release_digest = 27;
   string effect_observed_resolved_release_digest = 28;
+  BackendTerminationEvidence termination_evidence = 29;
 }
 
 message NodeOperation {
@@ -588,6 +609,7 @@ message NodeOperation {
   string proxy_effect_condition_code = 48;
   string proxy_effect_detail = 49;
   string revision_digest = 50;
+  BackendTerminationEvidence termination_evidence = 51;
 }
 
 message OperationEvent {
@@ -643,6 +665,7 @@ message SlotObservation {
   string agent_instance_id = 11;
   uint64 lease_epoch = 12;
   string observed_resolved_release_digest = 13;
+  BackendTerminationEvidence termination_evidence = 14;
 }
 message SlotAuthorityStatus {
   string node_id = 1;
@@ -777,6 +800,7 @@ message ReportStepResultRequest {
   string backend_query_error = 13;
   CleanupReleaseEvidence cleanup_evidence = 14;
   string observed_resolved_release_digest = 15;
+  BackendTerminationEvidence termination_evidence = 16;
 }
 message ReportStepResultResponse { NodeOperation operation = 1; }
 

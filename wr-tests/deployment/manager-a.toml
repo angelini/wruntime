@@ -1,0 +1,28 @@
+manager_id                    = "manager-a"
+listen_address                = "0.0.0.0:9000"
+engine_heartbeat_timeout_secs = 8
+module_heartbeat_timeout_secs = 8
+local_proxy_address           = "http://127.0.0.1:9001"
+
+[tls]
+cert_path           = "certs/manager.crt"
+key_path            = "certs/manager.key"
+client_ca_cert_path = "certs/client-root/ca.crt"
+
+[client_tls]
+cert_path           = "certs/manager-client/leaf.pem"
+key_path            = "certs/manager-client/key.pem"
+server_ca_cert_path = "certs/server-root/ca.crt"
+
+[authorization]
+policy_file = "policy/authorization.toml"
+
+[database]
+url             = "postgres://postgres@127.0.0.1:5432/wruntime_deployment_e2e"
+max_connections = 10
+
+[cluster]
+advertise_grpc_address                = "https://127.0.0.1:9000"
+manager_heartbeat_interval_secs       = 1
+manager_liveness_threshold_secs       = 5
+manager_stale_row_reap_threshold_secs = 300

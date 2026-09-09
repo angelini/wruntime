@@ -20,9 +20,9 @@ use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::watch;
 use wr_common::wruntime::{
-    AgentInstruction, BackendProcessState, CleanupReleaseEvidence, InstructionTargetKind,
-    LifecycleStatus, NodeOperationStepKind, ProcessLifecycleState, ReleaseInventoryEntry,
-    ServiceKind,
+    AgentInstruction, BackendProcessState, BackendStopDisposition, BackendTerminationEvidence,
+    CleanupReleaseEvidence, InstructionTargetKind, LifecycleStatus, NodeOperationStepKind,
+    ProcessLifecycleState, ReleaseInventoryEntry, ServiceKind,
 };
 
 use super::bundle_integrity::{verify_resolved_release, BundleManifest};
@@ -31,6 +31,11 @@ use crate::client;
 pub type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 const COMMAND_BUDGET: Duration = Duration::from_secs(45);
+const STOP_BUDGET: Duration = Duration::from_secs(90);
+const STOP_GRACE_BUDGET: Duration = Duration::from_secs(45);
+const STOP_ESCALATION_BUDGET: Duration = Duration::from_secs(15);
+const STOP_INSPECTION_BUDGET: Duration = Duration::from_secs(15);
+const STOP_MARGIN: Duration = Duration::from_secs(15);
 const INSPECTION_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -117,6 +122,9 @@ pub struct BackendObservation {
     pub state: BackendProcessState,
     pub instance_id: String,
     pub query_error: String,
+    pub terminal_result: String,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
 }
 
 impl BackendObservation {
@@ -125,6 +133,9 @@ impl BackendObservation {
             state: BackendProcessState::QueryError,
             instance_id: String::new(),
             query_error: error.to_string(),
+            terminal_result: String::new(),
+            exit_code: None,
+            signal: None,
         }
     }
 }
@@ -140,6 +151,7 @@ pub struct StepEvidence {
     pub backend_query_error: String,
     pub lifecycle: Option<LifecycleStatus>,
     pub cleanup_evidence: Option<CleanupReleaseEvidence>,
+    pub termination: Option<BackendTerminationEvidence>,
 }
 
 pub trait InstructionExecutor: Send + Sync {
@@ -559,6 +571,7 @@ impl HostBackend {
                 .unwrap_or_default(),
             lifecycle,
             cleanup_evidence: None,
+            termination: None,
         }
     }
 
@@ -618,6 +631,7 @@ impl HostBackend {
                 .unwrap_or_default(),
             lifecycle,
             cleanup_evidence: None,
+            termination: None,
         }
     }
 
@@ -646,7 +660,7 @@ impl HostBackend {
             [
                 "show",
                 unit,
-                "--property=LoadState,ActiveState,SubState,InvocationID",
+                "--property=LoadState,ActiveState,SubState,InvocationID,Result,ExecMainCode,ExecMainStatus",
                 "--no-pager",
             ],
         )
@@ -786,6 +800,183 @@ impl HostBackend {
             bail!("backend {} failed with status {status}", action.name());
         }
         Ok(())
+    }
+
+    fn docker_signal_command(
+        &self,
+        signal: &str,
+        slot: &ReleaseSlot,
+        release: &Path,
+    ) -> Result<Command> {
+        let binary = self
+            .config
+            .docker_path
+            .as_deref()
+            .context("docker_path missing")?;
+        let project = self
+            .config
+            .compose_project
+            .as_deref()
+            .context("compose project missing")?;
+        let compose = release.join("docker/docker-compose.yml");
+        let mut command = constrained_command(
+            binary,
+            [
+                "compose",
+                "-p",
+                project,
+                "-f",
+                compose.to_string_lossy().as_ref(),
+                "kill",
+                "--signal",
+                signal,
+                &slot.docker_service,
+            ],
+        );
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        Ok(command)
+    }
+
+    async fn wait_for_terminal_backend(
+        &self,
+        slot: &ReleaseSlot,
+        release: &Path,
+        deadline: tokio::time::Instant,
+        mut cancelled: watch::Receiver<bool>,
+    ) -> Result<Option<BackendObservation>> {
+        loop {
+            let observation = self
+                .inspect_backend(slot, &Some(release.to_path_buf()))
+                .await;
+            if observation.query_error.is_empty()
+                && observation.state == BackendProcessState::Exited
+            {
+                return Ok(Some(observation));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::select! {
+                changed = cancelled.changed() => {
+                    if changed.is_err() || *cancelled.borrow() {
+                        bail!("backend terminal inspection was cancelled by the lease guard");
+                    }
+                }
+                () = tokio::time::sleep(INSPECTION_INTERVAL) => {}
+            }
+        }
+    }
+
+    async fn run_stop_effect(
+        &self,
+        slot: &ReleaseSlot,
+        release: &Path,
+        cancelled: watch::Receiver<bool>,
+    ) -> Result<(BackendObservation, bool)> {
+        let stop_deadline = tokio::time::Instant::now() + STOP_BUDGET;
+        match self.config.backend {
+            BackendType::Systemd => {
+                let mut command = self.effect_command(EffectAction::Stop, slot, release)?;
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+                let remaining = stop_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(STOP_GRACE_BUDGET + STOP_MARGIN);
+                let status = run_cancellable(command, cancelled.clone(), remaining).await?;
+                anyhow::ensure!(status.success(), "backend stop failed with status {status}");
+                let inspection_deadline = std::cmp::min(
+                    stop_deadline,
+                    tokio::time::Instant::now() + STOP_INSPECTION_BUDGET,
+                );
+                let observation = self
+                    .wait_for_terminal_backend(slot, release, inspection_deadline, cancelled)
+                    .await?
+                    .context("systemd terminal facts remained unavailable")?;
+                Ok((observation, false))
+            }
+            BackendType::Docker => {
+                let term = self.docker_signal_command("TERM", slot, release)?;
+                let command_budget = stop_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(STOP_ESCALATION_BUDGET);
+                let status = run_cancellable(term, cancelled.clone(), command_budget).await?;
+                anyhow::ensure!(
+                    status.success(),
+                    "Docker TERM delivery failed with status {status}"
+                );
+                let grace_deadline = std::cmp::min(
+                    stop_deadline,
+                    tokio::time::Instant::now() + STOP_GRACE_BUDGET,
+                );
+                if let Some(observation) = self
+                    .wait_for_terminal_backend(slot, release, grace_deadline, cancelled.clone())
+                    .await?
+                {
+                    return Ok((observation, false));
+                }
+                let kill = self.docker_signal_command("KILL", slot, release)?;
+                let escalation_budget = stop_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(STOP_ESCALATION_BUDGET);
+                anyhow::ensure!(
+                    !escalation_budget.is_zero(),
+                    "stop deadline expired before escalation"
+                );
+                let status = run_cancellable(kill, cancelled.clone(), escalation_budget).await?;
+                anyhow::ensure!(
+                    status.success(),
+                    "Docker KILL escalation failed with status {status}"
+                );
+                let inspection_deadline = std::cmp::min(
+                    stop_deadline,
+                    tokio::time::Instant::now() + STOP_INSPECTION_BUDGET,
+                );
+                let observation = self
+                    .wait_for_terminal_backend(slot, release, inspection_deadline, cancelled)
+                    .await?
+                    .context("Docker terminal facts remained unavailable after escalation")?;
+                Ok((observation, true))
+            }
+        }
+    }
+
+    fn termination_evidence(
+        &self,
+        before: &StepEvidence,
+        terminal: &BackendObservation,
+        escalated: bool,
+    ) -> BackendTerminationEvidence {
+        let same_identity = !before.backend_instance_id.is_empty()
+            && terminal.instance_id == before.backend_instance_id;
+        let forced_terminal = match self.config.backend {
+            BackendType::Systemd => matches!(
+                terminal.terminal_result.as_str(),
+                "timeout" | "watchdog" | "signal" | "core-dump"
+            ),
+            BackendType::Docker => false,
+        };
+        let disposition = if !same_identity || terminal.state != BackendProcessState::Exited {
+            BackendStopDisposition::Unknown
+        } else if escalated || forced_terminal {
+            BackendStopDisposition::Forced
+        } else if match self.config.backend {
+            BackendType::Systemd => terminal.terminal_result == "success",
+            BackendType::Docker => matches!(terminal.exit_code, Some(0 | 143)),
+        } {
+            BackendStopDisposition::Graceful
+        } else {
+            BackendStopDisposition::Unknown
+        };
+        BackendTerminationEvidence {
+            backend: self.config.backend.wire() as i32,
+            backend_instance_id: before.backend_instance_id.clone(),
+            process_instance_id: before.process_instance_id.clone(),
+            graceful_termination_requested: true,
+            kill_escalated: escalated,
+            disposition: disposition as i32,
+            terminal_result: terminal.terminal_result.clone(),
+            exit_code: terminal.exit_code,
+            signal: terminal.signal,
+        }
     }
 
     async fn wait_for_proxy(
@@ -1106,17 +1297,20 @@ impl InstructionExecutor for HostBackend {
                             &desired.resolved_release_digest,
                         )?;
                         let slot = Self::proxy_slot(&metadata);
-                        self.run_effect(
-                            EffectAction::Stop,
-                            &slot,
-                            &self.release_dir(desired.revision)?,
-                            cancelled.clone(),
-                        )
-                        .await?;
-                        let mut after = self.wait_for_proxy(&desired, false, cancelled).await?;
-                        after.backend_instance_id = instruction.pinned_backend_instance_id.clone();
-                        after.process_instance_id = instruction.pinned_process_instance_id.clone();
-                        Ok(after)
+                        let release = self.release_dir(desired.revision)?;
+                        let (terminal, escalated) =
+                            self.run_stop_effect(&slot, &release, cancelled).await?;
+                        let termination = self.termination_evidence(&before, &terminal, escalated);
+                        Ok(StepEvidence {
+                            observed_revision: desired.revision,
+                            observed_digest: desired.digest,
+                            observed_resolved_release_digest: desired.resolved_release_digest,
+                            backend_state: Some(BackendProcessState::Exited),
+                            backend_instance_id: instruction.pinned_backend_instance_id.clone(),
+                            process_instance_id: instruction.pinned_process_instance_id.clone(),
+                            termination: Some(termination),
+                            ..Default::default()
+                        })
                     }
                     NodeOperationStepKind::VerifyTarget | NodeOperationStepKind::VerifyProxy => {
                         let evidence = self.inspect_proxy().await;
@@ -1266,20 +1460,20 @@ impl InstructionExecutor for HostBackend {
                         &desired.resolved_release_digest,
                     )?;
                     let slot = metadata.slot(&target.engine_slot)?;
-                    self.run_effect(
-                        EffectAction::Stop,
-                        slot,
-                        &self.release_dir(desired.revision)?,
-                        cancelled.clone(),
-                    )
-                    .await?;
-                    let mut after = self
-                        .wait_for(&target.engine_slot, &desired, false, cancelled)
-                        .await?;
-                    // An exited instance is attributed to the pre-stop identity.
-                    after.backend_instance_id = instruction.pinned_backend_instance_id.clone();
-                    after.process_instance_id = instruction.pinned_process_instance_id.clone();
-                    Ok(after)
+                    let release = self.release_dir(desired.revision)?;
+                    let (terminal, escalated) =
+                        self.run_stop_effect(slot, &release, cancelled).await?;
+                    let termination = self.termination_evidence(&before, &terminal, escalated);
+                    Ok(StepEvidence {
+                        observed_revision: desired.revision,
+                        observed_digest: desired.digest,
+                        observed_resolved_release_digest: desired.resolved_release_digest,
+                        backend_state: Some(BackendProcessState::Exited),
+                        backend_instance_id: instruction.pinned_backend_instance_id.clone(),
+                        process_instance_id: instruction.pinned_process_instance_id.clone(),
+                        termination: Some(termination),
+                        ..Default::default()
+                    })
                 }
                 NodeOperationStepKind::SelectRelease => {
                     self.select_release(
@@ -1670,6 +1864,11 @@ fn parse_systemd_observation(bytes: &[u8]) -> BackendObservation {
     let active = fields.get("ActiveState").copied().unwrap_or_default();
     let sub = fields.get("SubState").copied().unwrap_or_default();
     let invocation = fields.get("InvocationID").copied().unwrap_or_default();
+    let terminal_result = fields.get("Result").copied().unwrap_or_default();
+    let main_code = fields.get("ExecMainCode").copied().unwrap_or_default();
+    let main_status = fields
+        .get("ExecMainStatus")
+        .and_then(|value| value.parse::<i32>().ok());
     if load != "loaded" {
         return BackendObservation::query_error(format!("systemd unit load state is {load}"));
     }
@@ -1689,10 +1888,18 @@ fn parse_systemd_observation(bytes: &[u8]) -> BackendObservation {
     // A newly installed unit that has never started is inactive/dead with no
     // InvocationID. Treat it as not running, but keep the identity empty so
     // callers that require proof of a prior process exit still fail closed.
+    let (exit_code, signal) = match main_code {
+        "1" | "exited" => (main_status, None),
+        "2" | "3" | "killed" | "dumped" => (None, main_status),
+        _ => (None, None),
+    };
     BackendObservation {
         state,
         instance_id: invocation.to_string(),
         query_error: String::new(),
+        terminal_result: terminal_result.to_string(),
+        exit_code,
+        signal,
     }
 }
 
@@ -1703,6 +1910,9 @@ fn parse_docker_observation(bytes: &[u8], expected_service: &str) -> BackendObse
             state: BackendProcessState::Exited,
             instance_id: String::new(),
             query_error: String::new(),
+            terminal_result: String::new(),
+            exit_code: None,
+            signal: None,
         };
     }
     let values: Vec<serde_json::Value> = match serde_json::from_str::<serde_json::Value>(&text) {
@@ -1724,6 +1934,10 @@ fn parse_docker_observation(bytes: &[u8], expected_service: &str) -> BackendObse
     let service = json_string(value, &["Service", "service"]);
     let id = json_string(value, &["ID", "Id", "id"]);
     let state = json_string(value, &["State", "state"]).to_ascii_lowercase();
+    let exit_code = json_i32(value, &["ExitCode", "exit_code"]);
+    let signal = exit_code
+        .filter(|code| (128..=255).contains(code))
+        .map(|code| code - 128);
     if service != expected_service || id.is_empty() {
         return BackendObservation::query_error("docker container identity does not match service");
     }
@@ -1738,7 +1952,25 @@ fn parse_docker_observation(bytes: &[u8], expected_service: &str) -> BackendObse
         state,
         instance_id: id,
         query_error: String::new(),
+        terminal_result: if state == BackendProcessState::Exited {
+            "exited".to_string()
+        } else {
+            String::new()
+        },
+        exit_code,
+        signal,
     }
+}
+
+fn json_i32(value: &serde_json::Value, keys: &[&str]) -> Option<i32> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|value| {
+            value
+                .as_i64()
+                .and_then(|number| i32::try_from(number).ok())
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        })
+    })
 }
 
 fn json_string(value: &serde_json::Value, keys: &[&str]) -> String {
@@ -1804,11 +2036,17 @@ mod tests {
     #[test]
     fn parses_exact_docker_identity() {
         let observation = parse_docker_observation(
-            br#"[{"Service":"engine-blue","ID":"container-1","State":"running"}]"#,
+            br#"[{"Service":"engine-blue","ID":"container-1","State":"running","ExitCode":0}]"#,
             "engine-blue",
         );
         assert_eq!(observation.state, BackendProcessState::Running);
         assert_eq!(observation.instance_id, "container-1");
+        assert_eq!(observation.exit_code, Some(0));
+        let killed = parse_docker_observation(
+            br#"[{"Service":"engine-blue","ID":"container-1","State":"exited","ExitCode":137}]"#,
+            "engine-blue",
+        );
+        assert_eq!(killed.signal, Some(9));
         assert_eq!(
             parse_docker_observation(b"not json", "engine-blue").state,
             BackendProcessState::QueryError
@@ -1846,6 +2084,91 @@ mod tests {
         fn attest_binary(&self, _path: Option<&Path>, _name: &str) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn stop_budget_preserves_grace_escalation_inspection_and_margin() {
+        assert_eq!(COMMAND_BUDGET, Duration::from_secs(45));
+        assert_eq!(
+            STOP_GRACE_BUDGET + STOP_ESCALATION_BUDGET + STOP_INSPECTION_BUDGET + STOP_MARGIN,
+            STOP_BUDGET
+        );
+    }
+
+    #[test]
+    fn termination_disposition_fails_closed_and_records_escalation() {
+        let backend = HostBackend::new_with_attestor(
+            HostBackendConfig {
+                deployment_root: PathBuf::from("/tmp/wruntime-test"),
+                backend: BackendType::Docker,
+                systemctl_path: None,
+                docker_path: Some(PathBuf::from("/usr/bin/docker")),
+                compose_project: Some("wruntime-test".into()),
+                retention_count: 1,
+            },
+            Box::new(TestPathAttestor),
+        )
+        .expect("backend");
+        let before = StepEvidence {
+            backend_instance_id: "container-1".into(),
+            process_instance_id: "process-1".into(),
+            ..Default::default()
+        };
+        let terminal = BackendObservation {
+            state: BackendProcessState::Exited,
+            instance_id: "container-1".into(),
+            query_error: String::new(),
+            terminal_result: "exited".into(),
+            exit_code: Some(0),
+            signal: None,
+        };
+        assert_eq!(
+            backend
+                .termination_evidence(&before, &terminal, false)
+                .disposition,
+            BackendStopDisposition::Graceful as i32
+        );
+        assert_eq!(
+            backend
+                .termination_evidence(&before, &terminal, true)
+                .disposition,
+            BackendStopDisposition::Forced as i32
+        );
+        for exit_code in [1, 101, 134, 137, 139] {
+            let failed = BackendObservation {
+                exit_code: Some(exit_code),
+                signal: (exit_code >= 128).then_some(exit_code - 128),
+                ..terminal.clone()
+            };
+            assert_eq!(
+                backend
+                    .termination_evidence(&before, &failed, false)
+                    .disposition,
+                BackendStopDisposition::Unknown as i32,
+                "exit code {exit_code} must fail closed"
+            );
+        }
+        let terminated = BackendObservation {
+            exit_code: Some(143),
+            signal: Some(15),
+            ..terminal.clone()
+        };
+        assert_eq!(
+            backend
+                .termination_evidence(&before, &terminated, false)
+                .disposition,
+            BackendStopDisposition::Graceful as i32
+        );
+        let replaced = BackendObservation {
+            instance_id: "container-2".into(),
+            ..terminal
+        };
+        assert_eq!(
+            backend
+                .termination_evidence(&before, &replaced, false)
+                .disposition,
+            BackendStopDisposition::Unknown as i32
+        );
     }
 
     fn test_backend(root: &Path) -> HostBackend {

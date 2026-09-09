@@ -140,15 +140,18 @@ ensure_example_credential() {
 		previous="$argument"
 	done
 	if [ -e "$destination" ]; then
-		if "$CERT_CLI" cert verify "$destination" >/dev/null \
-			&& [ -n "$ca_dir" ] \
+		if ! "$CERT_CLI" cert verify "$destination" >/dev/null; then
+			echo "invalid immutable credential at $destination; refusing to overwrite it" >&2
+			return 1
+		fi
+		if [ -n "$ca_dir" ] \
 			&& openssl verify -CAfile "$ca_dir/ca.crt" "$destination/leaf.pem" >/dev/null 2>&1; then
 			"$CERT_CLI" cert verify "$destination"
 			return
 		fi
 		# Example credentials are disposable generator output. A root change
-		# invalidates the complete immutable set; never retain an internally
-		# consistent leaf that is not issued by the active root.
+		# invalidates an otherwise valid complete set, which may be regenerated
+		# under the active root. Malformed immutable sets fail closed above.
 		rm -rf -- "$destination"
 	fi
 	"$CERT_CLI" cert issue "$@" --destination "$destination"

@@ -4,8 +4,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use wr_common::wruntime::{
-    CancelOperationRequest, GetOperationRequest, ListOperationsRequest, NodeOperation,
-    NodeOperationState, ResumeOperationRequest,
+    BackendKind, BackendStopDisposition, BackendTerminationEvidence, CancelOperationRequest,
+    GetOperationRequest, ListOperationsRequest, NodeOperation, NodeOperationState,
+    OperationSlotProgress, ResumeOperationRequest,
 };
 
 use crate::client;
@@ -66,6 +67,51 @@ struct OperationDto<'a> {
     conditions: Vec<&'a str>,
 }
 
+#[derive(Serialize)]
+struct TerminationEvidenceDto<'a> {
+    backend: &'static str,
+    backend_instance_id: &'a str,
+    process_instance_id: &'a str,
+    graceful_termination_requested: bool,
+    kill_escalated: bool,
+    disposition: &'static str,
+    terminal_result: &'a str,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+}
+
+#[derive(Serialize)]
+struct OperationSlotDetailDto<'a> {
+    engine_slot: &'a str,
+    changed: bool,
+    effect_reported: bool,
+    pinned_backend_instance_id: &'a str,
+    pinned_process_instance_id: &'a str,
+    effect_backend_instance_id: &'a str,
+    effect_process_instance_id: &'a str,
+    termination_evidence: Option<TerminationEvidenceDto<'a>>,
+}
+
+#[derive(Serialize)]
+struct ProxyOperationDetailDto<'a> {
+    changed: bool,
+    effect_reported: bool,
+    pinned_backend_instance_id: &'a str,
+    pinned_process_instance_id: &'a str,
+    effect_backend_instance_id: &'a str,
+    effect_process_instance_id: &'a str,
+    termination_evidence: Option<TerminationEvidenceDto<'a>>,
+}
+
+#[derive(Serialize)]
+struct OperationDetailDto<'a> {
+    schema_version: u32,
+    #[serde(flatten)]
+    summary: OperationDto<'a>,
+    slots: Vec<OperationSlotDetailDto<'a>>,
+    proxy: ProxyOperationDetailDto<'a>,
+}
+
 fn action_name(value: i32) -> &'static str {
     use wr_common::wruntime::NodeOperationAction as Action;
     match Action::try_from(value).unwrap_or(Action::Unspecified) {
@@ -104,6 +150,49 @@ fn phase_name(value: i32) -> &'static str {
     }
 }
 
+fn backend_name(value: i32) -> &'static str {
+    match BackendKind::try_from(value).unwrap_or(BackendKind::Unspecified) {
+        BackendKind::Systemd => "systemd",
+        BackendKind::Docker => "docker",
+        BackendKind::Unspecified => "unknown",
+    }
+}
+
+fn disposition_name(value: i32) -> &'static str {
+    match BackendStopDisposition::try_from(value).unwrap_or(BackendStopDisposition::Unknown) {
+        BackendStopDisposition::Graceful => "graceful",
+        BackendStopDisposition::Forced => "forced",
+        BackendStopDisposition::Unknown => "unknown",
+    }
+}
+
+fn termination_dto(evidence: &BackendTerminationEvidence) -> TerminationEvidenceDto<'_> {
+    TerminationEvidenceDto {
+        backend: backend_name(evidence.backend),
+        backend_instance_id: &evidence.backend_instance_id,
+        process_instance_id: &evidence.process_instance_id,
+        graceful_termination_requested: evidence.graceful_termination_requested,
+        kill_escalated: evidence.kill_escalated,
+        disposition: disposition_name(evidence.disposition),
+        terminal_result: &evidence.terminal_result,
+        exit_code: evidence.exit_code,
+        signal: evidence.signal,
+    }
+}
+
+fn slot_detail_dto(slot: &OperationSlotProgress) -> OperationSlotDetailDto<'_> {
+    OperationSlotDetailDto {
+        engine_slot: &slot.engine_slot,
+        changed: slot.changed,
+        effect_reported: slot.effect_reported,
+        pinned_backend_instance_id: &slot.pinned_backend_instance_id,
+        pinned_process_instance_id: &slot.pinned_process_instance_id,
+        effect_backend_instance_id: &slot.effect_backend_instance_id,
+        effect_process_instance_id: &slot.effect_process_instance_id,
+        termination_evidence: slot.termination_evidence.as_ref().map(termination_dto),
+    }
+}
+
 fn dto(operation: &NodeOperation) -> OperationDto<'_> {
     OperationDto {
         operation_id: &operation.operation_id,
@@ -134,6 +223,23 @@ fn dto(operation: &NodeOperation) -> OperationDto<'_> {
                     .map(|condition| condition.code.as_str())
             }))
             .collect(),
+    }
+}
+
+fn detail_dto(operation: &NodeOperation) -> OperationDetailDto<'_> {
+    OperationDetailDto {
+        schema_version: 1,
+        summary: dto(operation),
+        slots: operation.slots.iter().map(slot_detail_dto).collect(),
+        proxy: ProxyOperationDetailDto {
+            changed: operation.proxy_changed,
+            effect_reported: operation.proxy_effect_reported,
+            pinned_backend_instance_id: &operation.proxy_backend_instance_id,
+            pinned_process_instance_id: &operation.proxy_process_instance_id,
+            effect_backend_instance_id: &operation.proxy_effect_backend_instance_id,
+            effect_process_instance_id: &operation.proxy_effect_process_instance_id,
+            termination_evidence: operation.termination_evidence.as_ref().map(termination_dto),
+        },
     }
 }
 
@@ -230,7 +336,11 @@ pub async fn run(args: OperationsArgs, manager: &str) -> Result<()> {
             let operation = response
                 .operation
                 .context("GetOperation omitted operation")?;
-            render_operation(&operation, json)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&detail_dto(&operation))?);
+            } else {
+                render_operation(&operation, false)?;
+            }
             if !json {
                 for event in response.events {
                     println!(
@@ -286,5 +396,124 @@ pub async fn run(args: OperationsArgs, manager: &str) -> Result<()> {
                 .context("CancelOperation omitted operation")?;
             render_operation(&operation, json)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn evidence(
+        backend: BackendKind,
+        disposition: BackendStopDisposition,
+    ) -> BackendTerminationEvidence {
+        BackendTerminationEvidence {
+            backend: backend as i32,
+            backend_instance_id: "backend-a".into(),
+            process_instance_id: "process-a".into(),
+            graceful_termination_requested: true,
+            kill_escalated: disposition == BackendStopDisposition::Forced,
+            disposition: disposition as i32,
+            terminal_result: "success".into(),
+            exit_code: Some(0),
+            signal: None,
+        }
+    }
+
+    #[test]
+    fn detail_projection_preserves_engine_and_proxy_termination_evidence() {
+        let operation = NodeOperation {
+            operation_id: "operation-a".into(),
+            node_id: "node-a".into(),
+            request_token: "token-a".into(),
+            action: wr_common::wruntime::NodeOperationAction::RollingUpgrade as i32,
+            state: NodeOperationState::Succeeded as i32,
+            slots: vec![OperationSlotProgress {
+                engine_slot: "blue".into(),
+                changed: true,
+                effect_reported: true,
+                pinned_backend_instance_id: "backend-a".into(),
+                pinned_process_instance_id: "process-a".into(),
+                effect_backend_instance_id: "backend-a".into(),
+                effect_process_instance_id: "process-a".into(),
+                termination_evidence: Some(evidence(
+                    BackendKind::Systemd,
+                    BackendStopDisposition::Graceful,
+                )),
+                ..Default::default()
+            }],
+            proxy_changed: true,
+            proxy_effect_reported: true,
+            proxy_backend_instance_id: "proxy-pinned-backend".into(),
+            proxy_process_instance_id: "proxy-pinned-process".into(),
+            proxy_effect_backend_instance_id: "proxy-backend".into(),
+            proxy_effect_process_instance_id: "proxy-process".into(),
+            termination_evidence: Some(BackendTerminationEvidence {
+                backend_instance_id: "proxy-backend".into(),
+                process_instance_id: "proxy-process".into(),
+                ..evidence(BackendKind::Docker, BackendStopDisposition::Forced)
+            }),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(detail_dto(&operation)).expect("detail JSON");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(
+            value["slots"][0]["termination_evidence"]["backend"],
+            "systemd"
+        );
+        assert_eq!(
+            value["slots"][0]["termination_evidence"]["disposition"],
+            "graceful"
+        );
+        assert_eq!(
+            value["proxy"]["pinned_backend_instance_id"],
+            "proxy-pinned-backend"
+        );
+        assert_eq!(
+            value["proxy"]["pinned_process_instance_id"],
+            "proxy-pinned-process"
+        );
+        assert_eq!(
+            value["proxy"]["termination_evidence"]["backend_instance_id"],
+            "proxy-backend"
+        );
+        assert_eq!(
+            value["proxy"]["termination_evidence"]["process_instance_id"],
+            "proxy-process"
+        );
+        assert_eq!(value["proxy"]["termination_evidence"]["backend"], "docker");
+        assert_eq!(
+            value["proxy"]["termination_evidence"]["disposition"],
+            "forced"
+        );
+    }
+
+    #[test]
+    fn detail_is_explicitly_null_unknown_and_summary_stays_compact() {
+        let operation = NodeOperation {
+            slots: vec![OperationSlotProgress {
+                engine_slot: "blue".into(),
+                termination_evidence: Some(evidence(
+                    BackendKind::Unspecified,
+                    BackendStopDisposition::Unknown,
+                )),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let detail = serde_json::to_value(detail_dto(&operation)).expect("detail JSON");
+        assert_eq!(
+            detail["slots"][0]["termination_evidence"]["backend"],
+            "unknown"
+        );
+        assert_eq!(
+            detail["slots"][0]["termination_evidence"]["disposition"],
+            "unknown"
+        );
+        assert!(detail["proxy"]["termination_evidence"].is_null());
+        let summary = serde_json::to_value(dto(&operation)).expect("summary JSON");
+        assert!(summary.get("slots").is_none());
+        assert!(summary.get("proxy").is_none());
+        assert!(summary.get("schema_version").is_none());
     }
 }

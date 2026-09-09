@@ -2307,6 +2307,26 @@ async fn manager_rollout_same_generation_reports_digest_mismatch() -> Result<()>
         target_deployment_leaf_fingerprint: format!("sha256:{}", "e".repeat(64)),
         ..Default::default()
     };
+    let mut stale_restoration = request.clone();
+    stale_restoration.client_operation_id = "b3c54ac7-fe23-4ddf-96e5-0da2e4b18d7d".into();
+    stale_restoration.target_generation = 1;
+    stale_restoration.target_policy_digest = accepted_digest;
+    let stale_error = wr_manager::db::begin_manager_rollout(
+        &pool,
+        &stale_restoration.target_deployment_principal_uri,
+        &stale_restoration.target_deployment_leaf_fingerprint,
+        &stale_restoration,
+        &format!("sha256:{}", "1".repeat(64)),
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale_error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        stale_error.message(),
+        "target policy generation must be strictly newer"
+    );
+
     let error = wr_manager::db::begin_manager_rollout(
         &pool,
         &request.target_deployment_principal_uri,

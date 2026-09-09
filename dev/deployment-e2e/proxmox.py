@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reset the two dedicated deployment-E2E VMs through the Proxmox HTTPS API."""
+"""Reset the three dedicated deployment-E2E VMs through the Proxmox HTTPS API."""
 
 from __future__ import annotations
 
@@ -43,6 +43,7 @@ class Target:
     host: str
     ssh_user: str
     role: str
+    snapshot: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,7 +55,7 @@ class Config:
     lock_file: str
     workdir: str
     node_id: str
-    targets: tuple[Target, Target]
+    targets: tuple[Target, Target, Target]
 
 
 class Client(Protocol):
@@ -118,32 +119,53 @@ def load_config(path: Path) -> Config:
         raise ProviderError("workdir must be a safe absolute path")
 
     targets: list[Target] = []
-    expected_names = {"manager": "wr-e2e-manager", "node": "wr-e2e-node"}
-    for key in ("manager", "node"):
+    expected = {
+        "manager": ("wr-e2e-manager", "manager"),
+        "manager_b": ("wr-e2e-manager-b", "manager-b"),
+        "node": ("wr-e2e-node", "node"),
+    }
+    for key in ("manager", "manager_b", "node"):
         raw = data.get(key)
         if not isinstance(raw, dict):
             raise ProviderError(f"missing [{key}] target")
+        if key == "manager_b":
+            raw = dict(raw)
+            inputs = {
+                "vmid": os.environ.get("WRT_DEPLOY_E2E_MANAGER_B_VMID"),
+                "host": os.environ.get("WRT_DEPLOY_E2E_MANAGER_B_IP"),
+                "snapshot": os.environ.get("WRT_DEPLOY_E2E_MANAGER_B_SNAPSHOT"),
+            }
+            missing = [name for name, value in inputs.items() if not value]
+            if missing:
+                raise ProviderError(
+                    "manager B requires protected inputs: "
+                    "WRT_DEPLOY_E2E_MANAGER_B_VMID, WRT_DEPLOY_E2E_MANAGER_B_IP, "
+                    "WRT_DEPLOY_E2E_MANAGER_B_SNAPSHOT"
+                )
+            raw.update(inputs)
         try:
             vmid = int(raw["vmid"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ProviderError(f"{key}.vmid must be an integer") from exc
         name = _nonempty(raw, "name")
-        if name != expected_names[key]:
-            raise ProviderError(f"{key}.name must be {expected_names[key]!r}, got {name!r}")
+        expected_name, expected_role = expected[key]
+        if name != expected_name:
+            raise ProviderError(f"{key}.name must be {expected_name!r}, got {name!r}")
         host = _nonempty(raw, "host")
         try:
             ipaddress.ip_address(host)
         except ValueError as exc:
             raise ProviderError(f"{key}.host must be a literal IP address") from exc
         role = _nonempty(raw, "role")
-        if role != key:
-            raise ProviderError(f"{key}.role must be {key!r}")
-        targets.append(Target(key, vmid, name, host, _nonempty(raw, "ssh_user"), role))
-    if targets[0].vmid == targets[1].vmid:
-        raise ProviderError("manager and node VM IDs must differ")
-    if targets[0].host == targets[1].host:
-        raise ProviderError("manager and node hosts must differ")
-    return Config(provider, proxmox_node, snapshot, image, lock_file, workdir, node_id, (targets[0], targets[1]))
+        if role != expected_role:
+            raise ProviderError(f"{key}.role must be {expected_role!r}")
+        target_snapshot = _nonempty(raw, "snapshot") if key == "manager_b" else snapshot
+        targets.append(Target(key, vmid, name, host, _nonempty(raw, "ssh_user"), role, target_snapshot))
+    if len({target.vmid for target in targets}) != len(targets):
+        raise ProviderError("deployment target VM IDs must be unique")
+    if len({target.host for target in targets}) != len(targets):
+        raise ProviderError("deployment target hosts must be unique")
+    return Config(provider, proxmox_node, snapshot, image, lock_file, workdir, node_id, tuple(targets))
 
 
 def ca_bundle_path() -> Path:
@@ -237,12 +259,12 @@ class LifecycleProvider:
         if actual_name != target.name:
             raise ProviderError(f"VM {target.vmid} name mismatch: expected {target.name!r}, got {actual_name!r}")
         snapshots = {item.get("name") for item in self.client.vm_snapshots(self.config.proxmox_node, target.vmid)}
-        if self.config.snapshot not in snapshots:
-            raise ProviderError(f"VM {target.vmid} is missing snapshot {self.config.snapshot!r}")
+        if target.snapshot not in snapshots:
+            raise ProviderError(f"VM {target.vmid} is missing snapshot {target.snapshot!r}")
         status = self.client.vm_status(self.config.proxmox_node, target.vmid).get("status")
         if status not in {"running", "stopped"}:
             raise ProviderError(f"VM {target.vmid} returned unknown state {status!r}")
-        return {"key": target.key, "vmid": target.vmid, "name": target.name, "status": status, "snapshot": self.config.snapshot}
+        return {"key": target.key, "vmid": target.vmid, "name": target.name, "status": status, "snapshot": target.snapshot}
 
     def preflight(self) -> dict[str, Any]:
         version = self.client.version()
@@ -291,7 +313,7 @@ class LifecycleProvider:
         self._wait_state(target, "stopped")
 
     def _rollback(self, target: Target) -> None:
-        self._wait_task(target, self.client.rollback(self.config.proxmox_node, target.vmid, self.config.snapshot), "rollback")
+        self._wait_task(target, self.client.rollback(self.config.proxmox_node, target.vmid, target.snapshot), "rollback")
         self._wait_state(target, "stopped")
 
     def _start(self, target: Target) -> None:

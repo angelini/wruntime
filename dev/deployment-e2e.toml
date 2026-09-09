@@ -13,6 +13,15 @@ host     = "192.168.178.77"
 ssh_user = "deploy"
 role     = "manager"
 
+# Manager B is a protected-runner-owned disposable target. Its VMID, reachable
+# literal IP, and baseline snapshot are supplied through
+# WRT_DEPLOY_E2E_MANAGER_B_{VMID,IP,SNAPSHOT}; they are deliberately not
+# repository infrastructure coordinates.
+[manager_b]
+name     = "wr-e2e-manager-b"
+ssh_user = "deploy"
+role     = "manager-b"
+
 [node]
 vmid     = 121
 name     = "wr-e2e-node"

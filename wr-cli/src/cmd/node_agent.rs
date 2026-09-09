@@ -580,6 +580,9 @@ fn result_request(
         backend_query_error: evidence.backend_query_error.clone(),
         cleanup_evidence: evidence.cleanup_evidence.clone(),
         observed_resolved_release_digest: evidence.observed_resolved_release_digest.clone(),
+        termination_evidence: (instruction.step == NodeOperationStepKind::StopBackend as i32)
+            .then(|| evidence.termination.clone())
+            .flatten(),
     })
 }
 
@@ -1992,6 +1995,38 @@ ca_cert_path = "/etc/wruntime/ca.crt"
             poll: Duration::from_millis(1),
             renew: Duration::from_secs(60),
         }
+    }
+
+    #[test]
+    fn stop_result_carries_typed_termination_evidence_only_for_stop_steps() {
+        let config = activation();
+        let mut instruction = test_instruction();
+        let evidence = StepEvidence {
+            termination: Some(wr_common::wruntime::BackendTerminationEvidence {
+                disposition: wr_common::wruntime::BackendStopDisposition::Graceful as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(result_request(&config, &instruction, &evidence, None)
+            .unwrap()
+            .termination_evidence
+            .is_none());
+        instruction.step = NodeOperationStepKind::StopBackend as i32;
+        assert_eq!(
+            result_request(&config, &instruction, &evidence, None)
+                .unwrap()
+                .termination_evidence
+                .unwrap()
+                .disposition,
+            wr_common::wruntime::BackendStopDisposition::Graceful as i32
+        );
+        instruction.target.as_mut().unwrap().kind =
+            wr_common::wruntime::InstructionTargetKind::Proxy as i32;
+        assert!(result_request(&config, &instruction, &evidence, None)
+            .unwrap()
+            .termination_evidence
+            .is_some());
     }
 
     fn test_instruction() -> AgentInstruction {

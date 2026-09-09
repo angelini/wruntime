@@ -21,11 +21,24 @@ sys.modules[SPEC.name] = pve
 SPEC.loader.exec_module(pve)
 
 
-def load_config_text(text):
+MANAGER_B_ENV = {
+    "WRT_DEPLOY_E2E_MANAGER_B_VMID": "122",
+    "WRT_DEPLOY_E2E_MANAGER_B_IP": "192.0.2.12",
+    "WRT_DEPLOY_E2E_MANAGER_B_SNAPSHOT": "wr-e2e-manager-b-v1",
+}
+
+
+def load_config_text(text, env=MANAGER_B_ENV):
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".toml") as config_file:
         config_file.write(text)
         config_file.flush()
-        return pve.load_config(Path(config_file.name))
+        with mock.patch.dict(os.environ, env, clear=False):
+            return pve.load_config(Path(config_file.name))
+
+
+def checked_in_config(env=MANAGER_B_ENV):
+    with mock.patch.dict(os.environ, env, clear=False):
+        return pve.load_config(CONFIG_PATH)
 
 
 def config():
@@ -33,17 +46,18 @@ def config():
         "proxmox", "server", "wr-e2e-v1", "wr-e2e-v1",
         "/var/lock/wruntime-deployment-e2e.lock", "/opt/wruntime", "wr-e2e-node",
         (
-            pve.Target("manager", 120, "wr-e2e-manager", "192.0.2.10", "deploy", "manager"),
-            pve.Target("node", 121, "wr-e2e-node", "192.0.2.11", "deploy", "node"),
+            pve.Target("manager", 120, "wr-e2e-manager", "192.0.2.10", "deploy", "manager", "wr-e2e-v1"),
+            pve.Target("manager_b", 122, "wr-e2e-manager-b", "192.0.2.12", "deploy", "manager-b", "wr-e2e-manager-b-v1"),
+            pve.Target("node", 121, "wr-e2e-node", "192.0.2.11", "deploy", "node", "wr-e2e-v1"),
         ),
     )
 
 
 class FakeClient:
     def __init__(self, states=None):
-        self.states = states or {120: "running", 121: "running"}
-        self.names = {120: "wr-e2e-manager", 121: "wr-e2e-node"}
-        self.snapshots = {120: ["wr-e2e-v1"], 121: ["wr-e2e-v1"]}
+        self.states = states or {120: "running", 122: "running", 121: "running"}
+        self.names = {120: "wr-e2e-manager", 122: "wr-e2e-manager-b", 121: "wr-e2e-node"}
+        self.snapshots = {120: ["wr-e2e-v1"], 122: ["wr-e2e-manager-b-v1"], 121: ["wr-e2e-v1"]}
         self.operations = []
         self.tasks = {}
         self.fail_operation: tuple[str, int] | None = None
@@ -97,16 +111,16 @@ class ProviderTests(unittest.TestCase):
         fake = FakeClient()
         result = self.provider(fake).reset(start=True)
         self.assertEqual(fake.operations, [
-            ("stop", 120), ("stop", 121),
-            ("rollback", 120), ("rollback", 121),
-            ("start", 120), ("start", 121),
+            ("stop", 120), ("stop", 122), ("stop", 121),
+            ("rollback", 120), ("rollback", 122), ("rollback", 121),
+            ("start", 120), ("start", 122), ("start", 121),
         ])
-        self.assertEqual([target["status"] for target in result["targets"]], ["running", "running"])
+        self.assertEqual([target["status"] for target in result["targets"]], ["running"] * 3)
 
     def test_already_stopped_vms_do_not_issue_stop_tasks(self):
-        fake = FakeClient({120: "stopped", 121: "stopped"})
+        fake = FakeClient({120: "stopped", 122: "stopped", 121: "stopped"})
         self.provider(fake).reset(start=False)
-        self.assertEqual(fake.operations, [("rollback", 120), ("rollback", 121)])
+        self.assertEqual(fake.operations, [("rollback", 120), ("rollback", 122), ("rollback", 121)])
 
     def test_missing_snapshot_is_fatal_before_mutation(self):
         fake = FakeClient()
@@ -147,11 +161,12 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(pve.ProviderError, "marker verification failed"):
             self.provider(fake, wrong_marker).reset(start=True)
 
-    def test_partial_two_vm_failure_attempts_both_targets(self):
+    def test_partial_three_vm_failure_attempts_all_targets(self):
         fake = FakeClient()
         fake.fail_operation = ("rollback", 120)
         with self.assertRaisesRegex(pve.ProviderError, "rollback failed"):
             self.provider(fake).reset(start=False)
+        self.assertIn(("rollback", 122), fake.operations)
         self.assertIn(("rollback", 121), fake.operations)
 
     def test_secret_redaction(self):
@@ -165,17 +180,24 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn("password", message)
         self.assertIn("<redacted>", message)
 
-    def test_checked_in_configuration_is_valid_and_rejects_duplicate_ids(self):
-        checked_in = pve.load_config(CONFIG_PATH)
-        self.assertEqual([target.vmid for target in checked_in.targets], [120, 121])
-        text = CONFIG_PATH.read_text()
-        with self.assertRaisesRegex(pve.ProviderError, "VM IDs must differ"):
-            load_config_text(re.sub(r"vmid\s*=\s*121", "vmid = 120", text))
+    def test_checked_in_configuration_uses_role_bound_owner_coordinates(self):
+        checked_in = checked_in_config()
+        self.assertEqual([target.key for target in checked_in.targets], ["manager", "manager_b", "node"])
+        self.assertEqual([target.vmid for target in checked_in.targets], [120, 122, 121])
+        self.assertEqual(checked_in.targets[1].host, MANAGER_B_ENV["WRT_DEPLOY_E2E_MANAGER_B_IP"])
+        self.assertEqual(checked_in.targets[1].snapshot, MANAGER_B_ENV["WRT_DEPLOY_E2E_MANAGER_B_SNAPSHOT"])
 
-    def test_configuration_rejects_duplicate_hosts(self):
-        text = CONFIG_PATH.read_text().replace('host     = "192.168.178.78"', 'host     = "192.168.178.77"')
-        with self.assertRaisesRegex(pve.ProviderError, "hosts must differ"):
-            load_config_text(text)
+    def test_configuration_requires_every_manager_b_owner_input(self):
+        for missing in MANAGER_B_ENV:
+            env = MANAGER_B_ENV | {missing: ""}
+            with self.subTest(missing=missing), self.assertRaisesRegex(pve.ProviderError, "manager B requires protected inputs"):
+                checked_in_config(env)
+
+    def test_configuration_rejects_duplicate_ids_and_hosts(self):
+        with self.assertRaisesRegex(pve.ProviderError, "VM IDs must be unique"):
+            checked_in_config(MANAGER_B_ENV | {"WRT_DEPLOY_E2E_MANAGER_B_VMID": "120"})
+        with self.assertRaisesRegex(pve.ProviderError, "hosts must be unique"):
+            checked_in_config(MANAGER_B_ENV | {"WRT_DEPLOY_E2E_MANAGER_B_IP": "192.168.178.78"})
 
     def test_configuration_rejects_unsafe_workdir(self):
         text = CONFIG_PATH.read_text().replace('workdir                = "/opt/wruntime"', 'workdir                = "/"')
