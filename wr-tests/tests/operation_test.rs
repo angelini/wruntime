@@ -2,6 +2,7 @@ mod helpers;
 
 use anyhow::Result;
 use helpers::db::manager_pool;
+use prost::Message;
 use tonic::Code;
 use uuid::Uuid;
 use wr_common::wruntime::{
@@ -311,6 +312,32 @@ async fn commit_ready_deployment(
     Ok(())
 }
 
+fn engine_registration(
+    deployment: &DeploymentRecord,
+    slot: &str,
+    engine_id: &str,
+) -> EngineRegistration {
+    EngineRegistration {
+        engine_id: engine_id.into(),
+        address: format!("http://127.0.0.1/{engine_id}"),
+        modules: vec![module_descriptor()],
+        proxy_address: "http://127.0.0.1:9001".into(),
+        secrets: vec![],
+        peer_address: "https://127.0.0.1:9443".into(),
+        db_namespaces: vec![],
+        job_queue_id: String::new(),
+        job_admin_address: String::new(),
+        deployment: Some(DeploymentMetadata {
+            node_id: deployment.node_id.clone(),
+            revision: deployment.revision,
+            bundle_digest: deployment.bundle_digest.clone(),
+            engine_slot: slot.into(),
+            operation_id: deployment.operation_id.clone(),
+            revision_digest: deployment.revision_digest.clone(),
+        }),
+    }
+}
+
 async fn register_ready(
     pool: &deadpool_postgres::Pool,
     deployment: &DeploymentRecord,
@@ -318,50 +345,11 @@ async fn register_ready(
     engine_id: &str,
 ) -> Result<EngineOwnershipFence> {
     let module = module_descriptor();
-    let operation_id: uuid::Uuid = pool
-        .get()
-        .await?
-        .query_one(
-            "SELECT operation.operation_id
-             FROM wr_node_operations operation
-             JOIN wr_node_operation_targets slot
-               ON slot.operation_id = operation.operation_id
-              AND slot.target_kind = 'engine_slot' AND slot.target_key = $2
-             WHERE operation.node_id = $1
-               AND operation.state IN ('queued', 'running', 'paused')
-               AND (
-                 operation.target_revision = $3
-                 OR (operation.action = 'restart' AND slot.target_revision = $3)
-                 OR (operation.phase = 'restoring_source' AND slot.source_revision = $3)
-               )
-             ORDER BY operation.created_at DESC LIMIT 1",
-            &[&deployment.node_id, &slot, &(deployment.revision as i64)],
-        )
-        .await?
-        .get(0);
     let activation_id = uuid::Uuid::new_v4().to_string();
     let commit = wr_manager::db::register_engine_and_routes(
         pool,
         &test_secret_crypto(),
-        &EngineRegistration {
-            engine_id: engine_id.into(),
-            address: format!("http://127.0.0.1/{}", engine_id),
-            modules: vec![module.clone()],
-            proxy_address: "http://127.0.0.1:9001".into(),
-            secrets: vec![],
-            peer_address: "https://127.0.0.1:9443".into(),
-            db_namespaces: vec![],
-            job_queue_id: String::new(),
-            job_admin_address: String::new(),
-            deployment: Some(DeploymentMetadata {
-                node_id: deployment.node_id.clone(),
-                revision: deployment.revision,
-                bundle_digest: deployment.bundle_digest.clone(),
-                engine_slot: slot.into(),
-                operation_id: operation_id.to_string(),
-                revision_digest: deployment.revision_digest.clone(),
-            }),
-        },
+        &engine_registration(deployment, slot, engine_id),
         &activation_id,
     )
     .await
@@ -374,6 +362,41 @@ async fn register_ready(
     })?;
     wr_manager::db::publish_engine_readiness(pool, engine_id, &[module], &commit.fence).await?;
     Ok(commit.fence)
+}
+
+async fn assert_registration_identities(
+    pool: &deadpool_postgres::Pool,
+    engine_id: &str,
+    deployment_operation_id: &str,
+    lifecycle_operation_id: &str,
+) -> Result<()> {
+    let row = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT engine.operation_id, engine.registration, owner.operation_id AS owner_operation_id
+             FROM wr_engines engine
+             JOIN wr_node_slot_owners owner ON owner.engine_id = engine.engine_id
+             WHERE engine.engine_id = $1",
+            &[&engine_id],
+        )
+        .await?;
+    let registration =
+        EngineRegistration::decode(row.get::<_, Vec<u8>>("registration").as_slice())?;
+    assert_eq!(
+        registration
+            .deployment
+            .expect("managed registration metadata")
+            .operation_id,
+        deployment_operation_id
+    );
+    let expected_lifecycle_id = Uuid::parse_str(lifecycle_operation_id)?;
+    assert_eq!(row.get::<_, Uuid>("operation_id"), expected_lifecycle_id);
+    assert_eq!(
+        row.get::<_, Uuid>("owner_operation_id"),
+        expected_lifecycle_id
+    );
+    Ok(())
 }
 
 async fn engine_fence(
@@ -499,6 +522,88 @@ async fn report_ok(
     result.backend_instance_id = backend.into();
     result.process_instance_id = process.into();
     Ok(wr_manager::operations::report_step(pool, &result, "agent-a").await?)
+}
+
+#[tokio::test]
+async fn registration_separately_validates_immutable_deployment_and_live_operation() -> Result<()> {
+    let pool = manager_pool().await;
+    let digest = format!("sha256:{}", "5".repeat(64));
+    let deployment =
+        stage_with_module(&pool, "registration-id-node", "deploy", &digest, &["blue"]).await;
+    let lifecycle_operation_id = submit_deployment_operation(&pool, &deployment).await?;
+
+    let mut wrong_id = engine_registration(&deployment, "blue", "wrong-deployment-id");
+    wrong_id
+        .deployment
+        .as_mut()
+        .expect("deployment metadata")
+        .operation_id = Uuid::new_v4().to_string();
+    let error = wr_manager::db::register_engine_and_routes(
+        &pool,
+        &test_secret_crypto(),
+        &wrong_id,
+        &Uuid::new_v4().to_string(),
+    )
+    .await
+    .err()
+    .expect("a non-canonical deployment ID must be rejected");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+
+    let mut wrong_revision = engine_registration(&deployment, "blue", "wrong-revision");
+    wrong_revision
+        .deployment
+        .as_mut()
+        .expect("deployment metadata")
+        .revision += 1;
+    let error = wr_manager::db::register_engine_and_routes(
+        &pool,
+        &test_secret_crypto(),
+        &wrong_revision,
+        &Uuid::new_v4().to_string(),
+    )
+    .await
+    .err()
+    .expect("a wrong deployment revision must be rejected");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+
+    let mut wrong_digest = engine_registration(&deployment, "blue", "wrong-revision-digest");
+    wrong_digest
+        .deployment
+        .as_mut()
+        .expect("deployment metadata")
+        .revision_digest = format!("sha256:{}", "0".repeat(64));
+    let error = wr_manager::db::register_engine_and_routes(
+        &pool,
+        &test_secret_crypto(),
+        &wrong_digest,
+        &Uuid::new_v4().to_string(),
+    )
+    .await
+    .err()
+    .expect("a wrong deployment revision digest must be rejected");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+
+    register_ready(&pool, &deployment, "blue", "registration-valid").await?;
+    assert_registration_identities(
+        &pool,
+        "registration-valid",
+        &deployment.operation_id,
+        &lifecycle_operation_id,
+    )
+    .await?;
+    finish_deployment_operation(&pool, &deployment, &lifecycle_operation_id).await?;
+
+    let error = wr_manager::db::register_engine_and_routes(
+        &pool,
+        &test_secret_crypto(),
+        &engine_registration(&deployment, "blue", "no-live-operation"),
+        &Uuid::new_v4().to_string(),
+    )
+    .await
+    .err()
+    .expect("registration must continue to require a matching live operation");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    Ok(())
 }
 
 #[tokio::test]
@@ -1312,6 +1417,10 @@ async fn restart_recovers_a_lost_start_report_from_exact_replacement_evidence() 
         },
     )
     .await?;
+    assert_ne!(
+        operation.operation_id, source.operation_id,
+        "restart lifecycle identity must differ from immutable deployment identity"
+    );
     configure_agent(&pool, "restart-node", "activation-a").await;
     let verify = claim_instruction(&pool, "restart-node", "activation-a").await?;
     observe(
@@ -1342,6 +1451,13 @@ async fn restart_recovers_a_lost_start_report_from_exact_replacement_evidence() 
     let start = claim_instruction(&pool, "restart-node", "activation-a").await?;
     assert_eq!(start.step, NodeOperationStepKind::StartBackend as i32);
     register_ready(&pool, &source, "blue", "restart-new").await?;
+    assert_registration_identities(
+        &pool,
+        "restart-new",
+        &source.operation_id,
+        &operation.operation_id,
+    )
+    .await?;
     observe(
         &pool,
         &start,
@@ -1719,6 +1835,28 @@ async fn restoration_targets_only_changed_slots_and_completes_from_observation()
         NodeOperationPhase::try_from(failed.phase)?,
         NodeOperationPhase::RestoringSource
     );
+    let late_target_engine_id = "restore-late-target";
+    let error = wr_manager::db::register_engine_and_routes(
+        &pool,
+        &test_secret_crypto(),
+        &engine_registration(&target, "blue", late_target_engine_id),
+        &Uuid::new_v4().to_string(),
+    )
+    .await
+    .err()
+    .expect("a late target registration must be rejected during source restoration");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    let persisted_late_target: i64 = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT COUNT(*) FROM wr_engines WHERE engine_id = $1",
+            &[&late_target_engine_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(persisted_late_target, 0);
+
     let targets = engine_targets(&failed);
     let blue = targets
         .iter()
@@ -2088,6 +2226,10 @@ async fn delivered_effect_ambiguity_is_inspected_for_cancel_deadline_and_error()
             "blue"
         );
         if mode == "error" {
+            assert_ne!(
+                operation.operation_id, source.operation_id,
+                "restoration lifecycle identity must differ from immutable source deployment identity"
+            );
             observe(
                 &pool,
                 &inspection,
@@ -2101,7 +2243,15 @@ async fn delivered_effect_ambiguity_is_inspected_for_cancel_deadline_and_error()
             .await?;
             let restore = claim_instruction(&pool, &node_id, "activation-a").await?;
             assert_eq!(restore.step, NodeOperationStepKind::RestoreSource as i32);
-            register_ready(&pool, &source, "blue", &format!("{node_id}-restored")).await?;
+            let restored_engine_id = format!("{node_id}-restored");
+            register_ready(&pool, &source, "blue", &restored_engine_id).await?;
+            assert_registration_identities(
+                &pool,
+                &restored_engine_id,
+                &source.operation_id,
+                &operation.operation_id,
+            )
+            .await?;
             observe(
                 &pool,
                 &restore,

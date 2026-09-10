@@ -235,8 +235,10 @@ pub async fn register_engine_and_routes(
         .deployment
         .as_ref()
         .ok_or_else(|| Status::failed_precondition("managed deployment metadata is required"))?;
-    let operation_id = uuid::Uuid::parse_str(&metadata.operation_id)
+    let deployment_operation_uuid = uuid::Uuid::parse_str(&metadata.operation_id)
         .map_err(|_| Status::invalid_argument("deployment operation_id must be a UUID"))?;
+    let revision_i64 = i64::try_from(metadata.revision)
+        .map_err(|_| Status::invalid_argument("deployment revision is too large"))?;
     let activation_uuid = uuid::Uuid::parse_str(activation_id)
         .map_err(|_| Status::invalid_argument("activation_id must be a UUID"))?;
     txn.query_one(
@@ -245,9 +247,45 @@ pub async fn register_engine_and_routes(
     )
     .await
     .internal()?;
+    let deployment = txn
+        .query_opt(
+            "SELECT deployment.expected_inventory, deployment.revision_digest, deployment.state,
+                deployment.operation_id, node.current_revision
+         FROM wr_node_deployments deployment
+         JOIN wr_nodes node ON node.node_id = deployment.node_id
+         WHERE deployment.node_id=$1 AND deployment.revision=$2
+           AND deployment.bundle_digest=$3
+           AND deployment.state IN ('pending','active','succeeded')
+         FOR UPDATE",
+            &[&metadata.node_id, &revision_i64, &metadata.bundle_digest],
+        )
+        .await
+        .internal()?
+        .ok_or_else(|| {
+            Status::failed_precondition("deployment metadata does not match desired state")
+        })?;
+    let stored_digest: String = deployment.get("revision_digest");
+    let expected_deployment_uuid =
+        uuid::Uuid::parse_str(&deployment_operation_id(&stored_digest).map_err(|error| {
+            Status::internal(format!("stored revision digest is invalid: {error}"))
+        })?)
+        .map_err(|error| {
+            Status::internal(format!(
+                "canonical deployment operation ID is invalid: {error}"
+            ))
+        })?;
+    if deployment_operation_uuid != expected_deployment_uuid
+        || deployment.get::<_, Option<uuid::Uuid>>("operation_id") != Some(expected_deployment_uuid)
+        || metadata.revision_digest != stored_digest
+    {
+        return Err(Status::failed_precondition(
+            "deployment operation/revision digest mismatch",
+        ));
+    }
     let operation = txn
         .query_opt(
-            "SELECT operation.target_revision, operation.bundle_digest,
+            "SELECT operation.operation_id AS lifecycle_operation_id,
+                operation.target_revision, operation.bundle_digest,
                 operation.target_revision_digest, operation.action, operation.phase,
                 slot.source_revision AS slot_source_revision,
                 slot.source_digest AS slot_source_digest,
@@ -256,66 +294,61 @@ pub async fn register_engine_and_routes(
          FROM wr_node_operations operation
          JOIN wr_node_operation_targets slot
            ON slot.operation_id = operation.operation_id
-          AND slot.target_kind = 'engine_slot' AND slot.target_key = $3
-         WHERE operation.operation_id=$1 AND operation.node_id=$2
+          AND slot.target_kind = 'engine_slot' AND slot.target_key = $2
+         WHERE operation.node_id=$1
            AND operation.state IN ('queued','running','paused')
+           AND (
+             (operation.action IN ('deployment','rollback')
+              AND operation.phase <> 'restoring_source'
+              AND operation.target_revision=$3
+              AND operation.bundle_digest=$4
+              AND operation.target_revision_digest=$5)
+             OR (operation.action='restart'
+                 AND slot.target_revision=$3 AND slot.target_digest=$4)
+             OR (operation.phase='restoring_source'
+                 AND slot.source_revision=$3 AND slot.source_digest=$4)
+           )
          FOR UPDATE",
-            &[&operation_id, &metadata.node_id, &metadata.engine_slot],
+            &[
+                &metadata.node_id,
+                &metadata.engine_slot,
+                &revision_i64,
+                &metadata.bundle_digest,
+                &stored_digest,
+            ],
         )
         .await
         .internal()?
         .ok_or_else(|| {
             Status::failed_precondition("deployment operation is not live for this node and slot")
         })?;
-    let deployment = txn
-        .query_opt(
-            "SELECT deployment.expected_inventory, deployment.revision_digest, deployment.state,
-                node.current_revision
-         FROM wr_node_deployments deployment
-         JOIN wr_nodes node ON node.node_id = deployment.node_id
-         WHERE deployment.node_id=$1 AND deployment.revision=$2
-           AND deployment.bundle_digest=$3
-           AND deployment.state IN ('pending','active','succeeded')
-         FOR UPDATE",
-            &[
-                &metadata.node_id,
-                &i64::try_from(metadata.revision)
-                    .map_err(|_| Status::invalid_argument("deployment revision is too large"))?,
-                &metadata.bundle_digest,
-            ],
-        )
-        .await
-        .internal()?
-        .ok_or_else(|| {
-            Status::failed_precondition("deployment metadata does not match desired state")
-        })?;
-    let stored_digest: String = deployment.get("revision_digest");
+    let lifecycle_operation_id: uuid::Uuid = operation.get("lifecycle_operation_id");
     let deployment_state: String = deployment.get("state");
+    let operation_phase: String = operation.get("phase");
     let is_staged = matches!(deployment_state.as_str(), "pending" | "active");
     let is_committed = deployment_state == "succeeded"
-        && deployment.get::<_, i64>("current_revision") == metadata.revision as i64;
-    let operation_target_matches = operation.get::<_, i64>("target_revision")
-        == metadata.revision as i64
+        && deployment.get::<_, i64>("current_revision") == revision_i64;
+    let operation_target_matches = operation_phase != "restoring_source"
+        && operation.get::<_, i64>("target_revision") == revision_i64
         && operation.get::<_, String>("bundle_digest") == metadata.bundle_digest
         && operation
             .get::<_, Option<String>>("target_revision_digest")
             .as_deref()
             == Some(&stored_digest);
     let restart_target_matches = operation.get::<_, String>("action") == "restart"
-        && operation.get::<_, i64>("slot_target_revision") == metadata.revision as i64
+        && operation.get::<_, i64>("slot_target_revision") == revision_i64
         && operation.get::<_, String>("slot_target_digest") == metadata.bundle_digest;
-    let restoration_source_matches = operation.get::<_, String>("phase") == "restoring_source"
-        && operation.get::<_, i64>("slot_source_revision") == metadata.revision as i64
+    let restoration_source_matches = operation_phase == "restoring_source"
+        && operation.get::<_, i64>("slot_source_revision") == revision_i64
         && operation.get::<_, String>("slot_source_digest") == metadata.bundle_digest;
     if !((operation_target_matches && is_staged)
         || ((restart_target_matches || restoration_source_matches) && is_committed))
-        || metadata.revision_digest != stored_digest
     {
         return Err(Status::failed_precondition(
             "deployment operation/revision digest mismatch",
         ));
     }
-    txn.query_opt("SELECT authoritative FROM wr_node_slot_authority WHERE node_id=$1 AND engine_slot=$2 AND revision=$3 FOR UPDATE", &[&metadata.node_id,&metadata.engine_slot,&(metadata.revision as i64)]).await.internal()?;
+    txn.query_opt("SELECT authoritative FROM wr_node_slot_authority WHERE node_id=$1 AND engine_slot=$2 AND revision=$3 FOR UPDATE", &[&metadata.node_id,&metadata.engine_slot,&revision_i64]).await.internal()?;
     let inventory = DeploymentInventoryV1::decode(
         deployment
             .get::<_, Vec<u8>>("expected_inventory")
@@ -398,8 +431,8 @@ pub async fn register_engine_and_routes(
             .try_into()
             .map_err(|_| Status::internal("stored slot generation is malformed"))?,
     );
-    let replay = owner.get::<_, Option<uuid::Uuid>>("operation_id") == Some(operation_id)
-        && owner.get::<_, Option<i64>>("revision") == Some(metadata.revision as i64)
+    let replay = owner.get::<_, Option<uuid::Uuid>>("operation_id") == Some(lifecycle_operation_id)
+        && owner.get::<_, Option<i64>>("revision") == Some(revision_i64)
         && owner.get::<_, Option<String>>("revision_digest").as_deref() == Some(&stored_digest)
         && owner.get::<_, Option<uuid::Uuid>>("activation_id") == Some(activation_uuid);
     let next_generation = assigned_slot_generation(generation, replay)?;
@@ -543,7 +576,7 @@ pub async fn register_engine_and_routes(
             &deployment_engine_slot,
             &reg.job_queue_id,
             &reg.job_admin_address,
-            &operation_id,
+            &lifecycle_operation_id,
             &stored_digest,
             &activation_uuid,
             &&next_generation.to_be_bytes()[..],
@@ -707,18 +740,13 @@ pub async fn register_engine_and_routes(
              WHERE d.node_id = $1 AND d.revision = $2 AND d.bundle_digest = $3
                AND d.state = 'pending' AND n.node_id = d.node_id
                AND (n.current_revision = d.revision OR n.target_revision = d.revision)",
-            &[
-                &metadata.node_id,
-                &i64::try_from(metadata.revision)
-                    .map_err(|_| Status::invalid_argument("deployment revision is too large"))?,
-                &metadata.bundle_digest,
-            ],
+            &[&metadata.node_id, &revision_i64, &metadata.bundle_digest],
         )
         .await
         .internal()?;
     }
 
-    txn.execute("UPDATE wr_node_slot_owners SET operation_id=$3,revision=$4,revision_digest=$5,activation_id=$6,engine_id=$7,slot_generation=$8,route_authority=TRUE,lifecycle_authority=TRUE,updated_at=NOW() WHERE node_id=$1 AND engine_slot=$2", &[&metadata.node_id,&metadata.engine_slot,&operation_id,&(metadata.revision as i64),&stored_digest,&activation_uuid,&reg.engine_id,&&next_generation.to_be_bytes()[..]]).await.internal()?;
+    txn.execute("UPDATE wr_node_slot_owners SET operation_id=$3,revision=$4,revision_digest=$5,activation_id=$6,engine_id=$7,slot_generation=$8,route_authority=TRUE,lifecycle_authority=TRUE,updated_at=NOW() WHERE node_id=$1 AND engine_slot=$2", &[&metadata.node_id,&metadata.engine_slot,&lifecycle_operation_id,&revision_i64,&stored_digest,&activation_uuid,&reg.engine_id,&&next_generation.to_be_bytes()[..]]).await.internal()?;
     txn.commit().await.internal()?;
     Ok(RegistrationCommit {
         fence: EngineOwnershipFence {
