@@ -200,28 +200,31 @@ dev-logs service="":
 dev-ps:
     docker compose ps
 
-# Reset example DB — drops module schemas, manager schema, and migration history
+# Reset example and test DBs — drops module schemas, manager schema, and migration history
 dev-reset-db:
-    @echo "==> Resetting example database..."
-    psql "{{db_url_example}}" -c " \
-        DO \$\$DECLARE r RECORD; \
-        BEGIN \
-            FOR r IN SELECT schema_name FROM information_schema.schemata \
-                     WHERE schema_name LIKE 'wr__%' \
-            LOOP \
-                EXECUTE 'DROP SCHEMA \"' || r.schema_name || '\" CASCADE'; \
-                RAISE NOTICE 'dropped schema %', r.schema_name; \
-            END LOOP; \
-            DROP SCHEMA IF EXISTS wr_system CASCADE; \
-            DROP TABLE IF EXISTS refinery_schema_history CASCADE; \
-            FOR r IN SELECT tablename FROM pg_tables \
-                     WHERE schemaname = 'public' AND tablename LIKE 'wr_%' \
-            LOOP \
-                EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; \
-                RAISE NOTICE 'dropped table %', r.tablename; \
-            END LOOP; \
-        END\$\$; \
-    "
+    @for database_url in "{{db_url_example}}" "{{db_url_test}}"; do \
+        echo "==> Resetting ${database_url##*/} database..."; \
+        psql "$database_url" -v ON_ERROR_STOP=1 -c " \
+            DO \$\$DECLARE r RECORD; \
+            BEGIN \
+                FOR r IN SELECT schema_name FROM information_schema.schemata \
+                         WHERE schema_name LIKE 'wr__%' \
+                LOOP \
+                    EXECUTE 'DROP SCHEMA \"' || r.schema_name || '\" CASCADE'; \
+                    RAISE NOTICE 'dropped schema %', r.schema_name; \
+                END LOOP; \
+                DROP SCHEMA IF EXISTS wr_system CASCADE; \
+                DROP TABLE IF EXISTS refinery_schema_history CASCADE; \
+                FOR r IN SELECT tablename FROM pg_tables \
+                         WHERE schemaname = 'public' AND tablename LIKE 'wr_%' \
+                LOOP \
+                    EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; \
+                    RAISE NOTICE 'dropped table %', r.tablename; \
+                END LOOP; \
+                CREATE SCHEMA wr_system; \
+            END\$\$; \
+        "; \
+    done
     @echo "Done."
 
 # Clear all objects from the codegen S3 bucket
