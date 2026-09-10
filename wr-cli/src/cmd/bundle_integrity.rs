@@ -67,13 +67,9 @@ pub struct BundleManifest {
 pub struct ManifestEngine {
     pub engine_slot: String,
     pub modules: Vec<ManifestModule>,
-    #[serde(default)]
     pub secrets: Vec<(String, String)>,
-    #[serde(default)]
     pub db_namespaces: Vec<String>,
-    #[serde(default)]
     pub job_queue_id: String,
-    #[serde(default)]
     pub job_admin_address: String,
 }
 
@@ -82,7 +78,6 @@ pub struct ManifestModule {
     pub name: String,
     pub namespace: String,
     pub version: String,
-    #[serde(default)]
     pub has_schema: bool,
 }
 
@@ -397,6 +392,50 @@ pub fn verify_resolved_release(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundle_manifest_requires_current_fields_but_not_precompile_hash() {
+        let complete = serde_json::json!({
+            "target": "x86_64-unknown-linux-gnu",
+            "bundle_digest": "sha256:bundle",
+            "engines": [{
+                "engine_slot": "engine-1",
+                "modules": [{"name": "api", "namespace": "test", "version": "1.0.0", "has_schema": false}],
+                "secrets": [],
+                "db_namespaces": [],
+                "job_queue_id": "queue-1",
+                "job_admin_address": "https://127.0.0.1:9200"
+            }],
+            "workdir": "/opt/wruntime",
+            "image_prefix": "wr",
+            "modules": [{"name": "api", "namespace": "test", "version": "1.0.0", "has_schema": false}],
+            "configs": [],
+            "template_vars": [],
+            "checksums": {}
+        });
+        let parsed: BundleManifest = serde_json::from_value(complete.clone()).unwrap();
+        assert_eq!(parsed.precompile_hash, None);
+
+        for field in [
+            "secrets",
+            "db_namespaces",
+            "job_queue_id",
+            "job_admin_address",
+        ] {
+            let mut missing = complete.clone();
+            missing["engines"][0].as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<BundleManifest>(missing).is_err(),
+                "missing {field} must fail"
+            );
+        }
+        let mut missing = complete;
+        missing["modules"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("has_schema");
+        assert!(serde_json::from_value::<BundleManifest>(missing).is_err());
+    }
 
     #[test]
     fn release_directory_verification_rejects_tampered_non_metadata_payload() {

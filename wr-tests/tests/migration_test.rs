@@ -6,9 +6,14 @@ use anyhow::{Context, Result};
 async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Result<()> {
     let app_tables_exist: bool = client
         .query_one(
-            "SELECT to_regclass('wr_engines') IS NOT NULL
+            "SELECT to_regclass('wr_manager_lock') IS NOT NULL
+                    AND to_regclass('wr_engines') IS NOT NULL
                     AND to_regclass('wr_routing_rules') IS NOT NULL
                     AND to_regclass('wr_schemas') IS NOT NULL
+                    AND to_regclass('wr_secrets') IS NOT NULL
+                    AND to_regclass('wr_managers') IS NOT NULL
+                    AND to_regclass('wr_schedules') IS NOT NULL
+                    AND to_regclass('wr_module_heartbeats') IS NOT NULL
                     AND to_regclass('wr_nodes') IS NOT NULL
                     AND to_regclass('wr_node_deployments') IS NOT NULL
                     AND to_regclass('wr_node_operations') IS NOT NULL
@@ -241,432 +246,156 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
         )
         .await?;
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_v16_to_v17_preserves_operation_and_event_history() -> Result<()> {
-    let pool = manager_pool_in_schema("mig_v17_upgrade").await;
-    let client = pool.get().await.context("upgrade connection")?;
-    for sql in [
-        include_str!("../../wr-manager/migrations/V1__initial.sql"),
-        include_str!("../../wr-manager/migrations/V2__secrets.sql"),
-        include_str!("../../wr-manager/migrations/V3__managers.sql"),
-        include_str!("../../wr-manager/migrations/V4__engine_heartbeats.sql"),
-        include_str!("../../wr-manager/migrations/V5__schedules.sql"),
-        include_str!("../../wr-manager/migrations/V6__peer_address.sql"),
-        include_str!("../../wr-manager/migrations/V7__system_schema.sql"),
-        include_str!("../../wr-manager/migrations/V8__module_heartbeats.sql"),
-        include_str!("../../wr-manager/migrations/V9__schedule_leases.sql"),
-        include_str!("../../wr-manager/migrations/V10__routing_rule_proxy_address.sql"),
-        include_str!("../../wr-manager/migrations/V11__drop_routing_rule_proxy_address.sql"),
-        include_str!("../../wr-manager/migrations/V12__routing_rule_peer_address_not_empty.sql"),
-        include_str!("../../wr-manager/migrations/V13__schedule_positive_counts.sql"),
-        include_str!("../../wr-manager/migrations/V14__node_deployments.sql"),
-        include_str!("../../wr-manager/migrations/V15__engine_draining.sql"),
-        include_str!("../../wr-manager/migrations/V16__node_operations.sql"),
-    ] {
-        client.batch_execute(sql).await?;
-    }
-    let operation_id = uuid::Uuid::new_v4();
-    client
-        .execute("INSERT INTO wr_nodes(node_id) VALUES ('upgrade-node')", &[])
-        .await?;
-    client
-        .execute(
-            "INSERT INTO wr_node_operations
-               (operation_id, node_id, request_token, actor, action, state,
-                request_payload, policy)
-             VALUES ($1, 'upgrade-node', 'old-token', 'old-actor', 'restart',
-                     'paused', '\\x01', '\\x02')",
-            &[&operation_id],
-        )
-        .await?;
-    client
-        .execute(
-            "INSERT INTO wr_node_operation_slots
-               (operation_id, node_id, engine_slot, rollout_order, next_step)
-             VALUES ($1, 'upgrade-node', 'blue', 0, 'stop_slot')",
-            &[&operation_id],
-        )
-        .await?;
-    client
-        .execute(
-            "INSERT INTO wr_node_operation_events
-               (operation_id, actor, event_code, detail)
-             VALUES ($1, 'old-actor', 'OLD_EVENT', 'retained')",
-            &[&operation_id],
-        )
-        .await?;
-
-    client
-        .batch_execute(include_str!(
-            "../../wr-manager/migrations/V17__node_agent_cutover.sql"
-        ))
-        .await?;
-    let row = client
+    let tables: Vec<String> = client
         .query_one(
-            "SELECT phase, forward_deadline IS NOT NULL AS has_deadline
-             FROM wr_node_operations WHERE operation_id = $1",
-            &[&operation_id],
-        )
-        .await?;
-    assert_eq!(row.get::<_, String>("phase"), "forward");
-    assert!(row.get::<_, bool>("has_deadline"));
-    let next_step: String = client
-        .query_one(
-            "SELECT next_step FROM wr_node_operation_slots WHERE operation_id = $1",
-            &[&operation_id],
-        )
-        .await?
-        .get(0);
-    assert_eq!(next_step, "stop_backend");
-    let event: String = client
-        .query_one(
-            "SELECT event_code FROM wr_node_operation_events WHERE operation_id = $1",
-            &[&operation_id],
-        )
-        .await?
-        .get(0);
-    assert_eq!(event, "OLD_EVENT");
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_v30_terminalizes_legacy_cleanup_and_preserves_provenance() -> Result<()> {
-    let pool = manager_pool_in_schema("mig_v30_cleanup_upgrade").await;
-    let client = pool.get().await.context("V30 upgrade connection")?;
-    for sql in [
-        include_str!("../../wr-manager/migrations/V1__initial.sql"),
-        include_str!("../../wr-manager/migrations/V2__secrets.sql"),
-        include_str!("../../wr-manager/migrations/V3__managers.sql"),
-        include_str!("../../wr-manager/migrations/V4__engine_heartbeats.sql"),
-        include_str!("../../wr-manager/migrations/V5__schedules.sql"),
-        include_str!("../../wr-manager/migrations/V6__peer_address.sql"),
-        include_str!("../../wr-manager/migrations/V7__system_schema.sql"),
-        include_str!("../../wr-manager/migrations/V8__module_heartbeats.sql"),
-        include_str!("../../wr-manager/migrations/V9__schedule_leases.sql"),
-        include_str!("../../wr-manager/migrations/V10__routing_rule_proxy_address.sql"),
-        include_str!("../../wr-manager/migrations/V11__drop_routing_rule_proxy_address.sql"),
-        include_str!("../../wr-manager/migrations/V12__routing_rule_peer_address_not_empty.sql"),
-        include_str!("../../wr-manager/migrations/V13__schedule_positive_counts.sql"),
-        include_str!("../../wr-manager/migrations/V14__node_deployments.sql"),
-        include_str!("../../wr-manager/migrations/V15__engine_draining.sql"),
-        include_str!("../../wr-manager/migrations/V16__node_operations.sql"),
-        include_str!("../../wr-manager/migrations/V17__node_agent_cutover.sql"),
-        include_str!("../../wr-manager/migrations/V18__node_operation_result_receipts.sql"),
-        include_str!("../../wr-manager/migrations/V19__node_agent_policy_and_retention.sql"),
-        include_str!("../../wr-manager/migrations/V20__resolved_releases_and_proxy_operations.sql"),
-        include_str!("../../wr-manager/migrations/V21__deployment_allocation_actor.sql"),
-        include_str!("../../wr-manager/migrations/V22__job_admin_delegates.sql"),
-        include_str!("../../wr-manager/migrations/V23__drop_manager_gossip_address.sql"),
-        include_str!("../../wr-manager/migrations/V24__proxy_source_verification_step.sql"),
-        include_str!("../../wr-manager/migrations/V25__manager_rollout_create_identity.sql"),
-        include_str!("../../wr-manager/migrations/V26__manager_policy_rollout_state.sql"),
-        include_str!("../../wr-manager/migrations/V27__fenced_engine_ownership.sql"),
-        include_str!("../../wr-manager/migrations/V28__manager_rollout_artifact_evidence.sql"),
-    ] {
-        client.batch_execute(sql).await?;
-    }
-
-    let operation_id = uuid::Uuid::new_v4();
-    client
-        .execute(
-            "INSERT INTO wr_nodes(node_id) VALUES ('legacy-cleanup-node')",
-            &[],
-        )
-        .await?;
-    client
-        .execute(
-            "INSERT INTO wr_node_operations
-               (operation_id, node_id, request_token, actor, action, state,
-                request_payload, policy, committed, committed_at, phase, forward_deadline)
-             VALUES ($1, 'legacy-cleanup-node', 'legacy-cleanup', 'operator-a',
-                     'rolling_upgrade', 'paused', '\\x01', '\\x02', TRUE, NOW(),
-                     'committed_cleanup', NOW() + INTERVAL '5 minutes')",
-            &[&operation_id],
-        )
-        .await?;
-    client
-        .execute(
-            "INSERT INTO wr_node_operation_slots
-               (operation_id, node_id, engine_slot, rollout_order, next_step)
-             VALUES ($1, 'legacy-cleanup-node', 'blue', 0, 'cleanup_release')",
-            &[&operation_id],
-        )
-        .await?;
-    client
-        .execute(
-            "INSERT INTO wr_node_release_deletions
-               (node_id, revision, bundle_digest, resolved_release_digest, operation_id)
-             VALUES ('legacy-cleanup-node', 7, 'sha256:legacy', 'sha256:resolved', $1)",
-            &[&operation_id],
-        )
-        .await?;
-
-    client
-        .batch_execute(include_str!(
-            "../../wr-manager/migrations/V29__node_operation_termination_evidence.sql"
-        ))
-        .await?;
-    client
-        .batch_execute(include_str!(
-            "../../wr-manager/migrations/V30__node_release_cleanup.sql"
-        ))
-        .await?;
-
-    let operation = client
-        .query_one(
-            "SELECT phase, state, committed, committed_at IS NOT NULL AS committed_at
-             FROM wr_node_operations WHERE operation_id = $1",
-            &[&operation_id],
-        )
-        .await?;
-    assert_eq!(operation.get::<_, String>("phase"), "complete");
-    assert_eq!(operation.get::<_, String>("state"), "succeeded");
-    assert!(operation.get::<_, bool>("committed"));
-    assert!(operation.get::<_, bool>("committed_at"));
-    let slot = client
-        .query_one(
-            "SELECT next_step, complete FROM wr_node_operation_slots WHERE operation_id = $1",
-            &[&operation_id],
-        )
-        .await?;
-    assert_eq!(slot.get::<_, String>("next_step"), "complete");
-    assert!(slot.get::<_, bool>("complete"));
-    let deletion = client
-        .query_one(
-            "SELECT operation_id, cleanup_generation FROM wr_node_release_deletions
-             WHERE node_id = 'legacy-cleanup-node' AND revision = 7",
-            &[],
-        )
-        .await?;
-    assert_eq!(
-        deletion.get::<_, Option<uuid::Uuid>>("operation_id"),
-        Some(operation_id)
-    );
-    assert_eq!(deletion.get::<_, Option<i64>>("cleanup_generation"), None);
-    let retired_columns: i64 = client
-        .query_one(
-            "SELECT COUNT(*) FROM information_schema.columns
-             WHERE table_schema = current_schema() AND table_name = 'wr_node_operations'
-               AND column_name LIKE 'cleanup_%'",
+            "SELECT array_agg(tablename ORDER BY tablename)::text[]
+             FROM pg_tables WHERE schemaname = current_schema()
+               AND tablename <> 'refinery_schema_history'",
             &[],
         )
         .await?
         .get(0);
-    assert_eq!(retired_columns, 0);
-
-    let proxy_termination_evidence = vec![0x08, 0x01];
-    let engine_termination_evidence = vec![0x08, 0x02];
-    client
-        .execute(
-            "UPDATE wr_node_operations SET proxy_effect_termination_evidence = $2
-             WHERE operation_id = $1",
-            &[&operation_id, &proxy_termination_evidence],
-        )
-        .await?;
-    client
-        .execute(
-            "UPDATE wr_node_operation_slots SET effect_termination_evidence = $2
-             WHERE operation_id = $1 AND engine_slot = 'blue'",
-            &[&operation_id, &engine_termination_evidence],
-        )
-        .await?;
-
-    let active_id = uuid::Uuid::new_v4();
-    client
-        .execute(
-            "INSERT INTO wr_node_operations
-               (operation_id, node_id, request_token, actor, action, state,
-                request_payload, policy, phase, forward_deadline)
-             VALUES ($1, 'legacy-cleanup-node', 'active-v30', 'operator-a',
-                     'restart', 'queued', '\\x01', '\\x02', 'forward',
-                     NOW() + INTERVAL '5 minutes')",
-            &[&active_id],
-        )
-        .await?;
-    let rejected = client
-        .batch_execute(include_str!(
-            "../../wr-manager/migrations/V31__node_operation_targets.sql"
-        ))
-        .await
-        .expect_err("V31 must reject nonterminal operations");
-    assert!(rejected.as_db_error().is_some_and(|error| {
-        error
-            .message()
-            .contains("requires all node operations to be terminal")
-    }));
-    client
-        .execute(
-            "UPDATE wr_node_operations SET state = 'failed', phase = 'complete'
-             WHERE operation_id = $1",
-            &[&active_id],
-        )
-        .await?;
-    client
-        .batch_execute(include_str!(
-            "../../wr-manager/migrations/V31__node_operation_targets.sql"
-        ))
-        .await?;
-    let converted: i64 = client
-        .query_one(
-            "SELECT count(*) FROM wr_node_operation_targets WHERE operation_id = $1",
-            &[&operation_id],
-        )
-        .await?
-        .get(0);
-    assert_eq!(converted, 2);
-    let converted_evidence = client
-        .query(
-            "SELECT target_kind, effect_termination_evidence
-             FROM wr_node_operation_targets WHERE operation_id = $1 ORDER BY target_kind",
-            &[&operation_id],
-        )
-        .await?;
     assert_eq!(
-        converted_evidence[0].get::<_, Option<Vec<u8>>>("effect_termination_evidence"),
-        Some(engine_termination_evidence)
+        tables,
+        [
+            "wr_engines",
+            "wr_manager_lock",
+            "wr_manager_rollout_events",
+            "wr_manager_rollout_guard",
+            "wr_manager_rollout_members",
+            "wr_manager_rollouts",
+            "wr_managers",
+            "wr_module_heartbeats",
+            "wr_node_agent_attestations",
+            "wr_node_agent_policies",
+            "wr_node_deployments",
+            "wr_node_operation_engine_target_details",
+            "wr_node_operation_events",
+            "wr_node_operation_result_receipts",
+            "wr_node_operation_targets",
+            "wr_node_operations",
+            "wr_node_release_cleanup",
+            "wr_node_release_cleanup_events",
+            "wr_node_release_cleanup_generations",
+            "wr_node_release_cleanup_result_receipts",
+            "wr_node_release_deletions",
+            "wr_node_slot_authority",
+            "wr_node_slot_observations",
+            "wr_node_slot_owners",
+            "wr_nodes",
+            "wr_proxy_inventory",
+            "wr_routing_rules",
+            "wr_schedules",
+            "wr_schemas",
+            "wr_secrets",
+        ]
+        .map(String::from)
+        .to_vec(),
+        "fresh V1 must create the complete manager catalog"
     );
-    assert_eq!(
-        converted_evidence[1].get::<_, Option<Vec<u8>>>("effect_termination_evidence"),
-        Some(proxy_termination_evidence)
-    );
-    assert!(client
-        .query_one(
-            "SELECT to_regclass('wr_node_operation_slots') IS NULL
-                    AND EXISTS (
-                        SELECT 1 FROM wr_node_release_deletions
-                        WHERE node_id = 'legacy-cleanup-node' AND revision = 7
-                          AND operation_id = $1 AND cleanup_generation IS NULL
-                    )",
-            &[&operation_id],
-        )
-        .await?
-        .get::<_, bool>(0));
 
-    client
-        .execute(
-            "INSERT INTO wr_node_agent_policies
-           (node_id, protocol_version, config_digest, backend, retention_count, actor,
-            policy_version, binary_digest, manager_endpoint, client_cert_path, client_key_path,
-            ca_cert_path, deployment_root, runtime_dir, compose_project, systemctl_path,
-            docker_path, poll_interval_seconds, renew_interval_seconds, capabilities)
-         VALUES ('legacy-cleanup-node', 'operator-engine-lifecycle-v1', 'sha256:config',
-                 'systemd', 7, 'operator-a', 1, $1, 'https://manager:9000', '/a', '/b',
-                 '/c', '/opt/wruntime', '/run/wruntime', '', '/usr/bin/systemctl', '', 5, 5,
-                 ARRAY['typed-backend-v1','continuous-lease-v1','typed-backend-v1'])",
-            &[&format!("sha256:{}", "a".repeat(64))],
-        )
-        .await?;
-    client
-        .execute(
-            "INSERT INTO wr_node_agent_attestations
-           (node_id, agent_instance_id, authenticated_principal, protocol_version,
-            binary_digest, config_digest, backend, capabilities, observed_at, retention_count)
-         VALUES ('legacy-cleanup-node', 'activation-v31', 'agent-a',
-                 'operator-engine-lifecycle-v1', $1, 'sha256:config', 'systemd',
-                 ARRAY['typed-backend-v1','continuous-lease-v1','typed-backend-v1'], NOW(), 7)",
-            &[&format!("sha256:{}", "a".repeat(64))],
-        )
-        .await?;
-    client
-        .batch_execute(include_str!(
-            "../../wr-manager/migrations/V32__narrow_node_agent_attestation.sql"
-        ))
-        .await?;
-    let narrow = client
+    // Pin the complete application catalog (all columns/defaults/types, keys,
+    // checks/FKs, indexes, functions, triggers, and owned sequences). The
+    // repository test service is pinned to PostgreSQL 18, so pg_catalog
+    // rendering is deterministic for this baseline.
+    let catalog_digest: String = client
         .query_one(
-            "SELECT p.retention_count, p.capabilities, a.capabilities
-         FROM wr_node_agent_policies p JOIN wr_node_agent_attestations a USING (node_id)
-         WHERE p.node_id = 'legacy-cleanup-node'",
-            &[],
-        )
-        .await?;
-    assert_eq!(narrow.get::<_, i32>("retention_count"), 7);
-    assert_eq!(
-        narrow.get::<_, Vec<String>>(1),
-        vec!["continuous-lease-v1", "typed-backend-v1"]
-    );
-    assert_eq!(
-        narrow.get::<_, Vec<String>>(2),
-        vec!["continuous-lease-v1", "typed-backend-v1"]
-    );
-    let broad_absent: bool = client.query_one(
-        "SELECT NOT EXISTS (
-             SELECT 1 FROM information_schema.columns
-             WHERE table_schema = current_schema() AND table_name = 'wr_node_agent_policies'
-               AND column_name IN ('config_digest','manager_endpoint','deployment_root','runtime_dir')
-         ) AND NOT EXISTS (
-             SELECT 1 FROM information_schema.columns
-             WHERE table_schema = current_schema() AND table_name = 'wr_node_agent_attestations'
-               AND column_name IN ('config_digest','retention_count')
-         )",
-        &[],
-    ).await?.get(0);
-    assert!(broad_absent);
-
-    let rejected = client
-        .batch_execute(include_str!(
-            "../../wr-manager/migrations/V33__node_operation_action_matrix.sql"
-        ))
-        .await
-        .expect_err("V33 must reject ambiguous legacy action history");
-    assert!(rejected.as_db_error().is_some_and(|error| {
-        error
-            .message()
-            .contains("cannot cut over legacy node operation actions")
-    }));
-    client
-        .execute(
-            "UPDATE wr_node_operations SET action = 'restart' WHERE operation_id = $1",
-            &[&operation_id],
-        )
-        .await?;
-    client
-        .batch_execute(include_str!(
-            "../../wr-manager/migrations/V33__node_operation_action_matrix.sql"
-        ))
-        .await?;
-    let transition: String = client
-        .query_one(
-            "SELECT transition_kind FROM wr_node_operation_engine_target_details
-             WHERE operation_id = $1 AND target_key = 'blue'",
-            &[&operation_id],
-        )
-        .await?
-        .get(0);
-    assert_eq!(transition, "restart");
-    for action in ["deployment", "rollback"] {
-        client
-            .execute(
-                "INSERT INTO wr_node_operations
-                   (operation_id, node_id, request_token, actor, action, state,
-                    request_payload, policy, phase, forward_deadline)
-                 VALUES ($1, 'legacy-cleanup-node', $2, 'operator-a', $3, 'failed',
-                         '\\x01', '\\x02', 'complete', NOW() + INTERVAL '5 minutes')",
-                &[&uuid::Uuid::new_v4(), &format!("valid-{action}"), &action],
+            r#"WITH catalog_lines AS (
+                SELECT 1 AS category, c.relname AS object_name, a.attnum AS ordinal,
+                       format('COLUMN|%s|%s|%s|%s|%s', c.relname, a.attname,
+                              pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull,
+                              COALESCE(pg_get_expr(d.adbin, d.adrelid), '')) AS line
+                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                  LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+                 WHERE n.nspname = current_schema() AND c.relkind = 'r'
+                   AND c.relname <> 'refinery_schema_history'
+                UNION ALL
+                SELECT 2, c.relname, 0,
+                       format('CONSTRAINT|%s|%s|%s|%s|%s|%s', c.relname, con.conname,
+                              con.contype, con.condeferrable, con.condeferred,
+                              pg_get_constraintdef(con.oid))
+                  FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = current_schema() AND c.relname <> 'refinery_schema_history'
+                UNION ALL
+                SELECT 3, i.indexname, 0,
+                       'INDEX|' || i.indexname || '|' || replace(i.indexdef, current_schema() || '.', '')
+                  FROM pg_indexes i WHERE i.schemaname = current_schema()
+                   AND i.tablename <> 'refinery_schema_history'
+                UNION ALL
+                SELECT 4, p.proname, 0,
+                       'FUNCTION|' || p.proname || '|' ||
+                       replace(replace(pg_get_functiondef(p.oid), E'\n', ' '), current_schema() || '.', '')
+                  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                 WHERE n.nspname = current_schema()
+                UNION ALL
+                SELECT 5, t.tgname, 0,
+                       format('TRIGGER|%s|%s|%s|%s|%s', c.relname, t.tgname,
+                              t.tgdeferrable, t.tginitdeferred,
+                              replace(pg_get_triggerdef(t.oid), current_schema() || '.', ''))
+                  FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = current_schema() AND NOT t.tgisinternal
+                UNION ALL
+                SELECT 6, c.relname, 0, 'SEQUENCE|' || c.relname
+                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = current_schema() AND c.relkind = 'S'
             )
-            .await?;
-    }
-    let invalid_action = client
-        .execute(
-            "UPDATE wr_node_operations SET action = 'drain' WHERE operation_id = $1",
-            &[&operation_id],
+            SELECT md5(string_agg(line, E'\n' ORDER BY category, object_name, ordinal, line))
+              FROM catalog_lines"#,
+            &[],
         )
-        .await
-        .expect_err("retired actions must be rejected");
-    assert!(invalid_action.as_db_error().is_some());
-    let invalid_transition = client
-        .execute(
-            "UPDATE wr_node_operation_engine_target_details SET transition_kind = 'invalid'
-             WHERE operation_id = $1 AND target_key = 'blue'",
-            &[&operation_id],
+        .await?
+        .get(0);
+    assert_eq!(catalog_digest, "7fdb235a4ce68a5da53817492a007057");
+
+    let detail_triggers: Vec<String> = client
+        .query_one(
+            "SELECT array_agg(c.relname || ':' || t.tgname || ':' || t.tgdeferrable || ':' || t.tginitdeferred ORDER BY t.tgname)::text[]
+             FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = current_schema() AND NOT t.tgisinternal
+               AND t.tgname IN ('wr_node_operation_target_detail_required', 'wr_node_operation_engine_detail_required')",
+            &[],
         )
-        .await
-        .expect_err("unknown transitions must be rejected");
-    assert!(invalid_transition.as_db_error().is_some());
+        .await?
+        .get(0);
+    assert_eq!(detail_triggers, vec![
+        "wr_node_operation_engine_target_details:wr_node_operation_engine_detail_required:true:true".to_string(),
+        "wr_node_operation_targets:wr_node_operation_target_detail_required:true:true".to_string(),
+    ]);
+    let function_exists: bool = client
+        .query_one(
+            "SELECT to_regprocedure('wr_check_node_operation_engine_target_detail()') IS NOT NULL",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(
+        function_exists,
+        "expected operation target-detail trigger function"
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM wr_manager_lock WHERE id = 1 AND version = 0",
+                &[]
+            )
+            .await?
+            .get::<_, i64>(0),
+        1
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM wr_manager_rollout_guard WHERE singleton",
+                &[]
+            )
+            .await?
+            .get::<_, i64>(0),
+        1
+    );
 
     Ok(())
 }
@@ -712,18 +441,18 @@ async fn test_run_migrations_second_run_is_noop() -> Result<()> {
         .context("second run")?;
 
     assert_manager_schema_ready(&client).await?;
-    let tail: Vec<i32> = client
+    let versions: Vec<i32> = client
         .query_one(
-            "SELECT array_agg(version::integer ORDER BY applied_on, version)
-             FROM refinery_schema_history WHERE version IN (29, 30, 31, 32, 33)",
+            "SELECT array_agg(version::integer ORDER BY version)
+             FROM refinery_schema_history",
             &[],
         )
         .await?
         .get(0);
     assert_eq!(
-        tail,
-        vec![29, 30, 31, 32, 33],
-        "V33 must follow preserved V29 through V32"
+        versions,
+        vec![1],
+        "fresh manager history must contain only V1"
     );
 
     Ok(())

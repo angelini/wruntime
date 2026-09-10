@@ -19,8 +19,8 @@ def load_status(path: str) -> dict[str, Any]:
         value = json.load(sys.stdin) if path == "-" else json.loads(Path(path).read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise AssertionFailure(f"cannot read cluster status JSON: {exc}") from exc
-    if not isinstance(value, dict) or value.get("schema_version") != 2:
-        raise AssertionFailure("cluster status schema_version must be 2")
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise AssertionFailure("cluster status schema_version must be 1")
     return value
 
 

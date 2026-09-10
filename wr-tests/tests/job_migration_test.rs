@@ -3,24 +3,7 @@ mod helpers;
 use anyhow::Result;
 use helpers::db::{require_db_url, skip_without_db};
 
-mod embedded_job_migrations {
-    use refinery::embed_migrations;
-    embed_migrations!("../wr-engine/migrations/jobs");
-}
-
 static JOB_MIGRATION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-async fn run_embedded_job_migrations(
-    client: &mut deadpool_postgres::Object,
-    target: refinery::Target,
-) -> Result<()> {
-    let client_wrapper: &mut deadpool_postgres::ClientWrapper = client;
-    let pg_client: &mut deadpool_postgres::tokio_postgres::Client = client_wrapper;
-    let mut runner = embedded_job_migrations::migrations::runner().set_target(target);
-    runner.set_migration_table_name("job_schema_history");
-    runner.run_async(pg_client).await?;
-    Ok(())
-}
 
 async fn assert_index_plan(
     client: &deadpool_postgres::Object,
@@ -72,7 +55,7 @@ async fn fresh_and_concurrent_job_migrations_converge() -> Result<()> {
             .query_one("SELECT count(*) FROM wr__jobs.job_schema_history", &[],)
             .await?
             .get::<_, i64>(0),
-        4
+        1
     );
     assert!(client
         .query_one(
@@ -165,6 +148,15 @@ async fn fresh_and_concurrent_job_migrations_converge() -> Result<()> {
         )
         .await;
     assert!(malformed_dead.is_err());
+    let incomplete_claim = client
+        .execute(
+            "INSERT INTO wr__jobs.jobs \
+             (job_id, worker_namespace, worker_name, worker_version, status, attempt) \
+             VALUES ('incomplete-claim', 'ns', 'worker', '1.0.0', 'running', 1)",
+            &[],
+        )
+        .await;
+    assert!(incomplete_claim.is_err());
 
     wr_engine::job_migration::run_job_migrations(&setup).await?;
     assert_eq!(
@@ -172,122 +164,8 @@ async fn fresh_and_concurrent_job_migrations_converge() -> Result<()> {
             .query_one("SELECT count(*) FROM wr__jobs.job_schema_history", &[],)
             .await?
             .get::<_, i64>(0),
-        4
-    );
-    client
-        .batch_execute("DROP SCHEMA IF EXISTS wr__jobs CASCADE")
-        .await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn v4_repairs_legacy_dead_rows_and_enforces_lifecycle_constraint() -> Result<()> {
-    if skip_without_db("v4_repairs_legacy_dead_rows_and_enforces_lifecycle_constraint") {
-        return Ok(());
-    }
-    let _guard = JOB_MIGRATION_TEST_LOCK.lock().await;
-    let pool = wr_engine::pool::build_pool(&require_db_url(), 1)?;
-    let mut client = pool.get().await?;
-    client
-        .batch_execute(
-            "DROP SCHEMA IF EXISTS wr__jobs CASCADE; \
-             CREATE SCHEMA wr__jobs; \
-             SET search_path = wr__jobs",
-        )
-        .await?;
-
-    run_embedded_job_migrations(&mut client, refinery::Target::Version(1)).await?;
-    assert_eq!(
-        client
-            .query_one("SELECT count(*) FROM job_schema_history", &[])
-            .await?
-            .get::<_, i64>(0),
         1
     );
-
-    client
-        .execute(
-            "INSERT INTO jobs \
-             (job_id, worker_namespace, worker_name, worker_version, status, \
-              attempt, max_attempts, error_message, result, completed_at, \
-              claimed_at, claimed_by, claim_id) \
-             VALUES ('legacy-null-failure', 'legacy', 'worker', '1.0.0', 'dead', \
-                     1, 3, NULL, decode('0102', 'hex'), now(), now(), 'old-engine', \
-                     '00000000-0000-0000-0000-000000000001'::uuid)",
-            &[],
-        )
-        .await?;
-
-    run_embedded_job_migrations(&mut client, refinery::Target::Version(3)).await?;
-    assert_eq!(
-        client
-            .query_one("SELECT count(*) FROM job_schema_history", &[])
-            .await?
-            .get::<_, i64>(0),
-        3
-    );
-    client
-        .execute(
-            "INSERT INTO jobs \
-             (job_id, worker_namespace, worker_name, worker_version, status, \
-              attempt, max_attempts, error_message, result, completed_at) \
-             VALUES ('legacy-empty-failure', 'legacy', 'worker', '1.0.0', 'dead', \
-                     0, 5, '', decode('03', 'hex'), now())",
-            &[],
-        )
-        .await?;
-
-    run_embedded_job_migrations(&mut client, refinery::Target::Latest).await?;
-    assert_eq!(
-        client
-            .query_one("SELECT count(*) FROM job_schema_history", &[])
-            .await?
-            .get::<_, i64>(0),
-        4
-    );
-
-    let rows = client
-        .query(
-            "SELECT job_id, attempt, max_attempts, error_message, result, completed_at, \
-                    claimed_at, claimed_by, claim_id, lease_expires_at \
-             FROM jobs WHERE job_id LIKE 'legacy-%' ORDER BY job_id",
-            &[],
-        )
-        .await?;
-    assert_eq!(rows.len(), 2);
-    for row in &rows {
-        assert_eq!(row.get::<_, i32>(1), row.get::<_, i32>(2));
-        assert_eq!(
-            row.get::<_, String>(3),
-            "legacy dead job: failure unavailable"
-        );
-        assert!(row.get::<_, Option<Vec<u8>>>(4).is_none());
-        assert!(row.get::<_, Option<std::time::SystemTime>>(5).is_none());
-        assert!(row.get::<_, Option<std::time::SystemTime>>(6).is_none());
-        assert!(row.get::<_, Option<String>>(7).is_none());
-        assert!(row.get::<_, Option<uuid::Uuid>>(8).is_none());
-        assert!(row.get::<_, Option<std::time::SystemTime>>(9).is_none());
-    }
-
-    assert!(client
-        .query_one(
-            "SELECT convalidated FROM pg_constraint \
-             WHERE conrelid = 'jobs'::regclass AND conname = 'jobs_dead_lifecycle_valid'",
-            &[],
-        )
-        .await?
-        .get::<_, bool>(0));
-    for regression in [
-        "UPDATE jobs SET attempt = max_attempts - 1 WHERE job_id = 'legacy-null-failure'",
-        "UPDATE jobs SET error_message = NULL WHERE job_id = 'legacy-null-failure'",
-        "UPDATE jobs SET result = decode('ff', 'hex') WHERE job_id = 'legacy-null-failure'",
-    ] {
-        assert!(
-            client.execute(regression, &[]).await.is_err(),
-            "V4 constraint accepted regression: {regression}"
-        );
-    }
-
     client
         .batch_execute("DROP SCHEMA IF EXISTS wr__jobs CASCADE")
         .await?;

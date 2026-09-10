@@ -359,9 +359,6 @@ mod tests {
         handle_worker_grpc_bytes, worker_error as worker_err, GET_JOB_STATUS_PATH, SUBMIT_JOB_PATH,
     };
 
-    const SHORT_SUBMIT_JOB_PATH: &str = "/SubmitJob";
-    const SHORT_GET_JOB_STATUS_PATH: &str = "/GetJobStatus";
-
     #[tokio::test]
     async fn lifecycle_rpc_is_status_only_and_never_mutates_admission() -> anyhow::Result<()> {
         use wr_common::process_lifecycle::{LifecycleOwner, ServiceKind, TransitionReason};
@@ -514,13 +511,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canonical_and_short_worker_paths_require_a_database() {
-        for path in [
-            SUBMIT_JOB_PATH,
-            GET_JOB_STATUS_PATH,
-            SHORT_SUBMIT_JOB_PATH,
-            SHORT_GET_JOB_STATUS_PATH,
-        ] {
+    async fn canonical_worker_paths_require_a_database() {
+        for path in [SUBMIT_JOB_PATH, GET_JOB_STATUS_PATH] {
             let (status, value) = response_json(
                 handle_worker_grpc_bytes(
                     path,
@@ -703,15 +695,25 @@ mod tests {
         assert_eq!(status.max_attempts, 4);
     }
 
-    #[test]
-    fn short_worker_paths_are_compatibility_aliases() {
-        assert_eq!(
-            canonical_worker_path(SHORT_SUBMIT_JOB_PATH),
-            Some(SUBMIT_JOB_PATH)
-        );
-        assert_eq!(
-            canonical_worker_path(SHORT_GET_JOB_STATUS_PATH),
-            Some(GET_JOB_STATUS_PATH)
-        );
+    #[tokio::test]
+    async fn short_worker_paths_are_not_routed() {
+        for path in ["/SubmitJob", "/GetJobStatus"] {
+            assert_eq!(canonical_worker_path(path), None);
+            let (status, value) = response_json(
+                handle_worker_grpc_bytes(
+                    path,
+                    Bytes::new(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    &WorkerDefaults::default(),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(value, json!({"error": "unknown worker endpoint"}), "{path}");
+        }
     }
 }

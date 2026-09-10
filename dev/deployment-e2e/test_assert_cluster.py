@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import copy
 import importlib.util
+import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 SPEC = importlib.util.spec_from_file_location("assert_cluster", Path(__file__).with_name("assert_cluster.py"))
@@ -56,7 +58,7 @@ def healthy_status(revision=3, digest="sha256:a", version="1.0.0", source=0):
                       "open": 0, "half_open": 0, "severity": "healthy", "conditions": []}],
     }
     return {
-        "schema_version": 2, "severity": "healthy", "routing_table_version": 7,
+        "schema_version": 1, "severity": "healthy", "routing_table_version": 7,
         "managers": [{"manager_id": "manager-id", "grpc_address": "https://192.0.2.10:9000"}],
         "nodes": [{"node_id": "wr-e2e-node", "severity": "healthy", "desired_deployment": desired, "deployment_history": [desired], "engines": [engine], "proxies": [proxy], "conditions": []}],
         "engines": [engine], "proxies": [proxy],
@@ -69,6 +71,19 @@ def healthy_status(revision=3, digest="sha256:a", version="1.0.0", source=0):
 
 
 class AssertionTests(unittest.TestCase):
+    def test_cluster_schema_is_strictly_version_one(self):
+        for version, accepted in ((1, True), (2, False), (0, False)):
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as fixture:
+                value = healthy_status()
+                value["schema_version"] = version
+                json.dump(value, fixture)
+                fixture.flush()
+                if accepted:
+                    self.assertEqual(assert_cluster.load_status(fixture.name)["schema_version"], 1)
+                else:
+                    with self.assertRaisesRegex(assert_cluster.AssertionFailure, "schema_version must be 1"):
+                        assert_cluster.load_status(fixture.name)
+
     def test_manager_and_desired_success(self):
         status = healthy_status()
         self.assertEqual(assert_cluster.assert_manager(status, "https://192.0.2.10:9000")["manager_id"], "manager-id")

@@ -976,7 +976,7 @@ server_ca_cert_path = "server-root.crt"
             [external]
             listen_address = "0.0.0.0:8080"
 
-            [[external.route]]
+            [[external.routes]]
             path = "/tasks"
             rpc_path = "/codegen.CoordinatorService/RunTask"
             methods = ["POST"]

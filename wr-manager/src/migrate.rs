@@ -16,21 +16,6 @@ mod embedded {
 /// production the pool sets `search_path = wr_system`; tests use an isolated
 /// per-test schema.
 pub async fn run_migrations(client: &mut deadpool_postgres::Object) -> Result<()> {
-    // Include `public` in the search_path so V7 can find pre-migration tables
-    // that still live in public and move them to the target schema. Applied to
-    // the session so it persists for refinery's internal transactions.
-    let row = client
-        .query_one("SHOW search_path", &[])
-        .await
-        .context("failed to read search_path")?;
-    let current: String = row.get(0);
-    if !current.contains("public") {
-        client
-            .batch_execute(&format!("SET search_path = {current}, public"))
-            .await
-            .context("failed to append public to search_path")?;
-    }
-
     client
         .batch_execute("SELECT pg_advisory_lock(hashtext('wr-manager-migrations'))")
         .await

@@ -214,8 +214,6 @@ message RoutingRule {
   bool   healthy                   = 7; // set by manager; false means no traffic
   string source_namespace          = 8; // metadata reserved for future source policy; ignored by routing
   string destination_namespace     = 9;
-  reserved 10;
-  reserved "proxy_address";
   string peer_address              = 11; // sole cross-node forwarding address (required, non-empty)
 }
 
@@ -316,8 +314,6 @@ message ListSecretsResponse { repeated SecretEntry secrets = 1; }
 
 message ListManagersRequest {}
 message ManagerInfo {
-  reserved 3;
-  reserved "gossip_address";
   string manager_id = 1;
   string grpc_address = 2;
 }
@@ -341,8 +337,6 @@ enum ManagerMembershipState {
 }
 
 message ManagerStatus {
-  reserved 3;
-  reserved "gossip_address";
   string manager_id = 1;
   string grpc_address = 2;
   StatusSeverity severity = 4;
@@ -525,8 +519,6 @@ message NodeStatus {
 
 message GetClusterStatusRequest {}
 message GetClusterStatusResponse {
-  reserved 3;
-  reserved "gossip_observed_at";
   optional google.protobuf.Timestamp response_at = 1;
   optional google.protobuf.Timestamp database_observed_at = 2;
   uint64 routing_table_version = 4;
@@ -544,8 +536,6 @@ message GetClusterStatusResponse {
 // Operator actions are durable deployment/node intent. They never identify a
 // PID and never mutate LifecycleService directly.
 enum NodeOperationAction {
-  reserved 1, 2, 4, 5;
-  reserved "NODE_OPERATION_ACTION_INITIAL_APPLY", "NODE_OPERATION_ACTION_DRAIN", "NODE_OPERATION_ACTION_ROLLING_UPGRADE", "NODE_OPERATION_ACTION_SCALE";
   NODE_OPERATION_ACTION_UNSPECIFIED = 0;
   NODE_OPERATION_ACTION_RESTART = 3;
   NODE_OPERATION_ACTION_ROLLBACK = 6;
@@ -592,8 +582,6 @@ message NodeCleanupSummary {
 // Operation phase is intentionally separate from terminal/lease state.
 // Restoration is deadline-free but lease-fenced; release cleanup is a separate lifecycle.
 enum NodeOperationPhase {
-  reserved 4, 6;
-  reserved "NODE_OPERATION_PHASE_COMMITTED_CLEANUP", "NODE_OPERATION_PHASE_SUPERSEDED";
   NODE_OPERATION_PHASE_UNSPECIFIED = 0;
   NODE_OPERATION_PHASE_FORWARD = 1;
   NODE_OPERATION_PHASE_RESTORING_SOURCE = 2;
@@ -612,8 +600,6 @@ enum NodeOperationStepKind {
   NODE_OPERATION_STEP_KIND_SWITCH_AUTHORITY = 7;
   NODE_OPERATION_STEP_KIND_VERIFY_SERVING = 8;
   NODE_OPERATION_STEP_KIND_RESTORE_SOURCE = 9;
-  reserved 10;
-  reserved "NODE_OPERATION_STEP_KIND_CLEANUP_RELEASE";
   // Read-only backend inspection after takeover or ambiguous effect delivery.
   NODE_OPERATION_STEP_KIND_INSPECT_BACKEND = 11;
 }
@@ -672,8 +658,6 @@ message EngineSlotTargetIdentity { string engine_slot = 1; }
 
 message InstructionTarget {
   InstructionTargetKind kind = 1;
-  reserved 2;
-  reserved "engine_slot";
   uint64 revision = 3;
   string bundle_digest = 4;
   string resolved_release_digest = 5;
@@ -684,8 +668,6 @@ message InstructionTarget {
 }
 
 message RolloutPolicy {
-  reserved 2, 3;
-  reserved "canary_slot", "pause_after_canary";
   uint32 max_unavailable = 1;
   bool allow_downtime = 4;
   uint64 deadline_seconds = 5;
@@ -747,8 +729,6 @@ message NodeOperation {
   uint64 source_revision = 8;
   uint64 target_revision = 9;
   string bundle_digest = 10;
-  reserved 11;
-  reserved "slots";
   bool committed = 12;
   uint64 lease_epoch = 13;
   optional google.protobuf.Timestamp lease_expires_at = 14;
@@ -760,9 +740,6 @@ message NodeOperation {
   bool forward_fenced = 20;
   bool restoration_requested = 21;
   string agent_instance_id = 22;
-  reserved 23, 24, 25, 26, 28, 29, 31 to 49;
-  reserved "cleanup_superseded_by", "cleanup_evidence", "cleanup_reported_at", "cleanup_backend_query_error", "cleanup_delivered_at";
-  reserved "proxy_process_instance_id", "proxy_next_step", "proxy_source_revision", "proxy_source_digest", "proxy_source_resolved_release_digest", "proxy_target_revision", "proxy_target_digest", "proxy_target_resolved_release_digest", "proxy_backend_instance_id", "proxy_changed", "proxy_effect_ambiguous", "proxy_effect_delivered_at", "proxy_effect_reported", "proxy_effect_observed_revision", "proxy_effect_observed_digest", "proxy_effect_observed_resolved_release_digest", "proxy_effect_backend_instance_id", "proxy_effect_process_instance_id", "proxy_effect_condition_code", "proxy_effect_detail";
   NodeOperationState restoration_terminal_state = 27;
   string resolved_release_digest = 30;
   string revision_digest = 50;
@@ -780,8 +757,6 @@ message OperationEvent {
 }
 
 message SubmitOperationRequest {
-  reserved 4;
-  reserved "engine_slots";
   string node_id = 1;
   string request_token = 2;
   NodeOperationAction action = 3;
@@ -838,8 +813,6 @@ message NodeAgentAttestation {
   string agent_instance_id = 2;
   string protocol_version = 3;
   string binary_digest = 4;
-  reserved 5, 10;
-  reserved "config_digest", "retention_count";
   BackendKind backend = 6;
   repeated string capabilities = 7;
   optional google.protobuf.Timestamp observed_at = 8;
@@ -851,8 +824,6 @@ message NodeAgentAttestation {
 message NodeAgentPolicy {
   string node_id = 1;
   string protocol_version = 2;
-  reserved 3, 6, 8 to 18;
-  reserved "config_digest", "policy_version", "manager_endpoint", "client_cert_path", "client_key_path", "ca_cert_path", "deployment_root", "runtime_dir", "compose_project", "systemctl_path", "docker_path", "poll_interval_seconds", "renew_interval_seconds";
   BackendKind backend = 4;
   optional uint32 retention_count = 5;
   string binary_digest = 7;
@@ -878,8 +849,6 @@ message ClaimOperationRequest {
   string agent_instance_id = 2;
 }
 message AgentInstruction {
-  reserved 3, 6, 7;
-  reserved "engine_slot", "revision", "bundle_digest";
   string operation_id = 1;
   string node_id = 2;
   uint64 lease_epoch = 4;
@@ -890,8 +859,6 @@ message AgentInstruction {
   string pinned_backend_instance_id = 11;
   string pinned_process_instance_id = 12;
   bool restoration = 13;
-  reserved 14;
-  reserved "cleanup_delete_releases";
   string revision_digest = 15;
 }
 message ClaimOperationResponse {
@@ -993,8 +960,6 @@ message ReportNodeCleanupResultResponse {
 message ReportStepResultRequest {
   string node_id = 1;
   string operation_id = 2;
-  reserved 3;
-  reserved "engine_slot";
   uint64 lease_epoch = 4;
   NodeOperationStepKind step = 5;
   string condition_code = 6;
@@ -1005,8 +970,6 @@ message ReportStepResultRequest {
   string backend_instance_id = 11;
   string process_instance_id = 12;
   string backend_query_error = 13;
-  reserved 14;
-  reserved "cleanup_evidence";
   string observed_resolved_release_digest = 15;
   InstructionTarget target = 16;
   BackendTerminationEvidence termination_evidence = 17;

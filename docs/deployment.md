@@ -252,11 +252,9 @@ The bundle's finalized inventory is authoritative; callers do not select initial
 
 The host agent verifies digest-covered release metadata, confines paths below `deployment_root`, atomically selects `wr-node/slots/<slot>`, and invokes only fixed systemd units or Compose services. It has no listener and no root-owned recovery-state directory or journal. The generated unit grants write access to workload state, the runtime directory, and backend-owned unit/socket paths only. Stop sends SIGTERM through that backend; the engine's 30-second shutdown emits `STOPPING`, withdraws routes, converges the proxy, drains, and deregisters. The manager commits delivery ambiguity before returning a mutation. A live agent retries an unacknowledged exact tagged result in memory before claiming more work; after agent replacement, the fresh activation never replays that result and instead receives typed backend inspection from durable manager state. Endpoint disappearance alone is never final-exit proof, and missing or query-error inspection evidence is unknown and pauses rather than authorizing another mutation.
 
-### Unified-target schema cutover
+### Clean-slate persistence baseline
 
-Migration V31 is a coordinated, quiesced binary/schema cutover. Stop new operation submissions and agent claims, verify there are zero queued/running/paused node operations, and take the required database restore point before applying migrations. V31 aborts rather than resetting in-flight state; it converts terminal proxy, engine, typed-detail, termination-evidence, and receipt history exactly and then removes the split schema.
-
-Before V31 commits, rollback uses the old binaries with the unchanged schema. After V31 commits, old binaries are incompatible: keep claims stopped and either roll forward with matching manager/agent binaries or restore the database and old binaries together. Mixed-version operation processing is unsupported.
+The embedded manager schema and engine job queue each have one V1 migration. Existing manager/job persistence and old Refinery history or checksums are unsupported. During development or testing, stop wruntime and run `just dev-reset-db` to destroy and recreate both stores before starting binaries containing the clean baseline. Guest-authored module migrations remain independent forward migration chains and are not reset by this contract.
 
 ## Multi-node cluster setup
 
@@ -452,7 +450,7 @@ wr-cli cluster status --fail-on unhealthy
 wr-cli cluster wait --node node-a --severity unhealthy --timeout-secs 30
 ```
 
-The default table prints aggregate counts (including proxies) and problem rows; `--detail` expands selected/expected proxy identity, lifecycle/admission, report and routing ages, routing source/version, listener states, aggregate breaker counts, and healthy/unknown records. JSON remains additive `schema_version: 2` and emits canonical top-level plus node-embedded proxy inventory alongside raw observation/heartbeat/deployment timestamps, server-computed ages, desired and actual identities, routing version, route evidence, and stable condition codes. Human `detail` text is explanatory; automation must use severity and code.
+The default table prints aggregate counts (including proxies) and problem rows; `--detail` expands selected/expected proxy identity, lifecycle/admission, report and routing ages, routing source/version, listener states, aggregate breaker counts, and healthy/unknown records. JSON uses the strict current `schema_version: 1` and emits canonical top-level plus node-embedded proxy inventory alongside raw observation/heartbeat/deployment timestamps, server-computed ages, desired and actual identities, routing version, route evidence, and stable condition codes. Human `detail` text is explanatory; automation must use severity and code.
 
 A healthy rollout reports the exact current node revision and digest with one authoritative fresh registration per desired slot, fresh module heartbeats, and healthy routes. Common failures are `REVISION_MISMATCH` for an old activated revision and `STALE_ENGINE_HEARTBEAT`/`STALE_MODULE_HEARTBEAT` for expired observations. A service remains available but becomes degraded with `PARTIAL_ROUTE_AVAILABILITY` when only some desired routes are healthy; zero healthy desired routes is unhealthy. A retained manager row whose lease is older than the configured live threshold is dead with `STALE_MANAGER_HEARTBEAT`; the database observation timestamp is the authoritative clock evidence.
 

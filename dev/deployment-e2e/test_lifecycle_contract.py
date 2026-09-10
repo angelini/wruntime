@@ -105,13 +105,13 @@ PY
 if [[ " $* " == *" invoke "* ]]; then
     printf '{{"nonce":"probe"}}\\n'
 elif [[ "$*" == *"operations list"* ]]; then
-    printf '[{{"operation_id":"operation-a","node_id":"node-a","request_token":"upgrade-token","state":"succeeded"}}]\\n'
+    printf '[{{"operation_id":"operation-a","node_id":"node-a","request_token":"replacement-token","state":"succeeded"}}]\\n'
 elif [[ "$*" == *"operations get operation-a"* ]]; then
     printf '{{"schema_version":1,"operation_id":"operation-a"}}\\n'
 elif [[ "$*" == *"--exit-after-finalization"* ]]; then
     printf 'deterministic exit after inactive release finalization\\n' >&2
     exit 1
-elif [[ " $* " == *" upgrade "* ]]; then
+elif [[ " $* " == *" replacement-token "* ]]; then
     sleep 0.4
 fi
 """)
@@ -132,8 +132,8 @@ fi
             events = [json.loads(line) for line in trace.read_text().splitlines()]
             operations = [event for event in events if event["event"] == "operation"]
             self.assertEqual([event["name"] for event in operations], [
-                "systemd-scale-out", "systemd-upgrade-finalize", "systemd-upgrade-retry", "systemd-scale-in", "systemd-drain", "systemd-rollback",
-                "docker-scale-out", "docker-upgrade-finalize", "docker-upgrade-retry", "docker-scale-in", "docker-drain", "docker-rollback",
+                "systemd-addition", "systemd-replacement-finalize", "systemd-replacement-retry", "systemd-removal", "systemd-empty-inventory", "systemd-rollback",
+                "docker-addition", "docker-replacement-finalize", "docker-replacement-retry", "docker-removal", "docker-empty-inventory", "docker-rollback",
             ])
             for event in operations:
                 self.assertIn("submitted=1000,durable=2800,cli_wait=2860,watchdog=2920", event["detail"])
@@ -146,7 +146,7 @@ fi
             self.assertTrue(all("barrier=120,lease=30,renew=10,watchdog=180" in event["detail"] for event in manager_rollouts))
             self.assertEqual(len([event for event in events if event["event"] == "cleanup"]), 1)
             captures = [event for event in events if event["event"] == "operation-detail"]
-            self.assertEqual([event["name"] for event in captures], ["upgrade-token", "upgrade-token"])
+            self.assertEqual([event["name"] for event in captures], ["replacement-token", "replacement-token"])
             self.assertEqual(json.loads((root / "operation.json").read_text())["operation_id"], "operation-a")
             invoked = calls.read_text().splitlines()
             self.assertTrue(any("operations list" in line for line in invoked))
@@ -159,11 +159,11 @@ fi
                 for line in probe_calls
             ))
             self.assertEqual([line for line in invoked if line.startswith("provider ")], ["provider reset", "provider reset", "provider stop-reset"])
-            upgrades = [line for line in invoked if line.startswith("cli upgrade ")]
-            self.assertEqual(len(upgrades), 4)
-            self.assertEqual(sum("--exit-after-finalization" in line for line in upgrades), 2)
-            self.assertTrue(all("--request-token upgrade-token" in line for line in upgrades))
-            self.assertEqual(sum("--bundle upgrade-two.tar.gz" in line for line in upgrades), 2)
+            replacements = [line for line in invoked if "node deploy" in line and "replacement-token" in line]
+            self.assertEqual(len(replacements), 4)
+            self.assertEqual(sum("--exit-after-finalization" in line for line in replacements), 2)
+            self.assertTrue(all("--request-token replacement-token" in line for line in replacements))
+            self.assertEqual(sum("--bundle upgrade-two.tar.gz" in line for line in replacements), 2)
             deploy_sets = [line for line in invoked if "managers deploy-set" in line]
             self.assertEqual(len(deploy_sets), 2)
             self.assertIn("manager-a-to-b-systemd.toml --generation 2 --manager-endpoint manager-a", deploy_sets[0])
@@ -174,14 +174,14 @@ fi
                 ("tunnel", "start"), ("probe", "start"), ("probe", "stop"), ("tunnel", "stop"),
                 ("tunnel", "start"), ("probe", "start"), ("probe", "stop"), ("tunnel", "stop"),
             ])
-            upgrade = upgrades[0]
-            drain = next(line for line in invoked if line.startswith("cli drain "))
-            rollback = next(line for line in invoked if line.startswith("cli rollback "))
-            self.assertNotIn("--allow-downtime", upgrade)
-            self.assertIn("--allow-downtime", drain)
+            replacement = replacements[0]
+            empty_inventory = next(line for line in invoked if "empty-inventory.tar.gz" in line)
+            rollback = next(line for line in invoked if line.startswith("cli node rollback "))
+            self.assertNotIn("--allow-downtime", replacement)
+            self.assertIn("--allow-downtime", empty_inventory)
             self.assertIn("--allow-downtime", rollback)
             self.assertIn("--to revision_one_a", rollback)
-            for line in (item for item in invoked if any(item.startswith(f"cli {command} ") for command in ("scale-out", "upgrade", "scale-in", "drain", "rollback"))):
+            for line in (item for item in invoked if item.startswith("cli node deploy ") or item.startswith("cli node rollback ")):
                 self.assertIn("--deadline 1800", line)
                 self.assertIn("--wait-timeout 1860", line)
                 self.assertNotIn("600", line)

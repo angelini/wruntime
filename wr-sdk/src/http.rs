@@ -260,26 +260,6 @@ pub fn http_request_with_timeouts(
     do_request(req, Some(opts))
 }
 
-/// Make a unary protobuf RPC call over WASI HTTP.
-///
-/// Sends a POST to `http://{authority}{path}` with the protobuf-encoded `body`
-/// and returns the HTTP status code and response bytes on success.
-///
-/// This is a convenience wrapper around [`http_request`]. New code should
-/// prefer `http_request` for typed errors and method flexibility.
-pub fn http_rpc(authority: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
-    let req = HttpRequest {
-        authority,
-        path,
-        method: Method::Post,
-        headers: &[("content-type", b"application/x-protobuf" as &[u8])],
-        body,
-    };
-    http_request(&req)
-        .map(|r| (r.status, r.body))
-        .map_err(|e| e.to_string())
-}
-
 // ── Internal ────────────────────────────────────────────────────────────────
 
 fn do_request(

@@ -1,7 +1,5 @@
 use std::future::Future;
 use std::pin::Pin;
-#[cfg(any(test, feature = "test-util"))]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use http::uri::PathAndQuery;
@@ -12,9 +10,6 @@ use wr_common::http_headers::{strip_before_engine, WR_VIA_PROXY};
 use wr_common::http_pool::{HttpClientPool, DEFAULT_POOL_SIZE};
 
 use super::{Destination, ForwardTarget, ProxyBody, ResBody, ResolvedRoute};
-
-#[cfg(any(test, feature = "test-util"))]
-static URI_FALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
 pub struct ForwardService {
@@ -34,39 +29,21 @@ impl ForwardService {
             open_duration_secs,
         }
     }
-
-    #[cfg(any(test, feature = "test-util"))]
-    #[allow(dead_code)]
-    pub fn reset_uri_fallback_calls() {
-        URI_FALLBACK_CALLS.store(0, Ordering::Relaxed);
-    }
-
-    #[cfg(any(test, feature = "test-util"))]
-    #[allow(dead_code)]
-    pub fn uri_fallback_calls() -> usize {
-        URI_FALLBACK_CALLS.load(Ordering::Relaxed)
-    }
 }
 
 fn assemble_forward_uri(
     target: &ForwardTarget,
     path_and_query: PathAndQuery,
 ) -> anyhow::Result<http::Uri> {
-    if let Some(base) = target.base_uri() {
-        let mut parts = base.clone().into_parts();
-        parts.path_and_query = Some(path_and_query);
-        return http::Uri::from_parts(parts).map_err(Into::into);
-    }
-
-    #[cfg(any(test, feature = "test-util"))]
-    URI_FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "{}{}",
-        target.address().trim_end_matches('/'),
-        path_and_query.as_str()
-    )
-    .parse()
-    .map_err(Into::into)
+    let base = target.base_uri().ok_or_else(|| {
+        anyhow::anyhow!(
+            "forward destination must be an absolute HTTP URI with a root path: {}",
+            target.address()
+        )
+    })?;
+    let mut parts = base.clone().into_parts();
+    parts.path_and_query = Some(path_and_query);
+    http::Uri::from_parts(parts).map_err(Into::into)
 }
 
 impl Service<Request<ProxyBody>> for ForwardService {
@@ -178,9 +155,7 @@ impl Service<Request<ProxyBody>> for ForwardService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-
-    static URI_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use std::sync::Arc;
 
     fn target(address: &str) -> ForwardTarget {
         ForwardTarget::new(Arc::from(address))
@@ -188,8 +163,6 @@ mod tests {
 
     #[test]
     fn prepared_uri_preserves_path_query_encoding_and_ipv6() {
-        let _guard = URI_TEST_LOCK.lock().unwrap();
-        ForwardService::reset_uri_fallback_calls();
         for (base, path, expected) in [
             ("http://engine", "/", "http://engine/"),
             ("http://engine/", "/rpc?q=one", "http://engine/rpc?q=one"),
@@ -202,16 +175,13 @@ mod tests {
             let uri = assemble_forward_uri(&target(base), path.parse().unwrap()).unwrap();
             assert_eq!(uri, expected);
         }
-        assert_eq!(ForwardService::uri_fallback_calls(), 0);
     }
 
     #[test]
-    fn non_root_base_uses_legacy_fallback() {
-        let _guard = URI_TEST_LOCK.lock().unwrap();
-        ForwardService::reset_uri_fallback_calls();
-        let uri = assemble_forward_uri(&target("http://engine/base"), "/rpc?q=1".parse().unwrap())
-            .unwrap();
-        assert_eq!(uri, "http://engine/base/rpc?q=1");
-        assert_eq!(ForwardService::uri_fallback_calls(), 1);
+    fn non_root_base_is_rejected() {
+        let error =
+            assemble_forward_uri(&target("http://engine/base"), "/rpc?q=1".parse().unwrap())
+                .expect_err("non-root destination must not be concatenated");
+        assert!(error.to_string().contains("root path"));
     }
 }

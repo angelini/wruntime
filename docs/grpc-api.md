@@ -46,7 +46,7 @@ Beginning and finalizing a deployment set `wr_nodes.target_revision`; neither re
 
 Operation claims and `ReportStepResult` carry the same tagged target identity: a proxy identity has no slot key, while an engine identity contains a required nonempty engine slot. `NodeOperation.targets` is deterministic (proxy first, then engines by rollout order) and combines common progress/evidence with a required `proxy_details` or `engine_details` oneof. Missing or mismatched kind, identity, details, or step combinations fail closed. `ReportNodeObservation` remains engine-slot-only; proxy proof is returned through the tagged `VerifyProxy` result path. Before returning a mutating claim, the manager commits its delivery timestamp and ambiguity flag. `ReportStepResult` atomically advances manager state and stores an indefinitely retained receipt over the authenticated principal and exact serialized tagged request. Only a byte-identical retry under the same node, activation, epoch, operation, step, and target is acknowledged idempotently. Agent restart does not replay a receipt candidate; the new activation follows manager-directed `InspectBackend` and reports fresh typed evidence.
 
-This is a breaking contract cutover. Removed slot/proxy fields are reserved and have no empty-slot compatibility alias.
+Operation targets use only the tagged proxy or nonempty engine-slot identities described above; removed split fields have no compatibility alias.
 
 ## Manager service authorization
 
@@ -71,7 +71,7 @@ The manager serves six domains—`ClusterService`, `InfrastructureService`, `Nod
 | `NodeService.ReportObservation` | same node-bound agent | Stores exact lifecycle observation separately from backend process evidence; endpoint absence never synthesizes lifecycle `STOPPED`, and inspection failure is explicit query-error evidence. |
 | `NodeService.RegisterProxy/ReportProxyInventory/DeregisterProxy` | enrolled node-bound `proxy` | Registers one process tuple, atomically replaces its bounded complete listener/admission/routing/breaker report using manager receipt time, and cleanly tombstones the exact process. The authenticated proxy principal and policy binding supply proxy/node identity; report payload never grants backend, process, release, or routing authority. |
 
-One forward/restoration operation is allowed per node. Operations, absolute deadlines, phases, and append-only events survive client, agent, and manager restarts. Typed operation steps cover proxy and engine release verification, backend stop/start/inspection, atomic selection, lifecycle/route verification, authority switching, and source restoration. The retired operation cleanup phase, step, and fields are reserved and are not reused; cleanup uses its dedicated generation protocol. The manager derives advancement from coherent evidence, so a lost acknowledgement or manager takeover reconciles actual state without repeating a backend effect.
+One forward/restoration operation is allowed per node. Operations, absolute deadlines, phases, and append-only events survive client, agent, and manager restarts. Typed operation steps cover proxy and engine release verification, backend stop/start/inspection, atomic selection, lifecycle/route verification, authority switching, and source restoration. Release cleanup uses its dedicated generation protocol. The manager derives advancement from coherent evidence, so a lost acknowledgement or manager takeover reconciles actual state without repeating a backend effect.
 
 Deployment reconciliation progresses sequentially: additions first, then retained replacements, then removals, with lexical order inside each group. Target registration remains non-serving until exact serving evidence permits the manager-owned authority switch; removal requires pinned exit, deregistration, non-serving routes, and zero authority. Before commit, cancellation or deadline expiry fences forward effects and completes full source restoration without the expired forward deadline. Rollback is separately authorized and never automatic. Defaults are `max_unavailable=1`, 300 seconds for restart, and 1800 seconds for deployment/rollback. Restart preserves the committed inventory and revision while replacing one process. Stopping the final serving slot or deploying an empty desired inventory requires explicit `allow_downtime`.
 
@@ -118,7 +118,7 @@ Aggregation rules are:
 
 Additional stable cluster codes include `STALE_MANAGER_HEARTBEAT`, `UNMANAGED_ENGINE`, `NO_HEALTHY_ROUTE`, `PARTIAL_ROUTE_AVAILABILITY`, `MANUAL_ROUTE_REASON_UNAVAILABLE`, `SIGNAL_NOT_REPORTED`, `MISSING_EXPECTED_PROXY`, `MISSING_PROXY_REPORT`, `STALE_PROXY_REPORT`, `MULTIPLE_FRESH_PROXY_INSTANCES`, `PROXY_RELEASE_MISMATCH`, `AMBIGUOUS_PROXY_OPERATION`, `PROXY_STOPPING`, `UNKNOWN_PROXY_RECEIVER_MANAGER`, `PROXY_ROUTING_NOT_SYNCHRONIZED`, `PROXY_ROUTING_BEHIND`, `STALE_PROXY_ROUTING`, `UNKNOWN_PROXY_ROUTING_MANAGER`, `PROXY_ADMISSION_CLOSED`, `PROXY_LISTENER_NOT_ACCEPTING`, `ALL_PROXY_TARGETS_OPEN`, `PARTIALLY_OPEN_PROXY_BREAKERS`, `HALF_OPEN_PROXY_BREAKERS`, `SUPERSEDED_PROXY_INSTANCE`, and `ORPHAN_PROXY_INVENTORY`. Consumers must branch on code/severity and use raw timestamps, ages, desired/actual revisions, and affected identities as evidence rather than parsing `detail`.
 
-`wr-cli cluster status` performs exactly this RPC; it does not join `ListManagers`, `ListEngines`, and `GetRoutingTable` client-side. `--output json` retains `schema_version: 2` and additively includes canonical top-level and node-embedded proxy DTOs with selected/expected deployment identity, lifecycle/admission, report and routing ages, listener states, routing version/source, aggregate breaker counts, and nested conditions. Table output adds proxy counts and problems; `--detail` expands the bounded evidence. `--node` filters both proxy inventory locations and strict unknown traversal includes proxy/listener/routing/breaker conditions. `InfrastructureService.GetStatus` additionally applies requested-node and per-node infrastructure-read authorization to canonical top-level proxies before returning the response. The default command is display-only; `--fail-on` remains a display gate.
+`wr-cli cluster status` performs exactly this RPC; it does not join `ListManagers`, `ListEngines`, and `GetRoutingTable` client-side. `--output json` requires `schema_version: 1` and additively includes canonical top-level and node-embedded proxy DTOs with selected/expected deployment identity, lifecycle/admission, report and routing ages, listener states, routing version/source, aggregate breaker counts, and nested conditions. Table output adds proxy counts and problems; `--detail` expands the bounded evidence. `--node` filters both proxy inventory locations and strict unknown traversal includes proxy/listener/routing/breaker conditions. `InfrastructureService.GetStatus` additionally applies requested-node and per-node infrastructure-read authorization to canonical top-level proxies before returning the response. The default command is display-only; `--fail-on` remains a display gate.
 
 `wr-cli cluster wait --severity healthy|degraded|unhealthy|unknown` is the expectation surface for automation. It returns zero only when the exact severity is observed for a present filtered node/service (or the cluster when unfiltered) and emits an `outcome: observed` object containing the matching snapshot. Empty targets, malformed filters or wire severity enums, transport/query failure, and timeout are non-zero and cannot satisfy an expected unhealthy check.
 
@@ -153,13 +153,11 @@ message RoutingRule {
   bool   healthy               = 7;   // set by manager; false = proxy will not route to this rule
   string source_namespace      = 8;   // metadata reserved for future source policy
   string destination_namespace = 9;   // namespace of the destination module
-  reserved 10;
-  reserved "proxy_address";
   string peer_address          = 11;  // mTLS address of the destination node's proxy
 }
 ```
 
-`RoutingRule.peer_address` is the sole cross-node forwarding address. Each proxy compares it with its explicit `[node].peer_address` to decide whether to forward directly to the local `engine_address` (`LocalEngine`) or relay over mTLS to `peer_address` (`RemoteProxy`). `EngineRegistration.proxy_address` remains separate plain-HTTP metadata: it is the local proxy URL used by an engine for outbound rewriting. The reserved routing-rule field 10 must not be reused.
+`RoutingRule.peer_address` is the sole cross-node forwarding address. Each proxy compares it with its explicit `[node].peer_address` to decide whether to forward directly to the local `engine_address` (`LocalEngine`) or relay over mTLS to `peer_address` (`RemoteProxy`). `EngineRegistration.proxy_address` remains separate plain-HTTP metadata: it is the local proxy URL used by an engine for outbound rewriting.
 
 `source_module` and `source_namespace` are persisted metadata but are not currently routing or authorization constraints. Current matching uses only destination namespace, module, and optional version.
 
@@ -175,8 +173,6 @@ A `ManagerInfo` has the fields:
 
 ```protobuf
 message ManagerInfo {
-  reserved 3;
-  reserved "gossip_address";
   string manager_id   = 1; // UUID assigned at startup
   string grpc_address = 2; // externally reachable mTLS gRPC endpoint
 }
@@ -202,7 +198,7 @@ This decouples engines from the manager address — engines only need to know th
 
 Worker jobs use HTTP RPC via the proxy (not a gRPC service). The SDK provides ergonomic wrappers in `wr_sdk::jobs`.
 
-The fully qualified endpoints are canonical. `/SubmitJob` and `/GetJobStatus` remain supported compatibility aliases; SDKs and new callers should use the canonical paths.
+Worker management accepts only fully qualified canonical endpoints.
 
 | Endpoint | Request | Response | Description |
 | --- | --- | --- | --- |

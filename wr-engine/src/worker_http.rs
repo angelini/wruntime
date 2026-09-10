@@ -18,13 +18,10 @@ use wr_common::wruntime::{
 
 pub const SUBMIT_JOB_PATH: &str = "/wruntime.WorkerService/SubmitJob";
 pub const GET_JOB_STATUS_PATH: &str = "/wruntime.WorkerService/GetJobStatus";
-const SHORT_SUBMIT_JOB_PATH: &str = "/SubmitJob";
-const SHORT_GET_JOB_STATUS_PATH: &str = "/GetJobStatus";
-
 pub fn canonical_worker_path(path: &str) -> Option<&'static str> {
     match path {
-        SUBMIT_JOB_PATH | SHORT_SUBMIT_JOB_PATH => Some(SUBMIT_JOB_PATH),
-        GET_JOB_STATUS_PATH | SHORT_GET_JOB_STATUS_PATH => Some(GET_JOB_STATUS_PATH),
+        SUBMIT_JOB_PATH => Some(SUBMIT_JOB_PATH),
+        GET_JOB_STATUS_PATH => Some(GET_JOB_STATUS_PATH),
         _ => None,
     }
 }

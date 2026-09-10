@@ -24,13 +24,13 @@ allowed_domains = ["api.github.com", "codeload.github.com", "docs.rs", "*.docs.r
 [external]
 listen_address = "0.0.0.0:8080"
 
-[[external.route]]
+[[external.routes]]
 path      = "/tasks"
 methods   = ["POST"]
 module    = "coordinator"
 namespace = "codegen"
 
-[[external.route]]
+[[external.routes]]
 path      = "/tasks/{id}"
 methods   = ["GET"]
 module    = "coordinator"

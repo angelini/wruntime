@@ -159,7 +159,7 @@ lifecycle_contract_fixture() {
 		lifecycle_reset_boundary "$backend-entry"
 		"$WRT_CONTRACT_PROVIDER" reset
 		lifecycle_artifact "$backend" manifest-a sha256:fixture
-		lifecycle_run_deploy_operation "$backend-scale-out" "$WRT_CONTRACT_CLI" scale-out --bundle baseline-two.tar.gz
+		lifecycle_run_deploy_operation "$backend-addition" "$WRT_CONTRACT_CLI" node deploy --bundle baseline-two.tar.gz
 		local injected_status submitted_at completed_at probe_log=""
 		if [ -n "${WRT_CONTRACT_TRAFFIC_DIR:-}" ]; then
 			probe_log="$WRT_CONTRACT_TRAFFIC_DIR/$backend-probe.jsonl"
@@ -167,16 +167,16 @@ lifecycle_contract_fixture() {
 			invoke_probe_over_tunnel probe "$WRT_CONTRACT_TRAFFIC_DIR/$backend-pre.json"
 			start_probe probe "$probe_log"
 		fi
-		if lifecycle_run_deploy_operation "$backend-upgrade-finalize" "$WRT_CONTRACT_CLI" upgrade --request-token upgrade-token --exit-after-finalization; then
+		if lifecycle_run_deploy_operation "$backend-replacement-finalize" "$WRT_CONTRACT_CLI" node deploy --request-token replacement-token --exit-after-finalization; then
 			injected_status=0
 		else
 			injected_status=$?
 		fi
 		[ "$injected_status" -eq 1 ] || { echo "documented finalization fault was not observed" >&2; return 1; }
 		submitted_at="$(python3 -c 'import time; print(time.time())')"
-		lifecycle_run_deploy_operation "$backend-upgrade-retry" "$WRT_CONTRACT_CLI" upgrade --bundle upgrade-two.tar.gz --request-token upgrade-token
+		lifecycle_run_deploy_operation "$backend-replacement-retry" "$WRT_CONTRACT_CLI" node deploy --bundle upgrade-two.tar.gz --request-token replacement-token
 		completed_at="$(python3 -c 'import time; print(time.time())')"
-		lifecycle_capture_operation_detail node-a upgrade-token "${WRT_CONTRACT_ARTIFACT:-/tmp/wruntime-operation-detail.json}" "$WRT_CONTRACT_CLI"
+		lifecycle_capture_operation_detail node-a replacement-token "${WRT_CONTRACT_ARTIFACT:-/tmp/wruntime-operation-detail.json}" "$WRT_CONTRACT_CLI"
 		if [ -n "$probe_log" ]; then
 			invoke_probe_over_tunnel probe "$WRT_CONTRACT_TRAFFIC_DIR/$backend-post.json"
 			stop_probe
@@ -185,9 +185,9 @@ lifecycle_contract_fixture() {
 			stop_tunnel
 			stop_tunnel
 		fi
-		lifecycle_run_deploy_operation "$backend-scale-in" "$WRT_CONTRACT_CLI" scale-in --bundle upgrade-one.tar.gz
-		lifecycle_run_deploy_operation "$backend-drain" "$WRT_CONTRACT_CLI" drain --slot engine-1 --allow-downtime
-		lifecycle_run_deploy_operation "$backend-rollback" "$WRT_CONTRACT_CLI" rollback --to revision_one_a --allow-downtime
+		lifecycle_run_deploy_operation "$backend-removal" "$WRT_CONTRACT_CLI" node deploy --bundle upgrade-one.tar.gz
+		lifecycle_run_deploy_operation "$backend-empty-inventory" "$WRT_CONTRACT_CLI" node deploy --bundle empty-inventory.tar.gz --allow-downtime
+		lifecycle_run_deploy_operation "$backend-rollback" "$WRT_CONTRACT_CLI" node rollback --to revision_one_a --allow-downtime
 		if [ "$backend" = systemd ]; then
 			lifecycle_run_manager_rollout a-to-b "${WRT_CONTRACT_TRAFFIC_DIR:-/tmp}/manager-a-to-b.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-a-to-b-systemd.toml --generation 2 --manager-endpoint manager-a
 			lifecycle_run_manager_rollout b-to-a "${WRT_CONTRACT_TRAFFIC_DIR:-/tmp}/manager-b-to-a.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-b-to-a-systemd.toml --generation 3 --manager-endpoint manager-b --old-selector-digest initial-a-selector

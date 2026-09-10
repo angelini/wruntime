@@ -62,7 +62,7 @@ async fn wasm_http_egress() -> Result<()> {
     assert_eq!(body.body, "egress:/hello-egress");
 
     // Over the cap: the outbound body exceeds `cap`, so send_request returns
-    // HttpRequestBodySize; the guest maps the failed http_rpc to a 500.
+    // HttpRequestBodySize; the guest maps the failed typed HTTP request to a 500.
     let over_state = ModuleState::new(
         "http-test".into(),
         "test-ns".into(),

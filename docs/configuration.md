@@ -179,14 +179,14 @@ Expose a subset of internal protobuf RPCs to external callers on a separate port
 listen_address = "0.0.0.0:8080"
 max_request_body_bytes = 16777216 # default: 16 MiB
 
-[[external.route]]
+[[external.routes]]
 path      = "/items"
 rpc_path  = "/inventory.InventoryService/ListItems"
 methods   = ["GET"]
 module    = "inventory"
 namespace = "ecommerce"
 
-[[external.route]]
+[[external.routes]]
 path      = "/items/{id}"
 rpc_path  = "/inventory.InventoryService/GetItem"
 methods   = ["GET"]
@@ -571,7 +571,7 @@ grpcurl \
 }' 127.0.0.1:9000 wruntime.ClusterService/UpsertRoutingRule
 ```
 
-`peer_address` tells every proxy which node owns this rule. A proxy whose own explicit `[node].peer_address` matches will route directly to `engine_address`; all other proxies relay to `peer_address` and let that node route locally. The old `proxy_address` routing-rule field is reserved in `proto/wruntime.proto` and must not be used in new rules. `source_module` and `source_namespace` are retained as metadata for future policy work; current routing matches only the destination namespace, module, and optional version, so these source fields do not restrict callers.
+`peer_address` tells every proxy which node owns this rule. A proxy whose own explicit `[node].peer_address` matches will route directly to `engine_address`; all other proxies relay to `peer_address` and let that node route locally. `source_module` and `source_namespace` are retained as metadata for future policy work; current routing matches only the destination namespace, module, and optional version, so these source fields do not restrict callers.
 
 Current worker modules use the same descriptor/default-route path as service modules, so direct worker routes remain available but are gated by the same unhealthy-until-ready lifecycle. Queue-only workers with no default route require a future proto/control-plane route-publication flag or module mode.
 
@@ -725,7 +725,7 @@ wr-cli cluster status --fail-on unknown  # strict: unknown/not-reported is non-z
 
 `jobs` never falls back to the ordinary manager address or runtime mTLS files. Every jobs subcommand supports `--format table|json`. List emits one page and its `next_cursor`; reuse the cursor only with identical filters. Inspect reports payload/result lengths by default and writes exact bytes only to explicit create-new output paths (`--force` replaces). Retry is dead-only, requires `--yes`, and is never automatically replayed after an uncertain response. The CLI rejects unknown status values, missing or malformed required timestamps, inconsistent lifecycle counters/claim fields, and inconsistent summary totals instead of rendering plausible output. Payloads and successful results are limited to 1 MiB each, combined job identity/source/type metadata to 64 KiB, and error text to 1 MiB; the admin transport ceiling is 4 MiB.
 
-`cluster status` uses one `GetClusterStatus` RPC and never requires direct PostgreSQL access. The default is display-only; only an explicit `--fail-on` turns reported state into an exit gate. Query and mTLS failures are always non-zero. Engine/module freshness uses the manager's configured `engine_heartbeat_timeout_secs` and `module_heartbeat_timeout_secs`. Manager membership is live while its PostgreSQL lease is within `cluster.manager_liveness_threshold_secs`; stale retained rows are dead and report `STALE_MANAGER_HEARTBEAT`. Proxy report and routing freshness use the configured proxy thresholds above; listener, admission, routing and aggregate breaker evidence is known even when external ingress is disabled, routing is empty, or breaker counts are zero. Host CPU/memory remains unknown/not reported. JSON status remains additive schema version 2.
+`cluster status` uses one `GetClusterStatus` RPC and never requires direct PostgreSQL access. The default is display-only; only an explicit `--fail-on` turns reported state into an exit gate. Query and mTLS failures are always non-zero. Engine/module freshness uses the manager's configured `engine_heartbeat_timeout_secs` and `module_heartbeat_timeout_secs`. Manager membership is live while its PostgreSQL lease is within `cluster.manager_liveness_threshold_secs`; stale retained rows are dead and report `STALE_MANAGER_HEARTBEAT`. Proxy report and routing freshness use the configured proxy thresholds above; listener, admission, routing and aggregate breaker evidence is known even when external ingress is disabled, routing is empty, or breaker counts are zero. Host CPU/memory remains unknown/not reported. JSON status uses the strict current schema version 1.
 
 Proxies and narrow discovery clients continue to use lease-filtered `ListManagers`; direct `wr_managers` reads are a bootstrap-only fallback when no manager RPC is reachable and use the matching proxy-side threshold.
 

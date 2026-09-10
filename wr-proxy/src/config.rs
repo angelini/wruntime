@@ -113,6 +113,7 @@ fn valid_sha256_digest(value: &str) -> bool {
 
 /// Configuration for the external-facing HTTP listener.
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalConfig {
     /// TCP address to bind the external listener, e.g. "0.0.0.0:8080"
     pub listen_address: String,
@@ -120,7 +121,7 @@ pub struct ExternalConfig {
     #[serde(default = "default_external_max_request_body_bytes")]
     pub max_request_body_bytes: usize,
     /// Routes accessible to external callers.
-    #[serde(default, alias = "route")]
+    #[serde(default)]
     pub routes: Vec<ExternalRoute>,
 }
 

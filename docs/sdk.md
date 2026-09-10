@@ -58,7 +58,7 @@ The template owns current dependency pins, manifest shape, WIT imports, descript
 | Submit/query `*WorkerService` jobs | `WrWorkerClientGenerator` |
 | Produce multiple kinds | nested `WrCombinedGenerator` |
 
-Generated service code includes both `_router` and `_handle`. Generated clients use canonical `/{package}.{Service}/{Method}` paths and `namespace.module` authorities. Prefer generated clients or typed `wr_sdk::http` helpers over the legacy `http_rpc` compatibility function.
+Generated service code includes both `_router` and `_handle`. Generated clients use canonical `/{package}.{Service}/{Method}` paths and `namespace.module` authorities. Use generated clients or the typed `wr_sdk::http::{Authority, PathAndQuery, TypedHttpRequest, http_request_typed}` surface for outbound HTTP.
 
 ## Host capabilities
 

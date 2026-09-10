@@ -25,13 +25,24 @@ impl wr_sdk::ServiceGuest for Component {
 
 impl proto::HttpTestService for Component {
     fn egress(&self, req: proto::EgressRequest) -> Result<proto::EgressResponse, ServiceError> {
-        match wr_sdk::http::http_rpc(&req.authority, &req.path, &req.body) {
-            Ok((status, body)) => Ok(proto::EgressResponse {
-                status: status as u32,
-                body: String::from_utf8_lossy(&body).into_owned(),
-            }),
-            Err(e) => Err(ServiceError::internal(format!("egress call failed: {e}"))),
-        }
+        let authority = wr_sdk::http::Authority::parse(&req.authority)?;
+        let path = wr_sdk::http::PathAndQuery::parse(&req.path)?;
+        let headers = [(
+            wr_sdk::http::HeaderName::parse("content-type")?,
+            wr_sdk::http::HeaderValue::from_bytes(b"application/x-protobuf")?,
+        )];
+        let response = wr_sdk::http::http_request_typed(&wr_sdk::http::TypedHttpRequest {
+            authority,
+            path,
+            method: wr_sdk::http::Method::Post,
+            headers: &headers,
+            body: &req.body,
+        })
+        .map_err(|error| ServiceError::internal(format!("egress call failed: {error}")))?;
+        Ok(proto::EgressResponse {
+            status: u32::from(response.status),
+            body: String::from_utf8_lossy(&response.body).into_owned(),
+        })
     }
 
     fn get_url(&self, req: proto::GetUrlRequest) -> Result<proto::GetUrlResponse, ServiceError> {

@@ -1064,7 +1064,7 @@ struct ClusterDto<'a> {
 impl<'a> From<&'a GetClusterStatusResponse> for ClusterDto<'a> {
     fn from(value: &'a GetClusterStatusResponse) -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 1,
             severity: severity_name(value.severity),
             response_at: value.response_at.as_ref().map(TimestampDto::from),
             database_observed_at: value.database_observed_at.as_ref().map(TimestampDto::from),
@@ -1147,7 +1147,7 @@ mod tests {
         assert_eq!(filtered.proxies.len(), 1);
         assert_eq!(filtered.nodes[0].proxies.len(), 1);
         let json = serde_json::to_value(ClusterDto::from(&filtered)).unwrap();
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 1);
         assert_eq!(json["proxies"][0]["selected"], true);
         assert!(
             !unknown_present(&filtered),
@@ -1172,7 +1172,7 @@ mod tests {
     fn json_schema_and_table_are_stable() {
         let value = response(StatusSeverity::Healthy);
         let json = serde_json::to_value(ClusterDto::from(&value)).unwrap();
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 1);
         assert_eq!(json["severity"], "healthy");
         assert!(render_table(&value, false).contains("No problems reported"));
     }
