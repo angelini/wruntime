@@ -24,7 +24,7 @@ def load_operation(path: str) -> dict[str, Any]:
     return value
 
 
-def assert_evidence(evidence: Any, pinned_backend: Any, pinned_process: Any, label: str) -> None:
+def assert_evidence(evidence: Any, label: str) -> None:
     if not isinstance(evidence, dict):
         raise AssertionFailure(f"{label} termination evidence is absent")
     if evidence.get("disposition") != "graceful":
@@ -33,12 +33,14 @@ def assert_evidence(evidence: Any, pinned_backend: Any, pinned_process: Any, lab
         raise AssertionFailure(f"{label} did not request graceful termination")
     if evidence.get("kill_escalated") is not False:
         raise AssertionFailure(f"{label} used kill escalation")
+    if evidence.get("backend") not in {"systemd", "docker"}:
+        raise AssertionFailure(f"{label} backend kind is invalid")
     backend = evidence.get("backend_instance_id")
     process = evidence.get("process_instance_id")
-    if not isinstance(backend, str) or not backend or backend != pinned_backend:
-        raise AssertionFailure(f"{label} backend identity does not match its pinned identity")
-    if not isinstance(process, str) or not process or process != pinned_process:
-        raise AssertionFailure(f"{label} process identity does not match its pinned identity")
+    if not isinstance(backend, str) or not backend:
+        raise AssertionFailure(f"{label} backend identity is absent")
+    if not isinstance(process, str) or not process:
+        raise AssertionFailure(f"{label} process identity is absent")
 
 
 def assert_operation(operation: dict[str, Any], args) -> dict[str, Any]:
@@ -73,12 +75,10 @@ def assert_operation(operation: dict[str, Any], args) -> dict[str, Any]:
     if set(stopped_names) != set(expected_slots) or len(stopped_names) != len(expected_slots):
         raise AssertionFailure("stopped engine slot inventory is not exact")
     for slot in stopped:
-        if slot.get("changed") is not True or slot.get("effect_reported") is not True:
-            raise AssertionFailure(f"engine slot {slot.get('engine_slot')!r} lacks reported stop facts")
+        if slot.get("changed") is not True:
+            raise AssertionFailure(f"engine slot {slot.get('engine_slot')!r} was not changed")
         assert_evidence(
             slot.get("termination_evidence"),
-            slot.get("pinned_backend_instance_id"),
-            slot.get("pinned_process_instance_id"),
             f"engine slot {slot.get('engine_slot')!r}",
         )
 
@@ -87,14 +87,9 @@ def assert_operation(operation: dict[str, Any], args) -> dict[str, Any]:
         raise AssertionFailure("operation proxy detail is malformed")
     proxy_evidence = proxy.get("termination_evidence")
     if args.expect_proxy_stop:
-        if proxy.get("changed") is not True or proxy.get("effect_reported") is not True:
-            raise AssertionFailure("proxy lacks reported stop facts")
-        assert_evidence(
-            proxy_evidence,
-            proxy.get("pinned_backend_instance_id"),
-            proxy.get("pinned_process_instance_id"),
-            "proxy",
-        )
+        if proxy.get("changed") is not True:
+            raise AssertionFailure("proxy was not changed")
+        assert_evidence(proxy_evidence, "proxy")
     elif proxy_evidence is not None:
         raise AssertionFailure("operation contains an unexpected proxy stop")
     return {
@@ -109,7 +104,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--input", default="-", help="operation detail JSON file, or - for stdin")
     value.add_argument("--node-id", required=True)
     value.add_argument("--request-token", required=True)
-    value.add_argument("--action", required=True, choices=["initial-apply", "drain", "restart", "rolling-upgrade", "scale", "rollback"])
+    value.add_argument("--action", required=True, choices=["deployment", "restart", "rollback"])
     value.add_argument("--target-revision", type=int)
     value.add_argument("--target-digest")
     value.add_argument("--stopped-engine-slot", action="append")

@@ -33,8 +33,8 @@ usage() {
 	cat <<'USAGE'
 Usage: dev/validate-deployment-lifecycle.sh [--backend systemd|docker]
 
-All protected inputs are required, including the protected-runner-owned manager
-B VMID, reachable IP, and snapshot. With no --backend, the complete node
+All protected inputs are required. The three disposable deployment targets are
+configured in dev/deployment-e2e.toml. With no --backend, the complete node
 lifecycle runs under systemd and Docker; authenticated manager A→B→A deploy-set
 qualification runs under systemd only. Compose manager deploy-set is unqualified
 until an immutable registry or supported image-transfer mechanism exists.
@@ -66,7 +66,7 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
-for name in PVE_HOST PVE_USER PVE_TOKEN_NAME PVE_TOKEN_VALUE WRT_DEPLOY_E2E_SSH_KEY WRT_DEPLOY_E2E_DB_URL WRT_SECRET_ENCRYPTION_KEY WRT_DEPLOY_E2E_MANAGER_B_VMID WRT_DEPLOY_E2E_MANAGER_B_IP WRT_DEPLOY_E2E_MANAGER_B_SNAPSHOT; do
+for name in PVE_HOST PVE_USER PVE_TOKEN_NAME PVE_TOKEN_VALUE WRT_DEPLOY_E2E_SSH_KEY WRT_DEPLOY_E2E_DB_URL WRT_SECRET_ENCRYPTION_KEY; do
 	if [ -z "${!name:-}" ]; then
 		echo "missing required protected input: $name" >&2
 		exit 2
@@ -104,7 +104,7 @@ PY
 }
 MANAGER_HOST="$(config_value manager.host)"
 MANAGER_USER="$(config_value manager.ssh_user)"
-MANAGER_B_HOST="$WRT_DEPLOY_E2E_MANAGER_B_IP"
+MANAGER_B_HOST="$(config_value manager_b.host)"
 MANAGER_B_USER="$(config_value manager_b.ssh_user)"
 NODE_HOST="$(config_value node.host)"
 NODE_USER="$(config_value node.ssh_user)"
@@ -424,10 +424,10 @@ on_error() {
 trap 'on_error $?' ERR
 
 run_logged provider-preflight provider preflight
-run_logged manager-b-db-preflight assert_manager_b_db_reachable
-run_logged build-echo-a cargo run --bin wr-cli -- dev build --config examples/multi-node/node-a/engine-1.toml
 run_logged build-echo-b cargo run --bin wr-cli -- dev build --config examples/multi-node/node-b/engine-1.toml
 run_logged build-workspace cargo build
+run_logged build-node-host-binaries cargo zigbuild --release --target x86_64-unknown-linux-gnu \
+	-p wr-proxy -p wr-engine -p wr-cli
 mkdir -p "$CERT_DIR"
 chmod 700 "$CERT_DIR"
 run_logged cert-server-root target/debug/wr-cli cert init-root server --output "$CERT_DIR/server-root"
@@ -613,6 +613,9 @@ lifecycle() {
 	echo "==> deployment lifecycle: $backend"
 	lifecycle_reset_boundary "$backend-entry"
 	run_to_log "$backend provider reset" "$pass/provider-reset.json" provider reset
+	if [ "$backend" = systemd ]; then
+		run_to_log "manager-b-db-preflight" "$pass/manager-b-db-preflight.log" assert_manager_b_db_reachable
+	fi
 	verify_manifest
 	lifecycle_artifact "$backend" "$SCENARIO_MANIFEST" "$(sha256sum "$SCENARIO_MANIFEST" | awk '{print $1}')"
 	assert_db_clean
@@ -698,7 +701,7 @@ PY
 
 	run_to_log "$backend durable engine restart" "$pass/restart.log" \
 		lifecycle_run_deploy_operation "$backend-restart" "${CLI_ARGS[@]}" engines restart --node-id "$NODE_ID" --slot engine-1 \
-		--request-token "$backend-restart" --wait-timeout 300 --json
+		--request-token "$backend-restart" --json
 	lifecycle_capture_operation_detail "$NODE_ID" "$backend-restart" "$pass/operation-restart.json" "${CLI_ARGS[@]}"
 	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-restart.json" \
 		--node-id "$NODE_ID" --request-token "$backend-restart" --action restart \

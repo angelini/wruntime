@@ -18,10 +18,6 @@ uri  = "urn:wruntime:deployment:manager:manager-a"
 kind = "manager"
 
 [[principals]]
-uri  = "urn:wruntime:deployment:manager:manager-b"
-kind = "manager"
-
-[[principals]]
 uri  = "urn:wruntime:deployment:proxy:wr-e2e-node"
 kind = "proxy"
 

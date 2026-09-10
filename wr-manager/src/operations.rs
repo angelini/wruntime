@@ -11,13 +11,14 @@ use wr_common::agent_policy::{
 use wr_common::deployment_contract::deployment_operation_id;
 use wr_common::wruntime::{
     instruction_target, operation_target_progress, AgentInstruction, BackendKind,
-    BackendProcessState, BackendTerminationEvidence, ClaimNodeCleanupResponse,
-    ClaimOperationResponse, DeploymentCondition, EngineSlotTargetIdentity, EngineTargetDetails,
-    InstructionTarget, InstructionTargetKind, NodeAgentAttestation, NodeAgentPolicy,
-    NodeCleanupAuthority, NodeCleanupInstruction, NodeCleanupResultDisposition, NodeCleanupState,
-    NodeCleanupSummary, NodeOperation, NodeOperationAction, NodeOperationPhase, NodeOperationState,
-    NodeOperationStepKind, NodeSlotTransitionKind, OperationEvent, OperationTargetProgress,
-    ProcessLifecycleState, ProxyTargetDetails, ProxyTargetIdentity, ReportNodeCleanupResultRequest,
+    BackendProcessState, BackendStopDisposition, BackendTerminationEvidence,
+    ClaimNodeCleanupResponse, ClaimOperationResponse, DeploymentCondition,
+    EngineSlotTargetIdentity, EngineTargetDetails, InstructionTarget, InstructionTargetKind,
+    NodeAgentAttestation, NodeAgentPolicy, NodeCleanupAuthority, NodeCleanupInstruction,
+    NodeCleanupResultDisposition, NodeCleanupState, NodeCleanupSummary, NodeOperation,
+    NodeOperationAction, NodeOperationPhase, NodeOperationState, NodeOperationStepKind,
+    NodeSlotTransitionKind, OperationEvent, OperationTargetProgress, ProcessLifecycleState,
+    ProxyTargetDetails, ProxyTargetIdentity, ReportNodeCleanupResultRequest,
     ReportNodeCleanupResultResponse, ReportNodeObservationRequest, ReportStepResultRequest,
     RolloutPolicy, ServiceKind, SlotAuthorityStatus, SlotObservation, SubmitOperationRequest,
 };
@@ -199,6 +200,55 @@ fn target_step_compatible(kind: InstructionTargetKind, step: NodeOperationStepKi
         ),
         InstructionTargetKind::Unspecified | InstructionTargetKind::ReleaseCleanup => false,
     }
+}
+
+fn stop_evidence_condition(
+    request: &ReportStepResultRequest,
+    step: NodeOperationStepKind,
+    pinned_backend: &str,
+    pinned_process: &str,
+) -> Option<(&'static str, &'static str)> {
+    if step != NodeOperationStepKind::StopBackend {
+        return None;
+    }
+    if pinned_backend.is_empty()
+        || pinned_process.is_empty()
+        || request.backend_instance_id != pinned_backend
+        || request.process_instance_id != pinned_process
+    {
+        return Some((
+            "STOP_IDENTITY_MISMATCH",
+            "stop result must identify the exact pinned backend and process instances",
+        ));
+    }
+    let Some(evidence) = request.termination_evidence.as_ref() else {
+        return Some((
+            "TERMINATION_EVIDENCE_MISSING",
+            "successful stop result requires typed termination evidence",
+        ));
+    };
+    if BackendKind::try_from(evidence.backend).unwrap_or(BackendKind::Unspecified)
+        == BackendKind::Unspecified
+        || evidence.backend_instance_id != request.backend_instance_id
+        || evidence.process_instance_id != request.process_instance_id
+    {
+        return Some((
+            "TERMINATION_EVIDENCE_MISMATCH",
+            "termination evidence must identify the reported backend and process instances",
+        ));
+    }
+    if !evidence.graceful_termination_requested
+        || evidence.kill_escalated
+        || BackendStopDisposition::try_from(evidence.disposition)
+            .unwrap_or(BackendStopDisposition::Unknown)
+            != BackendStopDisposition::Graceful
+    {
+        return Some((
+            "TERMINATION_NOT_GRACEFUL",
+            "stop result does not prove graceful termination without escalation",
+        ));
+    }
+    None
 }
 
 fn backend_name(value: BackendKind) -> Result<&'static str, Status> {
@@ -3545,7 +3595,8 @@ pub async fn report_step(
         let proxy = transaction
             .query_one(
                 "SELECT next_step, source_revision, source_digest, source_resolved_digest,
-                        target_revision, target_digest, target_resolved_digest
+                        target_revision, target_digest, target_resolved_digest,
+                        pinned_backend_instance_id, pinned_process_instance_id
                  FROM wr_node_operation_targets
                  WHERE operation_id = $1 AND target_kind = 'proxy' AND target_key = 'proxy'
                    AND NOT complete FOR UPDATE",
@@ -3563,6 +3614,8 @@ pub async fn report_step(
         }
         let source_revision: i64 = proxy.get("source_revision");
         let target_revision: i64 = proxy.get("target_revision");
+        let pinned_backend: String = proxy.get("pinned_backend_instance_id");
+        let pinned_process: String = proxy.get("pinned_process_instance_id");
         let proving_source = reported_step == NodeOperationStepKind::VerifyTarget;
         let uses_source = matches!(
             reported_step,
@@ -3605,6 +3658,14 @@ pub async fn report_step(
         {
             condition_code = "PROXY_EVIDENCE_MISSING".into();
             detail = "proxy verification requires a process identity".into();
+        }
+        if condition_code.is_empty() {
+            if let Some((code, evidence_detail)) =
+                stop_evidence_condition(request, reported_step, &pinned_backend, &pinned_process)
+            {
+                condition_code = code.into();
+                detail = evidence_detail.into();
+            }
         }
         if !condition_code.is_empty() {
             transaction
@@ -3763,13 +3824,10 @@ pub async fn report_step(
                 "PROXY_IDENTITY_CHANGED",
                 "proxy process identity differs from the operation's pinned activation",
             )
-        } else if reported_step == NodeOperationStepKind::StopBackend
-            && request.backend_instance_id != pinned_backend
+        } else if let Some(condition) =
+            stop_evidence_condition(request, reported_step, &pinned_backend, &pinned_process)
         {
-            (
-                "BACKEND_IDENTITY_MISMATCH",
-                "stop result must identify the exact pinned backend instance",
-            )
+            condition
         } else if matches!(
             reported_step,
             NodeOperationStepKind::StopBackend

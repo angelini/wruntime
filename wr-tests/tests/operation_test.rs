@@ -429,6 +429,19 @@ async fn claim_instruction(
         } else {
             instruction.pinned_process_instance_id.clone()
         };
+        if instruction.step == NodeOperationStepKind::StopBackend as i32 {
+            result.termination_evidence = Some(BackendTerminationEvidence {
+                backend: BackendKind::Systemd as i32,
+                backend_instance_id: result.backend_instance_id.clone(),
+                process_instance_id: result.process_instance_id.clone(),
+                graceful_termination_requested: true,
+                kill_escalated: false,
+                disposition: BackendStopDisposition::Graceful as i32,
+                terminal_result: "success".into(),
+                exit_code: Some(0),
+                signal: None,
+            });
+        }
         wr_manager::operations::report_step(pool, &result, "agent-a").await?;
     }
 }
@@ -1825,6 +1838,7 @@ async fn stop_result_waits_for_post_delivery_observation() -> Result<()> {
 
     let mut stop_result = result_for(&stop, "");
     stop_result.backend_instance_id = "backend-old".into();
+    stop_result.process_instance_id = "process-old".into();
     stop_result.termination_evidence = Some(BackendTerminationEvidence {
         backend: BackendKind::Systemd as i32,
         backend_instance_id: "backend-old".into(),
@@ -1901,6 +1915,117 @@ async fn stop_result_waits_for_post_delivery_observation() -> Result<()> {
         .expect_err("malformed stored termination evidence must fail explicitly");
     assert_eq!(malformed.code(), Code::Internal);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn stop_result_requires_evidence_bound_to_the_pinned_activation() -> Result<()> {
+    let pool = manager_pool().await;
+    for (case, node_id, expected_code) in [
+        (
+            "missing",
+            "stop-evidence-missing",
+            "TERMINATION_EVIDENCE_MISSING",
+        ),
+        (
+            "evidence-mismatch",
+            "stop-evidence-fields",
+            "TERMINATION_EVIDENCE_MISMATCH",
+        ),
+        (
+            "result-mismatch",
+            "stop-result-fields",
+            "STOP_IDENTITY_MISMATCH",
+        ),
+        (
+            "unknown-disposition",
+            "stop-unknown-disposition",
+            "TERMINATION_NOT_GRACEFUL",
+        ),
+        (
+            "forced-disposition",
+            "stop-forced-disposition",
+            "TERMINATION_NOT_GRACEFUL",
+        ),
+        (
+            "kill-escalated",
+            "stop-kill-escalated",
+            "TERMINATION_NOT_GRACEFUL",
+        ),
+        (
+            "grace-not-requested",
+            "stop-grace-not-requested",
+            "TERMINATION_NOT_GRACEFUL",
+        ),
+    ] {
+        let (_, _, stop) = delivered_stop_fixture(&pool, node_id).await?;
+        let mut result = result_for(&stop, "");
+        result.backend_instance_id = "backend-old".into();
+        result.process_instance_id = "process-old".into();
+        if case != "missing" {
+            result.termination_evidence = Some(BackendTerminationEvidence {
+                backend: BackendKind::Systemd as i32,
+                backend_instance_id: "backend-old".into(),
+                process_instance_id: "process-old".into(),
+                graceful_termination_requested: true,
+                kill_escalated: false,
+                disposition: BackendStopDisposition::Graceful as i32,
+                terminal_result: "success".into(),
+                exit_code: Some(0),
+                signal: None,
+            });
+        }
+        match case {
+            "evidence-mismatch" => {
+                result
+                    .termination_evidence
+                    .as_mut()
+                    .expect("evidence")
+                    .backend_instance_id = "backend-replacement".into();
+            }
+            "result-mismatch" => result.process_instance_id = "process-replacement".into(),
+            "unknown-disposition" => {
+                result
+                    .termination_evidence
+                    .as_mut()
+                    .expect("evidence")
+                    .disposition = BackendStopDisposition::Unknown as i32;
+            }
+            "forced-disposition" => {
+                result
+                    .termination_evidence
+                    .as_mut()
+                    .expect("evidence")
+                    .disposition = BackendStopDisposition::Forced as i32;
+            }
+            "kill-escalated" => {
+                result
+                    .termination_evidence
+                    .as_mut()
+                    .expect("evidence")
+                    .kill_escalated = true;
+            }
+            "grace-not-requested" => {
+                result
+                    .termination_evidence
+                    .as_mut()
+                    .expect("evidence")
+                    .graceful_termination_requested = false;
+            }
+            _ => {}
+        }
+
+        let paused = wr_manager::operations::report_step(&pool, &result, "agent-a").await?;
+        assert_ne!(
+            NodeOperationState::try_from(paused.state)?,
+            NodeOperationState::Succeeded,
+            "{case} evidence must not complete the operation"
+        );
+        assert!(paused
+            .conditions
+            .iter()
+            .any(|condition| condition.code == expected_code));
+    }
     Ok(())
 }
 

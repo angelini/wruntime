@@ -128,21 +128,6 @@ def load_config(path: Path) -> Config:
         raw = data.get(key)
         if not isinstance(raw, dict):
             raise ProviderError(f"missing [{key}] target")
-        if key == "manager_b":
-            raw = dict(raw)
-            inputs = {
-                "vmid": os.environ.get("WRT_DEPLOY_E2E_MANAGER_B_VMID"),
-                "host": os.environ.get("WRT_DEPLOY_E2E_MANAGER_B_IP"),
-                "snapshot": os.environ.get("WRT_DEPLOY_E2E_MANAGER_B_SNAPSHOT"),
-            }
-            missing = [name for name, value in inputs.items() if not value]
-            if missing:
-                raise ProviderError(
-                    "manager B requires protected inputs: "
-                    "WRT_DEPLOY_E2E_MANAGER_B_VMID, WRT_DEPLOY_E2E_MANAGER_B_IP, "
-                    "WRT_DEPLOY_E2E_MANAGER_B_SNAPSHOT"
-                )
-            raw.update(inputs)
         try:
             vmid = int(raw["vmid"])
         except (KeyError, TypeError, ValueError) as exc:

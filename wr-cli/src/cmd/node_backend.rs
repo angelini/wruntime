@@ -6,6 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -153,10 +155,17 @@ pub struct Selection {
     pub resolved_release_digest: String,
 }
 
+#[cfg(target_os = "linux")]
+type PinnedSystemdProcess = OwnedFd;
+
+#[cfg(not(target_os = "linux"))]
+struct PinnedSystemdProcess;
+
 #[derive(Clone, Debug)]
 pub struct BackendObservation {
     pub state: BackendProcessState,
     pub instance_id: String,
+    pub main_pid: u32,
     pub query_error: String,
     pub terminal_result: String,
     pub exit_code: Option<i32>,
@@ -168,6 +177,7 @@ impl BackendObservation {
         Self {
             state: BackendProcessState::QueryError,
             instance_id: String::new(),
+            main_pid: 0,
             query_error: error.to_string(),
             terminal_result: String::new(),
             exit_code: None,
@@ -183,6 +193,7 @@ pub struct StepEvidence {
     pub observed_resolved_release_digest: String,
     pub backend_state: Option<BackendProcessState>,
     pub backend_instance_id: String,
+    pub backend_main_pid: u32,
     pub process_instance_id: String,
     pub backend_query_error: String,
     pub lifecycle: Option<LifecycleStatus>,
@@ -604,6 +615,7 @@ impl HostBackend {
             observed_resolved_release_digest: selected.resolved_release_digest,
             backend_state: Some(backend.state),
             backend_instance_id: backend.instance_id,
+            backend_main_pid: backend.main_pid,
             backend_query_error: backend.query_error,
             process_instance_id: lifecycle
                 .as_ref()
@@ -664,6 +676,7 @@ impl HostBackend {
             observed_resolved_release_digest: selected.resolved_release_digest,
             backend_state: Some(backend.state),
             backend_instance_id: backend.instance_id,
+            backend_main_pid: backend.main_pid,
             backend_query_error: backend.query_error,
             process_instance_id: lifecycle
                 .as_ref()
@@ -700,7 +713,7 @@ impl HostBackend {
             [
                 "show",
                 unit,
-                "--property=LoadState,ActiveState,SubState,InvocationID,Result,ExecMainCode,ExecMainStatus",
+                "--property=LoadState,ActiveState,SubState,InvocationID,MainPID,Result,ExecMainCode,ExecMainStatus",
                 "--no-pager",
             ],
         )
@@ -907,15 +920,64 @@ impl HostBackend {
         }
     }
 
+    async fn pin_systemd_process(
+        &self,
+        slot: &ReleaseSlot,
+        before: &StepEvidence,
+    ) -> Result<PinnedSystemdProcess> {
+        anyhow::ensure!(
+            before.backend_main_pid != 0,
+            "systemd running activation has no main process"
+        );
+        let pinned = open_pidfd(before.backend_main_pid)?;
+        let confirmed = self.inspect_systemd(&slot.systemd_unit).await;
+        anyhow::ensure!(
+            confirmed.query_error.is_empty()
+                && confirmed.state == BackendProcessState::Running
+                && confirmed.instance_id == before.backend_instance_id
+                && confirmed.main_pid == before.backend_main_pid
+                && !pidfd_exited(&pinned)?,
+            "systemd backend/process identity changed before stop delivery"
+        );
+        Ok(pinned)
+    }
+
+    async fn wait_for_pinned_process_exit(
+        &self,
+        pinned: &PinnedSystemdProcess,
+        deadline: tokio::time::Instant,
+        mut cancelled: watch::Receiver<bool>,
+    ) -> Result<()> {
+        loop {
+            if pidfd_exited(pinned)? {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "systemd pinned process did not exit before the stop deadline"
+            );
+            tokio::select! {
+                changed = cancelled.changed() => {
+                    if changed.is_err() || *cancelled.borrow() {
+                        bail!("systemd pinned-process inspection was cancelled by the lease guard");
+                    }
+                }
+                () = tokio::time::sleep(INSPECTION_INTERVAL) => {}
+            }
+        }
+    }
+
     async fn run_stop_effect(
         &self,
         slot: &ReleaseSlot,
         release: &Path,
+        before: &StepEvidence,
         cancelled: watch::Receiver<bool>,
-    ) -> Result<(BackendObservation, bool)> {
+    ) -> Result<(BackendObservation, bool, bool)> {
         let stop_deadline = tokio::time::Instant::now() + STOP_BUDGET;
         match self.config.backend {
             BackendType::Systemd => {
+                let pinned = self.pin_systemd_process(slot, before).await?;
                 let mut command = self.effect_command(EffectAction::Stop, slot, release)?;
                 command.stdout(Stdio::null()).stderr(Stdio::null());
                 let remaining = stop_deadline
@@ -923,6 +985,8 @@ impl HostBackend {
                     .min(STOP_GRACE_BUDGET + STOP_MARGIN);
                 let status = run_cancellable(command, cancelled.clone(), remaining).await?;
                 anyhow::ensure!(status.success(), "backend stop failed with status {status}");
+                self.wait_for_pinned_process_exit(&pinned, stop_deadline, cancelled.clone())
+                    .await?;
                 let inspection_deadline = std::cmp::min(
                     stop_deadline,
                     tokio::time::Instant::now() + STOP_INSPECTION_BUDGET,
@@ -931,7 +995,7 @@ impl HostBackend {
                     .wait_for_terminal_backend(slot, release, inspection_deadline, cancelled)
                     .await?
                     .context("systemd terminal facts remained unavailable")?;
-                Ok((observation, false))
+                Ok((observation, false, true))
             }
             BackendType::Docker => {
                 let term = self.docker_signal_command("TERM", slot, release)?;
@@ -951,7 +1015,7 @@ impl HostBackend {
                     .wait_for_terminal_backend(slot, release, grace_deadline, cancelled.clone())
                     .await?
                 {
-                    return Ok((observation, false));
+                    return Ok((observation, false, false));
                 }
                 let kill = self.docker_signal_command("KILL", slot, release)?;
                 let escalation_budget = stop_deadline
@@ -974,7 +1038,7 @@ impl HostBackend {
                     .wait_for_terminal_backend(slot, release, inspection_deadline, cancelled)
                     .await?
                     .context("Docker terminal facts remained unavailable after escalation")?;
-                Ok((observation, true))
+                Ok((observation, true, false))
             }
         }
     }
@@ -984,9 +1048,15 @@ impl HostBackend {
         before: &StepEvidence,
         terminal: &BackendObservation,
         escalated: bool,
+        exact_process_exit: bool,
     ) -> BackendTerminationEvidence {
+        // systemd releases inactive units quickly, clearing InvocationID and
+        // ExecMain* properties. The pidfd pins the exact pre-stop main process.
         let same_identity = !before.backend_instance_id.is_empty()
-            && terminal.instance_id == before.backend_instance_id;
+            && (terminal.instance_id == before.backend_instance_id
+                || (self.config.backend == BackendType::Systemd
+                    && exact_process_exit
+                    && terminal.instance_id.is_empty()));
         let forced_terminal = match self.config.backend {
             BackendType::Systemd => matches!(
                 terminal.terminal_result.as_str(),
@@ -1006,6 +1076,22 @@ impl HostBackend {
         } else {
             BackendStopDisposition::Unknown
         };
+        if disposition == BackendStopDisposition::Unknown {
+            eprintln!(
+                "node-agent backend termination evidence is inconclusive: backend={:?} expected_backend_instance_id={} terminal_backend_instance_id={} expected_main_pid={} terminal_main_pid={} exact_process_exit={} terminal_state={:?} terminal_result={} exit_code={:?} signal={:?} escalated={}",
+                self.config.backend,
+                before.backend_instance_id,
+                terminal.instance_id,
+                before.backend_main_pid,
+                terminal.main_pid,
+                exact_process_exit,
+                terminal.state,
+                terminal.terminal_result,
+                terminal.exit_code,
+                terminal.signal,
+                escalated,
+            );
+        }
         BackendTerminationEvidence {
             backend: self.config.backend.wire() as i32,
             backend_instance_id: before.backend_instance_id.clone(),
@@ -1346,9 +1432,15 @@ impl InstructionExecutor for HostBackend {
                         )?;
                         let slot = Self::proxy_slot(&metadata);
                         let release = self.release_dir(desired.revision)?;
-                        let (terminal, escalated) =
-                            self.run_stop_effect(&slot, &release, cancelled).await?;
-                        let termination = self.termination_evidence(&before, &terminal, escalated);
+                        let (terminal, escalated, exact_process_exit) = self
+                            .run_stop_effect(&slot, &release, &before, cancelled)
+                            .await?;
+                        let termination = self.termination_evidence(
+                            &before,
+                            &terminal,
+                            escalated,
+                            exact_process_exit,
+                        );
                         Ok(StepEvidence {
                             observed_revision: desired.revision,
                             observed_digest: desired.digest,
@@ -1509,9 +1601,15 @@ impl InstructionExecutor for HostBackend {
                     )?;
                     let slot = metadata.slot(&target.engine_slot)?;
                     let release = self.release_dir(desired.revision)?;
-                    let (terminal, escalated) =
-                        self.run_stop_effect(slot, &release, cancelled).await?;
-                    let termination = self.termination_evidence(&before, &terminal, escalated);
+                    let (terminal, escalated, exact_process_exit) = self
+                        .run_stop_effect(slot, &release, &before, cancelled)
+                        .await?;
+                    let termination = self.termination_evidence(
+                        &before,
+                        &terminal,
+                        escalated,
+                        exact_process_exit,
+                    );
                     Ok(StepEvidence {
                         observed_revision: desired.revision,
                         observed_digest: desired.digest,
@@ -1900,6 +1998,45 @@ async fn run_cancellable(
     result
 }
 
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: u32) -> Result<PinnedSystemdProcess> {
+    anyhow::ensure!(pid != 0, "cannot pin process ID zero");
+    let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to pin systemd main process");
+    }
+    let raw_fd = i32::try_from(raw_fd).context("pidfd does not fit a file descriptor")?;
+    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_pidfd(_pid: u32) -> Result<PinnedSystemdProcess> {
+    bail!("systemd process pinning requires Linux pidfd support")
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_exited(pidfd: &PinnedSystemdProcess) -> Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if ready < 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to inspect pinned process");
+    }
+    anyhow::ensure!(
+        descriptor.revents & libc::POLLNVAL == 0,
+        "pinned process descriptor became invalid"
+    );
+    Ok(ready > 0 && descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pidfd_exited(_pidfd: &PinnedSystemdProcess) -> Result<bool> {
+    bail!("systemd process pinning requires Linux pidfd support")
+}
+
 fn parse_systemd_observation(bytes: &[u8]) -> BackendObservation {
     let text = String::from_utf8_lossy(bytes);
     let fields = text
@@ -1911,6 +2048,10 @@ fn parse_systemd_observation(bytes: &[u8]) -> BackendObservation {
     let active = fields.get("ActiveState").copied().unwrap_or_default();
     let sub = fields.get("SubState").copied().unwrap_or_default();
     let invocation = fields.get("InvocationID").copied().unwrap_or_default();
+    let main_pid = fields
+        .get("MainPID")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or_default();
     let terminal_result = fields.get("Result").copied().unwrap_or_default();
     let main_code = fields.get("ExecMainCode").copied().unwrap_or_default();
     let main_status = fields
@@ -1932,6 +2073,9 @@ fn parse_systemd_observation(bytes: &[u8]) -> BackendObservation {
     if invocation.is_empty() && !(active == "inactive" && sub == "dead") {
         return BackendObservation::query_error("systemd InvocationID is missing");
     }
+    if state == BackendProcessState::Running && main_pid == 0 {
+        return BackendObservation::query_error("systemd MainPID is missing");
+    }
     // A newly installed unit that has never started is inactive/dead with no
     // InvocationID. Treat it as not running, but keep the identity empty so
     // callers that require proof of a prior process exit still fail closed.
@@ -1943,6 +2087,7 @@ fn parse_systemd_observation(bytes: &[u8]) -> BackendObservation {
     BackendObservation {
         state,
         instance_id: invocation.to_string(),
+        main_pid,
         query_error: String::new(),
         terminal_result: terminal_result.to_string(),
         exit_code,
@@ -1956,6 +2101,7 @@ fn parse_docker_observation(bytes: &[u8], expected_service: &str) -> BackendObse
         return BackendObservation {
             state: BackendProcessState::Exited,
             instance_id: String::new(),
+            main_pid: 0,
             query_error: String::new(),
             terminal_result: String::new(),
             exit_code: None,
@@ -1998,6 +2144,7 @@ fn parse_docker_observation(bytes: &[u8], expected_service: &str) -> BackendObse
     BackendObservation {
         state,
         instance_id: id,
+        main_pid: 0,
         query_error: String::new(),
         terminal_result: if state == BackendProcessState::Exited {
             "exited".to_string()
@@ -2050,20 +2197,30 @@ mod tests {
     #[test]
     fn parses_exact_systemd_identity_and_unknown_states() {
         let running = parse_systemd_observation(
-            b"LoadState=loaded\nActiveState=active\nSubState=running\nInvocationID=abc\n",
+            b"LoadState=loaded\nActiveState=active\nSubState=running\nInvocationID=abc\nMainPID=123\n",
         );
         assert_eq!(running.state, BackendProcessState::Running);
         assert_eq!(running.instance_id, "abc");
+        assert_eq!(running.main_pid, 123);
+
+        let stopped = parse_systemd_observation(
+            b"LoadState=loaded\nActiveState=inactive\nSubState=dead\nInvocationID=\nMainPID=0\nResult=success\n",
+        );
+        assert_eq!(stopped.state, BackendProcessState::Exited);
+        assert!(stopped.instance_id.is_empty());
+        assert_eq!(stopped.main_pid, 0);
+        assert!(stopped.query_error.is_empty());
 
         let never_started = parse_systemd_observation(
-            b"LoadState=loaded\nActiveState=inactive\nSubState=dead\nInvocationID=\n",
+            b"LoadState=loaded\nActiveState=inactive\nSubState=dead\nInvocationID=\nMainPID=0\n",
         );
         assert_eq!(never_started.state, BackendProcessState::Exited);
         assert!(never_started.instance_id.is_empty());
+        assert_eq!(never_started.main_pid, 0);
         assert!(never_started.query_error.is_empty());
 
         let missing_running_identity = parse_systemd_observation(
-            b"LoadState=loaded\nActiveState=active\nSubState=running\nInvocationID=\n",
+            b"LoadState=loaded\nActiveState=active\nSubState=running\nInvocationID=\nMainPID=123\n",
         );
         assert_eq!(
             missing_running_identity.state,
@@ -2074,10 +2231,93 @@ mod tests {
             "systemd InvocationID is missing"
         );
 
+        let missing_running_process = parse_systemd_observation(
+            b"LoadState=loaded\nActiveState=active\nSubState=running\nInvocationID=abc\nMainPID=0\n",
+        );
+        assert_eq!(
+            missing_running_process.state,
+            BackendProcessState::QueryError
+        );
+        assert_eq!(
+            missing_running_process.query_error,
+            "systemd MainPID is missing"
+        );
+
         let unknown = parse_systemd_observation(
-            b"LoadState=loaded\nActiveState=activating\nSubState=start\nInvocationID=abc\n",
+            b"LoadState=loaded\nActiveState=activating\nSubState=start\nInvocationID=abc\nMainPID=123\n",
         );
         assert_eq!(unknown.state, BackendProcessState::QueryError);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_pins_the_exact_process_until_exit() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn process");
+        let pinned = open_pidfd(child.id()).expect("pin process");
+        assert!(!pidfd_exited(&pinned).expect("inspect live process"));
+        child.kill().expect("kill process");
+        child.wait().expect("reap process");
+        assert!(pidfd_exited(&pinned).expect("inspect exited process"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn systemd_stop_pins_process_when_inactive_unit_clears_invocation() {
+        let root = temp_root("systemd-stop-pidfd");
+        std::fs::create_dir_all(&root).expect("create test root");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn process");
+        std::fs::write(root.join("pid"), child.id().to_string()).expect("write pid");
+        let systemctl = root.join("systemctl");
+        std::fs::write(
+            &systemctl,
+            format!(
+                "#!/bin/sh\nstate={}\npid=$(cat {}/pid)\ncase \"$1\" in\nshow)\n if [ -f \"$state\" ]; then\n  printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nInvocationID=\\nMainPID=0\\nResult=success\\n'\n else\n  printf 'LoadState=loaded\\nActiveState=active\\nSubState=running\\nInvocationID=invocation-1\\nMainPID=%s\\nResult=success\\n' \"$pid\"\n fi\n ;;\nstop)\n kill -TERM \"$pid\"\n touch \"$state\"\n ;;\nesac\n",
+                root.join("stopped").display(),
+                root.display(),
+            ),
+        )
+        .expect("write fake systemctl");
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake systemctl executable");
+        let backend = test_backend(&root);
+        let slot = ReleaseSlot {
+            engine_slot: "blue".into(),
+            systemd_unit: "wr-engine-blue.service".into(),
+            docker_service: "engine-blue".into(),
+            lifecycle_address: "http://127.0.0.1:9100".into(),
+            config_path: "config/engine.toml".into(),
+        };
+        let before = StepEvidence {
+            backend_instance_id: "invocation-1".into(),
+            backend_main_pid: child.id(),
+            process_instance_id: "process-1".into(),
+            ..Default::default()
+        };
+        let (_cancel, receiver) = watch::channel(false);
+        let outcome = backend
+            .run_stop_effect(&slot, &root, &before, receiver)
+            .await;
+        if child.try_wait().expect("inspect process").is_none() {
+            child.kill().expect("kill test process");
+        }
+        child.wait().expect("reap test process");
+        let (terminal, escalated, exact_process_exit) = outcome.expect("stop effect");
+        assert!(terminal.instance_id.is_empty());
+        assert!(!escalated);
+        assert!(exact_process_exit);
+        assert_eq!(
+            backend
+                .termination_evidence(&before, &terminal, escalated, exact_process_exit,)
+                .disposition,
+            BackendStopDisposition::Graceful as i32
+        );
+        std::fs::remove_dir_all(root).expect("remove test root");
     }
 
     #[test]
@@ -2163,6 +2403,7 @@ mod tests {
         let terminal = BackendObservation {
             state: BackendProcessState::Exited,
             instance_id: "container-1".into(),
+            main_pid: 0,
             query_error: String::new(),
             terminal_result: "exited".into(),
             exit_code: Some(0),
@@ -2170,13 +2411,13 @@ mod tests {
         };
         assert_eq!(
             backend
-                .termination_evidence(&before, &terminal, false)
+                .termination_evidence(&before, &terminal, false, false)
                 .disposition,
             BackendStopDisposition::Graceful as i32
         );
         assert_eq!(
             backend
-                .termination_evidence(&before, &terminal, true)
+                .termination_evidence(&before, &terminal, true, false)
                 .disposition,
             BackendStopDisposition::Forced as i32
         );
@@ -2188,7 +2429,7 @@ mod tests {
             };
             assert_eq!(
                 backend
-                    .termination_evidence(&before, &failed, false)
+                    .termination_evidence(&before, &failed, false, false)
                     .disposition,
                 BackendStopDisposition::Unknown as i32,
                 "exit code {exit_code} must fail closed"
@@ -2201,7 +2442,7 @@ mod tests {
         };
         assert_eq!(
             backend
-                .termination_evidence(&before, &terminated, false)
+                .termination_evidence(&before, &terminated, false, false)
                 .disposition,
             BackendStopDisposition::Graceful as i32
         );
@@ -2211,7 +2452,69 @@ mod tests {
         };
         assert_eq!(
             backend
-                .termination_evidence(&before, &replaced, false)
+                .termination_evidence(&before, &replaced, false, false)
+                .disposition,
+            BackendStopDisposition::Unknown as i32
+        );
+    }
+
+    #[test]
+    fn systemd_termination_requires_same_identity_and_success() {
+        let backend = HostBackend::new_with_attestor(
+            HostBackendConfig {
+                deployment_root: PathBuf::from("/tmp/wruntime-test"),
+                backend: BackendType::Systemd,
+                systemctl_path: Some(PathBuf::from("/usr/bin/systemctl")),
+                docker_path: None,
+                compose_project: None,
+            },
+            Box::new(TestPathAttestor),
+        )
+        .expect("backend");
+        let before = StepEvidence {
+            backend_instance_id: "invocation-1".into(),
+            backend_main_pid: 123,
+            process_instance_id: "process-1".into(),
+            ..Default::default()
+        };
+        let terminal = BackendObservation {
+            state: BackendProcessState::Exited,
+            instance_id: "invocation-1".into(),
+            main_pid: 0,
+            query_error: String::new(),
+            terminal_result: "success".into(),
+            exit_code: Some(0),
+            signal: None,
+        };
+        assert_eq!(
+            backend
+                .termination_evidence(&before, &terminal, false, false)
+                .disposition,
+            BackendStopDisposition::Graceful as i32
+        );
+        let cleared_invocation = BackendObservation {
+            instance_id: String::new(),
+            ..terminal.clone()
+        };
+        assert_eq!(
+            backend
+                .termination_evidence(&before, &cleared_invocation, false, true)
+                .disposition,
+            BackendStopDisposition::Graceful as i32
+        );
+        assert_eq!(
+            backend
+                .termination_evidence(&before, &cleared_invocation, false, false)
+                .disposition,
+            BackendStopDisposition::Unknown as i32
+        );
+        let changed_invocation = BackendObservation {
+            instance_id: "invocation-2".into(),
+            ..terminal
+        };
+        assert_eq!(
+            backend
+                .termination_evidence(&before, &changed_invocation, false, true)
                 .disposition,
             BackendStopDisposition::Unknown as i32
         );

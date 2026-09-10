@@ -346,7 +346,7 @@ Production roots are installed under `/etc/wruntime/pki/roots/`. Immutable crede
 
 ## Remote host requirements
 
-External provisioning owns bootstrap, node-agent config and credentials, directories, backend prerequisites, and the hardened service unit. The product's agent install/update helper uses privileged SSH only to stage, verify, atomically replace the existing agent executable, and restart the existing service; it never transfers private material or repairs missing topology. Inactive release staging and diagnostic commands also use bounded privileged operations. Workload effects do not. The deploy user must have **passwordless sudo** configured on each target host:
+External provisioning owns bootstrap, node-agent config and credentials, directories, backend prerequisites, and the hardened service unit. Systemd node hosts require Linux 5.3 or newer so the agent can use `pidfd_open` for exact process-exit evidence. The product's agent install/update helper uses privileged SSH only to stage, verify, atomically replace the existing agent executable, and restart the existing service; it never transfers private material or repairs missing topology. Inactive release staging and diagnostic commands also use bounded privileged operations. Workload effects do not. The deploy user must have **passwordless sudo** configured on each target host:
 
 ```bash
 echo "deploy ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/deploy
@@ -408,7 +408,7 @@ Operators address stable deployment identity and submit durable intent:
 wr-cli engines restart --node-id node-a --slot inventory --request-token restart-42 --json
 ```
 
-Only the continuously fenced node agent maps the typed target to `wr-engine-<slot>.service` or the fixed Compose service. It records backend instance identity, sends the backend's graceful SIGTERM action, and inspects until the exact instance exits. Manager reconciliation separately requires `STOPPING`, route withdrawal, deregistration, and backend final exit where the action calls for them. A restarted process must have the requested revision/digests and a fresh process/backend identity before authority can return.
+Only the continuously fenced node agent maps the typed target to `wr-engine-<slot>.service` or the fixed Compose service. It records backend instance identity, sends the backend's graceful SIGTERM action, and inspects until the exact instance exits. For systemd, it pins and revalidates the activation's `MainPID` before stop so exact process-exit proof survives systemd unloading the inactive unit and clearing `InvocationID`. Manager reconciliation separately requires `STOPPING`, route withdrawal, deregistration, and backend final exit where the action calls for them. A restarted process must have the requested revision/digests and a fresh process/backend identity before authority can return.
 
 SSH remains available for binary-only host-agent updates on an existing provisioned baseline, pre-staging immutable bytes, and bounded diagnostics. It is never used to execute workload stop/start/select/cleanup effects. If the agent loses its activation lease or cannot inspect the backend, the operation pauses with explicit evidence; a replacement activation begins with inspection and cannot blindly repeat the prior effect.
 

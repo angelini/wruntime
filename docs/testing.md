@@ -128,10 +128,12 @@ and the checked-in `uv.lock`. Recipes and the lifecycle harness use
 environment or system `pip` installation is required. Protected runner inputs
 are `PVE_HOST`, `PVE_USER`,
 `PVE_TOKEN_NAME`, `PVE_TOKEN_VALUE`, `WRT_DEPLOY_E2E_SSH_KEY`,
-`WRT_DEPLOY_E2E_DB_URL`, and `WRT_SECRET_ENCRYPTION_KEY`. The dedicated SSH
-known-hosts file defaults to `~/.ssh/wruntime-e2e-known_hosts` and can be
-overridden with `WRT_DEPLOY_E2E_KNOWN_HOSTS`. Never pass these values in a
-checked-in config or transcript.
+`WRT_DEPLOY_E2E_DB_URL`, and `WRT_SECRET_ENCRYPTION_KEY`. The three disposable
+VM targets and their baseline snapshots are configured in
+`dev/deployment-e2e.toml`. The dedicated SSH known-hosts file defaults to
+`~/.ssh/wruntime-e2e-known_hosts` and can be overridden with
+`WRT_DEPLOY_E2E_KNOWN_HOSTS`. Never pass protected input values in a checked-in
+config or transcript.
 
 The Proxmox HTTPS client uses the Debian/Ubuntu OS CA bundle at
 `/etc/ssl/certs/ca-certificates.crt` instead of Requests' bundled `certifi`

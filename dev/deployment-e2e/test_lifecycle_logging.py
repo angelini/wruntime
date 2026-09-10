@@ -189,6 +189,7 @@ PY_REDACT
             self.assertIn(command, script)
         self.assertIn("--exit-after-finalization", script)
         self.assertEqual(script.count("--allow-downtime"), 2)
+        self.assertNotIn("--wait-timeout", script)
         self.assertIn("node inventory contraction", script)
         contract = LIFECYCLE_CONTRACT.read_text()
         self.assertIn('operations list --node-id "$node_id" --include-terminal --json', contract)

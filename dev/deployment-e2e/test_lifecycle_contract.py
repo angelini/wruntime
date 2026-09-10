@@ -23,6 +23,59 @@ class LifecycleContractTests(unittest.TestCase):
         path.write_text("#!/usr/bin/env bash\nset -Eeuo pipefail\n" + body)
         path.chmod(0o700)
 
+    def test_harness_builds_echo_from_module_owning_config(self):
+        harness = HARNESS.read_text()
+        build_command = "dev build --config examples/multi-node/node-b/engine-1.toml"
+        self.assertEqual(harness.count(build_command), 1)
+        self.assertNotIn(
+            "dev build --config examples/multi-node/node-a/engine-1.toml",
+            harness,
+        )
+
+    def test_node_bundles_use_fresh_release_host_binaries(self):
+        harness = HARNESS.read_text()
+        workspace_build = harness.index("run_logged build-workspace cargo build")
+        host_build = harness.index(
+            "run_logged build-node-host-binaries cargo zigbuild --release "
+            "--target x86_64-unknown-linux-gnu"
+        )
+        first_bundle = harness.index("run_logged baseline-one-bundle ")
+        self.assertLess(workspace_build, host_build)
+        self.assertLess(host_build, first_bundle)
+        host_build_command = harness[
+            host_build:harness.index('mkdir -p "$CERT_DIR"', host_build)
+        ]
+        self.assertIn("-p wr-proxy -p wr-engine -p wr-cli", host_build_command)
+        bundle_lines = [
+            line for line in harness.splitlines()
+            if line.startswith("run_logged ") and "-bundle target/debug/wr-cli node bundle" in line
+        ]
+        self.assertEqual(len(bundle_lines), 4)
+        self.assertTrue(all("--skip-build" in line for line in bundle_lines))
+
+    def test_manager_b_database_preflight_follows_systemd_vm_readiness(self):
+        harness = HARNESS.read_text()
+        lifecycle = harness[harness.index("lifecycle() {"):]
+        provider_reset = lifecycle.index(
+            'run_to_log "$backend provider reset" "$pass/provider-reset.json" provider reset'
+        )
+        preflight_command = (
+            'run_to_log "manager-b-db-preflight" '
+            '"$pass/manager-b-db-preflight.log" assert_manager_b_db_reachable'
+        )
+        database_preflight = lifecycle.index(preflight_command)
+        first_manager_rollout = lifecycle.index(
+            'run_to_log "manager A to B deploy-set"'
+        )
+        self.assertEqual(lifecycle.count(preflight_command), 1)
+        self.assertLess(provider_reset, database_preflight)
+        self.assertLess(database_preflight, first_manager_rollout)
+        self.assertIn(
+            'if [ "$backend" = systemd ]; then\n'
+            '\t\trun_to_log "manager-b-db-preflight"',
+            lifecycle,
+        )
+
     def test_real_harness_entry_executes_ordered_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -142,10 +195,30 @@ fi
         base = (ROOT / "wr-tests" / "deployment" / "policy" / "authorization.toml").read_text()
         generation_two = module.render_policy(base, 2, "manager-b", "https://192.0.2.12:9000")
         generation_three = module.render_policy(base, 3, "manager-a", "https://192.0.2.10:9000")
-        self.assertIn("generation = 2", generation_two)
-        self.assertIn('manager_id = "manager-b"', generation_two)
-        self.assertIn("generation = 3", generation_three)
-        self.assertIn('manager_id = "manager-a"', generation_three)
+        policies = (
+            (base, 1, "manager-a", "https://127.0.0.1:9000"),
+            (generation_two, 2, "manager-b", "https://192.0.2.12:9000"),
+            (generation_three, 3, "manager-a", "https://192.0.2.10:9000"),
+        )
+        for policy, generation, manager_id, endpoint in policies:
+            with self.subTest(generation=generation):
+                value = tomllib.loads(policy)
+                principal = f"urn:wruntime:deployment:manager:{manager_id}"
+                manager_principals = [
+                    item["uri"]
+                    for item in value["principals"]
+                    if item["kind"] == "manager"
+                ]
+                self.assertEqual(value["generation"], generation)
+                self.assertEqual(manager_principals, [principal])
+                self.assertEqual(
+                    value["manager_enrollments"],
+                    [{
+                        "principal": principal,
+                        "manager_id": manager_id,
+                        "endpoint": endpoint,
+                    }],
+                )
 
     def test_stable_slot_fixtures_have_unique_pinned_endpoints(self):
         scenarios = ROOT / "wr-tests" / "deployment" / "scenarios"

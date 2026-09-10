@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import struct
+import tomllib
 from urllib.parse import urlparse
 
 ZERO_DIGEST = "sha256:" + "0" * 64
@@ -49,12 +50,25 @@ def require_remote_database(url: str) -> None:
 
 
 def render_policy(source: str, generation: int, manager_id: str, endpoint: str) -> str:
-    value, count = re.subn(r"(?m)^generation\s*=\s*\d+\s*$", f"generation = {generation}", source)
+    parsed = tomllib.loads(source)
+    manager_principals = [item for item in parsed["principals"] if item["kind"] == "manager"]
+    manager_enrollments = parsed["manager_enrollments"]
+    if len(manager_principals) != 1 or len(manager_enrollments) != 1:
+        raise ValueError("source policy must declare and enroll exactly one manager")
+    source_principal = manager_principals[0]["uri"]
+    if manager_enrollments[0]["principal"] != source_principal:
+        raise ValueError("source policy manager declaration and enrollment must match")
+    target_principal = f'urn:wruntime:{parsed["cluster_id"]}:manager:{manager_id}'
+    encoded_source_principal = quote(source_principal)
+    if source.count(encoded_source_principal) != 2:
+        raise ValueError("source manager principal must occur exactly twice")
+    value = source.replace(encoded_source_principal, quote(target_principal))
+    value, count = re.subn(r"(?m)^generation\s*=\s*\d+\s*$", f"generation = {generation}", value)
     if count != 1:
         raise ValueError("policy must contain exactly one generation")
     block = (
         "[[manager_enrollments]]\n"
-        f'principal  = "urn:wruntime:deployment:manager:{manager_id}"\n'
+        f"principal  = {quote(target_principal)}\n"
         f'manager_id = "{manager_id}"\n'
         f'endpoint   = "{endpoint}"\n'
     )
