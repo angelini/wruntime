@@ -23,14 +23,11 @@ class LifecycleContractTests(unittest.TestCase):
         path.write_text("#!/usr/bin/env bash\nset -Eeuo pipefail\n" + body)
         path.chmod(0o700)
 
-    def test_harness_builds_echo_from_module_owning_config(self):
+    def test_harness_builds_deployment_probe_from_owning_config(self):
         harness = HARNESS.read_text()
-        build_command = "dev build --config examples/multi-node/node-b/engine-1.toml"
+        build_command = "dev build --config wr-tests/deployment/scenarios/baseline/engine-1.toml"
         self.assertEqual(harness.count(build_command), 1)
-        self.assertNotIn(
-            "dev build --config examples/multi-node/node-a/engine-1.toml",
-            harness,
-        )
+        self.assertNotIn("examples/multi-node/echo", harness)
 
     def test_node_bundles_use_fresh_release_host_binaries(self):
         harness = HARNESS.read_text()
@@ -106,7 +103,7 @@ PY
 """)
             self.executable(cli, f"""printf 'cli %s\\n' "$*" >> {calls!s}
 if [[ " $* " == *" invoke "* ]]; then
-    printf '{{"message":"probe"}}\\n'
+    printf '{{"nonce":"probe"}}\\n'
 elif [[ "$*" == *"operations list"* ]]; then
     printf '[{{"operation_id":"operation-a","node_id":"node-a","request_token":"upgrade-token","state":"succeeded"}}]\\n'
 elif [[ "$*" == *"operations get operation-a"* ]]; then
@@ -154,6 +151,13 @@ fi
             invoked = calls.read_text().splitlines()
             self.assertTrue(any("operations list" in line for line in invoked))
             self.assertTrue(any("operations get operation-a" in line for line in invoked))
+            probe_calls = [line for line in invoked if " invoke " in line]
+            self.assertTrue(probe_calls)
+            self.assertTrue(all(
+                "--destination http://deployment.probe/deployment.ProbeService/Check" in line
+                and '--body {"nonce":"probe"}' in line
+                for line in probe_calls
+            ))
             self.assertEqual([line for line in invoked if line.startswith("provider ")], ["provider reset", "provider reset", "provider stop-reset"])
             upgrades = [line for line in invoked if line.startswith("cli upgrade ")]
             self.assertEqual(len(upgrades), 4)
@@ -227,7 +231,12 @@ fi
             for slot in ("engine-1", "engine-2"):
                 value = tomllib.loads((scenarios / version / f"{slot}.toml").read_text())
                 observed[(version, slot)] = (value["listen_address"], value["job_admin"]["listen_address"])
-                self.assertEqual(value["module"][0]["version"], module_version)
+                module = value["module"][0]
+                self.assertEqual(module["name"], "probe")
+                self.assertEqual(module["namespace"], "deployment")
+                self.assertEqual(module["version"], module_version)
+                self.assertEqual(module["wasm_path"], "wr-tests/deployment/probe/target/wasm32-wasip2/debug/deployment_probe.wasm")
+                self.assertEqual(module["schema_path"], "wr-tests/deployment/probe/schemas/probe.binpb")
         self.assertEqual(observed[("baseline", "engine-1")], observed[("upgrade", "engine-1")])
         self.assertEqual(observed[("baseline", "engine-2")], observed[("upgrade", "engine-2")])
         self.assertEqual(len(set(observed.values())), 2)
@@ -254,7 +263,7 @@ fi
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             responder = root / "responder.py"
-            responder.write_text("import json; print(json.dumps({'message': 'probe'}))\n")
+            responder.write_text("import json; print(json.dumps({'nonce': 'probe'}))\n")
             log, stop = root / "probe.jsonl", root / "probe.stop"
             command = [sys.executable, str(ROOT / "dev/deployment-e2e/traffic_probe.py"), "run",
                        "--log", str(log), "--stop-file", str(stop), "--expected", "probe", "--",

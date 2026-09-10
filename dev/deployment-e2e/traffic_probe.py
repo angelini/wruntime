@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Continuously invoke typed echo traffic and evaluate an upgrade window."""
+"""Continuously invoke the typed deployment probe and evaluate an upgrade window."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def run(args: argparse.Namespace) -> int:
             if returncode == 0:
                 try:
                     value = json.loads(result.stdout)
-                    valid = value.get("message") == args.expected
+                    valid = value.get("nonce") == args.expected
                     if not valid:
                         error = f"unexpected response: {value!r}"
                 except (json.JSONDecodeError, AttributeError) as exc:

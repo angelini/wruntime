@@ -19,8 +19,8 @@ key_path            = "certs/job-admin-delegation/node.key"
 client_ca_cert_path = "certs/client-root/ca.crt"
 
 [[module]]
-name        = "echo"
+name        = "probe"
 namespace   = "deployment"
 version     = "2.0.0"
-wasm_path   = "examples/multi-node/echo/target/wasm32-wasip2/debug/echo.wasm"
-schema_path = "examples/multi-node/echo/schemas/echo.binpb"
+wasm_path   = "wr-tests/deployment/probe/target/wasm32-wasip2/debug/deployment_probe.wasm"
+schema_path = "wr-tests/deployment/probe/schemas/probe.binpb"

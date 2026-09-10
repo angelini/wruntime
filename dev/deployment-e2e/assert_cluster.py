@@ -52,8 +52,8 @@ def expected_modules(deployment: dict[str, Any], slots: list[str], version: str)
         modules = engine.get("modules", [])
         one(
             modules,
-            f"deployment.echo@{version}",
-            lambda item: item.get("namespace") == "deployment" and item.get("name") == "echo" and item.get("version") == version,
+            f"deployment.probe@{version}",
+            lambda item: item.get("namespace") == "deployment" and item.get("name") == "probe" and item.get("version") == version,
         )
         if len(modules) != 1:
             raise AssertionFailure("desired deployment module inventory is not exact")
@@ -66,32 +66,32 @@ def assert_routes(
     healthy_routes: int | None = None,
     unhealthy_routes: int = 0,
 ) -> None:
-    echo_services = [
+    probe_services = [
         item for item in status.get("services", [])
         if isinstance(item.get("service"), dict)
         and item["service"].get("namespace") == "deployment"
-        and item["service"].get("name") == "echo"
+        and item["service"].get("name") == "probe"
     ]
     service = one(
-        echo_services,
-        f"deployment.echo@{version} service",
+        probe_services,
+        f"deployment.probe@{version} service",
         lambda item: item["service"].get("version") == version,
     )
-    if len(echo_services) != 1:
-        raise AssertionFailure("echo service version inventory is not exact")
+    if len(probe_services) != 1:
+        raise AssertionFailure("probe service version inventory is not exact")
     healthy_routes = desired_routes if healthy_routes is None else healthy_routes
     if (
         service.get("desired_routes") != desired_routes
         or service.get("healthy_routes") != healthy_routes
         or service.get("unhealthy_routes") != unhealthy_routes
     ):
-        raise AssertionFailure("desired echo route counts do not match the exact inventory")
+        raise AssertionFailure("desired probe route counts do not match the exact inventory")
     routes = service.get("routes", [])
     desired = [route for route in routes if route.get("desired")]
     if len(routes) != desired_routes or len(desired) != desired_routes:
-        raise AssertionFailure("authoritative desired echo route inventory is not exact")
+        raise AssertionFailure("authoritative desired probe route inventory is not exact")
     if sum(route.get("healthy") is True for route in desired) != healthy_routes:
-        raise AssertionFailure("authoritative desired echo route health is not exact")
+        raise AssertionFailure("authoritative desired probe route health is not exact")
 
 
 def assert_manager(status: dict[str, Any], address: str) -> dict[str, Any]:
@@ -197,16 +197,16 @@ def assert_desired(status: dict[str, Any], args) -> dict[str, Any]:
             raise AssertionFailure("authoritative engine is not freshly healthy")
         modules = engine.get("modules", [])
         module = one(
-            modules, "authoritative echo module",
+            modules, "authoritative probe module",
             lambda item: isinstance(item.get("module"), dict)
             and item["module"].get("namespace") == "deployment"
-            and item["module"].get("name") == "echo"
+            and item["module"].get("name") == "probe"
             and item["module"].get("version") == args.version,
         )
         if len(modules) != 1:
             raise AssertionFailure("authoritative engine module inventory is not exact")
         if module.get("severity") != "healthy" or not module.get("last_healthy"):
-            raise AssertionFailure("authoritative echo module is not freshly healthy")
+            raise AssertionFailure("authoritative probe module is not freshly healthy")
     assert_routes(status, args.version, len(slots))
     assert_proxy_health(status, selected, desired)
     return {"revision": revision, "digest": args.digest, "version": args.version, "engine_slots": slots}

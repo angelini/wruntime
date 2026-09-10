@@ -22,7 +22,7 @@ def deployment(revision=3, digest="sha256:a", version="1.0.0", state="succeeded"
         "bundle_digest": digest, "operation_id": f"operation-{revision}",
         "revision_digest": f"revision-{revision}", "state": state, "source_revision": source,
         "expected_engines": [{"engine_slot": "engine", "modules": [
-            {"namespace": "deployment", "name": "echo", "version": version}
+            {"namespace": "deployment", "name": "probe", "version": version}
         ]}],
         "failure_detail": "staging certificate directory missing" if state == "failed" else "",
     }
@@ -30,7 +30,7 @@ def deployment(revision=3, digest="sha256:a", version="1.0.0", state="succeeded"
 
 def healthy_status(revision=3, digest="sha256:a", version="1.0.0", source=0):
     desired = deployment(revision, digest, version, source=source)
-    module = {"module": {"namespace": "deployment", "name": "echo", "version": version}, "severity": "healthy", "last_healthy": {"seconds": 1}, "conditions": []}
+    module = {"module": {"namespace": "deployment", "name": "probe", "version": version}, "severity": "healthy", "last_healthy": {"seconds": 1}, "conditions": []}
     engine = {
         "engine_id": "engine-id", "severity": "healthy", "authoritative_for_desired_revision": True,
         "last_heartbeat": {"seconds": 1}, "conditions": [], "modules": [module],
@@ -61,7 +61,7 @@ def healthy_status(revision=3, digest="sha256:a", version="1.0.0", source=0):
         "nodes": [{"node_id": "wr-e2e-node", "severity": "healthy", "desired_deployment": desired, "deployment_history": [desired], "engines": [engine], "proxies": [proxy], "conditions": []}],
         "engines": [engine], "proxies": [proxy],
         "services": [{
-            "service": {"namespace": "deployment", "name": "echo", "version": version},
+            "service": {"namespace": "deployment", "name": "probe", "version": version},
             "severity": "healthy", "desired_routes": 1, "healthy_routes": 1, "unhealthy_routes": 0,
             "routes": [{"desired": True, "healthy": True, "conditions": []}], "conditions": [],
         }],
@@ -182,7 +182,7 @@ class AssertionTests(unittest.TestCase):
         status["engines"].append(second)
         status["nodes"][0]["desired_deployment"]["expected_engines"].append({
             "engine_slot": "engine-b",
-            "modules": [{"namespace": "deployment", "name": "echo", "version": "1.0.0"}],
+            "modules": [{"namespace": "deployment", "name": "probe", "version": "1.0.0"}],
         })
         status["services"][0]["desired_routes"] = 2
         status["services"][0]["healthy_routes"] = 2

@@ -1,0 +1,14 @@
+syntax = "proto3";
+package deployment;
+
+service ProbeService {
+  rpc Check(CheckRequest) returns (CheckResponse);
+}
+
+message CheckRequest {
+  string nonce = 1;
+}
+
+message CheckResponse {
+  string nonce = 1;
+}

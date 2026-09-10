@@ -424,7 +424,7 @@ on_error() {
 trap 'on_error $?' ERR
 
 run_logged provider-preflight provider preflight
-run_logged build-echo-b cargo run --bin wr-cli -- dev build --config examples/multi-node/node-b/engine-1.toml
+run_logged build-deployment-probe cargo run --bin wr-cli -- dev build --config wr-tests/deployment/scenarios/baseline/engine-1.toml
 run_logged build-workspace cargo build
 run_logged build-node-host-binaries cargo zigbuild --release --target x86_64-unknown-linux-gnu \
 	-p wr-proxy -p wr-engine -p wr-cli
@@ -657,7 +657,7 @@ lifecycle() {
 	assert_job_summary "$pass/job-summary-a.json"
 	local revision_a revision_b revision_contracted
 	revision_a="$(revision_from "$pass/status-a.json")"
-	invoke_echo "hello-$backend-a" "$pass/invoke-a.json"
+	invoke_probe "probe-$backend-a" "$pass/invoke-a.json"
 
 	local failed_status retry_token="$backend-finalized-retry" staged_revision
 	if lifecycle_run_deploy_operation "$backend-deploy-finalize" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$UPGRADE_TWO" "$NODE_REMOTE" --format "$backend" \
@@ -697,7 +697,7 @@ PY
 		--node-id "$NODE_ID" --request-token "$retry_token" --action deployment \
 		--target-revision "$staged_revision" --target-digest "$DIGEST_B_TWO" \
 		--slot-order engine-2 --slot-order engine-1 --stopped-engine-slot engine-1 --expect-proxy-stop >"$pass/assert-operation-deploy-b.json"
-	invoke_echo "hello-$backend-b" "$pass/invoke-b.json"
+	invoke_probe "probe-$backend-b" "$pass/invoke-b.json"
 
 	run_to_log "$backend durable engine restart" "$pass/restart.log" \
 		lifecycle_run_deploy_operation "$backend-restart" "${CLI_ARGS[@]}" engines restart --node-id "$NODE_ID" --slot engine-1 \
@@ -706,7 +706,7 @@ PY
 	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-restart.json" \
 		--node-id "$NODE_ID" --request-token "$backend-restart" --action restart \
 		--slot-order engine-1 --stopped-engine-slot engine-1 >"$pass/assert-operation-restart.json"
-	invoke_echo "hello-$backend-restart" "$pass/invoke-restart.json"
+	invoke_probe "probe-$backend-restart" "$pass/invoke-restart.json"
 
 	run_to_log "$backend node inventory contraction" "$pass/contract.log" \
 		lifecycle_run_deploy_operation "$backend-contract" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$BASELINE_ONE" "$NODE_REMOTE" --format "$backend" \
@@ -720,7 +720,7 @@ PY
 		--node-id "$NODE_ID" --request-token "$backend-contract" --action deployment \
 		--target-digest "$DIGEST_A_ONE" --slot-order engine-1 --slot-order engine-2 \
 		--stopped-engine-slot engine-1 --stopped-engine-slot engine-2 --expect-proxy-stop >"$pass/assert-operation-contract.json"
-	invoke_echo "hello-$backend-contract" "$pass/invoke-contract.json"
+	invoke_probe "probe-$backend-contract" "$pass/invoke-contract.json"
 
 	local rollback_token="$backend-rollback"
 	run_to_log "$backend node rollback" "$pass/rollback.log" \
@@ -733,7 +733,7 @@ PY
 		--stopped-engine-slot engine-1 --expect-proxy-stop >"$pass/assert-operation-rollback.json"
 	status_json "$pass/status-rollback.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-rollback.json" rollback --node-id "$NODE_ID" --source-revision "$revision_b" --after-revision "$revision_contracted" --digest "$DIGEST_B_TWO" --version 2.0.0 --engine-slot engine-1 --engine-slot engine-2 >"$pass/assert-rollback.json"
-	invoke_echo "hello-$backend-rollback" "$pass/invoke-rollback.json"
+	invoke_probe "probe-$backend-rollback" "$pass/invoke-rollback.json"
 	[ "$revision_a" -lt "$revision_b" ]
 
 	if [ "$backend" = systemd ]; then

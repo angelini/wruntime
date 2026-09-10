@@ -164,7 +164,7 @@ lifecycle_contract_fixture() {
 		if [ -n "${WRT_CONTRACT_TRAFFIC_DIR:-}" ]; then
 			probe_log="$WRT_CONTRACT_TRAFFIC_DIR/$backend-probe.jsonl"
 			start_tunnel "$WRT_CONTRACT_TRAFFIC_DIR/$backend-tunnel.log"
-			invoke_echo_over_tunnel probe "$WRT_CONTRACT_TRAFFIC_DIR/$backend-pre.json"
+			invoke_probe_over_tunnel probe "$WRT_CONTRACT_TRAFFIC_DIR/$backend-pre.json"
 			start_probe probe "$probe_log"
 		fi
 		if lifecycle_run_deploy_operation "$backend-upgrade-finalize" "$WRT_CONTRACT_CLI" upgrade --request-token upgrade-token --exit-after-finalization; then
@@ -178,7 +178,7 @@ lifecycle_contract_fixture() {
 		completed_at="$(python3 -c 'import time; print(time.time())')"
 		lifecycle_capture_operation_detail node-a upgrade-token "${WRT_CONTRACT_ARTIFACT:-/tmp/wruntime-operation-detail.json}" "$WRT_CONTRACT_CLI"
 		if [ -n "$probe_log" ]; then
-			invoke_echo_over_tunnel probe "$WRT_CONTRACT_TRAFFIC_DIR/$backend-post.json"
+			invoke_probe_over_tunnel probe "$WRT_CONTRACT_TRAFFIC_DIR/$backend-post.json"
 			stop_probe
 			python3 "$ROOT/dev/deployment-e2e/traffic_probe.py" evaluate --log "$probe_log" --submitted-at "$submitted_at" --completed-at "$completed_at" >"$WRT_CONTRACT_TRAFFIC_DIR/$backend-summary.json"
 			stop_probe

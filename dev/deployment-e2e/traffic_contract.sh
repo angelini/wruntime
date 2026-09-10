@@ -64,26 +64,26 @@ PY
 	lifecycle_trace tunnel start "pid=$TUNNEL_PID,port=$TUNNEL_PORT"
 }
 
-invoke_echo_over_tunnel() {
+invoke_probe_over_tunnel() {
 	local expected="$1" log="$2" error
 	error="${log%.json}.stderr"
 	[ -n "${TUNNEL_PID:-}" ] && kill -0 "$TUNNEL_PID" 2>/dev/null || { echo "SSH proxy tunnel is unavailable" >&2; return 1; }
 	timeout -k 1 5 "${CLI_ARGS[@]}" invoke --json \
 		--proxy "http://127.0.0.1:${TUNNEL_PORT}" \
-		--destination http://deployment.echo/multinode.EchoService/Echo \
+		--destination http://deployment.probe/deployment.ProbeService/Check \
 		--source deployment-e2e --source-ns deployment \
-		--body "{\"message\":\"$expected\"}" >"$log" 2>"$error"
+		--body "{\"nonce\":\"$expected\"}" >"$log" 2>"$error"
 	"${PYTHON[@]}" - "$log" "$expected" <<'PY'
 import json,sys
 value=json.load(open(sys.argv[1]))
-if value.get("message") != sys.argv[2]: raise SystemExit(f"unexpected echo response: {value!r}")
+if value.get("nonce") != sys.argv[2]: raise SystemExit(f"unexpected probe response: {value!r}")
 PY
 }
 
-invoke_echo() {
+invoke_probe() {
 	local expected="$1" log="$2" status
 	start_tunnel "${log%.json}.tunnel.log"
-	if invoke_echo_over_tunnel "$expected" "$log"; then :; else status=$?; stop_tunnel || true; return "$status"; fi
+	if invoke_probe_over_tunnel "$expected" "$log"; then :; else status=$?; stop_tunnel || true; return "$status"; fi
 	stop_tunnel
 }
 
@@ -96,9 +96,9 @@ start_probe() {
 		--stop-file "$PROBE_STOP_FILE" --expected "$expected" -- \
 		timeout -k 1 5 "${CLI_ARGS[@]}" invoke --json \
 		--proxy "http://127.0.0.1:${TUNNEL_PORT}" \
-		--destination http://deployment.echo/multinode.EchoService/Echo \
+		--destination http://deployment.probe/deployment.ProbeService/Check \
 		--source deployment-e2e --source-ns deployment \
-		--body "{\"message\":\"$expected\"}" &
+		--body "{\"nonce\":\"$expected\"}" &
 	PROBE_PID=$!
 	lifecycle_trace probe start "pid=$PROBE_PID,log=$log"
 }
