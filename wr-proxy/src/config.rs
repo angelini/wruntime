@@ -24,11 +24,62 @@ pub struct ProxyConfig {
     pub cache: CacheConfig,
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
+    #[serde(default)]
+    pub status: StatusConfig,
+    /// Complete managed deployment identity, absent only for local development.
+    #[serde(default)]
+    pub deployment: Option<ProxyDeploymentConfig>,
     /// Optional external-facing listener with a restricted set of public routes.
     pub external: Option<ExternalConfig>,
     /// Optional egress allowlist — controls which external domains WASM modules may call.
     #[serde(default)]
     pub egress: Option<EgressConfig>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyDeploymentConfig {
+    pub node_id: String,
+    #[serde(deserialize_with = "deserialize_revision")]
+    pub revision: u64,
+    pub bundle_digest: String,
+    pub operation_id: String,
+    pub revision_digest: String,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct StatusConfig {
+    #[serde(default = "default_report_interval_secs")]
+    pub report_interval_secs: u64,
+}
+
+fn deserialize_revision<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Revision {
+        Number(u64),
+        String(String),
+    }
+    match Revision::deserialize(deserializer)? {
+        Revision::Number(value) => Ok(value),
+        Revision::String(value) => value.parse().map_err(D::Error::custom),
+    }
+}
+
+fn default_report_interval_secs() -> u64 {
+    5
+}
+
+impl Default for StatusConfig {
+    fn default() -> Self {
+        Self {
+            report_interval_secs: default_report_interval_secs(),
+        }
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -50,6 +101,14 @@ fn default_manager_liveness_threshold_secs() -> u64 {
 
 fn default_discovery_max_connections() -> usize {
     2
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 /// Configuration for the external-facing HTTP listener.
@@ -387,6 +446,29 @@ impl ProxyConfig {
             "cache.routing_table_ttl_secs must be > 0",
         );
         v.check(
+            (1..=300).contains(&self.status.report_interval_secs),
+            "status.report_interval_secs must be in 1..=300",
+        );
+        if let Some(deployment) = &self.deployment {
+            v.check(
+                !deployment.node_id.is_empty(),
+                "deployment.node_id is required",
+            );
+            v.check(deployment.revision > 0, "deployment.revision must be > 0");
+            v.check(
+                valid_sha256_digest(&deployment.bundle_digest),
+                "deployment.bundle_digest must be sha256:<lowercase hex>",
+            );
+            v.check(
+                !deployment.operation_id.is_empty(),
+                "deployment.operation_id is required",
+            );
+            v.check(
+                valid_sha256_digest(&deployment.revision_digest),
+                "deployment.revision_digest must be sha256:<lowercase hex>",
+            );
+        }
+        v.check(
             self.circuit_breaker.failure_threshold > 0,
             "circuit_breaker.failure_threshold must be > 0",
         );
@@ -437,5 +519,30 @@ impl ProxyConfig {
         }
 
         v.finish()
+    }
+}
+
+#[cfg(test)]
+mod status_config_tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct OptionalDeployment {
+        deployment: Option<ProxyDeploymentConfig>,
+    }
+
+    #[test]
+    fn unmanaged_deployment_may_be_absent_but_partial_managed_identity_is_rejected() {
+        let unmanaged: OptionalDeployment = serde_json::from_str("{}").unwrap();
+        assert!(unmanaged.deployment.is_none());
+        let partial = r#"{"deployment":{"node_id":"node-a","revision":1}}"#;
+        assert!(serde_json::from_str::<OptionalDeployment>(partial).is_err());
+    }
+
+    #[test]
+    fn status_interval_has_a_safe_nonzero_default() {
+        assert_eq!(StatusConfig::default().report_interval_secs, 5);
+        assert!(valid_sha256_digest(&format!("sha256:{}", "a".repeat(64))));
+        assert!(!valid_sha256_digest("sha256:ABC"));
     }
 }

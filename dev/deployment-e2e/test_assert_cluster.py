@@ -19,7 +19,8 @@ SPEC.loader.exec_module(assert_cluster)
 def deployment(revision=3, digest="sha256:a", version="1.0.0", state="succeeded", source=0):
     return {
         "node_id": "wr-e2e-node", "revision": revision, "attempt_token": "attempt",
-        "bundle_digest": digest, "state": state, "source_revision": source,
+        "bundle_digest": digest, "operation_id": f"operation-{revision}",
+        "revision_digest": f"revision-{revision}", "state": state, "source_revision": source,
         "expected_engines": [{"engine_slot": "engine", "modules": [
             {"namespace": "deployment", "name": "echo", "version": version}
         ]}],
@@ -35,11 +36,30 @@ def healthy_status(revision=3, digest="sha256:a", version="1.0.0", source=0):
         "last_heartbeat": {"seconds": 1}, "conditions": [], "modules": [module],
         "deployment": {"node_id": "wr-e2e-node", "revision": revision, "bundle_digest": digest, "engine_slot": "engine"},
     }
+    proxy = {
+        "proxy_id": "urn:wruntime:test:proxy", "node_id": "wr-e2e-node",
+        "process_instance_id": "proxy-process", "severity": "healthy",
+        "expected": True, "selected": True, "superseded": False,
+        "deployment": {
+            "node_id": "wr-e2e-node", "revision": revision, "bundle_digest": digest,
+            "operation_id": f"operation-{revision}", "revision_digest": f"revision-{revision}",
+        },
+        "lifecycle": "ready", "admission_open": True,
+        "report_received_at": {"seconds": 1}, "report_age_seconds": 0,
+        "receiving_manager_id": "manager-id", "conditions": [],
+        "listeners": [{"kind": "data-plane", "configured": True, "accepting": True,
+                       "severity": "healthy", "conditions": []}],
+        "routing": {"installed_table_version": 7, "synchronization_age_seconds": 0,
+                    "source_manager_id": "manager-id", "synchronized": True,
+                    "severity": "healthy", "conditions": []},
+        "breakers": [{"destination_kind": "local-engine", "total": 0, "closed": 0,
+                      "open": 0, "half_open": 0, "severity": "healthy", "conditions": []}],
+    }
     return {
-        "schema_version": 2, "severity": "healthy",
+        "schema_version": 2, "severity": "healthy", "routing_table_version": 7,
         "managers": [{"manager_id": "manager-id", "grpc_address": "https://192.0.2.10:9000"}],
-        "nodes": [{"node_id": "wr-e2e-node", "severity": "healthy", "desired_deployment": desired, "deployment_history": [desired], "engines": [engine], "conditions": []}],
-        "engines": [engine],
+        "nodes": [{"node_id": "wr-e2e-node", "severity": "healthy", "desired_deployment": desired, "deployment_history": [desired], "engines": [engine], "proxies": [proxy], "conditions": []}],
+        "engines": [engine], "proxies": [proxy],
         "services": [{
             "service": {"namespace": "deployment", "name": "echo", "version": version},
             "severity": "healthy", "desired_routes": 1, "healthy_routes": 1, "unhealthy_routes": 0,
@@ -54,6 +74,29 @@ class AssertionTests(unittest.TestCase):
         self.assertEqual(assert_cluster.assert_manager(status, "https://192.0.2.10:9000")["manager_id"], "manager-id")
         args = argparse.Namespace(node_id="wr-e2e-node", digest="sha256:a", version="1.0.0", engine_slot="engine")
         self.assertEqual(assert_cluster.assert_desired(status, args)["revision"], 3)
+
+    def test_proxy_assertions_reject_duplicate_stale_mismatch_and_malformed_evidence(self):
+        args = argparse.Namespace(node_id="wr-e2e-node", digest="sha256:a", version="1.0.0", engine_slot="engine")
+        duplicate = healthy_status()
+        duplicate["proxies"].append(copy.deepcopy(duplicate["proxies"][0]))
+        with self.assertRaisesRegex(assert_cluster.AssertionFailure, "exactly one"):
+            assert_cluster.assert_desired(duplicate, args)
+
+        stale = healthy_status()
+        stale["proxies"][0]["severity"] = "degraded"
+        stale["nodes"][0]["proxies"][0]["severity"] = "degraded"
+        with self.assertRaisesRegex(assert_cluster.AssertionFailure, "not fresh"):
+            assert_cluster.assert_desired(stale, args)
+
+        mismatch = healthy_status()
+        mismatch["proxies"][0]["deployment"]["revision_digest"] = "revision-other"
+        with self.assertRaisesRegex(assert_cluster.AssertionFailure, "not exact"):
+            assert_cluster.assert_desired(mismatch, args)
+
+        malformed = healthy_status()
+        malformed["proxies"][0]["breakers"][0]["total"] = 1
+        with self.assertRaisesRegex(assert_cluster.AssertionFailure, "not healthy and complete"):
+            assert_cluster.assert_desired(malformed, args)
 
     def test_failed_attempt_preserves_serving_revision(self):
         status = healthy_status()

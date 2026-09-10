@@ -5,19 +5,27 @@ use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
 use tokio::time::Instant;
 use tracing::{info, warn};
 use wr_common::discovery::ManagerDiscovery;
-use wr_common::manager_client::{ManagerClient as ManagerServiceClient, ManagerEpoch, RetryClass};
+use wr_common::manager_client::{ManagerEpoch, RetryClass};
 use wr_common::task_group::{TaskCancellation, TaskExit};
 use wr_common::wruntime::{GetRoutingTableRequest, RoutingTable};
 
-use crate::circuit_breaker::CircuitBreakerRegistry;
+use crate::circuit_breaker::{CircuitBreakerRegistry, CircuitBreakerSummary};
 use crate::config::CircuitBreakerConfig;
 use crate::indexed_routing::IndexedRoutingTable;
 
-/// Coupled routing snapshot, refresh serialization, and breaker ownership.
+#[derive(Clone, Debug)]
+pub struct RoutingSyncObservation {
+    pub installed_version: u64,
+    pub last_success: Instant,
+    pub manager_id: String,
+}
+
+/// Coupled routing snapshot, refresh serialization, synchronization evidence, and breaker ownership.
 #[derive(Clone)]
 pub struct CachedRoutingTable {
     table: Arc<RwLock<IndexedRoutingTable>>,
     refresh: Arc<Mutex<()>>,
+    observation: Arc<RwLock<Option<RoutingSyncObservation>>>,
     registry: Arc<CircuitBreakerRegistry>,
     self_peer_address: Arc<str>,
 }
@@ -27,6 +35,7 @@ impl CachedRoutingTable {
         Self {
             table: Arc::new(RwLock::new(IndexedRoutingTable::empty())),
             refresh: Arc::new(Mutex::new(())),
+            observation: Arc::new(RwLock::new(None)),
             registry: Arc::new(CircuitBreakerRegistry::new(config)),
             self_peer_address: self_peer_address.into(),
         }
@@ -42,6 +51,23 @@ impl CachedRoutingTable {
 
     pub fn open_duration_secs(&self) -> u64 {
         self.registry.open_duration_secs()
+    }
+
+    pub async fn synchronization_observation(&self) -> Option<RoutingSyncObservation> {
+        self.observation.read().await.clone()
+    }
+
+    pub fn breaker_summary(&self) -> CircuitBreakerSummary {
+        self.registry.snapshot()
+    }
+
+    async fn publish_synchronization(&self, manager_id: String) {
+        let installed_version = self.version().await;
+        *self.observation.write().await = Some(RoutingSyncObservation {
+            installed_version,
+            last_success: Instant::now(),
+            manager_id,
+        });
     }
 
     /// Publish a newer manager table and evict breaker membership afterward.
@@ -91,11 +117,12 @@ pub fn new_routing_table(
 
 /// Perform a single routing-table sync from wr-manager.
 pub async fn sync_once(
-    client: &mut ManagerServiceClient<tonic::transport::Channel>,
+    epoch: &mut ManagerEpoch,
     table: &CachedRoutingTable,
 ) -> Result<(), tonic::Status> {
     let known_version = table.version().await;
-    let response = client
+    let manager_id = epoch.observation().manager_id.clone();
+    let response = epoch
         .get_routing_table(GetRoutingTableRequest { known_version })
         .await?;
     if let Some(incoming) = response.into_inner().table {
@@ -104,6 +131,7 @@ pub async fn sync_once(
             info!(version, "routing table updated");
         }
     }
+    table.publish_synchronization(manager_id).await;
     Ok(())
 }
 
@@ -210,6 +238,26 @@ mod tests {
             destination_namespace: "ns".into(),
             peer_address: "https://self:9443".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn synchronization_observation_is_one_coherent_monotonic_tuple() {
+        let cache = CachedRoutingTable::new(CircuitBreakerConfig::default(), "https://self:9443");
+        assert!(cache.synchronization_observation().await.is_none());
+        assert!(
+            cache
+                .replace(&RoutingTable {
+                    rules: Vec::new(),
+                    version: 7,
+                })
+                .await
+        );
+        cache.publish_synchronization("manager-a".to_string()).await;
+
+        let observed = cache.synchronization_observation().await.unwrap();
+        assert_eq!(observed.installed_version, 7);
+        assert_eq!(observed.manager_id, "manager-a");
+        assert!(observed.last_success.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]

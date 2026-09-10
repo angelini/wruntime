@@ -171,6 +171,11 @@ async fn run_service(config_path: &str) -> Result<()> {
         config.cluster.manager_liveness_threshold_secs,
         admission.clone(),
     )
+    .with_proxy_inventory_owner(manager_id.clone(), config.proxy_tombstone_retention_secs)
+    .with_proxy_status_thresholds(
+        config.proxy_heartbeat_timeout_secs,
+        config.proxy_routing_freshness_secs,
+    )
     .with_workload_policy(config.authorization_policy.clone());
     let principal_policy = auth::PrincipalPolicy::new(config.authorization_policy.clone());
     let operator_service = service::OperatorApi::with_admission(
@@ -180,6 +185,10 @@ async fn run_service(config_path: &str) -> Result<()> {
         config.cluster.manager_liveness_threshold_secs as f64,
         config.engine_heartbeat_timeout_secs as f64,
         config.module_heartbeat_timeout_secs.get() as f64,
+    )
+    .with_proxy_status_thresholds(
+        config.proxy_heartbeat_timeout_secs,
+        config.proxy_routing_freshness_secs,
     );
     let job_admin_service = job_admin::JobAdminApi::new(
         db_pool.clone(),

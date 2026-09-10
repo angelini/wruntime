@@ -110,7 +110,7 @@ pub fn workload_binding_matches(
     }
 }
 
-pub const MANAGER_RPC_ROWS: [RpcAuthorizationRow; 51] = [
+pub const MANAGER_RPC_ROWS: [RpcAuthorizationRow; 54] = [
     row!("ClusterService", "ListEngines", "cluster.engines.read; H:view/admin, S:status", "node/namespace selectors; engine registry", "rows/count/page by matching tuples", NotApplicable, LargeRead),
     row!("ClusterService", "GetRoutingTable", "cluster.routes.read; H:view/admin, S:status, W:proxy", "namespace selector; routing repository", "scoped human/SA; complete cluster routing for proxy", ProxyEnrolledGlobal, LargeRead),
     row!("ClusterService", "UpsertRoutingRule", "cluster.routes.write; H:admin, S:route", "namespace/rule; routing repository", "n/a", NotApplicable, ConfigWrite),
@@ -142,6 +142,9 @@ pub const MANAGER_RPC_ROWS: [RpcAuthorizationRow; 51] = [
     row!("InfrastructureService", "PutNodeAgentPolicy", "infrastructure.node-agent-policy.write; H:infra/admin, S:deploy", "bound node; policy repository", "n/a", NotApplicable, ConfigWrite),
     row!("InfrastructureService", "GetNodeCleanupStatus", "infrastructure.cleanup.read; H:view/infra/admin, S:status/infra", "bound node; cleanup repository", "one bounded summary", NotApplicable, SmallRead),
     row!("InfrastructureService", "RetryNodeCleanup", "infrastructure.cleanup.write; H:infra/admin, S:infra", "bound node/generation; cleanup repository", "queued generation", NotApplicable, Operation),
+    row!("NodeService", "RegisterProxy", "node.proxies.register; W:proxy", "authenticated proxy principal + bound node + process; inventory repository", "accepted exact tuple", ProxyBound, Operation),
+    row!("NodeService", "ReportProxyInventory", "node.proxies.report; W:proxy", "authenticated proxy principal + bound node + process; inventory repository", "manager receipt identity/time", ProxyBound, Heartbeat),
+    row!("NodeService", "DeregisterProxy", "node.proxies.deregister; W:proxy", "authenticated proxy principal + bound node + exact process; inventory repository", "clean tombstone", ProxyBound, Operation),
     row!("NodeService", "RegisterEngine",  "node.engines.register; W:proxy", "node + operation/revision/slot/activation; desired deployment/owner lookup", "credentials/current policy/fence for owner", ProxyBound, Operation),
     row!("NodeService", "DeregisterEngine", "node.engines.deregister; W:proxy", "complete ownership fence; locked owner lookup", "n/a", ProxyBound, Operation),
     row!("NodeService", "Heartbeat", "node.engines.heartbeat; W:proxy", "complete ownership fence; owner lookup", "matching complete engine snapshot", ProxyBound, Heartbeat),
@@ -340,6 +343,9 @@ pub fn handler_adapter_binding(service: &str, method: &str) -> Option<HandlerAda
             "wruntime.InfrastructureService",
             "LeaseManagerRollout" | "AdvanceManagerRollout" | "GetManagerRollout",
         ) => (E::OperationId, L::RolloutRepository, F::BoundedStatus),
+        ("wruntime.NodeService", "RegisterProxy" | "ReportProxyInventory" | "DeregisterProxy") => {
+            (E::Node, L::StatusRepository, F::None)
+        }
         ("wruntime.NodeService", "RegisterEngine") => (
             E::EngineOwnership,
             L::DesiredDeployment,

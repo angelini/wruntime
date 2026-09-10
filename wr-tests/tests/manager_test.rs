@@ -10,17 +10,191 @@ use anyhow::Result;
 use wr_common::wruntime::{
     AbandonDeploymentRequest, AttestNodeAgentRequest, BackendProcessState, BeginDeploymentRequest,
     BeginEngineDrainRequest, ClaimNodeCleanupRequest, ClaimOperationRequest, DeploymentInventoryV1,
-    DeploymentMetadata, DeploymentState, DeregisterEngineRequest, EngineOwnershipFence,
-    EngineRegistration, ExpectedEngine, ExpectedModule, FinalizeDeploymentRequest,
-    GetClusterStatusRequest, GetNodeCleanupStatusRequest, GetOperatorStatusRequest,
-    GetRoutingTableRequest, GetSchemaRequest, HeartbeatRequest, ListEnginesRequest,
-    ModuleDescriptor, ModuleIdentity, NodeOperationAction, NodeOperationState,
-    NodeOperationStepKind, NodeSlotTransitionKind, PutNodeAgentPolicyRequest,
-    RegisterEngineRequest, RenewNodeCleanupLeaseRequest, ReportNodeCleanupResultRequest,
-    ReportNodeObservationRequest, ReportStepResultRequest, ResumeOperationRequest,
-    RetryNodeCleanupRequest, RolloutPolicy, RoutingRule, SecretRequest, StatusSeverity,
-    SubmitOperationRequest, VerifyDeploymentRequest, VerifyDeploymentResponse,
+    DeploymentMetadata, DeploymentState, DeregisterEngineRequest, DeregisterProxyRequest,
+    EngineOwnershipFence, EngineRegistration, ExpectedEngine, ExpectedModule,
+    FinalizeDeploymentRequest, GetClusterStatusRequest, GetNodeCleanupStatusRequest,
+    GetOperatorStatusRequest, GetRoutingTableRequest, GetSchemaRequest, HeartbeatRequest,
+    ListEnginesRequest, ModuleDescriptor, ModuleIdentity, NodeOperationAction, NodeOperationState,
+    NodeOperationStepKind, NodeSlotTransitionKind, ProcessLifecycleState,
+    ProxyBreakerDestinationKind, ProxyBreakerEvidence, ProxyDeploymentMetadata,
+    ProxyInventoryReport, ProxyListenerEvidence, ProxyListenerKind, PutNodeAgentPolicyRequest,
+    RegisterEngineRequest, RegisterProxyRequest, RenewNodeCleanupLeaseRequest,
+    ReportNodeCleanupResultRequest, ReportNodeObservationRequest, ReportProxyInventoryRequest,
+    ReportStepResultRequest, ResumeOperationRequest, RetryNodeCleanupRequest, RolloutPolicy,
+    RoutingRule, SecretRequest, StatusSeverity, SubmitOperationRequest, VerifyDeploymentRequest,
+    VerifyDeploymentResponse,
 };
+
+#[tokio::test]
+async fn proxy_inventory_replaces_atomically_and_deregistration_fences_exact_process() -> Result<()>
+{
+    let (_pool, _addr, mut client) = manager_trio().await?;
+    let first = "dev-run-11111111-1111-4111-8111-111111111111";
+    let second = "supervisor:slot-b:activation-2";
+
+    for invalid in [String::new(), "x".repeat(256)] {
+        assert_eq!(
+            client
+                .register_proxy(RegisterProxyRequest {
+                    process_instance_id: invalid,
+                    deployment: None,
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    assert_eq!(
+        client
+            .report_proxy_inventory(ReportProxyInventoryRequest {
+                process_instance_id: String::new(),
+                report: None,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        client
+            .deregister_proxy(DeregisterProxyRequest {
+                process_instance_id: "x".repeat(256),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+
+    let maximum = "m".repeat(255);
+    client
+        .register_proxy(RegisterProxyRequest {
+            process_instance_id: maximum.clone(),
+            deployment: None,
+        })
+        .await?;
+    client
+        .deregister_proxy(DeregisterProxyRequest {
+            process_instance_id: maximum,
+        })
+        .await?;
+
+    for process_instance_id in [first, second] {
+        client
+            .register_proxy(RegisterProxyRequest {
+                process_instance_id: process_instance_id.into(),
+                deployment: None,
+            })
+            .await?;
+    }
+    // Exact immutable replay succeeds, while the same tuple cannot change identity.
+    client
+        .register_proxy(RegisterProxyRequest {
+            process_instance_id: first.into(),
+            deployment: None,
+        })
+        .await?;
+    let mismatch = client
+        .register_proxy(RegisterProxyRequest {
+            process_instance_id: first.into(),
+            deployment: Some(ProxyDeploymentMetadata {
+                node_id: "node-a".into(),
+                revision: 1,
+                bundle_digest: format!("sha256:{}", "a".repeat(64)),
+                operation_id: "33333333-3333-4333-8333-333333333333".into(),
+                revision_digest: format!("sha256:{}", "b".repeat(64)),
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(mismatch.code(), tonic::Code::AlreadyExists);
+
+    let report = ProxyInventoryReport {
+        lifecycle_state: ProcessLifecycleState::Ready as i32,
+        admission_open: true,
+        listeners: vec![ProxyListenerEvidence {
+            kind: ProxyListenerKind::DataPlane as i32,
+            configured: true,
+            accepting: true,
+        }],
+        installed_routing_table_version: 7,
+        routing_observation_age_millis: 25,
+        routing_manager_id: "manager-local".into(),
+        routing_synchronized: true,
+        breakers: vec![ProxyBreakerEvidence {
+            destination_kind: ProxyBreakerDestinationKind::LocalEngine as i32,
+            total: 1,
+            closed: 1,
+            open: 0,
+            half_open: 0,
+        }],
+    };
+    let receipt = client
+        .report_proxy_inventory(ReportProxyInventoryRequest {
+            process_instance_id: first.into(),
+            report: Some(report.clone()),
+        })
+        .await?
+        .into_inner();
+    assert!(receipt.received_at.is_some());
+    assert_eq!(receipt.receiving_manager_id, "manager-local");
+
+    let malformed = ProxyInventoryReport {
+        listeners: vec![report.listeners[0], report.listeners[0]],
+        ..report.clone()
+    };
+    assert_eq!(
+        client
+            .report_proxy_inventory(ReportProxyInventoryRequest {
+                process_instance_id: first.into(),
+                report: Some(malformed),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    let snapshot = client
+        .get_cluster_status(GetClusterStatusRequest {})
+        .await?
+        .into_inner();
+    assert_eq!(snapshot.proxies.len(), 2);
+    assert_eq!(snapshot.proxies[0].process_instance_id, first);
+    assert_eq!(
+        snapshot.proxies[0]
+            .report
+            .as_ref()
+            .unwrap()
+            .installed_routing_table_version,
+        7
+    );
+    assert_eq!(snapshot.proxies[1].process_instance_id, second);
+
+    client
+        .deregister_proxy(DeregisterProxyRequest {
+            process_instance_id: first.into(),
+        })
+        .await?;
+    assert_eq!(
+        client
+            .report_proxy_inventory(ReportProxyInventoryRequest {
+                process_instance_id: first.into(),
+                report: Some(report),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let snapshot = client
+        .get_cluster_status(GetClusterStatusRequest {})
+        .await?
+        .into_inner();
+    assert_eq!(snapshot.proxies.len(), 1);
+    assert_eq!(snapshot.proxies[0].process_instance_id, second);
+    Ok(())
+}
 
 async fn verify_deployment(
     pool: &deadpool_postgres::Pool,
@@ -1486,7 +1660,11 @@ async fn test_revisioned_deployment_verification_and_rollback_history() -> Resul
         .iter()
         .find(|node| node.node_id == "node-a")
         .expect("status should retain the prior serving deployment");
-    assert_eq!(preserved_node.severity, StatusSeverity::Healthy as i32);
+    assert_eq!(preserved_node.severity, StatusSeverity::Degraded as i32);
+    assert!(preserved_node
+        .conditions
+        .iter()
+        .any(|condition| condition.code == "MISSING_EXPECTED_PROXY"));
     assert_eq!(preserved.services[0].healthy_routes, 1);
     assert_eq!(
         preserved_node

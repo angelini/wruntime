@@ -7,8 +7,10 @@ use serde::Serialize;
 use tabled::builder::Builder;
 use wr_common::wruntime::{
     DeploymentCondition, DeploymentRecord, DeploymentState, EngineStatus, GetClusterStatusResponse,
-    ManagerMembershipState, ManagerStatus, ModuleIdentity, ModuleStatus, NodeStatus, RouteStatus,
-    ServiceStatus, StatusSeverity,
+    ManagerMembershipState, ManagerStatus, ModuleIdentity, ModuleStatus, NodeStatus,
+    ProcessLifecycleState, ProxyBreakerDestinationKind, ProxyBreakerStatus, ProxyInventoryStatus,
+    ProxyListenerKind, ProxyListenerStatus, ProxyRoutingStatus, RouteStatus, ServiceStatus,
+    StatusSeverity,
 };
 
 use super::helpers::{self, WaitAttempt};
@@ -249,6 +251,7 @@ fn filter(
                 .as_ref()
                 .is_some_and(|metadata| metadata.node_id == node_id)
         });
+        response.proxies.retain(|item| item.node_id == node_id);
         let engine_ids: BTreeSet<_> = response
             .engines
             .iter()
@@ -360,6 +363,29 @@ fn unknown_present(response: &GetClusterStatusResponse) -> bool {
             .flat_map(|service| service.routes.iter())
             .flat_map(|route| route.conditions.iter())
             .any(|item| severity(item.severity) == StatusSeverity::Unknown)
+        || response
+            .proxies
+            .iter()
+            .chain(response.nodes.iter().flat_map(|node| node.proxies.iter()))
+            .any(|proxy| {
+                proxy
+                    .conditions
+                    .iter()
+                    .chain(
+                        proxy
+                            .listeners
+                            .iter()
+                            .flat_map(|item| item.conditions.iter()),
+                    )
+                    .chain(proxy.routing.iter().flat_map(|item| item.conditions.iter()))
+                    .chain(
+                        proxy
+                            .breakers
+                            .iter()
+                            .flat_map(|item| item.conditions.iter()),
+                    )
+                    .any(|item| severity(item.severity) == StatusSeverity::Unknown)
+            })
 }
 
 fn should_fail(response: &GetClusterStatusResponse, fail_on: FailOn) -> bool {
@@ -373,12 +399,13 @@ fn should_fail(response: &GetClusterStatusResponse, fail_on: FailOn) -> bool {
 
 fn render_table(response: &GetClusterStatusResponse, detail: bool) -> String {
     let mut output = format!(
-        "Cluster: {}  routing-version: {}  managers: {}  nodes: {}  engines: {}  services: {}\n",
+        "Cluster: {}  routing-version: {}  managers: {}  nodes: {}  engines: {}  proxies: {}  services: {}\n",
         severity_name(response.severity),
         response.routing_table_version,
         response.managers.len(),
         response.nodes.len(),
         response.engines.len(),
+        response.proxies.len(),
         response.services.len(),
     );
     let mut builder = Builder::new();
@@ -431,7 +458,77 @@ fn render_table(response: &GetClusterStatusResponse, detail: bool) -> String {
             .map(service_identity)
             .unwrap_or_default()
     });
+    push_records!("proxy", &response.proxies, |item: &ProxyInventoryStatus| {
+        format!("{}/{}", item.proxy_id, item.process_instance_id)
+    });
     if detail {
+        for proxy in &response.proxies {
+            let identity = format!("{}/{}", proxy.proxy_id, proxy.process_instance_id);
+            let report = proxy.report.as_ref();
+            let deployment = proxy.deployment.as_ref();
+            builder.push_record([
+                "proxy-detail".to_string(),
+                identity.clone(),
+                severity_name(proxy.severity).to_string(),
+                format!(
+                    "expected={} selected={} superseded={}",
+                    proxy.expected, proxy.selected, proxy.superseded
+                ),
+                format!(
+                    "deployment={}/{} operation={} lifecycle={} admission={} report-age={}s receiver={}",
+                    deployment.map_or("", |item| item.node_id.as_str()),
+                    deployment.map_or(0, |item| item.revision),
+                    deployment.map_or("", |item| item.operation_id.as_str()),
+                    report.map_or("missing", |item| lifecycle_name(item.lifecycle_state)),
+                    report.is_some_and(|item| item.admission_open),
+                    proxy.report_age_seconds,
+                    proxy.receiving_manager_id,
+                ),
+            ]);
+            rows += 1;
+            for listener in &proxy.listeners {
+                builder.push_record([
+                    "proxy-listener".to_string(),
+                    identity.clone(),
+                    severity_name(listener.severity).to_string(),
+                    listener_kind_name(listener.kind).to_string(),
+                    format!(
+                        "configured={} accepting={}",
+                        listener.configured, listener.accepting
+                    ),
+                ]);
+                rows += 1;
+            }
+            if let Some(routing) = &proxy.routing {
+                builder.push_record([
+                    "proxy-routing".to_string(),
+                    identity.clone(),
+                    severity_name(routing.severity).to_string(),
+                    format!("version={}", routing.installed_table_version),
+                    format!(
+                        "synchronized={} age={}s manager={}",
+                        routing.synchronized,
+                        routing.synchronization_age_seconds,
+                        routing.source_manager_id
+                    ),
+                ]);
+                rows += 1;
+            }
+            for breaker in &proxy.breakers {
+                builder.push_record([
+                    "proxy-breaker".to_string(),
+                    identity.clone(),
+                    severity_name(breaker.severity).to_string(),
+                    breaker_kind_name(breaker.destination_kind).to_string(),
+                    format!(
+                        "total={} closed={} open={} half-open={}",
+                        breaker.total, breaker.closed, breaker.open, breaker.half_open
+                    ),
+                ]);
+                rows += 1;
+            }
+        }
+
         for condition in &response.conditions {
             builder.push_record([
                 "signal".to_string(),
@@ -453,6 +550,35 @@ fn render_table(response: &GetClusterStatusResponse, detail: bool) -> String {
         output.push('\n');
     }
     output
+}
+
+fn lifecycle_name(value: i32) -> &'static str {
+    match ProcessLifecycleState::try_from(value).unwrap_or(ProcessLifecycleState::Unspecified) {
+        ProcessLifecycleState::Unspecified => "unspecified",
+        ProcessLifecycleState::Starting => "starting",
+        ProcessLifecycleState::Ready => "ready",
+        ProcessLifecycleState::Stopping => "stopping",
+    }
+}
+
+fn listener_kind_name(value: i32) -> &'static str {
+    match ProxyListenerKind::try_from(value).unwrap_or(ProxyListenerKind::Unspecified) {
+        ProxyListenerKind::Unspecified => "unspecified",
+        ProxyListenerKind::DataPlane => "data-plane",
+        ProxyListenerKind::NodeControl => "node-control",
+        ProxyListenerKind::Peer => "peer",
+        ProxyListenerKind::External => "external",
+    }
+}
+
+fn breaker_kind_name(value: i32) -> &'static str {
+    match ProxyBreakerDestinationKind::try_from(value)
+        .unwrap_or(ProxyBreakerDestinationKind::Unspecified)
+    {
+        ProxyBreakerDestinationKind::Unspecified => "unspecified",
+        ProxyBreakerDestinationKind::LocalEngine => "local-engine",
+        ProxyBreakerDestinationKind::PeerProxy => "peer-proxy",
+    }
 }
 
 fn service_identity(identity: &ModuleIdentity) -> String {
@@ -753,6 +879,143 @@ impl<'a> From<&'a ServiceStatus> for ServiceDto<'a> {
 }
 
 #[derive(Serialize)]
+struct ProxyDeploymentDto<'a> {
+    node_id: &'a str,
+    revision: u64,
+    bundle_digest: &'a str,
+    operation_id: &'a str,
+    revision_digest: &'a str,
+}
+
+#[derive(Serialize)]
+struct ProxyListenerDto<'a> {
+    kind: &'static str,
+    configured: bool,
+    accepting: bool,
+    severity: &'static str,
+    conditions: Vec<ConditionDto<'a>>,
+}
+
+impl<'a> From<&'a ProxyListenerStatus> for ProxyListenerDto<'a> {
+    fn from(value: &'a ProxyListenerStatus) -> Self {
+        Self {
+            kind: listener_kind_name(value.kind),
+            configured: value.configured,
+            accepting: value.accepting,
+            severity: severity_name(value.severity),
+            conditions: value.conditions.iter().map(ConditionDto::from).collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ProxyRoutingDto<'a> {
+    installed_table_version: u64,
+    synchronization_age_seconds: u64,
+    source_manager_id: &'a str,
+    synchronized: bool,
+    severity: &'static str,
+    conditions: Vec<ConditionDto<'a>>,
+}
+
+impl<'a> From<&'a ProxyRoutingStatus> for ProxyRoutingDto<'a> {
+    fn from(value: &'a ProxyRoutingStatus) -> Self {
+        Self {
+            installed_table_version: value.installed_table_version,
+            synchronization_age_seconds: value.synchronization_age_seconds,
+            source_manager_id: &value.source_manager_id,
+            synchronized: value.synchronized,
+            severity: severity_name(value.severity),
+            conditions: value.conditions.iter().map(ConditionDto::from).collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ProxyBreakerDto<'a> {
+    destination_kind: &'static str,
+    total: u32,
+    closed: u32,
+    open: u32,
+    half_open: u32,
+    severity: &'static str,
+    conditions: Vec<ConditionDto<'a>>,
+}
+
+impl<'a> From<&'a ProxyBreakerStatus> for ProxyBreakerDto<'a> {
+    fn from(value: &'a ProxyBreakerStatus) -> Self {
+        Self {
+            destination_kind: breaker_kind_name(value.destination_kind),
+            total: value.total,
+            closed: value.closed,
+            open: value.open,
+            half_open: value.half_open,
+            severity: severity_name(value.severity),
+            conditions: value.conditions.iter().map(ConditionDto::from).collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ProxyDto<'a> {
+    proxy_id: &'a str,
+    node_id: &'a str,
+    process_instance_id: &'a str,
+    deployment: Option<ProxyDeploymentDto<'a>>,
+    severity: &'static str,
+    expected: bool,
+    selected: bool,
+    superseded: bool,
+    lifecycle: &'static str,
+    admission_open: bool,
+    registered_at: Option<TimestampDto>,
+    report_received_at: Option<TimestampDto>,
+    report_age_seconds: u64,
+    receiving_manager_id: &'a str,
+    listeners: Vec<ProxyListenerDto<'a>>,
+    routing: Option<ProxyRoutingDto<'a>>,
+    breakers: Vec<ProxyBreakerDto<'a>>,
+    conditions: Vec<ConditionDto<'a>>,
+}
+
+impl<'a> From<&'a ProxyInventoryStatus> for ProxyDto<'a> {
+    fn from(value: &'a ProxyInventoryStatus) -> Self {
+        Self {
+            proxy_id: &value.proxy_id,
+            node_id: &value.node_id,
+            process_instance_id: &value.process_instance_id,
+            deployment: value.deployment.as_ref().map(|item| ProxyDeploymentDto {
+                node_id: &item.node_id,
+                revision: item.revision,
+                bundle_digest: &item.bundle_digest,
+                operation_id: &item.operation_id,
+                revision_digest: &item.revision_digest,
+            }),
+            severity: severity_name(value.severity),
+            expected: value.expected,
+            selected: value.selected,
+            superseded: value.superseded,
+            lifecycle: value
+                .report
+                .as_ref()
+                .map_or("missing", |report| lifecycle_name(report.lifecycle_state)),
+            admission_open: value
+                .report
+                .as_ref()
+                .is_some_and(|report| report.admission_open),
+            registered_at: value.registered_at.as_ref().map(TimestampDto::from),
+            report_received_at: value.report_received_at.as_ref().map(TimestampDto::from),
+            report_age_seconds: value.report_age_seconds,
+            receiving_manager_id: &value.receiving_manager_id,
+            listeners: value.listeners.iter().map(ProxyListenerDto::from).collect(),
+            routing: value.routing.as_ref().map(ProxyRoutingDto::from),
+            breakers: value.breakers.iter().map(ProxyBreakerDto::from).collect(),
+            conditions: value.conditions.iter().map(ConditionDto::from).collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct NodeDto<'a> {
     node_id: &'a str,
     severity: &'static str,
@@ -760,6 +1023,7 @@ struct NodeDto<'a> {
     target_deployment: Option<DeploymentDto<'a>>,
     deployment_history: Vec<DeploymentDto<'a>>,
     engines: Vec<EngineDto<'a>>,
+    proxies: Vec<ProxyDto<'a>>,
     conditions: Vec<ConditionDto<'a>>,
 }
 
@@ -776,6 +1040,7 @@ impl<'a> From<&'a NodeStatus> for NodeDto<'a> {
                 .map(DeploymentDto::from)
                 .collect(),
             engines: value.engines.iter().map(EngineDto::from).collect(),
+            proxies: value.proxies.iter().map(ProxyDto::from).collect(),
             conditions: value.conditions.iter().map(ConditionDto::from).collect(),
         }
     }
@@ -791,6 +1056,7 @@ struct ClusterDto<'a> {
     managers: Vec<ManagerDto<'a>>,
     nodes: Vec<NodeDto<'a>>,
     engines: Vec<EngineDto<'a>>,
+    proxies: Vec<ProxyDto<'a>>,
     services: Vec<ServiceDto<'a>>,
     conditions: Vec<ConditionDto<'a>>,
 }
@@ -806,6 +1072,7 @@ impl<'a> From<&'a GetClusterStatusResponse> for ClusterDto<'a> {
             managers: value.managers.iter().map(ManagerDto::from).collect(),
             nodes: value.nodes.iter().map(NodeDto::from).collect(),
             engines: value.engines.iter().map(EngineDto::from).collect(),
+            proxies: value.proxies.iter().map(ProxyDto::from).collect(),
             services: value.services.iter().map(ServiceDto::from).collect(),
             conditions: value.conditions.iter().map(ConditionDto::from).collect(),
         }
@@ -841,6 +1108,64 @@ mod tests {
             ..Default::default()
         });
         assert!(should_fail(&healthy, FailOn::Unknown));
+    }
+
+    #[test]
+    fn proxy_filter_json_and_strict_unknown_cover_canonical_and_nested_inventory() {
+        let proxy = ProxyInventoryStatus {
+            proxy_id: "proxy-a".into(),
+            node_id: "node-a".into(),
+            process_instance_id: "process-a".into(),
+            severity: StatusSeverity::Healthy as i32,
+            selected: true,
+            routing: Some(ProxyRoutingStatus {
+                installed_table_version: 7,
+                synchronized: true,
+                severity: StatusSeverity::Healthy as i32,
+                ..Default::default()
+            }),
+            breakers: vec![ProxyBreakerStatus {
+                severity: StatusSeverity::Healthy as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut value = response(StatusSeverity::Healthy);
+        value.proxies = vec![
+            proxy.clone(),
+            ProxyInventoryStatus {
+                node_id: "node-b".into(),
+                ..proxy.clone()
+            },
+        ];
+        value.nodes = vec![NodeStatus {
+            node_id: "node-a".into(),
+            proxies: vec![proxy],
+            ..Default::default()
+        }];
+        let filtered = filter(value, Some("node-a"), None).unwrap();
+        assert_eq!(filtered.proxies.len(), 1);
+        assert_eq!(filtered.nodes[0].proxies.len(), 1);
+        let json = serde_json::to_value(ClusterDto::from(&filtered)).unwrap();
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["proxies"][0]["selected"], true);
+        assert!(
+            !unknown_present(&filtered),
+            "known zero breaker evidence is not unknown"
+        );
+
+        let mut unknown = filtered;
+        unknown.proxies[0]
+            .routing
+            .as_mut()
+            .unwrap()
+            .conditions
+            .push(DeploymentCondition {
+                severity: StatusSeverity::Unknown as i32,
+                code: "MISSING_ROUTING_DIMENSION".into(),
+                ..Default::default()
+            });
+        assert!(unknown_present(&unknown));
     }
 
     #[test]

@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use wr_common::wruntime::{
     DeploymentCondition, EngineStatus, GetClusterStatusResponse, ManagerMembershipState,
-    ManagerStatus, ModuleIdentity, ModuleStatus, NodeStatus, RouteStatus, ServiceStatus,
-    StatusSeverity,
+    ManagerStatus, ModuleIdentity, ModuleStatus, NodeStatus, ProcessLifecycleState,
+    ProxyBreakerStatus, ProxyInventoryStatus, ProxyListenerKind, ProxyListenerStatus,
+    ProxyRoutingStatus, RouteStatus, ServiceStatus, StatusSeverity,
 };
 
 use crate::db::{self, ClusterStatusSnapshot};
@@ -369,9 +370,489 @@ fn compose_engines(
     engines
 }
 
+fn prost_timestamp(value: &prost_types::Timestamp) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp(value.seconds, value.nanos.try_into().ok()?)
+}
+
+fn exact_proxy_deployment(
+    actual: Option<&wr_common::wruntime::ProxyDeploymentMetadata>,
+    expected: Option<&wr_common::wruntime::ProxyDeploymentMetadata>,
+) -> bool {
+    matches!((actual, expected), (Some(actual), Some(expected))
+        if actual.node_id == expected.node_id
+            && actual.revision == expected.revision
+            && actual.bundle_digest == expected.bundle_digest
+            && actual.operation_id == expected.operation_id
+            && actual.revision_digest == expected.revision_digest)
+}
+
+type ProxyComposition = (
+    Vec<ProxyInventoryStatus>,
+    BTreeMap<String, Vec<DeploymentCondition>>,
+);
+
+fn compose_proxies(
+    snapshot: &ClusterStatusSnapshot,
+    proxy_heartbeat_timeout_secs: f64,
+    proxy_routing_freshness_secs: f64,
+) -> Result<ProxyComposition, tonic::Status> {
+    let mut projections = BTreeMap::new();
+    let node_ids = snapshot
+        .deployments
+        .iter()
+        .map(|item| item.record.node_id.clone())
+        .collect::<BTreeSet<_>>();
+    for node_id in node_ids {
+        let deployments = snapshot
+            .deployments
+            .iter()
+            .filter(|item| item.record.node_id == node_id)
+            .map(|item| item.record.clone())
+            .collect::<Vec<_>>();
+        let committed = snapshot.deployments.iter().find(|item| {
+            item.record.node_id == node_id && item.record.revision == item.current_revision
+        });
+        let operations = snapshot
+            .active_operations
+            .iter()
+            .filter(|operation| operation.node_id == node_id)
+            .collect::<Vec<_>>();
+        if operations.len() > 1 {
+            return Err(tonic::Status::internal(format!(
+                "multiple active operations found for node '{node_id}'"
+            )));
+        }
+        projections.insert(
+            node_id,
+            crate::operations::expected_proxy_projection(
+                &deployments,
+                committed.map(|item| &item.record),
+                operations.first().copied(),
+            )?,
+        );
+    }
+
+    let mut candidates: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut records = snapshot
+        .proxies
+        .iter()
+        .map(|row| row.status.clone())
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        (&left.node_id, &left.proxy_id, &left.process_instance_id).cmp(&(
+            &right.node_id,
+            &right.proxy_id,
+            &right.process_instance_id,
+        ))
+    });
+    for (index, proxy) in records.iter_mut().enumerate() {
+        let projection = projections.get(&proxy.node_id);
+        let report_time = proxy.report_received_at.as_ref().and_then(prost_timestamp);
+        let fresh = report_time.is_some_and(|time| {
+            snapshot
+                .observed_at
+                .signed_duration_since(time)
+                .num_milliseconds() as f64
+                <= proxy_heartbeat_timeout_secs * 1000.0
+        });
+        proxy.report_age_seconds = report_time
+            .map(|time| age_seconds(snapshot.observed_at, time))
+            .unwrap_or_default();
+        proxy.expected = projection.is_some_and(|projection| {
+            !projection.ambiguous
+                && exact_proxy_deployment(proxy.deployment.as_ref(), projection.deployment.as_ref())
+                && (projection.pinned_process_instance_id.is_empty()
+                    || projection.pinned_process_instance_id == proxy.process_instance_id)
+        });
+        if proxy.expected && fresh && proxy.report.is_some() {
+            candidates
+                .entry(proxy.node_id.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+    for indexes in candidates.values() {
+        if indexes.len() == 1 {
+            records[indexes[0]].selected = true;
+        }
+    }
+
+    let manager_ids = snapshot
+        .managers
+        .iter()
+        .map(|manager| manager.manager_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for proxy in &mut records {
+        let projection = projections.get(&proxy.node_id);
+        let duplicate = candidates
+            .get(&proxy.node_id)
+            .is_some_and(|indexes| indexes.len() > 1);
+        let unique_replacement = candidates
+            .get(&proxy.node_id)
+            .is_some_and(|indexes| indexes.len() == 1);
+        let report_time = proxy.report_received_at.as_ref().and_then(prost_timestamp);
+        let fresh = report_time.is_some_and(|time| {
+            snapshot
+                .observed_at
+                .signed_duration_since(time)
+                .num_milliseconds() as f64
+                <= proxy_heartbeat_timeout_secs * 1000.0
+        });
+        proxy.superseded = unique_replacement
+            && projection.is_some_and(|projection| {
+                exact_proxy_deployment(proxy.deployment.as_ref(), projection.deployment.as_ref())
+            })
+            && !fresh
+            && !proxy.selected;
+        let identity = format!("{}/{}", proxy.proxy_id, proxy.process_instance_id);
+        let mut conditions = Vec::new();
+        if projection.is_none() || proxy.deployment.is_none() {
+            conditions.push(condition(
+                "UNMANAGED_PROXY",
+                StatusSeverity::Degraded,
+                "proxy is not associated with managed deployment intent",
+                &identity,
+                "managed expected proxy identity",
+                "unmanaged",
+            ));
+        } else if projection.is_some_and(|item| item.ambiguous) {
+            conditions.push(condition(
+                "AMBIGUOUS_PROXY_OPERATION",
+                StatusSeverity::Degraded,
+                "paused operation evidence cannot safely select a proxy",
+                &identity,
+                "unambiguous operation projection",
+                "ambiguous",
+            ));
+        } else if !proxy.expected {
+            conditions.push(condition(
+                "PROXY_RELEASE_MISMATCH",
+                StatusSeverity::Degraded,
+                "proxy deployment or pinned process identity does not match expected operation state",
+                &identity,
+                projection
+                    .and_then(|item| item.deployment.as_ref())
+                    .map(|item| format!("{}/{}", item.node_id, item.revision))
+                    .unwrap_or_default(),
+                proxy
+                    .deployment
+                    .as_ref()
+                    .map(|item| format!("{}/{}", item.node_id, item.revision))
+                    .unwrap_or_else(|| "unmanaged".into()),
+            ));
+        }
+        if proxy.report.is_none() {
+            conditions.push(condition(
+                "MISSING_PROXY_REPORT",
+                StatusSeverity::Degraded,
+                "registered proxy has not supplied a complete inventory report",
+                &identity,
+                "complete report",
+                "missing",
+            ));
+        } else if !fresh {
+            conditions.push(condition(
+                "STALE_PROXY_REPORT",
+                StatusSeverity::Degraded,
+                format!("proxy report is {} seconds old", proxy.report_age_seconds),
+                &identity,
+                format!("age <= {proxy_heartbeat_timeout_secs}s"),
+                format!("{}s", proxy.report_age_seconds),
+            ));
+        }
+        if duplicate && proxy.expected {
+            conditions.push(condition(
+                "MULTIPLE_FRESH_PROXY_INSTANCES",
+                StatusSeverity::Degraded,
+                "multiple fresh reports match the expected proxy identity",
+                &proxy.node_id,
+                "one fresh exact process",
+                candidates[&proxy.node_id].len().to_string(),
+            ));
+        }
+        if proxy.superseded {
+            conditions.push(condition(
+                "SUPERSEDED_PROXY_INSTANCE",
+                StatusSeverity::Degraded,
+                "stale predecessor retained for replacement diagnostics",
+                &identity,
+                "selected replacement",
+                "superseded predecessor",
+            ));
+        }
+        if !proxy.receiving_manager_id.is_empty()
+            && !manager_ids.contains(proxy.receiving_manager_id.as_str())
+        {
+            conditions.push(condition(
+                "UNKNOWN_PROXY_RECEIVER_MANAGER",
+                StatusSeverity::Degraded,
+                "the manager that received this report is no longer known",
+                &identity,
+                "known receiving manager",
+                &proxy.receiving_manager_id,
+            ));
+        }
+
+        if let Some(report) = proxy.report.as_ref() {
+            let lifecycle = ProcessLifecycleState::try_from(report.lifecycle_state)
+                .unwrap_or(ProcessLifecycleState::Unspecified);
+            if lifecycle == ProcessLifecycleState::Stopping {
+                conditions.push(condition(
+                    "PROXY_STOPPING",
+                    StatusSeverity::Degraded,
+                    "proxy reports STOPPING lifecycle state",
+                    &identity,
+                    "serving lifecycle",
+                    "STOPPING",
+                ));
+            }
+            proxy.listeners = report
+                .listeners
+                .iter()
+                .map(|listener| {
+                    let kind = ProxyListenerKind::try_from(listener.kind)
+                        .unwrap_or(ProxyListenerKind::Unspecified);
+                    let required_data_plane = listener.configured
+                        && matches!(
+                            kind,
+                            ProxyListenerKind::DataPlane
+                                | ProxyListenerKind::Peer
+                                | ProxyListenerKind::External
+                        );
+                    let mut nested = Vec::new();
+                    if proxy.selected
+                        && fresh
+                        && lifecycle == ProcessLifecycleState::Ready
+                        && required_data_plane
+                        && !listener.accepting
+                    {
+                        nested.push(condition(
+                            "PROXY_LISTENER_NOT_ACCEPTING",
+                            StatusSeverity::Unhealthy,
+                            "required data-plane listener is not accepting",
+                            &identity,
+                            "accepting",
+                            "not accepting",
+                        ));
+                    }
+                    ProxyListenerStatus {
+                        kind: listener.kind,
+                        configured: listener.configured,
+                        accepting: listener.accepting,
+                        severity: if nested.is_empty() {
+                            StatusSeverity::Healthy as i32
+                        } else {
+                            StatusSeverity::Unhealthy as i32
+                        },
+                        conditions: nested,
+                    }
+                })
+                .collect();
+            if proxy.selected
+                && fresh
+                && lifecycle == ProcessLifecycleState::Ready
+                && !report.admission_open
+            {
+                conditions.push(condition(
+                    "PROXY_ADMISSION_CLOSED",
+                    StatusSeverity::Unhealthy,
+                    "fresh READY proxy positively reports closed admission",
+                    &identity,
+                    "admission open",
+                    "closed",
+                ));
+            }
+            let report_age_millis = report_time
+                .map(|time| {
+                    snapshot
+                        .observed_at
+                        .signed_duration_since(time)
+                        .num_milliseconds()
+                        .max(0) as u64
+                })
+                .unwrap_or_default();
+            let routing_age_millis = report
+                .routing_observation_age_millis
+                .saturating_add(report_age_millis);
+            let mut routing_conditions = Vec::new();
+            if !report.routing_synchronized {
+                routing_conditions.push(condition(
+                    "PROXY_ROUTING_NOT_SYNCHRONIZED",
+                    StatusSeverity::Degraded,
+                    "proxy reports routing synchronization incomplete",
+                    &identity,
+                    "synchronized",
+                    "not synchronized",
+                ));
+            }
+            if report.installed_routing_table_version < snapshot.routing_version {
+                routing_conditions.push(condition(
+                    "PROXY_ROUTING_BEHIND",
+                    StatusSeverity::Degraded,
+                    "proxy routing table is behind the manager snapshot",
+                    &identity,
+                    snapshot.routing_version.to_string(),
+                    report.installed_routing_table_version.to_string(),
+                ));
+            }
+            if routing_age_millis as f64 > proxy_routing_freshness_secs * 1000.0 {
+                routing_conditions.push(condition(
+                    "STALE_PROXY_ROUTING",
+                    StatusSeverity::Degraded,
+                    "proxy routing observation is stale",
+                    &identity,
+                    format!("age <= {proxy_routing_freshness_secs}s"),
+                    format!("{}ms", routing_age_millis),
+                ));
+            }
+            if report.routing_manager_id.is_empty()
+                || !manager_ids.contains(report.routing_manager_id.as_str())
+            {
+                routing_conditions.push(condition(
+                    "UNKNOWN_PROXY_ROUTING_MANAGER",
+                    StatusSeverity::Degraded,
+                    "routing observation has no known source manager",
+                    &identity,
+                    "known source manager",
+                    if report.routing_manager_id.is_empty() {
+                        "missing"
+                    } else {
+                        &report.routing_manager_id
+                    },
+                ));
+            }
+            proxy.routing = Some(ProxyRoutingStatus {
+                installed_table_version: report.installed_routing_table_version,
+                synchronization_age_seconds: routing_age_millis / 1000,
+                source_manager_id: report.routing_manager_id.clone(),
+                synchronized: report.routing_synchronized,
+                severity: if routing_conditions.is_empty() {
+                    StatusSeverity::Healthy as i32
+                } else {
+                    StatusSeverity::Degraded as i32
+                },
+                conditions: routing_conditions,
+            });
+            proxy.breakers = report
+                .breakers
+                .iter()
+                .map(|breaker| {
+                    let mut nested = Vec::new();
+                    if breaker.total > 0 && breaker.open == breaker.total {
+                        nested.push(condition(
+                            "ALL_PROXY_TARGETS_OPEN",
+                            StatusSeverity::Unhealthy,
+                            "every observed target in this proxy breaker class is open",
+                            &identity,
+                            "at least one forwarding target not open",
+                            format!("{} open", breaker.open),
+                        ));
+                    } else if breaker.open > 0 || breaker.half_open > 0 {
+                        nested.push(condition(
+                            if breaker.open > 0 {
+                                "PARTIALLY_OPEN_PROXY_BREAKERS"
+                            } else {
+                                "HALF_OPEN_PROXY_BREAKERS"
+                            },
+                            StatusSeverity::Degraded,
+                            "proxy breaker inventory is not fully closed",
+                            &identity,
+                            "all closed",
+                            format!("{} open, {} half-open", breaker.open, breaker.half_open),
+                        ));
+                    }
+                    ProxyBreakerStatus {
+                        destination_kind: breaker.destination_kind,
+                        total: breaker.total,
+                        closed: breaker.closed,
+                        open: breaker.open,
+                        half_open: breaker.half_open,
+                        severity: if nested.is_empty() {
+                            StatusSeverity::Healthy as i32
+                        } else {
+                            condition_severity(&nested) as i32
+                        },
+                        conditions: nested,
+                    }
+                })
+                .collect();
+            conditions.extend(
+                proxy
+                    .listeners
+                    .iter()
+                    .flat_map(|item| item.conditions.iter().cloned()),
+            );
+            if let Some(routing) = &proxy.routing {
+                conditions.extend(routing.conditions.iter().cloned());
+            }
+            conditions.extend(
+                proxy
+                    .breakers
+                    .iter()
+                    .flat_map(|item| item.conditions.iter().cloned()),
+            );
+        }
+        conditions.sort_by(|left, right| {
+            (&left.code, &left.affected_identity).cmp(&(&right.code, &right.affected_identity))
+        });
+        proxy.severity = if conditions.is_empty() {
+            StatusSeverity::Healthy as i32
+        } else {
+            condition_severity(&conditions) as i32
+        };
+        proxy.conditions = conditions;
+    }
+
+    let mut node_conditions = BTreeMap::new();
+    for (node_id, projection) in &projections {
+        let selected = records
+            .iter()
+            .find(|proxy| proxy.node_id == *node_id && proxy.selected);
+        let mut conditions = Vec::new();
+        if projection.ambiguous {
+            conditions.push(condition(
+                "AMBIGUOUS_PROXY_OPERATION",
+                StatusSeverity::Degraded,
+                "paused operation evidence cannot safely select the expected proxy",
+                node_id,
+                "unambiguous operation projection",
+                "ambiguous",
+            ));
+        } else if projection.deployment.is_some() && selected.is_none() {
+            let count = candidates.get(node_id).map_or(0, Vec::len);
+            conditions.push(condition(
+                if count > 1 {
+                    "MULTIPLE_FRESH_PROXY_INSTANCES"
+                } else {
+                    "MISSING_EXPECTED_PROXY"
+                },
+                StatusSeverity::Degraded,
+                if count > 1 {
+                    "multiple fresh exact proxy reports prevent selection"
+                } else {
+                    "no fresh exact proxy report matches expected deployment identity"
+                },
+                node_id,
+                "one fresh exact proxy",
+                count.to_string(),
+            ));
+        }
+        if let Some(selected) = selected {
+            conditions.extend(selected.conditions.iter().cloned());
+        }
+        conditions.sort_by(|left, right| {
+            (&left.code, &left.affected_identity).cmp(&(&right.code, &right.affected_identity))
+        });
+        node_conditions.insert(node_id.clone(), conditions);
+    }
+    Ok((records, node_conditions))
+}
+
 fn compose_nodes(
     snapshot: &ClusterStatusSnapshot,
     engines: &[EngineStatus],
+    proxies: &[ProxyInventoryStatus],
+    proxy_conditions: &BTreeMap<String, Vec<DeploymentCondition>>,
     engine_timeout_secs: f64,
     module_timeout_secs: f64,
 ) -> Result<Vec<NodeStatus>, tonic::Status> {
@@ -462,6 +943,12 @@ fn compose_nodes(
                     ));
                 }
             }
+            conditions.extend(
+                proxy_conditions
+                    .get(&node_id)
+                    .into_iter()
+                    .flat_map(|items| items.iter().cloned()),
+            );
             conditions.sort_by(|left, right| {
                 (&left.code, &left.affected_identity).cmp(&(&right.code, &right.affected_identity))
             });
@@ -480,6 +967,11 @@ fn compose_nodes(
             } else {
                 condition_severity(&conditions)
             };
+            let node_proxies = proxies
+                .iter()
+                .filter(|proxy| proxy.node_id == node_id)
+                .cloned()
+                .collect();
             Ok(NodeStatus {
                 node_id,
                 severity: severity as i32,
@@ -489,6 +981,7 @@ fn compose_nodes(
                 conditions,
                 target_deployment: target,
                 release_cleanup: cleanup,
+                proxies: node_proxies,
             })
         })
         .collect()
@@ -671,6 +1164,8 @@ pub fn compose(
     manager_liveness_threshold_secs: f64,
     engine_timeout_secs: f64,
     module_timeout_secs: f64,
+    proxy_heartbeat_timeout_secs: f64,
+    proxy_routing_freshness_secs: f64,
 ) -> Result<GetClusterStatusResponse, tonic::Status> {
     let current = snapshot
         .deployments
@@ -685,13 +1180,57 @@ pub fn compose(
         engine_timeout_secs,
         module_timeout_secs,
     );
+    let (proxies, proxy_conditions) = compose_proxies(
+        &snapshot,
+        proxy_heartbeat_timeout_secs,
+        proxy_routing_freshness_secs,
+    )?;
     let nodes = compose_nodes(
         &snapshot,
         &engines,
+        &proxies,
+        &proxy_conditions,
         engine_timeout_secs,
         module_timeout_secs,
     )?;
     let services = compose_services(&snapshot, &current, &engines);
+    let mut conditions = vec![condition(
+        "SIGNAL_NOT_REPORTED",
+        StatusSeverity::Unknown,
+        "host CPU and memory utilization is not reported by managers",
+        "host-resources",
+        "reported signal",
+        "not reported",
+    )];
+    for proxy in proxies.iter().filter(|proxy| {
+        !proxy.superseded
+            && !proxy.selected
+            && proxy.report.is_some()
+            && proxy
+                .report_received_at
+                .as_ref()
+                .and_then(prost_timestamp)
+                .is_some_and(|time| {
+                    snapshot
+                        .observed_at
+                        .signed_duration_since(time)
+                        .num_milliseconds() as f64
+                        <= proxy_heartbeat_timeout_secs * 1000.0
+                })
+            && (!proxy.expected || !proxy_conditions.contains_key(&proxy.node_id))
+    }) {
+        conditions.push(condition(
+            "ORPHAN_PROXY_INVENTORY",
+            StatusSeverity::Degraded,
+            "fresh proxy inventory is not selected by managed deployment intent",
+            format!("{}/{}", proxy.proxy_id, proxy.process_instance_id),
+            "selected managed proxy",
+            "orphan or unmanaged",
+        ));
+    }
+    conditions.sort_by(|left, right| {
+        (&left.code, &left.affected_identity).cmp(&(&right.code, &right.affected_identity))
+    });
     let severity = reduce_severity(
         managers
             .iter()
@@ -699,29 +1238,9 @@ pub fn compose(
             .chain(nodes.iter().map(|item| item.severity))
             .chain(engines.iter().map(|item| item.severity))
             .chain(services.iter().map(|item| item.severity))
+            .chain(std::iter::once(condition_severity(&conditions) as i32))
             .map(|value| StatusSeverity::try_from(value).unwrap_or(StatusSeverity::Unknown)),
     );
-    let conditions = [
-        (
-            "proxy routing synchronization age",
-            "proxy-routing-sync-age",
-        ),
-        ("host CPU and memory utilization", "host-resources"),
-        ("proxy circuit-breaker state", "circuit-breakers"),
-    ]
-    .into_iter()
-    .map(|(detail, identity)| {
-        condition(
-            "SIGNAL_NOT_REPORTED",
-            StatusSeverity::Unknown,
-            format!("{detail} is not reported by managers"),
-            identity,
-            "reported signal",
-            "not reported",
-        )
-    })
-    .collect();
-
     Ok(GetClusterStatusResponse {
         response_at: Some(timestamp(chrono::Utc::now())),
         database_observed_at: Some(timestamp(snapshot.observed_at)),
@@ -732,12 +1251,256 @@ pub fn compose(
         engines,
         services,
         conditions,
+        proxies,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proxy_snapshot(
+        reports: Vec<(&str, i64, wr_common::wruntime::ProxyInventoryReport)>,
+    ) -> ClusterStatusSnapshot {
+        use wr_common::wruntime::{
+            DeploymentRecord, DeploymentState, ProxyDeploymentMetadata, ProxyInventoryStatus,
+        };
+
+        let now = chrono::Utc::now();
+        let deployment = DeploymentRecord {
+            node_id: "node-a".into(),
+            revision: 1,
+            bundle_digest: "bundle-a".into(),
+            operation_id: "operation-a".into(),
+            revision_digest: "revision-a".into(),
+            state: DeploymentState::Succeeded as i32,
+            ..Default::default()
+        };
+        ClusterStatusSnapshot {
+            observed_at: now,
+            routing_version: 7,
+            deployments: vec![db::StatusDeploymentRecord {
+                record: deployment.clone(),
+                current_revision: 1,
+                target_revision: None,
+            }],
+            proxies: reports
+                .into_iter()
+                .map(|(process, age, report)| db::StatusProxyRecord {
+                    status: ProxyInventoryStatus {
+                        proxy_id: "urn:proxy:a".into(),
+                        node_id: "node-a".into(),
+                        process_instance_id: process.into(),
+                        deployment: Some(ProxyDeploymentMetadata {
+                            node_id: deployment.node_id.clone(),
+                            revision: deployment.revision,
+                            bundle_digest: deployment.bundle_digest.clone(),
+                            operation_id: deployment.operation_id.clone(),
+                            revision_digest: deployment.revision_digest.clone(),
+                        }),
+                        report: Some(report),
+                        report_received_at: Some(timestamp(now - chrono::Duration::seconds(age))),
+                        receiving_manager_id: "manager-a".into(),
+                        ..Default::default()
+                    },
+                })
+                .collect(),
+            managers: vec![db::StatusManagerRecord {
+                manager_id: "manager-a".into(),
+                grpc_address: "https://manager-a".into(),
+                registered_at: now,
+                last_heartbeat: now,
+            }],
+            engines: vec![],
+            module_heartbeats: vec![],
+            routes: vec![],
+            slot_authorities: vec![],
+            active_operations: vec![],
+            observations: vec![],
+            agent_attestations: vec![],
+            agent_policies: vec![],
+            cleanup_summaries: vec![],
+        }
+    }
+
+    fn ready_proxy_report() -> wr_common::wruntime::ProxyInventoryReport {
+        use wr_common::wruntime::{
+            ProxyBreakerDestinationKind, ProxyBreakerEvidence, ProxyInventoryReport,
+            ProxyListenerEvidence,
+        };
+        ProxyInventoryReport {
+            lifecycle_state: ProcessLifecycleState::Ready as i32,
+            admission_open: true,
+            listeners: vec![ProxyListenerEvidence {
+                kind: ProxyListenerKind::DataPlane as i32,
+                configured: true,
+                accepting: true,
+            }],
+            installed_routing_table_version: 7,
+            routing_observation_age_millis: 0,
+            routing_manager_id: "manager-a".into(),
+            routing_synchronized: true,
+            breakers: vec![ProxyBreakerEvidence {
+                destination_kind: ProxyBreakerDestinationKind::LocalEngine as i32,
+                total: 0,
+                closed: 0,
+                open: 0,
+                half_open: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn proxy_health_uses_strict_boundaries_and_positive_forwarding_evidence() {
+        let snapshot = proxy_snapshot(vec![("process-a", 15, ready_proxy_report())]);
+        let (healthy, rollup) = compose_proxies(&snapshot, 15.0, 30.0).unwrap();
+        assert!(healthy[0].selected);
+        assert_eq!(healthy[0].severity, StatusSeverity::Healthy as i32);
+        assert!(rollup["node-a"].is_empty());
+
+        let mut failed = ready_proxy_report();
+        failed.admission_open = false;
+        failed.listeners[0].accepting = false;
+        failed.breakers[0].total = 1;
+        failed.breakers[0].open = 1;
+        let snapshot = proxy_snapshot(vec![("process-a", 0, failed)]);
+        let (unhealthy, _) = compose_proxies(&snapshot, 15.0, 30.0).unwrap();
+        assert_eq!(unhealthy[0].severity, StatusSeverity::Unhealthy as i32);
+        let codes = unhealthy[0]
+            .conditions
+            .iter()
+            .map(|item| item.code.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(codes.contains("PROXY_ADMISSION_CLOSED"));
+        assert!(codes.contains("PROXY_LISTENER_NOT_ACCEPTING"));
+        assert!(codes.contains("ALL_PROXY_TARGETS_OPEN"));
+    }
+
+    #[test]
+    fn degraded_proxy_dimensions_remain_distinct_from_confirmed_no_forwarding() {
+        let mut report = ready_proxy_report();
+        report.lifecycle_state = ProcessLifecycleState::Stopping as i32;
+        report.installed_routing_table_version = 6;
+        report.routing_observation_age_millis = 31_000;
+        report.routing_manager_id = "missing-manager".into();
+        report.routing_synchronized = false;
+        report.breakers[0].total = 2;
+        report.breakers[0].closed = 1;
+        report.breakers[0].half_open = 1;
+        let snapshot = proxy_snapshot(vec![("process-a", 0, report)]);
+        let (records, _) = compose_proxies(&snapshot, 15.0, 30.0).unwrap();
+        assert_eq!(records[0].severity, StatusSeverity::Degraded as i32);
+        let codes = records[0]
+            .conditions
+            .iter()
+            .map(|item| item.code.as_str())
+            .collect::<BTreeSet<_>>();
+        for code in [
+            "PROXY_STOPPING",
+            "PROXY_ROUTING_BEHIND",
+            "PROXY_ROUTING_NOT_SYNCHRONIZED",
+            "STALE_PROXY_ROUTING",
+            "UNKNOWN_PROXY_ROUTING_MANAGER",
+            "HALF_OPEN_PROXY_BREAKERS",
+        ] {
+            assert!(codes.contains(code), "missing {code}");
+        }
+
+        let mut partial = ready_proxy_report();
+        partial.breakers[0].total = 2;
+        partial.breakers[0].closed = 1;
+        partial.breakers[0].open = 1;
+        partial
+            .breakers
+            .push(wr_common::wruntime::ProxyBreakerEvidence {
+                destination_kind: wr_common::wruntime::ProxyBreakerDestinationKind::PeerProxy
+                    as i32,
+                total: 1,
+                closed: 1,
+                open: 0,
+                half_open: 0,
+            });
+        let snapshot = proxy_snapshot(vec![("process-a", 0, partial)]);
+        let (records, _) = compose_proxies(&snapshot, 15.0, 30.0).unwrap();
+        assert_eq!(records[0].severity, StatusSeverity::Degraded as i32);
+        assert!(records[0]
+            .conditions
+            .iter()
+            .any(|item| item.code == "PARTIALLY_OPEN_PROXY_BREAKERS"));
+        assert!(!records[0]
+            .conditions
+            .iter()
+            .any(|item| item.code == "ALL_PROXY_TARGETS_OPEN"));
+
+        let stale = proxy_snapshot(vec![("process-a", 16, ready_proxy_report())]);
+        let (records, rollup) = compose_proxies(&stale, 15.0, 30.0).unwrap();
+        assert!(records[0]
+            .conditions
+            .iter()
+            .any(|item| item.code == "STALE_PROXY_REPORT"));
+        assert_eq!(rollup["node-a"][0].code, "MISSING_EXPECTED_PROXY");
+    }
+
+    #[test]
+    fn breaker_conditions_are_attributed_to_each_destination_class() {
+        use wr_common::wruntime::{ProxyBreakerDestinationKind, ProxyBreakerEvidence};
+
+        let mut report = ready_proxy_report();
+        report.breakers = vec![
+            ProxyBreakerEvidence {
+                destination_kind: ProxyBreakerDestinationKind::LocalEngine as i32,
+                total: 0,
+                closed: 0,
+                open: 0,
+                half_open: 0,
+            },
+            ProxyBreakerEvidence {
+                destination_kind: ProxyBreakerDestinationKind::PeerProxy as i32,
+                total: 2,
+                closed: 0,
+                open: 2,
+                half_open: 0,
+            },
+        ];
+        let snapshot = proxy_snapshot(vec![("process-a", 0, report)]);
+        let (records, _) = compose_proxies(&snapshot, 15.0, 30.0).unwrap();
+        let proxy = &records[0];
+
+        assert_eq!(proxy.severity, StatusSeverity::Unhealthy as i32);
+        assert_eq!(proxy.breakers[0].severity, StatusSeverity::Healthy as i32);
+        assert!(proxy.breakers[0].conditions.is_empty());
+        assert_eq!(proxy.breakers[1].severity, StatusSeverity::Unhealthy as i32);
+        assert_eq!(proxy.breakers[1].conditions.len(), 1);
+        assert_eq!(
+            proxy.breakers[1].conditions[0].code,
+            "ALL_PROXY_TARGETS_OPEN"
+        );
+    }
+
+    #[test]
+    fn duplicate_and_replacement_proxy_selection_is_deterministic() {
+        let duplicate = proxy_snapshot(vec![
+            ("process-b", 0, ready_proxy_report()),
+            ("process-a", 0, ready_proxy_report()),
+        ]);
+        let (duplicates, rollup) = compose_proxies(&duplicate, 15.0, 30.0).unwrap();
+        assert_eq!(duplicates.iter().filter(|item| item.selected).count(), 0);
+        assert_eq!(duplicates[0].process_instance_id, "process-a");
+        assert_eq!(rollup["node-a"][0].code, "MULTIPLE_FRESH_PROXY_INSTANCES");
+
+        let replacement = proxy_snapshot(vec![
+            ("process-old", 16, ready_proxy_report()),
+            ("process-new", 0, ready_proxy_report()),
+        ]);
+        let (records, rollup) = compose_proxies(&replacement, 15.0, 30.0).unwrap();
+        assert!(records
+            .iter()
+            .any(|item| item.process_instance_id == "process-new" && item.selected));
+        assert!(records
+            .iter()
+            .any(|item| item.process_instance_id == "process-old" && item.superseded));
+        assert!(rollup["node-a"].is_empty());
+    }
 
     #[test]
     fn unknown_does_not_worsen_supported_status() {
@@ -817,6 +1580,7 @@ mod tests {
                 registered_at: now,
                 last_heartbeat: now,
             }],
+            proxies: vec![],
             module_heartbeats: vec![],
             routes: vec![],
             managers: vec![],
@@ -838,7 +1602,7 @@ mod tests {
         let cleanup_engine = &engines[0];
         assert_eq!(cleanup_engine.severity, StatusSeverity::Degraded as i32);
         assert_eq!(cleanup_engine.conditions[0].code, "release_cleanup_paused");
-        let nodes = compose_nodes(&snapshot, &engines, 10.0, 10.0).unwrap();
+        let nodes = compose_nodes(&snapshot, &engines, &[], &BTreeMap::new(), 10.0, 10.0).unwrap();
         let cleanup_node = &nodes[0];
         assert_eq!(cleanup_node.severity, StatusSeverity::Degraded as i32);
         assert!(cleanup_node
@@ -918,6 +1682,7 @@ mod tests {
             routing_version: 1,
             deployments: Vec::new(),
             engines: Vec::new(),
+            proxies: Vec::new(),
             module_heartbeats: Vec::new(),
             routes,
             managers: Vec::new(),

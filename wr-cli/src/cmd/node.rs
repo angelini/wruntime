@@ -494,12 +494,22 @@ fn add_proxy_config(
         let proxy_port = helpers::extract_port(&source.listen_address)?.get();
         let control_port = helpers::extract_port(control_address)?.get();
         let artifact_peer_port = helpers::extract_port(&node.peer_address)?.get();
-        let proxy = source.to_bundle_config()?;
+        let mut proxy = source.to_bundle_config()?;
+        proxy.deployment = Some(super::config::ProxyDeploymentConfig {
+            node_id: "{node_id}".to_string(),
+            revision: "{revision}".to_string(),
+            bundle_digest: "{bundle_digest}".to_string(),
+            operation_id: "{operation_id}".to_string(),
+            revision_digest: "{revision_digest}".to_string(),
+        });
+        let proxy_template = proxy
+            .to_toml()?
+            .replace("revision = \"{revision}\"", "revision = {revision}");
         bundle::tar_add_bytes_checked(
             tar,
             checksums,
             "wr-node/config/proxy.toml",
-            proxy.to_toml()?.as_bytes(),
+            proxy_template.as_bytes(),
             0o644,
         )?;
         config_names.push("proxy.toml".to_string());
@@ -554,14 +564,28 @@ fn add_proxy_config(
             routing_table_ttl_secs: 5,
             extra: super::config::empty_extra_fields(),
         }),
+        status: Some(super::config::ProxyStatusConfig {
+            report_interval_secs: 5,
+        }),
+        deployment: Some(super::config::ProxyDeploymentConfig {
+            node_id: "{node_id}".to_string(),
+            revision: "{revision}".to_string(),
+            bundle_digest: "{bundle_digest}".to_string(),
+            operation_id: "{operation_id}".to_string(),
+            revision_digest: "{revision_digest}".to_string(),
+        }),
         extra: super::config::empty_extra_fields(),
     };
 
+    let proxy_template = proxy
+        .to_bundle_config()?
+        .to_toml()?
+        .replace("revision = \"{revision}\"", "revision = {revision}");
     bundle::tar_add_bytes_checked(
         tar,
         checksums,
         "wr-node/config/proxy.toml",
-        proxy.to_bundle_config()?.to_toml()?.as_bytes(),
+        proxy_template.as_bytes(),
         0o644,
     )?;
     config_names.push("proxy.toml".to_string());
@@ -2540,7 +2564,11 @@ allowed_hosts = ["api.example.com"]
                 "http://127.0.0.1:9102"
             );
             let proxy_toml = bundle::read_file_from_tarball(path.to_str().unwrap(), "proxy.toml")?;
-            let proxy_value: toml::Value = toml::from_str(&proxy_toml)?;
+            assert!(proxy_toml.contains("revision = {revision}"));
+            assert!(!proxy_toml.contains("revision = \"{revision}\""));
+            let materialized_proxy_toml =
+                proxy_toml.replace("revision = {revision}", "revision = 1");
+            let proxy_value: toml::Value = toml::from_str(&materialized_proxy_toml)?;
             assert_eq!(proxy_value["database"]["url"].as_str(), Some("{db_url}"));
             assert_eq!(
                 proxy_value["node"]["proxy_address"].as_str(),
@@ -2563,6 +2591,26 @@ allowed_hosts = ["api.example.com"]
                 Some("/etc/wruntime/pki/proxy-client/sets/v1/leaf.pem")
             );
             assert!(proxy_value["node"].get("tls").is_none());
+            assert_eq!(
+                proxy_value["deployment"]["node_id"].as_str(),
+                Some("{node_id}")
+            );
+            assert_eq!(proxy_value["deployment"]["revision"].as_integer(), Some(1));
+            assert_eq!(
+                proxy_value["deployment"]["bundle_digest"].as_str(),
+                Some("{bundle_digest}")
+            );
+            assert_eq!(
+                proxy_value["deployment"]["operation_id"].as_str(),
+                Some("{operation_id}")
+            );
+            assert_eq!(
+                proxy_value["deployment"]["revision_digest"].as_str(),
+                Some("{revision_digest}")
+            );
+            assert!(proxy_value["deployment"]
+                .get("resolved_release_digest")
+                .is_none());
 
             let engine_dockerfile =
                 bundle::read_file_from_tarball(path.to_str().unwrap(), "Dockerfile.engine-engine")?;
@@ -2649,7 +2697,11 @@ wasm_path = "inventory.wasm"
             tar.into_inner()?.finish()?;
 
             let proxy_toml = bundle::read_file_from_tarball(path.to_str().unwrap(), "proxy.toml")?;
-            let proxy_value: toml::Value = toml::from_str(&proxy_toml)?;
+            assert!(proxy_toml.contains("revision = {revision}"));
+            assert!(!proxy_toml.contains("revision = \"{revision}\""));
+            let materialized_proxy_toml =
+                proxy_toml.replace("revision = {revision}", "revision = 1");
+            let proxy_value: toml::Value = toml::from_str(&materialized_proxy_toml)?;
             assert_eq!(
                 proxy_value["listen_address"].as_str(),
                 Some("127.0.0.1:9001")
@@ -2659,6 +2711,30 @@ wasm_path = "inventory.wasm"
                 Some("127.0.0.1:9002")
             );
             assert_eq!(proxy_value["database"]["url"].as_str(), Some("{db_url}"));
+            assert_eq!(
+                proxy_value["status"]["report_interval_secs"].as_integer(),
+                Some(5)
+            );
+            assert_eq!(
+                proxy_value["deployment"]["node_id"].as_str(),
+                Some("{node_id}")
+            );
+            assert_eq!(proxy_value["deployment"]["revision"].as_integer(), Some(1));
+            assert_eq!(
+                proxy_value["deployment"]["bundle_digest"].as_str(),
+                Some("{bundle_digest}")
+            );
+            assert_eq!(
+                proxy_value["deployment"]["operation_id"].as_str(),
+                Some("{operation_id}")
+            );
+            assert_eq!(
+                proxy_value["deployment"]["revision_digest"].as_str(),
+                Some("{revision_digest}")
+            );
+            assert!(proxy_value["deployment"]
+                .get("resolved_release_digest")
+                .is_none());
             assert!(proxy_value.get("external").is_none());
             assert!(proxy_value.get("egress").is_none());
             Ok(())

@@ -240,6 +240,10 @@ pub struct ProxyConfig {
     pub database: Option<ProxyDatabaseConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<ProxyCacheConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ProxyStatusConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<ProxyDeploymentConfig>,
     #[serde(flatten)]
     pub extra: ExtraFields,
 }
@@ -262,6 +266,22 @@ pub struct ProxyDatabaseConfig {
 }
 
 #[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyStatusConfig {
+    pub report_interval_secs: u64,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyDeploymentConfig {
+    pub node_id: String,
+    pub revision: String,
+    pub bundle_digest: String,
+    pub operation_id: String,
+    pub revision_digest: String,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
 pub struct ProxyCacheConfig {
     pub routing_table_ttl_secs: u32,
     #[serde(flatten)]
@@ -278,6 +298,12 @@ pub struct ManagerConfig {
     pub listen_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_heartbeat_timeout_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_heartbeat_timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_routing_freshness_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_tombstone_retention_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_cleanup_interval_secs: Option<u64>,
     pub database: ManagerDatabaseConfig,

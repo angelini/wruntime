@@ -7,7 +7,7 @@ use tracing::warn;
 use wr_common::identity::{ModuleVersion, RouteKey};
 use wr_common::wruntime::{RoutingRule, RoutingTable};
 
-use crate::circuit_breaker::{CircuitBreakerRegistry, EngineBreaker};
+use crate::circuit_breaker::{BreakerTargetClass, CircuitBreakerRegistry, EngineBreaker};
 use crate::layers::Destination;
 
 type ModulesByName = HashMap<Arc<str>, RouteGroup>;
@@ -104,8 +104,23 @@ impl IndexedRoutingTable {
             }
 
             let destination = make_destination(rule, self_peer_address);
+            let class = match &destination {
+                Destination::LocalEngine(_) => BreakerTargetClass::LocalEngine,
+                Destination::RemoteProxy(_) => BreakerTargetClass::RemoteProxy,
+            };
             let address: Arc<str> = Arc::from(destination.address());
-            let breaker = registry.resolve(&address);
+            let breaker = match registry.resolve(&address, class) {
+                Ok(breaker) => breaker,
+                Err(existing_class) => {
+                    warn!(
+                        rule_id = %rule.rule_id,
+                        ?class,
+                        ?existing_class,
+                        "skipping routing rule whose forwarding address has an ambiguous target class"
+                    );
+                    continue;
+                }
+            };
             if !address.is_empty() {
                 active_forward_addrs.insert(address);
             }
@@ -397,7 +412,11 @@ mod tests {
             rules: vec![local, remote, fallback],
             version: 1,
         };
-        let indexed = index(&table, None);
+        let registry = registry();
+        let indexed = IndexedRoutingTable::from_proto(&table, None, &registry, SELF);
+        let summary = registry.snapshot();
+        assert_eq!(summary.local_engine.total, 2);
+        assert_eq!(summary.remote_proxy.total, 1);
         assert!(indexed.get("ns", "local").unwrap().candidates[0]
             .destination
             .target()

@@ -15,17 +15,201 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Result;
 use http::{Request, StatusCode};
 use http_body_util::Full;
+use prost::Message;
 
 use wr_common::discovery::ManagerDiscovery;
-use wr_common::process_lifecycle::{LifecycleOwner, ServiceKind};
+use wr_common::lifecycle_service::AdmissionGate;
+use wr_common::process_lifecycle::{LifecycleOwner, ProcessState, ServiceKind, TransitionReason};
+use wr_common::task_group::TaskGroup;
 use wr_common::wruntime::proxy_node_control_service_server::ProxyNodeControlService; // brings proxy-local methods into scope
 use wr_common::wruntime::{
     BeginDeploymentRequest, BeginEngineDrainRequest, DeploymentInventoryV1, DeploymentMetadata,
     EngineRegistration, ExpectedEngine, ExpectedModule, GetProxyRoutingStatusRequest,
     GetRoutingTableRequest, HeartbeatRequest, ModuleDescriptor, ModuleIdentity,
-    NodeOperationAction, RegisterEngineRequest, RolloutPolicy, SubmitOperationRequest,
+    NodeOperationAction, ProcessLifecycleState, ProxyInventoryReport, RegisterEngineRequest,
+    RolloutPolicy, SubmitOperationRequest,
 };
 use wr_proxy::node_service::NodeAgent;
+
+struct PersistedProxyEvidence {
+    report: Option<ProxyInventoryReport>,
+    report_received_at: Option<String>,
+    deregistered: bool,
+}
+
+async fn persisted_proxy_evidence(
+    pool: &deadpool_postgres::Pool,
+    process_instance_id: &str,
+) -> Result<Option<PersistedProxyEvidence>> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "SELECT process_instance_id,report,report_received_at::text,deregistered_at IS NOT NULL AS deregistered FROM wr_proxy_inventory WHERE process_instance_id=$1",
+            &[&process_instance_id],
+        )
+        .await?;
+    row.map(|row| {
+        let persisted_id: String = row.get("process_instance_id");
+        anyhow::ensure!(
+            persisted_id.as_bytes() == process_instance_id.as_bytes(),
+            "proxy process identity was not preserved byte-for-byte"
+        );
+        let report = row
+            .get::<_, Option<Vec<u8>>>("report")
+            .map(|bytes| ProxyInventoryReport::decode(bytes.as_slice()))
+            .transpose()?;
+        Ok(PersistedProxyEvidence {
+            report,
+            report_received_at: row.get("report_received_at"),
+            deregistered: row.get("deregistered"),
+        })
+    })
+    .transpose()
+}
+
+#[tokio::test]
+async fn managed_proxy_report_lifecycle_is_ordered_and_deregistration_fences_reports() -> Result<()>
+{
+    let (pool, manager_address, _client) = manager_trio().await?;
+    wr_manager::db::register_manager(&pool, "proxy-report-manager", &manager_address).await?;
+    let discovery = Arc::new(ManagerDiscovery::new(
+        pool.clone(),
+        manager_proxy_tls(),
+        "test-manager-server-root.pem",
+        "test-proxy-client.pem",
+        wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
+    )?);
+    discovery.refresh().await;
+
+    let process_instance_id = "dev-run-proxy-report-lifecycle".to_owned();
+    let mut lifecycle = LifecycleOwner::new(ServiceKind::Proxy, process_instance_id.clone());
+    let admission = AdmissionGate::closed();
+    let routing = wr_proxy::routing::new_routing_table(
+        wr_proxy::config::CircuitBreakerConfig::default(),
+        "https://127.0.0.1:9443",
+    );
+    let source = wr_proxy::reporting::ReportSource::new(
+        lifecycle.snapshot(),
+        admission.clone(),
+        wr_proxy::reporting::ListenerFacts {
+            data_plane: true,
+            node_control: true,
+            peer: true,
+            external: false,
+        },
+        routing,
+    );
+    let reporter = Arc::new(tokio::sync::Mutex::new(
+        wr_proxy::reporting::Reporter::connect(
+            Arc::clone(&discovery),
+            process_instance_id.clone(),
+            None,
+            source,
+        )
+        .await?,
+    ));
+
+    assert_eq!(lifecycle.current().state, ProcessState::Starting);
+    wr_proxy::reporting::register(&reporter).await?;
+    let registered = persisted_proxy_evidence(&pool, &process_instance_id)
+        .await?
+        .expect("STARTING registration must be persisted");
+    assert!(registered.report.is_none());
+    assert!(registered.report_received_at.is_none());
+    assert!(!registered.deregistered);
+
+    admission.open();
+    lifecycle.mark_ready("proxy reporting integration ready")?;
+    reporter.lock().await.report().await?;
+    let ready = persisted_proxy_evidence(&pool, &process_instance_id)
+        .await?
+        .expect("READY report must remain registered");
+    let ready_report = ready.report.as_ref().expect("READY report must be present");
+    assert_eq!(
+        ready_report.lifecycle_state,
+        ProcessLifecycleState::Ready as i32
+    );
+    assert!(ready_report.admission_open);
+    let ready_receipt = ready
+        .report_received_at
+        .expect("READY report must have a manager receipt");
+
+    let mut periodic = TaskGroup::new();
+    let periodic_reporter = Arc::clone(&reporter);
+    periodic.spawn("proxy-reporting-integration", move |cancellation| {
+        wr_proxy::reporting::run_periodic(
+            periodic_reporter,
+            Duration::from_millis(20),
+            cancellation,
+        )
+    });
+    let periodic_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let periodic_receipt = loop {
+        let evidence = persisted_proxy_evidence(&pool, &process_instance_id)
+            .await?
+            .expect("periodic report row must remain registered");
+        if evidence.report_received_at.as_ref() != Some(&ready_receipt) {
+            break evidence.report_received_at.unwrap();
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < periodic_deadline,
+            "periodic report did not produce newer persisted manager receipt evidence"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    lifecycle.request_stop(
+        TransitionReason::ShutdownOrchestration,
+        "proxy reporting integration stopping",
+    )?;
+    admission.close();
+    let periodic_shutdown = periodic
+        .shutdown(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await;
+    assert!(periodic_shutdown.is_clean(), "{periodic_shutdown:?}");
+    reporter.lock().await.report().await?;
+    let stopping = persisted_proxy_evidence(&pool, &process_instance_id)
+        .await?
+        .expect("STOPPING report must remain registered");
+    let stopping_report = stopping
+        .report
+        .as_ref()
+        .expect("STOPPING report must be present");
+    assert_eq!(
+        stopping_report.lifecycle_state,
+        ProcessLifecycleState::Stopping as i32
+    );
+    assert!(!stopping_report.admission_open);
+    assert_ne!(
+        stopping.report_received_at.as_ref(),
+        Some(&periodic_receipt)
+    );
+    assert!(!stopping.deregistered);
+
+    reporter.lock().await.deregister().await?;
+    let deregistered = persisted_proxy_evidence(&pool, &process_instance_id)
+        .await?
+        .expect("exact deregistration must retain its fenced tombstone");
+    assert!(deregistered.deregistered);
+    assert_eq!(deregistered.report, stopping.report);
+    assert_eq!(deregistered.report_received_at, stopping.report_received_at);
+
+    let rejected = reporter.lock().await.report().await.unwrap_err();
+    assert_eq!(rejected.code(), tonic::Code::FailedPrecondition);
+    let after_rejected_report = persisted_proxy_evidence(&pool, &process_instance_id)
+        .await?
+        .expect("late report must not remove the tombstone");
+    assert_eq!(after_rejected_report.report, deregistered.report);
+    assert_eq!(
+        after_rejected_report.report_received_at,
+        deregistered.report_received_at
+    );
+    assert_eq!(
+        after_rejected_report.deregistered,
+        deregistered.deregistered
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_proxy_routes_to_engine() -> Result<()> {

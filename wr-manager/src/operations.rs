@@ -12,15 +12,16 @@ use wr_common::deployment_contract::deployment_operation_id;
 use wr_common::wruntime::{
     instruction_target, operation_target_progress, AgentInstruction, BackendKind,
     BackendProcessState, BackendStopDisposition, BackendTerminationEvidence,
-    ClaimNodeCleanupResponse, ClaimOperationResponse, DeploymentCondition,
+    ClaimNodeCleanupResponse, ClaimOperationResponse, DeploymentCondition, DeploymentRecord,
     EngineSlotTargetIdentity, EngineTargetDetails, InstructionTarget, InstructionTargetKind,
     NodeAgentAttestation, NodeAgentPolicy, NodeCleanupAuthority, NodeCleanupInstruction,
     NodeCleanupResultDisposition, NodeCleanupState, NodeCleanupSummary, NodeOperation,
     NodeOperationAction, NodeOperationPhase, NodeOperationState, NodeOperationStepKind,
     NodeSlotTransitionKind, OperationEvent, OperationTargetProgress, ProcessLifecycleState,
-    ProxyTargetDetails, ProxyTargetIdentity, ReportNodeCleanupResultRequest,
-    ReportNodeCleanupResultResponse, ReportNodeObservationRequest, ReportStepResultRequest,
-    RolloutPolicy, ServiceKind, SlotAuthorityStatus, SlotObservation, SubmitOperationRequest,
+    ProxyDeploymentMetadata, ProxyTargetDetails, ProxyTargetIdentity,
+    ReportNodeCleanupResultRequest, ReportNodeCleanupResultResponse, ReportNodeObservationRequest,
+    ReportStepResultRequest, RolloutPolicy, ServiceKind, SlotAuthorityStatus, SlotObservation,
+    SubmitOperationRequest,
 };
 
 const LEASE_SECONDS: f64 = 15.0;
@@ -425,6 +426,82 @@ fn proxy_target(operation: &NodeOperation) -> Result<&OperationTargetProgress, S
         .iter()
         .find(|target| target.kind == InstructionTargetKind::Proxy as i32)
         .ok_or_else(|| Status::internal("operation proxy target is missing"))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExpectedProxyProjection {
+    pub deployment: Option<ProxyDeploymentMetadata>,
+    pub pinned_process_instance_id: String,
+    pub ambiguous: bool,
+}
+
+/// Project the proxy identity owned by the durable operation state machine.
+/// This deliberately shares the target progress representation used by claim
+/// and reconcile rather than decoding operation event text in status code.
+pub(crate) fn expected_proxy_projection(
+    deployments: &[DeploymentRecord],
+    committed: Option<&DeploymentRecord>,
+    operation: Option<&NodeOperation>,
+) -> Result<ExpectedProxyProjection, Status> {
+    let Some(operation) = operation else {
+        return Ok(ExpectedProxyProjection {
+            deployment: committed.map(proxy_deployment_metadata),
+            pinned_process_instance_id: String::new(),
+            ambiguous: false,
+        });
+    };
+    let target = proxy_target(operation)?;
+    let phase =
+        NodeOperationPhase::try_from(operation.phase).unwrap_or(NodeOperationPhase::Unspecified);
+    let step = NodeOperationStepKind::try_from(target.next_step)
+        .unwrap_or(NodeOperationStepKind::Unspecified);
+    let uses_source = phase == NodeOperationPhase::RestoringSource
+        || (!target.complete
+            && matches!(
+                step,
+                NodeOperationStepKind::VerifyReleaseMetadata
+                    | NodeOperationStepKind::VerifyTarget
+                    | NodeOperationStepKind::InspectBackend
+                    | NodeOperationStepKind::StopBackend
+                    | NodeOperationStepKind::SelectRelease
+            ));
+    let revision = if uses_source {
+        target.source_revision
+    } else {
+        target.target_revision
+    };
+    let deployment = deployments
+        .iter()
+        .find(|deployment| {
+            deployment.node_id == operation.node_id && deployment.revision == revision
+        })
+        .map(proxy_deployment_metadata);
+    let paused = NodeOperationState::try_from(operation.state)
+        .unwrap_or(NodeOperationState::Unspecified)
+        == NodeOperationState::Paused;
+    let ambiguous = paused && target.effect_ambiguous;
+    let pinned_process_instance_id = if target.effect_observed_revision == revision
+        && !target.effect_process_instance_id.is_empty()
+    {
+        target.effect_process_instance_id.clone()
+    } else {
+        String::new()
+    };
+    Ok(ExpectedProxyProjection {
+        deployment,
+        pinned_process_instance_id,
+        ambiguous,
+    })
+}
+
+fn proxy_deployment_metadata(deployment: &DeploymentRecord) -> ProxyDeploymentMetadata {
+    ProxyDeploymentMetadata {
+        node_id: deployment.node_id.clone(),
+        revision: deployment.revision,
+        bundle_digest: deployment.bundle_digest.clone(),
+        operation_id: deployment.operation_id.clone(),
+        revision_digest: deployment.revision_digest.clone(),
+    }
 }
 
 #[derive(Clone)]
@@ -4845,6 +4922,73 @@ mod tests {
             &target(1, "same", "same-release", 1, "same", "same-release"),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn expected_proxy_projection_tracks_forward_restoration_and_ambiguity() {
+        let deployment = |revision: u64| DeploymentRecord {
+            node_id: "node-a".into(),
+            revision,
+            bundle_digest: format!("bundle-{revision}"),
+            operation_id: format!("operation-{revision}"),
+            revision_digest: format!("revision-{revision}"),
+            ..Default::default()
+        };
+        let deployments = vec![deployment(1), deployment(2)];
+        let mut operation = NodeOperation {
+            node_id: "node-a".into(),
+            state: NodeOperationState::Running as i32,
+            phase: NodeOperationPhase::Forward as i32,
+            targets: vec![OperationTargetProgress {
+                kind: InstructionTargetKind::Proxy as i32,
+                identity: Some(operation_target_progress::Identity::Proxy(
+                    ProxyTargetIdentity {},
+                )),
+                source_revision: 1,
+                target_revision: 2,
+                next_step: NodeOperationStepKind::SelectRelease as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let source =
+            expected_proxy_projection(&deployments, Some(&deployments[0]), Some(&operation))
+                .unwrap();
+        assert_eq!(source.deployment.unwrap().revision, 1);
+
+        operation.targets[0].next_step = NodeOperationStepKind::StartBackend as i32;
+        let target =
+            expected_proxy_projection(&deployments, Some(&deployments[0]), Some(&operation))
+                .unwrap();
+        assert_eq!(target.deployment.unwrap().revision, 2);
+        operation.targets[0].complete = true;
+        operation.targets[0].next_step = NodeOperationStepKind::Unspecified as i32;
+        operation.phase = NodeOperationPhase::Committing as i32;
+        assert_eq!(
+            expected_proxy_projection(&deployments, Some(&deployments[0]), Some(&operation))
+                .unwrap()
+                .deployment
+                .unwrap()
+                .revision,
+            2,
+            "target remains expected through engine rollout and commit"
+        );
+
+        operation.targets[0].complete = false;
+        operation.phase = NodeOperationPhase::RestoringSource as i32;
+        operation.targets[0].next_step = NodeOperationStepKind::RestoreSource as i32;
+        let restored =
+            expected_proxy_projection(&deployments, Some(&deployments[0]), Some(&operation))
+                .unwrap();
+        assert_eq!(restored.deployment.unwrap().revision, 1);
+
+        operation.state = NodeOperationState::Paused as i32;
+        operation.targets[0].effect_ambiguous = true;
+        assert!(
+            expected_proxy_projection(&deployments, Some(&deployments[0]), Some(&operation))
+                .unwrap()
+                .ambiguous
+        );
     }
 
     #[test]

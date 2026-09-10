@@ -22,11 +22,12 @@ use wr_common::wruntime::{
     ClaimNodeCleanupResponse, ClaimOperationRequest, ClaimOperationResponse,
     DeleteRoutingRuleRequest, DeleteRoutingRuleResponse, DeleteScheduleRequest,
     DeleteScheduleResponse, DeleteSecretRequest, DeleteSecretResponse, DeploymentCondition,
-    DeregisterEngineRequest, DeregisterEngineResponse, FinalizeDeploymentRequest,
-    FinalizeDeploymentResponse, GetClusterStatusRequest, GetClusterStatusResponse,
-    GetLifecycleStatusRequest, GetLifecycleStatusResponse, GetManagerRolloutRequest,
-    GetManagerRolloutResponse, GetNodeCleanupStatusRequest, GetNodeCleanupStatusResponse,
-    GetOperationRequest, GetOperationResponse, GetOperatorStatusRequest, GetOperatorStatusResponse,
+    DeregisterEngineRequest, DeregisterEngineResponse, DeregisterProxyRequest,
+    DeregisterProxyResponse, FinalizeDeploymentRequest, FinalizeDeploymentResponse,
+    GetClusterStatusRequest, GetClusterStatusResponse, GetLifecycleStatusRequest,
+    GetLifecycleStatusResponse, GetManagerRolloutRequest, GetManagerRolloutResponse,
+    GetNodeCleanupStatusRequest, GetNodeCleanupStatusResponse, GetOperationRequest,
+    GetOperationResponse, GetOperatorStatusRequest, GetOperatorStatusResponse,
     GetPolicyStatusRequest, GetPolicyStatusResponse, GetRoutingTableRequest,
     GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse, GetWorkloadSnapshotRequest,
     GetWorkloadSnapshotResponse, HeartbeatRequest, HeartbeatResponse, LeaseManagerRolloutRequest,
@@ -34,10 +35,11 @@ use wr_common::wruntime::{
     ListManagersResponse, ListOperationsRequest, ListOperationsResponse, ListSchedulesRequest,
     ListSchedulesResponse, ListSecretsRequest, ListSecretsResponse, ManagerInfo,
     NodeOperationAction, PolicyCapHeadroom, PutNodeAgentPolicyRequest, PutNodeAgentPolicyResponse,
-    RegisterEngineRequest, RegisterEngineResponse, RenewNodeCleanupLeaseRequest,
-    RenewNodeCleanupLeaseResponse, RenewOperationLeaseRequest, RenewOperationLeaseResponse,
-    ReportNodeCleanupResultRequest, ReportNodeCleanupResultResponse, ReportNodeObservationRequest,
-    ReportNodeObservationResponse, ReportStepResultRequest, ReportStepResultResponse,
+    RegisterEngineRequest, RegisterEngineResponse, RegisterProxyRequest, RegisterProxyResponse,
+    RenewNodeCleanupLeaseRequest, RenewNodeCleanupLeaseResponse, RenewOperationLeaseRequest,
+    RenewOperationLeaseResponse, ReportNodeCleanupResultRequest, ReportNodeCleanupResultResponse,
+    ReportNodeObservationRequest, ReportNodeObservationResponse, ReportProxyInventoryRequest,
+    ReportProxyInventoryResponse, ReportStepResultRequest, ReportStepResultResponse,
     ResumeOperationRequest, ResumeOperationResponse, RetryNodeCleanupRequest,
     RetryNodeCleanupResponse, RoutingRule, Schedule, SecretEntry, SetSecretRequest,
     SetSecretResponse, SlotAuthorityStatus, SubmitOperationRequest, SubmitOperationResponse,
@@ -119,6 +121,10 @@ pub struct Manager {
     module_heartbeat_timeout_secs: f64,
     admission: AdmissionGate,
     workload_policy: Option<Arc<wr_common::authorization_policy::ValidatedPolicy>>,
+    receiving_manager_id: String,
+    proxy_heartbeat_timeout_secs: f64,
+    proxy_routing_freshness_secs: f64,
+    proxy_tombstone_retention_secs: u64,
 }
 
 impl Manager {
@@ -165,7 +171,33 @@ impl Manager {
             module_heartbeat_timeout_secs,
             admission,
             workload_policy: None,
+            receiving_manager_id: "manager-local".to_owned(),
+            proxy_heartbeat_timeout_secs: crate::config::DEFAULT_PROXY_HEARTBEAT_TIMEOUT_SECS
+                as f64,
+            proxy_routing_freshness_secs: crate::config::DEFAULT_PROXY_ROUTING_FRESHNESS_SECS
+                as f64,
+            proxy_tombstone_retention_secs: 3600,
         }
+    }
+
+    pub fn with_proxy_inventory_owner(
+        mut self,
+        manager_id: impl Into<String>,
+        tombstone_retention_secs: u64,
+    ) -> Self {
+        self.receiving_manager_id = manager_id.into();
+        self.proxy_tombstone_retention_secs = tombstone_retention_secs;
+        self
+    }
+
+    pub fn with_proxy_status_thresholds(
+        mut self,
+        heartbeat_timeout_secs: u64,
+        routing_freshness_secs: u64,
+    ) -> Self {
+        self.proxy_heartbeat_timeout_secs = heartbeat_timeout_secs as f64;
+        self.proxy_routing_freshness_secs = routing_freshness_secs as f64;
+        self
     }
 
     pub fn with_workload_policy(
@@ -235,6 +267,177 @@ impl Manager {
 }
 
 impl Manager {
+    fn proxy_identity<T>(request: &Request<T>) -> Result<(String, String), Status> {
+        let principal = request
+            .extensions()
+            .get::<crate::auth::AuthorizedPrincipal>()
+            .ok_or_else(|| Status::permission_denied("authenticated proxy identity is required"))?;
+        let node_id = principal
+            .node_id
+            .clone()
+            .ok_or_else(|| Status::permission_denied("proxy principal is not bound to a node"))?;
+        Ok((principal.name.clone(), node_id))
+    }
+
+    fn validate_proxy_process_instance_id(process_instance_id: &str) -> Result<(), Status> {
+        if !(1..=255).contains(&process_instance_id.len()) {
+            return Err(Status::invalid_argument(
+                "process_instance_id must contain 1..=255 UTF-8 bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_proxy_registration(
+        request: &RegisterProxyRequest,
+        node_id: &str,
+    ) -> Result<(), Status> {
+        Self::validate_proxy_process_instance_id(&request.process_instance_id)?;
+        if let Some(metadata) = request.deployment.as_ref() {
+            Namespace::parse(&metadata.node_id)
+                .map_err(|_| Status::invalid_argument("deployment.node_id is invalid"))?;
+            if metadata.node_id != node_id {
+                return Err(Status::permission_denied(
+                    "deployment node_id does not match the enrolled proxy node",
+                ));
+            }
+            if metadata.revision == 0
+                || metadata.revision > i64::MAX as u64
+                || !Self::valid_bundle_digest(&metadata.bundle_digest)
+                || !Self::valid_bundle_digest(&metadata.revision_digest)
+                || uuid::Uuid::parse_str(&metadata.operation_id).is_err()
+            {
+                return Err(Status::invalid_argument(
+                    "managed proxy deployment metadata is incomplete or invalid",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_proxy_report(
+        report: &wr_common::wruntime::ProxyInventoryReport,
+    ) -> Result<(), Status> {
+        use wr_common::wruntime::{
+            ProcessLifecycleState, ProxyBreakerDestinationKind, ProxyListenerKind,
+        };
+        if ProcessLifecycleState::try_from(report.lifecycle_state)
+            .unwrap_or(ProcessLifecycleState::Unspecified)
+            == ProcessLifecycleState::Unspecified
+        {
+            return Err(Status::invalid_argument(
+                "proxy lifecycle_state is required",
+            ));
+        }
+        if report.listeners.len() > 4
+            || report.breakers.len() > 2
+            || report.routing_manager_id.len() > 128
+        {
+            return Err(Status::invalid_argument(
+                "proxy inventory exceeds bounded evidence limits",
+            ));
+        }
+        let mut listener_kinds = HashSet::new();
+        for listener in &report.listeners {
+            let kind = ProxyListenerKind::try_from(listener.kind)
+                .unwrap_or(ProxyListenerKind::Unspecified);
+            if kind == ProxyListenerKind::Unspecified || !listener_kinds.insert(listener.kind) {
+                return Err(Status::invalid_argument(
+                    "proxy listener kinds must be valid and unique",
+                ));
+            }
+            if listener.accepting && !listener.configured {
+                return Err(Status::invalid_argument(
+                    "an accepting proxy listener must be configured",
+                ));
+            }
+        }
+        let mut breaker_kinds = HashSet::new();
+        for breaker in &report.breakers {
+            let kind = ProxyBreakerDestinationKind::try_from(breaker.destination_kind)
+                .unwrap_or(ProxyBreakerDestinationKind::Unspecified);
+            if kind == ProxyBreakerDestinationKind::Unspecified
+                || !breaker_kinds.insert(breaker.destination_kind)
+                || breaker
+                    .closed
+                    .saturating_add(breaker.open)
+                    .saturating_add(breaker.half_open)
+                    != breaker.total
+            {
+                return Err(Status::invalid_argument(
+                    "proxy breaker aggregates must be valid, unique, and complete",
+                ));
+            }
+        }
+        if report.routing_synchronized && report.routing_manager_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "synchronized routing evidence requires a manager identity",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn register_proxy(
+        &self,
+        request: Request<RegisterProxyRequest>,
+    ) -> Result<Response<RegisterProxyResponse>, Status> {
+        let _admission = self.require_admission()?;
+        let (proxy_id, node_id) = Self::proxy_identity(&request)?;
+        Self::validate_proxy_registration(request.get_ref(), &node_id)?;
+        db::register_proxy(
+            &self.pool,
+            &proxy_id,
+            &node_id,
+            request.get_ref(),
+            self.proxy_tombstone_retention_secs,
+        )
+        .await?;
+        Ok(Response::new(RegisterProxyResponse { accepted: true }))
+    }
+
+    async fn report_proxy_inventory(
+        &self,
+        request: Request<ReportProxyInventoryRequest>,
+    ) -> Result<Response<ReportProxyInventoryResponse>, Status> {
+        let _admission = self.require_admission()?;
+        let (proxy_id, node_id) = Self::proxy_identity(&request)?;
+        Self::validate_proxy_process_instance_id(&request.get_ref().process_instance_id)?;
+        let report = request.get_ref().report.as_ref().ok_or_else(|| {
+            Status::invalid_argument("complete proxy inventory report is required")
+        })?;
+        Self::validate_proxy_report(report)?;
+        let received_at = db::replace_proxy_inventory(
+            &self.pool,
+            &proxy_id,
+            &node_id,
+            &request.get_ref().process_instance_id,
+            report,
+            &self.receiving_manager_id,
+        )
+        .await?;
+        Ok(Response::new(ReportProxyInventoryResponse {
+            accepted: true,
+            received_at: Some(proto_timestamp(received_at)),
+            receiving_manager_id: self.receiving_manager_id.clone(),
+        }))
+    }
+
+    async fn deregister_proxy(
+        &self,
+        request: Request<DeregisterProxyRequest>,
+    ) -> Result<Response<DeregisterProxyResponse>, Status> {
+        let (proxy_id, node_id) = Self::proxy_identity(&request)?;
+        Self::validate_proxy_process_instance_id(&request.get_ref().process_instance_id)?;
+        db::deregister_proxy(
+            &self.pool,
+            &proxy_id,
+            &node_id,
+            &request.get_ref().process_instance_id,
+        )
+        .await?;
+        Ok(Response::new(DeregisterProxyResponse { accepted: true }))
+    }
+
     // ── Engine lifecycle ──────────────────────────────────────────────────
 
     async fn register_engine(
@@ -471,6 +674,8 @@ impl Manager {
             self.manager_liveness_threshold_secs as f64,
             self.engine_heartbeat_timeout_secs,
             self.module_heartbeat_timeout_secs,
+            self.proxy_heartbeat_timeout_secs,
+            self.proxy_routing_freshness_secs,
         )?;
         Ok(Response::new(response))
     }
@@ -724,6 +929,8 @@ pub struct OperatorApi {
     manager_liveness_threshold_secs: f64,
     engine_heartbeat_timeout_secs: f64,
     module_heartbeat_timeout_secs: f64,
+    proxy_heartbeat_timeout_secs: f64,
+    proxy_routing_freshness_secs: f64,
 }
 
 impl OperatorApi {
@@ -761,7 +968,21 @@ impl OperatorApi {
             manager_liveness_threshold_secs,
             engine_heartbeat_timeout_secs,
             module_heartbeat_timeout_secs,
+            proxy_heartbeat_timeout_secs: crate::config::DEFAULT_PROXY_HEARTBEAT_TIMEOUT_SECS
+                as f64,
+            proxy_routing_freshness_secs: crate::config::DEFAULT_PROXY_ROUTING_FRESHNESS_SECS
+                as f64,
         }
+    }
+
+    pub fn with_proxy_status_thresholds(
+        mut self,
+        heartbeat_timeout_secs: u64,
+        routing_freshness_secs: u64,
+    ) -> Self {
+        self.proxy_heartbeat_timeout_secs = heartbeat_timeout_secs as f64;
+        self.proxy_routing_freshness_secs = routing_freshness_secs as f64;
+        self
     }
 
     fn require_admission(&self) -> Result<AdmissionGuard, Status> {
@@ -944,6 +1165,8 @@ impl OperatorApi {
             self.manager_liveness_threshold_secs,
             self.engine_heartbeat_timeout_secs,
             self.module_heartbeat_timeout_secs,
+            self.proxy_heartbeat_timeout_secs,
+            self.proxy_routing_freshness_secs,
         )?;
         cluster.nodes.retain(|node| {
             (filter.node_id.is_empty() || node.node_id == filter.node_id)
@@ -960,6 +1183,12 @@ impl OperatorApi {
                         .policy
                         .allows_infrastructure_read(&principal, &deployment.node_id)
             })
+        });
+        cluster.proxies.retain(|proxy| {
+            (filter.node_id.is_empty() || proxy.node_id == filter.node_id)
+                && self
+                    .policy
+                    .allows_infrastructure_read(&principal, &proxy.node_id)
         });
         if !filter.node_id.is_empty() && cluster.nodes.is_empty() {
             return Err(Status::not_found("selected node or slot was not found"));
@@ -2427,6 +2656,24 @@ impl ManagerNodeApi {
 }
 
 impl ManagerNodeApi {
+    async fn register_proxy(
+        &self,
+        request: Request<RegisterProxyRequest>,
+    ) -> Result<Response<RegisterProxyResponse>, Status> {
+        self.manager.register_proxy(request).await
+    }
+    async fn report_proxy_inventory(
+        &self,
+        request: Request<ReportProxyInventoryRequest>,
+    ) -> Result<Response<ReportProxyInventoryResponse>, Status> {
+        self.manager.report_proxy_inventory(request).await
+    }
+    async fn deregister_proxy(
+        &self,
+        request: Request<DeregisterProxyRequest>,
+    ) -> Result<Response<DeregisterProxyResponse>, Status> {
+        self.manager.deregister_proxy(request).await
+    }
     async fn register_engine(
         &self,
         request: Request<RegisterEngineRequest>,
@@ -2554,6 +2801,27 @@ impl AuthorizedNodeService {
 }
 #[tonic::async_trait]
 impl NodeService for AuthorizedNodeService {
+    async fn register_proxy(
+        &self,
+        mut r: Request<RegisterProxyRequest>,
+    ) -> Result<Response<RegisterProxyResponse>, Status> {
+        self.authorize(&mut r, "RegisterProxy", None)?;
+        self.inner.register_proxy(r).await
+    }
+    async fn report_proxy_inventory(
+        &self,
+        mut r: Request<ReportProxyInventoryRequest>,
+    ) -> Result<Response<ReportProxyInventoryResponse>, Status> {
+        self.authorize(&mut r, "ReportProxyInventory", None)?;
+        self.inner.report_proxy_inventory(r).await
+    }
+    async fn deregister_proxy(
+        &self,
+        mut r: Request<DeregisterProxyRequest>,
+    ) -> Result<Response<DeregisterProxyResponse>, Status> {
+        self.authorize(&mut r, "DeregisterProxy", None)?;
+        self.inner.deregister_proxy(r).await
+    }
     async fn register_engine(
         &self,
         mut r: Request<RegisterEngineRequest>,

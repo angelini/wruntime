@@ -30,7 +30,8 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
                     AND to_regclass('wr_manager_rollout_guard') IS NOT NULL
                     AND to_regclass('wr_manager_rollout_members') IS NOT NULL
                     AND to_regclass('wr_manager_rollout_events') IS NOT NULL
-                    AND to_regclass('wr_node_slot_owners') IS NOT NULL",
+                    AND to_regclass('wr_node_slot_owners') IS NOT NULL
+                    AND to_regclass('wr_proxy_inventory') IS NOT NULL",
             &[],
         )
         .await?
@@ -194,6 +195,51 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
         gossip_column_absent,
         "latest manager migration must remove gossip_address"
     );
+
+    let proxy_process_id_contract: bool = client
+        .query_one(
+            "SELECT EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_proxy_inventory'
+                  AND column_name = 'process_instance_id'
+                  AND data_type = 'text'
+                  AND is_nullable = 'NO'
+            ) AND EXISTS(
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname = current_schema()
+                  AND t.relname = 'wr_proxy_inventory'
+                  AND c.conname = 'wr_proxy_inventory_process_instance_id_length'
+            )",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(
+        proxy_process_id_contract,
+        "proxy lifecycle process IDs must use constrained text storage"
+    );
+    for invalid in [String::new(), "x".repeat(256)] {
+        assert!(
+            client
+                .execute(
+                    "INSERT INTO wr_proxy_inventory (proxy_id,node_id,process_instance_id,registration) VALUES ('proxy-migration','node-migration',$1,'\\x'::bytea)",
+                    &[&invalid],
+                )
+                .await
+                .is_err(),
+            "database constraint accepted an invalid proxy process ID"
+        );
+    }
+    let maximum = "m".repeat(255);
+    client
+        .execute(
+            "INSERT INTO wr_proxy_inventory (proxy_id,node_id,process_instance_id,registration) VALUES ('proxy-migration','node-migration',$1,'\\x'::bytea)",
+            &[&maximum],
+        )
+        .await?;
 
     Ok(())
 }

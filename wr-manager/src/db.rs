@@ -15,8 +15,8 @@ use wr_common::wruntime::{
     BeginDeploymentRequest, BeginManagerRolloutRequest, DeploymentInventoryV1, DeploymentRecord,
     DeploymentState, EngineOwnershipFence, EngineRegistration, ManagerRollout, ManagerRolloutPhase,
     ModuleDescriptor, NamespaceDbCredential, NamespaceSecrets, NodeAgentAttestation,
-    NodeAgentPolicy, NodeOperation, PrivilegedAdmissionState, RoutingRule, RoutingTable,
-    SlotObservation,
+    NodeAgentPolicy, NodeOperation, PrivilegedAdmissionState, ProxyInventoryReport,
+    ProxyInventoryStatus, RegisterProxyRequest, RoutingRule, RoutingTable, SlotObservation,
 };
 
 /// Exponential backoff strategy for NOWAIT lock retries: 10ms, 20ms, 40ms, 80ms.
@@ -99,6 +99,101 @@ impl<T, E: std::fmt::Display> IntoInternalStatus<T> for Result<T, E> {
     fn internal(self) -> Result<T, Status> {
         self.map_err(|e| Status::internal(e.to_string()))
     }
+}
+
+// ── Proxy inventory operations ──────────────────────────────────────────────
+
+pub async fn register_proxy(
+    pool: &Pool,
+    proxy_id: &str,
+    node_id: &str,
+    request: &RegisterProxyRequest,
+    tombstone_retention_secs: u64,
+) -> Result<(), Status> {
+    let process_id = request.process_instance_id.as_str();
+    let retention = i64::try_from(tombstone_retention_secs)
+        .map_err(|_| Status::invalid_argument("proxy tombstone retention is too large"))?;
+    let registration = request.encode_to_vec();
+    let (revision, bundle, operation, digest) = match request.deployment.as_ref() {
+        Some(metadata) => (
+            Some(
+                i64::try_from(metadata.revision)
+                    .map_err(|_| Status::invalid_argument("deployment revision is too large"))?,
+            ),
+            Some(metadata.bundle_digest.as_str()),
+            Some(
+                uuid::Uuid::parse_str(&metadata.operation_id).map_err(|_| {
+                    Status::invalid_argument("deployment operation_id must be a UUID")
+                })?,
+            ),
+            Some(metadata.revision_digest.as_str()),
+        ),
+        None => (None, None, None, None),
+    };
+    let mut client = pool.get().await.internal()?;
+    let txn = client.transaction().await.internal()?;
+    txn.execute(
+        "DELETE FROM wr_proxy_inventory WHERE deregistered_at IS NOT NULL AND deregistered_at < statement_timestamp() - $1::bigint * interval '1 second'",
+        &[&retention],
+    ).await.internal()?;
+    txn.execute(
+        "INSERT INTO wr_proxy_inventory (proxy_id,node_id,process_instance_id,deployment_revision,bundle_digest,operation_id,revision_digest,registration) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (proxy_id,node_id,process_instance_id) DO NOTHING",
+        &[&proxy_id, &node_id, &process_id, &revision, &bundle, &operation, &digest, &registration],
+    ).await.internal()?;
+    let row = txn.query_one(
+        "SELECT registration, deregistered_at FROM wr_proxy_inventory WHERE proxy_id=$1 AND node_id=$2 AND process_instance_id=$3 FOR UPDATE",
+        &[&proxy_id, &node_id, &process_id],
+    ).await.internal()?;
+    let existing: Vec<u8> = row.get("registration");
+    let deregistered: Option<chrono::DateTime<chrono::Utc>> = row.get("deregistered_at");
+    if deregistered.is_some() {
+        return Err(Status::failed_precondition(
+            "proxy process has been deregistered",
+        ));
+    }
+    if existing != registration {
+        return Err(Status::already_exists(
+            "proxy process immutable registration metadata differs",
+        ));
+    }
+    txn.commit().await.internal()?;
+    Ok(())
+}
+
+pub async fn replace_proxy_inventory(
+    pool: &Pool,
+    proxy_id: &str,
+    node_id: &str,
+    process_instance_id: &str,
+    report: &ProxyInventoryReport,
+    receiving_manager_id: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, Status> {
+    let process_id = process_instance_id;
+    let report = report.encode_to_vec();
+    let client = pool.get().await.internal()?;
+    let row = client.query_opt(
+        "UPDATE wr_proxy_inventory SET report=$4, report_received_at=statement_timestamp(), receiving_manager_id=$5 WHERE proxy_id=$1 AND node_id=$2 AND process_instance_id=$3 AND deregistered_at IS NULL RETURNING report_received_at",
+        &[&proxy_id, &node_id, &process_id, &report, &receiving_manager_id],
+    ).await.internal()?.ok_or_else(|| Status::failed_precondition("proxy process is not registered or has been deregistered"))?;
+    Ok(row.get(0))
+}
+
+pub async fn deregister_proxy(
+    pool: &Pool,
+    proxy_id: &str,
+    node_id: &str,
+    process_instance_id: &str,
+) -> Result<(), Status> {
+    let process_id = process_instance_id;
+    let client = pool.get().await.internal()?;
+    let changed = client.execute(
+        "UPDATE wr_proxy_inventory SET deregistered_at=COALESCE(deregistered_at, statement_timestamp()) WHERE proxy_id=$1 AND node_id=$2 AND process_instance_id=$3",
+        &[&proxy_id, &node_id, &process_id],
+    ).await.internal()?;
+    if changed == 0 {
+        return Err(Status::not_found("proxy process is not registered"));
+    }
+    Ok(())
 }
 
 // ── Engine operations ────────────────────────────────────────────────────────
@@ -1065,6 +1160,11 @@ pub struct StatusModuleHeartbeat {
 }
 
 #[derive(Clone, Debug)]
+pub struct StatusProxyRecord {
+    pub status: ProxyInventoryStatus,
+}
+
+#[derive(Clone, Debug)]
 pub struct StatusRouteRecord {
     pub rule: RoutingRule,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -1093,6 +1193,7 @@ pub struct ClusterStatusSnapshot {
     pub routing_version: u64,
     pub deployments: Vec<StatusDeploymentRecord>,
     pub engines: Vec<StatusEngineRecord>,
+    pub proxies: Vec<StatusProxyRecord>,
     pub module_heartbeats: Vec<StatusModuleHeartbeat>,
     pub routes: Vec<StatusRouteRecord>,
     pub managers: Vec<StatusManagerRecord>,
@@ -1617,6 +1718,38 @@ where
         })
         .collect::<Result<Vec<_>, Status>>()?;
 
+    let proxies = txn
+        .query(
+            "SELECT proxy_id,node_id,process_instance_id,registration,report,registered_at,report_received_at,receiving_manager_id FROM wr_proxy_inventory WHERE deregistered_at IS NULL ORDER BY node_id,proxy_id,process_instance_id",
+            &[],
+        )
+        .await
+        .internal()?
+        .iter()
+        .map(|row| {
+            let registration: Vec<u8> = row.get("registration");
+            let registration = RegisterProxyRequest::decode(registration.as_slice())
+                .map_err(|error| Status::internal(format!("failed to decode proxy registration: {error}")))?;
+            let report: Option<Vec<u8>> = row.get("report");
+            let report = report.map(|bytes| ProxyInventoryReport::decode(bytes.as_slice()))
+                .transpose()
+                .map_err(|error| Status::internal(format!("failed to decode proxy inventory report: {error}")))?;
+            let registered_at: chrono::DateTime<chrono::Utc> = row.get("registered_at");
+            let report_received_at: Option<chrono::DateTime<chrono::Utc>> = row.get("report_received_at");
+            Ok(StatusProxyRecord { status: ProxyInventoryStatus {
+                proxy_id: row.get("proxy_id"),
+                node_id: row.get("node_id"),
+                process_instance_id: row.get("process_instance_id"),
+                deployment: registration.deployment,
+                report,
+                registered_at: Some(prost_types::Timestamp { seconds: registered_at.timestamp(), nanos: registered_at.timestamp_subsec_nanos() as i32 }),
+                report_received_at: report_received_at.map(|value| prost_types::Timestamp { seconds: value.timestamp(), nanos: value.timestamp_subsec_nanos() as i32 }),
+                receiving_manager_id: row.get::<_, Option<String>>("receiving_manager_id").unwrap_or_default(),
+                ..Default::default()
+            }})
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+
     let module_heartbeats = txn
         .query(
             "SELECT engine_id, namespace, module_name, version, last_healthy
@@ -1712,6 +1845,7 @@ where
         routing_version,
         deployments,
         engines,
+        proxies,
         module_heartbeats,
         routes,
         managers,

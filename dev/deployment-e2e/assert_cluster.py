@@ -101,6 +101,71 @@ def assert_manager(status: dict[str, Any], address: str) -> dict[str, Any]:
     return {"manager_id": manager["manager_id"], "address": address}
 
 
+def assert_proxy_health(
+    status: dict[str, Any], selected_node: dict[str, Any], desired: dict[str, Any]
+) -> dict[str, Any]:
+    proxies = status.get("proxies", [])
+    proxy = one(
+        proxies,
+        f"selected expected proxy for node {selected_node.get('node_id')!r}",
+        lambda item: item.get("node_id") == selected_node.get("node_id")
+        and item.get("expected") is True
+        and item.get("selected") is True,
+    )
+    embedded = selected_node.get("proxies", [])
+    embedded_proxy = one(
+        embedded,
+        "node-embedded selected expected proxy",
+        lambda item: item.get("proxy_id") == proxy.get("proxy_id")
+        and item.get("process_instance_id") == proxy.get("process_instance_id"),
+    )
+    if embedded_proxy != proxy:
+        raise AssertionFailure("top-level and node-embedded proxy inventory differ")
+    identity = proxy.get("deployment")
+    if not isinstance(identity, dict):
+        raise AssertionFailure("selected proxy has no managed deployment identity")
+    exact = ("node_id", "revision", "bundle_digest", "operation_id", "revision_digest")
+    if any(not identity.get(field) or identity.get(field) != desired.get(field) for field in exact):
+        raise AssertionFailure("selected proxy deployment identity is not exact and non-circular")
+    if (
+        proxy.get("severity") != "healthy"
+        or proxy.get("lifecycle") != "ready"
+        or proxy.get("admission_open") is not True
+        or not proxy.get("report_received_at")
+        or not isinstance(proxy.get("report_age_seconds"), int)
+    ):
+        raise AssertionFailure("selected proxy is not fresh, READY, healthy, and admitting")
+    listeners = proxy.get("listeners")
+    if not isinstance(listeners, list):
+        raise AssertionFailure("selected proxy listener evidence is missing")
+    data_plane = one(listeners, "data-plane listener", lambda item: item.get("kind") == "data-plane")
+    if data_plane.get("configured") is not True or data_plane.get("accepting") is not True:
+        raise AssertionFailure("selected proxy data-plane listener is not accepting")
+    if any(item.get("configured") is True and item.get("accepting") is not True for item in listeners):
+        raise AssertionFailure("a required configured proxy listener is not accepting")
+    routing = proxy.get("routing")
+    known_managers = {item.get("manager_id") for item in status.get("managers", [])}
+    if (
+        not isinstance(routing, dict)
+        or routing.get("severity") != "healthy"
+        or routing.get("synchronized") is not True
+        or routing.get("installed_table_version", -1) < status.get("routing_table_version", 0)
+        or routing.get("source_manager_id") not in known_managers
+        or not isinstance(routing.get("synchronization_age_seconds"), int)
+    ):
+        raise AssertionFailure("selected proxy routing is not current, fresh, and manager-backed")
+    breakers = proxy.get("breakers")
+    if not isinstance(breakers, list) or not breakers:
+        raise AssertionFailure("selected proxy breaker summary is missing")
+    for breaker in breakers:
+        counts = [breaker.get(name) for name in ("total", "closed", "open", "half_open")]
+        if not all(isinstance(value, int) and value >= 0 for value in counts):
+            raise AssertionFailure("selected proxy breaker summary is malformed")
+        if counts[0] != sum(counts[1:]) or breaker.get("severity") != "healthy":
+            raise AssertionFailure("selected proxy breaker summary is not healthy and complete")
+    return {"proxy_id": proxy.get("proxy_id"), "process_instance_id": proxy.get("process_instance_id")}
+
+
 def assert_desired(status: dict[str, Any], args) -> dict[str, Any]:
     selected = node(status, args.node_id)
     desired = selected.get("desired_deployment")
@@ -143,6 +208,7 @@ def assert_desired(status: dict[str, Any], args) -> dict[str, Any]:
         if module.get("severity") != "healthy" or not module.get("last_healthy"):
             raise AssertionFailure("authoritative echo module is not freshly healthy")
     assert_routes(status, args.version, len(slots))
+    assert_proxy_health(status, selected, desired)
     return {"revision": revision, "digest": args.digest, "version": args.version, "engine_slots": slots}
 
 

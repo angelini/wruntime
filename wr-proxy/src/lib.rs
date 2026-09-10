@@ -3,6 +3,7 @@ pub mod config;
 pub mod indexed_routing;
 pub mod layers;
 pub mod node_service;
+pub mod reporting;
 pub mod routing;
 pub mod schema;
 mod transcoding;

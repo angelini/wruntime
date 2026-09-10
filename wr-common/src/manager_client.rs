@@ -201,6 +201,42 @@ impl ManagerEpoch {
     pub async fn repin(&self) -> Result<Self, tonic::Status> {
         self.provider.repin(self).await
     }
+
+    pub async fn register_proxy_exact(
+        &mut self,
+        request: RegisterProxyRequest,
+    ) -> Result<tonic::Response<RegisterProxyResponse>, tonic::Status> {
+        if self.retry_class != RetryClass::FreshRegistration {
+            return Err(tonic::Status::failed_precondition(
+                "proxy registration requires FreshRegistration retry semantics",
+            ));
+        }
+        self.client.register_proxy(request).await
+    }
+
+    pub async fn report_proxy_inventory_exact(
+        &mut self,
+        request: ReportProxyInventoryRequest,
+    ) -> Result<tonic::Response<ReportProxyInventoryResponse>, tonic::Status> {
+        if self.retry_class != RetryClass::FreshRegistration {
+            return Err(tonic::Status::failed_precondition(
+                "proxy full-state reporting requires FreshRegistration retry semantics",
+            ));
+        }
+        self.client.report_proxy_inventory(request).await
+    }
+
+    pub async fn deregister_proxy_once(
+        &mut self,
+        request: DeregisterProxyRequest,
+    ) -> Result<tonic::Response<DeregisterProxyResponse>, tonic::Status> {
+        if self.retry_class != RetryClass::NoReplayMutation {
+            return Err(tonic::Status::failed_precondition(
+                "proxy deregistration requires NoReplayMutation semantics",
+            ));
+        }
+        self.client.deregister_proxy(request).await
+    }
 }
 
 fn require_matching_observation(
@@ -406,6 +442,24 @@ where
         }
     }
 
+    pub async fn register_proxy(
+        &mut self,
+        request: impl tonic::IntoRequest<RegisterProxyRequest>,
+    ) -> Result<tonic::Response<RegisterProxyResponse>, tonic::Status> {
+        self.node.register_proxy(request).await
+    }
+    pub async fn report_proxy_inventory(
+        &mut self,
+        request: impl tonic::IntoRequest<ReportProxyInventoryRequest>,
+    ) -> Result<tonic::Response<ReportProxyInventoryResponse>, tonic::Status> {
+        self.node.report_proxy_inventory(request).await
+    }
+    pub async fn deregister_proxy(
+        &mut self,
+        request: impl tonic::IntoRequest<DeregisterProxyRequest>,
+    ) -> Result<tonic::Response<DeregisterProxyResponse>, tonic::Status> {
+        self.node.deregister_proxy(request).await
+    }
     pub async fn register_engine(
         &mut self,
         request: impl tonic::IntoRequest<RegisterEngineRequest>,

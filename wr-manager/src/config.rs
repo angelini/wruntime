@@ -12,6 +12,9 @@ use wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS;
 pub const DEFAULT_MANAGER_HEARTBEAT_INTERVAL_SECS: u64 = 1;
 pub const DEFAULT_MANAGER_STALE_ROW_REAP_THRESHOLD_SECS: u64 = 300;
 pub const DEFAULT_RELEASE_CLEANUP_INTERVAL_SECS: u64 = 30;
+pub const DEFAULT_PROXY_HEARTBEAT_TIMEOUT_SECS: u64 = 15;
+pub const DEFAULT_PROXY_ROUTING_FRESHNESS_SECS: u64 = 30;
+pub const DEFAULT_PROXY_TOMBSTONE_RETENTION_SECS: u64 = 3600;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeartbeatTimeoutSecs(NonZeroU64);
@@ -39,6 +42,9 @@ pub struct ManagerConfig {
     /// How long (seconds) without a per-module heartbeat before that module's
     /// routes are marked unhealthy.
     pub module_heartbeat_timeout_secs: HeartbeatTimeoutSecs,
+    pub proxy_heartbeat_timeout_secs: u64,
+    pub proxy_routing_freshness_secs: u64,
+    pub proxy_tombstone_retention_secs: u64,
     /// Loopback proxy address the scheduler POSTs jobs to, e.g.
     /// "http://127.0.0.1:9001". REQUIRED — startup fails if unset or empty.
     pub local_proxy_address: String,
@@ -107,6 +113,16 @@ fn default_heartbeat_timeout() -> u64 {
     10
 }
 
+fn default_proxy_heartbeat_timeout_secs() -> u64 {
+    DEFAULT_PROXY_HEARTBEAT_TIMEOUT_SECS
+}
+fn default_proxy_routing_freshness_secs() -> u64 {
+    DEFAULT_PROXY_ROUTING_FRESHNESS_SECS
+}
+fn default_proxy_tombstone_retention_secs() -> u64 {
+    DEFAULT_PROXY_TOMBSTONE_RETENTION_SECS
+}
+
 fn default_scheduler_lease_secs() -> u64 {
     30
 }
@@ -133,6 +149,12 @@ pub struct RawManagerConfig {
     pub engine_heartbeat_timeout_secs: u64,
     #[serde(default)]
     pub module_heartbeat_timeout_secs: Option<u64>,
+    #[serde(default = "default_proxy_heartbeat_timeout_secs")]
+    pub proxy_heartbeat_timeout_secs: u64,
+    #[serde(default = "default_proxy_routing_freshness_secs")]
+    pub proxy_routing_freshness_secs: u64,
+    #[serde(default = "default_proxy_tombstone_retention_secs")]
+    pub proxy_tombstone_retention_secs: u64,
     pub local_proxy_address: String,
     #[serde(default = "default_scheduler_lease_secs")]
     pub scheduler_lease_secs: u64,
@@ -175,6 +197,19 @@ impl RawManagerConfig {
         if let Some(t) = self.module_heartbeat_timeout_secs {
             v.check(t > 0, "module_heartbeat_timeout_secs must be > 0");
         }
+        v.check(
+            self.proxy_heartbeat_timeout_secs > 0,
+            "proxy_heartbeat_timeout_secs must be > 0",
+        );
+        v.check(
+            self.proxy_routing_freshness_secs >= self.proxy_heartbeat_timeout_secs,
+            "proxy_routing_freshness_secs must be >= proxy_heartbeat_timeout_secs",
+        );
+        v.check(
+            self.proxy_tombstone_retention_secs
+                >= self.proxy_heartbeat_timeout_secs.saturating_mul(10),
+            "proxy_tombstone_retention_secs must be at least 10 times proxy_heartbeat_timeout_secs",
+        );
         v.check(
             !self.local_proxy_address.is_empty(),
             "local_proxy_address is required",
@@ -324,6 +359,9 @@ impl ManagerConfig {
             listen_address: raw.listen_address,
             engine_heartbeat_timeout_secs: raw.engine_heartbeat_timeout_secs,
             module_heartbeat_timeout_secs,
+            proxy_heartbeat_timeout_secs: raw.proxy_heartbeat_timeout_secs,
+            proxy_routing_freshness_secs: raw.proxy_routing_freshness_secs,
+            proxy_tombstone_retention_secs: raw.proxy_tombstone_retention_secs,
             local_proxy_address: raw.local_proxy_address,
             scheduler_lease_secs: raw.scheduler_lease_secs,
             scheduler_retry_base_secs: raw.scheduler_retry_base_secs,
@@ -349,6 +387,9 @@ mod tests {
             listen_address: "127.0.0.1:9000".into(),
             engine_heartbeat_timeout_secs: 10,
             module_heartbeat_timeout_secs: None,
+            proxy_heartbeat_timeout_secs: DEFAULT_PROXY_HEARTBEAT_TIMEOUT_SECS,
+            proxy_routing_freshness_secs: DEFAULT_PROXY_ROUTING_FRESHNESS_SECS,
+            proxy_tombstone_retention_secs: DEFAULT_PROXY_TOMBSTONE_RETENTION_SECS,
             local_proxy_address: "http://127.0.0.1:9001".into(),
             scheduler_lease_secs: 30,
             scheduler_retry_base_secs: 5,
@@ -390,6 +431,17 @@ mod tests {
         let error = invalid.validate_inner().unwrap_err().to_string();
         assert!(error.contains("manager_heartbeat_interval_secs must be > 0"));
         assert!(error.contains("must be at least 10 times"));
+    }
+
+    #[test]
+    fn proxy_inventory_intervals_are_bounded_and_ordered() {
+        let mut invalid = config();
+        invalid.proxy_heartbeat_timeout_secs = 10;
+        invalid.proxy_routing_freshness_secs = 9;
+        invalid.proxy_tombstone_retention_secs = 99;
+        let error = invalid.validate_inner().unwrap_err().to_string();
+        assert!(error.contains("proxy_routing_freshness_secs"));
+        assert!(error.contains("proxy_tombstone_retention_secs"));
     }
 
     #[test]

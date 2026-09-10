@@ -3,6 +3,7 @@ pub mod config;
 pub mod indexed_routing;
 mod layers;
 pub mod node_service;
+pub mod reporting;
 pub mod routing;
 mod schema;
 mod transcoding;
@@ -27,7 +28,7 @@ use layers::{
     SchemaValidationLayer, TracingLayer,
 };
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use wr_common::discovery::ManagerDiscovery;
 use wr_common::lifecycle_service::{
     notify_supervisor, query_ready_status, AdmissionGate, LifecycleServiceAdapter,
@@ -46,6 +47,7 @@ const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
 struct ProxyTaskScopes {
     background: TaskGroup,
     data_plane: TaskGroup,
+    reporting: TaskGroup,
     admission: AdmissionGate,
 }
 
@@ -54,6 +56,7 @@ impl ProxyTaskScopes {
         Self {
             background: TaskGroup::new(),
             data_plane: TaskGroup::new(),
+            reporting: TaskGroup::new(),
             admission,
         }
     }
@@ -72,6 +75,21 @@ impl ProxyTaskScopes {
         Fut: Future<Output = Result<TaskExit>> + Send + 'static,
     {
         self.data_plane.spawn(name, task);
+    }
+
+    fn spawn_reporting<F, Fut>(&mut self, name: impl Into<String>, task: F)
+    where
+        F: FnOnce(TaskCancellation) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<TaskExit>> + Send + 'static,
+    {
+        self.reporting.spawn(name, task);
+    }
+
+    async fn shutdown_reporting(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> wr_common::task_group::TaskShutdownReport {
+        self.reporting.shutdown(deadline).await
     }
 
     async fn shutdown_data_plane(&mut self, deadline: tokio::time::Instant) -> Result<()> {
@@ -106,7 +124,7 @@ async fn wait_for_proxy_shutdown_trigger<F>(
 where
     F: Future<Output = ShutdownRequest>,
 {
-    if scopes.background.is_empty() && scopes.data_plane.is_empty() {
+    if scopes.background.is_empty() && scopes.data_plane.is_empty() && scopes.reporting.is_empty() {
         lifecycle.request_stop(
             TransitionReason::TaskFailure,
             "all required proxy tasks exited",
@@ -123,6 +141,9 @@ where
             ShutdownCause::RequiredTask(outcome)
         }
         outcome = scopes.data_plane.next_completion(), if !scopes.data_plane.is_empty() => {
+            ShutdownCause::RequiredTask(outcome)
+        }
+        outcome = scopes.reporting.next_completion(), if !scopes.reporting.is_empty() => {
             ShutdownCause::RequiredTask(outcome)
         }
     };
@@ -163,13 +184,21 @@ async fn lifecycle_probe(config_path: &str) -> Result<()> {
 }
 
 async fn run_service(config_path: &str) -> Result<()> {
-    let process_id = format!(
-        "proxy-{}-{}",
-        std::process::id(),
+    let activation_nonce = format!(
+        "{:016x}{:016x}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos()
+            .as_nanos() as u64,
+        std::process::id()
+    );
+    let process_id = format!(
+        "{}-{}-{}-{}-{}",
+        &activation_nonce[0..8],
+        &activation_nonce[8..12],
+        &activation_nonce[12..16],
+        &activation_nonce[16..20],
+        &activation_nonce[20..32]
     );
     let mut lifecycle = LifecycleOwner::new(
         ServiceKind::Proxy,
@@ -302,6 +331,7 @@ async fn run_service(config_path: &str) -> Result<()> {
     } else {
         None
     };
+    let external_configured = external.is_some();
 
     let lifecycle_service = LifecycleServiceAdapter::new(lifecycle.snapshot());
     let control_router = Server::builder()
@@ -386,22 +416,77 @@ async fn run_service(config_path: &str) -> Result<()> {
     }
 
     let mut failure: Option<anyhow::Error> = None;
-    admission.open();
-    if let Err(error) = lifecycle
-        .mark_ready("manager discovery, routing snapshot, control, and data listeners ready")
+    let report_source = reporting::ReportSource::new(
+        lifecycle.snapshot(),
+        admission.clone(),
+        reporting::ListenerFacts {
+            data_plane: true,
+            node_control: true,
+            peer: true,
+            external: external_configured,
+        },
+        routing_table.clone(),
+    );
+    let reporter = match reporting::Reporter::connect(
+        Arc::clone(&discovery),
+        lifecycle.current().process_instance_id.clone(),
+        config.deployment.as_ref(),
+        report_source,
+    )
+    .await
     {
-        failure = Some(error.into());
-        let _ = lifecycle.request_stop(TransitionReason::TaskFailure, "proxy readiness failed");
-    } else if let Err(error) = notify_supervisor("READY=1") {
-        failure = Some(
-            anyhow::Error::new(error).context("failed to notify supervisor that proxy is ready"),
-        );
+        Ok(reporter) => {
+            let reporter = Arc::new(tokio::sync::Mutex::new(reporter));
+            match reporting::register(&reporter).await {
+                Ok(()) => {
+                    let periodic = Arc::clone(&reporter);
+                    let interval = Duration::from_secs(config.status.report_interval_secs);
+                    scopes.spawn_reporting("proxy-inventory-reporter", move |cancellation| {
+                        reporting::run_periodic(periodic, interval, cancellation)
+                    });
+                    Some(reporter)
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            failure = Some(anyhow::Error::new(error).context("proxy reporter manager pin failed"));
+            None
+        }
+    };
+
+    if failure.is_some() {
         let _ = lifecycle.request_stop(
             TransitionReason::TaskFailure,
-            "proxy supervisor readiness notification failed",
+            "proxy inventory registration failed",
         );
     } else {
-        info!(internal = %config.listen_address, peer = %peer_bind, control = %control_address, "proxy ready");
+        admission.open();
+        if let Err(error) = lifecycle
+            .mark_ready("manager discovery, routing snapshot, control, and data listeners ready")
+        {
+            failure = Some(error.into());
+            let _ = lifecycle.request_stop(TransitionReason::TaskFailure, "proxy readiness failed");
+        } else if let Err(error) = notify_supervisor("READY=1") {
+            failure = Some(
+                anyhow::Error::new(error)
+                    .context("failed to notify supervisor that proxy is ready"),
+            );
+            let _ = lifecycle.request_stop(
+                TransitionReason::TaskFailure,
+                "proxy supervisor readiness notification failed",
+            );
+        } else {
+            if let Some(reporter) = &reporter {
+                if let Err(error) = reporter.lock().await.report().await {
+                    warn!(%error, "immediate READY proxy inventory report failed");
+                }
+            }
+            info!(internal = %config.listen_address, peer = %peer_bind, control = %control_address, "proxy ready");
+        }
     }
 
     if failure.is_none() {
@@ -436,8 +521,44 @@ async fn run_service(config_path: &str) -> Result<()> {
         }
     }
     let deadline = tokio::time::Instant::now() + SHUTDOWN_BUDGET;
+    admission.close();
+    let reporting_report = scopes.shutdown_reporting(deadline).await;
+    if !reporting_report.is_clean() {
+        failure.get_or_insert_with(|| {
+            anyhow::anyhow!("proxy reporting task shutdown was not clean: {reporting_report:?}")
+        });
+    }
+    if let Some(reporter) = &reporter {
+        match tokio::time::timeout_at(deadline, async { reporter.lock().await.report().await })
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(%error, "best-effort STOPPING proxy inventory report failed");
+            }
+            Err(_) => {
+                warn!("best-effort STOPPING proxy inventory report exceeded shutdown deadline")
+            }
+        }
+    }
     if let Err(error) = scopes.shutdown_data_plane(deadline).await {
         failure.get_or_insert(error);
+    }
+
+    if let Some(reporter) = &reporter {
+        match tokio::time::timeout_at(deadline, async {
+            reporter.lock().await.deregister().await
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(%error, "proxy deregistration outcome is uncertain; it will not be replayed");
+            }
+            Err(_) => warn!(
+                "proxy deregistration exceeded shutdown deadline; outcome is uncertain and will not be replayed"
+            ),
+        }
     }
 
     if let Err(error) = notify_supervisor("STOPPING=1") {
@@ -698,6 +819,33 @@ mod lifecycle_tests {
         assert!(report
             .failures()
             .any(|outcome| outcome.name == "proxy-background-required"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reporting_task_is_required_and_independently_joined() -> anyhow::Result<()> {
+        let mut lifecycle = LifecycleOwner::new(ServiceKind::Proxy, "proxy-test");
+        let mut scopes = ProxyTaskScopes::new(AdmissionGate::closed());
+        scopes.spawn_reporting("proxy-reporting-required", |_| async {
+            anyhow::bail!("proxy reporting fixture failed")
+        });
+
+        let cause = wait_for_proxy_shutdown_trigger(
+            &mut lifecycle,
+            &mut scopes,
+            std::future::pending::<ShutdownRequest>(),
+        )
+        .await?;
+        assert!(matches!(
+            cause,
+            ShutdownCause::RequiredTask(Some(ref outcome))
+                if outcome.name == "proxy-reporting-required"
+        ));
+        let report = scopes
+            .shutdown_reporting(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(!report.is_clean());
+        assert!(scopes.reporting.is_empty());
         Ok(())
     }
 

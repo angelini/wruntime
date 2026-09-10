@@ -24,6 +24,9 @@ just manager
 manager_id = "manager-a"
 listen_address = "0.0.0.0:9000"
 engine_heartbeat_timeout_secs = 30
+proxy_heartbeat_timeout_secs = 15
+proxy_routing_freshness_secs = 30
+proxy_tombstone_retention_secs = 3600
 release_cleanup_interval_secs = 30
 
 [tls]
@@ -62,6 +65,8 @@ and schemas to Postgres. Embedded SQL migrations run automatically on startup vi
 refinery, serialized across active-active managers by a Postgres advisory lock.
 
 The `[cluster]` section is required. Multiple managers can run active-active against the same Postgres database, which defines the cluster boundary. PostgreSQL manager leases are the sole liveness signal, and freshness uses database-server `NOW()` so host clock skew does not split the live set. Defaults are a 1-second heartbeat, 5-second live threshold, and 300-second stale-row reap threshold. The heartbeat must be positive, the live threshold must exceed it, and row reaping must be at least ten times the live threshold. The long reap window keeps a briefly dead manager visible as stale status evidence without returning it from `ListManagers`; cleanup runs in a separate owned task every 60 seconds so it cannot delay self-heartbeats. Set `advertise_grpc_address` when the manager is behind a load balancer or NAT.
+
+Proxy status uses manager PostgreSQL receipt time. `proxy_heartbeat_timeout_secs` defaults to 15; a report is stale only when its age is strictly greater than that boundary. `proxy_routing_freshness_secs` defaults to 30 and must be at least the heartbeat timeout; routing age is the proxy's monotonic observation age plus database-observed time elapsed since receipt. `proxy_tombstone_retention_secs` defaults to 3600 and must be at least ten heartbeat timeouts. Cleanly deregistered tombstones fence late reports but are excluded from status inventory.
 
 The manager runs immediate startup and periodic per-node release-cleanup reconciliation in its owned task group. `release_cleanup_interval_secs` defaults to 30 and must be in `1..=300`; 30 seconds is the default bounded discovery/status objective while a manager and PostgreSQL are available. Protection-changing transactions fence existing deletion authority immediately, while only this periodic task discovers or materializes replacement work.
 
@@ -127,6 +132,17 @@ manager_liveness_threshold_secs = 5 # must match manager cluster configuration
 [cache]
 routing_table_ttl_secs = 5   # how often to poll the manager for routing updates
 
+[status]
+report_interval_secs = 5     # bounded complete inventory snapshot cadence
+
+# Present as a complete set in generated managed releases; omit only for local development.
+[deployment]
+node_id = "node-a"
+revision = 1
+bundle_digest = "sha256:..."
+operation_id = "manager-derived-uuid"
+revision_digest = "sha256:..."
+
 # Optional; omit to block external HTTP from guests.
 [egress]
 allowed_domains = ["api.github.com", "*.openai.com"]
@@ -136,7 +152,7 @@ allowed_domains = ["api.github.com", "*.openai.com"]
 
 `control_address` exposes a gRPC `NodeService` that engines on the same node use for registration and heartbeats instead of connecting directly to the manager. This decouples engines from the manager address and enables local-first orchestration. The proxy normally discovers managers through `ListManagers`, but preserves a direct-PostgreSQL bootstrap/fallback path. `database.manager_liveness_threshold_secs` is validated as positive, defaults to 5, and must match every manager's `cluster.manager_liveness_threshold_secs` so both paths use one cluster-wide lease contract.
 
-The proxy is a streaming header-based router — it inspects only HTTP headers for routing decisions and streams request and response bodies through without buffering. It connects to the manager at startup, then polls for routing table updates in the background.
+The proxy is a streaming header-based router — it inspects only HTTP headers for routing decisions and streams request and response bodies through without buffering. It connects to the manager at startup, then polls for routing table updates in the background. `[status].report_interval_secs` defaults to 5 and must be positive. Managed generated configs contain the complete `[deployment]` identity shown above; partial metadata is invalid, while unmanaged local development omits the section as a whole. The proxy registers while `STARTING`, reports again after READY, periodically replaces its full listener/admission/routing/breaker snapshot, sends a final `STOPPING` report after admission closes, joins reporting, and then deregisters.
 
 ### External egress
 
@@ -709,7 +725,7 @@ wr-cli cluster status --fail-on unknown  # strict: unknown/not-reported is non-z
 
 `jobs` never falls back to the ordinary manager address or runtime mTLS files. Every jobs subcommand supports `--format table|json`. List emits one page and its `next_cursor`; reuse the cursor only with identical filters. Inspect reports payload/result lengths by default and writes exact bytes only to explicit create-new output paths (`--force` replaces). Retry is dead-only, requires `--yes`, and is never automatically replayed after an uncertain response. The CLI rejects unknown status values, missing or malformed required timestamps, inconsistent lifecycle counters/claim fields, and inconsistent summary totals instead of rendering plausible output. Payloads and successful results are limited to 1 MiB each, combined job identity/source/type metadata to 64 KiB, and error text to 1 MiB; the admin transport ceiling is 4 MiB.
 
-`cluster status` uses one `GetClusterStatus` RPC and never requires direct PostgreSQL access. The default is display-only; only an explicit `--fail-on` turns reported state into an exit gate. Query and mTLS failures are always non-zero. Engine/module freshness uses the manager's configured `engine_heartbeat_timeout_secs` and `module_heartbeat_timeout_secs`. Manager membership is live while its PostgreSQL lease is within `cluster.manager_liveness_threshold_secs`; stale retained rows are dead and report `STALE_MANAGER_HEARTBEAT`. Proxy routing-sync age, circuit state, and host resource usage are not configured status inputs and render as unknown/not reported. JSON status schema version 2 reflects the lease-only manager evidence.
+`cluster status` uses one `GetClusterStatus` RPC and never requires direct PostgreSQL access. The default is display-only; only an explicit `--fail-on` turns reported state into an exit gate. Query and mTLS failures are always non-zero. Engine/module freshness uses the manager's configured `engine_heartbeat_timeout_secs` and `module_heartbeat_timeout_secs`. Manager membership is live while its PostgreSQL lease is within `cluster.manager_liveness_threshold_secs`; stale retained rows are dead and report `STALE_MANAGER_HEARTBEAT`. Proxy report and routing freshness use the configured proxy thresholds above; listener, admission, routing and aggregate breaker evidence is known even when external ingress is disabled, routing is empty, or breaker counts are zero. Host CPU/memory remains unknown/not reported. JSON status remains additive schema version 2.
 
 Proxies and narrow discovery clients continue to use lease-filtered `ListManagers`; direct `wr_managers` reads are a bootstrap-only fallback when no manager RPC is reachable and use the matching proxy-side threshold.
 
