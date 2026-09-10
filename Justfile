@@ -337,6 +337,15 @@ deployment-e2e-docker:
 validate-all *args:
     bash dev/validate-all.sh "$@"
 
+# Select conservative focused feedback, falling back to validate-all when needed
+[positional-arguments]
+validate-changed *args:
+    bash dev/validate-changed.sh "$@"
+
+# Run the hermetic validate-changed selector regression suite
+test-validate-changed:
+    bash dev/test-validate-changed.sh
+
 # Run hot-path benchmarks (WASM→proxy→WASM).
 bench iterations="5000" warmup="30" concurrency="20": build-test-guests
     WRT_TEST_DB_URL={{db_url_test}} \

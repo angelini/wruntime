@@ -29,7 +29,7 @@ Use one authority for each information class. Derived documentation explains int
 | Module migration behavior | `docs/configuration.md`, guest template/constraints, and migration tests/examples |
 | Deployment generation, templates, node-agent installation, or backend effects | `docs/deployment.md`, `docs/configuration.md`, sample deploy config, CLI help/tests, and parity/determinism/final-exit invariants |
 | Executable example | example configs/scripts, guest examples index, README if the advertised workflow changes, and matching validation guidance |
-| Architecture/request flow | `docs/architecture.md`, concise root README/CLAUDE summary, invariants, and any affected public guide |
+| Architecture/request flow | `docs/architecture.md`, concise root README/AGENTS summary, invariants, and any affected public guide |
 | Validation recipe or prerequisites | `Justfile`, `dev/validate-all.sh`, `docs/testing.md`, and maintainer `validation.md` |
 
-Keep `CLAUDE.md` concise. It points maintainers here rather than becoming a second copy of repository guidance.
+Keep repository-wide agent guidance in root `AGENTS.md`. Keep `CLAUDE.md` as a concise pointer to `AGENTS.md` rather than a second copy.

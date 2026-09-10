@@ -16,6 +16,8 @@ just test-wasm               # build WASM guests, then run host binding tests
 just clean-wasm-cache        # remove only the shared Cargo guest cache
 just validate-ecommerce      # ecommerce inline run, failing on WARN/WARNING output
 just bench-proxy-routing     # warmed HTTP/2 proxy routing/forwarding benchmark
+just validate-changed --explain # inspect conservative focused-feedback selection
+just test-validate-changed   # hermetic selector regression suite
 just validate-all --no-deployment-e2e # full local suite with an explicit live-stage skip
 just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e # Pi sandbox
 just validate-all --deployment-e2e    # trusted runner: require both live deployment backends
@@ -87,6 +89,22 @@ WASM host binding tests require:
 Example inline scripts require the built workspace binaries, the same dev
 infrastructure, and Python 3 for small JSON/config rendering and assertions.
 The multi-node smoke test requires Postgres but not RustFS. `just test-lifecycle-runners` uses focused OS-process and local gRPC fixtures for `dev run` argument validation, fixed startup order and within-wave concurrency, READY activation and exit-before-ready tails, the shared routing deadline and scenario gate, zero-descendant one-shot success, unexpected-service scenario-tree cleanup, primary/cleanup/both-failure reporting, recorded-signal spawn guards, subprocess parent-death protection, and a controlled post-boundary exit that proves reap-before-return while retaining terminal evidence. Real SIGINT fixtures run serially and cover interruption during readiness, routing convergence, no-scenario monitoring, plus second-signal scenario escalation. The runner retains every service `Child` and the scenario process group until reaping proves exit; the fixtures also assert that no owned descendant, state socket, lock, or persistent process state remains. Repository example Just recipes build artifacts first, then each run script makes one foreground `dev run` call with its scenario. The codegen example uses `wr-cli invoke --json` and Python stdlib JSON parsing; no `jq` dependency is required.
+
+### Change-based focused feedback
+
+Use `just validate-changed [--base REF] [--explain] [validate-all flags]` for fast, conservative feedback. The base defaults to local `HEAD`; refs are resolved locally and are never fetched. `--explain` prints the requested and resolved base, deterministically shell-quoted paths, selection reason, and prospective commands without running validation. `just test-validate-changed` runs the selector's isolated temporary-repository tests.
+
+A stable homogeneous change set can select one focused profile:
+
+- `docs`: whitespace checking, workspace formatting, and a manual link/navigation reminder;
+- `workspace`: whitespace, formatting, check, lint, and tests;
+- `wasm`: workspace and guest formatting/linting, checks, all-guest WASM build, and tests.
+
+Focused profiles reject all `validate-all` passthrough flags and do not run `dev-up`. Start Postgres and RustFS with `just dev-up` before focused integration tests that need them; Pi callers use the existing services exposed inside the sandbox. No changes succeeds without dispatch. Unknown or cross-cutting paths, mixed focused ownership, selector files, root agent-guidance files, and the testing/validation policy documents select `full`; deployment-sensitive paths select `protected-full` and require `--deployment-e2e`. Broad selections delegate exactly once to the authoritative `validate-all` command, preserving allowed flags and their order.
+
+The selector examines committed-since-base, staged, unstaged, deleted, renamed, and non-ignored untracked paths. It only permits focused success for a stable before/after fingerprint; changing, unreadable, or otherwise uninspectable inputs fail or conservatively fall back to the broad gate. It performs no Cargo dependency or per-test impact analysis, uses no success cache, and supplies feedback rather than pre-merge evidence. Continue to run every change-sensitive command from the [validation matrix](agents/wruntime-maintainer/validation.md).
+
+For ordinary broad evidence, use `just validate-all --no-deployment-e2e` only when an explicit deployment skip is valid. Pi uses `just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e` and still runs multi-node, ecommerce, and stockmarket. Protected changes require `just validate-all --deployment-e2e` on the trusted runner; a local skip is not equivalent evidence.
 
 `just validate-all` is a thin alias for `dev/validate-all.sh`. The script
 orchestrates existing Just recipes for formatting, compile checks, lints, WASM

@@ -1,6 +1,6 @@
 # Validation Matrix
 
-Start focused, then run the broader requirement for the change class.
+While working, default to `just validate-changed [--base REF] [--explain]`, then run the broader requirement for the change class before completion. The command provides conservative, change-based feedback: it uses a focused profile only for stable homogeneous known changes and otherwise hands off once to `validate-all`. It does not replace any change-sensitive requirement in this matrix, including `validate-all`, WASM, ecommerce, or protected-runner evidence.
 
 | Change class | Focused validation |
 | --- | --- |
@@ -20,6 +20,7 @@ Start focused, then run the broader requirement for the change class.
 
 ## Environment and command policy
 
+- `just validate-changed` is a feedback selector, not a pre-merge gate. Focused profiles do not run `dev-up`; start required Postgres and RustFS services before focused integration tests. In Pi, use the already exposed development services. Unknown, cross-cutting, mixed-profile, unstable, or uninspectable inputs conservatively select or report the authoritative broad fallback.
 - Run `just dev-up` before recipes that require Postgres, RustFS S3, or LGTM. `just test`, `just test-integration`, `just test-one`, and `just test-wasm` set the repository test environment variables but do not replace the services.
 - In the Pi sandbox (`DOTGEN_PI_SANDBOX=1`), run `just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e`. Docker is unavailable there, but the existing development services are exposed. Only `ANTHROPIC_API_KEY` is unavailable for the local examples, so skip codegen explicitly while still running the multi-node, ecommerce, and stockmarket E2E examples. Do not pass `--no-e2e`.
 - Direct `cargo test` is useful for fast pure tests. DB-backed tests skip under the shared helper policy when `WRT_TEST_DB_URL` is absent; direct S3-backed tests require `WRT_TEST_S3_*` variables.

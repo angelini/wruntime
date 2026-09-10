@@ -10,8 +10,8 @@ This mode covers `wr-manager`, `wr-proxy`, `wr-engine`, `wr-common`, `wr-sdk`, `
 2. Use the [repository map](repository_map.md) to locate sources, focused tests, and related docs.
 3. Review the relevant [invariants](invariants.md).
 4. Follow [generated-contract fanout](generated_contracts.md) for protobuf, WIT, SDK, or guest schema changes.
-5. Run focused checks from the [validation matrix](validation.md).
+5. While working, default to `just validate-changed` for conservative feedback, then run any additional focused checks required by the [validation matrix](validation.md).
 6. Update the document that owns the changed public or maintainer contract.
-7. Run the broader validation required by the change class.
+7. Run the broader authoritative validation required by the change class before completion.
 
 Do not duplicate operator material here. Use the public guides for [architecture](../../architecture.md), [configuration](../../configuration.md), [deployment](../../deployment.md), [gRPC](../../grpc-api.md), and [testing](../../testing.md).
