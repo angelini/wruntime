@@ -120,7 +120,7 @@ def descriptor(manager_id: str, binary_digest: str, unit_digest: str, config_dig
         "credential_set_path": credential_path,
         "credential_digest": credential_digest,
     }
-    return json.dumps(value, indent=2, separators=(",", ": ")).encode()
+    return json.dumps(value, indent=2, separators=(",", ": "), sort_keys=initial).encode()
 
 
 def host_digest(target: dict[str, str]) -> str:

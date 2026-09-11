@@ -10,6 +10,11 @@
 const DISTROLESS_CC_DEBIAN13: &str =
     "gcr.io/distroless/cc-debian13@sha256:9b615fff20e1a4fad29c2b30562580b212c7dd5e2225236735cca0070ed11c78";
 
+/// Stable manager unit directory below runtime-mask precedence.
+pub const MANAGER_SYSTEMD_UNIT_DIR: &str = "/usr/local/lib/systemd/system";
+/// Stable manager unit installed outside `/etc` so a runtime mask overrides it.
+pub const MANAGER_SYSTEMD_UNIT_PATH: &str = "/usr/local/lib/systemd/system/wr-manager.service";
+
 /// A systemd service unit definition.
 pub struct ServiceUnit<'a> {
     pub description: &'a str,
@@ -103,6 +108,30 @@ os.execve(d['executable'],[d['executable'],d['config_path']],env)
 "#
 }
 
+/// Build the selector-fenced stop for a source activation after target control
+/// has been established. The source selector itself remains unchanged.
+pub fn manager_source_stop_command(
+    manager_id: &str,
+    current_descriptor: &str,
+    selector_digest: &str,
+) -> String {
+    fn q(value: &str) -> String {
+        super::helpers::shell_quote(value)
+    }
+    let inspect = r#"import json,sys
+d=json.load(open(sys.argv[1]))
+if d.get('schema_version') != 1 or d.get('manager_id') != sys.argv[2]: sys.exit('source activation identity mismatch')
+print(d.get('backend',''))
+print(d.get('backend_spec_path',''))"#;
+    format!(
+        "set -eu; current={current}; test \"sha256:$(sudo sha256sum -- \"$current\" | cut -d' ' -f1)\" = {selector}; source_info=$(sudo python3 -c {inspect} \"$current\" {manager_id}); backend=$(printf '%s\\n' \"$source_info\" | head -n1); spec=$(printf '%s\\n' \"$source_info\" | tail -n1); case \"$backend\" in systemd) sudo systemctl disable wr-manager.service; sudo systemctl stop wr-manager.service || true; sudo systemctl mask --runtime wr-manager.service || true; if sudo systemctl is-active --quiet wr-manager.service; then echo 'source manager remained active' >&2; exit 1; fi; unit_file_state=$(sudo systemctl is-enabled wr-manager.service || true); test \"$unit_file_state\" = masked-runtime ;; compose) sudo docker compose --project-name wruntime-manager -f \"$spec\" down; test -z \"$(sudo docker compose --project-name wruntime-manager -f \"$spec\" ps -q)\" ;; *) echo 'unsupported source manager backend' >&2; exit 1 ;; esac",
+        current = q(current_descriptor),
+        selector = q(selector_digest),
+        inspect = q(inspect),
+        manager_id = q(manager_id),
+    )
+}
+
 /// Build the single post-OLD_CLOSED selector transition. Preparatory config
 /// writes may happen first, but the final descriptor rename is authoritative.
 pub fn manager_activation_command(
@@ -123,7 +152,7 @@ pub fn manager_activation_command(
         r#"if sudo test -e "$current"; then old_spec=$(sudo python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["backend_spec_path"])' "$current"); sudo docker compose --project-name wruntime-manager -f "$old_spec" down; fi"#
     };
     let start = if systemd {
-        "sudo systemctl unmask wr-manager.service; sudo systemctl start wr-manager.service"
+        "sudo systemctl unmask --runtime wr-manager.service; sudo systemctl unmask wr-manager.service; sudo systemctl enable wr-manager.service; sudo systemctl start wr-manager.service"
     } else {
         // The immutable backend spec is selected by the descriptor; it contains
         // the digest-qualified image and stable mounts/project declaration.
@@ -385,6 +414,10 @@ mod tests {
     #[test]
     fn manager_launcher_and_activation_are_digest_gated_and_ordered() {
         let unit = manager_activation_systemd_unit();
+        assert_eq!(
+            MANAGER_SYSTEMD_UNIT_PATH,
+            format!("{MANAGER_SYSTEMD_UNIT_DIR}/wr-manager.service")
+        );
         assert!(unit.contains("EnvironmentFile=/var/lib/wruntime/manager-secrets/runtime.env"));
         assert!(!unit.contains("WRT_SECRET_ENCRYPTION_KEY="));
 
@@ -405,10 +438,101 @@ mod tests {
         );
         let stop = action.find("systemctl stop").unwrap();
         let select = action.find("mv \"$next\" \"$current\"").unwrap();
+        let unmask_runtime = action.find("systemctl unmask --runtime").unwrap();
+        let enable = action.find("systemctl enable").unwrap();
         let start = action.find("systemctl start").unwrap();
-        assert!(stop < select && select < start);
+        assert!(stop < select && select < unmask_runtime);
+        assert!(unmask_runtime < enable && enable < start);
         assert!(action.contains("previous.toml"));
         assert!(!action.contains("rm -rf"));
+
+        let source_stop = manager_source_stop_command(
+            "manager-a",
+            "/state/current-activation.json",
+            &format!("sha256:{}", "4".repeat(64)),
+        );
+        let selector_check = source_stop.find("sha256sum").unwrap();
+        let identity_check = source_stop
+            .find("source activation identity mismatch")
+            .unwrap();
+        let disable = source_stop.find("systemctl disable").unwrap();
+        let mask = source_stop.find("systemctl mask --runtime").unwrap();
+        let source_stop_effect = source_stop.find("systemctl stop").unwrap();
+        let inactive = source_stop.find("systemctl is-active").unwrap();
+        assert!(selector_check < identity_check);
+        assert!(
+            identity_check < disable
+                && disable < source_stop_effect
+                && source_stop_effect < mask
+                && mask < inactive
+        );
+        assert!(source_stop.contains("systemctl stop wr-manager.service || true"));
+        assert!(source_stop.contains("systemctl mask --runtime wr-manager.service || true"));
+        assert!(source_stop.contains("unit_file_state=$(sudo systemctl is-enabled"));
+        assert!(source_stop.contains("source manager remained active"));
+        assert!(source_stop.contains("masked-runtime"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn manager_source_stop_fails_closed_when_systemd_stays_active() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let directory = tempfile::tempdir().expect("create command test directory");
+        let descriptor = directory.path().join("current-activation.json");
+        let bytes = br#"{"schema_version":1,"manager_id":"manager-a","backend":"systemd","backend_spec_path":"/unit"}"#;
+        std::fs::write(&descriptor, bytes).expect("write activation descriptor");
+        let selector_digest = format!("sha256:{:x}", Sha256::digest(bytes));
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).expect("create fake binary directory");
+        let sudo = bin.join("sudo");
+        std::fs::write(&sudo, "#!/bin/sh\nexec \"$@\"\n").expect("write fake sudo");
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake sudo executable");
+        let systemctl = bin.join("systemctl");
+        std::fs::write(
+            &systemctl,
+            r#"#!/bin/sh
+case "$1" in
+disable) exit 0 ;;
+stop|mask) exit 1 ;;
+is-active) [ "${MOCK_MANAGER_ACTIVE:-0}" = 1 ] ;;
+is-enabled) printf 'masked-runtime\n'; exit 1 ;;
+*) exit 2 ;;
+esac
+"#,
+        )
+        .expect("write fake systemctl");
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake systemctl executable");
+        let command = manager_source_stop_command(
+            "manager-a",
+            descriptor.to_str().expect("descriptor path is UTF-8"),
+            &selector_digest,
+        );
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").expect("PATH is set")
+        );
+
+        let active = Command::new("/bin/sh")
+            .args(["-c", &command])
+            .env("PATH", &path)
+            .env("MOCK_MANAGER_ACTIVE", "1")
+            .status()
+            .expect("run active source-stop command");
+        assert!(!active.success());
+
+        let inactive = Command::new("/bin/sh")
+            .args(["-c", &command])
+            .env("PATH", &path)
+            .env("MOCK_MANAGER_ACTIVE", "0")
+            .status()
+            .expect("run inactive source-stop command");
+        assert!(inactive.success());
     }
 
     #[test]

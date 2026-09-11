@@ -494,6 +494,15 @@ fn manager_secret_template_archive_paths() -> &'static [&'static str] {
     ]
 }
 
+fn manager_systemd_install_command(service_path: &str) -> String {
+    format!(
+        "sudo install -d -m 0755 {unit_dir} && sudo install -m 0444 {source} {unit_path} && sudo systemctl daemon-reload",
+        unit_dir = helpers::shell_quote(service_gen::MANAGER_SYSTEMD_UNIT_DIR),
+        source = helpers::shell_quote(service_path),
+        unit_path = helpers::shell_quote(service_gen::MANAGER_SYSTEMD_UNIT_PATH),
+    )
+}
+
 fn manager_systemd_start_command() -> &'static str {
     "sudo systemctl daemon-reload && sudo systemctl enable wr-manager.service && sudo systemctl restart wr-manager.service"
 }
@@ -532,14 +541,18 @@ fn manager_docker_compose(workdir: &str, image_prefix: &str) -> String {
 const MANAGER_COMPOSE_PROJECT: &str = "wruntime-manager";
 
 fn manager_docker_start_command(workdir: &str) -> String {
+    let compose_file =
+        helpers::shell_quote(&format!("{workdir}/wr-manager/docker/docker-compose.yml"));
     format!(
-        "cd {workdir}/wr-manager && sudo docker compose --project-name {MANAGER_COMPOSE_PROJECT} -f docker/docker-compose.yml up -d --build --force-recreate"
+        "sudo docker compose --project-name {MANAGER_COMPOSE_PROJECT} -f {compose_file} up -d --build --force-recreate"
     )
 }
 
 fn manager_docker_logs_command(workdir: &str, tail: u32, follow: bool) -> String {
+    let compose_file =
+        helpers::shell_quote(&format!("{workdir}/wr-manager/docker/docker-compose.yml"));
     let mut command = format!(
-        "cd {workdir}/wr-manager && sudo docker compose --project-name {MANAGER_COMPOSE_PROJECT} -f docker/docker-compose.yml logs --tail {tail}"
+        "sudo docker compose --project-name {MANAGER_COMPOSE_PROJECT} -f {compose_file} logs --tail {tail}"
     );
     if follow {
         command.push_str(" -f");
@@ -574,6 +587,56 @@ fn validate_manager_activation(
     Ok(observation)
 }
 
+async fn wait_for_manager_epoch_ready_with<F, Fut>(
+    expected_instance: &str,
+    expected_identity: &wr_common::manager_client::EpochIdentity,
+    timeout: Duration,
+    mut query: F,
+) -> Result<helpers::LifecycleObservation>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<wr_common::wruntime::LifecycleStatus>>,
+{
+    helpers::wait_with_deadline(
+        "manager authenticated READY epoch",
+        timeout,
+        Duration::from_millis(200),
+        || {
+            let query = query();
+            async move {
+                let status = match query.await {
+                    Ok(status) => status,
+                    Err(error) => return helpers::WaitAttempt::QueryFailure(error),
+                };
+                let observation =
+                    match wr_common::manager_client::EpochObservation::from_lifecycle(&status) {
+                        Ok(observation) => observation,
+                        Err(error) => return helpers::WaitAttempt::Terminal(error.into()),
+                    };
+                if let Err(error) = observation.require_identity(expected_identity) {
+                    return helpers::WaitAttempt::Terminal(error.into());
+                }
+                if observation.process_ready && observation.process_instance_id == expected_instance
+                {
+                    helpers::WaitAttempt::Matched(helpers::LifecycleObservation {
+                        state: status.state,
+                        service_kind: status.service_kind,
+                        process_instance_id: observation.process_instance_id,
+                        reason: status.reason,
+                        detail: status.detail,
+                    })
+                } else {
+                    helpers::WaitAttempt::Pending(format!(
+                        "instance={}, ready={}",
+                        observation.process_instance_id, observation.process_ready
+                    ))
+                }
+            }
+        },
+    )
+    .await
+}
+
 async fn wait_for_manager_epoch_ready(
     endpoint: &str,
     tls: &wr_common::node::TlsConfig,
@@ -581,55 +644,21 @@ async fn wait_for_manager_epoch_ready(
     expected_identity: &wr_common::manager_client::EpochIdentity,
     timeout: Duration,
 ) -> Result<helpers::LifecycleObservation> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut epoch = client::connect_authenticated_with_tls(
-        endpoint,
-        tls,
-        wr_common::manager_client::RetryClass::ReadOnly,
-    )
-    .await?;
-    loop {
-        match epoch
+    wait_for_manager_epoch_ready_with(expected_instance, expected_identity, timeout, || async {
+        let mut epoch = client::connect_authenticated_with_tls(
+            endpoint,
+            tls,
+            wr_common::manager_client::RetryClass::ReadOnly,
+        )
+        .await?;
+        epoch
             .get_lifecycle_status(wr_common::wruntime::GetLifecycleStatusRequest {})
-            .await
-        {
-            Ok(response) => {
-                let status = response
-                    .into_inner()
-                    .status
-                    .context("manager lifecycle response omitted status")?;
-                let observation =
-                    wr_common::manager_client::EpochObservation::from_lifecycle(&status)?;
-                observation.require_identity(expected_identity)?;
-                if observation.process_ready && observation.process_instance_id == expected_instance
-                {
-                    return Ok(helpers::LifecycleObservation {
-                        state: status.state,
-                        service_kind: status.service_kind,
-                        process_instance_id: observation.process_instance_id,
-                        reason: status.reason,
-                        detail: status.detail,
-                    });
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.code(),
-                    tonic::Code::Cancelled
-                        | tonic::Code::Unknown
-                        | tonic::Code::DeadlineExceeded
-                        | tonic::Code::Unavailable
-                ) =>
-            {
-                epoch = epoch.repin().await?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("manager did not publish the expected authenticated READY epoch before timeout");
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+            .await?
+            .into_inner()
+            .status
+            .context("manager lifecycle response omitted status")
+    })
+    .await
 }
 
 fn combine_manager_readiness_and_tail(
@@ -1115,7 +1144,7 @@ fn install_resolved_manager_runtime_artifacts(
         let service_path = format!("{workdir}/wr-manager/systemd/wr-manager.service");
         helpers::run_ssh(
             params.ssh_base,
-            &format!("sudo cp {service_path} /etc/systemd/system/ && sudo systemctl daemon-reload"),
+            &manager_systemd_install_command(&service_path),
         )?;
     }
     println!("OK");
@@ -1237,6 +1266,23 @@ mod tests {
         path
     }
 
+    fn ready_manager_status(
+        identity: &wr_common::manager_client::EpochIdentity,
+        process_instance_id: &str,
+    ) -> wr_common::wruntime::LifecycleStatus {
+        wr_common::wruntime::LifecycleStatus {
+            state: wr_common::wruntime::ProcessLifecycleState::Ready as i32,
+            service_kind: wr_common::wruntime::ServiceKind::Manager as i32,
+            process_instance_id: process_instance_id.to_string(),
+            process_ready: true,
+            manager_id: identity.manager_id.clone(),
+            policy_generation: identity.policy_generation,
+            policy_digest: identity.policy_digest.clone(),
+            privileged_admission: wr_common::wruntime::PrivilegedAdmissionState::Open as i32,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn manager_activation_identity_is_installed_in_every_backend() {
         let environment = manager_runtime_env();
@@ -1284,6 +1330,70 @@ mod tests {
             ..observation
         };
         assert!(validate_manager_activation(wrong_kind, "manager-deploy-fixture").is_err());
+    }
+
+    #[tokio::test]
+    async fn manager_readiness_retries_an_initial_transport_failure() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let expected_identity = wr_common::manager_client::EpochIdentity {
+            manager_id: "manager-a".to_string(),
+            policy_generation: 1,
+            policy_digest: "policy-digest".to_string(),
+        };
+        let ready = ready_manager_status(&expected_identity, "manager-deploy-fixture");
+
+        let observation = wait_for_manager_epoch_ready_with(
+            "manager-deploy-fixture",
+            &expected_identity,
+            Duration::from_secs(1),
+            || {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let ready = ready.clone();
+                async move {
+                    if attempt == 0 {
+                        Err(anyhow::anyhow!("transport error"))
+                    } else {
+                        Ok(ready)
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(observation.process_instance_id, "manager-deploy-fixture");
+    }
+
+    #[tokio::test]
+    async fn manager_readiness_rejects_a_mismatched_epoch_without_retrying() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let expected_identity = wr_common::manager_client::EpochIdentity {
+            manager_id: "manager-a".to_string(),
+            policy_generation: 1,
+            policy_digest: "policy-digest".to_string(),
+        };
+        let mismatched_identity = wr_common::manager_client::EpochIdentity {
+            manager_id: "manager-b".to_string(),
+            ..expected_identity.clone()
+        };
+        let ready = ready_manager_status(&mismatched_identity, "manager-deploy-fixture");
+
+        let error = wait_for_manager_epoch_ready_with(
+            "manager-deploy-fixture",
+            &expected_identity,
+            Duration::from_secs(1),
+            || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let ready = ready.clone();
+                async move { Ok(ready) }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("stale or mismatched"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1377,6 +1487,10 @@ advertise_grpc_address = "{advertise_address}"
             index_of(phases, ManagerDeployPhase::CaptureFirstStartTimestamp)
                 < index_of(phases, ManagerDeployPhase::FirstStart)
         );
+        let install = manager_systemd_install_command("/opt/wruntime/wr-manager.service");
+        assert!(install.contains("install -d -m 0755 '/usr/local/lib/systemd/system'"));
+        assert!(install.contains(service_gen::MANAGER_SYSTEMD_UNIT_PATH));
+        assert!(!install.contains("/etc/systemd/system"));
         assert!(manager_systemd_start_command().contains("enable wr-manager.service"));
         assert!(manager_systemd_start_command().contains("restart wr-manager.service"));
         assert_eq!(phases, manager_deploy_phase_order(&DeployFormat::Systemd));
@@ -1410,9 +1524,11 @@ advertise_grpc_address = "{advertise_address}"
         assert!(manager_secret_template_archive_paths()
             .contains(&"wr-manager/docker/Dockerfile.manager"));
         let command = manager_docker_start_command("/opt/wruntime");
-        assert!(command.contains("docker compose"));
+        assert!(command.starts_with("sudo docker compose"));
         assert!(command.contains("--project-name wruntime-manager"));
+        assert!(command.contains("-f '/opt/wruntime/wr-manager/docker/docker-compose.yml'"));
         assert!(command.contains("up -d --build --force-recreate"));
+        assert!(!command.contains("cd "));
         assert!(!command.contains("restart"));
 
         let compose = manager_docker_compose("/opt/wruntime", "wr");
@@ -1424,9 +1540,11 @@ advertise_grpc_address = "{advertise_address}"
 
         for follow in [false, true] {
             let logs = manager_docker_logs_command("/opt/wruntime", 20, follow);
-            assert!(logs.contains("sudo docker compose"));
+            assert!(logs.starts_with("sudo docker compose"));
             assert!(logs.contains("--project-name wruntime-manager"));
+            assert!(logs.contains("-f '/opt/wruntime/wr-manager/docker/docker-compose.yml'"));
             assert!(logs.contains("--tail 20"));
+            assert!(!logs.contains("cd "));
             assert_eq!(logs.ends_with(" -f"), follow);
         }
     }

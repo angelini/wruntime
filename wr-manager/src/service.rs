@@ -2221,6 +2221,7 @@ impl InfrastructureApi {
             request.expected_phase,
             request.next_phase,
             &request.member_outcomes,
+            self.manager.manager_liveness_threshold_secs,
         )
         .await?;
         Ok(Response::new(AdvanceManagerRolloutResponse {

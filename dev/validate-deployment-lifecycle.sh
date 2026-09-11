@@ -264,6 +264,25 @@ assert value["total"] == 0, value
 assert value["depth"] == 0, value
 PY
 }
+wait_for_manager_set() {
+	local output="$1" expected="$2" absent="$3" deadline tmp
+	shift 3
+	deadline=$((SECONDS + 30))
+	tmp="${output}.tmp"
+	while true; do
+		if lifecycle_run_short 60 "$@" managers list >"$tmp" 2>&1 &&
+			grep -Fq "$expected" "$tmp" && ! grep -Fq "$absent" "$tmp"; then
+			mv "$tmp" "$output"
+			return 0
+		fi
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			mv "$tmp" "$output"
+			echo "manager membership did not converge to $expected without $absent" >&2
+			return 1
+		fi
+		sleep 1
+	done
+}
 assert_manager_rollout_trace() {
 	"${PYTHON[@]}" - "$1" "$2" <<'PY'
 import json, sys
@@ -277,6 +296,8 @@ assert all(item.get('target_generation') == generation for item in values), valu
 assert any(item.get('event') == 'barrier-start' for item in values), values
 assert any(item.get('event') == 'lease-renewed' for item in values), values
 assert any(item.get('event') == 'target-ready-closed' for item in values), values
+assert any(item.get('event') == 'target-control-established' for item in values), values
+assert any(item.get('event') == 'source-stop-completed' for item in values), values
 assert values[-1].get('event') == 'cli-completed', values[-1]
 assert all((item.get('barrier_timeout_seconds'), item.get('lease_ttl_seconds'), item.get('lease_renew_seconds')) == (120, 30, 10) for item in values)
 PY
@@ -701,7 +722,7 @@ PY
 
 	run_to_log "$backend durable engine restart" "$pass/restart.log" \
 		lifecycle_run_deploy_operation "$backend-restart" "${CLI_ARGS[@]}" engines restart --node-id "$NODE_ID" --slot engine-1 \
-		--request-token "$backend-restart" --json
+		--request-token "$backend-restart"
 	lifecycle_capture_operation_detail "$NODE_ID" "$backend-restart" "$pass/operation-restart.json" "${CLI_ARGS[@]}"
 	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-restart.json" \
 		--node-id "$NODE_ID" --request-token "$backend-restart" --action restart \
@@ -747,15 +768,15 @@ PY
 		run_to_log "manager A to B deploy-set" "$pass/manager-a-to-b.log" lifecycle_run_manager_rollout a-to-b "$manager_a_trace" \
 			"${CLI_ARGS[@]}" managers deploy-set --manifest "$MANAGER_A_TO_B_MANIFEST"
 		assert_manager_rollout_trace "$manager_a_trace" 2
-		lifecycle_run_short 60 "${MANAGER_B_CLI_ARGS[@]}" managers list >"$pass/managers-through-b.txt"
-		grep -Fq manager-b "$pass/managers-through-b.txt"
-		if grep -Fq manager-a "$pass/managers-through-b.txt"; then echo "manager A remained active after A-to-B" >&2; return 1; fi
+		wait_for_manager_set "$pass/managers-through-b.txt" manager-b manager-a "${MANAGER_B_CLI_ARGS[@]}"
+		"${SSH[@]}" "$MANAGER_REMOTE" "! sudo systemctl is-active --quiet wr-manager.service && test \"\$(sudo systemctl is-enabled wr-manager.service)\" = masked-runtime"
+		"${SSH[@]}" "$MANAGER_B_REMOTE" "sudo systemctl is-active --quiet wr-manager.service && test \"\$(sudo systemctl is-enabled wr-manager.service)\" = enabled"
 		run_to_log "manager B to A deploy-set" "$pass/manager-b-to-a.log" lifecycle_run_manager_rollout b-to-a "$manager_b_trace" \
 			"${MANAGER_B_CLI_ARGS[@]}" managers deploy-set --manifest "$MANAGER_B_TO_A_MANIFEST"
 		assert_manager_rollout_trace "$manager_b_trace" 3
-		lifecycle_run_short 60 "${CLI_ARGS[@]}" managers list >"$pass/managers-through-a-restored.txt"
-		grep -Fq manager-a "$pass/managers-through-a-restored.txt"
-		if grep -Fq manager-b "$pass/managers-through-a-restored.txt"; then echo "manager B remained active after B-to-A" >&2; return 1; fi
+		wait_for_manager_set "$pass/managers-through-a-restored.txt" manager-a manager-b "${CLI_ARGS[@]}"
+		"${SSH[@]}" "$MANAGER_B_REMOTE" "! sudo systemctl is-active --quiet wr-manager.service && test \"\$(sudo systemctl is-enabled wr-manager.service)\" = masked-runtime"
+		"${SSH[@]}" "$MANAGER_REMOTE" "sudo systemctl is-active --quiet wr-manager.service && test \"\$(sudo systemctl is-enabled wr-manager.service)\" = enabled"
 	fi
 	verify_manifest
 	collect_diagnostics "$backend"

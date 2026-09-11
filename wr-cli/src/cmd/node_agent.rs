@@ -130,6 +130,7 @@ impl AgentConfig {
     fn backend_config(&self) -> HostBackendConfig {
         HostBackendConfig {
             deployment_root: PathBuf::from(&self.deployment_root),
+            runtime_dir: PathBuf::from(&self.runtime_dir),
             backend: self.backend(),
             systemctl_path: (!self.systemctl_path.is_empty())
                 .then(|| PathBuf::from(&self.systemctl_path)),

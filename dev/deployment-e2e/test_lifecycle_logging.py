@@ -191,6 +191,10 @@ PY_REDACT
         self.assertEqual(script.count("--allow-downtime"), 2)
         self.assertNotIn("--wait-timeout", script)
         self.assertIn("node inventory contraction", script)
+        restart_invocation = script.split(
+            'run_to_log "$backend durable engine restart"', 1
+        )[1].split("lifecycle_capture_operation_detail", 1)[0]
+        self.assertNotIn("--json", restart_invocation)
         contract = LIFECYCLE_CONTRACT.read_text()
         self.assertIn('operations list --node-id "$node_id" --include-terminal --json', contract)
         self.assertIn('len(matches) != 1', contract)

@@ -73,6 +73,25 @@ class LifecycleContractTests(unittest.TestCase):
             lifecycle,
         )
 
+    def test_manager_rollout_waits_for_membership_and_checks_source_exit(self):
+        harness = HARNESS.read_text()
+        self.assertIn("wait_for_manager_set() {", harness)
+        self.assertIn(
+            'wait_for_manager_set "$pass/managers-through-b.txt" manager-b manager-a',
+            harness,
+        )
+        self.assertIn(
+            'wait_for_manager_set "$pass/managers-through-a-restored.txt" manager-a manager-b',
+            harness,
+        )
+        self.assertEqual(harness.count("! sudo systemctl is-active --quiet wr-manager.service"), 2)
+        self.assertEqual(harness.count("sudo systemctl is-active --quiet wr-manager.service"), 4)
+        self.assertEqual(harness.count("masked-runtime"), 2)
+        self.assertEqual(harness.count('= enabled"'), 2)
+        trace_assertion = harness[harness.index("assert_manager_rollout_trace() {"):]
+        self.assertIn("target-control-established", trace_assertion)
+        self.assertIn("source-stop-completed", trace_assertion)
+
     def test_real_harness_entry_executes_ordered_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -223,6 +242,51 @@ fi
                         "endpoint": endpoint,
                     }],
                 )
+
+    def test_manager_fixture_descriptor_order_matches_rust_producers(self):
+        import importlib.util
+        path = ROOT / "dev" / "deployment-e2e" / "manager_rollout_fixture.py"
+        spec = importlib.util.spec_from_file_location("manager_rollout_fixture", path)
+        self.assertIsNotNone(spec)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        args = (
+            "manager-a",
+            "sha256:" + "1" * 64,
+            "sha256:" + "2" * 64,
+            "sha256:" + "3" * 64,
+            "/etc/wruntime/pki/manager-endpoint/sets/v1",
+            "sha256:" + "4" * 64,
+        )
+
+        initial = module.descriptor(*args, initial=True)
+        self.assertEqual(list(json.loads(initial)), sorted(json.loads(initial)))
+        self.assertEqual(
+            module.digest_bytes(initial),
+            "sha256:146939e3166e4febd9bc963d539288767dc97022b91b929997d5fcc3c8013455",
+        )
+
+        rollout = module.descriptor(*args)
+        self.assertEqual(
+            list(json.loads(rollout)),
+            [
+                "schema_version",
+                "manager_id",
+                "backend",
+                "executable",
+                "executable_digest",
+                "backend_spec_path",
+                "backend_spec_digest",
+                "config_path",
+                "config_digest",
+                "credential_set_path",
+                "credential_digest",
+            ],
+        )
+        self.assertEqual(
+            module.digest_bytes(rollout),
+            "sha256:bc2eec1187de56f34a3973047fbdd37821982dd569c13e248bfe691f07a2e262",
+        )
 
     def test_stable_slot_fixtures_have_unique_pinned_endpoints(self):
         scenarios = ROOT / "wr-tests" / "deployment" / "scenarios"

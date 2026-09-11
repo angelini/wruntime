@@ -193,6 +193,22 @@ struct HostActionEvidence<'a> {
     continuation_deadline_unix: Option<u64>,
 }
 
+#[derive(Debug, Serialize)]
+struct SourceHostActionEvidence<'a> {
+    schema_version: u32,
+    rollout_id: &'a str,
+    manager_id: &'a str,
+    lease_epoch: u64,
+    action_sequence: u64,
+    manifest_digest: &'a str,
+    host_digest: &'a str,
+    selector_digest: &'a str,
+    effect: &'a str,
+    outcome: &'a str,
+    lease_expires_unix: u64,
+    continuation_deadline_unix: u64,
+}
+
 struct ValidatedManifest {
     manifest: ManagerSetManifest,
     policy: ValidatedPolicy,
@@ -508,6 +524,18 @@ fn ssh(target: &TargetManager, manifest: &ManagerSetManifest) -> Vec<String> {
     )
 }
 
+fn source_ssh(source: &SourceManager, manifest: &ManagerSetManifest) -> Vec<String> {
+    helpers::build_ssh_args(
+        &source.remote,
+        manifest.ssh_key.as_deref(),
+        manifest.ssh_port,
+    )
+}
+
+fn source_replaced_by_target(source: &SourceManager, target: &TargetManager) -> bool {
+    source.remote == target.remote && source.selector_digest == target.old_selector_digest
+}
+
 fn install_bootstrap_backend(target: &TargetManager, manifest: &ManagerSetManifest) -> Result<()> {
     if target.backend == Backend::Systemd {
         let launcher = service_gen::manager_launcher_script().as_bytes();
@@ -522,20 +550,24 @@ fn install_bootstrap_backend(target: &TargetManager, manifest: &ManagerSetManife
             RemoteInstallClass::Public,
             Some(&launcher_digest),
         )?;
+        helpers::run_ssh(
+            &ssh(target, manifest),
+            &format!(
+                "sudo install -d -m 0755 {}",
+                helpers::shell_quote(service_gen::MANAGER_SYSTEMD_UNIT_DIR)
+            ),
+        )?;
         helpers::install_remote_file(
             &target.backend_spec,
             &target.remote,
-            "/etc/systemd/system/wr-manager.service",
+            service_gen::MANAGER_SYSTEMD_UNIT_PATH,
             manifest.ssh_key.as_deref(),
             manifest.ssh_port,
             0o444,
             RemoteInstallClass::Public,
             Some(&target.backend_spec_digest),
         )?;
-        helpers::run_ssh(
-            &ssh(target, manifest),
-            "sudo systemctl daemon-reload && sudo systemctl enable wr-manager.service",
-        )?;
+        helpers::run_ssh(&ssh(target, manifest), "sudo systemctl daemon-reload")?;
     }
     Ok(())
 }
@@ -714,6 +746,74 @@ fn lease_expiry_unix(rollout: &ManagerRollout) -> u64 {
         .unwrap_or(0)
 }
 
+fn write_source_evidence(
+    source: &SourceManager,
+    validated: &ValidatedManifest,
+    rollout: &ManagerRollout,
+    outcome: &str,
+    continuation_deadline_unix: u64,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(&SourceHostActionEvidence {
+        schema_version: SCHEMA_VERSION,
+        rollout_id: &rollout.rollout_id,
+        manager_id: &source.manager_id,
+        lease_epoch: rollout.lease_epoch,
+        action_sequence: 2,
+        manifest_digest: &validated.manifest_digest,
+        host_digest: &source.host_digest,
+        selector_digest: &source.selector_digest,
+        effect: "deactivate-source",
+        outcome,
+        lease_expires_unix: lease_expiry_unix(rollout),
+        continuation_deadline_unix,
+    })?;
+    helpers::install_remote_fenced_json(
+        &bytes,
+        &source.remote,
+        &format!(
+            "{STATE_ROOT}/manager-rollouts/{}/{}.json",
+            rollout.rollout_id, source.manager_id
+        ),
+        validated.manifest.ssh_key.as_deref(),
+        validated.manifest.ssh_port,
+    )
+}
+
+fn deactivate_source(
+    source: &SourceManager,
+    validated: &ValidatedManifest,
+    rollout: &ManagerRollout,
+    continuation_deadline_unix: u64,
+) -> Result<ManagerRolloutMemberOutcome> {
+    write_source_evidence(
+        source,
+        validated,
+        rollout,
+        "started",
+        continuation_deadline_unix,
+    )?;
+    let command = service_gen::manager_source_stop_command(
+        &source.manager_id,
+        &format!("{STATE_ROOT}/manager-activation/current-activation.json"),
+        &source.selector_digest,
+    );
+    helpers::run_ssh(&source_ssh(source, &validated.manifest), &command)
+        .context("selector-fenced source manager deactivation failed")?;
+    write_source_evidence(
+        source,
+        validated,
+        rollout,
+        "completed",
+        continuation_deadline_unix,
+    )?;
+    Ok(ManagerRolloutMemberOutcome {
+        manager_id: source.manager_id.clone(),
+        member_role: "source".into(),
+        host_action_outcome: "STOPPED".into(),
+        error: String::new(),
+    })
+}
+
 fn activate_target(
     target: &TargetManager,
     validated: &ValidatedManifest,
@@ -809,6 +909,46 @@ async fn advance(
         .context("manager omitted rollout")
 }
 
+/// Best-effort durable failure recording through the current epoch or an
+/// expected target. Host state remains closed even when no endpoint responds.
+async fn mark_failed_closed(
+    epoch: &mut wr_common::manager_client::ManagerEpoch,
+    rollout: &ManagerRollout,
+    validated: &ValidatedManifest,
+    endpoint_present: bool,
+) {
+    if let Ok(current) = lease(epoch, rollout, &validated.manifest.executor_id).await {
+        if let Ok(failed) =
+            advance(epoch, &current, ManagerRolloutPhase::FailedClosed, vec![]).await
+        {
+            trace_rollout("phase", &failed, endpoint_present);
+            return;
+        }
+    }
+    for target in &validated.manifest.targets {
+        let Ok(mut candidate) =
+            client::connect_operator(&target.endpoint, RetryClass::DurableCreate).await
+        else {
+            continue;
+        };
+        let Ok(current) = lease(&mut candidate, rollout, &validated.manifest.executor_id).await
+        else {
+            continue;
+        };
+        if let Ok(failed) = advance(
+            &mut candidate,
+            &current,
+            ManagerRolloutPhase::FailedClosed,
+            vec![],
+        )
+        .await
+        {
+            trace_rollout("phase", &failed, endpoint_present);
+            return;
+        }
+    }
+}
+
 /// Observe manager-owned barriers without changing canonical action evidence.
 /// The lease is renewed on the specified ten-second cadence while waiting.
 async fn advance_when_ready(
@@ -872,6 +1012,62 @@ async fn lease(
         .into_inner()
         .rollout
         .context("manager omitted leased rollout")
+}
+
+fn target_controls_rollout(
+    epoch: &wr_common::manager_client::ManagerEpoch,
+    rollout: &ManagerRollout,
+    target: &TargetManager,
+) -> bool {
+    let observation = epoch.observation();
+    observation.manager_id == target.manager_id
+        && observation.process_ready
+        && observation.policy_generation == rollout.target_generation
+        && observation.policy_digest == rollout.target_policy_digest
+        && observation.privileged_admission
+            == wr_common::wruntime::PrivilegedAdmissionState::ClosedRollout as i32
+        && observation.rollout_id == rollout.rollout_id
+        && observation.rollout_phase == ManagerRolloutPhase::StartingTarget as i32
+        && observation.rollout_expected_set_hash == rollout.expected_target_set_hash
+        && observation.rollout_lease_epoch == rollout.lease_epoch
+}
+
+async fn establish_target_control(
+    validated: &ValidatedManifest,
+    source_epoch: &mut wr_common::manager_client::ManagerEpoch,
+    rollout: &mut ManagerRollout,
+    deadline: tokio::time::Instant,
+) -> Result<wr_common::manager_client::ManagerEpoch> {
+    let mut renew_at = tokio::time::Instant::now() + LEASE_RENEW_INTERVAL;
+    loop {
+        for target in &validated.manifest.targets {
+            if let Ok(mut candidate) =
+                client::connect_operator(&target.endpoint, RetryClass::DurableCreate).await
+            {
+                if target_controls_rollout(&candidate, rollout, target) {
+                    *rollout =
+                        lease(&mut candidate, rollout, &validated.manifest.executor_id).await?;
+                    trace_rollout("target-control-established", rollout, true);
+                    return Ok(candidate);
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("timed out establishing an exact closed target rollout-control endpoint");
+        }
+        if tokio::time::Instant::now() >= renew_at {
+            if let Ok(renewed) = lease(source_epoch, rollout, &validated.manifest.executor_id).await
+            {
+                *rollout = renewed;
+                trace_rollout("lease-renewed", rollout, true);
+            }
+            // An in-place transition deliberately stopped this epoch. Keep
+            // trying exact target endpoints within the bounded continuation;
+            // their first lease call still detects any intervening takeover.
+            renew_at = tokio::time::Instant::now() + LEASE_RENEW_INTERVAL;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 async fn begin(
@@ -1035,7 +1231,14 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
         trace_rollout("phase", &rollout, endpoint_present);
     }
     if rollout.phase == ManagerRolloutPhase::StartingTarget as i32 {
+        let handoff_deadline = tokio::time::Instant::now() + MANAGER_BARRIER_TIMEOUT;
+        let continuation_deadline_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + SOLE_MANAGER_CONTINUATION_SECS;
         let mut outcomes = Vec::new();
+        let mut stopped_sources = BTreeSet::new();
         for target in &validated.manifest.targets {
             if validated.manifest.manager_endpoint.is_none() {
                 outcomes.push(ManagerRolloutMemberOutcome {
@@ -1052,7 +1255,17 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
                 &rollout,
                 validated.manifest.sources.len() == 1 && validated.manifest.targets.len() == 1,
             ) {
-                Ok(outcome) => outcomes.push(outcome),
+                Ok(outcome) => {
+                    outcomes.push(outcome);
+                    for source in validated
+                        .manifest
+                        .sources
+                        .iter()
+                        .filter(|source| source_replaced_by_target(source, target))
+                    {
+                        stopped_sources.insert(source.manager_id.clone());
+                    }
+                }
                 Err(error) => {
                     let _ = write_evidence(
                         target,
@@ -1065,37 +1278,79 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
                         lease_expiry_unix(&rollout),
                         None,
                     );
-                    let failure = ManagerRolloutMemberOutcome {
-                        manager_id: target.manager_id.clone(),
-                        member_role: "target".into(),
-                        host_action_outcome: "ACTIVATION_FAILED".into(),
-                        error: format!("{error:#}"),
-                    };
-                    if let Ok(failed) = advance(
-                        &mut epoch,
-                        &rollout,
-                        ManagerRolloutPhase::FailedClosed,
-                        vec![failure],
-                    )
-                    .await
-                    {
-                        trace_rollout("phase", &failed, endpoint_present);
-                    }
+                    mark_failed_closed(&mut epoch, &rollout, &validated, endpoint_present).await;
                     return Err(error.context(
                         "manager activation failed closed; explicit host repair is required",
                     ));
                 }
             }
         }
+
+        epoch =
+            match establish_target_control(&validated, &mut epoch, &mut rollout, handoff_deadline)
+                .await
+            {
+                Ok(target_epoch) => target_epoch,
+                Err(error) => {
+                    mark_failed_closed(&mut epoch, &rollout, &validated, endpoint_present).await;
+                    return Err(error.context(
+                        "failed to establish target rollout control; explicit recovery is required",
+                    ));
+                }
+            };
+        for source in &validated.manifest.sources {
+            let outcome = if stopped_sources.contains(&source.manager_id) {
+                ManagerRolloutMemberOutcome {
+                    manager_id: source.manager_id.clone(),
+                    member_role: "source".into(),
+                    host_action_outcome: "STOPPED".into(),
+                    error: String::new(),
+                }
+            } else {
+                rollout = lease(&mut epoch, &rollout, &validated.manifest.executor_id).await?;
+                trace_rollout("lease-renewed", &rollout, endpoint_present);
+                match deactivate_source(source, &validated, &rollout, continuation_deadline_unix) {
+                    Ok(outcome) => {
+                        trace_rollout("source-stop-completed", &rollout, endpoint_present);
+                        outcome
+                    }
+                    Err(error) => {
+                        let _ = write_source_evidence(
+                            source,
+                            &validated,
+                            &rollout,
+                            "failed",
+                            continuation_deadline_unix,
+                        );
+                        mark_failed_closed(&mut epoch, &rollout, &validated, endpoint_present)
+                            .await;
+                        return Err(error.context(
+                            "source manager deactivation failed closed; explicit host repair is required",
+                        ));
+                    }
+                }
+            };
+            outcomes.push(outcome);
+        }
         trace_rollout("target-ready-closed", &rollout, endpoint_present);
-        rollout = advance_when_ready(
+        let starting_target = rollout.clone();
+        rollout = match advance_when_ready(
             &mut epoch,
             rollout,
             &validated.manifest.executor_id,
             ManagerRolloutPhase::TargetReadyClosed,
             outcomes,
         )
-        .await?;
+        .await
+        {
+            Ok(rollout) => rollout,
+            Err(error) => {
+                mark_failed_closed(&mut epoch, &starting_target, &validated, endpoint_present)
+                    .await;
+                return Err(error
+                    .context("target-ready barrier failed closed; explicit recovery is required"));
+            }
+        };
         trace_rollout("phase", &rollout, endpoint_present);
     }
     if rollout.phase == ManagerRolloutPhase::TargetReadyClosed as i32 {
@@ -1109,14 +1364,25 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
         trace_rollout("phase", &rollout, endpoint_present);
     }
     if rollout.phase == ManagerRolloutPhase::ActivatingTarget as i32 {
-        rollout = advance_when_ready(
+        let activating_target = rollout.clone();
+        rollout = match advance_when_ready(
             &mut epoch,
             rollout,
             &validated.manifest.executor_id,
             ManagerRolloutPhase::Completed,
             vec![],
         )
-        .await?;
+        .await
+        {
+            Ok(rollout) => rollout,
+            Err(error) => {
+                mark_failed_closed(&mut epoch, &activating_target, &validated, endpoint_present)
+                    .await;
+                return Err(error.context(
+                    "target activation barrier failed closed; explicit recovery is required",
+                ));
+            }
+        };
         trace_rollout("phase", &rollout, endpoint_present);
     }
     trace_rollout("cli-completed", &rollout, endpoint_present);
@@ -1152,6 +1418,37 @@ mod tests {
             new_selector_digest: format!("sha256:{}", "6".repeat(64)),
             host_digest: String::new(),
         }
+    }
+
+    #[test]
+    fn manager_unit_is_installed_below_runtime_mask_precedence() {
+        assert!(
+            service_gen::MANAGER_SYSTEMD_UNIT_PATH.starts_with("/usr/local/lib/systemd/system/")
+        );
+        assert!(!service_gen::MANAGER_SYSTEMD_UNIT_PATH.starts_with("/etc/systemd/system/"));
+    }
+
+    #[test]
+    fn source_is_replaced_only_by_the_exact_target_host_and_selector() {
+        let source = SourceManager {
+            manager_id: "manager-a".into(),
+            endpoint: "https://manager-a.example:9000".into(),
+            remote: "root@manager-a.example".into(),
+            host_digest: format!("sha256:{}", "4".repeat(64)),
+            selector_digest: format!("sha256:{}", "5".repeat(64)),
+        };
+        let mut replacement = target();
+        replacement.remote.clone_from(&source.remote);
+        replacement
+            .old_selector_digest
+            .clone_from(&source.selector_digest);
+        assert!(source_replaced_by_target(&source, &replacement));
+
+        replacement.remote = "root@manager-b.example".into();
+        assert!(!source_replaced_by_target(&source, &replacement));
+        replacement.remote.clone_from(&source.remote);
+        replacement.old_selector_digest = format!("sha256:{}", "6".repeat(64));
+        assert!(!source_replaced_by_target(&source, &replacement));
     }
 
     #[test]

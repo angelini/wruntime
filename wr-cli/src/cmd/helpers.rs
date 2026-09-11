@@ -1022,7 +1022,7 @@ if current.exists():
  old=json.loads(current.read_text())
  if data['lease_epoch'] < old['lease_epoch'] or (data['lease_epoch']==old['lease_epoch'] and data['action_sequence'] < old['action_sequence']): sys.exit('stale host action fence')
  same=data['lease_epoch']==old['lease_epoch'] and data['action_sequence']==old['action_sequence']
- immutable=['rollout_id','manager_id','manifest_digest','executable_digest','backend_spec_digest','config_digest','credential_digest','old_selector_digest','new_selector_digest','effect']
+ immutable=['rollout_id','manager_id','manifest_digest','host_digest','selector_digest','executable_digest','backend_spec_digest','config_digest','credential_digest','old_selector_digest','new_selector_digest','effect']
  if same and any(data.get(k)!=old.get(k) for k in immutable): sys.exit('conflicting host action replay')
  if same and old.get('outcome') in ('completed','failed') and data.get('outcome')!=old.get('outcome'): sys.exit('terminal host action replay conflict')
  if not same and data.get('lease_expires_unix',0) <= int(time.time()): sys.exit('host action lease expired')

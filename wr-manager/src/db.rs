@@ -3534,6 +3534,7 @@ pub async fn lease_manager_rollout(
     get_manager_rollout(pool, &rollout_id.to_string()).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn advance_manager_rollout(
     pool: &Pool,
     rollout_id: &str,
@@ -3542,6 +3543,7 @@ pub async fn advance_manager_rollout(
     expected_phase: i32,
     next_phase: i32,
     member_outcomes: &[wr_common::wruntime::ManagerRolloutMemberOutcome],
+    manager_liveness_threshold_secs: u64,
 ) -> Result<ManagerRollout, Status> {
     let rollout_id = uuid::Uuid::parse_str(rollout_id)
         .map_err(|_| Status::invalid_argument("rollout_id must be a UUID"))?;
@@ -3667,31 +3669,41 @@ pub async fn advance_manager_rollout(
         return get_manager_rollout(pool, &rollout_id.to_string()).await;
     }
     let barrier_sql = match next {
-        ManagerRolloutPhase::OldClosed => Some("SELECT COUNT(*) FROM wr_manager_rollout_members WHERE rollout_id=$1 AND member_role='source' AND COALESCE(admission_state,'') NOT IN ('CLOSED_ROLLOUT','STOPPED','UNREACHABLE')"),
+        ManagerRolloutPhase::OldClosed => Some("SELECT COUNT(*) FROM wr_manager_rollout_members WHERE rollout_id=$1 AND member_role='source' AND COALESCE(admission_state,'')!='CLOSED_ROLLOUT'"),
         ManagerRolloutPhase::TargetReadyClosed => Some("SELECT
             (SELECT COUNT(*) FROM wr_manager_rollout_members m JOIN wr_manager_rollouts r USING (rollout_id)
              WHERE m.rollout_id=$1 AND m.member_role='target'
                AND (m.process_state!='READY' OR m.admission_state!='CLOSED_ROLLOUT'
                     OR m.observed_policy_generation!=r.target_generation
-                    OR m.observed_policy_digest!=r.target_policy_digest))
+                    OR m.observed_policy_digest!=r.target_policy_digest
+                    OR COALESCE(m.host_action_outcome,'')!='READY_CLOSED'))
+            + (SELECT COUNT(*) FROM wr_manager_rollout_members
+               WHERE rollout_id=$1 AND member_role='source'
+                 AND COALESCE(host_action_outcome,'')!='STOPPED')
             + (SELECT COUNT(*) FROM wr_managers
-               WHERE last_heartbeat > NOW() - INTERVAL '30 seconds' AND admission_state='OPEN')"),
+               WHERE last_heartbeat > NOW() - make_interval(secs => $2::double precision)
+                 AND admission_state='OPEN')"),
         ManagerRolloutPhase::Completed => Some("SELECT
             (SELECT COUNT(*) FROM wr_manager_rollout_members
              WHERE rollout_id=$1 AND member_role='target' AND admission_state!='OPEN')
             + (SELECT COUNT(*) FROM wr_managers live
-               WHERE live.last_heartbeat > NOW() - INTERVAL '30 seconds' AND live.admission_state='OPEN'
+               WHERE live.last_heartbeat > NOW() - make_interval(secs => $2::double precision)
                  AND NOT EXISTS (SELECT 1 FROM wr_manager_rollout_members target
                                  WHERE target.rollout_id=$1 AND target.member_role='target'
                                    AND target.manager_id=live.manager_id))"),
         _ => None,
     };
     if let Some(sql) = barrier_sql {
-        let remaining: i64 = transaction
-            .query_one(sql, &[&rollout_id])
-            .await
-            .internal()?
-            .get(0);
+        let threshold_secs = manager_liveness_threshold_secs as f64;
+        let row = if next == ManagerRolloutPhase::OldClosed {
+            transaction.query_one(sql, &[&rollout_id]).await
+        } else {
+            transaction
+                .query_one(sql, &[&rollout_id, &threshold_secs])
+                .await
+        }
+        .internal()?;
+        let remaining: i64 = row.get(0);
         if remaining != 0 {
             return Err(Status::failed_precondition(
                 "manager rollout barrier is not satisfied",

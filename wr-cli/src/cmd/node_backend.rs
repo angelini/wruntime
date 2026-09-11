@@ -19,6 +19,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::watch;
 use wr_common::wruntime::{
@@ -69,6 +70,7 @@ impl std::ops::Deref for ValidatedTarget<'_> {
 }
 
 const COMMAND_BUDGET: Duration = Duration::from_secs(45);
+const COMMAND_OUTPUT_LIMIT: usize = 2_048;
 const STOP_BUDGET: Duration = Duration::from_secs(90);
 const STOP_GRACE_BUDGET: Duration = Duration::from_secs(45);
 const STOP_ESCALATION_BUDGET: Duration = Duration::from_secs(15);
@@ -220,6 +222,7 @@ pub trait InstructionExecutor: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct HostBackendConfig {
     pub deployment_root: PathBuf,
+    pub runtime_dir: PathBuf,
     pub backend: BackendType,
     pub systemctl_path: Option<PathBuf>,
     pub docker_path: Option<PathBuf>,
@@ -230,6 +233,9 @@ impl HostBackendConfig {
     pub fn validate(&self) -> Result<()> {
         if !self.deployment_root.is_absolute() || self.deployment_root == Path::new("/") {
             bail!("deployment_root must be a non-root absolute path");
+        }
+        if !self.runtime_dir.is_absolute() || self.runtime_dir == Path::new("/") {
+            bail!("runtime_dir must be a non-root absolute path");
         }
         match self.backend {
             BackendType::Systemd => validate_binary(
@@ -287,6 +293,7 @@ impl HostBackend {
         path_attestor: Box<dyn PathAttestor>,
     ) -> Result<Self> {
         config.validate()?;
+        path_attestor.attest_directory(&config.runtime_dir, "runtime_dir")?;
         match config.backend {
             BackendType::Systemd => {
                 path_attestor.attest_binary(config.systemctl_path.as_deref(), "systemctl_path")?
@@ -312,6 +319,22 @@ impl HostBackend {
             .deployment_root
             .join("wr-node/releases")
             .join(revision.to_string()))
+    }
+
+    fn prepare_docker_command(&self, mut command: Command) -> Result<Command> {
+        let docker_config_dir = self.config.runtime_dir.join("docker");
+        match std::fs::create_dir(&docker_config_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).context("failed to create Docker CLI config directory")
+            }
+        }
+        std::fs::set_permissions(&docker_config_dir, std::fs::Permissions::from_mode(0o700))?;
+        self.path_attestor
+            .attest_directory(&docker_config_dir, "Docker CLI config directory")?;
+        command.env("DOCKER_CONFIG", docker_config_dir);
+        Ok(command)
     }
 
     fn canonical_release(&self, revision: u64) -> Result<PathBuf> {
@@ -735,7 +758,7 @@ impl HostBackend {
         };
         let compose = release.join("docker/docker-compose.yml");
         let project = self.config.compose_project.as_deref().unwrap_or_default();
-        let output = constrained_command(
+        let command = constrained_command(
             binary,
             [
                 "compose",
@@ -749,9 +772,12 @@ impl HostBackend {
                 "json",
                 service,
             ],
-        )
-        .output()
-        .await;
+        );
+        let mut command = match self.prepare_docker_command(command) {
+            Ok(command) => command,
+            Err(error) => return BackendObservation::query_error(error),
+        };
+        let output = command.output().await;
         match output {
             Ok(output) if output.status.success() => {
                 parse_docker_observation(&output.stdout, service)
@@ -794,7 +820,7 @@ impl HostBackend {
                     .as_deref()
                     .context("compose project missing")?;
                 let compose = release.join("docker/docker-compose.yml");
-                let mut command = constrained_command(
+                let mut command = self.prepare_docker_command(constrained_command(
                     binary,
                     [
                         "compose",
@@ -803,11 +829,16 @@ impl HostBackend {
                         "-f",
                         compose.to_string_lossy().as_ref(),
                     ],
-                );
+                ))?;
                 match action {
-                    EffectAction::Start => {
-                        command.args(["up", "-d", "--build", "--no-deps", &slot.docker_service])
-                    }
+                    EffectAction::Start => command.args([
+                        "up",
+                        "-d",
+                        "--build",
+                        "--force-recreate",
+                        "--no-deps",
+                        &slot.docker_service,
+                    ]),
                     EffectAction::Stop => {
                         command.args(["stop", "--timeout", "45", &slot.docker_service])
                     }
@@ -846,11 +877,15 @@ impl HostBackend {
         release: &Path,
         cancelled: watch::Receiver<bool>,
     ) -> Result<()> {
-        let mut command = self.effect_command(action, slot, release)?;
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-        let status = run_cancellable(command, cancelled, COMMAND_BUDGET).await?;
-        if !status.success() {
-            bail!("backend {} failed with status {status}", action.name());
+        let command = self.effect_command(action, slot, release)?;
+        let output = run_cancellable_with_output(command, cancelled, COMMAND_BUDGET).await?;
+        if !output.status.success() {
+            let diagnostic = format_command_output(&output.stdout, &output.stderr);
+            bail!(
+                "backend {} failed with status {}: {diagnostic}",
+                action.name(),
+                output.status
+            );
         }
         Ok(())
     }
@@ -872,7 +907,7 @@ impl HostBackend {
             .as_deref()
             .context("compose project missing")?;
         let compose = release.join("docker/docker-compose.yml");
-        let mut command = constrained_command(
+        let mut command = self.prepare_docker_command(constrained_command(
             binary,
             [
                 "compose",
@@ -885,7 +920,7 @@ impl HostBackend {
                 signal,
                 &slot.docker_service,
             ],
-        );
+        ))?;
         command.stdout(Stdio::null()).stderr(Stdio::null());
         Ok(command)
     }
@@ -1962,6 +1997,146 @@ where
     command
 }
 
+#[derive(Debug)]
+struct BoundedCommandStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct BoundedCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: BoundedCommandStream,
+    stderr: BoundedCommandStream,
+}
+
+async fn read_bounded_command_stream<R>(mut reader: R) -> std::io::Result<BoundedCommandStream>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(COMMAND_OUTPUT_LIMIT);
+    let mut chunk = [0_u8; 1024];
+    let mut truncated = false;
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        if count >= COMMAND_OUTPUT_LIMIT {
+            bytes.clear();
+            bytes.extend_from_slice(&chunk[count - COMMAND_OUTPUT_LIMIT..count]);
+            truncated = true;
+            continue;
+        }
+        let overflow = bytes
+            .len()
+            .saturating_add(count)
+            .saturating_sub(COMMAND_OUTPUT_LIMIT);
+        if overflow > 0 {
+            bytes.drain(..overflow);
+            truncated = true;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    Ok(BoundedCommandStream { bytes, truncated })
+}
+
+fn format_command_stream(stream: &BoundedCommandStream) -> String {
+    let text = String::from_utf8_lossy(&stream.bytes);
+    let sanitized = text
+        .chars()
+        .map(|character| {
+            if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        return String::new();
+    }
+    if stream.truncated {
+        format!("[truncated] {sanitized}")
+    } else {
+        sanitized.to_string()
+    }
+}
+
+fn format_command_output(stdout: &BoundedCommandStream, stderr: &BoundedCommandStream) -> String {
+    let stdout = format_command_stream(stdout);
+    let stderr = format_command_stream(stderr);
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => "backend command produced no output".to_string(),
+        (false, true) => format!("stdout: {stdout}"),
+        (true, false) => format!("stderr: {stderr}"),
+        (false, false) => format!("stdout: {stdout}; stderr: {stderr}"),
+    }
+}
+
+async fn run_cancellable_with_output(
+    mut command: Command,
+    mut cancelled: watch::Receiver<bool>,
+    budget: Duration,
+) -> Result<BoundedCommandOutput> {
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .context("failed to spawn constrained backend command")?;
+    let pid = child.id().context("backend command has no process id")? as i32;
+    let stdout = child
+        .stdout
+        .take()
+        .context("backend command stdout was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("backend command stderr was not captured")?;
+    let stdout_task = tokio::spawn(read_bounded_command_stream(stdout));
+    let stderr_task = tokio::spawn(read_bounded_command_stream(stderr));
+    let result = tokio::select! {
+        status = child.wait() => status.context("backend command wait failed"),
+        changed = cancelled.changed() => {
+            let _ = changed;
+            Err(anyhow::anyhow!("backend command cancelled by lease guard"))
+        }
+        () = tokio::time::sleep(budget) => Err(anyhow::anyhow!("backend command exceeded 45-second budget")),
+    };
+    let status = match result {
+        Ok(status) => status,
+        Err(error) => {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(error);
+        }
+    };
+    let stdout = stdout_task
+        .await
+        .context("backend stdout collector failed")?
+        .context("failed to read backend stdout")?;
+    let stderr = stderr_task
+        .await
+        .context("backend stderr collector failed")?
+        .context("failed to read backend stderr")?;
+    Ok(BoundedCommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 async fn run_cancellable(
     mut command: Command,
     mut cancelled: watch::Receiver<bool>,
@@ -2320,6 +2495,79 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 
+    #[tokio::test]
+    async fn backend_effect_failure_preserves_bounded_command_diagnostics() {
+        let root = temp_root("backend-effect-diagnostics");
+        let release = root.join("release");
+        let runtime_dir = root.join("run");
+        std::fs::create_dir_all(release.join("docker")).expect("create release directory");
+        std::fs::create_dir(&runtime_dir).expect("create runtime directory");
+        std::fs::create_dir_all(root.join("bin")).expect("create binary directory");
+        let docker = root.join("bin/docker");
+        std::fs::write(
+            &docker,
+            r#"#!/bin/sh
+printf 'docker-config=%s\n' "${DOCKER_CONFIG:-missing}"
+printf 'args=%s\n' "$*"
+printf 'discarded-prefix-' >&2
+i=0
+while [ "$i" -lt 3000 ]; do
+  printf x >&2
+  i=$((i + 1))
+done
+printf '\ncompose final diagnostic\n' >&2
+exit 1
+"#,
+        )
+        .expect("write fake docker CLI");
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake docker CLI executable");
+        let backend = HostBackend::new_with_attestor(
+            HostBackendConfig {
+                deployment_root: root.clone(),
+                runtime_dir: runtime_dir.clone(),
+                backend: BackendType::Docker,
+                systemctl_path: None,
+                docker_path: Some(docker),
+                compose_project: Some("wruntime-test".into()),
+            },
+            Box::new(TestPathAttestor),
+        )
+        .expect("backend");
+        let slot = ReleaseSlot {
+            engine_slot: "blue".into(),
+            systemd_unit: "wr-engine-blue.service".into(),
+            docker_service: "engine-blue".into(),
+            lifecycle_address: "http://127.0.0.1:9100".into(),
+            config_path: "config/engine.toml".into(),
+        };
+        let (_cancel, receiver) = watch::channel(false);
+        let error = backend
+            .run_effect(EffectAction::Start, &slot, &release, receiver)
+            .await
+            .expect_err("fake Docker start must fail");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("backend start failed with status exit status: 1"));
+        assert!(detail.contains(&format!(
+            "stdout: docker-config={}",
+            runtime_dir.join("docker").display()
+        )));
+        assert!(detail.contains("args=compose -p wruntime-test"));
+        assert!(detail.contains("up -d --build --force-recreate --no-deps engine-blue"));
+        assert!(detail.contains("stderr: [truncated]"));
+        assert!(detail.contains("compose final diagnostic"));
+        assert!(!detail.contains("discarded-prefix"));
+        assert_eq!(
+            std::fs::metadata(runtime_dir.join("docker"))
+                .expect("inspect Docker config directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
     #[test]
     fn parses_exact_docker_identity() {
         let observation = parse_docker_observation(
@@ -2387,6 +2635,7 @@ mod tests {
         let backend = HostBackend::new_with_attestor(
             HostBackendConfig {
                 deployment_root: PathBuf::from("/tmp/wruntime-test"),
+                runtime_dir: PathBuf::from("/run/wruntime"),
                 backend: BackendType::Docker,
                 systemctl_path: None,
                 docker_path: Some(PathBuf::from("/usr/bin/docker")),
@@ -2463,6 +2712,7 @@ mod tests {
         let backend = HostBackend::new_with_attestor(
             HostBackendConfig {
                 deployment_root: PathBuf::from("/tmp/wruntime-test"),
+                runtime_dir: PathBuf::from("/run/wruntime"),
                 backend: BackendType::Systemd,
                 systemctl_path: Some(PathBuf::from("/usr/bin/systemctl")),
                 docker_path: None,
@@ -2524,6 +2774,7 @@ mod tests {
         HostBackend::new_with_attestor(
             HostBackendConfig {
                 deployment_root: root.to_path_buf(),
+                runtime_dir: root.to_path_buf(),
                 backend: BackendType::Systemd,
                 systemctl_path: Some(root.join("systemctl")),
                 docker_path: None,

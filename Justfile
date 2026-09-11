@@ -291,6 +291,7 @@ deployment-e2e-contract-test:
     cargo test -p wr-cli cmd::node
     cargo test -p wr-cli cmd::operations
     cargo test -p wr-cli cmd::manager_deploy_set
+    cargo test -p wr-cli cmd::managers
     cargo test -p wr-manager operations
     just test-one operation_test
     just test-one manager_test

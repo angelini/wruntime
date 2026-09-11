@@ -2676,6 +2676,7 @@ async fn manager_rollout_lease_phases_and_activation_barriers_are_fenced() -> Re
             expected as i32,
             next as i32,
             &[],
+            wr_common::DEFAULT_MANAGER_LIVENESS_THRESHOLD_SECS,
         )
     };
     advance(ManagerRolloutPhase::Prepared, ManagerRolloutPhase::Staging).await?;
@@ -2695,7 +2696,7 @@ async fn manager_rollout_lease_phases_and_activation_barriers_are_fenced() -> Re
     )
     .await?;
     pool.get().await?.execute(
-        "UPDATE wr_manager_rollout_members SET process_state='READY',admission_state='CLOSED_ROLLOUT',observed_policy_generation=2,observed_policy_digest=$2 WHERE rollout_id=$1 AND member_role='target'",
+        "UPDATE wr_manager_rollout_members SET process_state='READY',admission_state='CLOSED_ROLLOUT',observed_policy_generation=2,observed_policy_digest=$2,host_action_outcome='READY_CLOSED' WHERE rollout_id=$1 AND member_role='target'",
         &[&uuid::Uuid::parse_str(&rollout.rollout_id)?, &target_digest],
     ).await?;
     advance(
@@ -2727,6 +2728,191 @@ async fn manager_rollout_lease_phases_and_activation_barriers_are_fenced() -> Re
         Some(target_digest.as_str())
     );
     assert!(guard.get::<_, Option<uuid::Uuid>>(2).is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn manager_rollout_requires_source_stop_and_lease_absence_before_completion() -> Result<()> {
+    use wr_common::wruntime::{
+        BeginManagerRolloutRequest, ManagerRolloutMemberOutcome, ManagerRolloutPhase,
+        ManagerRolloutSource, ManagerRolloutTarget,
+    };
+
+    let pool = helpers::db::manager_pool().await;
+    let source_digest = format!("sha256:{}", "1".repeat(64));
+    let target_digest = format!("sha256:{}", "2".repeat(64));
+    wr_manager::db::register_manager(&pool, "manager-a", "https://manager-a:9000").await?;
+    let client = pool.get().await?;
+    client
+        .execute(
+            "UPDATE wr_manager_rollout_guard SET accepted_generation=1,accepted_digest=$1",
+            &[&source_digest],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE wr_managers SET policy_generation=1,policy_digest=$1,admission_state='OPEN' WHERE manager_id='manager-a'",
+            &[&source_digest],
+        )
+        .await?;
+    drop(client);
+
+    let request = BeginManagerRolloutRequest {
+        client_operation_id: "a63c54ac-7fe2-4ddf-96e5-0da2e4b18d7d".into(),
+        cluster_id: "cluster-a".into(),
+        target_generation: 2,
+        target_policy_digest: target_digest.clone(),
+        expected_targets: vec![ManagerRolloutTarget {
+            manager_id: "manager-b".into(),
+            endpoint: "https://manager-b:9000".into(),
+            host_digest: format!("sha256:{}", "3".repeat(64)),
+            config_digest: format!("sha256:{}", "4".repeat(64)),
+            ..Default::default()
+        }],
+        source_managers: vec![ManagerRolloutSource {
+            manager_id: "manager-a".into(),
+            endpoint: "https://manager-a:9000".into(),
+            host_digest: format!("sha256:{}", "5".repeat(64)),
+            selector_digest: format!("sha256:{}", "6".repeat(64)),
+        }],
+        target_policy_validator_version: 1,
+        target_deployment_principal_uri: "urn:wruntime:cluster-a:human:deployer".into(),
+        target_deployment_leaf_fingerprint: format!("sha256:{}", "7".repeat(64)),
+        ..Default::default()
+    };
+    let rollout = wr_manager::db::begin_manager_rollout(
+        &pool,
+        &request.target_deployment_principal_uri,
+        &request.target_deployment_leaf_fingerprint,
+        &request,
+        &format!("sha256:{}", "8".repeat(64)),
+        true,
+    )
+    .await?;
+    let owner = "33333333-3333-4333-8333-333333333333";
+    let rollout =
+        wr_manager::db::lease_manager_rollout(&pool, &rollout.rollout_id, owner, 0).await?;
+    let advance = |expected: ManagerRolloutPhase, next: ManagerRolloutPhase| {
+        wr_manager::db::advance_manager_rollout(
+            &pool,
+            &rollout.rollout_id,
+            owner,
+            rollout.lease_epoch,
+            expected as i32,
+            next as i32,
+            &[],
+            1,
+        )
+    };
+    advance(ManagerRolloutPhase::Prepared, ManagerRolloutPhase::Staging).await?;
+    advance(
+        ManagerRolloutPhase::Staging,
+        ManagerRolloutPhase::ClosingOld,
+    )
+    .await?;
+    let rollout_id = uuid::Uuid::parse_str(&rollout.rollout_id)?;
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE wr_manager_rollout_members SET admission_state='CLOSED_ROLLOUT' WHERE rollout_id=$1 AND member_role='source'",
+            &[&rollout_id],
+        )
+        .await?;
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE wr_managers SET admission_state='CLOSED_ROLLOUT' WHERE manager_id='manager-a'",
+            &[],
+        )
+        .await?;
+    advance(
+        ManagerRolloutPhase::ClosingOld,
+        ManagerRolloutPhase::OldClosed,
+    )
+    .await?;
+    advance(
+        ManagerRolloutPhase::OldClosed,
+        ManagerRolloutPhase::StartingTarget,
+    )
+    .await?;
+
+    wr_manager::db::register_manager(&pool, "manager-b", "https://manager-b:9000").await?;
+    pool.get().await?.execute(
+        "UPDATE wr_managers SET policy_generation=2,policy_digest=$1,admission_state='CLOSED_ROLLOUT' WHERE manager_id='manager-b'",
+        &[&target_digest],
+    ).await?;
+    pool.get().await?.execute(
+        "UPDATE wr_manager_rollout_members SET process_state='READY',admission_state='CLOSED_ROLLOUT',observed_policy_generation=2,observed_policy_digest=$2 WHERE rollout_id=$1 AND member_role='target'",
+        &[&rollout_id, &target_digest],
+    ).await?;
+    let target_ready = ManagerRolloutMemberOutcome {
+        manager_id: "manager-b".into(),
+        member_role: "target".into(),
+        host_action_outcome: "READY_CLOSED".into(),
+        error: String::new(),
+    };
+    let source_stopped = ManagerRolloutMemberOutcome {
+        manager_id: "manager-a".into(),
+        member_role: "source".into(),
+        host_action_outcome: "STOPPED".into(),
+        error: String::new(),
+    };
+    let missing_source_stop = wr_manager::db::advance_manager_rollout(
+        &pool,
+        &rollout.rollout_id,
+        owner,
+        rollout.lease_epoch,
+        ManagerRolloutPhase::StartingTarget as i32,
+        ManagerRolloutPhase::TargetReadyClosed as i32,
+        std::slice::from_ref(&target_ready),
+        1,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(missing_source_stop.code(), tonic::Code::FailedPrecondition);
+    wr_manager::db::advance_manager_rollout(
+        &pool,
+        &rollout.rollout_id,
+        owner,
+        rollout.lease_epoch,
+        ManagerRolloutPhase::StartingTarget as i32,
+        ManagerRolloutPhase::TargetReadyClosed as i32,
+        &[target_ready, source_stopped],
+        1,
+    )
+    .await?;
+    advance(
+        ManagerRolloutPhase::TargetReadyClosed,
+        ManagerRolloutPhase::ActivatingTarget,
+    )
+    .await?;
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE wr_manager_rollout_members SET admission_state='OPEN' WHERE rollout_id=$1 AND member_role='target'",
+            &[&rollout_id],
+        )
+        .await?;
+    let fresh_source = advance(
+        ManagerRolloutPhase::ActivatingTarget,
+        ManagerRolloutPhase::Completed,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(fresh_source.code(), tonic::Code::FailedPrecondition);
+    pool.get()
+        .await?
+        .execute(
+            "UPDATE wr_managers SET last_heartbeat=NOW()-INTERVAL '2 seconds' WHERE manager_id='manager-a'",
+            &[],
+        )
+        .await?;
+    advance(
+        ManagerRolloutPhase::ActivatingTarget,
+        ManagerRolloutPhase::Completed,
+    )
+    .await?;
+
     Ok(())
 }
 
