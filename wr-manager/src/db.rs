@@ -16,7 +16,8 @@ use wr_common::wruntime::{
     DeploymentState, EngineOwnershipFence, EngineRegistration, ManagerRollout, ManagerRolloutPhase,
     ModuleDescriptor, NamespaceDbCredential, NamespaceSecrets, NodeAgentAttestation,
     NodeAgentPolicy, NodeOperation, PrivilegedAdmissionState, ProxyInventoryReport,
-    ProxyInventoryStatus, RegisterProxyRequest, RoutingRule, RoutingTable, SlotObservation,
+    ProxyInventoryStatus, RegisterProxyRequest, ResetFailedManagerRolloutResponse, RoutingRule,
+    RoutingTable, SlotObservation,
 };
 
 /// Exponential backoff strategy for NOWAIT lock retries: 10ms, 20ms, 40ms, 80ms.
@@ -2652,6 +2653,22 @@ pub async fn bootstrap_initial_manager_policy_state(
     Ok(())
 }
 
+pub async fn manager_rollout_recovery_permitted(
+    pool: &Pool,
+    deployment_principal_uri: &str,
+) -> Result<bool, Status> {
+    let client = pool.get().await.internal()?;
+    let permit: Option<String> = client
+        .query_one(
+            "SELECT recovery_permit_principal_uri FROM wr_manager_rollout_guard WHERE singleton",
+            &[],
+        )
+        .await
+        .internal()?
+        .get(0);
+    Ok(permit.as_deref() == Some(deployment_principal_uri))
+}
+
 pub async fn initialize_manager_policy_state(
     pool: &Pool,
     manager_id: &str,
@@ -2660,12 +2677,13 @@ pub async fn initialize_manager_policy_state(
 ) -> Result<bool, Status> {
     let client = pool.get().await.internal()?;
     let row = client.query_one(
-        "SELECT accepted_generation, accepted_digest, active_rollout_id FROM wr_manager_rollout_guard WHERE singleton",
+        "SELECT accepted_generation, accepted_digest, active_rollout_id, recovery_permit_principal_uri FROM wr_manager_rollout_guard WHERE singleton",
         &[],
     ).await.internal()?;
     let accepted_generation: Option<i64> = row.get(0);
     let accepted_digest: Option<String> = row.get(1);
     let active: Option<uuid::Uuid> = row.get(2);
+    let recovery_permit: Option<String> = row.get(3);
     if accepted_generation.is_some_and(|accepted| generation < accepted as u64)
         || (accepted_generation == Some(generation as i64)
             && accepted_digest.as_deref() != Some(digest))
@@ -2674,6 +2692,7 @@ pub async fn initialize_manager_policy_state(
         return Ok(false);
     }
     let open = active.is_none()
+        && recovery_permit.is_none()
         && accepted_generation == Some(generation as i64)
         && accepted_digest.as_deref() == Some(digest);
     let state = if open { "OPEN" } else { "CLOSED_STARTUP" };
@@ -2693,9 +2712,9 @@ pub async fn observe_manager_rollout(
     let client = pool.get().await.internal()?;
     let row = client
         .query_one(
-            "SELECT g.accepted_generation, g.accepted_digest,
+            "SELECT g.accepted_generation, g.accepted_digest, g.recovery_permit_principal_uri,
                 r.rollout_id, r.phase, r.target_generation, r.target_policy_digest,
-                m.member_role, r.lease_epoch, r.expected_target_set_hash,
+                m.member_role, r.expected_target_set_hash,
                 r.target_policy_validator_version, r.target_deployment_principal_uri,
                 r.target_deployment_leaf_fingerprint, r.cluster_id, r.canonical_request
          FROM wr_manager_rollout_guard g
@@ -2712,10 +2731,12 @@ pub async fn observe_manager_rollout(
         .internal()?;
     let accepted_generation: Option<i64> = row.get(0);
     let accepted_digest: Option<String> = row.get(1);
-    let rollout_id: Option<uuid::Uuid> = row.get(2);
+    let recovery_permit: Option<String> = row.get(2);
+    let rollout_id: Option<uuid::Uuid> = row.get(3);
 
     let Some(rollout_id) = rollout_id else {
-        let accepted = accepted_generation == Some(generation as i64)
+        let accepted = recovery_permit.is_none()
+            && accepted_generation == Some(generation as i64)
             && accepted_digest.as_deref() == Some(digest);
         let mismatch = accepted_generation.is_some_and(|accepted_generation| {
             generation < accepted_generation as u64
@@ -2734,25 +2755,18 @@ pub async fn observe_manager_rollout(
         } else {
             admission.close();
         }
-        lifecycle.update(
-            wire_state,
-            "",
-            ManagerRolloutPhase::Unspecified as i32,
-            "",
-            0,
-        );
+        lifecycle.update(wire_state, "", ManagerRolloutPhase::Unspecified as i32, "");
         client.execute(
-            "UPDATE wr_managers SET policy_generation=$2,policy_digest=$3,admission_state=$4,rollout_id=NULL,rollout_phase=NULL,rollout_lease_epoch=0,last_heartbeat=NOW() WHERE manager_id=$1",
+            "UPDATE wr_managers SET policy_generation=$2,policy_digest=$3,admission_state=$4,rollout_id=NULL,rollout_phase=NULL,last_heartbeat=NOW() WHERE manager_id=$1",
             &[&manager_id, &(generation as i64), &digest, &state],
         ).await.internal()?;
         return Ok(());
     };
 
-    let phase: i32 = row.get(3);
-    let target_generation: i64 = row.get(4);
-    let target_digest: String = row.get(5);
-    let role: Option<String> = row.get(6);
-    let epoch: i64 = row.get(7);
+    let phase: i32 = row.get(4);
+    let target_generation: i64 = row.get(5);
+    let target_digest: String = row.get(6);
+    let role: Option<String> = row.get(7);
     let expected_set_hash: String = row.get(8);
     let validator_version: i32 = row.get(9);
     let target_principal: String = row.get(10);
@@ -2811,16 +2825,10 @@ pub async fn observe_manager_rollout(
     } else {
         admission.close();
     }
-    lifecycle.update(
-        wire_state,
-        rollout_id.to_string(),
-        phase,
-        expected_set_hash,
-        epoch as u64,
-    );
+    lifecycle.update(wire_state, rollout_id.to_string(), phase, expected_set_hash);
     client.execute(
-        "UPDATE wr_managers SET policy_generation=$2,policy_digest=$3,admission_state=$4,rollout_id=$5,rollout_phase=$6,rollout_lease_epoch=$7,last_heartbeat=NOW() WHERE manager_id=$1",
-        &[&manager_id, &(generation as i64), &digest, &state, &rollout_id, &phase, &epoch],
+        "UPDATE wr_managers SET policy_generation=$2,policy_digest=$3,admission_state=$4,rollout_id=$5,rollout_phase=$6,last_heartbeat=NOW() WHERE manager_id=$1",
+        &[&manager_id, &(generation as i64), &digest, &state, &rollout_id, &phase],
     ).await.internal()?;
     let process_state = if target_matches || role.as_deref() == Some("source") {
         "READY"
@@ -3217,7 +3225,6 @@ pub async fn mark_schedule_failed(
 pub async fn begin_manager_rollout(
     pool: &Pool,
     deployment_principal_uri: &str,
-    deployment_leaf_fingerprint: &str,
     request: &BeginManagerRolloutRequest,
     canonical_request_digest: &str,
     privileged_admission_open: bool,
@@ -3228,7 +3235,7 @@ pub async fn begin_manager_rollout(
     let transaction = client.transaction().await.internal()?;
     if let Some(row) = transaction
         .query_opt(
-            "SELECT rollout_id, deployment_leaf_fingerprint, canonical_request_digest, canonical_request, phase
+            "SELECT rollout_id, canonical_request_digest, canonical_request
              FROM wr_manager_rollouts
              WHERE deployment_principal_uri = $1 AND client_operation_id = $2
              FOR UPDATE",
@@ -3237,14 +3244,13 @@ pub async fn begin_manager_rollout(
         .await
         .internal()?
     {
-        let _original_fingerprint: String = row.get(1);
-        let stored_digest: String = row.get(2);
+        let stored_digest: String = row.get(1);
         if stored_digest != canonical_request_digest {
             return Err(Status::already_exists(
                 "client_operation_id was already used with different rollout content",
             ));
         }
-        let stored: Vec<u8> = row.get(3);
+        let stored: Vec<u8> = row.get(2);
         let stored_request = BeginManagerRolloutRequest::decode(stored.as_slice())
             .map_err(|_| Status::internal("stored manager rollout request is corrupt"))?;
         let rollout = manager_rollout_from_row(
@@ -3252,65 +3258,36 @@ pub async fn begin_manager_rollout(
             deployment_principal_uri,
             &stored_request,
             stored_digest,
-            row.get(4),
+            ManagerRolloutPhase::Prepared as i32,
         );
         transaction.commit().await.internal()?;
         return Ok(rollout);
     }
 
     let guard = transaction.query_one(
-        "SELECT accepted_generation, accepted_digest, active_rollout_id FROM wr_manager_rollout_guard WHERE singleton FOR UPDATE",
+        "SELECT accepted_generation, accepted_digest, active_rollout_id, recovery_permit_principal_uri FROM wr_manager_rollout_guard WHERE singleton FOR UPDATE",
         &[],
     ).await.internal()?;
     let accepted_generation: Option<i64> = guard.get(0);
     let accepted_digest: Option<String> = guard.get(1);
     let active: Option<uuid::Uuid> = guard.get(2);
-    let recovery_of = if request.recovery_of.is_empty() {
-        None
-    } else {
-        Some(
-            uuid::Uuid::parse_str(&request.recovery_of)
-                .map_err(|_| Status::invalid_argument("recovery_of must be a rollout UUID"))?,
-        )
-    };
-    if !privileged_admission_open && accepted_generation.is_some() && recovery_of.is_none() {
+    let recovery_permit: Option<String> = guard.get(3);
+    if active.is_some() {
         return Err(Status::failed_precondition(
-            "closed privileged admission permits only empty-cluster bootstrap or failed-closed recovery",
+            "another manager rollout is active",
         ));
     }
-    match (active, recovery_of) {
-        (None, None) => {}
-        (Some(active), Some(predecessor)) if active == predecessor => {
-            let predecessor = transaction
-                .query_one(
-                    "SELECT phase, deployment_principal_uri, target_generation
-                 FROM wr_manager_rollouts WHERE rollout_id=$1 FOR UPDATE",
-                    &[&predecessor],
-                )
-                .await
-                .internal()?;
-            let predecessor_phase: i32 = predecessor.get(0);
-            let predecessor_principal: String = predecessor.get(1);
-            let predecessor_generation: i64 = predecessor.get(2);
-            if predecessor_phase != ManagerRolloutPhase::FailedClosed as i32
-                || predecessor_principal != deployment_principal_uri
-                || request.target_generation <= predecessor_generation as u64
-            {
-                return Err(Status::failed_precondition(
-                    "failed-closed recovery requires the active predecessor, its recorded principal, and a strictly newer generation",
-                ));
-            }
+    let consuming_permit = recovery_permit.is_some();
+    if let Some(owner) = recovery_permit.as_deref() {
+        if owner != deployment_principal_uri {
+            return Err(Status::permission_denied(
+                "manager rollout recovery permit belongs to another principal",
+            ));
         }
-        (Some(_), None) => {
-            return Err(Status::failed_precondition(
-                "another manager rollout is active",
-            ))
-        }
-        _ => {
-            return Err(Status::failed_precondition(
-                "recovery_of must name the active failed-closed rollout",
-            ))
-        }
+    } else if !privileged_admission_open && accepted_generation.is_some() {
+        return Err(Status::failed_precondition(
+            "closed privileged admission requires an explicit recovery permit",
+        ));
     }
     let live_sources = transaction
         .query(
@@ -3399,16 +3376,15 @@ pub async fn begin_manager_rollout(
     transaction
         .execute(
             "INSERT INTO wr_manager_rollouts
-             (rollout_id, deployment_principal_uri, deployment_leaf_fingerprint,
+             (rollout_id, deployment_principal_uri,
               client_operation_id, canonical_request_digest, canonical_request,
               target_policy_validator_version, target_deployment_principal_uri,
               target_deployment_leaf_fingerprint, expected_target_set_hash, cluster_id,
-              target_generation, target_policy_digest, recovery_of)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+              target_generation, target_policy_digest)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             &[
                 &rollout_id,
                 &deployment_principal_uri,
-                &deployment_leaf_fingerprint,
                 &client_operation_id,
                 &canonical_request_digest,
                 &canonical_request,
@@ -3419,15 +3395,14 @@ pub async fn begin_manager_rollout(
                 &request.cluster_id,
                 &(request.target_generation as i64),
                 &request.target_policy_digest,
-                &recovery_of,
             ],
         )
         .await
         .internal()?;
     transaction
         .execute(
-            "UPDATE wr_manager_rollout_guard SET active_rollout_id = $1 WHERE singleton",
-            &[&rollout_id],
+            "UPDATE wr_manager_rollout_guard SET active_rollout_id = $1, recovery_permit_principal_uri = CASE WHEN $2 THEN NULL ELSE recovery_permit_principal_uri END WHERE singleton",
+            &[&rollout_id, &consuming_permit],
         )
         .await
         .internal()?;
@@ -3442,23 +3417,9 @@ pub async fn begin_manager_rollout(
     for target in &request.expected_targets {
         transaction
             .execute(
-                "INSERT INTO wr_manager_rollout_members
-             (rollout_id, member_role, manager_id, expected_host_digest, expected_config_digest,
-              expected_backend, expected_executable_digest, expected_backend_spec_digest,
-              expected_credential_digest, expected_old_selector_digest, expected_new_selector_digest)
-             VALUES ($1, 'target', $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-                &[
-                    &rollout_id,
-                    &target.manager_id,
-                    &target.host_digest,
-                    &target.config_digest,
-                    &target.backend,
-                    &target.executable_digest,
-                    &target.backend_spec_digest,
-                    &target.credential_digest,
-                    &target.old_selector_digest,
-                    &target.new_selector_digest,
-                ],
+                "INSERT INTO wr_manager_rollout_members (rollout_id, member_role, manager_id)
+                 VALUES ($1, 'target', $2)",
+                &[&rollout_id, &target.manager_id],
             )
             .await
             .internal()?;
@@ -3477,69 +3438,11 @@ pub async fn begin_manager_rollout(
     ))
 }
 
-pub async fn lease_manager_rollout(
-    pool: &Pool,
-    rollout_id: &str,
-    executor_id: &str,
-    expected_lease_epoch: u64,
-) -> Result<ManagerRollout, Status> {
-    let rollout_id = uuid::Uuid::parse_str(rollout_id)
-        .map_err(|_| Status::invalid_argument("rollout_id must be a UUID"))?;
-    let executor = uuid::Uuid::parse_str(executor_id)
-        .map_err(|_| Status::invalid_argument("executor_id must be a UUID"))?;
-    let mut client = pool.get().await.internal()?;
-    let transaction = client.transaction().await.internal()?;
-    let row = transaction.query_opt(
-        "SELECT executor_id, lease_epoch, lease_expires_at, phase FROM wr_manager_rollouts WHERE rollout_id=$1 FOR UPDATE",
-        &[&rollout_id],
-    ).await.internal()?.ok_or_else(|| Status::not_found("manager rollout was not found"))?;
-    let owner: Option<uuid::Uuid> = row.get(0);
-    let epoch: i64 = row.get(1);
-    let expires: Option<chrono::DateTime<chrono::Utc>> = row.get(2);
-    let phase: i32 = row.get(3);
-    if matches!(
-        ManagerRolloutPhase::try_from(phase),
-        Ok(ManagerRolloutPhase::Completed
-            | ManagerRolloutPhase::FailedPreClose
-            | ManagerRolloutPhase::FailedClosed)
-    ) {
-        return Err(Status::failed_precondition(
-            "terminal rollout cannot be leased",
-        ));
-    }
-    if expected_lease_epoch != epoch as u64 {
-        return Err(Status::failed_precondition("stale rollout lease epoch"));
-    }
-    let expired = expires.is_none_or(|deadline| deadline <= chrono::Utc::now());
-    let next_epoch = match owner {
-        Some(owner) if owner == executor => epoch.max(1),
-        Some(_) if !expired => {
-            return Err(Status::failed_precondition(
-                "rollout lease is owned by another executor",
-            ))
-        }
-        _ => epoch
-            .checked_add(1)
-            .ok_or_else(|| Status::resource_exhausted("rollout lease epoch exhausted"))?,
-    };
-    transaction
-        .execute(
-            "UPDATE wr_manager_rollouts SET executor_id=$2, lease_epoch=$3,
-         lease_expires_at=NOW()+INTERVAL '30 seconds', updated_at=NOW() WHERE rollout_id=$1",
-            &[&rollout_id, &executor, &next_epoch],
-        )
-        .await
-        .internal()?;
-    transaction.commit().await.internal()?;
-    get_manager_rollout(pool, &rollout_id.to_string()).await
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn advance_manager_rollout(
     pool: &Pool,
     rollout_id: &str,
-    executor_id: &str,
-    lease_epoch: u64,
+    deployment_principal_uri: &str,
     expected_phase: i32,
     next_phase: i32,
     member_outcomes: &[wr_common::wruntime::ManagerRolloutMemberOutcome],
@@ -3547,8 +3450,6 @@ pub async fn advance_manager_rollout(
 ) -> Result<ManagerRollout, Status> {
     let rollout_id = uuid::Uuid::parse_str(rollout_id)
         .map_err(|_| Status::invalid_argument("rollout_id must be a UUID"))?;
-    let executor = uuid::Uuid::parse_str(executor_id)
-        .map_err(|_| Status::invalid_argument("executor_id must be a UUID"))?;
     let expected = ManagerRolloutPhase::try_from(expected_phase)
         .map_err(|_| Status::invalid_argument("expected rollout phase is invalid"))?;
     let next = ManagerRolloutPhase::try_from(next_phase)
@@ -3585,21 +3486,20 @@ pub async fn advance_manager_rollout(
     }
     let mut client = pool.get().await.internal()?;
     let transaction = client.transaction().await.internal()?;
-    let row = transaction.query_opt(
-        "SELECT phase, executor_id, lease_epoch, lease_expires_at, target_generation, target_policy_digest
+    let row = transaction
+        .query_opt(
+            "SELECT phase, deployment_principal_uri, target_generation, target_policy_digest
          FROM wr_manager_rollouts WHERE rollout_id=$1 FOR UPDATE",
-        &[&rollout_id],
-    ).await.internal()?.ok_or_else(|| Status::not_found("manager rollout was not found"))?;
+            &[&rollout_id],
+        )
+        .await
+        .internal()?
+        .ok_or_else(|| Status::not_found("manager rollout was not found"))?;
     let current: i32 = row.get(0);
-    let owner: Option<uuid::Uuid> = row.get(1);
-    let epoch: i64 = row.get(2);
-    let expires: Option<chrono::DateTime<chrono::Utc>> = row.get(3);
-    if owner != Some(executor)
-        || epoch as u64 != lease_epoch
-        || expires.is_none_or(|deadline| deadline <= chrono::Utc::now())
-    {
-        return Err(Status::failed_precondition(
-            "rollout fenced lease no longer matches",
+    let owner: String = row.get(1);
+    if owner != deployment_principal_uri {
+        return Err(Status::permission_denied(
+            "rollout control requires its immutable owner principal",
         ));
     }
     if current != expected_phase && current != next_phase {
@@ -3726,8 +3626,8 @@ pub async fn advance_manager_rollout(
     transaction.execute("INSERT INTO wr_manager_rollout_events (rollout_id,event_type,phase) VALUES ($1,'phase-advanced',$2)", &[&rollout_id, &next_phase]).await.internal()?;
     match next {
         ManagerRolloutPhase::Completed => {
-            let generation: i64 = row.get(4);
-            let digest: String = row.get(5);
+            let generation: i64 = row.get(2);
+            let digest: String = row.get(3);
             transaction.execute("UPDATE wr_manager_rollout_guard SET accepted_generation=$2, accepted_digest=$3, active_rollout_id=NULL WHERE singleton AND active_rollout_id=$1", &[&rollout_id, &generation, &digest]).await.internal()?;
         }
         ManagerRolloutPhase::FailedPreClose => {
@@ -3739,6 +3639,123 @@ pub async fn advance_manager_rollout(
     get_manager_rollout(pool, &rollout_id.to_string()).await
 }
 
+pub async fn reset_failed_manager_rollout(
+    pool: &Pool,
+    deployment_principal_uri: &str,
+    request: &wr_common::wruntime::ResetFailedManagerRolloutRequest,
+    reset_request_digest: &str,
+    evidence_digest: &str,
+) -> Result<ResetFailedManagerRolloutResponse, Status> {
+    let rollout_id = uuid::Uuid::parse_str(&request.rollout_id)
+        .map_err(|_| Status::invalid_argument("rollout_id must be a UUID"))?;
+    let mut client = pool.get().await.internal()?;
+    let transaction = client.transaction().await.internal()?;
+    let row = transaction.query_opt(
+        "SELECT deployment_principal_uri, canonical_request_digest, phase, reset_request_digest,
+                reset_evidence_digest, reset_policy_generation, reset_policy_digest
+         FROM wr_manager_rollouts WHERE rollout_id=$1 FOR UPDATE",
+        &[&rollout_id],
+    ).await.internal()?.ok_or_else(|| Status::not_found("manager rollout was not found"))?;
+    let owner: String = row.get(0);
+    if owner != deployment_principal_uri {
+        return Err(Status::permission_denied(
+            "reset requires the immutable rollout owner principal",
+        ));
+    }
+    let original: String = row.get(1);
+    if original != request.original_request_digest {
+        return Err(Status::failed_precondition(
+            "original Begin request digest does not match",
+        ));
+    }
+    if let Some(stored_reset) = row.get::<_, Option<String>>(3) {
+        if stored_reset != reset_request_digest
+            || row.get::<_, Option<String>>(4).as_deref() != Some(evidence_digest)
+        {
+            return Err(Status::already_exists(
+                "manager rollout was reset with different evidence",
+            ));
+        }
+        let generation: i64 = row
+            .get::<_, Option<i64>>(5)
+            .ok_or_else(|| Status::internal("stored reset receipt is incomplete"))?;
+        let digest: String = row
+            .get::<_, Option<String>>(6)
+            .ok_or_else(|| Status::internal("stored reset receipt is incomplete"))?;
+        transaction.commit().await.internal()?;
+        return Ok(ResetFailedManagerRolloutResponse {
+            rollout_id: request.rollout_id.clone(),
+            original_request_digest: original,
+            reset_request_digest: stored_reset,
+            evidence_digest: evidence_digest.to_string(),
+            observed_policy_generation: generation as u64,
+            observed_policy_digest: digest,
+        });
+    }
+    if row.get::<_, i32>(2) != ManagerRolloutPhase::FailedClosed as i32 {
+        return Err(Status::failed_precondition(
+            "only FAILED_CLOSED rollout can be reset",
+        ));
+    }
+    let guard = transaction
+        .query_one(
+            "SELECT active_rollout_id FROM wr_manager_rollout_guard WHERE singleton FOR UPDATE",
+            &[],
+        )
+        .await
+        .internal()?;
+    if guard.get::<_, Option<uuid::Uuid>>(0) != Some(rollout_id) {
+        return Err(Status::failed_precondition(
+            "failed rollout is not the active guard",
+        ));
+    }
+    let stored = transaction.query(
+        "SELECT member_role, manager_id FROM wr_manager_rollout_members WHERE rollout_id=$1 ORDER BY member_role, manager_id FOR UPDATE",
+        &[&rollout_id],
+    ).await.internal()?.into_iter().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))).collect::<Vec<_>>();
+    let supplied = request
+        .evidence
+        .iter()
+        .map(|e| (e.member_role.clone(), e.manager_id.clone()))
+        .collect::<Vec<_>>();
+    if supplied != stored {
+        return Err(Status::failed_precondition(
+            "reset evidence must exactly cover stored rollout members",
+        ));
+    }
+    let first = request
+        .evidence
+        .first()
+        .ok_or_else(|| Status::invalid_argument("reset evidence must not be empty"))?;
+    if first.process_state != "STOPPED"
+        || first.policy_generation == 0
+        || request.evidence.iter().any(|item| {
+            item.process_state != "STOPPED"
+                || item.policy_generation != first.policy_generation
+                || item.policy_digest != first.policy_digest
+        })
+    {
+        return Err(Status::failed_precondition(
+            "reset evidence must report every member stopped with one uniform nonzero policy",
+        ));
+    }
+    transaction.execute(
+        "UPDATE wr_manager_rollouts SET reset_request_digest=$2, reset_evidence_digest=$3, reset_policy_generation=$4, reset_policy_digest=$5, updated_at=NOW() WHERE rollout_id=$1",
+        &[&rollout_id, &reset_request_digest, &evidence_digest, &(first.policy_generation as i64), &first.policy_digest],
+    ).await.internal()?;
+    transaction.execute("INSERT INTO wr_manager_rollout_events (rollout_id,event_type,phase,detail) VALUES ($1,'failed-closed-reset',$2,$3)", &[&rollout_id, &(ManagerRolloutPhase::FailedClosed as i32), &evidence_digest]).await.internal()?;
+    transaction.execute("UPDATE wr_manager_rollout_guard SET active_rollout_id=NULL,recovery_permit_principal_uri=$2 WHERE singleton AND active_rollout_id=$1", &[&rollout_id, &deployment_principal_uri]).await.internal()?;
+    transaction.commit().await.internal()?;
+    Ok(ResetFailedManagerRolloutResponse {
+        rollout_id: request.rollout_id.clone(),
+        original_request_digest: original,
+        reset_request_digest: reset_request_digest.to_string(),
+        evidence_digest: evidence_digest.to_string(),
+        observed_policy_generation: first.policy_generation,
+        observed_policy_digest: first.policy_digest.clone(),
+    })
+}
+
 pub async fn get_manager_rollout(pool: &Pool, rollout_id: &str) -> Result<ManagerRollout, Status> {
     let rollout_id = uuid::Uuid::parse_str(rollout_id)
         .map_err(|_| Status::invalid_argument("rollout_id must be a UUID"))?;
@@ -3746,7 +3763,7 @@ pub async fn get_manager_rollout(pool: &Pool, rollout_id: &str) -> Result<Manage
     let row = client
         .query_opt(
             "SELECT deployment_principal_uri, canonical_request_digest, canonical_request, phase,
-                    executor_id::text, lease_epoch, lease_expires_at, failure, expected_target_set_hash
+                    failure, expected_target_set_hash
              FROM wr_manager_rollouts WHERE rollout_id = $1",
             &[&rollout_id],
         )
@@ -3759,16 +3776,8 @@ pub async fn get_manager_rollout(pool: &Pool, rollout_id: &str) -> Result<Manage
         .map_err(|_| Status::internal("stored manager rollout request is corrupt"))?;
     let mut rollout =
         manager_rollout_from_row(rollout_id, &principal, &request, row.get(1), row.get(3));
-    rollout.executor_id = row.get::<_, Option<String>>(4).unwrap_or_default();
-    rollout.lease_epoch = row.get::<_, i64>(5) as u64;
-    rollout.lease_expires_at =
-        row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(6)
-            .map(|value| prost_types::Timestamp {
-                seconds: value.timestamp(),
-                nanos: value.timestamp_subsec_nanos() as i32,
-            });
-    rollout.failure = row.get::<_, Option<String>>(7).unwrap_or_default();
-    rollout.expected_target_set_hash = row.get(8);
+    rollout.failure = row.get::<_, Option<String>>(4).unwrap_or_default();
+    rollout.expected_target_set_hash = row.get(5);
     Ok(rollout)
 }
 
@@ -3788,11 +3797,7 @@ fn manager_rollout_from_row(
         target_generation: request.target_generation,
         target_policy_digest: request.target_policy_digest.clone(),
         expected_targets: request.expected_targets.clone(),
-        recovery_of: request.recovery_of.clone(),
         phase,
-        executor_id: String::new(),
-        lease_epoch: 0,
-        lease_expires_at: None,
         target_policy_validator_version: request.target_policy_validator_version,
         target_deployment_principal_uri: request.target_deployment_principal_uri.clone(),
         target_deployment_leaf_fingerprint: request.target_deployment_leaf_fingerprint.clone(),
@@ -3800,7 +3805,6 @@ fn manager_rollout_from_row(
         failure: String::new(),
         source_managers: request.source_managers.clone(),
         manifest_digest: request.manifest_digest.clone(),
-        executor_id_from_manifest: request.executor_id.clone(),
         deployment_certificate: request.deployment_certificate.clone(),
     }
 }

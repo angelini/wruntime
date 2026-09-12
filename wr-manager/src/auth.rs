@@ -135,9 +135,9 @@ pub const MANAGER_RPC_ROWS: [RpcAuthorizationRow; 54] = [
     row!("InfrastructureService", "FinalizeDeployment", "infrastructure.deployments.write; H:infra/admin, S:deploy", "node/revision/state; locked deployment lookup", "n/a", NotApplicable, Operation),
     row!("InfrastructureService", "AbandonDeployment", "infrastructure.deployments.write; H:infra/admin, S:deploy", "request token plus node; locked deployment and evidence lookup", "n/a", NotApplicable, Operation),
     row!("InfrastructureService", "BeginRollback",  "infrastructure.deployments.write; H:infra/admin, S:deploy", "request token plus deployment/target revision; authority lookup", "n/a", NotApplicable, Operation),
-    row!("InfrastructureService", "BeginManagerRollout", "infrastructure.manager-rollout.write; H:infra/admin, S:deploy; bootstrap/recovery exceptions", "caller UUID plus canonical target generation/digest/expected set and optional predecessor; rollout repository", "original rollout ID/state on exact token replay", NotApplicable, RolloutControl),
-    row!("InfrastructureService", "LeaseManagerRollout", "infrastructure.manager-rollout.write; while closed only recorded deployment principal", "rollout ID, executor/epoch; rollout CAS", "current lease/state", NotApplicable, RolloutControl),
-    row!("InfrastructureService", "AdvanceManagerRollout", "infrastructure.manager-rollout.write; while closed only recorded deployment principal", "rollout ID, lease epoch, expected phase/member outcomes; rollout CAS", "committed phase/members", NotApplicable, RolloutControl),
+    row!("InfrastructureService", "BeginManagerRollout", "infrastructure.manager-rollout.write; H:infra/admin, S:deploy; bootstrap/recovery exceptions", "caller UUID plus canonical target generation/digest/expected set and one-use recovery permit; rollout repository", "original rollout ID/state on exact token replay", NotApplicable, RolloutControl),
+    row!("InfrastructureService", "ResetFailedManagerRollout", "infrastructure.manager-rollout.write; while closed only recorded deployment principal", "exact failed rollout and stopped uniform-policy evidence; rollout guard CAS", "stable reset receipt", NotApplicable, RolloutControl),
+    row!("InfrastructureService", "AdvanceManagerRollout", "infrastructure.manager-rollout.write; while closed only recorded deployment principal", "rollout ID, expected phase/member outcomes; rollout CAS", "committed phase/members", NotApplicable, RolloutControl),
     row!("InfrastructureService", "GetManagerRollout", "rollout read roles while open; recorded principal while closed", "rollout ID; rollout repository", "bounded phase/member status", NotApplicable, RolloutControl),
     row!("InfrastructureService", "PutNodeAgentPolicy", "infrastructure.node-agent-policy.write; H:infra/admin, S:deploy", "bound node; policy repository", "n/a", NotApplicable, ConfigWrite),
     row!("InfrastructureService", "GetNodeCleanupStatus", "infrastructure.cleanup.read; H:view/infra/admin, S:status/infra", "bound node; cleanup repository", "one bounded summary", NotApplicable, SmallRead),
@@ -341,7 +341,7 @@ pub fn handler_adapter_binding(service: &str, method: &str) -> Option<HandlerAda
         }
         (
             "wruntime.InfrastructureService",
-            "LeaseManagerRollout" | "AdvanceManagerRollout" | "GetManagerRollout",
+            "ResetFailedManagerRollout" | "AdvanceManagerRollout" | "GetManagerRollout",
         ) => (E::OperationId, L::RolloutRepository, F::BoundedStatus),
         ("wruntime.NodeService", "RegisterProxy" | "ReportProxyInventory" | "DeregisterProxy") => {
             (E::Node, L::StatusRepository, F::None)
@@ -461,7 +461,7 @@ fn roles_for_row(row: &RpcAuthorizationRow, kind: PrincipalKind) -> &'static [Po
             | "PutNodeAgentPolicy"
             | "BeginRollback"
             | "BeginManagerRollout"
-            | "LeaseManagerRollout"
+            | "ResetFailedManagerRollout"
             | "AdvanceManagerRollout",
             PrincipalKind::Human,
         ) => &[R::Admin, R::Infra],
@@ -474,7 +474,7 @@ fn roles_for_row(row: &RpcAuthorizationRow, kind: PrincipalKind) -> &'static [Po
             | "PutNodeAgentPolicy"
             | "BeginRollback"
             | "BeginManagerRollout"
-            | "LeaseManagerRollout"
+            | "ResetFailedManagerRollout"
             | "AdvanceManagerRollout",
             PrincipalKind::ServiceAccount,
         ) => &[R::Deploy],
@@ -616,7 +616,7 @@ impl ManagerAuthorizer {
                 && matches!(
                     method,
                     "BeginManagerRollout"
-                        | "LeaseManagerRollout"
+                        | "ResetFailedManagerRollout"
                         | "AdvanceManagerRollout"
                         | "GetManagerRollout"
                 ))

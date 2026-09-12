@@ -99,7 +99,8 @@ impl proto::WorkerService for Component {
 
         wr_sdk::log!(
             "collected {} source(s), {} bytes",
-            fetch_resp.sources_fetched, fetch_resp.total_bytes
+            fetch_resp.sources_fetched,
+            fetch_resp.total_bytes
         );
 
         // Phase 2: Run agent.

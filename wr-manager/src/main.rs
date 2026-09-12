@@ -207,7 +207,6 @@ async fn run_service(config_path: &str) -> Result<()> {
         "",
         wr_common::wruntime::ManagerRolloutPhase::Unspecified as i32,
         "",
-        0,
     );
     let policy_service = service::PolicyApi::new(
         principal_policy.clone(),
@@ -282,7 +281,6 @@ async fn run_service(config_path: &str) -> Result<()> {
             "",
             wr_common::wruntime::ManagerRolloutPhase::Unspecified as i32,
             "",
-            0,
         );
     }
 

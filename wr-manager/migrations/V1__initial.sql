@@ -77,8 +77,10 @@ CREATE TABLE wr_manager_rollout_guard (
     accepted_generation bigint,
     accepted_digest text,
     active_rollout_id uuid,
+    recovery_permit_principal_uri text,
     CONSTRAINT wr_manager_rollout_guard_accepted_generation_check CHECK (((accepted_generation IS NULL) OR (accepted_generation > 0))),
     CONSTRAINT wr_manager_rollout_guard_check CHECK (((accepted_generation IS NULL) = (accepted_digest IS NULL))),
+    CONSTRAINT wr_manager_rollout_guard_permit_check CHECK (active_rollout_id IS NULL OR recovery_permit_principal_uri IS NULL),
     CONSTRAINT wr_manager_rollout_guard_singleton_check CHECK (singleton)
 );
 
@@ -86,8 +88,6 @@ CREATE TABLE wr_manager_rollout_members (
     rollout_id uuid NOT NULL,
     member_role text NOT NULL,
     manager_id text NOT NULL,
-    expected_host_digest text,
-    expected_config_digest text,
     observed_policy_generation bigint,
     observed_policy_digest text,
     process_state text,
@@ -95,19 +95,12 @@ CREATE TABLE wr_manager_rollout_members (
     last_acknowledged_at timestamp with time zone,
     host_action_outcome text,
     error text,
-    expected_backend text,
-    expected_executable_digest text,
-    expected_backend_spec_digest text,
-    expected_credential_digest text,
-    expected_old_selector_digest text,
-    expected_new_selector_digest text,
     CONSTRAINT wr_manager_rollout_members_member_role_check CHECK ((member_role = ANY (ARRAY['source'::text, 'target'::text])))
 );
 
 CREATE TABLE wr_manager_rollouts (
     rollout_id uuid NOT NULL,
     deployment_principal_uri text NOT NULL,
-    deployment_leaf_fingerprint text NOT NULL,
     client_operation_id uuid NOT NULL,
     canonical_request_digest text NOT NULL,
     canonical_request bytea NOT NULL,
@@ -120,13 +113,14 @@ CREATE TABLE wr_manager_rollouts (
     cluster_id text NOT NULL,
     target_generation bigint NOT NULL,
     target_policy_digest text NOT NULL,
-    recovery_of uuid,
-    executor_id uuid,
-    lease_epoch bigint DEFAULT 0 NOT NULL,
-    lease_expires_at timestamp with time zone,
     failure text,
+    reset_request_digest text,
+    reset_evidence_digest text,
+    reset_policy_generation bigint,
+    reset_policy_digest text,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT wr_manager_rollouts_lease_epoch_check CHECK ((lease_epoch >= 0)),
+    CONSTRAINT wr_manager_rollouts_reset_receipt_check CHECK ((reset_request_digest IS NULL) = (reset_evidence_digest IS NULL) AND (reset_request_digest IS NULL) = (reset_policy_generation IS NULL) AND (reset_request_digest IS NULL) = (reset_policy_digest IS NULL)),
+    CONSTRAINT wr_manager_rollouts_reset_generation_check CHECK (reset_policy_generation IS NULL OR reset_policy_generation > 0),
     CONSTRAINT wr_manager_rollouts_phase_check CHECK (((phase >= 1) AND (phase <= 10))),
     CONSTRAINT wr_manager_rollouts_target_generation_check CHECK ((target_generation > 0))
 );
@@ -140,8 +134,7 @@ CREATE TABLE wr_managers (
     policy_digest text,
     admission_state text DEFAULT 'CLOSED_STARTUP'::text NOT NULL,
     rollout_id uuid,
-    rollout_phase integer,
-    rollout_lease_epoch bigint DEFAULT 0 NOT NULL
+    rollout_phase integer
 );
 
 CREATE TABLE wr_module_heartbeats (
@@ -734,8 +727,6 @@ CREATE INDEX idx_wr_node_release_cleanup_due ON wr_node_release_cleanup USING bt
 
 CREATE UNIQUE INDEX idx_wr_node_slot_one_authority ON wr_node_slot_authority USING btree (node_id, engine_slot) WHERE authoritative;
 
-CREATE UNIQUE INDEX wr_manager_rollouts_one_recovery ON wr_manager_rollouts USING btree (recovery_of) WHERE (recovery_of IS NOT NULL);
-
 CREATE UNIQUE INDEX wr_node_operation_one_proxy_target ON wr_node_operation_targets USING btree (operation_id) WHERE (target_kind = 'proxy'::text);
 
 CREATE INDEX wr_proxy_inventory_active_order ON wr_proxy_inventory USING btree (node_id, proxy_id, process_instance_id) WHERE (deregistered_at IS NULL);
@@ -754,9 +745,6 @@ ALTER TABLE ONLY wr_manager_rollout_guard
 
 ALTER TABLE ONLY wr_manager_rollout_members
     ADD CONSTRAINT wr_manager_rollout_members_rollout_id_fkey FOREIGN KEY (rollout_id) REFERENCES wr_manager_rollouts(rollout_id) ON DELETE CASCADE;
-
-ALTER TABLE ONLY wr_manager_rollouts
-    ADD CONSTRAINT wr_manager_rollouts_recovery_of_fkey FOREIGN KEY (recovery_of) REFERENCES wr_manager_rollouts(rollout_id);
 
 ALTER TABLE ONLY wr_node_agent_attestations
     ADD CONSTRAINT wr_node_agent_attestations_node_id_fkey FOREIGN KEY (node_id) REFERENCES wr_nodes(node_id);

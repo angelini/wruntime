@@ -122,7 +122,6 @@ struct ManagerRolloutObservation {
     rollout_operation_id: String,
     rollout_phase: i32,
     rollout_expected_set_hash: String,
-    last_observed_rollout_lease_epoch: u64,
 }
 
 /// Coherent rollout metadata shared by the manager's durable observer and its
@@ -149,7 +148,6 @@ impl ManagerLifecycleState {
         rollout_operation_id: impl Into<String>,
         rollout_phase: i32,
         rollout_expected_set_hash: impl Into<String>,
-        last_observed_rollout_lease_epoch: u64,
     ) {
         *self
             .observation
@@ -159,7 +157,6 @@ impl ManagerLifecycleState {
             rollout_operation_id: rollout_operation_id.into(),
             rollout_phase,
             rollout_expected_set_hash: rollout_expected_set_hash.into(),
-            last_observed_rollout_lease_epoch,
         };
     }
 }
@@ -220,7 +217,6 @@ impl LifecycleService for LifecycleServiceAdapter {
             status.rollout_operation_id = rollout.rollout_operation_id.clone();
             status.rollout_phase = rollout.rollout_phase;
             status.rollout_expected_set_hash = rollout.rollout_expected_set_hash.clone();
-            status.last_observed_rollout_lease_epoch = rollout.last_observed_rollout_lease_epoch;
         }
         Ok(Response::new(GetLifecycleStatusResponse {
             status: Some(status),
@@ -410,7 +406,6 @@ mod tests {
             "11111111-1111-4111-8111-111111111111",
             crate::wruntime::ManagerRolloutPhase::ClosingOld as i32,
             format!("sha256:{}", "a".repeat(64)),
-            7,
         );
         let adapter = LifecycleServiceAdapter::new_manager(
             lifecycle.snapshot(),
@@ -436,7 +431,6 @@ mod tests {
             status.rollout_phase,
             crate::wruntime::ManagerRolloutPhase::ClosingOld as i32
         );
-        assert_eq!(status.last_observed_rollout_lease_epoch, 7);
         Ok(())
     }
 

@@ -30,21 +30,22 @@ use wr_common::wruntime::{
     GetOperationResponse, GetOperatorStatusRequest, GetOperatorStatusResponse,
     GetPolicyStatusRequest, GetPolicyStatusResponse, GetRoutingTableRequest,
     GetRoutingTableResponse, GetSchemaRequest, GetSchemaResponse, GetWorkloadSnapshotRequest,
-    GetWorkloadSnapshotResponse, HeartbeatRequest, HeartbeatResponse, LeaseManagerRolloutRequest,
-    LeaseManagerRolloutResponse, ListEnginesRequest, ListEnginesResponse, ListManagersRequest,
-    ListManagersResponse, ListOperationsRequest, ListOperationsResponse, ListSchedulesRequest,
-    ListSchedulesResponse, ListSecretsRequest, ListSecretsResponse, ManagerInfo,
-    NodeOperationAction, PolicyCapHeadroom, PutNodeAgentPolicyRequest, PutNodeAgentPolicyResponse,
-    RegisterEngineRequest, RegisterEngineResponse, RegisterProxyRequest, RegisterProxyResponse,
+    GetWorkloadSnapshotResponse, HeartbeatRequest, HeartbeatResponse, ListEnginesRequest,
+    ListEnginesResponse, ListManagersRequest, ListManagersResponse, ListOperationsRequest,
+    ListOperationsResponse, ListSchedulesRequest, ListSchedulesResponse, ListSecretsRequest,
+    ListSecretsResponse, ManagerInfo, NodeOperationAction, PolicyCapHeadroom,
+    PutNodeAgentPolicyRequest, PutNodeAgentPolicyResponse, RegisterEngineRequest,
+    RegisterEngineResponse, RegisterProxyRequest, RegisterProxyResponse,
     RenewNodeCleanupLeaseRequest, RenewNodeCleanupLeaseResponse, RenewOperationLeaseRequest,
     RenewOperationLeaseResponse, ReportNodeCleanupResultRequest, ReportNodeCleanupResultResponse,
     ReportNodeObservationRequest, ReportNodeObservationResponse, ReportProxyInventoryRequest,
     ReportProxyInventoryResponse, ReportStepResultRequest, ReportStepResultResponse,
-    ResumeOperationRequest, ResumeOperationResponse, RetryNodeCleanupRequest,
-    RetryNodeCleanupResponse, RoutingRule, Schedule, SecretEntry, SetSecretRequest,
-    SetSecretResponse, SlotAuthorityStatus, SubmitOperationRequest, SubmitOperationResponse,
-    UpsertRoutingRuleResponse, UpsertScheduleRequest, UpsertScheduleResponse,
-    VerifyDeploymentRequest, VerifyDeploymentResponse,
+    ResetFailedManagerRolloutRequest, ResetFailedManagerRolloutResponse, ResumeOperationRequest,
+    ResumeOperationResponse, RetryNodeCleanupRequest, RetryNodeCleanupResponse, RoutingRule,
+    Schedule, SecretEntry, SetSecretRequest, SetSecretResponse, SlotAuthorityStatus,
+    SubmitOperationRequest, SubmitOperationResponse, UpsertRoutingRuleResponse,
+    UpsertScheduleRequest, UpsertScheduleResponse, VerifyDeploymentRequest,
+    VerifyDeploymentResponse,
 };
 
 use crate::auth::PrincipalPolicy;
@@ -1926,13 +1927,12 @@ impl InfrastructureApi {
             }
         }
         if !Manager::valid_bundle_digest(&request.manifest_digest)
-            || uuid::Uuid::parse_str(&request.executor_id).is_err()
             || request.deployment_certificate.is_empty()
             || request.deployment_certificate.len() > 128
             || request.deployment_certificate.contains('/')
         {
             return Err(Status::invalid_argument(
-                "manifest digest, executor UUID, and deployment certificate name are required",
+                "manifest digest and deployment certificate name are required",
             ));
         }
         request
@@ -1962,13 +1962,63 @@ impl InfrastructureApi {
                 ));
             }
         }
-        if !request.recovery_of.is_empty() {
-            uuid::Uuid::parse_str(&request.recovery_of)
-                .map_err(|_| Status::invalid_argument("recovery_of must be a rollout UUID"))?;
-        }
         Ok(format!(
             "sha256:{:x}",
             Sha256::digest(request.encode_to_vec())
+        ))
+    }
+
+    fn canonical_reset_request(
+        request: &mut ResetFailedManagerRolloutRequest,
+    ) -> Result<(String, String), Status> {
+        use prost::Message;
+        use sha2::{Digest, Sha256};
+        uuid::Uuid::parse_str(&request.rollout_id)
+            .map_err(|_| Status::invalid_argument("rollout_id must be a UUID"))?;
+        if !Manager::valid_bundle_digest(&request.original_request_digest)
+            || request.evidence.is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "original request digest and reset evidence are required",
+            ));
+        }
+        let mut keys = HashSet::new();
+        for item in &request.evidence {
+            wr_common::identity::ManagerId::parse(&item.manager_id)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            if !matches!(item.member_role.as_str(), "source" | "target")
+                || !keys.insert((item.member_role.clone(), item.manager_id.clone()))
+                || item.process_state != "STOPPED"
+                || item.policy_generation == 0
+                || !Manager::valid_bundle_digest(&item.policy_digest)
+            {
+                return Err(Status::invalid_argument(
+                    "reset evidence is invalid or duplicated",
+                ));
+            }
+        }
+        request
+            .evidence
+            .sort_by(|a, b| (&a.member_role, &a.manager_id).cmp(&(&b.member_role, &b.manager_id)));
+        let generation = request.evidence[0].policy_generation;
+        let digest = request.evidence[0].policy_digest.clone();
+        if request
+            .evidence
+            .iter()
+            .any(|item| item.policy_generation != generation || item.policy_digest != digest)
+        {
+            return Err(Status::failed_precondition(
+                "reset evidence must report one uniform policy",
+            ));
+        }
+        let evidence_bytes = ResetFailedManagerRolloutRequest {
+            evidence: request.evidence.clone(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        Ok((
+            format!("sha256:{:x}", Sha256::digest(request.encode_to_vec())),
+            format!("sha256:{:x}", Sha256::digest(evidence_bytes)),
         ))
     }
 
@@ -1998,11 +2048,27 @@ impl InfrastructureApi {
             .extensions()
             .get::<crate::auth::AuthorizedPrincipal>()
             .ok_or_else(|| Status::permission_denied("authorized caller context is missing"))?;
-        if principal.name != rollout.deployment_principal_uri
-            || principal.fingerprint != rollout.target_deployment_leaf_fingerprint
-        {
+        if principal.name != rollout.deployment_principal_uri {
             return Err(Status::permission_denied(
                 "rollout control requires its recorded deployment identity",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_closed_startup_rollout_policy(
+        receipt: &wr_common::authorization_policy::RolloutPrevalidation,
+        request: &BeginManagerRolloutRequest,
+        recovery_permitted: bool,
+    ) -> Result<(), Status> {
+        if receipt.cluster_id != request.cluster_id
+            || receipt.validator_version != request.target_policy_validator_version
+            || (!recovery_permitted
+                && (receipt.generation != request.target_generation
+                    || receipt.digest != request.target_policy_digest))
+        {
+            return Err(Status::failed_precondition(
+                "closed-startup rollout does not match the loaded target policy",
             ));
         }
         Ok(())
@@ -2069,21 +2135,14 @@ impl InfrastructureApi {
                         "closed-startup target validation failed: {error}"
                     ))
                 })?;
-            if receipt.generation != request.target_generation
-                || receipt.digest != request.target_policy_digest
-                || receipt.cluster_id != request.cluster_id
-                || receipt.validator_version != request.target_policy_validator_version
-            {
-                return Err(Status::failed_precondition(
-                    "closed-startup rollout does not match the loaded target policy",
-                ));
-            }
+            let recovery_permitted =
+                db::manager_rollout_recovery_permitted(&self.manager.pool, &principal.name).await?;
+            Self::validate_closed_startup_rollout_policy(&receipt, &request, recovery_permitted)?;
         }
         let digest = Self::canonical_rollout_request(&mut request)?;
         let rollout = db::begin_manager_rollout(
             &self.manager.pool,
             &principal.name,
-            &principal.fingerprint,
             &request,
             &digest,
             self.manager.admission.is_open(),
@@ -2186,24 +2245,30 @@ impl InfrastructureApi {
     ) -> Result<Response<BeginManagerRolloutResponse>, Status> {
         self.begin_manager_rollout_inner(request).await
     }
-    async fn lease_manager_rollout(
+    async fn reset_failed_manager_rollout(
         &self,
-        request: Request<LeaseManagerRolloutRequest>,
-    ) -> Result<Response<LeaseManagerRolloutResponse>, Status> {
+        request: Request<ResetFailedManagerRolloutRequest>,
+    ) -> Result<Response<ResetFailedManagerRolloutResponse>, Status> {
         let current =
             db::get_manager_rollout(&self.manager.pool, &request.get_ref().rollout_id).await?;
         self.authorize_rollout_controller(&request, &current)?;
-        let request = request.into_inner();
-        let rollout = db::lease_manager_rollout(
+        let principal = request
+            .extensions()
+            .get::<crate::auth::AuthorizedPrincipal>()
+            .ok_or_else(|| Status::permission_denied("authorized caller context is missing"))?
+            .name
+            .clone();
+        let mut request = request.into_inner();
+        let (request_digest, evidence_digest) = Self::canonical_reset_request(&mut request)?;
+        let response = db::reset_failed_manager_rollout(
             &self.manager.pool,
-            &request.rollout_id,
-            &request.executor_id,
-            request.expected_lease_epoch,
+            &principal,
+            &request,
+            &request_digest,
+            &evidence_digest,
         )
         .await?;
-        Ok(Response::new(LeaseManagerRolloutResponse {
-            rollout: Some(rollout),
-        }))
+        Ok(Response::new(response))
     }
     async fn advance_manager_rollout(
         &self,
@@ -2212,12 +2277,17 @@ impl InfrastructureApi {
         let current =
             db::get_manager_rollout(&self.manager.pool, &request.get_ref().rollout_id).await?;
         self.authorize_rollout_controller(&request, &current)?;
+        let principal = request
+            .extensions()
+            .get::<crate::auth::AuthorizedPrincipal>()
+            .ok_or_else(|| Status::permission_denied("authorized caller context is missing"))?
+            .name
+            .clone();
         let request = request.into_inner();
         let rollout = db::advance_manager_rollout(
             &self.manager.pool,
             &request.rollout_id,
-            &request.executor_id,
-            request.lease_epoch,
+            &principal,
             request.expected_phase,
             request.next_phase,
             &request.member_outcomes,
@@ -2446,12 +2516,12 @@ impl InfrastructureService for AuthorizedInfrastructureService {
             .verify("wruntime.InfrastructureService", "BeginManagerRollout")?;
         self.inner.begin_manager_rollout(r).await
     }
-    async fn lease_manager_rollout(
+    async fn reset_failed_manager_rollout(
         &self,
-        mut r: Request<LeaseManagerRolloutRequest>,
-    ) -> Result<Response<LeaseManagerRolloutResponse>, Status> {
-        self.authorize(&mut r, "LeaseManagerRollout")?;
-        self.inner.lease_manager_rollout(r).await
+        mut r: Request<ResetFailedManagerRolloutRequest>,
+    ) -> Result<Response<ResetFailedManagerRolloutResponse>, Status> {
+        self.authorize(&mut r, "ResetFailedManagerRollout")?;
+        self.inner.reset_failed_manager_rollout(r).await
     }
     async fn advance_manager_rollout(
         &self,
@@ -3003,13 +3073,11 @@ node_agent_enrollments=[]
             target_generation: 2,
             target_policy_digest: format!("sha256:{}", "a".repeat(64)),
             expected_targets: vec![target("manager-b", 'b'), target("manager-a", 'a')],
-            recovery_of: String::new(),
             target_policy_validator_version: 1,
             target_deployment_principal_uri: "urn:wruntime:cluster-a:human:deployer".into(),
             target_deployment_leaf_fingerprint: format!("sha256:{}", "c".repeat(64)),
             source_managers: vec![],
             manifest_digest: format!("sha256:{}", "d".repeat(64)),
-            executor_id: "9ba18521-717d-4c39-bf79-e4bb87f95c55".into(),
             deployment_certificate: "deploy-set-v1".into(),
         };
         first.source_managers = vec![wr_common::wruntime::ManagerRolloutSource {
@@ -3035,6 +3103,53 @@ node_agent_enrollments=[]
             first_digest,
             InfrastructureApi::canonical_rollout_request(&mut changed_source).unwrap()
         );
+    }
+
+    #[test]
+    fn recovery_permit_allows_a_new_target_policy_from_closed_startup() {
+        let loaded_digest = format!("sha256:{}", "3".repeat(64));
+        let receipt = wr_common::authorization_policy::RolloutPrevalidation {
+            validator_version: 1,
+            schema_version: 1,
+            generation: 3,
+            digest: loaded_digest.clone(),
+            cluster_id: "cluster-a".into(),
+            targets: Vec::new(),
+            target_set_hash: format!("sha256:{}", "1".repeat(64)),
+            caller_principal_uri: "urn:wruntime:cluster-a:human:deployer".into(),
+            caller_leaf_fingerprint: format!("sha256:{}", "2".repeat(64)),
+            caller_can_begin: true,
+        };
+        let mut request = BeginManagerRolloutRequest {
+            cluster_id: "cluster-a".into(),
+            target_generation: 4,
+            target_policy_digest: format!("sha256:{}", "4".repeat(64)),
+            target_policy_validator_version: 1,
+            ..Default::default()
+        };
+
+        let error =
+            InfrastructureApi::validate_closed_startup_rollout_policy(&receipt, &request, false)
+                .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(InfrastructureApi::validate_closed_startup_rollout_policy(
+            &receipt, &request, true,
+        )
+        .is_ok());
+
+        request.cluster_id = "other-cluster".into();
+        let error =
+            InfrastructureApi::validate_closed_startup_rollout_policy(&receipt, &request, true)
+                .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+        request.cluster_id = receipt.cluster_id.clone();
+        request.target_generation = receipt.generation;
+        request.target_policy_digest = loaded_digest;
+        assert!(InfrastructureApi::validate_closed_startup_rollout_policy(
+            &receipt, &request, false,
+        )
+        .is_ok());
     }
 
     #[test]

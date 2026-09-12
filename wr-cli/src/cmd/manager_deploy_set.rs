@@ -4,7 +4,7 @@
 //! named by its digest and the create request is derived only from validated,
 //! sorted manifest content. Active selectors are not touched while staging.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,9 +17,10 @@ use sha2::{Digest, Sha256};
 use wr_common::authorization_policy::{RolloutTarget, ValidatedPolicy};
 use wr_common::manager_client::RetryClass;
 use wr_common::wruntime::{
-    AdvanceManagerRolloutRequest, BeginManagerRolloutRequest, LeaseManagerRolloutRequest,
-    ManagerRollout, ManagerRolloutMemberOutcome, ManagerRolloutPhase, ManagerRolloutSource,
-    ManagerRolloutTarget,
+    AdvanceManagerRolloutRequest, BeginManagerRolloutRequest, FailedManagerRolloutEvidence,
+    GetManagerRolloutRequest, ManagerRollout, ManagerRolloutMemberOutcome, ManagerRolloutPhase,
+    ManagerRolloutSource, ManagerRolloutTarget, ResetFailedManagerRolloutRequest,
+    ResetFailedManagerRolloutResponse,
 };
 
 use super::helpers::{self, RemoteInstallClass};
@@ -29,8 +30,6 @@ const SCHEMA_VERSION: u32 = 1;
 const ARTIFACT_ROOT: &str = "/opt/wruntime/manager-artifacts";
 const STATE_ROOT: &str = "/var/lib/wruntime";
 const PKI_ROOT: &str = "/etc/wruntime/pki";
-const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
-const MANAGER_ROLLOUT_LEASE_SECS: u64 = 30;
 const MANAGER_BARRIER_TIMEOUT: Duration = Duration::from_secs(120);
 const SOLE_MANAGER_CONTINUATION_SECS: u64 = 120;
 
@@ -63,12 +62,8 @@ fn trace_rollout(event: &str, rollout: &ManagerRollout, endpoint_present: bool) 
         "phase": phase,
         "target_generation": rollout.target_generation,
         "deployment_identity": rollout.target_deployment_principal_uri,
-        "lease_epoch": rollout.lease_epoch,
-        "lease_expires_unix": lease_expiry_unix(rollout),
         "endpoint_present": endpoint_present,
         "barrier_timeout_seconds": MANAGER_BARRIER_TIMEOUT.as_secs(),
-        "lease_ttl_seconds": MANAGER_ROLLOUT_LEASE_SECS,
-        "lease_renew_seconds": LEASE_RENEW_INTERVAL.as_secs(),
     });
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{value}");
@@ -92,18 +87,26 @@ pub struct RestoreConfigArgs {
     pub manager_id: String,
 }
 
+#[derive(Args)]
+pub struct ResetFailedRolloutArgs {
+    /// The exact digest-qualified deployment manifest used by the failed rollout.
+    #[arg(long)]
+    pub manifest: String,
+    /// Durable FAILED_CLOSED rollout to reset.
+    #[arg(long)]
+    pub rollout_id: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagerSetManifest {
     pub schema_version: u32,
     pub client_operation_id: String,
-    pub executor_id: String,
     pub cluster_id: String,
     /// Existing control endpoint. Omit only for a pristine empty-cluster bootstrap.
     pub manager_endpoint: Option<String>,
     pub target_policy: PathBuf,
     pub deployment_certificate: String,
-    pub recovery_of: Option<String>,
     #[serde(default = "default_parallelism")]
     pub max_parallel: usize,
     #[serde(default)]
@@ -173,42 +176,6 @@ struct ActivationDescriptor<'a> {
     credential_digest: &'a str,
 }
 
-#[derive(Debug, Serialize)]
-struct HostActionEvidence<'a> {
-    schema_version: u32,
-    rollout_id: &'a str,
-    manager_id: &'a str,
-    lease_epoch: u64,
-    action_sequence: u64,
-    manifest_digest: &'a str,
-    executable_digest: &'a str,
-    backend_spec_digest: &'a str,
-    config_digest: &'a str,
-    credential_digest: &'a str,
-    old_selector_digest: &'a str,
-    new_selector_digest: &'a str,
-    effect: &'a str,
-    outcome: &'a str,
-    lease_expires_unix: u64,
-    continuation_deadline_unix: Option<u64>,
-}
-
-#[derive(Debug, Serialize)]
-struct SourceHostActionEvidence<'a> {
-    schema_version: u32,
-    rollout_id: &'a str,
-    manager_id: &'a str,
-    lease_epoch: u64,
-    action_sequence: u64,
-    manifest_digest: &'a str,
-    host_digest: &'a str,
-    selector_digest: &'a str,
-    effect: &'a str,
-    outcome: &'a str,
-    lease_expires_unix: u64,
-    continuation_deadline_unix: u64,
-}
-
 struct ValidatedManifest {
     manifest: ManagerSetManifest,
     policy: ValidatedPolicy,
@@ -271,7 +238,10 @@ fn target_host_digest(target: &TargetManager) -> Result<String> {
     })?))
 }
 
-fn load_manifest(path: &Path) -> Result<ValidatedManifest> {
+fn load_manifest_with_artifacts(
+    path: &Path,
+    validate_artifacts: bool,
+) -> Result<ValidatedManifest> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut manifest: ManagerSetManifest =
         toml::from_slice(&bytes).context("invalid deploy-set manifest")?;
@@ -280,10 +250,6 @@ fn load_manifest(path: &Path) -> Result<ValidatedManifest> {
     }
     uuid::Uuid::parse_str(&manifest.client_operation_id)
         .context("client_operation_id must be a UUID")?;
-    uuid::Uuid::parse_str(&manifest.executor_id).context("executor_id must be a UUID")?;
-    if let Some(recovery) = &manifest.recovery_of {
-        uuid::Uuid::parse_str(recovery).context("recovery_of must be a UUID")?;
-    }
     wr_common::identity::ClusterId::parse(&manifest.cluster_id)?;
     if manifest.deployment_certificate.is_empty()
         || manifest.deployment_certificate.contains('/')
@@ -334,44 +300,46 @@ fn load_manifest(path: &Path) -> Result<ValidatedManifest> {
         ] {
             validate_digest(digest, label)?;
         }
-        if digest_file(&target.backend_spec)? != target.backend_spec_digest
-            || digest_file(&target.config)? != target.config_digest
-            || helpers::local_tree_digest(&target.credential_set)? != target.credential_digest
-        {
-            bail!(
-                "manager {} has an artifact digest mismatch",
-                target.manager_id
-            );
-        }
-        let backend_spec = fs::read_to_string(&target.backend_spec)
-            .context("manager backend spec must be UTF-8")?;
-        match target.backend {
-            Backend::Systemd => {
-                if digest_file(Path::new(&target.executable))? != target.executable_digest {
-                    bail!("manager {} binary digest mismatch", target.manager_id);
-                }
-                if backend_spec != service_gen::manager_activation_systemd_unit() {
-                    bail!(
-                        "manager {} systemd spec must be the stable activation-launcher unit",
-                        target.manager_id
-                    );
-                }
+        if validate_artifacts {
+            if digest_file(&target.backend_spec)? != target.backend_spec_digest
+                || digest_file(&target.config)? != target.config_digest
+                || helpers::local_tree_digest(&target.credential_set)? != target.credential_digest
+            {
+                bail!(
+                    "manager {} has an artifact digest mismatch",
+                    target.manager_id
+                );
             }
-            Backend::Compose => {
-                if !target.executable.contains("@sha256:")
-                    || !target.executable.ends_with(&target.executable_digest[7..])
-                {
-                    bail!(
-                        "manager {} Compose image must be an immutable matching repo digest",
-                        target.manager_id
-                    );
+            let backend_spec = fs::read_to_string(&target.backend_spec)
+                .context("manager backend spec must be UTF-8")?;
+            match target.backend {
+                Backend::Systemd => {
+                    if digest_file(Path::new(&target.executable))? != target.executable_digest {
+                        bail!("manager {} binary digest mismatch", target.manager_id);
+                    }
+                    if backend_spec != service_gen::manager_activation_systemd_unit() {
+                        bail!(
+                            "manager {} systemd spec must be the stable activation-launcher unit",
+                            target.manager_id
+                        );
+                    }
                 }
-                if !backend_spec.contains(&target.executable)
-                    || backend_spec.contains(".key")
-                    || backend_spec.contains("/release")
-                    || backend_spec.contains("config.toml")
-                {
-                    bail!("manager {} Compose spec must select only the immutable image and protected stable mounts", target.manager_id);
+                Backend::Compose => {
+                    if !target.executable.contains("@sha256:")
+                        || !target.executable.ends_with(&target.executable_digest[7..])
+                    {
+                        bail!(
+                            "manager {} Compose image must be an immutable matching repo digest",
+                            target.manager_id
+                        );
+                    }
+                    if !backend_spec.contains(&target.executable)
+                        || backend_spec.contains(".key")
+                        || backend_spec.contains("/release")
+                        || backend_spec.contains("config.toml")
+                    {
+                        bail!("manager {} Compose spec must select only the immutable image and protected stable mounts", target.manager_id);
+                    }
                 }
             }
         }
@@ -412,6 +380,10 @@ fn load_manifest(path: &Path) -> Result<ValidatedManifest> {
         policy,
         manifest_digest,
     })
+}
+
+fn load_manifest(path: &Path) -> Result<ValidatedManifest> {
+    load_manifest_with_artifacts(path, true)
 }
 
 fn activation_descriptor(target: &TargetManager) -> Result<(Vec<u8>, String)> {
@@ -495,7 +467,6 @@ fn create_request(validated: &ValidatedManifest) -> Result<BeginManagerRolloutRe
                 new_selector_digest: target.new_selector_digest.clone(),
             })
             .collect(),
-        recovery_of: validated.manifest.recovery_of.clone().unwrap_or_default(),
         target_policy_validator_version: receipt.validator_version,
         target_deployment_principal_uri: receipt.caller_principal_uri,
         target_deployment_leaf_fingerprint: receipt.caller_leaf_fingerprint,
@@ -511,7 +482,6 @@ fn create_request(validated: &ValidatedManifest) -> Result<BeginManagerRolloutRe
             })
             .collect(),
         manifest_digest: validated.manifest_digest.clone(),
-        executor_id: validated.manifest.executor_id.clone(),
         deployment_certificate: validated.manifest.deployment_certificate.clone(),
     })
 }
@@ -589,13 +559,7 @@ fn install_credential_tree(target: &TargetManager, manifest: &ManagerSetManifest
     )
 }
 
-fn stage_target(
-    target: &TargetManager,
-    validated: &ValidatedManifest,
-    rollout_id: &str,
-    lease_epoch: u64,
-    lease_expires_unix: u64,
-) -> Result<()> {
+fn stage_target(target: &TargetManager, validated: &ValidatedManifest) -> Result<()> {
     let manifest = &validated.manifest;
     let ssh = ssh(target, manifest);
     let config_dir = format!("{STATE_ROOT}/manager-config/{}", target.manager_id);
@@ -683,115 +647,13 @@ fn stage_target(
         RemoteInstallClass::Sensitive,
         Some(&digest),
     )?;
-    write_evidence(
-        target,
-        validated,
-        rollout_id,
-        lease_epoch,
-        1,
-        "stage",
-        "completed",
-        lease_expires_unix,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_evidence(
-    target: &TargetManager,
-    validated: &ValidatedManifest,
-    rollout_id: &str,
-    lease_epoch: u64,
-    sequence: u64,
-    effect: &str,
-    outcome: &str,
-    lease_expires_unix: u64,
-    deadline: Option<u64>,
-) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(&HostActionEvidence {
-        schema_version: SCHEMA_VERSION,
-        rollout_id,
-        manager_id: &target.manager_id,
-        lease_epoch,
-        action_sequence: sequence,
-        manifest_digest: &validated.manifest_digest,
-        executable_digest: &target.executable_digest,
-        backend_spec_digest: &target.backend_spec_digest,
-        config_digest: &target.config_digest,
-        credential_digest: &target.credential_digest,
-        old_selector_digest: &target.old_selector_digest,
-        new_selector_digest: &target.new_selector_digest,
-        effect,
-        outcome,
-        lease_expires_unix,
-        continuation_deadline_unix: deadline,
-    })?;
-    helpers::install_remote_fenced_json(
-        &bytes,
-        &target.remote,
-        &format!(
-            "{STATE_ROOT}/manager-rollouts/{rollout_id}/{}.json",
-            target.manager_id
-        ),
-        validated.manifest.ssh_key.as_deref(),
-        validated.manifest.ssh_port,
-    )
-}
-
-fn lease_expiry_unix(rollout: &ManagerRollout) -> u64 {
-    rollout
-        .lease_expires_at
-        .as_ref()
-        .and_then(|timestamp| u64::try_from(timestamp.seconds).ok())
-        .unwrap_or(0)
-}
-
-fn write_source_evidence(
-    source: &SourceManager,
-    validated: &ValidatedManifest,
-    rollout: &ManagerRollout,
-    outcome: &str,
-    continuation_deadline_unix: u64,
-) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(&SourceHostActionEvidence {
-        schema_version: SCHEMA_VERSION,
-        rollout_id: &rollout.rollout_id,
-        manager_id: &source.manager_id,
-        lease_epoch: rollout.lease_epoch,
-        action_sequence: 2,
-        manifest_digest: &validated.manifest_digest,
-        host_digest: &source.host_digest,
-        selector_digest: &source.selector_digest,
-        effect: "deactivate-source",
-        outcome,
-        lease_expires_unix: lease_expiry_unix(rollout),
-        continuation_deadline_unix,
-    })?;
-    helpers::install_remote_fenced_json(
-        &bytes,
-        &source.remote,
-        &format!(
-            "{STATE_ROOT}/manager-rollouts/{}/{}.json",
-            rollout.rollout_id, source.manager_id
-        ),
-        validated.manifest.ssh_key.as_deref(),
-        validated.manifest.ssh_port,
-    )
+    Ok(())
 }
 
 fn deactivate_source(
     source: &SourceManager,
     validated: &ValidatedManifest,
-    rollout: &ManagerRollout,
-    continuation_deadline_unix: u64,
 ) -> Result<ManagerRolloutMemberOutcome> {
-    write_source_evidence(
-        source,
-        validated,
-        rollout,
-        "started",
-        continuation_deadline_unix,
-    )?;
     let command = service_gen::manager_source_stop_command(
         &source.manager_id,
         &format!("{STATE_ROOT}/manager-activation/current-activation.json"),
@@ -799,13 +661,6 @@ fn deactivate_source(
     );
     helpers::run_ssh(&source_ssh(source, &validated.manifest), &command)
         .context("selector-fenced source manager deactivation failed")?;
-    write_source_evidence(
-        source,
-        validated,
-        rollout,
-        "completed",
-        continuation_deadline_unix,
-    )?;
     Ok(ManagerRolloutMemberOutcome {
         manager_id: source.manager_id.clone(),
         member_role: "source".into(),
@@ -821,24 +676,6 @@ fn activate_target(
     sole_manager: bool,
 ) -> Result<ManagerRolloutMemberOutcome> {
     let ssh = ssh(target, &validated.manifest);
-    let deadline = sole_manager.then(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            + SOLE_MANAGER_CONTINUATION_SECS
-    });
-    write_evidence(
-        target,
-        validated,
-        &rollout.rollout_id,
-        rollout.lease_epoch,
-        2,
-        "activate",
-        "started",
-        lease_expiry_unix(rollout),
-        deadline,
-    )?;
     let descriptor_path = format!(
         "{STATE_ROOT}/manager-activation/{}/{}.next",
         target.manager_id,
@@ -859,8 +696,8 @@ fn activate_target(
         format!(
             "sudo systemd-run --quiet --wait --collect --unit={} --property=RuntimeMaxSec={}s /bin/sh -c {}",
             helpers::shell_quote(&format!(
-                "wruntime-manager-rollout-{}-{}",
-                rollout.rollout_id, rollout.lease_epoch
+                "wruntime-manager-rollout-{}",
+                rollout.rollout_id
             )),
             SOLE_MANAGER_CONTINUATION_SECS,
             helpers::shell_quote(&action),
@@ -869,17 +706,6 @@ fn activate_target(
         action
     };
     helpers::run_ssh(&ssh, &action).context("fenced target activation failed")?;
-    write_evidence(
-        target,
-        validated,
-        &rollout.rollout_id,
-        rollout.lease_epoch,
-        2,
-        "activate",
-        "completed",
-        lease_expiry_unix(rollout),
-        deadline,
-    )?;
     Ok(ManagerRolloutMemberOutcome {
         manager_id: target.manager_id.clone(),
         member_role: "target".into(),
@@ -897,8 +723,6 @@ async fn advance(
     epoch
         .advance_manager_rollout(AdvanceManagerRolloutRequest {
             rollout_id: rollout.rollout_id.clone(),
-            executor_id: rollout.executor_id.clone(),
-            lease_epoch: rollout.lease_epoch,
             expected_phase: rollout.phase,
             next_phase: next as i32,
             member_outcomes: outcomes,
@@ -917,13 +741,9 @@ async fn mark_failed_closed(
     validated: &ValidatedManifest,
     endpoint_present: bool,
 ) {
-    if let Ok(current) = lease(epoch, rollout, &validated.manifest.executor_id).await {
-        if let Ok(failed) =
-            advance(epoch, &current, ManagerRolloutPhase::FailedClosed, vec![]).await
-        {
-            trace_rollout("phase", &failed, endpoint_present);
-            return;
-        }
+    if let Ok(failed) = advance(epoch, rollout, ManagerRolloutPhase::FailedClosed, vec![]).await {
+        trace_rollout("phase", &failed, endpoint_present);
+        return;
     }
     for target in &validated.manifest.targets {
         let Ok(mut candidate) =
@@ -931,13 +751,9 @@ async fn mark_failed_closed(
         else {
             continue;
         };
-        let Ok(current) = lease(&mut candidate, rollout, &validated.manifest.executor_id).await
-        else {
-            continue;
-        };
         if let Ok(failed) = advance(
             &mut candidate,
-            &current,
+            rollout,
             ManagerRolloutPhase::FailedClosed,
             vec![],
         )
@@ -950,37 +766,22 @@ async fn mark_failed_closed(
 }
 
 /// Observe manager-owned barriers without changing canonical action evidence.
-/// The lease is renewed on the specified ten-second cadence while waiting.
 async fn advance_when_ready(
     epoch: &mut wr_common::manager_client::ManagerEpoch,
-    mut rollout: ManagerRollout,
-    executor_id: &str,
+    rollout: ManagerRollout,
     next: ManagerRolloutPhase,
     outcomes: Vec<ManagerRolloutMemberOutcome>,
 ) -> Result<ManagerRollout> {
     let deadline = tokio::time::Instant::now() + MANAGER_BARRIER_TIMEOUT;
     trace_rollout("barrier-start", &rollout, true);
-    let mut renew_at = tokio::time::Instant::now() + LEASE_RENEW_INTERVAL;
     loop {
-        match epoch
-            .advance_manager_rollout(AdvanceManagerRolloutRequest {
-                rollout_id: rollout.rollout_id.clone(),
-                executor_id: rollout.executor_id.clone(),
-                lease_epoch: rollout.lease_epoch,
-                expected_phase: rollout.phase,
-                next_phase: next as i32,
-                member_outcomes: outcomes.clone(),
-            })
-            .await
-        {
-            Ok(response) => {
-                return response
-                    .into_inner()
-                    .rollout
-                    .context("manager omitted rollout")
-            }
-            Err(error) if error.code() == tonic::Code::FailedPrecondition => {}
-            Err(error) => return Err(error.into()),
+        match advance(epoch, &rollout, next, outcomes.clone()).await {
+            Ok(rollout) => return Ok(rollout),
+            Err(error)
+                if error
+                    .downcast_ref::<tonic::Status>()
+                    .is_some_and(|status| status.code() == tonic::Code::FailedPrecondition) => {}
+            Err(error) => return Err(error),
         }
         if tokio::time::Instant::now() >= deadline {
             bail!(
@@ -988,30 +789,8 @@ async fn advance_when_ready(
                 next.as_str_name()
             );
         }
-        if tokio::time::Instant::now() >= renew_at {
-            rollout = lease(epoch, &rollout, executor_id).await?;
-            trace_rollout("lease-renewed", &rollout, true);
-            renew_at = tokio::time::Instant::now() + LEASE_RENEW_INTERVAL;
-        }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-}
-
-async fn lease(
-    epoch: &mut wr_common::manager_client::ManagerEpoch,
-    rollout: &ManagerRollout,
-    executor_id: &str,
-) -> Result<ManagerRollout> {
-    epoch
-        .lease_manager_rollout(LeaseManagerRolloutRequest {
-            rollout_id: rollout.rollout_id.clone(),
-            executor_id: executor_id.to_string(),
-            expected_lease_epoch: rollout.lease_epoch,
-        })
-        .await?
-        .into_inner()
-        .rollout
-        .context("manager omitted leased rollout")
 }
 
 fn target_controls_rollout(
@@ -1029,24 +808,19 @@ fn target_controls_rollout(
         && observation.rollout_id == rollout.rollout_id
         && observation.rollout_phase == ManagerRolloutPhase::StartingTarget as i32
         && observation.rollout_expected_set_hash == rollout.expected_target_set_hash
-        && observation.rollout_lease_epoch == rollout.lease_epoch
 }
 
 async fn establish_target_control(
     validated: &ValidatedManifest,
-    source_epoch: &mut wr_common::manager_client::ManagerEpoch,
-    rollout: &mut ManagerRollout,
+    rollout: &ManagerRollout,
     deadline: tokio::time::Instant,
 ) -> Result<wr_common::manager_client::ManagerEpoch> {
-    let mut renew_at = tokio::time::Instant::now() + LEASE_RENEW_INTERVAL;
     loop {
         for target in &validated.manifest.targets {
-            if let Ok(mut candidate) =
+            if let Ok(candidate) =
                 client::connect_operator(&target.endpoint, RetryClass::DurableCreate).await
             {
                 if target_controls_rollout(&candidate, rollout, target) {
-                    *rollout =
-                        lease(&mut candidate, rollout, &validated.manifest.executor_id).await?;
                     trace_rollout("target-control-established", rollout, true);
                     return Ok(candidate);
                 }
@@ -1054,17 +828,6 @@ async fn establish_target_control(
         }
         if tokio::time::Instant::now() >= deadline {
             bail!("timed out establishing an exact closed target rollout-control endpoint");
-        }
-        if tokio::time::Instant::now() >= renew_at {
-            if let Ok(renewed) = lease(source_epoch, rollout, &validated.manifest.executor_id).await
-            {
-                *rollout = renewed;
-                trace_rollout("lease-renewed", rollout, true);
-            }
-            // An in-place transition deliberately stopped this epoch. Keep
-            // trying exact target endpoints within the bounded continuation;
-            // their first lease call still detects any intervening takeover.
-            renew_at = tokio::time::Instant::now() + LEASE_RENEW_INTERVAL;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -1086,6 +849,368 @@ async fn begin(
         .rollout
         .context("manager omitted rollout")?;
     Ok((epoch, rollout))
+}
+
+#[derive(Debug, Deserialize)]
+struct StoppedInspection {
+    manager_id: String,
+    selector_digest: String,
+    backend: String,
+    config_path: String,
+    config_digest: String,
+    policy_path: String,
+    policy_hex: String,
+}
+
+#[derive(Debug)]
+struct PhysicalInspection {
+    policy_generation: u64,
+    policy_digest: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ResetReceipt {
+    rollout_id: String,
+    original_request_digest: String,
+    reset_request_digest: String,
+    evidence_digest: String,
+    observed_policy_generation: u64,
+    observed_policy_digest: String,
+}
+
+impl From<ResetFailedManagerRolloutResponse> for ResetReceipt {
+    fn from(value: ResetFailedManagerRolloutResponse) -> Self {
+        Self {
+            rollout_id: value.rollout_id,
+            original_request_digest: value.original_request_digest,
+            reset_request_digest: value.reset_request_digest,
+            evidence_digest: value.evidence_digest,
+            observed_policy_generation: value.observed_policy_generation,
+            observed_policy_digest: value.observed_policy_digest,
+        }
+    }
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("inspection returned malformed policy bytes");
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|offset| {
+            u8::from_str_radix(&value[offset..offset + 2], 16)
+                .context("inspection returned malformed policy bytes")
+        })
+        .collect()
+}
+
+fn validate_reset_control_endpoint(manifest: &ManagerSetManifest, endpoint: &str) -> Result<()> {
+    wr_common::identity::PeerHttpsUrl::parse(endpoint)?;
+    let endpoint_declared = manifest.manager_endpoint.as_deref() == Some(endpoint)
+        || manifest
+            .targets
+            .iter()
+            .any(|target| target.endpoint == endpoint);
+    if !endpoint_declared {
+        bail!("--manager must be a control endpoint declared by the deployment manifest");
+    }
+    Ok(())
+}
+
+fn validate_reset_rollout(
+    rollout: &ManagerRollout,
+    expected: &BeginManagerRolloutRequest,
+    expected_target_set_hash: &str,
+) -> Result<()> {
+    if rollout.phase != ManagerRolloutPhase::FailedClosed as i32 {
+        bail!("rollout is not FAILED_CLOSED");
+    }
+    validate_digest(&rollout.request_digest, "original rollout request digest")?;
+    if rollout.deployment_principal_uri != expected.target_deployment_principal_uri {
+        bail!("current caller principal does not own the failed rollout");
+    }
+    if rollout.cluster_id != expected.cluster_id
+        || rollout.target_generation != expected.target_generation
+        || rollout.target_policy_digest != expected.target_policy_digest
+        || rollout.target_policy_validator_version != expected.target_policy_validator_version
+        || rollout.target_deployment_principal_uri != expected.target_deployment_principal_uri
+        || rollout.expected_target_set_hash != expected_target_set_hash
+        || rollout.expected_targets != expected.expected_targets
+        || rollout.source_managers != expected.source_managers
+        || rollout.manifest_digest != expected.manifest_digest
+        || rollout.deployment_certificate != expected.deployment_certificate
+    {
+        bail!("deployment manifest does not exactly match the durable rollout declaration");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResetFlowStage {
+    Fetching,
+    Matched,
+    Snapshot,
+    Submitting,
+}
+
+#[derive(Debug)]
+struct ResetFlow {
+    stage: ResetFlowStage,
+    inspections: usize,
+}
+
+impl ResetFlow {
+    fn new() -> Self {
+        Self {
+            stage: ResetFlowStage::Fetching,
+            inspections: 0,
+        }
+    }
+
+    fn declaration_matched(&mut self) -> Result<()> {
+        if self.stage != ResetFlowStage::Fetching {
+            bail!("reset declaration may only be matched once");
+        }
+        self.stage = ResetFlowStage::Matched;
+        Ok(())
+    }
+
+    fn record_inspection(&mut self) -> Result<()> {
+        if self.stage != ResetFlowStage::Matched {
+            bail!("reset inspection cannot precede declaration matching");
+        }
+        self.inspections += 1;
+        Ok(())
+    }
+
+    fn snapshot_complete(&mut self, expected: usize) -> Result<()> {
+        if self.stage != ResetFlowStage::Matched || expected == 0 || self.inspections != expected {
+            bail!("reset snapshot is incomplete");
+        }
+        self.stage = ResetFlowStage::Snapshot;
+        Ok(())
+    }
+
+    fn begin_submit(&mut self) -> Result<()> {
+        if self.stage != ResetFlowStage::Snapshot {
+            bail!("reset cannot be submitted before the complete snapshot");
+        }
+        self.stage = ResetFlowStage::Submitting;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ProbeExpectation {
+    remote: String,
+    selectors: BTreeSet<String>,
+    roles: BTreeSet<String>,
+}
+
+fn probe_expectations(validated: &ValidatedManifest) -> Result<BTreeMap<String, ProbeExpectation>> {
+    let mut probes = BTreeMap::<String, ProbeExpectation>::new();
+    for source in &validated.manifest.sources {
+        let probe = probes.entry(source.manager_id.clone()).or_default();
+        if !probe.remote.is_empty() && probe.remote != source.remote {
+            bail!(
+                "manager {} has conflicting declared remotes",
+                source.manager_id
+            );
+        }
+        probe.remote.clone_from(&source.remote);
+        probe.selectors.insert(source.selector_digest.clone());
+        probe.roles.insert("source".into());
+    }
+    for target in &validated.manifest.targets {
+        let probe = probes.entry(target.manager_id.clone()).or_default();
+        if !probe.remote.is_empty() && probe.remote != target.remote {
+            bail!(
+                "manager {} has conflicting declared remotes",
+                target.manager_id
+            );
+        }
+        if probe.roles.contains("source")
+            && !probe.selectors.contains(&target.old_selector_digest)
+            && !probe.selectors.contains(&target.new_selector_digest)
+        {
+            bail!(
+                "manager {} has conflicting source/target activation selectors",
+                target.manager_id
+            );
+        }
+        probe.remote.clone_from(&target.remote);
+        probe.selectors.insert(target.old_selector_digest.clone());
+        probe.selectors.insert(target.new_selector_digest.clone());
+        probe.roles.insert("target".into());
+    }
+    Ok(probes)
+}
+
+fn canonical_reset_evidence(
+    probes: &BTreeMap<String, ProbeExpectation>,
+    inspected: &BTreeMap<String, PhysicalInspection>,
+) -> Result<Vec<FailedManagerRolloutEvidence>> {
+    if probes.len() != inspected.len() || probes.keys().ne(inspected.keys()) {
+        bail!("stopped-host inspection does not exactly cover every declared manager");
+    }
+    let mut uniform: Option<(u64, &str)> = None;
+    let mut evidence = Vec::new();
+    for (manager_id, probe) in probes {
+        let result = inspected
+            .get(manager_id)
+            .context("missing stopped-host inspection")?;
+        if result.policy_generation == 0 {
+            bail!("installed authorization policy generation must be nonzero");
+        }
+        validate_digest(
+            &result.policy_digest,
+            "installed authorization policy digest",
+        )?;
+        match uniform {
+            Some((generation, digest))
+                if generation != result.policy_generation || digest != result.policy_digest =>
+            {
+                bail!("installed authorization policy is not uniform across all managers")
+            }
+            None => uniform = Some((result.policy_generation, &result.policy_digest)),
+            _ => {}
+        }
+        for role in &probe.roles {
+            evidence.push(FailedManagerRolloutEvidence {
+                member_role: role.clone(),
+                manager_id: manager_id.clone(),
+                process_state: "STOPPED".into(),
+                policy_generation: result.policy_generation,
+                policy_digest: result.policy_digest.clone(),
+            });
+        }
+    }
+    evidence.sort_by(|a, b| (&a.member_role, &a.manager_id).cmp(&(&b.member_role, &b.manager_id)));
+    Ok(evidence)
+}
+
+fn trace_reset(event: &str, rollout_id: &str, details: serde_json::Value) {
+    let Some(path) = std::env::var_os("WRT_MANAGER_ROLLOUT_TRACE") else {
+        return;
+    };
+    let mut value = serde_json::json!({"event": event, "rollout_id": rollout_id});
+    if let (Some(base), Some(extra)) = (value.as_object_mut(), details.as_object()) {
+        base.extend(extra.clone());
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{value}");
+    }
+}
+
+pub async fn reset_failed_rollout(
+    args: ResetFailedRolloutArgs,
+    manager_endpoint: &str,
+) -> Result<()> {
+    let validated = load_manifest_with_artifacts(Path::new(&args.manifest), false)?;
+    validate_reset_control_endpoint(&validated.manifest, manager_endpoint)?;
+    let expected_request = create_request(&validated)?;
+    let mut flow = ResetFlow::new();
+    let mut epoch = client::connect_operator(manager_endpoint, RetryClass::DurableCreate).await?;
+    let rollout = epoch
+        .get_manager_rollout(GetManagerRolloutRequest {
+            rollout_id: args.rollout_id.clone(),
+        })
+        .await?
+        .into_inner()
+        .rollout
+        .context("manager omitted rollout")?;
+    if rollout.rollout_id != args.rollout_id {
+        bail!("manager returned a different rollout");
+    }
+    validate_reset_rollout(
+        &rollout,
+        &expected_request,
+        &validated.policy.manager_set_hash,
+    )?;
+    flow.declaration_matched()?;
+    trace_reset(
+        "reset-declaration-fetched",
+        &rollout.rollout_id,
+        serde_json::json!({"manifest_digest": rollout.manifest_digest}),
+    );
+    drop(epoch);
+
+    let probes = probe_expectations(&validated)?;
+    let mut inspected = BTreeMap::new();
+    for (manager_id, expected) in &probes {
+        let selectors = expected.selectors.iter().cloned().collect::<Vec<_>>();
+        let command = service_gen::manager_stopped_inspection_command(
+            manager_id,
+            &format!("{STATE_ROOT}/manager-activation/current-activation.json"),
+            &selectors,
+        );
+        let ssh = helpers::build_ssh_args(
+            &expected.remote,
+            validated.manifest.ssh_key.as_deref(),
+            validated.manifest.ssh_port,
+        );
+        let output = helpers::run_ssh_output(&ssh, &command).with_context(|| {
+            format!("read-only stopped-state inspection failed for {manager_id}")
+        })?;
+        let observation: StoppedInspection =
+            serde_json::from_str(output.trim()).with_context(|| {
+                format!("manager {manager_id} returned malformed inspection output")
+            })?;
+        if observation.manager_id != *manager_id
+            || !expected.selectors.contains(&observation.selector_digest)
+            || !matches!(observation.backend.as_str(), "systemd" | "compose")
+            || observation.config_path
+                != format!("{STATE_ROOT}/manager-config/{manager_id}/current.toml")
+            || observation.config_digest.is_empty()
+            || observation.policy_path.is_empty()
+        {
+            bail!("manager {manager_id} returned inconsistent inspection metadata");
+        }
+        let policy = ValidatedPolicy::load(&decode_hex(&observation.policy_hex)?)
+            .with_context(|| format!("manager {manager_id} has an invalid installed policy"))?;
+        if policy.cluster_id != rollout.cluster_id {
+            bail!("manager {manager_id} installed policy belongs to a different cluster");
+        }
+        inspected.insert(
+            manager_id.clone(),
+            PhysicalInspection {
+                policy_generation: policy.generation,
+                policy_digest: policy.digest,
+            },
+        );
+        flow.record_inspection()?;
+    }
+    let evidence = canonical_reset_evidence(&probes, &inspected)?;
+    flow.snapshot_complete(probes.len())?;
+    trace_reset(
+        "reset-snapshot-complete",
+        &rollout.rollout_id,
+        serde_json::json!({"evidence_count": evidence.len()}),
+    );
+
+    flow.begin_submit()?;
+    let mut epoch = client::connect_operator(manager_endpoint, RetryClass::DurableCreate).await?;
+    let response = epoch
+        .reset_failed_manager_rollout(ResetFailedManagerRolloutRequest {
+            rollout_id: rollout.rollout_id.clone(),
+            original_request_digest: rollout.request_digest,
+            evidence,
+        })
+        .await?
+        .into_inner();
+    let receipt = ResetReceipt::from(response);
+    trace_reset(
+        "reset-completed",
+        &receipt.rollout_id,
+        serde_json::json!({
+            "reset_request_digest": receipt.reset_request_digest,
+            "evidence_digest": receipt.evidence_digest,
+            "observed_policy_generation": receipt.observed_policy_generation,
+            "observed_policy_digest": receipt.observed_policy_digest,
+        }),
+    );
+    println!("{}", serde_json::to_string_pretty(&receipt)?);
+    Ok(())
 }
 
 pub fn restore_config(args: RestoreConfigArgs) -> Result<()> {
@@ -1127,21 +1252,10 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
     if validated.manifest.manager_endpoint.is_none() {
         let bootstrap_id = validated.manifest.client_operation_id.clone();
         for target in &validated.manifest.targets {
-            stage_target(
-                target,
-                &validated,
-                &bootstrap_id,
-                1,
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-                    + SOLE_MANAGER_CONTINUATION_SECS,
-            )?;
+            stage_target(target, &validated)?;
             install_bootstrap_backend(target, &validated.manifest)?;
             let placeholder = ManagerRollout {
                 rollout_id: bootstrap_id.clone(),
-                lease_epoch: 1,
                 ..Default::default()
             };
             activate_target(
@@ -1156,8 +1270,6 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
     let endpoint_present = validated.manifest.manager_endpoint.is_some();
     let (mut epoch, mut rollout) = begin(&validated).await?;
     trace_rollout("phase", &rollout, endpoint_present);
-    rollout = lease(&mut epoch, &rollout, &validated.manifest.executor_id).await?;
-    trace_rollout("lease-acquired", &rollout, endpoint_present);
 
     if rollout.phase == ManagerRolloutPhase::Prepared as i32 {
         rollout = advance(&mut epoch, &rollout, ManagerRolloutPhase::Staging, vec![]).await?;
@@ -1167,13 +1279,7 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
         && rollout.phase == ManagerRolloutPhase::Staging as i32
     {
         for target in &validated.manifest.targets {
-            if let Err(error) = stage_target(
-                target,
-                &validated,
-                &rollout.rollout_id,
-                rollout.lease_epoch,
-                lease_expiry_unix(&rollout),
-            ) {
+            if let Err(error) = stage_target(target, &validated) {
                 let failure = ManagerRolloutMemberOutcome {
                     manager_id: target.manager_id.clone(),
                     member_role: "target".into(),
@@ -1194,8 +1300,6 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
                     "manager-set staging failed; FAILED_PRE_CLOSE preserves every active selector",
                 ));
             }
-            rollout = lease(&mut epoch, &rollout, &validated.manifest.executor_id).await?;
-            trace_rollout("lease-renewed", &rollout, endpoint_present);
         }
     }
     if rollout.phase == ManagerRolloutPhase::Staging as i32 {
@@ -1210,14 +1314,8 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
     }
     if rollout.phase == ManagerRolloutPhase::ClosingOld as i32 {
         // The manager-side barrier observes every source CLOSED_ROLLOUT before accepting this.
-        rollout = advance_when_ready(
-            &mut epoch,
-            rollout,
-            &validated.manifest.executor_id,
-            ManagerRolloutPhase::OldClosed,
-            vec![],
-        )
-        .await?;
+        rollout =
+            advance_when_ready(&mut epoch, rollout, ManagerRolloutPhase::OldClosed, vec![]).await?;
         trace_rollout("phase", &rollout, endpoint_present);
     }
     if rollout.phase == ManagerRolloutPhase::OldClosed as i32 {
@@ -1232,11 +1330,6 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
     }
     if rollout.phase == ManagerRolloutPhase::StartingTarget as i32 {
         let handoff_deadline = tokio::time::Instant::now() + MANAGER_BARRIER_TIMEOUT;
-        let continuation_deadline_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            + SOLE_MANAGER_CONTINUATION_SECS;
         let mut outcomes = Vec::new();
         let mut stopped_sources = BTreeSet::new();
         for target in &validated.manifest.targets {
@@ -1267,17 +1360,6 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
                     }
                 }
                 Err(error) => {
-                    let _ = write_evidence(
-                        target,
-                        &validated,
-                        &rollout.rollout_id,
-                        rollout.lease_epoch,
-                        2,
-                        "activate",
-                        "failed",
-                        lease_expiry_unix(&rollout),
-                        None,
-                    );
                     mark_failed_closed(&mut epoch, &rollout, &validated, endpoint_present).await;
                     return Err(error.context(
                         "manager activation failed closed; explicit host repair is required",
@@ -1286,18 +1368,15 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
             }
         }
 
-        epoch =
-            match establish_target_control(&validated, &mut epoch, &mut rollout, handoff_deadline)
-                .await
-            {
-                Ok(target_epoch) => target_epoch,
-                Err(error) => {
-                    mark_failed_closed(&mut epoch, &rollout, &validated, endpoint_present).await;
-                    return Err(error.context(
-                        "failed to establish target rollout control; explicit recovery is required",
-                    ));
-                }
-            };
+        epoch = match establish_target_control(&validated, &rollout, handoff_deadline).await {
+            Ok(target_epoch) => target_epoch,
+            Err(error) => {
+                mark_failed_closed(&mut epoch, &rollout, &validated, endpoint_present).await;
+                return Err(error.context(
+                    "failed to establish target rollout control; explicit recovery is required",
+                ));
+            }
+        };
         for source in &validated.manifest.sources {
             let outcome = if stopped_sources.contains(&source.manager_id) {
                 ManagerRolloutMemberOutcome {
@@ -1307,21 +1386,12 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
                     error: String::new(),
                 }
             } else {
-                rollout = lease(&mut epoch, &rollout, &validated.manifest.executor_id).await?;
-                trace_rollout("lease-renewed", &rollout, endpoint_present);
-                match deactivate_source(source, &validated, &rollout, continuation_deadline_unix) {
+                match deactivate_source(source, &validated) {
                     Ok(outcome) => {
                         trace_rollout("source-stop-completed", &rollout, endpoint_present);
                         outcome
                     }
                     Err(error) => {
-                        let _ = write_source_evidence(
-                            source,
-                            &validated,
-                            &rollout,
-                            "failed",
-                            continuation_deadline_unix,
-                        );
                         mark_failed_closed(&mut epoch, &rollout, &validated, endpoint_present)
                             .await;
                         return Err(error.context(
@@ -1337,7 +1407,6 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
         rollout = match advance_when_ready(
             &mut epoch,
             rollout,
-            &validated.manifest.executor_id,
             ManagerRolloutPhase::TargetReadyClosed,
             outcomes,
         )
@@ -1365,24 +1434,24 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
     }
     if rollout.phase == ManagerRolloutPhase::ActivatingTarget as i32 {
         let activating_target = rollout.clone();
-        rollout = match advance_when_ready(
-            &mut epoch,
-            rollout,
-            &validated.manifest.executor_id,
-            ManagerRolloutPhase::Completed,
-            vec![],
-        )
-        .await
-        {
-            Ok(rollout) => rollout,
-            Err(error) => {
-                mark_failed_closed(&mut epoch, &activating_target, &validated, endpoint_present)
+        rollout =
+            match advance_when_ready(&mut epoch, rollout, ManagerRolloutPhase::Completed, vec![])
+                .await
+            {
+                Ok(rollout) => rollout,
+                Err(error) => {
+                    mark_failed_closed(
+                        &mut epoch,
+                        &activating_target,
+                        &validated,
+                        endpoint_present,
+                    )
                     .await;
-                return Err(error.context(
-                    "target activation barrier failed closed; explicit recovery is required",
-                ));
-            }
-        };
+                    return Err(error.context(
+                        "target activation barrier failed closed; explicit recovery is required",
+                    ));
+                }
+            };
         trace_rollout("phase", &rollout, endpoint_present);
     }
     trace_rollout("cli-completed", &rollout, endpoint_present);
@@ -1479,11 +1548,220 @@ mod tests {
         assert!(!target.executable.contains("@sha256:"));
     }
 
+    fn reset_manifest() -> ManagerSetManifest {
+        ManagerSetManifest {
+            schema_version: 1,
+            client_operation_id: "00000000-0000-0000-0000-000000000001".into(),
+            cluster_id: "cluster-a".into(),
+            manager_endpoint: Some("https://manager-a.example:9000".into()),
+            target_policy: "/tmp/policy.toml".into(),
+            deployment_certificate: "deployment-v1".into(),
+            max_parallel: 1,
+            ssh_key: None,
+            ssh_port: None,
+            sources: vec![],
+            targets: vec![target()],
+        }
+    }
+
+    fn expected_reset_request() -> BeginManagerRolloutRequest {
+        BeginManagerRolloutRequest {
+            cluster_id: "cluster-a".into(),
+            target_generation: 7,
+            target_policy_digest: format!("sha256:{}", "2".repeat(64)),
+            target_policy_validator_version: 1,
+            target_deployment_principal_uri: "urn:wruntime:cluster-a:human:operator".into(),
+            expected_targets: vec![ManagerRolloutTarget {
+                manager_id: "manager-a".into(),
+                endpoint: "https://manager-a.example:9000".into(),
+                ..Default::default()
+            }],
+            source_managers: vec![ManagerRolloutSource {
+                manager_id: "manager-old".into(),
+                endpoint: "https://manager-old.example:9000".into(),
+                ..Default::default()
+            }],
+            manifest_digest: format!("sha256:{}", "3".repeat(64)),
+            deployment_certificate: "deployment-v1".into(),
+            ..Default::default()
+        }
+    }
+
+    fn matching_failed_rollout(expected: &BeginManagerRolloutRequest) -> ManagerRollout {
+        ManagerRollout {
+            rollout_id: "rollout-1".into(),
+            deployment_principal_uri: expected.target_deployment_principal_uri.clone(),
+            request_digest: format!("sha256:{}", "1".repeat(64)),
+            cluster_id: expected.cluster_id.clone(),
+            target_generation: expected.target_generation,
+            target_policy_digest: expected.target_policy_digest.clone(),
+            expected_targets: expected.expected_targets.clone(),
+            phase: ManagerRolloutPhase::FailedClosed as i32,
+            target_policy_validator_version: expected.target_policy_validator_version,
+            target_deployment_principal_uri: expected.target_deployment_principal_uri.clone(),
+            expected_target_set_hash: format!("sha256:{}", "4".repeat(64)),
+            source_managers: expected.source_managers.clone(),
+            manifest_digest: expected.manifest_digest.clone(),
+            deployment_certificate: expected.deployment_certificate.clone(),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn protected_live_contract_uses_real_barrier_lease_and_all_typed_phases() {
+    fn reset_control_endpoint_must_be_declared() {
+        let manifest = reset_manifest();
+        assert!(
+            validate_reset_control_endpoint(&manifest, "https://manager-a.example:9000").is_ok()
+        );
+        assert!(
+            validate_reset_control_endpoint(&manifest, "https://unrelated.example:9000").is_err()
+        );
+        assert!(
+            validate_reset_control_endpoint(&manifest, "http://manager-a.example:9000").is_err()
+        );
+    }
+
+    #[test]
+    fn reset_rollout_matching_rejects_every_durable_declaration_class() {
+        let expected = expected_reset_request();
+        let set_hash = format!("sha256:{}", "4".repeat(64));
+        let rollout = matching_failed_rollout(&expected);
+        assert!(validate_reset_rollout(&rollout, &expected, &set_hash).is_ok());
+
+        let mut cases = Vec::new();
+        let mut wrong = rollout.clone();
+        wrong.phase = ManagerRolloutPhase::Completed as i32;
+        cases.push(wrong);
+        let mut wrong = rollout.clone();
+        wrong.deployment_principal_uri = "urn:wruntime:cluster-a:human:other".into();
+        cases.push(wrong);
+        let mut wrong = rollout.clone();
+        wrong.manifest_digest = format!("sha256:{}", "9".repeat(64));
+        cases.push(wrong);
+        let mut wrong = rollout.clone();
+        wrong.cluster_id = "cluster-b".into();
+        cases.push(wrong);
+        let mut wrong = rollout.clone();
+        wrong.deployment_certificate = "deployment-v2".into();
+        cases.push(wrong);
+        let mut wrong = rollout.clone();
+        wrong.target_generation += 1;
+        cases.push(wrong);
+        let mut wrong = rollout.clone();
+        wrong.target_policy_validator_version += 1;
+        cases.push(wrong);
+        let mut wrong = rollout.clone();
+        wrong.expected_targets.clear();
+        cases.push(wrong);
+        let mut wrong = rollout.clone();
+        wrong.source_managers.clear();
+        cases.push(wrong);
+        let mut wrong = rollout.clone();
+        wrong.request_digest = "not-a-digest".into();
+        cases.push(wrong);
+
+        for wrong in cases {
+            assert!(validate_reset_rollout(&wrong, &expected, &set_hash).is_err());
+        }
+        assert!(validate_reset_rollout(&rollout, &expected, "wrong-set-hash").is_err());
+    }
+
+    #[test]
+    fn reset_flow_forbids_inspection_or_submit_before_complete_snapshot() {
+        let mut flow = ResetFlow::new();
+        assert!(flow.record_inspection().is_err());
+        assert!(flow.begin_submit().is_err());
+        flow.declaration_matched().unwrap();
+        flow.record_inspection().unwrap();
+        assert!(flow.snapshot_complete(2).is_err());
+        assert!(flow.begin_submit().is_err());
+
+        let mut flow = ResetFlow::new();
+        flow.declaration_matched().unwrap();
+        flow.record_inspection().unwrap();
+        flow.record_inspection().unwrap();
+        flow.snapshot_complete(2).unwrap();
+        flow.begin_submit().unwrap();
+        assert_eq!(flow.stage, ResetFlowStage::Submitting);
+        assert!(flow.record_inspection().is_err());
+    }
+
+    #[test]
+    fn reset_evidence_preserves_overlapping_source_and_target_roles() {
+        let mut probes = BTreeMap::new();
+        probes.insert(
+            "manager-a".into(),
+            ProbeExpectation {
+                remote: "root@manager-a.example".into(),
+                selectors: BTreeSet::from([format!("sha256:{}", "1".repeat(64))]),
+                roles: BTreeSet::from(["source".into(), "target".into()]),
+            },
+        );
+        let inspected = BTreeMap::from([(
+            "manager-a".into(),
+            PhysicalInspection {
+                policy_generation: 7,
+                policy_digest: format!("sha256:{}", "2".repeat(64)),
+            },
+        )]);
+        let evidence = canonical_reset_evidence(&probes, &inspected).unwrap();
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0].member_role, "source");
+        assert_eq!(evidence[1].member_role, "target");
+        assert_eq!(evidence[0].manager_id, evidence[1].manager_id);
+    }
+
+    #[test]
+    fn reset_evidence_rejects_missing_and_mixed_policy_snapshots() {
+        let probes = BTreeMap::from([
+            (
+                "manager-a".into(),
+                ProbeExpectation {
+                    remote: "a".into(),
+                    selectors: BTreeSet::new(),
+                    roles: BTreeSet::from(["source".into()]),
+                },
+            ),
+            (
+                "manager-b".into(),
+                ProbeExpectation {
+                    remote: "b".into(),
+                    selectors: BTreeSet::new(),
+                    roles: BTreeSet::from(["target".into()]),
+                },
+            ),
+        ]);
+        let one = BTreeMap::from([(
+            "manager-a".into(),
+            PhysicalInspection {
+                policy_generation: 7,
+                policy_digest: format!("sha256:{}", "2".repeat(64)),
+            },
+        )]);
+        assert!(canonical_reset_evidence(&probes, &one).is_err());
+
+        let mixed = BTreeMap::from([
+            (
+                "manager-a".into(),
+                PhysicalInspection {
+                    policy_generation: 7,
+                    policy_digest: format!("sha256:{}", "2".repeat(64)),
+                },
+            ),
+            (
+                "manager-b".into(),
+                PhysicalInspection {
+                    policy_generation: 8,
+                    policy_digest: format!("sha256:{}", "3".repeat(64)),
+                },
+            ),
+        ]);
+        assert!(canonical_reset_evidence(&probes, &mixed).is_err());
+    }
+
+    #[test]
+    fn protected_live_contract_uses_real_barrier_and_all_typed_phases() {
         assert_eq!(MANAGER_BARRIER_TIMEOUT, Duration::from_secs(120));
-        assert_eq!(MANAGER_ROLLOUT_LEASE_SECS, 30);
-        assert_eq!(LEASE_RENEW_INTERVAL, Duration::from_secs(10));
         assert_eq!(
             protected_phase_sequence().map(|phase| {
                 phase

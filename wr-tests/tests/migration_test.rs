@@ -144,13 +144,30 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
             ) AND EXISTS(
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema()
-                  AND table_name = 'wr_manager_rollout_members'
-                  AND column_name = 'expected_credential_digest'
+                  AND table_name = 'wr_manager_rollout_guard'
+                  AND column_name = 'recovery_permit_principal_uri'
+            ) AND EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_manager_rollouts'
+                  AND column_name IN ('reset_request_digest', 'reset_evidence_digest', 'reset_policy_generation', 'reset_policy_digest')
+                GROUP BY table_name HAVING COUNT(*) = 4
+            ) AND NOT EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND ((table_name = 'wr_manager_rollouts' AND column_name IN ('recovery_of', 'executor_id', 'lease_epoch', 'lease_expires_at', 'deployment_leaf_fingerprint'))
+                    OR (table_name = 'wr_manager_rollout_members' AND column_name IN ('expected_host_digest', 'expected_config_digest', 'expected_backend', 'expected_executable_digest', 'expected_backend_spec_digest', 'expected_credential_digest', 'expected_old_selector_digest', 'expected_new_selector_digest'))
+                    OR (table_name = 'wr_managers' AND column_name = 'rollout_lease_epoch'))
+            ) AND EXISTS(
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'wr_node_operations' AND column_name = 'lease_epoch'
             ) AND EXISTS(
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema()
                   AND table_name = 'wr_managers' AND column_name = 'policy_generation'
-            ) AND to_regclass('idx_wr_engines_job_admin_delegates') IS NOT NULL",
+            ) AND to_regclass('wr_manager_rollouts_one_recovery') IS NULL
+              AND to_regclass('idx_wr_engines_job_admin_delegates') IS NOT NULL",
             &[],
         )
         .await?
@@ -348,7 +365,7 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
         )
         .await?
         .get(0);
-    assert_eq!(catalog_digest, "7fdb235a4ce68a5da53817492a007057");
+    assert_eq!(catalog_digest, "0426433291ee97f40db0e46fddd3a373");
 
     let detail_triggers: Vec<String> = client
         .query_one(

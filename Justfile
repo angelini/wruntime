@@ -54,7 +54,7 @@ fmt-examples:
 
 # Check example guest formatting without writing changes
 fmt-examples-check:
-    for d in {{guest_crates}}; do (cd "$d" && cargo fmt -- --check); done
+    set -e; for d in {{guest_crates}}; do (cd "$d" && cargo fmt -- --check); done
 
 # Run Clippy lints across the workspace
 lint:
@@ -323,8 +323,9 @@ test-lifecycle-runners:
 deployment-e2e-preflight:
     uv run --project dev/deployment-e2e --locked python dev/deployment-e2e/proxmox.py preflight
 
-# Protected gate: node lifecycle under systemd+Docker and manager A→B→A under systemd.
-# Compose manager deploy-set remains unqualified pending immutable image distribution.
+# Protected gate: node lifecycle under systemd+Docker; manager Systemd A→B→A,
+# failed-closed/reset/closed-startup/fresh-rollout qualification. Fast contract tests
+# are not protected evidence. Compose manager deploy-set remains unqualified.
 deployment-e2e:
     bash dev/validate-deployment-lifecycle.sh
 

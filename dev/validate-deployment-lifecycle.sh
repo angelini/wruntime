@@ -130,6 +130,10 @@ mkdir -p "$RUN_DIR/bin"
 printf '#!/usr/bin/env bash\nexec %q -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%q "$@"\n' "$REAL_SSH" "$KNOWN_HOSTS" >"$RUN_DIR/bin/ssh"
 printf '#!/usr/bin/env bash\nexec %q -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%q "$@"\n' "$REAL_SCP" "$KNOWN_HOSTS" >"$RUN_DIR/bin/scp"
 chmod 700 "$RUN_DIR/bin/ssh" "$RUN_DIR/bin/scp"
+cp "$RUN_DIR/bin/ssh" "$RUN_DIR/bin/ssh.base"
+restore_ssh_wrapper() {
+	[ ! -e "$RUN_DIR/bin/ssh.base" ] || cp "$RUN_DIR/bin/ssh.base" "$RUN_DIR/bin/ssh"
+}
 export PATH="$RUN_DIR/bin:$PATH"
 CERT_DIR="$RUN_DIR/certs"
 MANAGER_CONFIG="$RUN_DIR/manager-a.toml"
@@ -137,6 +141,8 @@ MANAGER_BUNDLE="$RUN_DIR/manager-a.tar.gz"
 MANAGER_ROLLOUT_DIR="$RUN_DIR/manager-rollout"
 MANAGER_A_TO_B_MANIFEST="$MANAGER_ROLLOUT_DIR/manager-a-to-b-systemd.toml"
 MANAGER_B_TO_A_MANIFEST="$MANAGER_ROLLOUT_DIR/manager-b-to-a-systemd.toml"
+MANAGER_FAILED_MANIFEST="$MANAGER_ROLLOUT_DIR/manager-failed-closed-systemd.toml"
+MANAGER_FRESH_MANIFEST="$MANAGER_ROLLOUT_DIR/manager-fresh-systemd.toml"
 MANAGER_A_SET="$RUN_DIR/manager-credentials/gen3"
 MANAGER_B_SET="$RUN_DIR/manager-credentials/gen2"
 BASELINE_ONE="$RUN_DIR/baseline-one.tar.gz"
@@ -205,6 +211,7 @@ cleanup() {
 	[ "$incoming" -eq 0 ] || record_failure "$incoming"
 	[ "$CLEANUP_STARTED" = false ] || return
 	CLEANUP_STARTED=true
+	restore_ssh_wrapper
 	if stop_probe; then :; else
 		cleanup_status=$?
 		record_promoted_cleanup_failure "EXIT traffic probe" "$cleanup_status"
@@ -284,9 +291,9 @@ wait_for_manager_set() {
 	done
 }
 assert_manager_rollout_trace() {
-	"${PYTHON[@]}" - "$1" "$2" <<'PY'
+	"${PYTHON[@]}" - "$1" "$2" "${3:-source}" <<'PY'
 import json, sys
-path, generation = sys.argv[1], int(sys.argv[2])
+path, generation, source_mode = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 values = [json.loads(line) for line in open(path) if line.strip()]
 phases = [item['phase'] for item in values if item.get('event') == 'phase']
 expected = ['PREPARED', 'STAGING', 'CLOSING_OLD', 'OLD_CLOSED', 'STARTING_TARGET', 'TARGET_READY_CLOSED', 'ACTIVATING_TARGET', 'COMPLETED']
@@ -294,13 +301,114 @@ assert phases == expected, (phases, expected)
 assert all(item.get('endpoint_present') is True for item in values), values
 assert all(item.get('target_generation') == generation for item in values), values
 assert any(item.get('event') == 'barrier-start' for item in values), values
-assert any(item.get('event') == 'lease-renewed' for item in values), values
 assert any(item.get('event') == 'target-ready-closed' for item in values), values
 assert any(item.get('event') == 'target-control-established' for item in values), values
-assert any(item.get('event') == 'source-stop-completed' for item in values), values
+assert any(item.get('event') == 'source-stop-completed' for item in values) == (source_mode == 'source'), values
 assert values[-1].get('event') == 'cli-completed', values[-1]
-assert all((item.get('barrier_timeout_seconds'), item.get('lease_ttl_seconds'), item.get('lease_renew_seconds')) == (120, 30, 10) for item in values)
+assert all(item.get('barrier_timeout_seconds') == 120 for item in values), values
+assert not any({'lease_ttl_seconds', 'lease_renew_seconds'} & item.keys() or item.get('event') == 'lease-renewed' for item in values), values
 PY
+}
+assert_failed_closed_trace() {
+	"${PYTHON[@]}" - "$1" <<'PY'
+import json, sys
+values = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+phases = [item['phase'] for item in values if item.get('event') == 'phase']
+assert phases == ['PREPARED', 'STAGING', 'CLOSING_OLD', 'OLD_CLOSED', 'STARTING_TARGET', 'FAILED_CLOSED'], phases
+assert not any(item.get('phase') == 'COMPLETED' or item.get('event') == 'cli-completed' for item in values), values
+assert any(item.get('event') == 'source-stop-completed' for item in values) is False, values
+assert all(item.get('barrier_timeout_seconds') == 120 for item in values), values
+PY
+}
+assert_manager_admission() {
+	"${PYTHON[@]}" - "$1" "$2" <<'PY'
+import json, sys
+path, expected = sys.argv[1:]
+value = json.load(open(path))
+observation = value.get('observation')
+assert isinstance(observation, dict), f"missing lifecycle observation in {path}: {value!r}"
+actual = observation.get('privileged_admission')
+assert actual == expected, f"expected {expected}, got {actual!r} in {path}: {observation!r}"
+assert observation.get('service_kind') == 1, f"expected manager service kind in {path}: {observation!r}"
+assert isinstance(observation.get('process_instance_id'), str) and observation['process_instance_id'], f"missing manager process identity in {path}: {observation!r}"
+PY
+}
+wait_for_manager_admission() {
+	local expected="$1" deadline tmp
+	deadline=$((SECONDS + 30))
+	tmp="$RUN_DIR/manager-admission.$$.json"
+	while true; do
+		if lifecycle_run_short 60 "${CLI_ARGS[@]}" lifecycle status --endpoint "$MANAGER_ADDR" --tls >"$tmp" 2>&1 &&
+			assert_manager_admission "$tmp" "$expected" 2>/dev/null; then
+			cat "$tmp"
+			rm -f "$tmp"
+			return 0
+		fi
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			cat "$tmp" >&2
+			rm -f "$tmp"
+			echo "manager admission did not converge to $expected" >&2
+			return 1
+		fi
+		sleep 1
+	done
+}
+assert_reset_trace() {
+	"${PYTHON[@]}" - "$1" "$2" <<'PY'
+import json, sys
+values = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+events = [item['event'] for item in values]
+expected = ['reset-declaration-fetched', 'reset-snapshot-complete', 'reset-completed']
+assert events == expected, (events, expected)
+assert values[-1]['observed_policy_generation'] == int(sys.argv[2]), values[-1]
+assert values[1]['evidence_count'] == 2, values[1]
+PY
+}
+
+install_manager_fault_ssh_shim() {
+	local descriptor="$1" marker="$2"
+	export WRT_E2E_SSH_BASE="$RUN_DIR/bin/ssh.base" WRT_E2E_FAULT_REMOTE="$MANAGER_B_REMOTE" WRT_E2E_FAULT_DESCRIPTOR="$descriptor" WRT_E2E_SHIM_MARKER="$marker"
+	cat >"$RUN_DIR/bin/ssh" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+args=("$@")
+last=$((${#args[@]} - 1)); command=${args[$last]}
+if [[ " $* " == *" $WRT_E2E_FAULT_REMOTE "* && "$command" == *"$WRT_E2E_FAULT_DESCRIPTOR"* && "$command" == *'sha256sum --'* && "$command" == *'systemctl stop wr-manager.service'* ]]; then
+	[ ! -e "$WRT_E2E_SHIM_MARKER" ] || { echo 'fault shim triggered more than once' >&2; exit 97; }
+	printf 'fault\n' >"$WRT_E2E_SHIM_MARKER"
+	printf -v corrupt 'sudo sh -c %q; ' "printf x >> '$WRT_E2E_FAULT_DESCRIPTOR'"
+	args[$last]="$corrupt$command"
+fi
+exec "$WRT_E2E_SSH_BASE" "${args[@]}"
+SH
+	chmod 700 "$RUN_DIR/bin/ssh"
+}
+
+install_manager_reset_ssh_shim() {
+	local mode="$1" marker="$2"
+	export WRT_E2E_SSH_BASE="$RUN_DIR/bin/ssh.base" WRT_E2E_RESET_MODE="$mode" WRT_E2E_SHIM_MARKER="$marker" \
+		WRT_E2E_MANAGER_A_REMOTE="$MANAGER_REMOTE" WRT_E2E_MANAGER_B_REMOTE="$MANAGER_B_REMOTE" WRT_E2E_SSH_KEY="$WRT_DEPLOY_E2E_SSH_KEY"
+	cat >"$RUN_DIR/bin/ssh" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+args=("$@")
+last=$((${#args[@]} - 1)); command=${args[$last]}
+is_probe=false
+[[ "$command" == *'manager systemd process is not conclusively stopped'* ]] && is_probe=true
+if $is_probe && [[ " $* " == *" $WRT_E2E_MANAGER_A_REMOTE "* ]]; then
+	printf 'a\n' >>"$WRT_E2E_SHIM_MARKER"
+	"$WRT_E2E_SSH_BASE" -i "$WRT_E2E_SSH_KEY" "$WRT_E2E_MANAGER_A_REMOTE" 'set -eu; sudo systemctl stop wr-manager.service; attempt=0; while [ "$attempt" -lt 30 ]; do observed=$(sudo systemctl show wr-manager.service --property=ActiveState --property=SubState --property=MainPID); line_count=$(printf "%s\n" "$observed" | awk "END { print NR }"); active=$(printf "%s\n" "$observed" | sed -n "s/^ActiveState=//p"); sub=$(printf "%s\n" "$observed" | sed -n "s/^SubState=//p"); pid=$(printf "%s\n" "$observed" | sed -n "s/^MainPID=//p"); if [ "$line_count" = 3 ] && [ "$active" = inactive ] && [ "$sub" = dead ] && [ "$pid" = 0 ]; then exit 0; fi; attempt=$((attempt + 1)); sleep 1; done; echo "manager stop convergence timed out: properties=$line_count ActiveState=$active SubState=$sub MainPID=$pid observed=$(printf %s "$observed" | tr "\n" ";")" >&2; exit 1'
+	exec "$WRT_E2E_SSH_BASE" "${args[@]}"
+elif $is_probe && [[ "$WRT_E2E_RESET_MODE" == complete && " $* " == *" $WRT_E2E_MANAGER_B_REMOTE "* ]]; then
+	printf 'b\n' >>"$WRT_E2E_SHIM_MARKER"
+	output=$("$WRT_E2E_SSH_BASE" "${args[@]}")
+	"$WRT_E2E_SSH_BASE" -i "$WRT_E2E_SSH_KEY" "$WRT_E2E_MANAGER_A_REMOTE" 'sudo systemctl start wr-manager.service'
+	printf '%s\n' "$output"
+	exit 0
+fi
+exec "$WRT_E2E_SSH_BASE" "${args[@]}"
+SH
+	chmod 700 "$RUN_DIR/bin/ssh"
 }
 assert_job_queues() {
 	"${PYTHON[@]}" - "$1" <<'PY'
@@ -758,7 +866,8 @@ PY
 	[ "$revision_a" -lt "$revision_b" ]
 
 	if [ "$backend" = systemd ]; then
-		local initial_selector manager_a_trace manager_b_trace
+		local initial_selector manager_a_trace manager_b_trace failed_trace failed_selector failed_descriptor failed_rollout_id
+		local reset_active_trace reset_mixed_trace reset_complete_trace fresh_trace shim_marker failed_status
 		initial_selector="$("${PYTHON[@]}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["initial_a_selector_digest"])' "$MANAGER_ROLLOUT_DIR/manager-rollout-artifacts.json")"
 		"${SSH[@]}" "$MANAGER_REMOTE" "test \"sha256:\$(sudo sha256sum /var/lib/wruntime/manager-activation/current-activation.json | cut -d' ' -f1)\" = '$initial_selector'"
 		printf 'WRT_SECRET_ENCRYPTION_KEY=%s\nWRT_LIFECYCLE_INSTANCE_ID=manager-rollout-b\n' "$WRT_SECRET_ENCRYPTION_KEY" | \
@@ -777,6 +886,97 @@ PY
 		wait_for_manager_set "$pass/managers-through-a-restored.txt" manager-a manager-b "${CLI_ARGS[@]}"
 		"${SSH[@]}" "$MANAGER_B_REMOTE" "! sudo systemctl is-active --quiet wr-manager.service && test \"\$(sudo systemctl is-enabled wr-manager.service)\" = masked-runtime"
 		"${SSH[@]}" "$MANAGER_REMOTE" "sudo systemctl is-active --quiet wr-manager.service && test \"\$(sudo systemctl is-enabled wr-manager.service)\" = enabled"
+
+		failed_trace="$pass/manager-failed-closed-trace.jsonl"
+		failed_selector="$("${PYTHON[@]}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["targets"]["failed-closed"]["new_selector_digest"])' "$MANAGER_ROLLOUT_DIR/manager-rollout-artifacts.json")"
+		failed_descriptor="/var/lib/wruntime/manager-activation/manager-b/${failed_selector#sha256:}.next"
+		shim_marker="$RUN_DIR/manager-fault-shim.marker"
+		install_manager_fault_ssh_shim "$failed_descriptor" "$shim_marker"
+		if run_to_log "manager failed-closed deploy-set" "$pass/manager-failed-closed.log" lifecycle_run_manager_rollout failed-closed "$failed_trace" \
+			"${CLI_ARGS[@]}" managers deploy-set --manifest "$MANAGER_FAILED_MANIFEST"; then
+			failed_status=0
+		else
+			failed_status=$?
+		fi
+		restore_ssh_wrapper
+		[ "$failed_status" -ne 0 ] && [ "$(cat "$shim_marker")" = fault ] || {
+			echo "manager descriptor fault was not triggered exactly once" >&2
+			return 1
+		}
+		assert_failed_closed_trace "$failed_trace"
+		failed_rollout_id="$("${PYTHON[@]}" - "$failed_trace" <<'PY'
+import json, sys
+values = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+ids = {item['rollout_id'] for item in values if item.get('phase') == 'FAILED_CLOSED'}
+assert len(ids) == 1, ids
+print(ids.pop())
+PY
+)"
+		run_to_log "manager closed-rollout lifecycle" "$pass/manager-closed-rollout.json" \
+			wait_for_manager_admission CLOSED_ROLLOUT
+		assert_manager_admission "$pass/manager-closed-rollout.json" CLOSED_ROLLOUT
+		"${SSH[@]}" "$MANAGER_REMOTE" "sudo systemctl is-active --quiet wr-manager.service"
+		"${SSH[@]}" "$MANAGER_B_REMOTE" "! sudo systemctl is-active --quiet wr-manager.service"
+
+		reset_active_trace="$pass/manager-reset-active-trace.jsonl"
+		if run_to_log "manager reset rejects active snapshot" "$pass/manager-reset-active.log" lifecycle_run_manager_rollout reset-active "$reset_active_trace" \
+			"${CLI_ARGS[@]}" managers reset-failed-rollout --manifest "$MANAGER_FAILED_MANIFEST" --rollout-id "$failed_rollout_id"; then
+			echo "reset unexpectedly accepted an active manager" >&2
+			return 1
+		fi
+		grep -Fq reset-declaration-fetched "$reset_active_trace"
+		! grep -Fq reset-completed "$reset_active_trace"
+
+		reset_mixed_trace="$pass/manager-reset-mixed-trace.jsonl"
+		shim_marker="$RUN_DIR/manager-reset-mixed-shim.marker"
+		install_manager_reset_ssh_shim mixed "$shim_marker"
+		if run_to_log "manager reset rejects mixed policy" "$pass/manager-reset-mixed.log" lifecycle_run_manager_rollout reset-mixed "$reset_mixed_trace" \
+			"${CLI_ARGS[@]}" managers reset-failed-rollout --manifest "$MANAGER_FAILED_MANIFEST" --rollout-id "$failed_rollout_id"; then
+			restore_ssh_wrapper
+			echo "reset unexpectedly accepted mixed policy evidence" >&2
+			return 1
+		fi
+		restore_ssh_wrapper
+		[ "$(cat "$shim_marker")" = a ]
+		grep -Fq reset-declaration-fetched "$reset_mixed_trace"
+		! grep -Fq reset-snapshot-complete "$reset_mixed_trace"
+		"${SSH[@]}" "$MANAGER_REMOTE" "! sudo systemctl is-active --quiet wr-manager.service"
+		"${SSH[@]}" "$MANAGER_B_REMOTE" "! sudo systemctl is-active --quiet wr-manager.service"
+
+		local repair_policy repair_digest b_policy_path b_selector_before b_selector_after
+		repair_policy="$("${PYTHON[@]}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["policies"]["b-to-a"])' "$MANAGER_ROLLOUT_DIR/manager-rollout-artifacts.json")"
+		repair_digest="$(sha256sum "$repair_policy" | cut -d' ' -f1)"
+		b_policy_path="/etc/wruntime/pki/manager-manager-b/sets/$(basename "$MANAGER_B_SET")/authorization.toml"
+		b_selector_before="$("${SSH[@]}" "$MANAGER_B_REMOTE" "sudo sha256sum /var/lib/wruntime/manager-activation/current-activation.json | cut -d' ' -f1")"
+		timeout -k 5 60 scp -i "$WRT_DEPLOY_E2E_SSH_KEY" "$repair_policy" "$MANAGER_B_REMOTE:/tmp/wruntime-reset-policy.toml"
+		"${SSH[@]}" "$MANAGER_B_REMOTE" "set -eu; policy='$b_policy_path'; dir=\$(dirname \"\$policy\"); test '$repair_digest' = \"\$(sha256sum /tmp/wruntime-reset-policy.toml | cut -d' ' -f1)\"; sudo install -o root -g root -m 0600 /tmp/wruntime-reset-policy.toml \"\$policy.next\"; test '$repair_digest' = \"\$(sudo sha256sum \"\$policy.next\" | cut -d' ' -f1)\"; sudo sync -f \"\$policy.next\"; sudo mv \"\$policy.next\" \"\$policy\"; sudo sync -f \"\$dir\"; test '$repair_digest' = \"\$(sudo sha256sum \"\$policy\" | cut -d' ' -f1)\"; test \"\$(sudo stat -c %a \"\$policy\")\" = 600; sudo rm -f /tmp/wruntime-reset-policy.toml"
+		b_selector_after="$("${SSH[@]}" "$MANAGER_B_REMOTE" "sudo sha256sum /var/lib/wruntime/manager-activation/current-activation.json | cut -d' ' -f1")"
+		[ "$b_selector_before" = "$b_selector_after" ]
+
+		"${SSH[@]}" "$MANAGER_REMOTE" "sudo systemctl start wr-manager.service"
+		reset_complete_trace="$pass/manager-reset-complete-trace.jsonl"
+		shim_marker="$RUN_DIR/manager-reset-complete-shim.marker"
+		install_manager_reset_ssh_shim complete "$shim_marker"
+		run_to_log "manager reset complete stopped snapshot" "$pass/manager-reset-complete.log" lifecycle_run_manager_rollout reset-complete "$reset_complete_trace" \
+			"${CLI_ARGS[@]}" managers reset-failed-rollout --manifest "$MANAGER_FAILED_MANIFEST" --rollout-id "$failed_rollout_id"
+		restore_ssh_wrapper
+		[ "$(cat "$shim_marker")" = $'a\nb' ]
+		assert_reset_trace "$reset_complete_trace" 3
+		grep -Fq '"observed_policy_generation": 3' "$pass/manager-reset-complete.log"
+		run_to_log "manager closed-startup lifecycle" "$pass/manager-closed-startup.json" \
+			wait_for_manager_admission CLOSED_STARTUP
+		assert_manager_admission "$pass/manager-closed-startup.json" CLOSED_STARTUP
+
+		fresh_trace="$pass/manager-fresh-trace.jsonl"
+		run_to_log "manager fresh rollout" "$pass/manager-fresh.log" lifecycle_run_manager_rollout fresh "$fresh_trace" \
+			"${CLI_ARGS[@]}" managers deploy-set --manifest "$MANAGER_FRESH_MANIFEST"
+		assert_manager_rollout_trace "$fresh_trace" 4 no-source
+		wait_for_manager_set "$pass/managers-after-fresh.txt" manager-a manager-b "${CLI_ARGS[@]}"
+		"${SSH[@]}" "$MANAGER_REMOTE" "sudo systemctl is-active --quiet wr-manager.service && test \"\$(sudo systemctl is-enabled wr-manager.service)\" = enabled"
+		"${SSH[@]}" "$MANAGER_B_REMOTE" "! sudo systemctl is-active --quiet wr-manager.service"
+		run_to_log "manager open lifecycle" "$pass/manager-open.json" \
+			wait_for_manager_admission OPEN
+		assert_manager_admission "$pass/manager-open.json" OPEN
 	fi
 	verify_manifest
 	collect_diagnostics "$backend"

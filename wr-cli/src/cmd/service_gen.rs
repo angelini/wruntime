@@ -132,6 +132,76 @@ print(d.get('backend_spec_path',''))"#;
     )
 }
 
+fn manager_systemd_stopped_parser() -> &'static str {
+    r#"def require_stopped_systemd(text):
+ required={'ActiveState','SubState','MainPID'}; fields={}
+ for line in text.splitlines():
+  if line.count('=') != 1: sys.exit('malformed manager systemd property')
+  key,value=(part.strip() for part in line.split('=',1))
+  if key not in required or key in fields or not value: sys.exit('malformed manager systemd property')
+  fields[key]=value
+ if set(fields) != required: sys.exit('manager systemd property is missing')
+ if fields != {'ActiveState':'inactive','SubState':'dead','MainPID':'0'}: sys.exit('manager systemd process is not conclusively stopped')
+ return fields"#
+}
+
+/// Build a read-only stopped-state inspection for the selected manager activation.
+/// The script emits one bounded JSON object containing the installed policy as hex.
+pub fn manager_stopped_inspection_command(
+    manager_id: &str,
+    current_descriptor: &str,
+    allowed_selector_digests: &[String],
+) -> String {
+    fn q(value: &str) -> String {
+        super::helpers::shell_quote(value)
+    }
+    let inspect = format!(
+        "{}\n{}",
+        manager_systemd_stopped_parser(),
+        r#"import hashlib,json,pathlib,subprocess,sys,tomllib
+current=pathlib.Path(sys.argv[1]); expected=sys.argv[2]; allowed=set(sys.argv[3:])
+raw=current.read_bytes()
+selector='sha256:'+hashlib.sha256(raw).hexdigest()
+if selector not in allowed: sys.exit('activation selector mismatch')
+d=json.loads(raw)
+if d.get('schema_version') != 1 or d.get('manager_id') != expected: sys.exit('activation identity mismatch')
+required=('backend','backend_spec_path','backend_spec_digest','config_path','config_digest')
+if any(not isinstance(d.get(k),str) or not d[k] for k in required): sys.exit('malformed activation descriptor')
+config=pathlib.Path(d['config_path'])
+expected_config=pathlib.Path('/var/lib/wruntime/manager-config')/expected/'current.toml'
+if config != expected_config: sys.exit('activation config path mismatch')
+config_raw=config.read_bytes()
+if 'sha256:'+hashlib.sha256(config_raw).hexdigest() != d['config_digest']: sys.exit('config digest mismatch')
+cfg=tomllib.loads(config_raw.decode('utf-8'))
+policy=pathlib.Path(cfg['authorization']['policy_file'])
+if not policy.is_absolute(): policy=(config.parent/policy).resolve()
+policy_raw=policy.read_bytes()
+if len(policy_raw) > 4194304: sys.exit('authorization policy exceeds inspection limit')
+backend=d['backend']; spec=pathlib.Path(d['backend_spec_path'])
+if backend == 'systemd':
+ out=subprocess.run(['systemctl','show','wr-manager.service','--property=ActiveState','--property=SubState','--property=MainPID'],check=True,capture_output=True,text=True).stdout
+ require_stopped_systemd(out)
+elif backend == 'compose':
+ if not spec.is_absolute() or not spec.is_file(): sys.exit('invalid compose backend spec')
+ if 'sha256:'+hashlib.sha256(spec.read_bytes()).hexdigest() != d['backend_spec_digest']: sys.exit('compose backend spec digest mismatch')
+ out=subprocess.run(['docker','compose','--project-name','wruntime-manager','-f',str(spec),'ps','-q'],check=True,capture_output=True,text=True).stdout
+ if out.strip(): sys.exit('manager compose process is not stopped')
+else: sys.exit('unsupported manager backend')
+print(json.dumps({'manager_id':expected,'selector_digest':selector,'backend':backend,'config_path':str(config),'config_digest':'sha256:'+hashlib.sha256(config_raw).hexdigest(),'policy_path':str(policy),'policy_hex':policy_raw.hex()},sort_keys=True,separators=(',',':')))"#,
+    );
+    let mut command = format!(
+        "sudo python3 -c {inspect} {current} {manager_id}",
+        inspect = q(&inspect),
+        current = q(current_descriptor),
+        manager_id = q(manager_id),
+    );
+    for digest in allowed_selector_digests {
+        command.push(' ');
+        command.push_str(&q(digest));
+    }
+    command
+}
+
 /// Build the single post-OLD_CLOSED selector transition. Preparatory config
 /// writes may happen first, but the final descriptor rename is authoritative.
 pub fn manager_activation_command(
@@ -409,6 +479,70 @@ mod tests {
         assert!(!unit.contains("{run_user}"));
         assert!(!unit.contains("sudo"));
         assert!(!unit.contains("wr-node/releases"));
+    }
+
+    #[test]
+    fn stopped_inspection_is_selector_bound_and_read_only() {
+        let command = manager_stopped_inspection_command(
+            "manager-a",
+            "/var/lib/wruntime/manager-activation/current-activation.json",
+            &[format!("sha256:{}", "1".repeat(64))],
+        );
+        assert!(command.contains("activation selector mismatch"));
+        assert!(command.contains("systemctl"));
+        assert!(command.contains("--property=ActiveState"));
+        assert!(!command.contains("--value"));
+        let parser = manager_systemd_stopped_parser();
+        assert!(parser.contains("line.count('=') != 1"));
+        assert!(parser.contains("key in fields"));
+        assert!(parser.contains("set(fields) != required"));
+        assert!(command.contains("ps"));
+        assert!(command.contains("-q"));
+        assert!(command.contains("policy_hex"));
+        for mutation in [
+            "systemctl stop",
+            "systemctl start",
+            "systemctl enable",
+            "systemctl disable",
+            "systemctl mask",
+            "'up'",
+            "'down'",
+            "shutil",
+            "unlink(",
+            "write_bytes",
+        ] {
+            assert!(!command.contains(mutation), "probe contains {mutation}");
+        }
+    }
+
+    #[test]
+    fn stopped_systemd_parser_accepts_reordering_and_rejects_every_invalid_class() {
+        let script = format!(
+            "import sys\n{}\nrequire_stopped_systemd(sys.argv[1])",
+            manager_systemd_stopped_parser()
+        );
+        let run = |value: &str| {
+            std::process::Command::new("python3")
+                .args(["-c", &script, value])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("run stopped-state parser")
+                .success()
+        };
+        assert!(run("MainPID=0\nSubState=dead\nActiveState=inactive\n"));
+        for rejected in [
+            "ActiveState=inactive\nSubState=dead\n",
+            "ActiveState=inactive\nSubState=dead\nMainPID=0\nMainPID=0\n",
+            "ActiveState=inactive\nSubState\nMainPID=0\n",
+            "ActiveState=inactive\nSubState=dead\nMainPID=\n",
+            "ActiveState=inactive\nSubState=dead\nUnknown=0\n",
+            "ActiveState=active\nSubState=running\nMainPID=42\n",
+            "ActiveState=inactive\nSubState=exited\nMainPID=0\n",
+            "ActiveState=inactive\nSubState=dead\nMainPID=7\n",
+        ] {
+            assert!(!run(rejected), "unexpectedly accepted {rejected:?}");
+        }
     }
 
     #[test]

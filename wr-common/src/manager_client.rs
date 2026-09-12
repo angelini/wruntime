@@ -60,7 +60,6 @@ pub struct EpochObservation {
     pub rollout_id: String,
     pub rollout_phase: i32,
     pub rollout_expected_set_hash: String,
-    pub rollout_lease_epoch: u64,
 }
 
 impl EpochObservation {
@@ -113,7 +112,6 @@ impl EpochObservation {
         if status.rollout_operation_id.is_empty() {
             if phase != ManagerRolloutPhase::Unspecified
                 || !status.rollout_expected_set_hash.is_empty()
-                || status.last_observed_rollout_lease_epoch != 0
             {
                 return Err(tonic::Status::failed_precondition(
                     "manager lifecycle observation has rollout fields without an operation",
@@ -137,7 +135,6 @@ impl EpochObservation {
             rollout_id: status.rollout_operation_id.clone(),
             rollout_phase: status.rollout_phase,
             rollout_expected_set_hash: status.rollout_expected_set_hash.clone(),
-            rollout_lease_epoch: status.last_observed_rollout_lease_epoch,
         })
     }
 }
@@ -616,11 +613,13 @@ where
     ) -> Result<tonic::Response<BeginManagerRolloutResponse>, tonic::Status> {
         self.infrastructure.begin_manager_rollout(request).await
     }
-    pub async fn lease_manager_rollout(
+    pub async fn reset_failed_manager_rollout(
         &mut self,
-        request: impl tonic::IntoRequest<LeaseManagerRolloutRequest>,
-    ) -> Result<tonic::Response<LeaseManagerRolloutResponse>, tonic::Status> {
-        self.infrastructure.lease_manager_rollout(request).await
+        request: impl tonic::IntoRequest<ResetFailedManagerRolloutRequest>,
+    ) -> Result<tonic::Response<ResetFailedManagerRolloutResponse>, tonic::Status> {
+        self.infrastructure
+            .reset_failed_manager_rollout(request)
+            .await
     }
     pub async fn advance_manager_rollout(
         &mut self,

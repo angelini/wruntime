@@ -2618,7 +2618,7 @@ async fn resumed_agent_receives_epoch_bound_inspection_through_node_agent_rpc() 
 }
 
 #[tokio::test]
-async fn manager_rollout_lease_phases_and_activation_barriers_are_fenced() -> Result<()> {
+async fn manager_rollout_phases_and_activation_barriers_are_owner_authorized() -> Result<()> {
     use wr_common::wruntime::{
         BeginManagerRolloutRequest, ManagerRolloutPhase, ManagerRolloutTarget,
     };
@@ -2639,7 +2639,6 @@ async fn manager_rollout_lease_phases_and_activation_barriers_are_fenced() -> Re
             config_digest: format!("sha256:{}", "c".repeat(64)),
             ..Default::default()
         }],
-        recovery_of: String::new(),
         target_policy_validator_version: 1,
         target_deployment_principal_uri: "urn:wruntime:cluster-a:human:deployer".into(),
         target_deployment_leaf_fingerprint: format!("sha256:{}", "d".repeat(64)),
@@ -2648,31 +2647,18 @@ async fn manager_rollout_lease_phases_and_activation_barriers_are_fenced() -> Re
     let rollout = wr_manager::db::begin_manager_rollout(
         &pool,
         &request.target_deployment_principal_uri,
-        &request.target_deployment_leaf_fingerprint,
         &request,
         &format!("sha256:{}", "e".repeat(64)),
         false,
     )
     .await?;
-    let owner = "11111111-1111-4111-8111-111111111111";
-    let lease = wr_manager::db::lease_manager_rollout(&pool, &rollout.rollout_id, owner, 0).await?;
-    assert_eq!(lease.lease_epoch, 1);
-    let denied = wr_manager::db::lease_manager_rollout(
-        &pool,
-        &rollout.rollout_id,
-        "22222222-2222-4222-8222-222222222222",
-        1,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::FailedPrecondition);
+    let owner = request.target_deployment_principal_uri.as_str();
 
     let advance = |expected: ManagerRolloutPhase, next: ManagerRolloutPhase| {
         wr_manager::db::advance_manager_rollout(
             &pool,
             &rollout.rollout_id,
             owner,
-            1,
             expected as i32,
             next as i32,
             &[],
@@ -2732,7 +2718,8 @@ async fn manager_rollout_lease_phases_and_activation_barriers_are_fenced() -> Re
 }
 
 #[tokio::test]
-async fn manager_rollout_requires_source_stop_and_lease_absence_before_completion() -> Result<()> {
+async fn manager_rollout_requires_source_stop_and_liveness_absence_before_completion() -> Result<()>
+{
     use wr_common::wruntime::{
         BeginManagerRolloutRequest, ManagerRolloutMemberOutcome, ManagerRolloutPhase,
         ManagerRolloutSource, ManagerRolloutTarget,
@@ -2783,21 +2770,17 @@ async fn manager_rollout_requires_source_stop_and_lease_absence_before_completio
     let rollout = wr_manager::db::begin_manager_rollout(
         &pool,
         &request.target_deployment_principal_uri,
-        &request.target_deployment_leaf_fingerprint,
         &request,
         &format!("sha256:{}", "8".repeat(64)),
         true,
     )
     .await?;
-    let owner = "33333333-3333-4333-8333-333333333333";
-    let rollout =
-        wr_manager::db::lease_manager_rollout(&pool, &rollout.rollout_id, owner, 0).await?;
+    let owner = request.target_deployment_principal_uri.as_str();
     let advance = |expected: ManagerRolloutPhase, next: ManagerRolloutPhase| {
         wr_manager::db::advance_manager_rollout(
             &pool,
             &rollout.rollout_id,
             owner,
-            rollout.lease_epoch,
             expected as i32,
             next as i32,
             &[],
@@ -2861,7 +2844,6 @@ async fn manager_rollout_requires_source_stop_and_lease_absence_before_completio
         &pool,
         &rollout.rollout_id,
         owner,
-        rollout.lease_epoch,
         ManagerRolloutPhase::StartingTarget as i32,
         ManagerRolloutPhase::TargetReadyClosed as i32,
         std::slice::from_ref(&target_ready),
@@ -2874,7 +2856,6 @@ async fn manager_rollout_requires_source_stop_and_lease_absence_before_completio
         &pool,
         &rollout.rollout_id,
         owner,
-        rollout.lease_epoch,
         ManagerRolloutPhase::StartingTarget as i32,
         ManagerRolloutPhase::TargetReadyClosed as i32,
         &[target_ready, source_stopped],
@@ -2975,7 +2956,6 @@ node_agent_enrollments=[]
             config_digest: format!("sha256:{}", "c".repeat(64)),
             ..Default::default()
         }],
-        recovery_of: String::new(),
         target_policy_validator_version: 1,
         target_deployment_principal_uri: "urn:wruntime:cluster-a:human:deployer".into(),
         target_deployment_leaf_fingerprint: format!("sha256:{}", "d".repeat(64)),
@@ -2990,7 +2970,6 @@ node_agent_enrollments=[]
     let rollout = wr_manager::db::begin_manager_rollout(
         &pool,
         &request.target_deployment_principal_uri,
-        &request.target_deployment_leaf_fingerprint,
         &request,
         &format!("sha256:{}", "e".repeat(64)),
         true,
@@ -3071,7 +3050,6 @@ async fn manager_rollout_same_generation_reports_digest_mismatch() -> Result<()>
             config_digest: format!("sha256:{}", "d".repeat(64)),
             ..Default::default()
         }],
-        recovery_of: String::new(),
         target_policy_validator_version: 1,
         target_deployment_principal_uri: "urn:wruntime:cluster-a:human:deployer".into(),
         target_deployment_leaf_fingerprint: format!("sha256:{}", "e".repeat(64)),
@@ -3084,7 +3062,6 @@ async fn manager_rollout_same_generation_reports_digest_mismatch() -> Result<()>
     let stale_error = wr_manager::db::begin_manager_rollout(
         &pool,
         &stale_restoration.target_deployment_principal_uri,
-        &stale_restoration.target_deployment_leaf_fingerprint,
         &stale_restoration,
         &format!("sha256:{}", "1".repeat(64)),
         true,
@@ -3100,7 +3077,6 @@ async fn manager_rollout_same_generation_reports_digest_mismatch() -> Result<()>
     let error = wr_manager::db::begin_manager_rollout(
         &pool,
         &request.target_deployment_principal_uri,
-        &request.target_deployment_leaf_fingerprint,
         &request,
         &format!("sha256:{}", "f".repeat(64)),
         true,
@@ -3138,7 +3114,6 @@ async fn manager_rollout_create_recovers_lost_response_and_rejects_token_reuse()
             config_digest: format!("sha256:{}", "c".repeat(64)),
             ..Default::default()
         }],
-        recovery_of: String::new(),
         target_policy_validator_version: 1,
         target_deployment_principal_uri: "urn:wruntime:cluster-a:human:deployer".into(),
         target_deployment_leaf_fingerprint: format!("sha256:{}", "d".repeat(64)),
@@ -3147,7 +3122,6 @@ async fn manager_rollout_create_recovers_lost_response_and_rejects_token_reuse()
     let first = wr_manager::db::begin_manager_rollout(
         &pool,
         "urn:wruntime:cluster-a:human:deployer",
-        &format!("sha256:{}", "d".repeat(64)),
         &request,
         &format!("sha256:{}", "e".repeat(64)),
         false,
@@ -3156,7 +3130,6 @@ async fn manager_rollout_create_recovers_lost_response_and_rejects_token_reuse()
     let replay = wr_manager::db::begin_manager_rollout(
         &pool,
         "urn:wruntime:cluster-a:human:deployer",
-        &format!("sha256:{}", "f".repeat(64)),
         &request,
         &format!("sha256:{}", "e".repeat(64)),
         false,
@@ -3168,7 +3141,6 @@ async fn manager_rollout_create_recovers_lost_response_and_rejects_token_reuse()
     let conflict = wr_manager::db::begin_manager_rollout(
         &pool,
         "urn:wruntime:cluster-a:human:deployer",
-        &format!("sha256:{}", "d".repeat(64)),
         &request,
         &format!("sha256:{}", "0".repeat(64)),
         false,
@@ -3183,5 +3155,107 @@ async fn manager_rollout_create_recovers_lost_response_and_rejects_token_reuse()
         .await?
         .get(0);
     assert_eq!(count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_closed_rollout_reset_is_owner_bound_exact_and_replay_stable() -> Result<()> {
+    use wr_common::wruntime::{
+        BeginManagerRolloutRequest, FailedManagerRolloutEvidence, ManagerRolloutPhase,
+        ManagerRolloutTarget, ResetFailedManagerRolloutRequest,
+    };
+
+    let pool = helpers::db::manager_pool().await;
+    let policy_digest = format!("sha256:{}", "a".repeat(64));
+    let begin_digest = format!("sha256:{}", "b".repeat(64));
+    let principal = "urn:wruntime:cluster-a:human:reset-owner";
+    wr_manager::db::register_manager(&pool, "manager-reset", "https://manager-reset:9000").await?;
+    wr_manager::db::initialize_manager_policy_state(&pool, "manager-reset", 7, &policy_digest)
+        .await?;
+    let request = BeginManagerRolloutRequest {
+        client_operation_id: "63c54ac7-fe23-4ddf-96e5-0da2e4b18d7d".into(),
+        cluster_id: "cluster-a".into(),
+        target_generation: 7,
+        target_policy_digest: policy_digest.clone(),
+        expected_targets: vec![ManagerRolloutTarget {
+            manager_id: "manager-reset".into(),
+            endpoint: "https://manager-reset:9000".into(),
+            ..Default::default()
+        }],
+        target_policy_validator_version: 1,
+        target_deployment_principal_uri: principal.into(),
+        target_deployment_leaf_fingerprint: format!("sha256:{}", "c".repeat(64)),
+        ..Default::default()
+    };
+    let rollout =
+        wr_manager::db::begin_manager_rollout(&pool, principal, &request, &begin_digest, false)
+            .await?;
+    let client = pool.get().await?;
+    let rollout_uuid = uuid::Uuid::parse_str(&rollout.rollout_id)?;
+    client
+        .execute(
+            "UPDATE wr_manager_rollouts SET phase=$2 WHERE rollout_id=$1",
+            &[&rollout_uuid, &(ManagerRolloutPhase::FailedClosed as i32)],
+        )
+        .await?;
+    let reset = ResetFailedManagerRolloutRequest {
+        rollout_id: rollout.rollout_id.clone(),
+        original_request_digest: begin_digest.clone(),
+        evidence: vec![FailedManagerRolloutEvidence {
+            member_role: "target".into(),
+            manager_id: "manager-reset".into(),
+            process_state: "STOPPED".into(),
+            policy_generation: 7,
+            policy_digest: policy_digest.clone(),
+        }],
+    };
+    let reset_digest = format!("sha256:{}", "d".repeat(64));
+    let evidence_digest = format!("sha256:{}", "e".repeat(64));
+    let denied = wr_manager::db::reset_failed_manager_rollout(
+        &pool,
+        "urn:wruntime:cluster-a:human:other",
+        &reset,
+        &reset_digest,
+        &evidence_digest,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    let receipt = wr_manager::db::reset_failed_manager_rollout(
+        &pool,
+        principal,
+        &reset,
+        &reset_digest,
+        &evidence_digest,
+    )
+    .await?;
+    assert_eq!(receipt.observed_policy_generation, 7);
+    let replay = wr_manager::db::reset_failed_manager_rollout(
+        &pool,
+        principal,
+        &reset,
+        &reset_digest,
+        &evidence_digest,
+    )
+    .await?;
+    assert_eq!(replay, receipt);
+    let guard = client.query_one(
+        "SELECT active_rollout_id, recovery_permit_principal_uri, accepted_generation, accepted_digest FROM wr_manager_rollout_guard WHERE singleton", &[],
+    ).await?;
+    assert!(guard.get::<_, Option<uuid::Uuid>>(0).is_none());
+    assert_eq!(
+        guard.get::<_, Option<String>>(1).as_deref(),
+        Some(principal)
+    );
+    assert_eq!(guard.get::<_, Option<i64>>(2), None);
+    assert_eq!(guard.get::<_, Option<String>>(3), None);
+    assert!(wr_manager::db::manager_rollout_recovery_permitted(&pool, principal).await?);
+    assert!(
+        !wr_manager::db::manager_rollout_recovery_permitted(
+            &pool,
+            "urn:wruntime:cluster-a:human:other",
+        )
+        .await?
+    );
     Ok(())
 }

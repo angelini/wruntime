@@ -11,6 +11,7 @@ pub struct NamespaceProvisioning {
 }
 
 const PROVISIONING_LOCK_DOMAIN: i32 = 0x5752_4442;
+const DATABASE_ACCESS_LOCK_DOMAIN: i32 = 0x5752_4441;
 
 fn namespace_lock_key(namespace: &str) -> i32 {
     let mut hash: u32 = 0x811c9dc5;
@@ -21,19 +22,19 @@ fn namespace_lock_key(namespace: &str) -> i32 {
     hash as i32
 }
 
-async fn quote_identifier_and_literal(
+async fn quote_provisioning_values(
     client: &deadpool_postgres::ClientWrapper,
-    identifier: &str,
-    literal: &str,
-) -> Result<(String, String)> {
+    role: &str,
+    password: &str,
+) -> Result<(String, String, String)> {
     let row = client
         .query_one(
-            "SELECT quote_ident($1::text), quote_literal($2::text)",
-            &[&identifier, &literal],
+            "SELECT quote_ident($1::text), quote_literal($2::text), quote_ident(current_database())",
+            &[&role, &password],
         )
         .await
         .context("failed to quote database provisioning values")?;
-    Ok((row.get(0), row.get(1)))
+    Ok((row.get(0), row.get(1), row.get(2)))
 }
 
 /// Provision namespace roles and schemas on the engine's target database.
@@ -54,8 +55,8 @@ async fn provision_namespace(pool: &Pool, specification: &NamespaceProvisioning)
         .await
         .context("failed to acquire database provisioning connection")?;
     let mut client = deadpool_postgres::Object::take(pooled);
-    let (quoted_role, quoted_password) =
-        quote_identifier_and_literal(&client, &specification.role, &specification.password).await?;
+    let (quoted_role, quoted_password, quoted_database) =
+        quote_provisioning_values(&client, &specification.role, &specification.password).await?;
     let mut quoted_schemas = Vec::with_capacity(specification.schemas.len());
     for schema in &specification.schemas {
         let row = client
@@ -69,6 +70,15 @@ async fn provision_namespace(pool: &Pool, specification: &NamespaceProvisioning)
         .transaction()
         .await
         .context("failed to begin database provisioning transaction")?;
+    transaction
+        .execute(
+            "SELECT pg_advisory_xact_lock(\
+                 $1, (SELECT oid::int FROM pg_database WHERE datname = current_database())\
+             )",
+            &[&DATABASE_ACCESS_LOCK_DOMAIN],
+        )
+        .await
+        .context("failed to acquire database access provisioning lock")?;
     transaction
         .execute(
             "SELECT pg_advisory_xact_lock($1, $2)",
@@ -90,10 +100,11 @@ async fn provision_namespace(pool: &Pool, specification: &NamespaceProvisioning)
         .map_err(|_| anyhow::anyhow!("failed to converge namespace database role"))?;
     transaction
         .batch_execute(&format!(
-            "ALTER ROLE {quoted_role} LOGIN PASSWORD {quoted_password}"
+            "ALTER ROLE {quoted_role} LOGIN CONNECTION LIMIT -1 PASSWORD {quoted_password}; \
+             GRANT CONNECT ON DATABASE {quoted_database} TO {quoted_role};"
         ))
         .await
-        .map_err(|_| anyhow::anyhow!("failed to synchronize namespace database credential"))?;
+        .map_err(|_| anyhow::anyhow!("failed to synchronize namespace database access"))?;
 
     for quoted_schema in quoted_schemas {
         transaction

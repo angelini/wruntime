@@ -62,7 +62,6 @@ message LifecycleStatus {
   string rollout_operation_id = 12;
   ManagerRolloutPhase rollout_phase = 13;
   string rollout_expected_set_hash = 14;
-  uint64 last_observed_rollout_lease_epoch = 15;
 }
 
 message GetLifecycleStatusRequest {}
@@ -1237,19 +1236,17 @@ message ManagerRolloutTarget {
 }
 
 message BeginManagerRolloutRequest {
-  string client_operation_id = 1; // required bounded caller UUID
+  string client_operation_id = 1;
   string cluster_id = 2;
   uint64 target_generation = 3;
   string target_policy_digest = 4;
   repeated ManagerRolloutTarget expected_targets = 5;
-  string recovery_of = 6; // optional predecessor rollout UUID
-  uint32 target_policy_validator_version = 7;
-  string target_deployment_principal_uri = 8;
-  string target_deployment_leaf_fingerprint = 9;
-  repeated ManagerRolloutSource source_managers = 10;
-  string manifest_digest = 11;
-  string executor_id = 12;
-  string deployment_certificate = 13;
+  uint32 target_policy_validator_version = 6;
+  string target_deployment_principal_uri = 7;
+  string target_deployment_leaf_fingerprint = 8;
+  repeated ManagerRolloutSource source_managers = 9;
+  string manifest_digest = 10;
+  string deployment_certificate = 11;
 }
 
 message ManagerRollout {
@@ -1261,28 +1258,17 @@ message ManagerRollout {
   uint64 target_generation = 6;
   string target_policy_digest = 7;
   repeated ManagerRolloutTarget expected_targets = 8;
-  string recovery_of = 9;
-  ManagerRolloutPhase phase = 10;
-  string executor_id = 11;
-  uint64 lease_epoch = 12;
-  optional google.protobuf.Timestamp lease_expires_at = 13;
-  uint32 target_policy_validator_version = 14;
-  string target_deployment_principal_uri = 15;
-  string target_deployment_leaf_fingerprint = 16;
-  string expected_target_set_hash = 17;
-  string failure = 18;
-  repeated ManagerRolloutSource source_managers = 19;
-  string manifest_digest = 20;
-  string executor_id_from_manifest = 21;
-  string deployment_certificate = 22;
+  ManagerRolloutPhase phase = 9;
+  uint32 target_policy_validator_version = 10;
+  string target_deployment_principal_uri = 11;
+  string target_deployment_leaf_fingerprint = 12;
+  string expected_target_set_hash = 13;
+  string failure = 14;
+  repeated ManagerRolloutSource source_managers = 15;
+  string manifest_digest = 16;
+  string deployment_certificate = 17;
 }
 message BeginManagerRolloutResponse { ManagerRollout rollout = 1; }
-message LeaseManagerRolloutRequest {
-  string rollout_id = 1;
-  string executor_id = 2;
-  uint64 expected_lease_epoch = 3;
-}
-message LeaseManagerRolloutResponse { ManagerRollout rollout = 1; }
 message ManagerRolloutMemberOutcome {
   string manager_id = 1;
   string member_role = 2;
@@ -1291,15 +1277,34 @@ message ManagerRolloutMemberOutcome {
 }
 message AdvanceManagerRolloutRequest {
   string rollout_id = 1;
-  string executor_id = 2;
-  uint64 lease_epoch = 3;
-  ManagerRolloutPhase expected_phase = 4;
-  ManagerRolloutPhase next_phase = 5;
-  repeated ManagerRolloutMemberOutcome member_outcomes = 6;
+  ManagerRolloutPhase expected_phase = 2;
+  ManagerRolloutPhase next_phase = 3;
+  repeated ManagerRolloutMemberOutcome member_outcomes = 4;
 }
 message AdvanceManagerRolloutResponse { ManagerRollout rollout = 1; }
 message GetManagerRolloutRequest { string rollout_id = 1; }
 message GetManagerRolloutResponse { ManagerRollout rollout = 1; }
+
+message FailedManagerRolloutEvidence {
+  string member_role = 1;
+  string manager_id = 2;
+  string process_state = 3;
+  uint64 policy_generation = 4;
+  string policy_digest = 5;
+}
+message ResetFailedManagerRolloutRequest {
+  string rollout_id = 1;
+  string original_request_digest = 2;
+  repeated FailedManagerRolloutEvidence evidence = 3;
+}
+message ResetFailedManagerRolloutResponse {
+  string rollout_id = 1;
+  string original_request_digest = 2;
+  string reset_request_digest = 3;
+  string evidence_digest = 4;
+  uint64 observed_policy_generation = 5;
+  string observed_policy_digest = 6;
+}
 
 message GetPolicyStatusRequest {}
 message PolicyCapHeadroom {
@@ -1406,7 +1411,7 @@ service InfrastructureService {
   rpc GetNodeCleanupStatus(GetNodeCleanupStatusRequest) returns (GetNodeCleanupStatusResponse);
   rpc RetryNodeCleanup(RetryNodeCleanupRequest) returns (RetryNodeCleanupResponse);
   rpc BeginManagerRollout(BeginManagerRolloutRequest) returns (BeginManagerRolloutResponse);
-  rpc LeaseManagerRollout(LeaseManagerRolloutRequest) returns (LeaseManagerRolloutResponse);
+  rpc ResetFailedManagerRollout(ResetFailedManagerRolloutRequest) returns (ResetFailedManagerRolloutResponse);
   rpc AdvanceManagerRollout(AdvanceManagerRolloutRequest) returns (AdvanceManagerRolloutResponse);
   rpc GetManagerRollout(GetManagerRolloutRequest) returns (GetManagerRolloutResponse);
 }

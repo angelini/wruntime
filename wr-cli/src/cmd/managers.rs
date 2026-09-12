@@ -34,8 +34,10 @@ pub enum ManagersCommand {
     Bundle(BundleArgs),
     /// Deploy a manager bundle to a remote host
     Deploy(DeployArgs),
-    /// Deploy or take over a complete digest-qualified manager set
+    /// Deploy a complete digest-qualified manager set
     DeploySet(super::manager_deploy_set::DeploySetArgs),
+    /// Reset the exact FAILED_CLOSED rollout after read-only stopped-host inspection
+    ResetFailedRollout(super::manager_deploy_set::ResetFailedRolloutArgs),
     /// Explicitly restore the bounded previous manager config/activation
     RestoreConfig(super::manager_deploy_set::RestoreConfigArgs),
     /// Inspect a manager bundle without deploying
@@ -143,6 +145,11 @@ const MANAGER_SECRET_ENV_PATH: &str = "/var/lib/wruntime/manager-secrets/runtime
 
 // --- Entry point ---
 
+fn require_reset_manager(manager: Option<&str>) -> Result<&str> {
+    manager
+        .ok_or_else(|| anyhow::anyhow!("--manager is required for managers reset-failed-rollout"))
+}
+
 pub async fn run(args: ManagersArgs, manager: Option<&str>) -> Result<()> {
     match args.command {
         ManagersCommand::List => {
@@ -154,6 +161,13 @@ pub async fn run(args: ManagersArgs, manager: Option<&str>) -> Result<()> {
         ManagersCommand::Deploy(deploy_args) => deploy(deploy_args).await,
         ManagersCommand::DeploySet(deploy_args) => {
             super::manager_deploy_set::run(deploy_args).await
+        }
+        ManagersCommand::ResetFailedRollout(reset_args) => {
+            super::manager_deploy_set::reset_failed_rollout(
+                reset_args,
+                require_reset_manager(manager)?,
+            )
+            .await
         }
         ManagersCommand::RestoreConfig(restore_args) => {
             super::manager_deploy_set::restore_config(restore_args)
@@ -1230,7 +1244,53 @@ fn status(args: StatusArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use sha2::{Digest, Sha256};
+
+    #[derive(Parser)]
+    struct ManagersTestCli {
+        #[command(flatten)]
+        managers: ManagersArgs,
+    }
+
+    #[test]
+    fn reset_failed_rollout_arguments_are_required_and_dispatch_separately() {
+        let cli = ManagersTestCli::try_parse_from([
+            "test",
+            "reset-failed-rollout",
+            "--manifest",
+            "manager-set.toml",
+            "--rollout-id",
+            "rollout-1",
+        ])
+        .unwrap();
+        match cli.managers.command {
+            ManagersCommand::ResetFailedRollout(args) => {
+                assert_eq!(args.manifest, "manager-set.toml");
+                assert_eq!(args.rollout_id, "rollout-1");
+            }
+            _ => panic!("reset parsed as the wrong manager command"),
+        }
+        assert!(ManagersTestCli::try_parse_from([
+            "test",
+            "reset-failed-rollout",
+            "--manifest",
+            "manager-set.toml",
+        ])
+        .is_err());
+        assert!(ManagersTestCli::try_parse_from([
+            "test",
+            "reset-failed-rollout",
+            "--rollout-id",
+            "rollout-1",
+        ])
+        .is_err());
+        assert!(require_reset_manager(None).is_err());
+        assert_eq!(
+            require_reset_manager(Some("https://manager-a.example:9000")).unwrap(),
+            "https://manager-a.example:9000"
+        );
+    }
 
     fn manager_test_bundle(payload: &[u8], declared_payload: &[u8]) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

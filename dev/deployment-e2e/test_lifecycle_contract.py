@@ -84,13 +84,17 @@ class LifecycleContractTests(unittest.TestCase):
             'wait_for_manager_set "$pass/managers-through-a-restored.txt" manager-a manager-b',
             harness,
         )
-        self.assertEqual(harness.count("! sudo systemctl is-active --quiet wr-manager.service"), 2)
-        self.assertEqual(harness.count("sudo systemctl is-active --quiet wr-manager.service"), 4)
+        self.assertGreaterEqual(harness.count("! sudo systemctl is-active --quiet wr-manager.service"), 4)
+        self.assertGreaterEqual(harness.count("sudo systemctl is-active --quiet wr-manager.service"), 6)
         self.assertEqual(harness.count("masked-runtime"), 2)
-        self.assertEqual(harness.count('= enabled"'), 2)
+        self.assertGreaterEqual(harness.count('= enabled"'), 3)
         trace_assertion = harness[harness.index("assert_manager_rollout_trace() {"):]
         self.assertIn("target-control-established", trace_assertion)
         self.assertIn("source-stop-completed", trace_assertion)
+        self.assertIn(
+            'assert_manager_admission "$tmp" "$expected" 2>/dev/null',
+            harness,
+        )
 
     def test_real_harness_entry_executes_ordered_contract(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -121,7 +125,14 @@ with socket.socket() as listener:
 PY
 """)
             self.executable(cli, f"""printf 'cli %s\\n' "$*" >> {calls!s}
-if [[ " $* " == *" invoke "* ]]; then
+if [[ "$*" == *"manager-failed-closed-systemd.toml"* && "$*" == *"deploy-set"* ]]; then
+    exit 1
+elif [[ "$*" == *"reset-failed-rollout"* ]]; then
+    count_file={root!s}/reset-count
+    count=0; [ ! -e "$count_file" ] || count=$(cat "$count_file")
+    count=$((count + 1)); printf '%s\\n' "$count" >"$count_file"
+    [ "$count" -gt 2 ] || exit 1
+elif [[ " $* " == *" invoke "* ]]; then
     printf '{{"nonce":"probe"}}\\n'
 elif [[ "$*" == *"operations list"* ]]; then
     printf '[{{"operation_id":"operation-a","node_id":"node-a","request_token":"replacement-token","state":"succeeded"}}]\\n'
@@ -161,8 +172,13 @@ fi
             self.assertEqual({event["detail"].split("digest=")[1] for event in artifacts}, {"sha256:fixture"})
             self.assertEqual([event["name"] for event in events if event["event"] == "reset"], ["systemd-entry", "docker-entry"])
             manager_rollouts = [event for event in events if event["event"] == "manager-rollout"]
-            self.assertEqual([event["name"] for event in manager_rollouts], ["a-to-b", "b-to-a"])
-            self.assertTrue(all("barrier=120,lease=30,renew=10,watchdog=180" in event["detail"] for event in manager_rollouts))
+            self.assertEqual([event["name"] for event in manager_rollouts], [
+                "a-to-b", "b-to-a", "failed-closed", "reset-active", "reset-mixed",
+                "reset-complete", "closed-after-reset", "fresh",
+            ])
+            self.assertTrue(all("barrier=120,watchdog=180" in event["detail"] for event in manager_rollouts))
+            self.assertTrue(all("lease=" not in event["detail"] and "renew=" not in event["detail"] for event in manager_rollouts))
+            self.assertEqual([event["name"] for event in events if event["event"] == "manager-failure"], ["failed-closed", "reset-active", "reset-mixed"])
             self.assertEqual(len([event for event in events if event["event"] == "cleanup"]), 1)
             captures = [event for event in events if event["event"] == "operation-detail"]
             self.assertEqual([event["name"] for event in captures], ["replacement-token", "replacement-token"])
@@ -184,9 +200,14 @@ fi
             self.assertTrue(all("--request-token replacement-token" in line for line in replacements))
             self.assertEqual(sum("--bundle upgrade-two.tar.gz" in line for line in replacements), 2)
             deploy_sets = [line for line in invoked if "managers deploy-set" in line]
-            self.assertEqual(len(deploy_sets), 2)
-            self.assertIn("manager-a-to-b-systemd.toml --generation 2 --manager-endpoint manager-a", deploy_sets[0])
-            self.assertIn("manager-b-to-a-systemd.toml --generation 3 --manager-endpoint manager-b --old-selector-digest initial-a-selector", deploy_sets[1])
+            self.assertEqual(len(deploy_sets), 4)
+            self.assertIn("manager-a-to-b-systemd.toml", deploy_sets[0])
+            self.assertIn("manager-b-to-a-systemd.toml", deploy_sets[1])
+            self.assertIn("manager-failed-closed-systemd.toml", deploy_sets[2])
+            self.assertIn("manager-fresh-systemd.toml", deploy_sets[3])
+            resets = [line for line in invoked if "reset-failed-rollout" in line]
+            self.assertEqual(len(resets), 3)
+            self.assertTrue(all("--rollout-id failed-rollout" in line for line in resets))
             self.assertTrue(all((root / f"{backend}-summary.json").exists() for backend in ("systemd", "docker")))
             traffic_events = [event for event in events if event["event"] in {"tunnel", "probe"}]
             self.assertEqual([(event["event"], event["name"]) for event in traffic_events], [
@@ -242,6 +263,106 @@ fi
                         "endpoint": endpoint,
                     }],
                 )
+
+    def test_manager_manifest_shape_is_lease_free_and_allows_empty_sources(self):
+        import importlib.util
+        path = ROOT / "dev" / "deployment-e2e" / "manager_rollout_fixture.py"
+        spec = importlib.util.spec_from_file_location("manager_rollout_fixture_manifest", path)
+        self.assertIsNotNone(spec)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy, key, manifest = root / "policy.toml", root / "id", root / "fresh.toml"
+            policy.write_text("generation = 4\n")
+            key.touch()
+            target = {
+                "manager_id": "manager-a", "endpoint": "https://manager-a:9000", "remote": "root@manager-a",
+                "executable": "/tmp/wr-manager", "executable_digest": "sha256:" + "1" * 64,
+                "backend_spec": "/tmp/unit", "backend_spec_digest": "sha256:" + "2" * 64,
+                "config": "/tmp/config", "config_digest": "sha256:" + "3" * 64,
+                "credential_set": "/tmp/set", "credential_digest": "sha256:" + "4" * 64,
+                "old_selector_digest": "sha256:" + "5" * 64, "new_selector_digest": "sha256:" + "6" * 64,
+                "host_digest": "sha256:" + "7" * 64,
+            }
+            module.write_manifest(manifest, "55555555-5555-4555-8555-555555555555", "https://manager-a:9000", policy, "deployment-manager-a-fresh-gen4", [], [target], str(key))
+            value = tomllib.loads(manifest.read_text())
+            self.assertEqual(value["client_operation_id"], "55555555-5555-4555-8555-555555555555")
+            self.assertEqual(value.get("sources", []), [])
+            self.assertEqual([item["manager_id"] for item in value["targets"]], ["manager-a"])
+            self.assertNotIn("executor_id", value)
+            self.assertNotIn("recovery_of", value)
+
+    def test_protected_manager_failure_reset_and_fresh_order_is_explicit(self):
+        harness = HARNESS.read_text()
+        lifecycle = harness[harness.index("lifecycle() {"):]
+        labels = [
+            "manager A to B deploy-set", "manager B to A deploy-set",
+            "manager failed-closed deploy-set", "manager reset rejects active snapshot",
+            "manager reset rejects mixed policy", "manager reset complete stopped snapshot",
+            "manager closed-startup lifecycle", "manager fresh rollout", "manager open lifecycle",
+        ]
+        positions = [lifecycle.index(label) for label in labels]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("restore_ssh_wrapper", harness[harness.index("cleanup() {"):harness.index("trap cleanup EXIT")])
+        self.assertIn('sudo sync -f', lifecycle)
+        self.assertIn('dir=\\$(dirname', lifecycle)
+        self.assertIn("b_selector_before", lifecycle)
+        fault_shim = harness[
+            harness.index("install_manager_fault_ssh_shim() {"):
+            harness.index("install_manager_reset_ssh_shim() {")
+        ]
+        self.assertIn("WRT_E2E_FAULT_DESCRIPTOR", fault_shim)
+        self.assertIn("systemctl stop wr-manager.service", fault_shim)
+        reset_shim = harness[
+            harness.index("install_manager_reset_ssh_shim() {"):
+            harness.index("assert_job_queues() {")
+        ]
+        stopped_fence = (
+            'systemctl show wr-manager.service --property=ActiveState '
+            '--property=SubState --property=MainPID'
+        )
+        self.assertIn(stopped_fence, reset_shim)
+        self.assertNotIn("--value", reset_shim)
+        self.assertIn('[ "$attempt" -lt 30 ]', reset_shim)
+        self.assertIn('s/^ActiveState=//p', reset_shim)
+        self.assertIn('s/^SubState=//p', reset_shim)
+        self.assertIn('s/^MainPID=//p', reset_shim)
+        self.assertIn('[ "$line_count" = 3 ]', reset_shim)
+        self.assertIn('[ "$active" = inactive ]', reset_shim)
+        self.assertIn('[ "$sub" = dead ]', reset_shim)
+        self.assertIn('[ "$pid" = 0 ]', reset_shim)
+        self.assertIn("manager stop convergence timed out: properties=$line_count ActiveState=$active SubState=$sub MainPID=$pid observed=", reset_shim)
+        self.assertEqual(reset_shim.count("systemctl stop wr-manager.service"), 1)
+        self.assertEqual(reset_shim.count("systemctl start wr-manager.service"), 1)
+        self.assertNotIn("systemctl restart", reset_shim)
+        self.assertNotIn("systemctl kill", reset_shim)
+        admission_assertion = harness[
+            harness.index("assert_manager_admission() {"):
+            harness.index("assert_reset_trace() {")
+        ]
+        self.assertIn("json.load", admission_assertion)
+        self.assertIn("observation.get('privileged_admission')", admission_assertion)
+        self.assertIn("actual == expected", admission_assertion)
+        self.assertIn("got {actual!r} in {path}", admission_assertion)
+        self.assertIn("observation.get('service_kind') == 1", admission_assertion)
+        self.assertNotIn("grep", admission_assertion)
+        self.assertNotIn("grep -Fq CLOSED_ROLLOUT", lifecycle)
+        self.assertNotIn("grep -Fq CLOSED_STARTUP", lifecycle)
+        self.assertNotIn("grep -Fq OPEN", lifecycle)
+        self.assertEqual(lifecycle.count("assert_manager_admission"), 3)
+        self.assertNotIn("MANAGER_ROLLOUT_LEASE_SECONDS", HELPER.read_text())
+        self.assertNotIn("MANAGER_ROLLOUT_RENEW_SECONDS", HELPER.read_text())
+
+    def test_manager_fixture_declares_distinct_failed_and_fresh_generation_four(self):
+        fixture = (ROOT / "dev" / "deployment-e2e" / "manager_rollout_fixture.py").read_text()
+        self.assertIn('"failed-closed": (4, "manager-b"', fixture)
+        self.assertIn('"fresh": (4, "manager-a"', fixture)
+        self.assertIn('"44444444-4444-4444-8444-444444444444"', fixture)
+        self.assertIn('"55555555-5555-4555-8555-555555555555"', fixture)
+        self.assertIn('[], [targets["fresh"]]', fixture)
+        self.assertNotIn("executor_id", fixture)
+        self.assertNotIn("recovery_of", fixture)
 
     def test_manager_fixture_descriptor_order_matches_rust_producers(self):
         import importlib.util

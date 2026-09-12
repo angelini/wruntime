@@ -379,7 +379,7 @@ fn classify_lifecycle_observation(
     }
 }
 
-fn lifecycle_observation(status: LifecycleStatus) -> Result<LifecycleObservation> {
+pub(crate) fn lifecycle_observation(status: LifecycleStatus) -> Result<LifecycleObservation> {
     validate_lifecycle_status(&status)?;
     Ok(LifecycleObservation {
         state: status.state,
@@ -390,21 +390,30 @@ fn lifecycle_observation(status: LifecycleStatus) -> Result<LifecycleObservation
     })
 }
 
+pub(crate) async fn get_raw_lifecycle_status(
+    endpoint: &str,
+    tls: Option<&TlsConfig>,
+) -> Result<LifecycleStatus> {
+    let mut lifecycle = client::connect_lifecycle(endpoint, tls)
+        .await
+        .with_context(|| format!("failed to connect lifecycle endpoint {endpoint}"))?;
+    let status = lifecycle
+        .get_status(GetLifecycleStatusRequest {})
+        .await
+        .with_context(|| format!("lifecycle status RPC failed for {endpoint}"))?
+        .into_inner()
+        .status
+        .ok_or_else(|| anyhow::anyhow!("lifecycle endpoint {endpoint} returned no status"))?;
+    validate_lifecycle_status(&status)
+        .with_context(|| format!("lifecycle endpoint {endpoint} returned invalid status"))?;
+    Ok(status)
+}
+
 pub async fn get_lifecycle_status(
     endpoint: &str,
     tls: Option<&TlsConfig>,
 ) -> Result<LifecycleObservation> {
-    let mut lifecycle = client::connect_lifecycle(endpoint, tls).await?;
-    let response = lifecycle
-        .get_status(GetLifecycleStatusRequest {})
-        .await
-        .with_context(|| format!("lifecycle status RPC failed for {endpoint}"))?
-        .into_inner();
-    lifecycle_observation(
-        response
-            .status
-            .ok_or_else(|| anyhow::anyhow!("lifecycle endpoint returned no status"))?,
-    )
+    lifecycle_observation(get_raw_lifecycle_status(endpoint, tls).await?)
 }
 
 /// One typed result from a protocol poll under an absolute deadline.
@@ -988,57 +997,6 @@ print('sha256:'+h.hexdigest())"#;
         parent=shell_quote(&parent), dest=shell_quote(remote_path), staging=shell_quote(&staging), archive=shell_quote(&remote_archive), script=shell_quote(script), digest=shell_quote(expected_tree_digest)
     );
     run_ssh(&ssh_base, &command).context("remote immutable credential install failed")
-}
-
-/// Commit one owner-only fenced host-action record. Lower epochs, regressing
-/// sequences, conflicting replay, and new effects after lease expiry are
-/// rejected by the host rather than trusted to the remote caller.
-pub fn install_remote_fenced_json(
-    bytes: &[u8],
-    remote: &str,
-    remote_path: &str,
-    ssh_key: Option<&str>,
-    ssh_port: Option<u16>,
-) -> Result<()> {
-    let local = local_private_temp(bytes)?;
-    let ssh_base = build_ssh_args(remote, ssh_key, ssh_port);
-    let remote_tmp = remote_mktemp(&ssh_base, RemoteInstallClass::Sensitive)?;
-    let transfer = scp_file(
-        &local.to_string_lossy(),
-        remote,
-        &remote_tmp,
-        ssh_key,
-        ssh_port,
-    );
-    let _ = std::fs::remove_file(local);
-    transfer?;
-    let parent = Path::new(remote_path)
-        .parent()
-        .context("evidence path has no parent")?
-        .to_string_lossy();
-    let script = r#"import json, os, pathlib, sys, time
-incoming=pathlib.Path(sys.argv[1]); current=pathlib.Path(sys.argv[2]); data=json.loads(incoming.read_text())
-if current.exists():
- old=json.loads(current.read_text())
- if data['lease_epoch'] < old['lease_epoch'] or (data['lease_epoch']==old['lease_epoch'] and data['action_sequence'] < old['action_sequence']): sys.exit('stale host action fence')
- same=data['lease_epoch']==old['lease_epoch'] and data['action_sequence']==old['action_sequence']
- immutable=['rollout_id','manager_id','manifest_digest','host_digest','selector_digest','executable_digest','backend_spec_digest','config_digest','credential_digest','old_selector_digest','new_selector_digest','effect']
- if same and any(data.get(k)!=old.get(k) for k in immutable): sys.exit('conflicting host action replay')
- if same and old.get('outcome') in ('completed','failed') and data.get('outcome')!=old.get('outcome'): sys.exit('terminal host action replay conflict')
- if not same and data.get('lease_expires_unix',0) <= int(time.time()): sys.exit('host action lease expired')
-tmp=current.with_name(current.name+'.tmp-'+str(os.getpid())); tmp.write_bytes(incoming.read_bytes()); os.chmod(tmp,0o600)
-with open(tmp,'rb') as f: os.fsync(f.fileno())
-os.replace(tmp,current)
-fd=os.open(current.parent,os.O_RDONLY); os.fsync(fd); os.close(fd)
-incoming.unlink()"#;
-    let command = format!(
-        "set -eu; sudo install -d -m 0700 {parent}; sudo python3 -c {script} {incoming} {current}",
-        parent = shell_quote(&parent),
-        script = shell_quote(script),
-        incoming = shell_quote(&remote_tmp),
-        current = shell_quote(remote_path)
-    );
-    run_ssh(&ssh_base, &command).context("remote fenced evidence install failed")
 }
 
 /// SCP a local file to a remote path.

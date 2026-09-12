@@ -32,6 +32,50 @@ async fn concurrent_namespace_provisioning_converges() -> Result<()> {
     left?;
     right?;
 
+    let admin = pool.get().await?;
+    let quoted_row = admin
+        .query_one(
+            "SELECT quote_ident(current_database()), quote_ident($1::text)",
+            &[&role],
+        )
+        .await?;
+    let quoted_database = quoted_row.get::<_, String>(0);
+    let quoted_role = quoted_row.get::<_, String>(1);
+    admin
+        .batch_execute(&format!(
+            "ALTER ROLE {quoted_role} CONNECTION LIMIT 0; \
+             REVOKE CONNECT ON DATABASE {quoted_database} FROM {quoted_role}"
+        ))
+        .await?;
+    drop(admin);
+
+    provision_namespaces(&pool, std::slice::from_ref(&specification)).await?;
+
+    let admin = pool.get().await?;
+    let role_row = admin
+        .query_one(
+            "SELECT rolcanlogin, rolconnlimit FROM pg_roles WHERE rolname = $1",
+            &[&role],
+        )
+        .await?;
+    assert!(role_row.get::<_, bool>(0));
+    assert_eq!(role_row.get::<_, i32>(1), -1);
+    assert!(admin
+        .query_one(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM pg_database AS database \
+                 CROSS JOIN LATERAL aclexplode(database.datacl) AS acl \
+                 JOIN pg_roles AS grantee ON grantee.oid = acl.grantee \
+                 WHERE database.datname = current_database() \
+                   AND grantee.rolname = $1 \
+                   AND acl.privilege_type = 'CONNECT'\
+             )",
+            &[&role],
+        )
+        .await?
+        .get::<_, bool>(0));
+    drop(admin);
+
     let guest = wr_engine::pool::build_guest_pool(&url, &role, &password, 1)?;
     let client = guest.get().await?;
     assert_eq!(
@@ -70,7 +114,8 @@ async fn concurrent_namespace_provisioning_converges() -> Result<()> {
     assert_eq!(owner, current_user);
     admin
         .batch_execute(&format!(
-            "DROP SCHEMA \"{schema_a}\" CASCADE; \
+            "REVOKE CONNECT ON DATABASE {quoted_database} FROM \"{role}\"; \
+             DROP SCHEMA \"{schema_a}\" CASCADE; \
              DROP SCHEMA \"{schema_b}\" CASCADE; \
              DROP ROLE \"{role}\""
         ))

@@ -211,9 +211,14 @@ async fn database_grants_enforce_namespace_not_module_authorization() -> Result<
             &[&vec![role_one.clone(), role_two.clone()]],
         )
         .await?;
+    let quoted_database: String = admin
+        .query_one("SELECT quote_ident(current_database())", &[])
+        .await?
+        .get(0);
     admin
         .batch_execute(&format!(
-            "DROP SCHEMA \"{schema_a}\" CASCADE; \
+            "REVOKE CONNECT ON DATABASE {quoted_database} FROM \"{role_one}\", \"{role_two}\"; \
+             DROP SCHEMA \"{schema_a}\" CASCADE; \
              DROP SCHEMA \"{schema_b}\" CASCADE; \
              DROP SCHEMA \"{schema_other}\" CASCADE; \
              DROP TABLE wr_system.boundary_secret; \

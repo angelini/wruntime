@@ -8,8 +8,6 @@ LIFECYCLE_CLI_WAIT_SECONDS=1860
 LIFECYCLE_WATCHDOG_SECONDS=1920
 LIFECYCLE_CLEANUP_SECONDS=300
 MANAGER_ROLLOUT_BARRIER_SECONDS=120
-MANAGER_ROLLOUT_LEASE_SECONDS=30
-MANAGER_ROLLOUT_RENEW_SECONDS=10
 MANAGER_ROLLOUT_WATCHDOG_SECONDS=180
 
 lifecycle_now() {
@@ -81,10 +79,22 @@ lifecycle_run_deploy_operation() {
 }
 
 lifecycle_run_manager_rollout() {
-	local direction="$1" trace="$2"
+	local stage="$1" trace="$2"
 	shift 2
-	lifecycle_trace manager-rollout "$direction" "barrier=$MANAGER_ROLLOUT_BARRIER_SECONDS,lease=$MANAGER_ROLLOUT_LEASE_SECONDS,renew=$MANAGER_ROLLOUT_RENEW_SECONDS,watchdog=$MANAGER_ROLLOUT_WATCHDOG_SECONDS,trace=$trace"
+	lifecycle_trace manager-rollout "$stage" "barrier=$MANAGER_ROLLOUT_BARRIER_SECONDS,watchdog=$MANAGER_ROLLOUT_WATCHDOG_SECONDS,trace=$trace"
 	WRT_MANAGER_ROLLOUT_TRACE="$trace" timeout -k 10 "$MANAGER_ROLLOUT_WATCHDOG_SECONDS" "$@"
+}
+
+lifecycle_expect_manager_failure() {
+	local stage="$1" trace="$2" status
+	shift 2
+	if lifecycle_run_manager_rollout "$stage" "$trace" "$@"; then
+		echo "manager stage unexpectedly succeeded: $stage" >&2
+		return 1
+	else
+		status=$?
+	fi
+	lifecycle_trace manager-failure "$stage" "status=$status"
 }
 
 lifecycle_capture_operation_detail() {
@@ -189,8 +199,15 @@ lifecycle_contract_fixture() {
 		lifecycle_run_deploy_operation "$backend-empty-inventory" "$WRT_CONTRACT_CLI" node deploy --bundle empty-inventory.tar.gz --allow-downtime
 		lifecycle_run_deploy_operation "$backend-rollback" "$WRT_CONTRACT_CLI" node rollback --to revision_one_a --allow-downtime
 		if [ "$backend" = systemd ]; then
-			lifecycle_run_manager_rollout a-to-b "${WRT_CONTRACT_TRAFFIC_DIR:-/tmp}/manager-a-to-b.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-a-to-b-systemd.toml --generation 2 --manager-endpoint manager-a
-			lifecycle_run_manager_rollout b-to-a "${WRT_CONTRACT_TRAFFIC_DIR:-/tmp}/manager-b-to-a.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-b-to-a-systemd.toml --generation 3 --manager-endpoint manager-b --old-selector-digest initial-a-selector
+			local manager_trace_root="${WRT_CONTRACT_TRAFFIC_DIR:-/tmp}"
+			lifecycle_run_manager_rollout a-to-b "$manager_trace_root/manager-a-to-b.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-a-to-b-systemd.toml
+			lifecycle_run_manager_rollout b-to-a "$manager_trace_root/manager-b-to-a.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-b-to-a-systemd.toml
+			lifecycle_expect_manager_failure failed-closed "$manager_trace_root/manager-failed-closed.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-failed-closed-systemd.toml
+			lifecycle_expect_manager_failure reset-active "$manager_trace_root/manager-reset-active.jsonl" "$WRT_CONTRACT_CLI" managers reset-failed-rollout --manifest manager-failed-closed-systemd.toml --rollout-id failed-rollout
+			lifecycle_expect_manager_failure reset-mixed "$manager_trace_root/manager-reset-mixed.jsonl" "$WRT_CONTRACT_CLI" managers reset-failed-rollout --manifest manager-failed-closed-systemd.toml --rollout-id failed-rollout
+			lifecycle_run_manager_rollout reset-complete "$manager_trace_root/manager-reset-complete.jsonl" "$WRT_CONTRACT_CLI" managers reset-failed-rollout --manifest manager-failed-closed-systemd.toml --rollout-id failed-rollout
+			lifecycle_run_manager_rollout closed-after-reset "$manager_trace_root/manager-closed-after-reset.jsonl" "$WRT_CONTRACT_CLI" lifecycle status
+			lifecycle_run_manager_rollout fresh "$manager_trace_root/manager-fresh.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-fresh-systemd.toml
 		fi
 	done
 	lifecycle_final_cleanup "$WRT_CONTRACT_PROVIDER" stop-reset

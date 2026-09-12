@@ -161,7 +161,6 @@ fn test_manager_services(pool: deadpool_postgres::Pool, manager: Manager) -> Tes
         "",
         wr_common::wruntime::ManagerRolloutPhase::Unspecified as i32,
         "",
-        0,
     );
     let policy =
         wr_manager::service::PolicyApi::new(principal_policy.clone(), admission, rollout.clone());
