@@ -3272,6 +3272,14 @@ pub async fn begin_manager_rollout(
     let accepted_digest: Option<String> = guard.get(1);
     let active: Option<uuid::Uuid> = guard.get(2);
     let recovery_permit: Option<String> = guard.get(3);
+    let (accepted_generation, accepted_digest) = match (accepted_generation, accepted_digest) {
+        (Some(generation), Some(digest)) => (generation, digest),
+        _ => {
+            return Err(Status::failed_precondition(
+                "manager rollout creation requires initialized accepted policy",
+            ));
+        }
+    };
     if active.is_some() {
         return Err(Status::failed_precondition(
             "another manager rollout is active",
@@ -3284,7 +3292,7 @@ pub async fn begin_manager_rollout(
                 "manager rollout recovery permit belongs to another principal",
             ));
         }
-    } else if !privileged_admission_open && accepted_generation.is_some() {
+    } else if !privileged_admission_open {
         return Err(Status::failed_precondition(
             "closed privileged admission requires an explicit recovery permit",
         ));
@@ -3319,55 +3327,17 @@ pub async fn begin_manager_rollout(
             "manifest source manager set does not match the complete live source set",
         ));
     }
-    if accepted_generation.is_some_and(|generation| request.target_generation < generation as u64) {
+    if request.target_generation < accepted_generation as u64 {
         return Err(Status::failed_precondition(
             "target policy generation must be strictly newer",
         ));
     }
-    if accepted_generation == Some(request.target_generation as i64)
-        && accepted_digest.as_deref() != Some(&request.target_policy_digest)
+    if accepted_generation == request.target_generation as i64
+        && accepted_digest != request.target_policy_digest
     {
         return Err(Status::failed_precondition(
             "same policy generation has a different digest",
         ));
-    }
-    if accepted_generation.is_none() {
-        let fresh = transaction
-            .query(
-                "SELECT manager_id, policy_generation, policy_digest, admission_state
-             FROM wr_managers WHERE last_heartbeat > NOW() - INTERVAL '30 seconds'
-             ORDER BY manager_id FOR UPDATE",
-                &[],
-            )
-            .await
-            .internal()?;
-        let expected = request
-            .expected_targets
-            .iter()
-            .map(|target| target.manager_id.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        let observed = fresh
-            .iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<std::collections::BTreeSet<_>>();
-        let matching = !fresh.is_empty()
-            && fresh.iter().all(|row| {
-                row.get::<_, Option<i64>>(1) == Some(request.target_generation as i64)
-                    && row.get::<_, Option<String>>(2).as_deref()
-                        == Some(&request.target_policy_digest)
-                    && row.get::<_, String>(3) == "CLOSED_STARTUP"
-            });
-        if !matching
-            || observed
-                .iter()
-                .map(String::as_str)
-                .collect::<std::collections::BTreeSet<_>>()
-                != expected
-        {
-            return Err(Status::failed_precondition(
-                "empty-cluster rollout requires the complete matching CLOSED_STARTUP manager set",
-            ));
-        }
     }
 
     let rollout_id = uuid::Uuid::new_v4();

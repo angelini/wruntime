@@ -47,7 +47,7 @@ fn protected_phase_sequence() -> [ManagerRolloutPhase; 8] {
     ]
 }
 
-fn trace_rollout(event: &str, rollout: &ManagerRollout, endpoint_present: bool) {
+fn trace_rollout(event: &str, rollout: &ManagerRollout) {
     let Some(path) = std::env::var_os("WRT_MANAGER_ROLLOUT_TRACE") else {
         return;
     };
@@ -62,7 +62,6 @@ fn trace_rollout(event: &str, rollout: &ManagerRollout, endpoint_present: bool) 
         "phase": phase,
         "target_generation": rollout.target_generation,
         "deployment_identity": rollout.target_deployment_principal_uri,
-        "endpoint_present": endpoint_present,
         "barrier_timeout_seconds": MANAGER_BARRIER_TIMEOUT.as_secs(),
     });
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
@@ -103,8 +102,8 @@ pub struct ManagerSetManifest {
     pub schema_version: u32,
     pub client_operation_id: String,
     pub cluster_id: String,
-    /// Existing control endpoint. Omit only for a pristine empty-cluster bootstrap.
-    pub manager_endpoint: Option<String>,
+    /// Existing manager peer-HTTPS endpoint used to coordinate the rollout.
+    pub manager_endpoint: String,
     pub target_policy: PathBuf,
     pub deployment_certificate: String,
     #[serde(default = "default_parallelism")]
@@ -251,6 +250,7 @@ fn load_manifest_with_artifacts(
     uuid::Uuid::parse_str(&manifest.client_operation_id)
         .context("client_operation_id must be a UUID")?;
     wr_common::identity::ClusterId::parse(&manifest.cluster_id)?;
+    wr_common::identity::PeerHttpsUrl::parse(&manifest.manager_endpoint)?;
     if manifest.deployment_certificate.is_empty()
         || manifest.deployment_certificate.contains('/')
         || manifest.deployment_certificate.len() > 128
@@ -259,9 +259,6 @@ fn load_manifest_with_artifacts(
     }
     if manifest.max_parallel == 0 || manifest.max_parallel > 16 {
         bail!("max_parallel must be between 1 and 16");
-    }
-    if manifest.manager_endpoint.is_none() && !manifest.sources.is_empty() {
-        bail!("empty-cluster bootstrap requires an empty source manager set");
     }
     if manifest.targets.is_empty() {
         bail!("target manager set must not be empty");
@@ -506,7 +503,10 @@ fn source_replaced_by_target(source: &SourceManager, target: &TargetManager) -> 
     source.remote == target.remote && source.selector_digest == target.old_selector_digest
 }
 
-fn install_bootstrap_backend(target: &TargetManager, manifest: &ManagerSetManifest) -> Result<()> {
+fn install_systemd_activation_launcher(
+    target: &TargetManager,
+    manifest: &ManagerSetManifest,
+) -> Result<()> {
     if target.backend == Backend::Systemd {
         let launcher = service_gen::manager_launcher_script().as_bytes();
         let launcher_digest = digest_bytes(launcher);
@@ -581,7 +581,7 @@ fn stage_target(target: &TargetManager, validated: &ValidatedManifest) -> Result
         // A live rollout may target a pristine disposable host. Install the
         // stable launcher/unit during staging; this does not select or start
         // the staged manager and therefore preserves the pre-close barrier.
-        install_bootstrap_backend(target, manifest)?;
+        install_systemd_activation_launcher(target, manifest)?;
         let binary_path = format!(
             "{ARTIFACT_ROOT}/binaries/{}/wr-manager",
             &target.executable_digest[7..]
@@ -739,10 +739,9 @@ async fn mark_failed_closed(
     epoch: &mut wr_common::manager_client::ManagerEpoch,
     rollout: &ManagerRollout,
     validated: &ValidatedManifest,
-    endpoint_present: bool,
 ) {
     if let Ok(failed) = advance(epoch, rollout, ManagerRolloutPhase::FailedClosed, vec![]).await {
-        trace_rollout("phase", &failed, endpoint_present);
+        trace_rollout("phase", &failed);
         return;
     }
     for target in &validated.manifest.targets {
@@ -759,7 +758,7 @@ async fn mark_failed_closed(
         )
         .await
         {
-            trace_rollout("phase", &failed, endpoint_present);
+            trace_rollout("phase", &failed);
             return;
         }
     }
@@ -773,7 +772,7 @@ async fn advance_when_ready(
     outcomes: Vec<ManagerRolloutMemberOutcome>,
 ) -> Result<ManagerRollout> {
     let deadline = tokio::time::Instant::now() + MANAGER_BARRIER_TIMEOUT;
-    trace_rollout("barrier-start", &rollout, true);
+    trace_rollout("barrier-start", &rollout);
     loop {
         match advance(epoch, &rollout, next, outcomes.clone()).await {
             Ok(rollout) => return Ok(rollout),
@@ -821,7 +820,7 @@ async fn establish_target_control(
                 client::connect_operator(&target.endpoint, RetryClass::DurableCreate).await
             {
                 if target_controls_rollout(&candidate, rollout, target) {
-                    trace_rollout("target-control-established", rollout, true);
+                    trace_rollout("target-control-established", rollout);
                     return Ok(candidate);
                 }
             }
@@ -836,12 +835,11 @@ async fn establish_target_control(
 async fn begin(
     validated: &ValidatedManifest,
 ) -> Result<(wr_common::manager_client::ManagerEpoch, ManagerRollout)> {
-    let endpoint = validated
-        .manifest
-        .manager_endpoint
-        .as_deref()
-        .unwrap_or(&validated.manifest.targets[0].endpoint);
-    let mut epoch = client::connect_operator(endpoint, RetryClass::DurableCreate).await?;
+    let mut epoch = client::connect_operator(
+        &validated.manifest.manager_endpoint,
+        RetryClass::DurableCreate,
+    )
+    .await?;
     let rollout = epoch
         .begin_manager_rollout(create_request(validated)?)
         .await?
@@ -906,7 +904,7 @@ fn decode_hex(value: &str) -> Result<Vec<u8>> {
 
 fn validate_reset_control_endpoint(manifest: &ManagerSetManifest, endpoint: &str) -> Result<()> {
     wr_common::identity::PeerHttpsUrl::parse(endpoint)?;
-    let endpoint_declared = manifest.manager_endpoint.as_deref() == Some(endpoint)
+    let endpoint_declared = manifest.manager_endpoint == endpoint
         || manifest
             .targets
             .iter()
@@ -1247,37 +1245,14 @@ pub fn restore_config(args: RestoreConfigArgs) -> Result<()> {
 pub async fn run(args: DeploySetArgs) -> Result<()> {
     let validated = load_manifest(Path::new(&args.manifest))?;
 
-    // Empty-cluster bootstrap is the only path that starts targets before create.
-    // They remain CLOSED_STARTUP and the direct endpoint is fixed by the manifest.
-    if validated.manifest.manager_endpoint.is_none() {
-        let bootstrap_id = validated.manifest.client_operation_id.clone();
-        for target in &validated.manifest.targets {
-            stage_target(target, &validated)?;
-            install_bootstrap_backend(target, &validated.manifest)?;
-            let placeholder = ManagerRollout {
-                rollout_id: bootstrap_id.clone(),
-                ..Default::default()
-            };
-            activate_target(
-                target,
-                &validated,
-                &placeholder,
-                validated.manifest.targets.len() == 1,
-            )?;
-        }
-    }
-
-    let endpoint_present = validated.manifest.manager_endpoint.is_some();
     let (mut epoch, mut rollout) = begin(&validated).await?;
-    trace_rollout("phase", &rollout, endpoint_present);
+    trace_rollout("phase", &rollout);
 
     if rollout.phase == ManagerRolloutPhase::Prepared as i32 {
         rollout = advance(&mut epoch, &rollout, ManagerRolloutPhase::Staging, vec![]).await?;
-        trace_rollout("phase", &rollout, endpoint_present);
+        trace_rollout("phase", &rollout);
     }
-    if validated.manifest.manager_endpoint.is_some()
-        && rollout.phase == ManagerRolloutPhase::Staging as i32
-    {
+    if rollout.phase == ManagerRolloutPhase::Staging as i32 {
         for target in &validated.manifest.targets {
             if let Err(error) = stage_target(target, &validated) {
                 let failure = ManagerRolloutMemberOutcome {
@@ -1294,7 +1269,7 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
                 )
                 .await
                 {
-                    trace_rollout("phase", &failed, endpoint_present);
+                    trace_rollout("phase", &failed);
                 }
                 return Err(error.context(
                     "manager-set staging failed; FAILED_PRE_CLOSE preserves every active selector",
@@ -1310,13 +1285,13 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
             vec![],
         )
         .await?;
-        trace_rollout("phase", &rollout, endpoint_present);
+        trace_rollout("phase", &rollout);
     }
     if rollout.phase == ManagerRolloutPhase::ClosingOld as i32 {
         // The manager-side barrier observes every source CLOSED_ROLLOUT before accepting this.
         rollout =
             advance_when_ready(&mut epoch, rollout, ManagerRolloutPhase::OldClosed, vec![]).await?;
-        trace_rollout("phase", &rollout, endpoint_present);
+        trace_rollout("phase", &rollout);
     }
     if rollout.phase == ManagerRolloutPhase::OldClosed as i32 {
         rollout = advance(
@@ -1326,22 +1301,13 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
             vec![],
         )
         .await?;
-        trace_rollout("phase", &rollout, endpoint_present);
+        trace_rollout("phase", &rollout);
     }
     if rollout.phase == ManagerRolloutPhase::StartingTarget as i32 {
         let handoff_deadline = tokio::time::Instant::now() + MANAGER_BARRIER_TIMEOUT;
         let mut outcomes = Vec::new();
         let mut stopped_sources = BTreeSet::new();
         for target in &validated.manifest.targets {
-            if validated.manifest.manager_endpoint.is_none() {
-                outcomes.push(ManagerRolloutMemberOutcome {
-                    manager_id: target.manager_id.clone(),
-                    member_role: "target".into(),
-                    host_action_outcome: "READY_CLOSED".into(),
-                    error: String::new(),
-                });
-                continue;
-            }
             match activate_target(
                 target,
                 &validated,
@@ -1360,7 +1326,7 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
                     }
                 }
                 Err(error) => {
-                    mark_failed_closed(&mut epoch, &rollout, &validated, endpoint_present).await;
+                    mark_failed_closed(&mut epoch, &rollout, &validated).await;
                     return Err(error.context(
                         "manager activation failed closed; explicit host repair is required",
                     ));
@@ -1371,7 +1337,7 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
         epoch = match establish_target_control(&validated, &rollout, handoff_deadline).await {
             Ok(target_epoch) => target_epoch,
             Err(error) => {
-                mark_failed_closed(&mut epoch, &rollout, &validated, endpoint_present).await;
+                mark_failed_closed(&mut epoch, &rollout, &validated).await;
                 return Err(error.context(
                     "failed to establish target rollout control; explicit recovery is required",
                 ));
@@ -1388,12 +1354,11 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
             } else {
                 match deactivate_source(source, &validated) {
                     Ok(outcome) => {
-                        trace_rollout("source-stop-completed", &rollout, endpoint_present);
+                        trace_rollout("source-stop-completed", &rollout);
                         outcome
                     }
                     Err(error) => {
-                        mark_failed_closed(&mut epoch, &rollout, &validated, endpoint_present)
-                            .await;
+                        mark_failed_closed(&mut epoch, &rollout, &validated).await;
                         return Err(error.context(
                             "source manager deactivation failed closed; explicit host repair is required",
                         ));
@@ -1402,7 +1367,7 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
             };
             outcomes.push(outcome);
         }
-        trace_rollout("target-ready-closed", &rollout, endpoint_present);
+        trace_rollout("target-ready-closed", &rollout);
         let starting_target = rollout.clone();
         rollout = match advance_when_ready(
             &mut epoch,
@@ -1414,13 +1379,12 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
         {
             Ok(rollout) => rollout,
             Err(error) => {
-                mark_failed_closed(&mut epoch, &starting_target, &validated, endpoint_present)
-                    .await;
+                mark_failed_closed(&mut epoch, &starting_target, &validated).await;
                 return Err(error
                     .context("target-ready barrier failed closed; explicit recovery is required"));
             }
         };
-        trace_rollout("phase", &rollout, endpoint_present);
+        trace_rollout("phase", &rollout);
     }
     if rollout.phase == ManagerRolloutPhase::TargetReadyClosed as i32 {
         rollout = advance(
@@ -1430,7 +1394,7 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
             vec![],
         )
         .await?;
-        trace_rollout("phase", &rollout, endpoint_present);
+        trace_rollout("phase", &rollout);
     }
     if rollout.phase == ManagerRolloutPhase::ActivatingTarget as i32 {
         let activating_target = rollout.clone();
@@ -1440,21 +1404,15 @@ pub async fn run(args: DeploySetArgs) -> Result<()> {
             {
                 Ok(rollout) => rollout,
                 Err(error) => {
-                    mark_failed_closed(
-                        &mut epoch,
-                        &activating_target,
-                        &validated,
-                        endpoint_present,
-                    )
-                    .await;
+                    mark_failed_closed(&mut epoch, &activating_target, &validated).await;
                     return Err(error.context(
                         "target activation barrier failed closed; explicit recovery is required",
                     ));
                 }
             };
-        trace_rollout("phase", &rollout, endpoint_present);
+        trace_rollout("phase", &rollout);
     }
-    trace_rollout("cli-completed", &rollout, endpoint_present);
+    trace_rollout("cli-completed", &rollout);
     println!(
         "{}\t{}",
         rollout.rollout_id,
@@ -1553,7 +1511,7 @@ mod tests {
             schema_version: 1,
             client_operation_id: "00000000-0000-0000-0000-000000000001".into(),
             cluster_id: "cluster-a".into(),
-            manager_endpoint: Some("https://manager-a.example:9000".into()),
+            manager_endpoint: "https://coordinator.example:9000".into(),
             target_policy: "/tmp/policy.toml".into(),
             deployment_certificate: "deployment-v1".into(),
             max_parallel: 1,
@@ -1608,8 +1566,53 @@ mod tests {
     }
 
     #[test]
+    fn manifest_requires_manager_endpoint() {
+        let manifest = toml::to_string(&reset_manifest()).unwrap();
+        let without_endpoint = manifest
+            .lines()
+            .filter(|line| !line.starts_with("manager_endpoint = "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = toml::from_str::<ManagerSetManifest>(&without_endpoint).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("missing field `manager_endpoint`"));
+    }
+
+    #[test]
+    fn malformed_manager_endpoint_precedes_artifact_and_policy_reads() {
+        let mut manifest = reset_manifest();
+        manifest.manager_endpoint = "http://coordinator.example:9000".into();
+        manifest.target_policy = "/definitely/missing/policy.toml".into();
+        manifest.targets[0].backend_spec = "/definitely/missing/spec".into();
+        manifest.targets[0].config = "/definitely/missing/config".into();
+        manifest.targets[0].credential_set = "/definitely/missing/credentials".into();
+        manifest.targets[0].executable = "/definitely/missing/wr-manager".into();
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(toml::to_string(&manifest).unwrap().as_bytes())
+            .unwrap();
+        let error = match load_manifest(file.path()) {
+            Ok(_) => panic!("malformed manager endpoint was accepted"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            !message.contains("failed to read target policy"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("failed to read /definitely/missing"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn reset_control_endpoint_must_be_declared() {
         let manifest = reset_manifest();
+        assert!(
+            validate_reset_control_endpoint(&manifest, "https://coordinator.example:9000").is_ok()
+        );
         assert!(
             validate_reset_control_endpoint(&manifest, "https://manager-a.example:9000").is_ok()
         );

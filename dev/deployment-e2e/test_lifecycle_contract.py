@@ -199,6 +199,14 @@ fi
             self.assertEqual(sum("--exit-after-finalization" in line for line in replacements), 2)
             self.assertTrue(all("--request-token replacement-token" in line for line in replacements))
             self.assertEqual(sum("--bundle upgrade-two.tar.gz" in line for line in replacements), 2)
+            lifecycle = HARNESS.read_text()[HARNESS.read_text().index("lifecycle() {"):]
+            initial_manager_deploy = lifecycle.index(
+                'managers deploy "$MANAGER_BUNDLE" "$MANAGER_REMOTE" --format "$backend"'
+            )
+            systemd_rollouts = lifecycle.index('if [ "$backend" = systemd ]; then', initial_manager_deploy)
+            first_deploy_set = lifecycle.index('run_to_log "manager A to B deploy-set"')
+            self.assertLess(initial_manager_deploy, systemd_rollouts)
+            self.assertLess(systemd_rollouts, first_deploy_set)
             deploy_sets = [line for line in invoked if "managers deploy-set" in line]
             self.assertEqual(len(deploy_sets), 4)
             self.assertIn("manager-a-to-b-systemd.toml", deploy_sets[0])
@@ -264,7 +272,7 @@ fi
                     }],
                 )
 
-    def test_manager_manifest_shape_is_lease_free_and_allows_empty_sources(self):
+    def test_manager_manifest_shape_requires_endpoint_and_preserves_sources(self):
         import importlib.util
         path = ROOT / "dev" / "deployment-e2e" / "manager_rollout_fixture.py"
         spec = importlib.util.spec_from_file_location("manager_rollout_fixture_manifest", path)
@@ -273,7 +281,7 @@ fi
         spec.loader.exec_module(module)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            policy, key, manifest = root / "policy.toml", root / "id", root / "fresh.toml"
+            policy, key = root / "policy.toml", root / "id"
             policy.write_text("generation = 4\n")
             key.touch()
             target = {
@@ -285,13 +293,43 @@ fi
                 "old_selector_digest": "sha256:" + "5" * 64, "new_selector_digest": "sha256:" + "6" * 64,
                 "host_digest": "sha256:" + "7" * 64,
             }
-            module.write_manifest(manifest, "55555555-5555-4555-8555-555555555555", "https://manager-a:9000", policy, "deployment-manager-a-fresh-gen4", [], [target], str(key))
-            value = tomllib.loads(manifest.read_text())
-            self.assertEqual(value["client_operation_id"], "55555555-5555-4555-8555-555555555555")
-            self.assertEqual(value.get("sources", []), [])
-            self.assertEqual([item["manager_id"] for item in value["targets"]], ["manager-a"])
-            self.assertNotIn("executor_id", value)
-            self.assertNotIn("recovery_of", value)
+            source_a = {
+                "manager_id": "manager-a", "endpoint": "https://manager-a:9000",
+                "remote": "root@manager-a", "host_digest": "sha256:" + "8" * 64,
+                "selector_digest": "sha256:" + "9" * 64,
+            }
+            source_b = source_a | {
+                "manager_id": "manager-b", "endpoint": "https://manager-b:9000",
+                "remote": "root@manager-b",
+            }
+            cases = (
+                ("a-to-b", "https://manager-a:9000", [source_a], ["manager-a"]),
+                ("b-to-a", "https://manager-b:9000", [source_b], ["manager-b"]),
+                ("failed-closed", "https://manager-a:9000", [source_a], ["manager-a"]),
+                ("fresh", "https://manager-a:9000", [], []),
+            )
+            for index, (name, endpoint, sources, expected_sources) in enumerate(cases):
+                with self.subTest(name=name):
+                    manifest = root / f"{name}.toml"
+                    operation_id = f"00000000-0000-4000-8000-{index:012d}"
+                    module.write_manifest(
+                        manifest, operation_id, endpoint, policy,
+                        f"deployment-{name}", sources, [target], str(key),
+                    )
+                    value = tomllib.loads(manifest.read_text())
+                    self.assertEqual(value["client_operation_id"], operation_id)
+                    self.assertEqual(value["manager_endpoint"], endpoint)
+                    self.assertTrue(value["manager_endpoint"])
+                    self.assertEqual(
+                        [item["manager_id"] for item in value.get("sources", [])],
+                        expected_sources,
+                    )
+                    self.assertEqual(
+                        [item["manager_id"] for item in value["targets"]],
+                        ["manager-a"],
+                    )
+                    self.assertNotIn("executor_id", value)
+                    self.assertNotIn("recovery_of", value)
 
     def test_protected_manager_failure_reset_and_fresh_order_is_explicit(self):
         harness = HARNESS.read_text()
@@ -354,13 +392,26 @@ fi
         self.assertNotIn("MANAGER_ROLLOUT_LEASE_SECONDS", HELPER.read_text())
         self.assertNotIn("MANAGER_ROLLOUT_RENEW_SECONDS", HELPER.read_text())
 
-    def test_manager_fixture_declares_distinct_failed_and_fresh_generation_four(self):
+    def test_manager_fixture_declares_exact_coordinators_and_predecessors(self):
         fixture = (ROOT / "dev" / "deployment-e2e" / "manager_rollout_fixture.py").read_text()
         self.assertIn('"failed-closed": (4, "manager-b"', fixture)
         self.assertIn('"fresh": (4, "manager-a"', fixture)
+        manifest_calls = [
+            line.strip()
+            for line in fixture.splitlines()
+            if line.strip().startswith("write_manifest(manifests[")
+        ]
+        self.assertEqual(len(manifest_calls), 4)
+        expected_relationships = (
+            ('manifests["a-to-b"]', "args.a_endpoint", '[source_a_initial]', 'targets["a-to-b"]'),
+            ('manifests["b-to-a"]', "args.b_endpoint", '[source_b_gen2]', 'targets["b-to-a"]'),
+            ('manifests["failed-closed"]', "args.a_endpoint", '[source_a_gen3]', 'targets["failed-closed"]'),
+            ('manifests["fresh"]', "args.a_endpoint", "[]", 'targets["fresh"]'),
+        )
+        for call, expected in zip(manifest_calls, expected_relationships, strict=True):
+            self.assertTrue(all(fragment in call for fragment in expected), call)
         self.assertIn('"44444444-4444-4444-8444-444444444444"', fixture)
         self.assertIn('"55555555-5555-4555-8555-555555555555"', fixture)
-        self.assertIn('[], [targets["fresh"]]', fixture)
         self.assertNotIn("executor_id", fixture)
         self.assertNotIn("recovery_of", fixture)
 

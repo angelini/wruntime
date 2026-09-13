@@ -298,7 +298,6 @@ values = [json.loads(line) for line in open(path) if line.strip()]
 phases = [item['phase'] for item in values if item.get('event') == 'phase']
 expected = ['PREPARED', 'STAGING', 'CLOSING_OLD', 'OLD_CLOSED', 'STARTING_TARGET', 'TARGET_READY_CLOSED', 'ACTIVATING_TARGET', 'COMPLETED']
 assert phases == expected, (phases, expected)
-assert all(item.get('endpoint_present') is True for item in values), values
 assert all(item.get('target_generation') == generation for item in values), values
 assert any(item.get('event') == 'barrier-start' for item in values), values
 assert any(item.get('event') == 'target-ready-closed' for item in values), values
