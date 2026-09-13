@@ -9,10 +9,11 @@ echo "S3_ENDPOINT: ${S3_ENDPOINT}"
 
 CG_ENGINE_CFG="${CONFIG_DIR}/codegen-engine.toml"
 render_config examples/codegen/engine.toml "$CG_ENGINE_CFG" \
-	"postgres://user:pass@localhost:5432/codegen" "${DB_URL}" \
+	"postgres://user:pass@localhost:5432/codegen" "${JOB_DB_URL}" \
 	"http://127.0.0.1:8900" "${S3_ENDPOINT}" \
 	"access_key_id     = \"rustfsadmin\"" "access_key_id     = \"${S3_ACCESS_KEY}\"" \
 	"secret_access_key = \"rustfsadmin\"" "secret_access_key = \"${S3_SECRET_KEY}\""
+prepare_example_tenant_native "$CG_ENGINE_CFG"
 # ── Prepare manager + proxy configs ──────────────────────────────────────
 MANAGER_CFG=$(prepare_manager_config)
 PROXY_CFG=$(prepare_proxy_config "${CONFIG_DIR}/codegen-proxy.toml")

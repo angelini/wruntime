@@ -31,10 +31,12 @@ pub mod lifecycle_observation;
 #[cfg(any(feature = "signal", test))]
 pub mod lifecycle_service;
 pub mod manager_client;
+pub mod migration_bundle;
 pub mod naming;
 pub mod node;
 #[cfg(feature = "pool")]
 pub mod pool;
+pub mod postgres;
 #[cfg(any(feature = "signal", test))]
 pub mod process_lifecycle;
 #[cfg(any(feature = "signal", test))]

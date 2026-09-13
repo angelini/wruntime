@@ -173,7 +173,7 @@ PY_REDACT
                 result = self.run_bash(
                     f"""
                     WR_EXAMPLE_RUN_DIR={directory}
-                    source {EXAMPLE_HELPERS}
+                    source {EXAMPLE_HELPERS} --helper-contract-test
                     remove_example_run_directory() {{ return 17; }}
                     exit {primary}
                     """

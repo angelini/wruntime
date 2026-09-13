@@ -1,24 +1,79 @@
+name: wruntime-dev
+
 services:
   postgres:
     image: postgres:18-alpine
     shm_size: 1gb
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_PASSWORD: wruntime-dev-admin
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=peer
+    entrypoint: ["/bin/sh", "/wr-config/entrypoint.sh"]
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/var/lib/postgresql/wruntime-tls/server.crt
+      - -c
+      - ssl_key_file=/var/lib/postgresql/wruntime-tls/server.key
+      - -c
+      - ssl_ca_file=/var/lib/postgresql/wruntime-tls/ca.crt
+      - -c
+      - hba_file=/var/lib/postgresql/wruntime-config/pg_hba.conf
+      - -c
+      - ident_file=/var/lib/postgresql/wruntime-config/pg_ident.conf
+      - -c
+      # docker_process_sql clears PGHOST/PGHOSTADDR, so the temporary server
+      # must expose libpq's image-default socket as well as the shared tool socket.
+      - unix_socket_directories=/var/run/postgresql,/var/run/wruntime-postgresql
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          PGPASSWORD="$$POSTGRES_PASSWORD"
+          psql 'host=127.0.0.1 user=postgres dbname=postgres sslmode=verify-full sslrootcert=/var/lib/postgresql/wruntime-tls/ca.crt'
+          -Atqc "select current_setting('server_version_num')::int / 10000 = 18 and current_setting('ssl') = 'on'"
+          | grep -Fx t >/dev/null
+      interval: 2s
+      timeout: 5s
+      retries: 30
     volumes:
-      - ./dev/postgres-init:/docker-entrypoint-initdb.d
+      - ./dev/postgres-init:/docker-entrypoint-initdb.d:ro
+      - ./dev/postgres-entrypoint.sh:/wr-config/entrypoint.sh:ro
+      - ./dev/postgres-config/pg_hba.conf:/wr-config/pg_hba.conf:ro
+      - ${WRT_SHARED_DEV_STATE_ROOT:?canonical shared dev state root is required}/pki:/wr-input:ro
       - postgres-data:/var/lib/postgresql
+      - postgres-config:/var/lib/postgresql/wruntime-config
+      - postgres-socket:/var/run/wruntime-postgresql
+    networks: [platform]
+
+  postgres-provisioner:
+    profiles: [postgres-tools]
+    # Host preparation replaces this inert lifecycle-only placeholder through
+    # the canonical generated override before any provisioner run.
+    image: wruntime-dev-postgres-provisioner:unconfigured
+    pull_policy: never
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - postgres-config:/var/lib/postgresql/wruntime-config
+      - postgres-socket:/var/run/wruntime-postgresql
+      - ${WRT_SHARED_DEV_STATE_ROOT:?canonical shared dev state root is required}/pki:/wr-input:ro
+    networks: [platform]
 
   lgtm:
     image: grafana/otel-lgtm:latest
     ports:
-      - "3000:3000" # Grafana UI
-      - "4317:4317" # OTLP gRPC
-      - "4318:4318" # OTLP HTTP
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
     volumes:
       - ./dev/observability/data:/data
+    networks: [platform]
 
   rustfs:
     image: rustfs/rustfs:latest
@@ -26,12 +81,19 @@ services:
       RUSTFS_ACCESS_KEY: rustfsadmin
       RUSTFS_SECRET_KEY: rustfsadmin
     ports:
-      - "8900:9000" # S3 API
-      - "8901:9001" # Web console
+      - "127.0.0.1:8900:9000"
+      - "127.0.0.1:8901:9001"
     volumes:
       - rustfs-data:/data
     command: --access-key rustfsadmin --secret-key rustfsadmin /data
+    networks: [platform]
+
+networks:
+  platform:
+    internal: false
 
 volumes:
   postgres-data:
+  postgres-config:
+  postgres-socket:
   rustfs-data:

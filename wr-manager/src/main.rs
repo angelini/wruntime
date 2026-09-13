@@ -129,8 +129,7 @@ async fn run_service(config_path: &str) -> Result<()> {
                 "failed to connect to manager database {database_url} while bootstrapping wr_system schema"
             )
         })?;
-        client
-            .batch_execute("CREATE SCHEMA IF NOT EXISTS wr_system")
+        migrate::ensure_system_schema(&client)
             .await
             .with_context(|| format!("failed to create wr_system schema in {database_url}"))?;
     }

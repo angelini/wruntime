@@ -1,6 +1,9 @@
 mod helpers;
 use helpers::{
-    db::{db_state_for_module, require_db_url, skip_without_db, DbHost, PgValue},
+    db::{
+        db_state_for_module, require_db_url, skip_without_db, DbHost, PgValue,
+        PrivateDatabaseFixture,
+    },
     manager::{manager_trio, register_test_module_ready, synced_routing_table},
     proxy::{http_client, proxy_get, start_proxy, TEST_SELF_PEER},
     stubs::spawn_identified_stub,
@@ -8,11 +11,15 @@ use helpers::{
 };
 
 use anyhow::Result;
+use deadpool_postgres::tokio_postgres;
 use http::{Request, StatusCode};
 use http_body_util::Full;
 
+use wr_common::postgres::{
+    PlatformDatabases, PostgresProvisioningLimits, PostgresProvisioningManifest,
+    PostgresProvisioningNamespace, PostgresProvisioningNode,
+};
 use wr_common::wruntime::{EngineRegistration, ModuleDescriptor, RegisterEngineRequest};
-use wr_engine::provisioning::{provision_namespaces, NamespaceProvisioning};
 
 #[tokio::test]
 async fn test_proxy_namespaces_are_isolated() -> Result<()> {
@@ -126,106 +133,103 @@ async fn database_grants_enforce_namespace_not_module_authorization() -> Result<
     if skip_without_db("database_grants_enforce_namespace_not_module_authorization") {
         return Ok(());
     }
-    let url = require_db_url();
-    let admin_pool = wr_engine::pool::build_pool(&url, 4)?;
-    let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let role_one = format!("wr_boundary_one_{suffix}");
-    let role_two = format!("wr_boundary_two_{suffix}");
-    let password_one = format!("one{suffix}");
-    let password_two = format!("two{suffix}");
-    let schema_a = format!("wr__boundary_{suffix}__a");
-    let schema_b = format!("wr__boundary_{suffix}__b");
-    let schema_other = format!("wr__other_{suffix}__c");
-    provision_namespaces(
-        &admin_pool,
-        &[
-            NamespaceProvisioning {
-                namespace: format!("boundary_{suffix}"),
-                role: role_one.clone(),
-                password: password_one.clone(),
-                schemas: vec![schema_a.clone(), schema_b.clone()],
+    use std::str::FromStr as _;
+    let fixture = PrivateDatabaseFixture::create().await?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+    let namespace_one = format!("boundary-{suffix}");
+    let namespace_two = format!("other-{suffix}");
+    let manifest = PostgresProvisioningManifest {
+        format_version: 1,
+        cluster_id: "cluster-a".into(),
+        generation: 1,
+        postgres_major: 18,
+        postgres_ca_sha256: format!("sha256:{}", "a".repeat(64)),
+        ident_map_name: "wruntime_nodes".into(),
+        platform_databases: PlatformDatabases {
+            manager: fixture.platform_database.clone(),
+            job_queues: vec![],
+        },
+        extension_allowlist: vec![],
+        tenant_client_cidrs: vec!["127.0.0.1/32".into()],
+        limits: PostgresProvisioningLimits {
+            namespace_database_connections: 20,
+            runtime_login_connections: 5,
+            readiness_verifier_connections: 1,
+            statement_timeout_ms: 30_000,
+            lock_timeout_ms: 5_000,
+            idle_in_transaction_timeout_ms: 60_000,
+        },
+        nodes: vec![PostgresProvisioningNode {
+            node_id: "node-a".into(),
+            certificate_pem_path: "/unused/test.pem".into(),
+            certificate_sha256: format!("sha256:{}", "b".repeat(64)),
+            certificate_common_name: "wr-db-node-a".into(),
+        }],
+        namespaces: vec![
+            PostgresProvisioningNamespace {
+                namespace: namespace_one.clone(),
+                modules: vec!["a".into(), "b".into()],
             },
-            NamespaceProvisioning {
-                namespace: format!("other_{suffix}"),
-                role: role_two.clone(),
-                password: password_two.clone(),
-                schemas: vec![schema_other.clone()],
+            PostgresProvisioningNamespace {
+                namespace: namespace_two.clone(),
+                modules: vec!["c".into()],
             },
         ],
-    )
-    .await?;
-    let admin = admin_pool.get().await?;
+    };
+    let derived = wr_cli::postgres::converge_sql_state(&require_db_url(), &manifest).await?;
+    let one = &derived[0];
+    let two = &derived[1];
+    let mut admin_config = tokio_postgres::Config::from_str(&require_db_url())?;
+    admin_config.dbname(&one.database);
+    let (admin, driver) = admin_config.connect(tokio_postgres::NoTls).await?;
+    let admin_task = tokio::spawn(driver);
     admin
         .batch_execute(&format!(
-            "CREATE SCHEMA IF NOT EXISTS wr_system; \
-             CREATE TABLE \"{schema_a}\".admin_table (id INT); \
-             CREATE SEQUENCE \"{schema_a}\".admin_sequence; \
-             CREATE FUNCTION \"{schema_a}\".admin_function() RETURNS INT LANGUAGE SQL AS 'SELECT 1'; \
-             CREATE TABLE IF NOT EXISTS wr_system.boundary_secret (id INT)"
+            "CREATE TABLE {}.shared_table (id bigint); CREATE TABLE {}.other_module_table (id bigint)",
+            one.schemas[0], one.schemas[1]
         ))
         .await?;
+    wr_cli::postgres::converge_sql_state(&require_db_url(), &manifest).await?;
 
-    let one_pool = wr_engine::pool::build_guest_pool(&url, &role_one, &password_one, 1)?;
-    let one = one_pool.get().await?;
-    one.batch_execute(&format!("SET search_path = \"{schema_a}\""))
-        .await?;
-    one.batch_execute("CREATE TABLE unqualified_table (id INT)")
-        .await?;
-    assert!(one
-        .query_one(
-            "SELECT to_regclass($1) IS NOT NULL",
-            &[&format!("{schema_a}.unqualified_table")],
-        )
-        .await?
-        .get::<_, bool>(0));
-    one.batch_execute(&format!(
-        "CREATE TABLE \"{schema_b}\".qualified_table (id INT); \
-         SELECT nextval('\"{schema_a}\".admin_sequence'); \
-         SELECT \"{schema_a}\".admin_function(); \
-         SELECT * FROM \"{schema_a}\".admin_table"
-    ))
-    .await?;
-    assert!(one
-        .query("SELECT * FROM wr_system.boundary_secret", &[])
-        .await
-        .is_err());
-    assert!(one
-        .batch_execute("CREATE TABLE wr_system.guest_forbidden (id INT)")
-        .await
-        .is_err());
-    drop(one);
-    drop(one_pool);
-
-    let two_pool = wr_engine::pool::build_guest_pool(&url, &role_two, &password_two, 1)?;
-    let two = two_pool.get().await?;
-    assert!(two
-        .query(&format!("SELECT * FROM \"{schema_a}\".admin_table"), &[])
-        .await
-        .is_err());
-    drop(two);
-    drop(two_pool);
-
-    admin
-        .execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = ANY($1) AND pid <> pg_backend_pid()",
-            &[&vec![role_one.clone(), role_two.clone()]],
-        )
-        .await?;
-    let quoted_database: String = admin
-        .query_one("SELECT quote_ident(current_database())", &[])
+    let mut runtime_config = tokio_postgres::Config::from_str(&require_db_url())?;
+    runtime_config.dbname(&one.database);
+    let (runtime, runtime_driver) = runtime_config.connect(tokio_postgres::NoTls).await?;
+    let runtime_task = tokio::spawn(runtime_driver);
+    let runtime_role: String = runtime
+        .query_one("SELECT quote_ident($1)", &[&one.node_logins[0].runtime])
         .await?
         .get(0);
-    admin
+    runtime
+        .batch_execute(&format!("SET SESSION AUTHORIZATION {runtime_role}"))
+        .await?;
+    runtime
         .batch_execute(&format!(
-            "REVOKE CONNECT ON DATABASE {quoted_database} FROM \"{role_one}\", \"{role_two}\"; \
-             DROP SCHEMA \"{schema_a}\" CASCADE; \
-             DROP SCHEMA \"{schema_b}\" CASCADE; \
-             DROP SCHEMA \"{schema_other}\" CASCADE; \
-             DROP TABLE wr_system.boundary_secret; \
-             DROP ROLE \"{role_one}\"; \
-             DROP ROLE \"{role_two}\""
+            "INSERT INTO {}.shared_table VALUES (1); SELECT * FROM {}.other_module_table",
+            one.schemas[0], one.schemas[1]
         ))
         .await?;
+    assert!(runtime
+        .batch_execute(&format!(
+            "CREATE TABLE {}.forbidden (id bigint)",
+            one.schemas[0]
+        ))
+        .await
+        .is_err());
+    assert!(runtime.batch_execute("SET ROLE postgres").await.is_err());
+
+    let cross_database_connect: bool = admin
+        .query_one(
+            "SELECT has_database_privilege($1,$2,'CONNECT')",
+            &[&one.node_logins[0].runtime, &two.database],
+        )
+        .await?
+        .get(0);
+    assert!(!cross_database_connect);
+    drop(runtime);
+    runtime_task.await??;
+    drop(admin);
+    admin_task.await??;
+    fixture.cleanup(&manifest).await?;
     Ok(())
 }
 

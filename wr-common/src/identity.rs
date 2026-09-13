@@ -79,6 +79,7 @@ pub enum PrincipalKind {
     Manager,
     Proxy,
     NodeAgent,
+    PostgresClient,
 }
 
 impl PrincipalKind {
@@ -89,6 +90,7 @@ impl PrincipalKind {
             Self::Manager => "manager",
             Self::Proxy => "proxy",
             Self::NodeAgent => "node-agent",
+            Self::PostgresClient => "postgres-client",
         }
     }
 }
@@ -103,6 +105,7 @@ impl FromStr for PrincipalKind {
             "manager" => Ok(Self::Manager),
             "proxy" => Ok(Self::Proxy),
             "node-agent" => Ok(Self::NodeAgent),
+            "postgres-client" => Ok(Self::PostgresClient),
             _ => bail!("unsupported principal kind"),
         }
     }

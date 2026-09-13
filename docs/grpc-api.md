@@ -22,7 +22,7 @@ Transitions never move backward. Service-specific route withdrawal, admission cl
 
 | RPC | Request | Response | Description |
 | ----- | --------- | ---------- | ------------- |
-| `RegisterEngine` | `EngineRegistration` | `{ accepted }` | Engine announces itself and its modules; the manager resolves requested secrets and DB credentials, then persists the engine, its schemas, and one initially-unhealthy default routing rule per schema-bearing module in a single transaction; module readiness rows are reset for advertised tuples |
+| `RegisterEngine` | `RegisterEngineRequest` | `RegisterEngineResponse` | Engine announces its exact declared inventory; after the authenticated node and ownership fence pass, the manager resolves requested application secrets and returns deterministic, non-secret namespace access descriptors, then persists the engine, schemas, and initially-unhealthy routes atomically |
 | `DeregisterEngine` | `{ engine_id }` | — | Engine removes itself on shutdown |
 | `Heartbeat` | `{ engine_id, healthy_modules }` | manager/proxy routing versions | Atomically records engine/module readiness and makes only matching routes serving. A draining or deregistered engine is rejected. The manager response identifies the durable routing version; `NodeService` adds the locally installed proxy version and does not acknowledge initial readiness before it converges. Invalid module identities are skipped without starving valid entries. |
 | `BeginEngineDrain` | `{ engine_id }` | manager/proxy routing versions | Idempotently fences later heartbeat publication, makes the engine's routes non-serving without deleting registration, and returns manager/local-proxy convergence evidence. Final deregistration remains separate. |
@@ -268,6 +268,8 @@ Schedule delivery is at least once. Handlers must be idempotent, and `job_type` 
 | `GetSchema` | Retrieve the stored schema bytes |
 
 Schemas are automatically uploaded when engines register; the first occurrence of each unique `(namespace, name, version)` tuple in `engine.toml` supplies `schema_path`.
+
+`RegisterEngineResponse.namespace_access` contains only `namespace`, deterministic private `database`, node-and-namespace-bound `runtime_role`, and node-and-namespace-bound `readiness_role`. It contains no password, provisioning generation, migration digest, or deployment digest. Those expected-state values and the PostgreSQL client certificate remain node-local. The declared `db_namespaces` comparison is an inventory-integrity check; it does not authorize namespace access independently of the authenticated node identity.
 
 ## Secrets
 

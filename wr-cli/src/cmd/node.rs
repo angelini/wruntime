@@ -7,12 +7,16 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use prost::Message;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use wr_common::agent_policy::AGENT_PROTOCOL_VERSION;
 use wr_common::wruntime::{
     AbandonDeploymentRequest, BeginDeploymentRequest, BeginRollbackRequest, DeploymentInventoryV1,
-    ExpectedEngine, ExpectedModule, FinalizeDeploymentRequest, GetNodeCleanupStatusRequest,
-    ModuleIdentity, NodeCleanupState, NodeCleanupSummary, NodeOperationAction,
-    RetryNodeCleanupRequest, RolloutPolicy, SecretRequest, SubmitOperationRequest,
+    DeploymentRecord, ExpectedEngine, ExpectedModule, FinalizeDeploymentRequest,
+    GetNodeCleanupStatusRequest, ModuleIdentity, NodeCleanupState, NodeCleanupSummary,
+    NodeOperationAction, RetryNodeCleanupRequest, RolloutPolicy, SecretRequest,
+    SubmitOperationRequest,
 };
 
 use super::build_helpers::{self, BuildModule};
@@ -22,8 +26,12 @@ use super::bundle_integrity::{
     write_resolved_identity, BundleManifest as Manifest, ManifestEngine, ManifestModule,
     ResolvedReleaseManifest,
 };
-use super::config::{EngineConfig, ProxyConfig};
-use super::deploy_config::{self, DeployConfig, DeployFormat};
+use super::config::{
+    EngineConfig, NamespaceDatabaseExpectation, ProxyConfig, TenantDatabaseConfig,
+};
+use super::deploy_config::{
+    self, DeployConfig, DeployFormat, TenantDeployConfig, TenantDeployOverrides,
+};
 use super::helpers;
 use super::node_backend::{ReleaseMetadata, ReleaseSlot};
 use super::service_gen::{self, DockerfileSpec, ServiceUnit};
@@ -39,6 +47,8 @@ pub struct NodeArgs {
 pub enum NodeCommand {
     /// Build and package a host-agnostic deployment bundle
     Bundle(BundleArgs),
+    /// Reserve manager deployment identity without mutating a worker node.
+    ReserveDeployment(ReserveDeploymentArgs),
     /// Reconcile a remote node to a bundle's complete desired inventory
     Deploy(DeployArgs),
     /// Activate a retained prior bundle revision as a new desired revision
@@ -88,6 +98,43 @@ pub struct BundleArgs {
 }
 
 #[derive(Args)]
+pub struct ReserveDeploymentArgs {
+    /// Stable operator-supplied node identity.
+    #[arg(long)]
+    node_id: String,
+    /// Path to the verified node bundle.
+    bundle: String,
+    /// Remote host in user@host form; contacted read-only to resolve its address.
+    remote: String,
+    #[arg(long)]
+    config: Option<String>,
+    #[arg(long)]
+    format: Option<DeployFormat>,
+    #[arg(long)]
+    db_url: Option<String>,
+    #[arg(long)]
+    ssh_key: Option<String>,
+    #[arg(long)]
+    ssh_port: Option<u16>,
+    #[arg(long)]
+    peer_port: Option<u16>,
+    #[arg(long)]
+    request_token: String,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long)]
+    postgres_client_set: Option<PathBuf>,
+    #[arg(long)]
+    tenant_db_server_name: Option<String>,
+    #[arg(long)]
+    tenant_db_host_addr: Option<String>,
+    #[arg(long)]
+    tenant_db_port: Option<u16>,
+    #[arg(long)]
+    tenant_db_connect_timeout_secs: Option<u64>,
+}
+
+#[derive(Args)]
 pub struct DeployArgs {
     /// Stable operator-supplied node identity
     #[arg(long)]
@@ -117,6 +164,23 @@ pub struct DeployArgs {
     /// mTLS peer listener port (default: 9443)
     #[arg(long)]
     peer_port: Option<u16>,
+    /// Reservation created by `node reserve-deployment` (required for DB bundles).
+    #[arg(long)]
+    reservation: Option<PathBuf>,
+    /// Non-secret state receipt emitted after provision and migration.
+    #[arg(long)]
+    tenant_state_manifest: Option<PathBuf>,
+    /// Dedicated postgres-client credential set; never copied into the release.
+    #[arg(long)]
+    postgres_client_set: Option<PathBuf>,
+    #[arg(long)]
+    tenant_db_server_name: Option<String>,
+    #[arg(long)]
+    tenant_db_host_addr: Option<String>,
+    #[arg(long)]
+    tenant_db_port: Option<u16>,
+    #[arg(long)]
+    tenant_db_connect_timeout_secs: Option<u64>,
     /// Stable idempotency token spanning allocation, staging, and submission.
     #[arg(long)]
     request_token: Option<String>,
@@ -286,6 +350,10 @@ fn verify_bundle(bundle_path: &str, manifest: &Manifest) -> Result<()> {
 pub async fn run(args: NodeArgs, manager: Option<&str>) -> Result<()> {
     match args.command {
         NodeCommand::Bundle(bundle_args) => bundle(bundle_args),
+        NodeCommand::ReserveDeployment(reserve_args) => {
+            let mgr = manager.context("--manager is required for node reserve-deployment")?;
+            reserve_deployment(reserve_args, mgr).await
+        }
         NodeCommand::Deploy(deploy_args) => {
             let mgr =
                 manager.ok_or_else(|| anyhow::anyhow!("--manager is required for node deploy"))?;
@@ -1262,6 +1330,243 @@ fn expected_engines(manifest: &Manifest, host: &str) -> Result<Vec<ExpectedEngin
         .collect()
 }
 
+const RESERVATION_DOMAIN: &[u8] = b"wruntime.node-deployment-reservation.v1\0";
+const INVENTORY_DOMAIN: &[u8] = b"wruntime.deployment-inventory.v1\0";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeDeploymentReservationV1 {
+    pub schema_version: u32,
+    pub manager_endpoint: String,
+    pub node_id: String,
+    pub request_token: String,
+    pub remote_host_ip: String,
+    pub deployment_format: DeployFormat,
+    pub bundle_digest: String,
+    pub canonical_inventory_digest: String,
+    pub allocated_revision: u64,
+    pub operation_id: String,
+    pub revision_digest: String,
+    pub tenant_database: Option<TenantDeployConfig>,
+    pub postgres_client_leaf_fingerprint: Option<String>,
+}
+
+impl NodeDeploymentReservationV1 {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.schema_version == 1,
+            "unsupported deployment reservation schema"
+        );
+        anyhow::ensure!(
+            !self.manager_endpoint.is_empty(),
+            "reservation manager endpoint is empty"
+        );
+        wr_common::identity::NodeId::parse(self.node_id.clone())?;
+        anyhow::ensure!(
+            !self.request_token.is_empty(),
+            "reservation request token is empty"
+        );
+        self.remote_host_ip
+            .parse::<std::net::IpAddr>()
+            .context("reservation remote host is not an IP address")?;
+        anyhow::ensure!(self.allocated_revision > 0, "reservation revision is zero");
+        anyhow::ensure!(
+            wr_common::deployment_contract::deployment_operation_id(&self.revision_digest)?
+                == self.operation_id,
+            "reservation operation ID does not match revision digest"
+        );
+        if let Some(tenant) = &self.tenant_database {
+            tenant.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String> {
+        self.validate()?;
+        let mut hash = Sha256::new();
+        hash.update(RESERVATION_DOMAIN);
+        hash.update(serde_json::to_vec(self)?);
+        Ok(format!("sha256:{:x}", hash.finalize()))
+    }
+
+    pub fn read(path: &Path) -> Result<Self> {
+        let value: Self = serde_json::from_slice(
+            &fs::read(path)
+                .with_context(|| format!("reading deployment reservation {}", path.display()))?,
+        )?;
+        value.validate()?;
+        Ok(value)
+    }
+}
+
+fn begin_deployment_request(
+    node_id: &str,
+    request_token: &str,
+    bundle_digest: &str,
+    inventory: DeploymentInventoryV1,
+) -> BeginDeploymentRequest {
+    BeginDeploymentRequest {
+        node_id: node_id.to_string(),
+        attempt_token: request_token.to_string(),
+        bundle_digest: bundle_digest.to_string(),
+        inventory: Some(inventory),
+    }
+}
+
+fn abandon_deployment_request(node_id: &str, request_token: &str) -> AbandonDeploymentRequest {
+    AbandonDeploymentRequest {
+        node_id: node_id.to_string(),
+        attempt_token: request_token.to_string(),
+    }
+}
+
+struct ReservationDraft {
+    manager_endpoint: String,
+    node_id: String,
+    request_token: String,
+    remote_host_ip: String,
+    deployment_format: DeployFormat,
+    bundle_digest: String,
+    canonical_inventory_digest: String,
+    tenant_database: Option<TenantDeployConfig>,
+    postgres_client_leaf_fingerprint: Option<String>,
+}
+
+fn verified_reservation(
+    draft: ReservationDraft,
+    inventory: &DeploymentInventoryV1,
+    deployment: DeploymentRecord,
+) -> Result<NodeDeploymentReservationV1> {
+    let expected_revision_digest = wr_common::deployment_contract::revision_digest(
+        &draft.node_id,
+        deployment.revision,
+        &draft.bundle_digest,
+        inventory,
+    )?;
+    anyhow::ensure!(
+        deployment.revision_digest == expected_revision_digest,
+        "manager returned an invalid revision digest"
+    );
+    anyhow::ensure!(
+        wr_common::deployment_contract::deployment_operation_id(&expected_revision_digest)?
+            == deployment.operation_id,
+        "manager returned an invalid deployment operation ID"
+    );
+    let reservation = NodeDeploymentReservationV1 {
+        schema_version: 1,
+        manager_endpoint: draft.manager_endpoint,
+        node_id: draft.node_id,
+        request_token: draft.request_token,
+        remote_host_ip: draft.remote_host_ip,
+        deployment_format: draft.deployment_format,
+        bundle_digest: draft.bundle_digest,
+        canonical_inventory_digest: draft.canonical_inventory_digest,
+        allocated_revision: deployment.revision,
+        operation_id: deployment.operation_id,
+        revision_digest: deployment.revision_digest,
+        tenant_database: draft.tenant_database,
+        postgres_client_leaf_fingerprint: draft.postgres_client_leaf_fingerprint,
+    };
+    reservation.validate()?;
+    Ok(reservation)
+}
+
+fn inventory_digest(inventory: &DeploymentInventoryV1) -> Result<String> {
+    let canonical = wr_common::deployment_contract::canonicalize_inventory(inventory.clone())?;
+    let mut bytes = Vec::new();
+    canonical.encode(&mut bytes)?;
+    let mut hash = Sha256::new();
+    hash.update(INVENTORY_DOMAIN);
+    hash.update(bytes);
+    Ok(format!("sha256:{:x}", hash.finalize()))
+}
+
+fn bundle_requires_tenant(manifest: &Manifest) -> bool {
+    manifest
+        .engines
+        .iter()
+        .any(|engine| !engine.db_namespaces.is_empty())
+}
+
+fn tenant_overrides(
+    server_name: Option<String>,
+    host_addr: Option<String>,
+    port: Option<u16>,
+    connect_timeout_secs: Option<u64>,
+) -> TenantDeployOverrides {
+    TenantDeployOverrides {
+        server_name,
+        host_addr,
+        port,
+        connect_timeout_secs,
+    }
+}
+
+fn require_tenant_config(
+    required: bool,
+    resolved: Option<TenantDeployConfig>,
+) -> Result<Option<TenantDeployConfig>> {
+    if required {
+        resolved
+            .map(Some)
+            .context("database-enabled bundles require tenant database deployment settings")
+    } else {
+        Ok(resolved)
+    }
+}
+
+fn postgres_client_fingerprint(path: &Path, node_id: &str) -> Result<String> {
+    let metadata = super::cert::verify_credential_set(path)
+        .context("validating dedicated postgres-client credential set")?;
+    anyhow::ensure!(
+        metadata.profile == "postgres-client",
+        "credential set is not postgres-client"
+    );
+    let expected = wr_common::identity::PrincipalUri::new(
+        wr_common::identity::ClusterId::parse(
+            metadata
+                .subject
+                .split(':')
+                .nth(2)
+                .context("postgres-client subject omitted cluster")?
+                .to_string(),
+        )?,
+        wr_common::identity::PrincipalKind::PostgresClient,
+        wr_common::identity::PrincipalName::parse(node_id.to_string())?,
+    )
+    .to_string();
+    anyhow::ensure!(
+        metadata.subject == expected,
+        "postgres-client identity is bound to another node"
+    );
+    Ok(metadata.leaf_fingerprint)
+}
+
+fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let parent = path.parent().context("output path requires a parent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".{}.{}",
+        path.file_name()
+            .context("output path requires a name")?
+            .to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
+    fs::rename(&temporary, path)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 struct ResolvedStage {
     root: PathBuf,
     archive: PathBuf,
@@ -1283,10 +1588,16 @@ fn resolved_stage_root() -> PathBuf {
     ))
 }
 
-fn node_tls_profiles(requires_job_admin_tls: bool) -> Vec<&'static str> {
+fn node_tls_profiles(
+    requires_job_admin_tls: bool,
+    requires_postgres_client: bool,
+) -> Vec<&'static str> {
     let mut profiles = vec!["proxy-endpoint", "proxy-client"];
     if requires_job_admin_tls {
         profiles.push("engine-admin-endpoint");
+    }
+    if requires_postgres_client {
+        profiles.push("postgres-client");
     }
     profiles
 }
@@ -1313,6 +1624,8 @@ fn provision_node_tls(
     ssh_key: Option<&str>,
     ssh_port: Option<u16>,
     requires_job_admin_tls: bool,
+    postgres_client_set: Option<&Path>,
+    node_id: &str,
 ) -> Result<()> {
     for (local, remote_path) in [
         (
@@ -1335,9 +1648,15 @@ fn provision_node_tls(
             None,
         )?;
     }
-    let profiles = node_tls_profiles(requires_job_admin_tls);
+    let profiles = node_tls_profiles(requires_job_admin_tls, postgres_client_set.is_some());
     for profile in &profiles {
-        let local = PathBuf::from(format!("{cert_dir}/{profile}"));
+        let local = if *profile == "postgres-client" {
+            let path = postgres_client_set.context("postgres-client credential set is required")?;
+            let _ = postgres_client_fingerprint(path, node_id)?;
+            path.to_path_buf()
+        } else {
+            PathBuf::from(format!("{cert_dir}/{profile}"))
+        };
         let digest = helpers::local_tree_digest(&local)?;
         helpers::install_remote_directory(
             &local,
@@ -1370,6 +1689,7 @@ fn materialize_resolved_release(
     peer_port: u16,
     remote: &str,
     host_ip: &str,
+    tenant_state: Option<(&TenantDeployConfig, &crate::postgres::TenantStateReceiptV1)>,
 ) -> Result<ResolvedStage> {
     anyhow::ensure!(
         wr_common::deployment_contract::deployment_operation_id(revision_digest)? == operation_id,
@@ -1396,9 +1716,74 @@ fn materialize_resolved_release(
     vars.insert("bundle_digest", manifest.bundle_digest.as_str());
     vars.insert("operation_id", operation_id);
     vars.insert("revision_digest", revision_digest);
+    let mut resolved_configs = Vec::with_capacity(configs.len());
     for (name, template) in configs {
         let resolved = helpers::resolve_template(template, &vars)
             .with_context(|| format!("failed to resolve template in {name}"))?;
+        resolved_configs.push((name.clone(), resolved));
+    }
+    if let Some((tenant_endpoint, receipt)) = tenant_state {
+        let mut engine_positions = Vec::new();
+        let mut engines = Vec::new();
+        for (position, (name, text)) in resolved_configs.iter().enumerate() {
+            if name == "proxy.toml" {
+                continue;
+            }
+            let parseable = text.replace(
+                &format!("revision = {revision}"),
+                &format!("revision = \"{revision}\""),
+            );
+            let mut engine: EngineConfig = toml::from_str(&parseable)
+                .with_context(|| format!("failed to parse resolved engine config {name}"))?;
+            let namespaces = engine
+                .modules
+                .iter()
+                .filter(|module| module.database)
+                .map(|module| module.namespace.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            if !namespaces.is_empty() {
+                let database = engine
+                    .database
+                    .as_mut()
+                    .context("database-enabled engine lacks platform [database] configuration")?;
+                database.tenant = Some(TenantDatabaseConfig {
+                    server_name: tenant_endpoint.server_name.clone(),
+                    host_addr: tenant_endpoint.host_addr.clone(),
+                    port: tenant_endpoint.port,
+                    trust_root_path: "/etc/wruntime/pki/postgres-client/sets/v1/chain.pem".into(),
+                    client_cert_path: "/etc/wruntime/pki/postgres-client/sets/v1/leaf.pem".into(),
+                    client_key_path: "/etc/wruntime/pki/postgres-client/sets/v1/key.pem".into(),
+                    connect_timeout_secs: tenant_endpoint.connect_timeout_secs,
+                    expected_namespaces: namespaces
+                        .into_iter()
+                        .map(|namespace| NamespaceDatabaseExpectation {
+                            namespace,
+                            generation: receipt.provision_generation,
+                            deployment_digest: revision_digest.to_string(),
+                            bundle_digest: receipt.migration_bundle_digest.clone(),
+                            migrations: Vec::new(),
+                        })
+                        .collect(),
+                });
+            }
+            engine_positions.push(position);
+            engines.push(engine);
+        }
+        EngineConfig::populate_receipt_tenant_expectations(
+            &mut engines,
+            revision_digest,
+            &receipt.migration_bundle_digest,
+            Some(receipt.provision_generation),
+            &receipt.successful_migrations,
+        )?;
+        for (position, engine) in engine_positions.into_iter().zip(engines) {
+            resolved_configs[position].1 = engine.to_toml()?.replace(
+                &format!("revision = \"{revision}\""),
+                &format!("revision = {revision}"),
+            );
+        }
+    }
+    for (name, resolved) in resolved_configs {
         std::fs::write(release.join("config").join(name), resolved)?;
     }
     let run_user = helpers::extract_remote_user(remote).unwrap_or("root");
@@ -1607,6 +1992,188 @@ fn rollback_request(
     }
 }
 
+fn capture_bundle_migrations(
+    bundle_path: &str,
+    configs: &[(String, String)],
+    deployment_digest: &str,
+) -> Result<wr_common::migration_bundle::MigrationBundle> {
+    let extraction = tempfile::tempdir()?;
+    let decoder = flate2::read::GzDecoder::new(fs::File::open(bundle_path)?);
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(extraction.path())?;
+    let migration_root = extraction.path().join("wr-node/migrations");
+    let parsed = configs
+        .iter()
+        .filter(|(name, _)| name != "proxy.toml")
+        .map(|(_, text)| {
+            toml::from_str::<EngineConfig>(
+                &text.replace("revision = {revision}", "revision = \"1\""),
+            )
+            .context("parsing bundled engine config")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut sources = BTreeMap::new();
+    for module in parsed
+        .iter()
+        .flat_map(|config| &config.modules)
+        .filter(|module| module.database && module.migrations_path.is_some())
+    {
+        sources.insert(
+            (module.namespace.clone(), module.name.clone()),
+            migration_root.join(&module.name),
+        );
+    }
+    let sources = sources
+        .into_iter()
+        .map(|((namespace, module), path)| (namespace, module, path))
+        .collect::<Vec<_>>();
+    wr_common::migration_bundle::MigrationBundleManifest::capture_sources(
+        deployment_digest.to_string(),
+        wr_common::migration_bundle::MigrationLimits {
+            max_migrations_per_namespace: 1_024,
+            max_file_bytes: 2 * 1024 * 1024,
+            max_startup_bytes: 64 * 1024 * 1024,
+            file_deadline_ms: 30_000,
+            cancellation_grace_ms: 5_000,
+        },
+        &sources,
+    )
+}
+
+async fn reserve_deployment(args: ReserveDeploymentArgs, manager: &str) -> Result<()> {
+    anyhow::ensure!(
+        Path::new(&args.bundle).is_file(),
+        "Bundle not found: {}",
+        args.bundle
+    );
+    anyhow::ensure!(!args.output.exists(), "reservation output already exists");
+    let deploy_cfg = DeployConfig::load_or_discover(args.config.as_deref())?;
+    let format = deploy_config::resolve_format(args.format, deploy_cfg.format);
+    // Resolve platform configuration here as deploy does, but never persist its potentially
+    // credential-bearing value in the non-secret reservation.
+    let _platform_db_url = deploy_config::resolve_required(
+        args.db_url,
+        deploy_cfg.db_url.clone(),
+        "WR_DB_URL",
+        "db_url",
+    )?;
+    let ssh_key = deploy_config::resolve_string(args.ssh_key, deploy_cfg.ssh_key, "WR_SSH_KEY");
+    let ssh_port = deploy_config::resolve_ssh_port(args.ssh_port, deploy_cfg.ssh_port)?
+        .map(helpers::DeployPort::get);
+    let peer_port = deploy_config::resolve_peer_port(args.peer_port, deploy_cfg.peer_port)?.get();
+    let manifest: Manifest = bundle::read_manifest(&args.bundle)?;
+    verify_bundle(&args.bundle, &manifest)?;
+    validate_remote_workdir(&manifest.workdir)?;
+    let configs = bundle::read_configs_from_tarball(&args.bundle)?;
+    validate_deploy_listener_ports(&configs, peer_port)?;
+    let tenant_database = require_tenant_config(
+        bundle_requires_tenant(&manifest),
+        deploy_config::resolve_tenant_database(
+            tenant_overrides(
+                args.tenant_db_server_name,
+                args.tenant_db_host_addr,
+                args.tenant_db_port,
+                args.tenant_db_connect_timeout_secs,
+            ),
+            deploy_cfg.tenant_database,
+        )?,
+    )?;
+    let postgres_client_leaf_fingerprint = bundle_requires_tenant(&manifest)
+        .then(|| {
+            postgres_client_fingerprint(
+                args.postgres_client_set
+                    .as_deref()
+                    .context("database-enabled reservation requires --postgres-client-set")?,
+                &args.node_id,
+            )
+        })
+        .transpose()?;
+    let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
+    let host_ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
+    let inventory = DeploymentInventoryV1 {
+        schema_version: 1,
+        engines: expected_engines(&manifest, &host_ip)?,
+    };
+    let inventory = wr_common::deployment_contract::canonicalize_inventory(inventory)?;
+    let canonical_inventory_digest = inventory_digest(&inventory)?;
+    let deployment = client::connect_operator(
+        manager,
+        wr_common::manager_client::RetryClass::DurableCreate,
+    )
+    .await?
+    .begin_deployment(begin_deployment_request(
+        &args.node_id,
+        &args.request_token,
+        &manifest.bundle_digest,
+        inventory.clone(),
+    ))
+    .await?
+    .into_inner()
+    .deployment
+    .context("manager returned no deployment record")?;
+    // Manager identity is fully verified before creating the local output stage. A malformed
+    // response therefore cannot leave a reservation or invoke any worker-side helper.
+    let reservation = verified_reservation(
+        ReservationDraft {
+            manager_endpoint: manager.to_string(),
+            node_id: args.node_id,
+            request_token: args.request_token,
+            remote_host_ip: host_ip,
+            deployment_format: format,
+            bundle_digest: manifest.bundle_digest.clone(),
+            canonical_inventory_digest,
+            tenant_database,
+            postgres_client_leaf_fingerprint,
+        },
+        &inventory,
+        deployment,
+    )?;
+
+    let parent = args.output.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let stage = parent.join(format!(".reservation-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&stage)?;
+    let result = (|| -> Result<()> {
+        let migration_root = stage.join("migrations");
+        fs::create_dir(&migration_root)?;
+        // Use the same engine-config discovery and authenticated archive capture as deploy
+        // materialization. Engine config filenames are arbitrary; only proxy.toml is special.
+        let migration_bundle =
+            capture_bundle_migrations(&args.bundle, &configs, &reservation.revision_digest)?;
+        for file in &migration_bundle.files {
+            let path = migration_root
+                .join(&file.manifest.namespace)
+                .join(&file.manifest.module)
+                .join(&file.manifest.filename);
+            fs::create_dir_all(path.parent().expect("migration path has parent"))?;
+            atomic_write(&path, &file.bytes, 0o644)?;
+        }
+        atomic_write(
+            &stage.join("reservation.json"),
+            &serde_json::to_vec_pretty(&reservation)?,
+            0o644,
+        )?;
+        atomic_write(
+            &stage.join("migration-bundle.json"),
+            &serde_json::to_vec_pretty(&migration_bundle.manifest)?,
+            0o644,
+        )?;
+        fs::rename(&stage, &args.output)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&stage);
+    }
+    result?;
+    println!(
+        "Reserved deployment revision {} at {}",
+        reservation.allocated_revision,
+        args.output.display()
+    );
+    Ok(())
+}
+
 async fn durable_deploy(args: DeployArgs, manager: &str) -> Result<()> {
     anyhow::ensure!(
         Path::new(&args.bundle).is_file(),
@@ -1632,9 +2199,57 @@ async fn durable_deploy(args: DeployArgs, manager: &str) -> Result<()> {
     validate_remote_workdir(&manifest.workdir)?;
     let configs = bundle::read_configs_from_tarball(&args.bundle)?;
     validate_deploy_listener_ports(&configs, peer_port)?;
-    let token = args
-        .request_token
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let requires_tenant = bundle_requires_tenant(&manifest);
+    let tenant_database = require_tenant_config(
+        requires_tenant,
+        deploy_config::resolve_tenant_database(
+            tenant_overrides(
+                args.tenant_db_server_name,
+                args.tenant_db_host_addr,
+                args.tenant_db_port,
+                args.tenant_db_connect_timeout_secs,
+            ),
+            deploy_cfg.tenant_database,
+        )?,
+    )?;
+    let reservation = args
+        .reservation
+        .as_deref()
+        .map(NodeDeploymentReservationV1::read)
+        .transpose()?;
+    let tenant_receipt = args
+        .tenant_state_manifest
+        .as_deref()
+        .map(crate::postgres::TenantStateReceiptV1::read)
+        .transpose()?;
+    if requires_tenant {
+        anyhow::ensure!(reservation.is_some(), "database-enabled bundle requires --reservation; run `wr-cli node reserve-deployment` first");
+        anyhow::ensure!(
+            tenant_receipt.is_some(),
+            "database-enabled bundle requires --tenant-state-manifest"
+        );
+        anyhow::ensure!(
+            args.postgres_client_set.is_some(),
+            "database-enabled bundle requires --postgres-client-set"
+        );
+    } else {
+        anyhow::ensure!(
+            reservation.is_none() && tenant_receipt.is_none() && args.postgres_client_set.is_none(),
+            "tenant deployment inputs are invalid for a database-free bundle"
+        );
+    }
+    let token = if let Some(reservation) = &reservation {
+        if let Some(token) = args.request_token.as_deref() {
+            anyhow::ensure!(
+                token == reservation.request_token,
+                "request token differs from reservation"
+            );
+        }
+        reservation.request_token.clone()
+    } else {
+        args.request_token
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+    };
     println!("Request token: {token}");
     println!("Bundle digest: {}", manifest.bundle_digest);
     println!(
@@ -1648,24 +2263,105 @@ async fn durable_deploy(args: DeployArgs, manager: &str) -> Result<()> {
     );
     let ssh_base = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
     let host_ip = helpers::resolve_remote_ip(&ssh_base, &args.remote)?;
+    let inventory =
+        wr_common::deployment_contract::canonicalize_inventory(DeploymentInventoryV1 {
+            schema_version: 1,
+            engines: expected_engines(&manifest, &host_ip)?,
+        })?;
+    let inventory_identity = inventory_digest(&inventory)?;
+    if let Some(reservation) = &reservation {
+        anyhow::ensure!(
+            reservation.manager_endpoint == manager,
+            "manager endpoint differs from reservation"
+        );
+        anyhow::ensure!(
+            reservation.node_id == args.node_id,
+            "node ID differs from reservation"
+        );
+        anyhow::ensure!(
+            reservation.remote_host_ip == host_ip,
+            "resolved remote host differs from reservation"
+        );
+        anyhow::ensure!(
+            reservation.deployment_format == format,
+            "deployment format differs from reservation"
+        );
+        anyhow::ensure!(
+            reservation.bundle_digest == manifest.bundle_digest,
+            "bundle differs from reservation"
+        );
+        anyhow::ensure!(
+            reservation.canonical_inventory_digest == inventory_identity,
+            "deployment inventory differs from reservation"
+        );
+        anyhow::ensure!(
+            reservation.tenant_database == tenant_database,
+            "tenant endpoint differs from reservation"
+        );
+        let fingerprint = postgres_client_fingerprint(
+            args.postgres_client_set.as_deref().expect("required above"),
+            &args.node_id,
+        )?;
+        anyhow::ensure!(
+            reservation.postgres_client_leaf_fingerprint.as_deref() == Some(fingerprint.as_str()),
+            "postgres-client set differs from reservation"
+        );
+        let receipt = tenant_receipt.as_ref().expect("required above");
+        anyhow::ensure!(
+            receipt.reservation == *reservation,
+            "tenant state receipt is for another reservation"
+        );
+        anyhow::ensure!(
+            receipt.reservation_digest == reservation.digest()?,
+            "tenant state receipt binding is invalid"
+        );
+        let captured =
+            capture_bundle_migrations(&args.bundle, &configs, &reservation.revision_digest)?;
+        anyhow::ensure!(
+            receipt.migration_bundle_digest == captured.manifest.bundle_digest
+                && receipt.successful_migrations == captured.manifest.files,
+            "tenant state migration inventory differs from the node bundle"
+        );
+    }
     let deployment = client::connect_operator(
         manager,
         wr_common::manager_client::RetryClass::DurableCreate,
     )
     .await?
-    .begin_deployment(BeginDeploymentRequest {
-        node_id: args.node_id.clone(),
-        attempt_token: token.clone(),
-        bundle_digest: manifest.bundle_digest.clone(),
-        inventory: Some(DeploymentInventoryV1 {
-            schema_version: 1,
-            engines: expected_engines(&manifest, &host_ip)?,
-        }),
-    })
+    .begin_deployment(begin_deployment_request(
+        &args.node_id,
+        &token,
+        &manifest.bundle_digest,
+        inventory.clone(),
+    ))
     .await?
     .into_inner()
     .deployment
     .context("manager returned no deployment record")?;
+    let computed_revision = wr_common::deployment_contract::revision_digest(
+        &args.node_id,
+        deployment.revision,
+        &manifest.bundle_digest,
+        &inventory,
+    )?;
+    anyhow::ensure!(
+        computed_revision == deployment.revision_digest,
+        "manager returned an invalid revision digest"
+    );
+    anyhow::ensure!(
+        wr_common::deployment_contract::deployment_operation_id(&computed_revision)?
+            == deployment.operation_id,
+        "manager returned an invalid operation ID"
+    );
+    if let Some(reservation) = &reservation {
+        anyhow::ensure!(
+            deployment.revision == reservation.allocated_revision
+                && deployment.operation_id == reservation.operation_id
+                && deployment.revision_digest == reservation.revision_digest,
+            "manager replay differs from reservation"
+        );
+    }
+    // Every reservation/receipt/credential mismatch above occurs before this first worker mutation.
     provision_node_tls(
         &cert_dir,
         &args.remote,
@@ -1674,6 +2370,8 @@ async fn durable_deploy(args: DeployArgs, manager: &str) -> Result<()> {
         configs
             .iter()
             .any(|(_, config)| config.contains("[job_admin]")),
+        args.postgres_client_set.as_deref(),
+        &args.node_id,
     )?;
     let stage = materialize_resolved_release(
         &args.bundle,
@@ -1688,6 +2386,7 @@ async fn durable_deploy(args: DeployArgs, manager: &str) -> Result<()> {
         peer_port,
         &args.remote,
         &host_ip,
+        tenant_database.as_ref().zip(tenant_receipt.as_ref()),
     )?;
     println!("Resolved release digest: {}", stage.digest);
     finalize_remote_release(
@@ -1771,10 +2470,10 @@ async fn abandon(args: AbandonArgs, manager: &str) -> Result<()> {
         wr_common::manager_client::RetryClass::NoReplayMutation,
     )
     .await?
-    .abandon_deployment(AbandonDeploymentRequest {
-        node_id: args.node_id,
-        attempt_token: args.request_token,
-    })
+    .abandon_deployment(abandon_deployment_request(
+        &args.node_id,
+        &args.request_token,
+    ))
     .await?
     .into_inner();
     let deployment = response
@@ -2111,7 +2810,7 @@ mod tests {
 
     #[test]
     fn node_tls_access_keeps_credentials_root_owned_and_workload_group_readable() {
-        let profiles = node_tls_profiles(true);
+        let profiles = node_tls_profiles(true, true);
         let command = node_tls_runtime_access_command(&profiles, "wruntime");
         assert!(command.contains("chown 'root:wruntime'"));
         assert!(command.contains("chmod 0750"));
@@ -2121,7 +2820,7 @@ mod tests {
             assert!(command.contains(&format!("/etc/wruntime/pki/{profile}/sets/v1")));
         }
 
-        let command = node_tls_runtime_access_command(&node_tls_profiles(false), "wruntime");
+        let command = node_tls_runtime_access_command(&node_tls_profiles(false, false), "wruntime");
         assert!(!command.contains("engine-admin-endpoint"));
     }
 
@@ -2158,6 +2857,14 @@ mod tests {
     }
 
     fn assemble_production_fixture(root: &Path, output: &Path) -> Result<ProductionBundleOutputs> {
+        assemble_production_fixture_with_names(root, output, false)
+    }
+
+    fn assemble_production_fixture_with_names(
+        root: &Path,
+        output: &Path,
+        arbitrary_multi_engine_names: bool,
+    ) -> Result<ProductionBundleOutputs> {
         let binaries = root.join("bin");
         fs::create_dir_all(&binaries)?;
         for name in ["wr-proxy", "wr-engine", "wr-cli"] {
@@ -2200,13 +2907,26 @@ namespace = "store"
 version = "1.0.0"
 wasm_path = {wasm:?}
 schema_path = {schema:?}
+database = true
 migrations_path = {migrations:?}
 "#,
             wasm = wasm.to_string_lossy(),
             schema = schema.to_string_lossy(),
             migrations = migrations.to_string_lossy(),
         ))?;
-        let engine_configs = vec![("blue.toml".to_string(), engine)];
+        let engine_configs = if arbitrary_multi_engine_names {
+            let mut ledger = engine.clone();
+            ledger.listen_address = "127.0.0.1:9101".into();
+            let job_admin = ledger.job_admin.as_mut().expect("fixture job admin");
+            job_admin.listen_address = "0.0.0.0:9151".into();
+            job_admin.advertise_address = "https://127.0.0.1:9151/".into();
+            vec![
+                ("exchange.toml".to_string(), engine),
+                ("ledger.toml".to_string(), ledger),
+            ]
+        } else {
+            vec![("blue.toml".to_string(), engine)]
+        };
         let manifest = assemble_node_bundle(NodeBundleAssembly {
             output,
             target: "x86_64-unknown-linux-gnu",
@@ -2224,6 +2944,16 @@ migrations_path = {migrations:?}
             &manifest,
         )?;
         let archive_path = output.to_str().context("fixture path is not UTF-8")?;
+        let engine_config_path = if arbitrary_multi_engine_names {
+            "wr-node/config/exchange.toml"
+        } else {
+            "wr-node/config/engine.toml"
+        };
+        let engine_unit_path = if arbitrary_multi_engine_names {
+            "wr-node/systemd/wr-engine-exchange.service"
+        } else {
+            "wr-node/systemd/wr-engine-blue.service"
+        };
         for required in [
             "wr-node/bin/wr-proxy",
             "wr-node/bin/wr-engine",
@@ -2231,13 +2961,13 @@ migrations_path = {migrations:?}
             "wr-node/agent/protocol-version",
             "wr-node/agent/wr-node-agent.service",
             "wr-node/config/proxy.toml",
-            "wr-node/config/engine.toml",
+            engine_config_path,
             "wr-node/modules/inventory.wasm",
             "wr-node/modules/inventory.cwasm",
             "wr-node/schemas/inventory.binpb",
             "wr-node/migrations/inventory/V1__fixture.sql",
             "wr-node/systemd/wr-proxy.service",
-            "wr-node/systemd/wr-engine-blue.service",
+            engine_unit_path,
             "wr-node/docker/docker-compose.yml",
             "wr-node/release-metadata.json",
             "wr-node/manifest.json",
@@ -2251,10 +2981,7 @@ migrations_path = {migrations:?}
                 archive_path,
                 "wr-node/config/proxy.toml",
             )?,
-            engine_config: bundle::read_bytes_from_tarball(
-                archive_path,
-                "wr-node/config/engine.toml",
-            )?,
+            engine_config: bundle::read_bytes_from_tarball(archive_path, engine_config_path)?,
             agent_unit: bundle::read_bytes_from_tarball(
                 archive_path,
                 "wr-node/agent/wr-node-agent.service",
@@ -2303,6 +3030,31 @@ migrations_path = {migrations:?}
     }
 
     #[test]
+    fn reservation_capture_discovers_arbitrary_multi_engine_filenames() {
+        let root = std::env::temp_dir().join(format!(
+            "wr-reservation-config-discovery-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let bundle_path = root.join("node.tar.gz");
+        assemble_production_fixture_with_names(&root, &bundle_path, true).unwrap();
+        let bundle_path = bundle_path.to_str().unwrap();
+        let configs = bundle::read_configs_from_tarball(bundle_path).unwrap();
+        assert!(configs.iter().any(|(name, _)| name == "exchange.toml"));
+        assert!(configs.iter().any(|(name, _)| name == "ledger.toml"));
+        assert!(configs
+            .iter()
+            .all(|(name, _)| name == "proxy.toml" || !name.contains("engine")));
+        let revision_digest = format!("sha256:{}", "a".repeat(64));
+        let captured = capture_bundle_migrations(bundle_path, &configs, &revision_digest).unwrap();
+        assert_eq!(captured.manifest.deployment_digest, revision_digest);
+        assert_eq!(captured.manifest.files.len(), 1);
+        assert_eq!(captured.manifest.files[0].module, "inventory");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn resolved_release_materialization_binds_operation_and_revision_identity() {
         let root = std::env::temp_dir().join(format!(
             "wr-resolved-release-identity-{}-{}",
@@ -2332,6 +3084,7 @@ migrations_path = {migrations:?}
             9443,
             "deploy@example.test",
             "192.0.2.10",
+            None,
         )
         .unwrap();
         let engine = fs::read_to_string(stage.root.join("wr-node/config/engine.toml")).unwrap();
@@ -2372,6 +3125,7 @@ migrations_path = {migrations:?}
             9443,
             "deploy@example.test",
             "192.0.2.10",
+            None,
         )
         .err()
         .expect("mismatched operation identity must fail");
@@ -2394,10 +3148,268 @@ migrations_path = {migrations:?}
             9443,
             "deploy@example.test",
             "192.0.2.10",
+            None,
         )
         .unwrap();
         assert_ne!(stage.digest, other.digest);
         drop((stage, other));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reservation_digest_is_canonical_and_binds_tenant_endpoint() {
+        let revision_digest = format!("sha256:{}", "a".repeat(64));
+        let mut reservation = NodeDeploymentReservationV1 {
+            schema_version: 1,
+            manager_endpoint: "https://manager.internal:9000".into(),
+            node_id: "node-a".into(),
+            request_token: "token-a".into(),
+            remote_host_ip: "10.0.0.9".into(),
+            deployment_format: DeployFormat::Systemd,
+            bundle_digest: format!("sha256:{}", "b".repeat(64)),
+            canonical_inventory_digest: format!("sha256:{}", "c".repeat(64)),
+            allocated_revision: 7,
+            operation_id: wr_common::deployment_contract::deployment_operation_id(&revision_digest)
+                .unwrap(),
+            revision_digest,
+            tenant_database: Some(TenantDeployConfig {
+                server_name: "postgres.internal".into(),
+                host_addr: Some("10.0.0.15".into()),
+                port: 5432,
+                connect_timeout_secs: 10,
+            }),
+            postgres_client_leaf_fingerprint: Some(format!("sha256:{}", "d".repeat(64))),
+        };
+        let digest = reservation.digest().unwrap();
+        assert_eq!(
+            reservation,
+            serde_json::from_slice::<NodeDeploymentReservationV1>(
+                &serde_json::to_vec(&reservation).unwrap()
+            )
+            .unwrap()
+        );
+        reservation.tenant_database.as_mut().unwrap().port = 6432;
+        assert_ne!(digest, reservation.digest().unwrap());
+        let mut encoded = serde_json::to_value(&reservation).unwrap();
+        encoded["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<NodeDeploymentReservationV1>(encoded).is_err());
+    }
+
+    #[test]
+    fn reserve_command_has_no_worker_mutation_calls() {
+        let source = include_str!("node.rs");
+        let reserve = source
+            .split("async fn reserve_deployment")
+            .nth(1)
+            .unwrap()
+            .split("async fn durable_deploy")
+            .next()
+            .unwrap();
+        assert!(
+            reserve.contains("resolve_remote_ip"),
+            "reserve must retain read-only host resolution"
+        );
+        assert!(
+            reserve.find("verified_reservation(").unwrap()
+                < reserve.find("fs::create_dir_all(parent)").unwrap(),
+            "manager digest verification must precede reservation output staging"
+        );
+        for forbidden in [
+            "provision_node_tls(",
+            "materialize_resolved_release(",
+            "finalize_deployment(",
+            "submit_operation(",
+            "run_ssh(",
+            "run_scp(",
+        ] {
+            assert!(
+                !reserve.contains(forbidden),
+                "reserve called worker mutation helper {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn reservation_replay_is_identical_verified_before_output_and_abandon_is_exact() {
+        let inventory = DeploymentInventoryV1 {
+            schema_version: 1,
+            engines: vec![],
+        };
+        let bundle_digest = format!("sha256:{}", "b".repeat(64));
+        let first =
+            begin_deployment_request("node-a", "prepare-7", &bundle_digest, inventory.clone());
+        let replay =
+            begin_deployment_request("node-a", "prepare-7", &bundle_digest, inventory.clone());
+        assert_eq!(
+            first, replay,
+            "idempotent replay must be byte-for-byte identical"
+        );
+        let revision_digest = wr_common::deployment_contract::revision_digest(
+            "node-a",
+            7,
+            &bundle_digest,
+            &inventory,
+        )
+        .unwrap();
+        let deployment = DeploymentRecord {
+            node_id: "node-a".into(),
+            revision: 7,
+            attempt_token: "prepare-7".into(),
+            bundle_digest: bundle_digest.clone(),
+            inventory: Some(inventory.clone()),
+            revision_digest: revision_digest.clone(),
+            operation_id: wr_common::deployment_contract::deployment_operation_id(&revision_digest)
+                .unwrap(),
+            ..DeploymentRecord::default()
+        };
+        let inventory_identity = inventory_digest(&inventory).unwrap();
+        let reservation = verified_reservation(
+            ReservationDraft {
+                manager_endpoint: "https://manager.internal:9000".into(),
+                node_id: "node-a".into(),
+                request_token: "prepare-7".into(),
+                remote_host_ip: "10.0.0.4".into(),
+                deployment_format: DeployFormat::Systemd,
+                bundle_digest: bundle_digest.clone(),
+                canonical_inventory_digest: inventory_identity.clone(),
+                tenant_database: None,
+                postgres_client_leaf_fingerprint: None,
+            },
+            &inventory,
+            deployment.clone(),
+        )
+        .unwrap();
+        let replay_reservation = verified_reservation(
+            ReservationDraft {
+                manager_endpoint: "https://manager.internal:9000".into(),
+                node_id: "node-a".into(),
+                request_token: "prepare-7".into(),
+                remote_host_ip: "10.0.0.4".into(),
+                deployment_format: DeployFormat::Systemd,
+                bundle_digest: bundle_digest.clone(),
+                canonical_inventory_digest: inventory_identity,
+                tenant_database: None,
+                postgres_client_leaf_fingerprint: None,
+            },
+            &inventory,
+            deployment.clone(),
+        )
+        .unwrap();
+        assert_eq!(reservation, replay_reservation);
+
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("reservation");
+        let mut malformed = deployment;
+        malformed.revision_digest = format!("sha256:{}", "c".repeat(64));
+        assert!(verified_reservation(
+            ReservationDraft {
+                manager_endpoint: "https://manager.internal:9000".into(),
+                node_id: "node-a".into(),
+                request_token: "prepare-7".into(),
+                remote_host_ip: "10.0.0.4".into(),
+                deployment_format: DeployFormat::Systemd,
+                bundle_digest,
+                canonical_inventory_digest: format!("sha256:{}", "d".repeat(64)),
+                tenant_database: None,
+                postgres_client_leaf_fingerprint: None,
+            },
+            &inventory,
+            malformed,
+        )
+        .is_err());
+        assert!(
+            !output.exists(),
+            "invalid manager identity must precede local output or worker work"
+        );
+
+        let abandon = abandon_deployment_request("node-a", "prepare-7");
+        assert_eq!(abandon.node_id, "node-a");
+        assert_eq!(abandon.attempt_token, "prepare-7");
+    }
+
+    #[test]
+    fn receipt_backed_materialization_keeps_platform_and_tenant_database_distinct() {
+        let root = std::env::temp_dir().join(format!(
+            "wr-tenant-materialization-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let bundle_path = root.join("node.tar.gz");
+        assemble_production_fixture(&root, &bundle_path).unwrap();
+        let bundle_path = bundle_path.to_str().unwrap();
+        let manifest: Manifest = bundle::read_manifest(bundle_path).unwrap();
+        let configs = bundle::read_configs_from_tarball(bundle_path).unwrap();
+        let revision_digest = format!("sha256:{}", "a".repeat(64));
+        let operation_id =
+            wr_common::deployment_contract::deployment_operation_id(&revision_digest).unwrap();
+        let migration = capture_bundle_migrations(bundle_path, &configs, &revision_digest).unwrap();
+        let reservation = NodeDeploymentReservationV1 {
+            schema_version: 1,
+            manager_endpoint: "https://manager.internal:9000".into(),
+            node_id: "node-a".into(),
+            request_token: "token-a".into(),
+            remote_host_ip: "192.0.2.10".into(),
+            deployment_format: DeployFormat::Systemd,
+            bundle_digest: manifest.bundle_digest.clone(),
+            canonical_inventory_digest: format!("sha256:{}", "c".repeat(64)),
+            allocated_revision: 7,
+            operation_id: operation_id.clone(),
+            revision_digest: revision_digest.clone(),
+            tenant_database: Some(TenantDeployConfig {
+                server_name: "postgres.internal".into(),
+                host_addr: Some("10.0.0.15".into()),
+                port: 5432,
+                connect_timeout_secs: 10,
+            }),
+            postgres_client_leaf_fingerprint: Some(format!("sha256:{}", "d".repeat(64))),
+        };
+        let receipt = crate::postgres::TenantStateReceiptV1 {
+            schema_version: 1,
+            reservation_digest: reservation.digest().unwrap(),
+            reservation,
+            provision_generation: 9,
+            provisioning_manifest_digest: format!("sha256:{}", "e".repeat(64)),
+            migration_bundle_digest: migration.manifest.bundle_digest.clone(),
+            successful_migrations: migration.manifest.files.clone(),
+        };
+        let endpoint = receipt.reservation.tenant_database.clone().unwrap();
+        let stage = materialize_resolved_release(
+            bundle_path,
+            &manifest,
+            &configs,
+            "node-a",
+            7,
+            &operation_id,
+            &revision_digest,
+            DeployFormat::Systemd,
+            "postgres://platform.internal/jobs",
+            9443,
+            "deploy@example.test",
+            "192.0.2.10",
+            Some((&endpoint, &receipt)),
+        )
+        .unwrap();
+        let engine = fs::read_to_string(stage.root.join("wr-node/config/engine.toml")).unwrap();
+        let engine: toml::Value = toml::from_str(&engine).unwrap();
+        assert_eq!(
+            engine["database"]["url"].as_str(),
+            Some("postgres://platform.internal/jobs")
+        );
+        assert_eq!(
+            engine["database"]["tenant"]["server_name"].as_str(),
+            Some("postgres.internal")
+        );
+        assert_eq!(
+            engine["database"]["tenant"]["expected_namespaces"][0]["generation"].as_integer(),
+            Some(9)
+        );
+        assert_eq!(
+            engine["database"]["tenant"]["trust_root_path"].as_str(),
+            Some("/etc/wruntime/pki/postgres-client/sets/v1/chain.pem")
+        );
+        assert!(!engine.to_string().contains("admin-url"));
+        drop(stage);
         fs::remove_dir_all(root).unwrap();
     }
 

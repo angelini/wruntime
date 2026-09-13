@@ -7,3 +7,4 @@
 pub mod client;
 pub mod cmd;
 pub mod display;
+pub mod postgres;

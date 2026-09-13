@@ -9,6 +9,20 @@ for arg in "$@"; do
 done
 
 if [ "$INLINE" = true ]; then
+	if [ "${WRT_ASSERT_ENGINE_ADMIN_ENV_ABSENT:-0}" = 1 ]; then
+		engine_count=0
+		for environ in /proc/[0-9]*/environ; do
+			cmdline="${environ%/environ}/cmdline"
+			[ -r "$cmdline" ] && tr '\0' ' ' <"$cmdline" | grep -Eq '(^|[/ ])wr-engine([[:space:]]|$)' || continue
+			engine_count=$((engine_count + 1))
+			if tr '\0' '\n' <"$environ" | grep -Eq '^WRT_.*(ADMIN|IDENT|POSTGRES.*(URL|CERT|KEY))=|postgres-admin-url|/wruntime-config/pg_ident'; then
+				echo "engine process inherited PostgreSQL administrative material" >&2
+				exit 1
+			fi
+		done
+		[ "$engine_count" -gt 0 ] || { echo "no engine process found for environment inspection" >&2; exit 1; }
+		echo "==> Verified engine environments contain no PostgreSQL administrative inputs"
+	fi
 	# The inline application seed runs exactly once, after dev run has proved
 	# every service READY and every proxy has crossed the routing barrier.
 	echo "==> Seeding inventory..."

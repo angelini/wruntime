@@ -49,7 +49,7 @@ impl proto::LedgerService for Component {
         let trades_deleted =
             query_scalar::<i64>("SELECT COUNT(*) FROM trades").fetch_exactly_one()?;
 
-        query("TRUNCATE trades").execute()?;
+        query("DELETE FROM trades").execute()?;
 
         let snapshots = bucket("stockmarket")?;
         let objects = snapshots.list("ledger-snapshots/")?;

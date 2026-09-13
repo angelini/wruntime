@@ -23,6 +23,12 @@ pub struct SchemaStartup {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StartupDbManifest {
     pub schemas: Vec<SchemaStartup>,
+    /// Immutable bytes captured once from every unique migration source. Managed deployments bind
+    /// this manifest to their authenticated revision digest; local development uses an explicit
+    /// non-production digest.
+    pub migration_bundle: Option<wr_common::migration_bundle::MigrationBundle>,
+    /// Node-local expected provisioning and immutable migration state.
+    pub namespace_expectations: BTreeMap<String, crate::config::NamespaceDatabaseExpectation>,
     pub namespace_capacities: BTreeMap<String, usize>,
     pub has_workers: bool,
     pub needs_job_queue: bool,
@@ -100,8 +106,59 @@ impl StartupDbManifest {
             }
         }
 
+        let schemas = schemas.into_values().collect::<Vec<_>>();
+        let sources = schemas
+            .iter()
+            .filter_map(|schema| {
+                schema.migrations_path.as_ref().map(|path| {
+                    (
+                        schema.namespace.clone(),
+                        schema.module.clone(),
+                        path.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let migration_bundle = if sources.is_empty() {
+            None
+        } else {
+            let deployment_digest = config
+                .deployment
+                .as_ref()
+                .map(|deployment| deployment.revision_digest.clone())
+                .unwrap_or_else(|| format!("sha256:{}", "0".repeat(64)));
+            Some(
+                wr_common::migration_bundle::MigrationBundleManifest::capture_sources(
+                    deployment_digest,
+                    wr_common::migration_bundle::MigrationLimits {
+                        max_migrations_per_namespace: 1_024,
+                        max_file_bytes: 2 * 1024 * 1024,
+                        max_startup_bytes: 64 * 1024 * 1024,
+                        file_deadline_ms: 30_000,
+                        cancellation_grace_ms: 5_000,
+                    },
+                    &sources,
+                )
+                .context("capturing immutable startup migration bytes")?,
+            )
+        };
+
+        let namespace_expectations = database
+            .tenant
+            .as_ref()
+            .map(|tenant| {
+                tenant
+                    .expected_namespaces
+                    .iter()
+                    .cloned()
+                    .map(|expected| (expected.namespace.clone(), expected))
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
-            schemas: schemas.into_values().collect(),
+            schemas,
+            migration_bundle,
+            namespace_expectations,
             namespace_capacities,
             has_workers,
             needs_job_queue,

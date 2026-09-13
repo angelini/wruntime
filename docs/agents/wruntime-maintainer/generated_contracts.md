@@ -53,7 +53,8 @@ flowchart TB
 - `wr-build` emits service `_router` and `_handle` helpers; worker clients are generated only for services whose names end in `WorkerService`.
 - SDK, WIT, build-generator, or host-binding changes require focused `just test-wasm-one <target>` where possible and full `just test-wasm` before completion.
 - Update the guest API guide when preferred usage or guest-visible semantics change. Exact signatures stay in Rust/WIT source.
-- Manager migrations under `wr-manager/migrations/` modify control-plane state. Module migrations are trusted guest-owned SQL, run at engine startup with target-database admin credentials and the module schema as the default `search_path`, and use a separate history/cancellation-safe locking policy.
+- Manager migrations under `wr-manager/migrations/` modify control-plane state. Module migrations are trusted guest-owned SQL captured as immutable bundle artifacts, executed offline by the operator through bounded disposable authority, and verified from the platform ledger by engines before readiness.
+- Development fixture generation is a content-addressed fanout. Keep `dev/postgres-fixture-inputs.txt` synchronized with Compose/PostgreSQL setup, the runtime-only provisioner Dockerfile/helper, every Cargo/protobuf/source input affecting the Linux-musl `wr-cli`, database engine configs, and migration trees—without adding unrelated runtime source or host `target/` bytes. Host preparation packages exactly the verified binary and Dockerfile; every linked worktree validates source plus binary/context/image/base/toolchain provenance against shared `owner.json`/`fixture/ready.json`.
 - Runtime listener, advertise-address, queue-identity, or TLS-path changes must fan out through `wr-cli` bundle transforms, deploy-time placeholder resolution and certificate provisioning, checked-in deployment fixtures, and runnable example TOML. Generated configs must still pass the owning runtime parser.
 
 ## Review checklist

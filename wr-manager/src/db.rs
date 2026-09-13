@@ -9,12 +9,14 @@ use wr_common::deployment_contract::{
 };
 use wr_common::identity::NamespaceFilter;
 use wr_common::lifecycle_service::{AdmissionGate, ManagerLifecycleState};
-use wr_common::naming::namespace_role;
+use wr_common::naming::{
+    namespace_database, namespace_readiness_verifier, namespace_runtime_login,
+};
 use wr_common::task_group::{TaskCancellation, TaskExit};
 use wr_common::wruntime::{
     BeginDeploymentRequest, BeginManagerRolloutRequest, DeploymentInventoryV1, DeploymentRecord,
     DeploymentState, EngineOwnershipFence, EngineRegistration, ManagerRollout, ManagerRolloutPhase,
-    ModuleDescriptor, NamespaceDbCredential, NamespaceSecrets, NodeAgentAttestation,
+    ModuleDescriptor, NamespaceAccessDescriptor, NamespaceSecrets, NodeAgentAttestation,
     NodeAgentPolicy, NodeOperation, PrivilegedAdmissionState, ProxyInventoryReport,
     ProxyInventoryStatus, RegisterProxyRequest, ResetFailedManagerRolloutResponse, RoutingRule,
     RoutingTable, SlotObservation,
@@ -218,7 +220,7 @@ fn assigned_slot_generation(current: u64, replay: bool) -> Result<u64, Status> {
 pub struct RegistrationCommit {
     pub fence: EngineOwnershipFence,
     pub secrets: Vec<NamespaceSecrets>,
-    pub db_credentials: Vec<NamespaceDbCredential>,
+    pub namespace_access: Vec<NamespaceAccessDescriptor>,
 }
 
 pub async fn register_engine_and_routes(
@@ -471,43 +473,21 @@ pub async fn register_engine_and_routes(
             .or_default()
             .insert(secret.key.clone(), value);
     }
-    let mut db_credentials = Vec::new();
-    let dbs = reg
+    // Namespace database authorization is derived solely from the authenticated
+    // node identity after desired-inventory integrity checks. No database secret
+    // is stored or returned by the manager.
+    let namespace_access = reg
         .db_namespaces
         .iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    for namespace in dbs {
-        let key = "__db_password";
-        let row = txn
-            .query_opt(
-                "SELECT ciphertext,nonce FROM wr_secrets WHERE namespace=$1 AND key=$2 FOR UPDATE",
-                &[namespace, &key],
-            )
-            .await
-            .internal()?;
-        let password = if let Some(row) = row {
-            crypto
-                .decrypt(&row.get::<_, Vec<u8>>(0), &row.get::<_, Vec<u8>>(1))
-                .map_err(|e| Status::internal(format!("failed to decrypt db password: {e}")))?
-        } else {
-            let candidate = crate::crypto::SecretCrypto::generate_random_password();
-            let (ciphertext, nonce) = crypto
-                .encrypt(&candidate)
-                .map_err(|e| Status::internal(format!("encryption failed: {e}")))?;
-            txn.execute(
-                "INSERT INTO wr_secrets(namespace,key,ciphertext,nonce) VALUES($1,$2,$3,$4)",
-                &[namespace, &key, &ciphertext, &nonce],
-            )
-            .await
-            .internal()?;
-            candidate
-        };
-        db_credentials.push(NamespaceDbCredential {
-            namespace: (*namespace).clone(),
-            role: namespace_role(namespace),
-            password,
-        });
-    }
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|namespace| NamespaceAccessDescriptor {
+            namespace: namespace.clone(),
+            database: namespace_database(namespace),
+            runtime_role: namespace_runtime_login(&metadata.node_id, namespace),
+            readiness_role: namespace_readiness_verifier(&metadata.node_id, namespace),
+        })
+        .collect();
     let secrets = grouped
         .into_iter()
         .map(|(namespace, secrets)| NamespaceSecrets { namespace, secrets })
@@ -758,7 +738,7 @@ pub async fn register_engine_and_routes(
             slot_generation: next_generation,
         },
         secrets,
-        db_credentials,
+        namespace_access,
     })
 }
 

@@ -75,13 +75,20 @@ impl Host for ModuleState {
         params: Vec<PgValue>,
     ) -> impl std::future::Future<Output = Result<Vec<Row>, DbError>> + Send {
         let mut telemetry = self.start_db_span(DbOperation::Query, &sql);
-        let prepared = self
-            .db()
-            .map(|db| (db.pool.clone(), db.schema.clone(), db.timeouts.clone()));
+        let prepared = self.db().map(|db| {
+            (
+                db.pool.clone(),
+                db.schema.clone(),
+                db.expected_database.clone(),
+                db.expected_user.clone(),
+                db.timeouts.clone(),
+            )
+        });
         async move {
             let result = async {
-                let (pool, schema, timeouts) = prepared?;
-                let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
+                let (pool, schema, database, user, timeouts) = prepared?;
+                let client =
+                    get_prepared_connection(&pool, &schema, &database, &user, &timeouts).await?;
                 query_rows(&client, sql, params)
                     .await
                     .map_err(HostDbError::into_public)
@@ -98,13 +105,20 @@ impl Host for ModuleState {
         params: Vec<PgValue>,
     ) -> impl std::future::Future<Output = Result<u64, DbError>> + Send {
         let mut telemetry = self.start_db_span(DbOperation::Execute, &sql);
-        let prepared = self
-            .db()
-            .map(|db| (db.pool.clone(), db.schema.clone(), db.timeouts.clone()));
+        let prepared = self.db().map(|db| {
+            (
+                db.pool.clone(),
+                db.schema.clone(),
+                db.expected_database.clone(),
+                db.expected_user.clone(),
+                db.timeouts.clone(),
+            )
+        });
         async move {
             let result = async {
-                let (pool, schema, timeouts) = prepared?;
-                let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
+                let (pool, schema, database, user, timeouts) = prepared?;
+                let client =
+                    get_prepared_connection(&pool, &schema, &database, &user, &timeouts).await?;
                 execute_statement(&client, sql, params)
                     .await
                     .map_err(HostDbError::into_public)
@@ -130,24 +144,27 @@ impl Host for ModuleState {
             Ok((
                 db.pool.clone(),
                 db.schema.clone(),
+                db.expected_database.clone(),
+                db.expected_user.clone(),
                 db.timeouts.clone(),
                 guard,
             ))
         })();
-        let (pool, schema, timeouts, guard) = match prepared {
+        let (pool, schema, database, user, timeouts, guard) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 telemetry.finish_error(&error);
                 return Err(error);
             }
         };
-        let client = match get_prepared_connection(&pool, &schema, &timeouts).await {
-            Ok(client) => client,
-            Err(error) => {
-                telemetry.finish_error(&error);
-                return Err(error);
-            }
-        };
+        let client =
+            match get_prepared_connection(&pool, &schema, &database, &user, &timeouts).await {
+                Ok(client) => client,
+                Err(error) => {
+                    telemetry.finish_error(&error);
+                    return Err(error);
+                }
+            };
         let stream = match open_row_stream(&client, sql, params).await {
             Ok(stream) => stream,
             Err(error) => {
@@ -171,7 +188,7 @@ impl Host for ModuleState {
     }
 
     async fn begin_transaction(&mut self) -> Result<Resource<TxState>, DbError> {
-        let (pool, schema, timeouts, guard) = {
+        let (pool, schema, database, user, timeouts, guard) = {
             let db = self.db()?;
             let guard = db
                 .accounting
@@ -180,11 +197,13 @@ impl Host for ModuleState {
             (
                 db.pool.clone(),
                 db.schema.clone(),
+                db.expected_database.clone(),
+                db.expected_user.clone(),
                 db.timeouts.clone(),
                 guard,
             )
         };
-        let client = get_prepared_connection(&pool, &schema, &timeouts).await?;
+        let client = get_prepared_connection(&pool, &schema, &database, &user, &timeouts).await?;
         client
             .execute("BEGIN", &[])
             .await

@@ -7,7 +7,7 @@ TEST_CERTS_DIR="${RUN_ROOT}/config/certs"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}" \
 	WRT_EXAMPLE_CERTS_DIR="$TEST_CERTS_DIR" \
 	WR_EXAMPLE_RUN_DIR="$RUN_ROOT" \
-	source "$REPO_ROOT/examples/helpers.sh" --inline
+	source "$REPO_ROOT/examples/helpers.sh" --inline --helper-contract-test
 
 for credential in runtime-manager-endpoint runtime-proxy-endpoint job-admin-engine-endpoint runtime-human-client runtime-manager-client runtime-proxy-client; do
 	"$CERT_CLI" cert verify "${TEST_CERTS_DIR}/${credential}" >/dev/null
@@ -97,12 +97,25 @@ if find "$RUN_ROOT" -mindepth 1 -maxdepth 1 ! -name config -print -quit | grep -
 	echo "helper created persistent state outside its temporary config directory" >&2
 	exit 1
 fi
-if grep -Eq 'state-dir|dev-state|supervisor|wr-cli dev (up|deploy|down|status|wait|start-proxy)' "$REPO_ROOT/examples/helpers.sh"; then
-	echo "helper retains removed cross-command lifecycle state or commands" >&2
+if grep -Eq 'state-dir|supervisor|wr-cli dev (up|deploy|down|status|wait|start-proxy)' "$REPO_ROOT/examples/helpers.sh"; then
+	echo "helper retains removed process-lifecycle state or commands" >&2
 	exit 1
 fi
 if grep -Eq 'wr-cli dev build' "$REPO_ROOT/examples/helpers.sh"; then
 	echo "helper must not build guest artifacts during foreground execution" >&2
+	exit 1
+fi
+if grep -Eq 'postgres (provision|migrate)|postgres-provision|postgres-native-certs|docker compose|WRT_POSTGRES_(NATIVE|ADMIN|IDENT|TEST)|WR_TENANT_DB' "$REPO_ROOT/examples/helpers.sh"; then
+	echo "example helper crossed the consume-only PostgreSQL fixture boundary" >&2
+	exit 1
+fi
+if ! grep -Fq 'WRT_POSTGRES_FIXTURE_DIR' "$REPO_ROOT/examples/helpers.sh"; then
+	echo "example helper does not consume the canonical shared fixture" >&2
+	exit 1
+fi
+if [ "$DB_URL" != 'postgres://wr_manager_platform:wruntime-dev-manager@localhost:5433/wruntime_manager' ] || \
+	[ "$JOB_DB_URL" != 'postgres://wr_jobs_platform:wruntime-dev-jobs@localhost:5433/wruntime_jobs' ]; then
+	echo "example helper did not lock the fixed development platform URLs" >&2
 	exit 1
 fi
 

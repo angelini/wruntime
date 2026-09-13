@@ -105,6 +105,8 @@ pub struct JobAdminConfig {
 pub struct DatabaseConfig {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<TenantDatabaseConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statement_timeout_secs: Option<u32>,
@@ -112,6 +114,42 @@ pub struct DatabaseConfig {
     pub idle_in_transaction_timeout_secs: Option<u32>,
     #[serde(flatten)]
     pub extra: ExtraFields,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TenantDatabaseConfig {
+    pub server_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_addr: Option<String>,
+    pub port: u16,
+    pub trust_root_path: String,
+    pub client_cert_path: String,
+    pub client_key_path: String,
+    pub connect_timeout_secs: u64,
+    #[serde(default)]
+    pub expected_namespaces: Vec<NamespaceDatabaseExpectation>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceDatabaseExpectation {
+    pub namespace: String,
+    pub generation: u64,
+    pub deployment_digest: String,
+    pub bundle_digest: String,
+    #[serde(default)]
+    pub migrations: Vec<ExpectedMigration>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedMigration {
+    pub module: String,
+    pub version: u64,
+    pub filename: String,
+    pub content_hash: String,
+    pub byte_length: u64,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -151,6 +189,157 @@ fn is_false(v: &bool) -> bool {
 }
 
 impl EngineConfig {
+    /// Populate the authenticated namespace migration inventory shared by a
+    /// generated local topology. SQL staging may use an earlier receipt digest;
+    /// successful ledger rows are authenticated by immutable file identity,
+    /// while engines bind this generated inventory to the manager revision.
+    pub fn populate_local_tenant_expectations(configs: &mut [Self]) -> anyhow::Result<()> {
+        let deployment_digest = configs
+            .iter()
+            .filter_map(|config| config.deployment.as_ref())
+            .map(|deployment| deployment.revision_digest.as_str())
+            .next()
+            .context("managed deployment metadata is required")?
+            .to_string();
+        anyhow::ensure!(
+            configs
+                .iter()
+                .filter_map(|config| config.deployment.as_ref())
+                .all(|deployment| deployment.revision_digest == deployment_digest),
+            "generated engine configs disagree on deployment digest"
+        );
+
+        let mut sources = std::collections::BTreeMap::new();
+        for module in configs
+            .iter()
+            .flat_map(|config| &config.modules)
+            .filter(|module| module.database)
+        {
+            if let Some(path) = module.migrations_path.as_deref() {
+                let canonical = std::fs::canonicalize(path).with_context(|| {
+                    format!(
+                        "failed to canonicalize migrations_path for module '{}.{}'",
+                        module.namespace, module.name
+                    )
+                })?;
+                let key = (module.namespace.clone(), module.name.clone());
+                if let Some(previous) = sources.insert(key.clone(), canonical.clone()) {
+                    anyhow::ensure!(
+                        previous == canonical,
+                        "conflicting migration sources for module '{}.{}'",
+                        key.0,
+                        key.1
+                    );
+                }
+            }
+        }
+        let source_list = sources
+            .into_iter()
+            .map(|((namespace, module), path)| (namespace, module, path))
+            .collect::<Vec<_>>();
+        let bundle = if source_list.is_empty() {
+            None
+        } else {
+            Some(
+                wr_common::migration_bundle::MigrationBundleManifest::capture_sources(
+                    deployment_digest.clone(),
+                    wr_common::migration_bundle::MigrationLimits {
+                        max_migrations_per_namespace: 1_024,
+                        max_file_bytes: 2 * 1024 * 1024,
+                        max_startup_bytes: 64 * 1024 * 1024,
+                        file_deadline_ms: 30_000,
+                        cancellation_grace_ms: 5_000,
+                    },
+                    &source_list,
+                )?,
+            )
+        };
+        let bundle_digest = bundle
+            .as_ref()
+            .map(|bundle| bundle.manifest.bundle_digest.clone())
+            .unwrap_or_else(|| format!("sha256:{}", "0".repeat(64)));
+
+        let migrations = bundle
+            .as_ref()
+            .map(|bundle| {
+                bundle
+                    .files
+                    .iter()
+                    .map(|file| wr_common::migration_bundle::MigrationFileManifest {
+                        namespace: file.manifest.namespace.clone(),
+                        module: file.manifest.module.clone(),
+                        version: file.manifest.version,
+                        filename: file.manifest.filename.clone(),
+                        content_hash: file.manifest.content_hash.clone(),
+                        byte_length: file.manifest.byte_length,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Self::populate_receipt_tenant_expectations(
+            configs,
+            &deployment_digest,
+            &bundle_digest,
+            None,
+            &migrations,
+        )
+    }
+
+    /// Populate a deployment from already authenticated reservation/receipt data.
+    /// Unlike local source capture, this never resolves migration paths on the
+    /// operator host after a bundle has been created.
+    pub fn populate_receipt_tenant_expectations(
+        configs: &mut [Self],
+        deployment_digest: &str,
+        bundle_digest: &str,
+        generation: Option<u64>,
+        migrations: &[wr_common::migration_bundle::MigrationFileManifest],
+    ) -> anyhow::Result<()> {
+        for config in configs {
+            let required = config
+                .modules
+                .iter()
+                .filter(|module| module.database)
+                .map(|module| module.namespace.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if required.is_empty() {
+                continue;
+            }
+            let tenant = config
+                .database
+                .as_mut()
+                .and_then(|database| database.tenant.as_mut())
+                .context("database-enabled engine lacks node-local tenant configuration")?;
+            anyhow::ensure!(
+                tenant.expected_namespaces.len() == required.len()
+                    && tenant
+                        .expected_namespaces
+                        .iter()
+                        .all(|expected| required.contains(expected.namespace.as_str())),
+                "tenant expected namespace inventory differs from database-enabled modules"
+            );
+            for expectation in &mut tenant.expected_namespaces {
+                if let Some(generation) = generation {
+                    expectation.generation = generation;
+                }
+                expectation.deployment_digest = deployment_digest.to_string();
+                expectation.bundle_digest = bundle_digest.to_string();
+                expectation.migrations = migrations
+                    .iter()
+                    .filter(|file| file.namespace == expectation.namespace)
+                    .map(|file| ExpectedMigration {
+                        module: file.module.clone(),
+                        version: file.version,
+                        filename: file.filename.clone(),
+                        content_hash: file.content_hash.clone(),
+                        byte_length: file.byte_length,
+                    })
+                    .collect();
+            }
+        }
+        Ok(())
+    }
+
     /// Parse an engine config from a TOML file.
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -1012,6 +1201,84 @@ server_ca_cert_path = "server-root.crt"
             vec!["api.github.com".to_string(), "*.docs.rs".to_string()]
         );
         assert_eq!(cfg.external.as_ref().unwrap().routes.len(), 1);
+    }
+
+    #[test]
+    fn local_tenant_generation_carries_complete_cross_engine_migration_inventory() {
+        let root = runtime_unique_temp_dir("tenant-topology");
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("V1__first.sql"), "SELECT 1;").unwrap();
+        fs::write(second.join("V1__second.sql"), "SELECT 2;").unwrap();
+        let source = |name: &str, migrations: &Path| {
+            toml::from_str::<EngineConfig>(&format!(
+                r#"
+listen_address = "127.0.0.1:9100"
+[node]
+proxy_address = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_address = "https://127.0.0.1:9443"
+[deployment]
+node_id = "node-a"
+revision = "1"
+bundle_digest = "sha256:{zeros}"
+engine_slot = "engine-{name}"
+operation_id = "operation"
+revision_digest = "sha256:{revision}"
+[database]
+url = "postgres://postgres@localhost/jobs"
+[database.tenant]
+server_name = "localhost"
+host_addr = "127.0.0.1"
+port = 5432
+trust_root_path = "/tmp/ca.pem"
+client_cert_path = "/tmp/client.pem"
+client_key_path = "/tmp/client.key"
+connect_timeout_secs = 1
+[[database.tenant.expected_namespaces]]
+namespace = "shop"
+generation = 1
+deployment_digest = "sha256:{zeros}"
+bundle_digest = "sha256:{zeros}"
+[[module]]
+name = "{name}"
+namespace = "shop"
+version = "1.0.0"
+wasm_path = "{name}.wasm"
+database = true
+migrations_path = "{}"
+"#,
+                migrations.display(),
+                zeros = "0".repeat(64),
+                revision = "a".repeat(64),
+            ))
+            .unwrap()
+        };
+        let mut configs = vec![source("first", &first), source("second", &second)];
+        EngineConfig::populate_local_tenant_expectations(&mut configs).unwrap();
+        for config in &configs {
+            let expectation = &config
+                .database
+                .as_ref()
+                .unwrap()
+                .tenant
+                .as_ref()
+                .unwrap()
+                .expected_namespaces[0];
+            assert_eq!(
+                expectation.deployment_digest,
+                format!("sha256:{}", "a".repeat(64))
+            );
+            assert_eq!(expectation.migrations.len(), 2);
+            assert_eq!(expectation.migrations[0].module, "first");
+            assert_eq!(expectation.migrations[1].module, "second");
+        }
+        let rendered = configs[0].to_toml().unwrap();
+        assert!(!rendered.contains("password"));
+        assert!(!rendered.contains("admin_url"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

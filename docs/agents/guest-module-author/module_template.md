@@ -246,7 +246,7 @@ The referenced secret must exist under the module namespace. The guest reads onl
 
 ## Migrations
 
-Use refinery names such as `V1__create_tables.sql`. Migrations run with engine target-database admin credentials and the module schema as the default `search_path`; they complete before readiness and are serialized across replicas. Migration files are trusted input, not a PostgreSQL authorization sandbox. Do not issue schema DDL in request or worker handlers.
+Use canonical names such as `V1__create_tables.sql`. Bundle construction authenticates migration bytes, and an operator runs them offline through a disposable bounded owner-capable login before node deployment. Engine startup verifies the successful immutable ledger before readiness; engines and runtime handlers never receive migration/admin authority. Migration files are trusted release input, not a PostgreSQL authorization sandbox. Do not issue schema DDL in request or worker handlers.
 
 ## Build and validation
 

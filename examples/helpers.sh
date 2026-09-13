@@ -8,9 +8,11 @@ set -euo pipefail
 # Consumed by scripts that source this helper.
 # shellcheck disable=SC2034
 INLINE=false
+HELPER_CONTRACT_TEST=false
 for arg in "$@"; do
 	case "$arg" in
 	--inline) INLINE=true ;;
+	--helper-contract-test) HELPER_CONTRACT_TEST=true ;;
 	esac
 done
 export INLINE
@@ -20,11 +22,17 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 # shellcheck source=dev/local-e2e-lock.sh
 source "$REPO_ROOT/dev/local-e2e-lock.sh"
+# shellcheck source=dev/shared-dev-state.sh
+source "$REPO_ROOT/dev/shared-dev-state.sh"
+wrt_acquire_postgres_fixture_lock "example runner: $0"
+if [ "$HELPER_CONTRACT_TEST" != true ]; then
+	wrt_require_compatible_fixture
+fi
 wrt_acquire_local_e2e_lock "example runner: $0"
 
 # ── Environment defaults ─────────────────────────────────────────────────────
-DB_URL="${DB_URL:-${WRT_EXAMPLE_DB_URL:-postgres://postgres@localhost:5433/wruntime_example}}"
-GUEST_DB_URL="${GUEST_DB_URL:-postgres://wr_guest@localhost:5433/wruntime_example}"
+DB_URL="postgres://wr_manager_platform:wruntime-dev-manager@localhost:5433/wruntime_manager"
+JOB_DB_URL="postgres://wr_jobs_platform:wruntime-dev-jobs@localhost:5433/wruntime_jobs"
 S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:8900}"
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-rustfsadmin}"
@@ -209,6 +217,21 @@ PY
 
 copy_config() {
 	render_config "$1" "$2"
+}
+
+# Consume the host-owned fixture. This command only validates fixed public artifacts and
+# materializes tenant expectations into the caller's run-directory config copies.
+prepare_example_tenant_native() {
+	if [ "$#" -eq 0 ]; then
+		echo "prepare_example_tenant_native requires engine config paths" >&2
+		return 2
+	fi
+	local command=(cargo run --quiet -p wr-tests --example postgres_tenant_consume --
+		--fixture "$WRT_POSTGRES_FIXTURE_DIR")
+	local config
+	for config in "$@"; do command+=(--config "$config"); done
+	"${command[@]}"
+	echo "==> Consumed host-prepared PostgreSQL tenant fixture"
 }
 
 # ── Prepare manager config ───────────────────────────────────────────────────

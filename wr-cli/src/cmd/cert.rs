@@ -51,11 +51,13 @@ pub enum CertificateProfile {
     ManagerEndpoint,
     ProxyPeerEndpoint,
     EngineAdminEndpoint,
+    PostgresServer,
     Human,
     ServiceAccount,
     Manager,
     Proxy,
     NodeAgent,
+    PostgresClient,
 }
 
 impl CertificateProfile {
@@ -67,6 +69,7 @@ impl CertificateProfile {
             Self::Manager => Some(PrincipalKind::Manager),
             Self::Proxy => Some(PrincipalKind::Proxy),
             Self::NodeAgent => Some(PrincipalKind::NodeAgent),
+            Self::PostgresClient => Some(PrincipalKind::PostgresClient),
             _ => None,
         }
     }
@@ -76,11 +79,13 @@ impl CertificateProfile {
             Self::ManagerEndpoint => "manager-endpoint",
             Self::ProxyPeerEndpoint => "proxy-peer-endpoint",
             Self::EngineAdminEndpoint => "engine-admin-endpoint",
+            Self::PostgresServer => "postgres-server",
             Self::Human => "human",
             Self::ServiceAccount => "service-account",
             Self::Manager => "manager",
             Self::Proxy => "proxy",
             Self::NodeAgent => "node-agent",
+            Self::PostgresClient => "postgres-client",
         }
     }
 }
@@ -117,9 +122,9 @@ pub struct VerifyArgs {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CredentialMetadata {
     schema_version: u32,
-    profile: String,
-    subject: String,
-    leaf_fingerprint: String,
+    pub profile: String,
+    pub subject: String,
+    pub leaf_fingerprint: String,
     serial: String,
     issuer_display_fingerprint: String,
     spki_fingerprint: String,
@@ -319,7 +324,7 @@ fn install_credential_set_with_parent_sync(
         let result = (|| -> Result<String> {
             let evidence = wr_common::tls::parse_leaf_evidence(
                 &content.leaf_der,
-                if content.profile.ends_with("endpoint") {
+                if content.profile.ends_with("endpoint") || content.profile == "postgres-server" {
                     wr_common::tls::LeafProfile::Server
                 } else {
                     wr_common::tls::LeafProfile::Client
@@ -428,7 +433,9 @@ fn verify_credential_set_without_parent_sync(path: &Path) -> Result<CredentialMe
     let leaf_pem = std::fs::read(path.join("leaf.pem"))?;
     let (_, leaf) =
         parse_x509_pem(&leaf_pem).map_err(|error| anyhow::anyhow!("parsing leaf PEM: {error}"))?;
-    let evidence = if metadata.profile.ends_with("endpoint") {
+    let evidence = if metadata.profile.ends_with("endpoint")
+        || metadata.profile == "postgres-server"
+    {
         wr_common::tls::validate_server_leaf(&leaf.contents, &metadata.subject)?
     } else {
         let evidence = wr_common::tls::parse_leaf_evidence(

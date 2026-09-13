@@ -74,19 +74,21 @@ tidy-examples: fmt-examples lint-examples
 
 # Run all tests
 test: build-test-guests
-    WRT_TEST_DB_URL={{db_url_test}} \
-    WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
-    WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-    WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-    cargo test --timings
+    bash dev/with-postgres-fixture.sh env \
+        WRT_TEST_DB_URL={{db_url_test}} \
+        WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
+        WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+        WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
+        cargo test --timings
 
 # Run integration tests only
 test-integration: build-test-guests
-    WRT_TEST_DB_URL={{db_url_test}} \
-    WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
-    WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-    WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-    cargo test -p wr-tests
+    bash dev/with-postgres-fixture.sh env \
+        WRT_TEST_DB_URL={{db_url_test}} \
+        WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
+        WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+        WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
+        cargo test -p wr-tests
 
 # Run one integration-test target when its file exists, otherwise filter by test name
 test-one name: build-test-guests
@@ -95,11 +97,12 @@ test-one name: build-test-guests
     else \
         test_args='{{name}}'; \
     fi; \
-    WRT_TEST_DB_URL={{db_url_test}} \
-    WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
-    WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-    WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-    cargo test $test_args
+    bash dev/with-postgres-fixture.sh env \
+        WRT_TEST_DB_URL={{db_url_test}} \
+        WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
+        WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+        WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
+        cargo test $test_args
 
 # ── Run services ──────────────────────────────────────────────────────────────
 
@@ -165,16 +168,16 @@ node-b-engine-1: build-multi-node
 
 # ── Dev infrastructure (Docker Compose) ──────────────────────────────────────
 
-db_url_example := "postgres://postgres@localhost:5433/wruntime_example"
-db_url_test    := "postgres://postgres@localhost:5433/wruntime_test"
+db_url_example := "postgres://wr_manager_platform:wruntime-dev-manager@localhost:5433/wruntime_manager"
+db_url_jobs    := "postgres://wr_jobs_platform:wruntime-dev-jobs@localhost:5433/wruntime_jobs"
+db_url_test    := "postgres://postgres:wruntime-dev-admin@localhost:5433/wruntime_test"
 s3_endpoint    := "http://localhost:8900"
 s3_access_key  := "rustfsadmin"
 s3_secret_key  := "rustfsadmin"
 
 # Start all dev services (Postgres, LGTM, RustFS S3) and create test buckets
 dev-up:
-    mkdir -p dev/observability/data
-    docker compose up -d
+    bash dev/shared-dev-command.sh up
     @echo "Postgres:   localhost:5433"
     @echo "            example: {{db_url_example}}"
     @echo "            test:    {{db_url_test}}"
@@ -183,48 +186,27 @@ dev-up:
     @echo "OTLP HTTP:  localhost:4318"
     @echo "RustFS S3:  {{s3_endpoint}}"
     @echo "RustFS Web: http://localhost:8901"
-    @sleep 2
-    -AWS_ACCESS_KEY_ID={{s3_access_key}} AWS_SECRET_ACCESS_KEY={{s3_secret_key}} \
-        aws --endpoint-url {{s3_endpoint}} s3 mb s3://test-bucket 2>/dev/null
-    @echo "S3 bucket:  test-bucket (created)"
+    @echo "S3 buckets: test-bucket, stockmarket, codegen (ready)"
 
-# Stop all dev services
+# Destructively replace the one shared dev project and fixture from this worktree.
+dev-reprepare:
+    bash dev/shared-dev-command.sh reprepare
+
+# Stop all shared dev services through the recorded owner.
 dev-down:
-    docker compose down
+    bash dev/shared-dev-command.sh down
 
-# Tail logs — optionally filter to one service: just dev-logs postgres
+# Tail logs through the recorded owner — optionally filter to one service.
 dev-logs service="":
-    docker compose logs -f {{service}}
+    bash dev/shared-dev-command.sh logs {{service}}
 
-# Show running container status
+# Show shared project status through the recorded owner.
 dev-ps:
-    docker compose ps
+    bash dev/shared-dev-command.sh ps
 
-# Reset example and test DBs — drops module schemas, manager schema, and migration history
+# Reset example DB under the shared database lock.
 dev-reset-db:
-    @for database_url in "{{db_url_example}}" "{{db_url_test}}"; do \
-        echo "==> Resetting ${database_url##*/} database..."; \
-        psql "$database_url" -v ON_ERROR_STOP=1 -c " \
-            DO \$\$DECLARE r RECORD; \
-            BEGIN \
-                FOR r IN SELECT schema_name FROM information_schema.schemata \
-                         WHERE schema_name LIKE 'wr__%' \
-                LOOP \
-                    EXECUTE 'DROP SCHEMA \"' || r.schema_name || '\" CASCADE'; \
-                    RAISE NOTICE 'dropped schema %', r.schema_name; \
-                END LOOP; \
-                DROP SCHEMA IF EXISTS wr_system CASCADE; \
-                DROP TABLE IF EXISTS refinery_schema_history CASCADE; \
-                FOR r IN SELECT tablename FROM pg_tables \
-                         WHERE schemaname = 'public' AND tablename LIKE 'wr_%' \
-                LOOP \
-                    EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; \
-                    RAISE NOTICE 'dropped table %', r.tablename; \
-                END LOOP; \
-                CREATE SCHEMA wr_system; \
-            END\$\$; \
-        "; \
-    done
+    bash dev/shared-dev-command.sh reset-db
     @echo "Done."
 
 # Clear all objects from the codegen S3 bucket
@@ -247,11 +229,12 @@ build-test-guests:
 
 # Run all WASM host binding tests (sets env vars for dev infrastructure automatically)
 test-wasm: build-test-guests
-    WRT_TEST_DB_URL={{db_url_test}} \
-    WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
-    WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-    WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-    cargo test -p wr-tests \
+    bash dev/with-postgres-fixture.sh env \
+        WRT_TEST_DB_URL={{db_url_test}} \
+        WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
+        WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+        WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
+        cargo test -p wr-tests \
         --test wasm_db_host_test \
         --test wasm_blobstore_host_test \
         --test wasm_tracing_host_test \
@@ -269,11 +252,25 @@ test-wasm-one target: build-test-guests
         wasm_*) test_target="{{target}}" ;; \
         *) echo "unknown WASM test target '{{target}}'; use db, blobstore, tracing, llm, http, or a wasm_* target" >&2; exit 2 ;; \
     esac; \
-    WRT_TEST_DB_URL={{db_url_test}} \
-    WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
-    WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-    WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-    cargo test -p wr-tests --test "$test_target"
+    bash dev/with-postgres-fixture.sh env \
+        WRT_TEST_DB_URL={{db_url_test}} \
+        WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
+        WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
+        WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
+        cargo test -p wr-tests --test "$test_target"
+
+# Hermetic shared-fixture build, producer, and consume-only contracts.
+test-shared-dev-fixture:
+    bash dev/postgres-provisioner-image-test.sh
+    bash dev/postgres-fixture-contract-test.sh
+
+# Backward-compatible focused name for the shared fixture contract gate.
+test-postgres-fixture-contract:
+    just test-shared-dev-fixture
+
+# Native PostgreSQL tenant lifecycle/adversarial integration target.
+test-tenant-isolation-e2e:
+    bash dev/test-tenant-isolation-e2e.sh
 
 # Run pure deployment E2E Python tests in the locked uv project
 deployment-e2e-python-test:
@@ -304,6 +301,7 @@ test-local-e2e-lock:
 # Run focused foreground-runner, example-helper, waiter, and cleanup fixtures
 test-lifecycle-runners:
     just test-local-e2e-lock
+    just test-postgres-fixture-contract
     bash examples/helpers_test.sh
     bash examples/ecommerce/scenario_test.sh
     bash examples/scenarios_test.sh
@@ -376,12 +374,12 @@ build-ecommerce:
 # Run the full ecommerce example (requires Postgres — see `just dev-up`)
 ecommerce: build-ecommerce build
     WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
-    DB_URL={{db_url_example}} bash examples/ecommerce/run.sh
+    bash examples/ecommerce/run.sh
 
 # Run the ecommerce example inline (single invocation, exits on failure)
 ecommerce-inline: build-ecommerce build
     WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
-    DB_URL={{db_url_example}} bash examples/ecommerce/run.sh --inline
+    bash examples/ecommerce/run.sh --inline
 
 # Run ecommerce inline and fail if any warning is emitted
 validate-ecommerce:
@@ -409,12 +407,12 @@ build-stockmarket:
 # Pass exchanges=N to run N exchange engines in parallel (default: 1)
 stockmarket exchanges="1": build-stockmarket build
     WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
-    DB_URL={{db_url_example}} bash examples/stockmarket/run.sh --exchanges {{exchanges}}
+    bash examples/stockmarket/run.sh --exchanges {{exchanges}}
 
 # Run the stockmarket example inline (single invocation, exits on failure)
 stockmarket-inline exchanges="1": build-stockmarket build
     WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
-    DB_URL={{db_url_example}} bash examples/stockmarket/run.sh --inline --exchanges {{exchanges}}
+    bash examples/stockmarket/run.sh --inline --exchanges {{exchanges}}
 
 # ── Codegen Example ───────────────────────────────────────────────────────────
 
@@ -425,12 +423,12 @@ build-codegen:
 # Run the full codegen example (requires Postgres + RustFS S3 — see `just dev-up`)
 codegen: build-codegen build
     WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
-    DB_URL={{db_url_example}} bash examples/codegen/run.sh
+    bash examples/codegen/run.sh
 
 # Run the codegen example inline (single invocation, exits on failure)
 codegen-inline: build-codegen build
     WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
-    DB_URL={{db_url_example}} bash examples/codegen/run.sh --inline
+    bash examples/codegen/run.sh --inline
 
 # ── Dev Workflow ──────────────────────────────────────────────────────────────
 

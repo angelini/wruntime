@@ -55,8 +55,10 @@ fn build_tls_config(cli: &Cli) -> TlsConfig {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Database management (reset schemas, migrations)
+    /// Legacy development database management.
     Db(cmd::db::DbArgs),
+    /// Offline PostgreSQL tenant provisioning.
+    Postgres(cmd::postgres::PostgresArgs),
     /// View coherent cluster-wide status
     Cluster(cmd::cluster::ClusterArgs),
     /// Local development workflow (start infra, build, deploy)
@@ -118,6 +120,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Db(args) => cmd::db::run(args).await,
+        Commands::Postgres(args) => cmd::postgres::run(args).await,
         Commands::Cluster(args) => cmd::cluster::run(args, require_manager(&cli.manager)?).await,
         Commands::Dev(args) => cmd::dev::run(args, cli.manager.as_deref()).await,
         Commands::Engines(args) => cmd::engines::run(args, require_manager(&cli.manager)?).await,
@@ -262,6 +265,37 @@ mod tests {
             "json",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn postgres_provision_has_exact_offline_secret_surface() {
+        assert!(Cli::try_parse_from([
+            "wr-cli",
+            "postgres",
+            "provision",
+            "--manifest",
+            "desired.toml",
+            "--admin-url-file",
+            "admin-url",
+            "--pg-ident-target",
+            "pg_ident.conf",
+            "--dry-run",
+            "--output",
+            "json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "wr-cli",
+            "postgres",
+            "provision",
+            "--manifest",
+            "desired.toml",
+            "--admin-url",
+            "postgres://admin:secret@localhost/postgres",
+            "--pg-ident-target",
+            "pg_ident.conf",
+        ])
+        .is_err());
     }
 
     #[test]

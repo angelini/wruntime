@@ -271,7 +271,7 @@ On startup the engine:
 1. Starts an inbound HTTP server on `listen_address`.
 2. Registers itself and its modules with the manager to obtain requested secrets and DB credentials.
 3. The manager creates schemas and default routes as unhealthy and resets module readiness for advertised tuples.
-4. Provisions unique module schemas, applies embedded engine job-queue migrations, runs unique module-schema migrations, builds namespace pools, starts one recovery coordinator when workers exist, resolves secrets, validates component imports against each module's enabled DB/blobstore/LLM capabilities, and loads modules. Capability mismatches or migration failures leave registered routes unhealthy and abort startup.
+4. Reconciles non-secret namespace identities with node-local tenant expectations, performs one-shot provision/migration-ledger readiness checks, applies embedded job-queue migrations on the separate platform database, builds certificate-authenticated namespace pools, starts recovery when needed, resolves secrets, validates capability imports, and loads modules. Any mismatch leaves registered routes unhealthy and aborts startup.
 5. Sends an immediate readiness heartbeat after module load, then every 3 seconds, reporting healthy loaded modules.
 6. Deregisters cleanly on `Ctrl+C`, which immediately marks its routing rules as unhealthy.
 
@@ -305,7 +305,11 @@ The engine TOML shape and defaults are unchanged. Configuration is parsed into p
 
 ### Database pool and timeout settings
 
-When `[database]` exists, the engine eagerly creates exactly one administrative pool capped by `max_connections`, even if no module enables the DB capability. Provisioning, engine/module migrations, worker HTTP operations, claims/finalization, and recovery share this capacity. The engine also creates one guest pool per DB-enabled namespace. Every configured DB-enabled module instance contributes `db_max_connections`, or `[database].max_connections` when the override is absent, and contributions are checked and summed for that namespace. Each configured worker entry additionally owns one non-pooled PostgreSQL `LISTEN` session.
+`database.url` is platform configuration for the engine's physical job-queue database. It is never a tenant endpoint or namespace credential. A database-enabled module additionally requires generated `database.tenant` state: a native PostgreSQL endpoint, dedicated node certificate paths, and the exact provision/migration receipt expected at startup. Operators do not hand-author that state in a release; the host-owned development fixture consumer or `node deploy` materializes it from authenticated artifacts.
+
+For development, every linked worktree automatically derives the sole state root as `<absolute-git-common-dir>/wruntime-dev-state`. Host `just dev-up` owns the fixed `wruntime-dev` Compose project and publishes `owner.json`, `fixture/ready.json`, `fixture/{provisioning.toml,migration-bundle.toml,migrations/**}`, `pki/{root,node-a}`, the content-addressed two-file provisioner context, and `compose-provisioner.generated.yml` only after a daemon-architecture-matched `cargo zigbuild`, ELF/image verification and smoke, native setup, and offline migration succeed. The owner and readiness records bind daemon platform, musl target/toolchain, binary/context hashes, exact no-pull image tag/ID, and PostgreSQL base image ID. Consumers take no root/project/path override: they acquire the shared lock inode, hash the explicit repository fixture-input set (including uncommitted bytes), verify owner/ready, normalized manifest, migration inventory, artifact, image, endpoint, and PKI bindings, then use TLS name `postgres.internal`, destination `127.0.0.1:5433`, and a 10-second timeout. A missing owner or mismatch names active/required digests and requires coordinated host `just dev-reprepare`; it never triggers setup or a per-worktree fallback. The fixed platform connections are `postgres://wr_manager_platform:wruntime-dev-manager@localhost:5433/wruntime_manager` and `postgres://wr_jobs_platform:wruntime-dev-jobs@localhost:5433/wruntime_jobs`.
+
+The engine creates one certificate-authenticated runtime pool per DB-enabled namespace. Every configured DB-enabled module instance contributes `db_max_connections`, or `[database].max_connections` when absent, and contributions are checked and summed for that namespace. Worker queue operations and each worker's non-pooled `LISTEN` session remain on the distinct platform `database.url`.
 
 ```toml
 [database]
@@ -335,7 +339,7 @@ database           = true
 db_max_connections = 10 # this module contributes 10 instead of 20
 ```
 
-`max_connections` defaults to **20**, `statement_timeout_secs` to **30**, and `idle_in_transaction_timeout_secs` to **60**; all three and every effective module contribution must be positive. `[database]` and `[job_admin]` are an all-or-nothing pair. The job-admin bind must be a distinct socket, the advertised address must be an explicit-port HTTPS URL with a non-unspecified host, and `queue_id` uses the same lowercase/hyphen stable-name rules as namespaces. Engines on different physical databases must use different IDs; duplicate IDs across different databases cannot be detected from registration and can route an operation to the wrong queue. Namespace capacity overflow fails config validation. Guest pools authenticate with the manager-issued namespace role and clean each recycled session before module-specific setup reapplies `search_path` and both timeouts. The per-module `search_path` selects the default schema for unqualified SQL; it is not an authorization boundary. Fully qualified access to another module schema in the same namespace is allowed, while other namespace roles and all guest roles remain denied access to unrelated schemas, `wr__jobs`, and `wr_system`. Module schemas remain admin-owned; namespace roles receive grants but cannot drop a schema.
+`max_connections` defaults to **20**, `statement_timeout_secs` to **30**, and `idle_in_transaction_timeout_secs` to **60**; all three and every effective module contribution must be positive. `[database]` and `[job_admin]` are an all-or-nothing pair. The job-admin bind must be distinct, its advertised address must be explicit-port HTTPS, and `queue_id` identifies one physical job database. Namespace capacity overflow fails validation. Runtime pools use node-bound roles returned as non-secret identities by the manager and native client-certificate authentication. Recycle cleanup precedes module setup. The per-module `search_path` selects a default schema; it is not authorization. Fully qualified access to another module schema in the same namespace is allowed because same-namespace modules are mutually trusted. Other namespace databases, platform databases, owner roles, and runtime DDL are denied by PostgreSQL privileges.
 
 ### Database telemetry
 
@@ -353,7 +357,7 @@ When enabled, `db.query.text` contains the statement exactly as supplied by the 
 
 ### Database migrations
 
-Modules that use a database can declare a `migrations_path` pointing to a directory of SQL migration files. Migrations run on the engine (host side) at startup — after the Postgres schema is provisioned and before the WASM module loads. Default route rows may already be registered, but they remain unhealthy and unroutable until migrations, secret resolution, module load, readiness heartbeat, and manager health recomputation succeed.
+Modules that use a database can declare a `migrations_path` containing immutable SQL migration files. Bundle construction authenticates their names, sizes, and hashes. The operator runs them offline with `wr-cli postgres migrate` after co-located provisioning and before node deployment. Engines never execute module migrations or hold owner/admin authority. At startup an engine uses a single-use bounded readiness login to verify the published generation and successful immutable ledger inventory; stale, failed, extra, or ambiguous state leaves routes unhealthy.
 
 ```toml
 [database]
@@ -380,12 +384,12 @@ modules/inventory/migrations/
 
 Key behaviors:
 
-- **Per-namespace DB roles:** The manager automatically generates and stores a random password for each namespace that needs database access. At engine registration, the manager returns per-namespace credentials (`wr_ns_{namespace}` roles). The engine uses its target-database admin credentials to create or synchronize those roles, admin-owned schemas, and grants under provisioning locks, then connects guest pools using the namespace role. Modules never receive the password.
-- **Namespace authorization, module default schema:** The namespace role is granted every DB-enabled module schema in that namespace. `search_path` selects the module's default for unqualified migration SQL but does not prevent trusted migration files from using fully qualified names for other schemas. Migration SQL runs with target-database admin privileges and must not be sourced from untrusted parties.
-- **Cancellation-safe advisory locking:** An engine acquires a Postgres advisory lock before running migrations, preventing concurrent execution across replicas for the same module. The lock is held on a detached physical connection, so cancellation or failure closes the session instead of returning a locked session to the pool.
-- **Normalized ownership:** Config entries sharing `(namespace, module)` also share one Postgres schema. They provision and migrate it once, while each DB-enabled entry still contributes namespace-pool capacity and each configured module instance still loads. Their canonicalized `migrations_path` values must all resolve to the same directory; `None` versus `Some` is also a conflict. Validation fails before registration or DB writes rather than choosing by config order.
-- **Idempotent:** Refinery tracks applied module migrations in a `refinery_schema_history` table inside the module's schema. Engine-owned job queue migrations are embedded in the binary, use separate history in `wr__jobs`, and run once before module migrations, workers, or job-administration admission. Already-applied migrations are checked and skipped on subsequent startups.
-- **Fail-fast:** If any engine or module migration fails, the engine exits before the module becomes routable. Registered route rows remain unhealthy, so the module never receives traffic.
+- **Database-per-namespace:** deterministic retained databases and owner/runtime/readiness roles are converged only by `wr-cli postgres provision`; deployment inventory is not namespace authorization.
+- **Native certificate mapping:** PostgreSQL 18 `hostssl cert map=wruntime_nodes` maps one dedicated node `postgres-client` Common Name to only that node's bounded logins. There is no tenant trust/password fallback.
+- **Bounded migration authority:** each file runs transactionally through a disposable login that can `SET ROLE` only to the namespace owner. The login is removed after execution; runtime roles cannot perform DDL.
+- **Immutable ledger and recovery:** successful filename/hash/length identity is permanent. A failed or ambiguous latest attempt requires an explicit exact-artifact approval before one retry; no generic idempotence claim or automatic replay is accepted.
+- **Permanent retention:** wruntime does not retire unreferenced namespace databases, roles, or mappings. External PostgreSQL administration owns retirement and access revocation.
+- **Separate platform policy:** embedded manager and `wr__jobs` migrations remain on their distinct platform databases and never use tenant pools.
 
 ### Per-module request timeout
 
@@ -550,7 +554,7 @@ If `health_check` returns `false`, traps, or does not respond within 5 seconds, 
 
 ### Routing rules
 
-When an engine registers, the manager automatically creates one default routing rule per module that carries a schema, in the same transaction as the registration (and only after the engine's requested secrets and per-namespace DB credentials resolve successfully). Default rules start with `healthy = false`; the proxy indexes only healthy rules, so they are not routable until module readiness is reported and recomputed. You do not need to create these rules manually. The `UpsertRoutingRule` RPC remains available as an admin override — for example to add an extra rule or force a rule healthy:
+When an engine registers, the manager automatically creates one default routing rule per module that carries a schema, in the same transaction as registration and non-secret namespace identity resolution. Deployment inventory is validated for integrity but is not namespace authorization. Default rules start with `healthy = false`; the proxy indexes only healthy rules, so they are not routable until module readiness is reported and recomputed. You do not need to create these rules manually. The `UpsertRoutingRule` RPC remains available as an admin override — for example to add an extra rule or force a rule healthy:
 
 ```bash
 # example using grpcurl

@@ -90,7 +90,8 @@ cat >"${FAKE_ROOT}/examples/helpers.sh" <<'HELPERS'
 #!/usr/bin/env bash
 set -euo pipefail
 CONFIG_DIR="${FAKE_CONFIG_DIR:?}"
-DB_URL=postgres://test
+DB_URL=postgres://manager.test
+JOB_DB_URL=postgres://jobs.test
 S3_ENDPOINT=http://s3.test
 S3_ACCESS_KEY=test
 S3_SECRET_KEY=test
@@ -99,6 +100,7 @@ render_config() {
 	: >"$2"
 }
 copy_config() { render_config "$@"; }
+prepare_example_tenant_native() { :; }
 prepare_manager_config() { printf '%s\n' "${CONFIG_DIR}/manager.toml"; }
 prepare_proxy_config() { printf '%s\n' "$1"; }
 create_s3_bucket() { :; }

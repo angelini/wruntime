@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::helpers::DeployPort;
 
 /// Shared deployment format used by both manager and node deploy commands.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeployFormat {
     Systemd,
@@ -21,8 +21,10 @@ pub enum DeployFormat {
 pub struct DeployConfig {
     /// Deployment format: "systemd" or "docker"
     pub format: Option<DeployFormat>,
-    /// Postgres database URL
+    /// Platform PostgreSQL URL used by manager/proxy/job-queue code only.
     pub db_url: Option<String>,
+    /// Node-local endpoint for certificate-authenticated tenant databases.
+    pub tenant_database: Option<TenantDeployConfigSource>,
     /// Secret encryption key (manager deploy only)
     pub secret_key: Option<String>,
     /// SSH private key path
@@ -61,6 +63,146 @@ pub struct DeployConfig {
     pub agent_poll_seconds: Option<u64>,
     /// Agent lease-renewal interval in seconds.
     pub agent_renew_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantDeployConfigSource {
+    pub server_name: String,
+    pub host_addr: Option<String>,
+    pub port: Option<u16>,
+    pub connect_timeout_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantDeployConfig {
+    pub server_name: String,
+    pub host_addr: Option<String>,
+    pub port: u16,
+    pub connect_timeout_secs: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TenantDeployOverrides {
+    pub server_name: Option<String>,
+    pub host_addr: Option<String>,
+    pub port: Option<u16>,
+    pub connect_timeout_secs: Option<u64>,
+}
+
+impl TenantDeployConfig {
+    pub fn validate(&self) -> Result<()> {
+        let name = self.server_name.as_str();
+        anyhow::ensure!(
+            !name.is_empty()
+                && name.len() <= 253
+                && !name.contains("://")
+                && !name.chars().any(|ch| matches!(ch, '/' | '@' | '*' | ':'))
+                && !name.starts_with('.')
+                && !name.ends_with('.')
+                && name.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                }),
+            "tenant database server_name must be a canonical DNS name without URL syntax or wildcards"
+        );
+        anyhow::ensure!(self.port != 0, "tenant database port must be nonzero");
+        anyhow::ensure!(
+            self.connect_timeout_secs != 0,
+            "tenant database connect timeout must be nonzero"
+        );
+        if let Some(host) = &self.host_addr {
+            let address: std::net::IpAddr = host
+                .parse()
+                .with_context(|| "tenant database host_addr must be an IP literal")?;
+            let private = match address {
+                std::net::IpAddr::V4(ip) => {
+                    ip.is_private() || ip.is_loopback() || ip.is_link_local()
+                }
+                std::net::IpAddr::V6(ip) => {
+                    ip.is_unique_local() || ip.is_loopback() || ip.is_unicast_link_local()
+                }
+            };
+            anyhow::ensure!(
+                private,
+                "tenant database host_addr must be on a private node/service network"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn env_optional(key: &str) -> Result<Option<String>> {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => Ok(Some(value)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{key} must be UTF-8"),
+    }
+}
+
+pub fn resolve_tenant_database(
+    cli: TenantDeployOverrides,
+    config: Option<TenantDeployConfigSource>,
+) -> Result<Option<TenantDeployConfig>> {
+    let configured = config.is_some();
+    let config = config.unwrap_or(TenantDeployConfigSource {
+        server_name: String::new(),
+        host_addr: None,
+        port: None,
+        connect_timeout_secs: None,
+    });
+    let env_server = env_optional("WR_TENANT_DB_SERVER_NAME")?;
+    let env_host = env_optional("WR_TENANT_DB_HOST_ADDR")?;
+    let env_port = env_optional("WR_TENANT_DB_PORT")?;
+    let env_timeout = env_optional("WR_TENANT_DB_CONNECT_TIMEOUT_SECS")?;
+    let present = cli.server_name.is_some()
+        || cli.host_addr.is_some()
+        || cli.port.is_some()
+        || cli.connect_timeout_secs.is_some()
+        || configured
+        || env_server.is_some()
+        || env_host.is_some()
+        || env_port.is_some()
+        || env_timeout.is_some();
+    if !present {
+        return Ok(None);
+    }
+    let parse = |value: Option<String>, field: &str| -> Result<Option<u64>> {
+        value
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .with_context(|| format!("{field} must be an integer"))
+            })
+            .transpose()
+    };
+    let port = cli
+        .port
+        .map(u64::from)
+        .or(config.port.map(u64::from))
+        .or(parse(env_port, "WR_TENANT_DB_PORT")?)
+        .unwrap_or(5432);
+    let port = u16::try_from(port).context("tenant database port is out of range")?;
+    let value = TenantDeployConfig {
+        server_name: cli
+            .server_name
+            .or_else(|| (!config.server_name.is_empty()).then_some(config.server_name))
+            .or(env_server)
+            .context("tenant database server_name is required")?,
+        host_addr: cli.host_addr.or(config.host_addr).or(env_host),
+        port,
+        connect_timeout_secs: cli
+            .connect_timeout_secs
+            .or(config.connect_timeout_secs)
+            .or(parse(env_timeout, "WR_TENANT_DB_CONNECT_TIMEOUT_SECS")?)
+            .unwrap_or(10),
+    };
+    value.validate()?;
+    Ok(Some(value))
 }
 
 impl DeployConfig {
@@ -278,6 +420,70 @@ mod tests {
         assert!(parse_deploy_port("not-a-port", "WR_PEER_PORT").is_err());
         assert!(parse_deploy_port("0", "WR_SSH_PORT").is_err());
         assert!(optional_deploy_port(Some(0), "--peer-port").is_err());
+    }
+
+    #[test]
+    fn tenant_database_is_strict_and_keeps_platform_url_out_of_the_contract() {
+        let parsed: DeployConfig = toml::from_str(
+            r#"
+db_url = "postgres://platform.example/jobs"
+[tenant_database]
+server_name = "postgres.internal"
+host_addr = "10.0.0.15"
+port = 5432
+connect_timeout_secs = 10
+"#,
+        )
+        .unwrap();
+        let tenant =
+            resolve_tenant_database(TenantDeployOverrides::default(), parsed.tenant_database)
+                .unwrap()
+                .unwrap();
+        assert_eq!(tenant.server_name, "postgres.internal");
+        assert_eq!(tenant.host_addr.as_deref(), Some("10.0.0.15"));
+        assert_eq!(
+            parsed.db_url.as_deref(),
+            Some("postgres://platform.example/jobs")
+        );
+        for bad in ["postgres://internal", "user@internal", "*.internal", ""] {
+            let value = TenantDeployConfig {
+                server_name: bad.into(),
+                host_addr: Some("10.0.0.1".into()),
+                port: 5432,
+                connect_timeout_secs: 10,
+            };
+            assert!(value.validate().is_err(), "accepted {bad:?}");
+        }
+        let public = TenantDeployConfig {
+            server_name: "postgres.internal".into(),
+            host_addr: Some("203.0.113.5".into()),
+            port: 5432,
+            connect_timeout_secs: 10,
+        };
+        assert!(public.validate().is_err());
+    }
+
+    #[test]
+    fn tenant_database_cli_precedence_is_field_by_field() {
+        let resolved = resolve_tenant_database(
+            TenantDeployOverrides {
+                server_name: Some("override.internal".into()),
+                port: Some(6432),
+                ..TenantDeployOverrides::default()
+            },
+            Some(TenantDeployConfigSource {
+                server_name: "configured.internal".into(),
+                host_addr: Some("10.2.0.8".into()),
+                port: Some(5432),
+                connect_timeout_secs: Some(12),
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.server_name, "override.internal");
+        assert_eq!(resolved.host_addr.as_deref(), Some("10.2.0.8"));
+        assert_eq!(resolved.port, 6432);
+        assert_eq!(resolved.connect_timeout_secs, 12);
     }
 
     #[test]

@@ -12,10 +12,11 @@ INV2_CFG="${CONFIG_DIR}/ecommerce-inventory-2.toml"
 CLIENT_CFG="${CONFIG_DIR}/ecommerce-client.toml"
 
 render_config examples/ecommerce/engine-inventory-1.toml "$INV1_CFG" \
-	"postgres://postgres@localhost:5433/wruntime_example" "${DB_URL}"
+	"postgres://postgres@localhost:5433/wruntime_example" "${JOB_DB_URL}"
 render_config examples/ecommerce/engine-inventory-2.toml "$INV2_CFG" \
-	"postgres://postgres@localhost:5433/wruntime_example" "${DB_URL}"
+	"postgres://postgres@localhost:5433/wruntime_example" "${JOB_DB_URL}"
 copy_config examples/ecommerce/engine-client.toml "$CLIENT_CFG"
+prepare_example_tenant_native "$INV1_CFG" "$INV2_CFG"
 
 # ── Prepare manager + proxy configs ──────────────────────────────────────
 MANAGER_CFG=$(prepare_manager_config)

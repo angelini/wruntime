@@ -524,7 +524,7 @@ impl Manager {
             db::register_engine_and_routes(&self.pool, &self.crypto, &reg, &activation_id).await?;
         let fence = committed.fence;
         let secrets = committed.secrets;
-        let db_credentials = committed.db_credentials;
+        let namespace_access = committed.namespace_access;
         let serialized_snapshot = self
             .workload_policy
             .as_ref()
@@ -547,7 +547,7 @@ impl Manager {
         Ok(Response::new(RegisterEngineResponse {
             accepted: true,
             secrets,
-            db_credentials,
+            namespace_access,
             fence: Some(fence),
             serialized_snapshot,
         }))

@@ -11,6 +11,8 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT" || exit 1
 # shellcheck source=dev/local-e2e-lock.sh
 source "$ROOT/dev/local-e2e-lock.sh"
+# shellcheck source=dev/shared-dev-state.sh
+source "$ROOT/dev/shared-dev-state.sh"
 
 RUN_E2E=true
 RUN_CODEGEN_E2E=auto
@@ -313,6 +315,12 @@ fi
 
 section "setup"
 printf 'logs: %s\n' "$LOG_ROOT"
+if ! wrt_acquire_postgres_fixture_lock "validate-all database interval"; then
+	finish_failure 1
+fi
+if [ "$START_DEV" != true ] && ! wrt_require_compatible_fixture; then
+	finish_failure 1
+fi
 if [ ! -f certs/runtime-server-root/ca.crt ] \
 	|| [ ! -f certs/runtime-client-root/ca.crt ] \
 	|| [ ! -f certs/runtime-manager-endpoint/leaf.pem ] \
@@ -340,6 +348,8 @@ if [ "$E2E_ONLY" != true ]; then
 
 	section "rust tests"
 	run_cmd "workspace tests including wasm host tests" "just test"
+	section "native PostgreSQL tenant lifecycle"
+	run_cmd "tenant isolation native E2E" "just test-tenant-isolation-e2e"
 fi
 
 section "deployment lifecycle E2E"

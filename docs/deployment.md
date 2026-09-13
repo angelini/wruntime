@@ -25,7 +25,9 @@ cargo install cargo-zigbuild
 | `wr-cli managers deploy` | Push bundle to a remote host and start the service |
 | `wr-cli managers inspect-bundle` | Inspect a manager bundle without deploying |
 | `wr-cli managers list` | List active managers in the cluster |
-| `wr-cli node bundle` | Package proxy + engine binaries, WASM modules, and schemas |
+| `wr-cli node bundle` | Package proxy + engine binaries, WASM modules, schemas, and immutable migrations |
+| `wr-cli node reserve-deployment` | Reserve manager revision identity and capture a deployment-bound offline migration stage without worker mutation |
+| `wr-cli postgres provision/migrate` | Converge native certificate mappings/namespace databases and execute immutable migrations from the operator/database host |
 | `wr-cli node agent install/update` | Atomically update only an already provisioned host-agent binary, restart it, and wait for a new compatible attestation |
 | `wr-cli node deploy` | Stage/finalize a complete desired inventory and reconcile initial, replacement, scale, or mixed changes |
 | `wr-cli node rollback` | Stage a retained successful bundle as a new revision and submit explicit rollback |
@@ -103,6 +105,14 @@ secret_key = "<64-hex-character-key>"
 ssh_key    = "~/.ssh/deploy_key"
 cert_dir   = "./certs"    # CA + node certs from `wr-cli cert`
 peer_port  = 9443         # mTLS peer listener port
+
+# Required exactly when a node bundle contains database-enabled modules.
+[tenant_database]
+server_name = "postgres.internal" # DNS identity in the PostgreSQL server leaf
+host_addr = "10.0.0.15"           # optional private IP destination only
+port = 5432
+connect_timeout_secs = 10
+
 # ssh_port     = 22
 # image_prefix = "wr"
 ```
@@ -126,8 +136,12 @@ All fields are optional. Fields that only apply to specific commands (e.g. `secr
 | `--manager` | `WR_MANAGER` | — |
 | `--cert-dir` | `WR_CERT_DIR` | — |
 | `--peer-port` | `WR_PEER_PORT` | `9443` |
+| `--tenant-db-server-name` | `WR_TENANT_DB_SERVER_NAME` | required for DB bundles |
+| `--tenant-db-host-addr` | `WR_TENANT_DB_HOST_ADDR` | resolve server name |
+| `--tenant-db-port` | `WR_TENANT_DB_PORT` | `5432` |
+| `--tenant-db-connect-timeout-secs` | `WR_TENANT_DB_CONNECT_TIMEOUT_SECS` | `10` |
 
-Deployment ports must be valid non-zero TCP ports. Malformed or zero CLI/config/environment values fail immediately; defaults apply only when a value is absent. Likewise, malformed ports in source manager, proxy, or engine addresses fail bundle/deploy generation instead of becoming port `0`.
+Deployment ports must be valid non-zero TCP ports. Tenant `server_name` is a canonical DNS name and TLS identity, never a URL, role, or database name. Optional `host_addr` must be an IP literal on the private node/service network and changes only the TCP destination. URL syntax, userinfo, wildcards, public addresses, zero ports, and zero timeouts fail before reservation. `db_url` remains exclusively the platform manager/proxy/job-queue URL and is never used to infer tenant settings.
 
 ## Template variables
 
@@ -144,6 +158,51 @@ Config files use placeholders that are resolved at deploy time:
 | `{advertise_address}` | `--advertise-address` / `WR_ADVERTISE_ADDRESS` (auto-derived from remote host if omitted) | manager config (`advertise_grpc_address`) |
 
 Unresolved placeholders cause deployment to fail. Systemd manager deployment atomically installs the encryption key in the root-only `/var/lib/wruntime/manager-secrets/runtime.env` environment file referenced by the stable unit; the key is not embedded in that unit. The unit is installed at `/usr/local/lib/systemd/system/wr-manager.service`, below `/run/systemd/system` in the unit load path, so the runtime mask used during manager-set cutover takes precedence. Manager Docker deployments retain host networking for systemd parity and direct listener addressing.
+
+### Database-enabled reservation and operator preparation
+
+Database-enabled nodes use a reservation-first sequence so the manager-derived revision digest exists before migration without touching a worker:
+
+```bash
+# 1. Build the node bundle and issue a dedicated PostgreSQL-only root, server
+#    leaf (`postgres-server`), and node leaf (`postgres-client`).
+wr-cli node bundle --engine-config engine.toml --output node.tar.gz
+wr-cli cert init-root postgres --output postgres-pki/root
+wr-cli cert issue postgres-server --endpoint postgres.internal --ip 10.0.0.15 \
+  --ca-dir postgres-pki/root --destination postgres-pki/server
+wr-cli cert issue postgres-client --cluster-id production --name node-a \
+  --ca-dir postgres-pki/root --destination postgres-pki/node-a
+
+# 2. Reserve revision identity only. This performs no worker write/effect.
+wr-cli node reserve-deployment node.tar.gz deploy@node-a \
+  --node-id node-a --request-token node-a-v7 --output prepared/node-a \
+  --postgres-client-set postgres-pki/node-a
+
+# 3. On the database host (or equivalent co-located one-shot job), provision,
+#    then migrate and atomically emit the non-secret state receipt.
+wr-cli postgres provision --manifest provisioning.toml \
+  --admin-url-file /run/operator/postgres-admin-url \
+  --pg-ident-target /var/lib/postgresql/data/pg_ident.conf
+wr-cli postgres migrate --manifest provisioning.toml \
+  --bundle-manifest prepared/node-a/migration-bundle.json \
+  --bundle-root prepared/node-a/migrations \
+  --admin-url-file /run/operator/postgres-admin-url \
+  --node-bundle node.tar.gz \
+  --deployment-reservation prepared/node-a/reservation.json \
+  --receipt-out prepared/node-a/tenant-state.json
+
+# 4. Only matching prepared state may install credentials/finalize/submit.
+wr-cli node deploy node.tar.gz deploy@node-a --node-id node-a \
+  --reservation prepared/node-a/reservation.json \
+  --tenant-state-manifest prepared/node-a/tenant-state.json \
+  --postgres-client-set postgres-pki/node-a
+```
+
+The reservation and receipt are versioned non-secret JSON. They bind manager endpoint, node/token/revision/operation, canonical inventory, remote address, deployment format, explicit tenant endpoint, expected node certificate fingerprint, provision generation, manifest digest, migration bundle digest, and ordered immutable migration inventory. Any mismatch fails before TLS installation, SSH writes, release finalization, attestation, or operation submission. The admin URL file, active `pg_ident` path, and database-host filesystem authority never enter a release, worker environment, manager payload, proxy, engine, or node agent. A failed preparation allocation can be retried with the same token or explicitly abandoned; namespace database state is retained.
+
+The active PostgreSQL 18 fixture uses `ssl=on`, a PostgreSQL-only CA, a `postgres-server` SAN matching `server_name`, and ordered `hostssl cert map=wruntime_nodes` rules for `+wr__tenant_client_auth` before broader platform rules. Disposable migration logins use a separate `+wr__migration_executor_auth` SCRAM rule on the co-located Unix socket; the provisioner grants that marker only for an attempt and drops the login afterward. The identity file is server-owned mode `0600`; only the co-located one-shot provisioner can replace/reload it. Tenant endpoints stay on private service/node networks. Platform administration uses a separate explicit credential/rule.
+
+Development setup is deliberately not a sandbox deployment workflow. Run `just dev-up` on the Docker-capable host to create or converge the compatible generation at `<absolute-git-common-dir>/wruntime-dev-state`. One recorded owner worktree supplies the Compose file for the fixed `wruntime-dev` project; one global lock serializes all linked-worktree setup, reset, tests, and examples. Each preparation maps the Docker daemon architecture to `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`, verifies the mapped target is already listed by `rustup target list --installed` before taking the shared lock or changing Compose/state, and incrementally runs `cargo zigbuild` in that owner's existing `target/`, verifies the ELF architecture/static executability, and builds a content-tagged one-shot provisioner from a staged two-file `Dockerfile`/`wr-cli` context. Compose receives that exact local image through the canonical generated override with `pull_policy: never`; Docker receives no repository source and uses normal layer caching. A missing mapped target fails without changing the toolchain and reports the exact owner action `rustup target add <mapped-target>`. The shared root contains host PKI and public `fixture/` artifacts. The UID-70 provisioner reads only top-level `pki/node-a-public.pem` (leaf plus issuer); issuance, server, and node private directories remain mode `0700` and keys mode `0600`. `owner.json` and `fixture/ready.json` are published atomically only after PostgreSQL, provisioning/migration, map reload, digest, and bucket validation. Callers automatically hash the scoped fixture sources and verify owner/manifest/migration/artifact/PKI bindings before database access. Missing, deleted-owner, partial, or mismatched state reports owner plus active/required digests and requires coordinated destructive host `just dev-reprepare`; ordinary `dev-up` never steals ownership. Pi uses only `postgres.internal` at `127.0.0.1:5433` and fixed manager/job URLs, accepts no fixture root/project/runner/admin/ident/certificate/endpoint input, and performs no Docker, reload, provision, migrate, or topology discovery. Protected deployment qualification remains separate and never reads, locks, or treats shared development state as evidence.
 
 ### Manager deploy readiness contract
 
@@ -215,7 +274,7 @@ wr-cli node deploy --node-id node-a myapp.tar.gz deploy@10.0.1.1 \
     --manager https://10.0.1.1:9000 --request-token node-a-initial
 ```
 
-Node deploy creates an inactive manager allocation for the stable `--node-id`; that allocation reserves the operation UUID and canonical revision digest embedded in the prelaunch engine configuration. The CLI verifies the bundle, resolves host and manager-derived values, uploads bytes without touching running workloads, writes digest-covered release metadata, and calls `FinalizeDeployment`. It then requires a fresh compatible agent attestation and submits one durable operation. The manager and agent—not the CLI's SSH session—select, stop, start, verify, switch authority, commit, and clean up. A CLI wait timeout is nonzero but does not cancel durable work.
+For a database-free bundle, `node deploy` may create the inactive manager allocation directly. For a database-enabled bundle, the direct path is removed: `reserve-deployment` must create the allocation, and `node deploy` idempotently replays it only after the matching tenant receipt and `postgres-client` set validate. It then installs credentials outside the release, materializes only stable credential paths and non-secret expected state, uploads/finalizes inactive bytes, requires a fresh compatible agent attestation, and submits one durable operation. The manager and agent—not the CLI SSH session—select, stop, start, verify, switch authority, commit, and clean up. A CLI wait timeout is nonzero but does not cancel durable work.
 
 Immutable bundle content is retained under `{workdir}/wr-node/bundles/<digest>/` and revisions under `wr-node/releases/<revision>/`. Each proxy/engine slot selects its own release through `wr-node/slots/<slot>`; no node-wide engine `current` or aggregate activation exists. A staging/finalization interruption leaves serving authority unchanged. An allocation finalized but not submitted is explicit and may be removed only with `node abandon`; once submitted, recovery uses operation status/resume or rollback rather than inference from CLI exit.
 

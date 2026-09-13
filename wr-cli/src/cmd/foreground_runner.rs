@@ -1347,18 +1347,26 @@ async fn prepare_managed_engine_configs(
         .operation
         .context("foreground SubmitOperation omitted operation")?;
 
-    let directory = tempfile::tempdir().context("failed to create foreground config directory")?;
-    let mut paths = Vec::with_capacity(configs.len());
-    for (index, (mut config, engine_slot)) in configs.into_iter().enumerate() {
+    for (config, engine_slot) in &mut configs {
         config.deployment = Some(DeploymentConfig {
             node_id: node_id.clone(),
             revision: deployment.revision.to_string(),
             bundle_digest: deployment.bundle_digest.clone(),
-            engine_slot,
+            engine_slot: engine_slot.clone(),
             operation_id: operation.operation_id.clone(),
             revision_digest: deployment.revision_digest.clone(),
             extra: super::config::empty_extra_fields(),
         });
+    }
+    let mut generated_configs = configs
+        .into_iter()
+        .map(|(config, _)| config)
+        .collect::<Vec<_>>();
+    EngineConfig::populate_local_tenant_expectations(&mut generated_configs)?;
+
+    let directory = tempfile::tempdir().context("failed to create foreground config directory")?;
+    let mut paths = Vec::with_capacity(generated_configs.len());
+    for (index, config) in generated_configs.into_iter().enumerate() {
         let path = directory.path().join(format!("engine-{}.toml", index + 1));
         let rendered = config.to_toml()?.replace(
             &format!("revision = \"{}\"", deployment.revision),

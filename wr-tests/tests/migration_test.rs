@@ -1,6 +1,8 @@
 mod helpers;
 use helpers::db::{manager_pool_in_schema, require_db_url};
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 
 async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Result<()> {
@@ -413,6 +415,42 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
             .get::<_, i64>(0),
         1
     );
+
+    Ok(())
+}
+
+/// Concurrent first starts serialize schema creation before issuing DDL.
+#[tokio::test]
+async fn test_concurrent_system_schema_bootstrap_is_serialized() -> Result<()> {
+    let pool = wr_common::pool::build_pool(&require_db_url(), 2)
+        .context("failed to build bootstrap pool")?;
+    let blocker = pool.get().await.context("bootstrap lock connection")?;
+    blocker
+        .batch_execute(
+            "BEGIN; \
+             SELECT pg_advisory_xact_lock(hashtext('wr-manager-schema-bootstrap'))",
+        )
+        .await
+        .context("acquire bootstrap lock")?;
+
+    let waiter = pool.get().await.context("bootstrap waiter connection")?;
+    let mut bootstrap =
+        tokio::spawn(async move { wr_manager::migrate::ensure_system_schema(&waiter).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut bootstrap)
+            .await
+            .is_err(),
+        "schema bootstrap did not wait for the serialization lock"
+    );
+
+    blocker
+        .batch_execute("ROLLBACK")
+        .await
+        .context("release bootstrap lock")?;
+    let result = tokio::time::timeout(Duration::from_secs(5), bootstrap)
+        .await
+        .context("schema bootstrap remained blocked after lock release")?;
+    result.context("schema bootstrap task panicked")??;
 
     Ok(())
 }

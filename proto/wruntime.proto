@@ -238,7 +238,7 @@ message RegisterEngineRequest {
 message RegisterEngineResponse   {
   bool                              accepted       = 1;
   repeated NamespaceSecrets         secrets        = 2; // only the requested secrets, decrypted
-  repeated NamespaceDbCredential    db_credentials = 3; // per-namespace DB role + password
+  repeated NamespaceAccessDescriptor namespace_access = 3; // deterministic, non-secret tenant identities
   EngineOwnershipFence              fence          = 4;
   bytes serialized_snapshot                        = 5;
 }
@@ -281,12 +281,15 @@ message UpsertRoutingRuleResponse {}
 message DeleteRoutingRuleRequest  { string rule_id = 1; }
 message DeleteRoutingRuleResponse {}
 
-// ── Database credentials ──────────────────────────────────────────────────
+// ── Namespace database access ─────────────────────────────────────────────
 
-message NamespaceDbCredential {
-  string namespace = 1;
-  string role      = 2;  // e.g. "wr_ns_ecommerce"
-  string password  = 3;
+// Non-secret identities used with the node's locally installed PostgreSQL
+// client certificate. Provisioning generation and migration state remain local.
+message NamespaceAccessDescriptor {
+  string namespace       = 1;
+  string database        = 2;
+  string runtime_role    = 3;
+  string readiness_role  = 4;
 }
 
 // ── Secrets ───────────────────────────────────────────────────────────────

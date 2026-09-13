@@ -40,13 +40,13 @@ echo "Ledger engine: port ${LEDGER_PORT}"
 render_exchange_config() {
 	local src="$1" dest="$2"
 	render_config "$src" "$dest" \
-		"postgres://user:pass@localhost:5432/stockmarket" "${DB_URL}"
+		"postgres://user:pass@localhost:5432/stockmarket" "${JOB_DB_URL}"
 }
 
 render_ledger_config() {
 	local src="$1" dest="$2"
 	render_config "$src" "$dest" \
-		"postgres://user:pass@localhost:5432/stockmarket" "${DB_URL}" \
+		"postgres://user:pass@localhost:5432/stockmarket" "${JOB_DB_URL}" \
 		"http://127.0.0.1:8900" "${S3_ENDPOINT}" \
 		"access_key_id     = \"rustfsadmin\"" "access_key_id     = \"${S3_ACCESS_KEY}\"" \
 		"secret_access_key = \"rustfsadmin\"" "secret_access_key = \"${S3_SECRET_KEY}\""
@@ -68,6 +68,7 @@ SIMULATOR_CFG="${CONFIG_DIR}/stockmarket-simulator.toml"
 render_ledger_config examples/stockmarket/engine-ledger.toml "$LEDGER_CFG"
 render_config "$LEDGER_CFG" "$LEDGER_CFG" "127.0.0.1:9101" "127.0.0.1:${LEDGER_PORT}"
 copy_config examples/stockmarket/engine-simulator.toml "$SIMULATOR_CFG"
+prepare_example_tenant_native "${EXCHANGE_CONFIGS[@]}" "$LEDGER_CFG"
 
 # ── Prepare manager + proxy configs ──────────────────────────────────────
 MANAGER_CFG=$(prepare_manager_config)

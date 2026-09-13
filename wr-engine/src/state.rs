@@ -311,6 +311,8 @@ impl ResourceAccounting {
 pub struct DbAccess {
     pub pool: Arc<Pool>,
     pub schema: Arc<str>,
+    pub expected_database: Arc<str>,
+    pub expected_user: Arc<str>,
     pub timeouts: DbTimeouts,
     pub telemetry_include_query_text: bool,
 }
@@ -474,6 +476,8 @@ impl ModuleState {
             (None, Some(pool), Some(schema)) => Some(DbAccess {
                 pool,
                 schema,
+                expected_database: Arc::from(""),
+                expected_user: Arc::from(""),
                 timeouts: services.db_timeouts,
                 telemetry_include_query_text: services.db_telemetry_include_query_text,
             }),

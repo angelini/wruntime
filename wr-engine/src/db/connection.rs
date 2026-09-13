@@ -15,7 +15,7 @@ pub(crate) async fn prepare_connection(
     use std::fmt::Write;
     let mut sql = String::new();
     let quoted = schema.replace('"', "\"\"");
-    write!(sql, "SET search_path = \"{quoted}\"; ").unwrap();
+    write!(sql, "SET search_path = \"{quoted}\", pg_catalog; ").unwrap();
     write!(
         sql,
         "SET statement_timeout = '{}s'; SET idle_in_transaction_session_timeout = '{}s';",
@@ -37,12 +37,41 @@ pub(crate) async fn prepare_connection(
 pub(crate) async fn get_prepared_connection(
     pool: &deadpool_postgres::Pool,
     schema: &Arc<str>,
+    expected_database: &Arc<str>,
+    expected_user: &Arc<str>,
     timeouts: &DbTimeouts,
 ) -> Result<deadpool_postgres::Object, DbError> {
     let client = pool
         .get()
         .await
         .map_err(|e| DbError::Connection(e.to_string()))?;
-    prepare_connection(&client, schema, timeouts).await?;
+    if !expected_database.is_empty() || !expected_user.is_empty() {
+        let identity = match client
+            .query_one("SELECT current_database(), session_user, current_user", &[])
+            .await
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(deadpool_postgres::Object::take(client));
+                return Err(DbError::Connection(error.to_string()));
+            }
+        };
+        let database: String = identity.get(0);
+        let session_user: String = identity.get(1);
+        let current_user: String = identity.get(2);
+        if database != expected_database.as_ref()
+            || session_user != expected_user.as_ref()
+            || current_user != expected_user.as_ref()
+        {
+            drop(deadpool_postgres::Object::take(client));
+            return Err(DbError::Connection(
+                "PostgreSQL guest connection identity mismatch".into(),
+            ));
+        }
+    }
+    if let Err(error) = prepare_connection(&client, schema, timeouts).await {
+        drop(deadpool_postgres::Object::take(client));
+        return Err(error);
+    }
     Ok(client)
 }

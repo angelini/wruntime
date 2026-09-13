@@ -71,8 +71,9 @@ impl proto::ExchangeService for Component {
     fn setup(&self, req: proto::SetupRequest) -> Result<proto::SetupResponse, ServiceError> {
         let sp = wr_sdk::span!("exchange.setup");
 
-        // Tables are created by engine-side migrations; truncate for a clean run.
-        query("TRUNCATE orders, positions").execute()?;
+        // Offline migrations create the tables; bounded runtime DML resets the run.
+        query("DELETE FROM orders").execute()?;
+        query("DELETE FROM positions").execute()?;
 
         let count = i32::try_from(req.symbols.len())
             .map_err(|_| ServiceError::bad_request("too many symbols"))?;

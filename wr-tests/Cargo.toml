@@ -3,6 +3,13 @@ name    = "wr-tests"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+native-postgres-e2e = []
+
+[[test]]
+name              = "tenant_isolation_e2e_test"
+required-features = ["native-postgres-e2e"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["transport"] }
@@ -19,6 +26,7 @@ prost-types = "0.14"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+tokio-postgres = "0.7"
 wr-cli = { path = "../wr-cli" }
 refinery = { version = "0.9", features = ["tokio-postgres"] }
 wr-common = { path = "../wr-common", features = [
@@ -58,6 +66,7 @@ wasmtime-wasi-http = { version = "46", default-features = false, features = [
 ] }
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
+rustls-pemfile = "2"
 
 [build-dependencies]
 prost-build = "0.14"

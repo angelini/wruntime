@@ -1,29 +1,17 @@
 #!/usr/bin/env bash
-set -e
-psql -U postgres -c "CREATE DATABASE wruntime_example;"
-psql -U postgres -c "CREATE DATABASE wruntime_test;"
-
-# Bootstrap the local guest role referenced by example database URLs.
-# Engine startup provisions per-namespace runtime roles separately.
-psql -U postgres <<'SQL'
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'wr_guest') THEN
-        CREATE ROLE wr_guest LOGIN;
-    END IF;
-END
-$$;
-
--- Deny access to control-plane tables in public schema.
-REVOKE ALL ON SCHEMA public FROM wr_guest;
-GRANT USAGE ON SCHEMA public TO wr_guest;
-
--- Apply the same to both databases.
-\c wruntime_example
-REVOKE ALL ON SCHEMA public FROM wr_guest;
-GRANT USAGE ON SCHEMA public TO wr_guest;
-
-\c wruntime_test
-REVOKE ALL ON SCHEMA public FROM wr_guest;
-GRANT USAGE ON SCHEMA public TO wr_guest;
+set -euo pipefail
+# Greenfield platform bootstrap only. Namespace databases, roles, schemas,
+# migration ledgers, and pg_ident mappings belong exclusively to the offline
+# provision/migrate phase.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" <<'SQL'
+CREATE ROLE wr_manager_platform LOGIN PASSWORD 'wruntime-dev-manager';
+CREATE ROLE wr_jobs_platform LOGIN PASSWORD 'wruntime-dev-jobs';
+CREATE DATABASE wruntime_manager OWNER wr_manager_platform;
+CREATE DATABASE wruntime_jobs OWNER wr_jobs_platform;
+CREATE DATABASE wruntime_test;
+CREATE DATABASE wruntime_example;
+REVOKE CONNECT,TEMPORARY ON DATABASE wruntime_manager FROM PUBLIC;
+REVOKE CONNECT,TEMPORARY ON DATABASE wruntime_jobs FROM PUBLIC;
+GRANT CONNECT,TEMPORARY ON DATABASE wruntime_manager TO wr_manager_platform;
+GRANT CONNECT,TEMPORARY ON DATABASE wruntime_jobs TO wr_jobs_platform;
 SQL

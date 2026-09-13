@@ -21,6 +21,7 @@ pub mod node;
 pub mod node_agent;
 pub mod node_backend;
 pub mod operations;
+pub mod postgres;
 pub mod schedules;
 pub mod secrets;
 pub mod service_gen;

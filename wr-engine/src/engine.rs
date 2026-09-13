@@ -23,7 +23,7 @@ use wr_engine::pool::{blob_key_prefix, module_schema};
 use wr_engine::state::{BlobAccess, DbAccess, DbTimeouts, LlmAccess, ModuleServices, ModuleState};
 
 struct DatabaseRuntime {
-    admin_pool: Arc<Pool>,
+    platform_pool: Arc<Pool>,
     namespace_pools: HashMap<String, Arc<Pool>>,
 }
 
@@ -36,8 +36,10 @@ struct ResolvedServices {
 pub struct EngineRunner {
     engine: Arc<Engine>,
     config: EngineConfig,
-    /// Engine-owned administrative pool, namespace pools, and DB background work.
+    /// Platform/job pool plus certificate-authenticated namespace runtime pools.
     database: Option<DatabaseRuntime>,
+    /// Manager descriptors after exact reconciliation with node-local state.
+    namespace_access: Vec<wr_engine::tenant_db::VerifiedNamespaceAccess>,
     /// Normalized unique-schema startup work and summed namespace capacities.
     startup_db: wr_engine::startup_db::StartupDbManifest,
     /// Shared S3-compatible blobstore client, present when `[blobstore]` is configured.
@@ -51,6 +53,7 @@ pub struct EngineRunner {
 
 impl EngineRunner {
     pub fn new(config: EngineConfig) -> Result<Self> {
+        config.validate_tenant_startup()?;
         let startup_db = wr_engine::startup_db::StartupDbManifest::build(&config)?;
         let engine = wr_engine::runtime::build_engine(&config.pool)?;
 
@@ -59,7 +62,10 @@ impl EngineRunner {
             .as_ref()
             .map(|db| {
                 Ok::<_, anyhow::Error>(DatabaseRuntime {
-                    admin_pool: Arc::new(wr_engine::pool::build_pool(&db.url, db.max_connections)?),
+                    platform_pool: Arc::new(wr_engine::pool::build_pool(
+                        &db.url,
+                        db.max_connections,
+                    )?),
                     namespace_pools: HashMap::new(),
                 })
             })
@@ -87,6 +93,7 @@ impl EngineRunner {
             engine: Arc::new(engine),
             config,
             database,
+            namespace_access: Vec::new(),
             startup_db,
             blobstore_client,
             llm_client,
@@ -94,10 +101,10 @@ impl EngineRunner {
         })
     }
 
-    pub fn admin_pool(&self) -> Option<Arc<Pool>> {
+    pub fn platform_pool(&self) -> Option<Arc<Pool>> {
         self.database
             .as_ref()
-            .map(|database| database.admin_pool.clone())
+            .map(|database| database.platform_pool.clone())
     }
 
     pub async fn run_job_migrations(&self) -> Result<()> {
@@ -105,8 +112,8 @@ impl EngineRunner {
             return Ok(());
         }
         let pool = self
-            .admin_pool()
-            .context("worker mode requires an administrative database pool")?;
+            .platform_pool()
+            .context("worker mode requires a platform database pool")?;
         wr_engine::job_migration::run_job_migrations(&pool).await
     }
 
@@ -118,7 +125,7 @@ impl EngineRunner {
             .database
             .as_ref()
             .context("worker mode requires a database runtime")?;
-        wr_engine::worker::spawn_recovery_coordinator(tasks, database.admin_pool.clone());
+        wr_engine::worker::spawn_recovery_coordinator(tasks, database.platform_pool.clone());
         Ok(())
     }
 
@@ -137,110 +144,110 @@ impl EngineRunner {
         });
     }
 
-    /// Build per-namespace connection pools from manager-provided DB credentials.
-    /// Must be called after registration and before loading modules.
-    pub fn build_namespace_pools(
+    /// Reconcile manager-supplied non-secret identities with the local expected
+    /// state before any tenant connection is attempted.
+    pub fn accept_namespace_access(
         &mut self,
-        credentials: &[wr_common::wruntime::NamespaceDbCredential],
+        descriptors: &[wr_common::wruntime::NamespaceAccessDescriptor],
     ) -> Result<()> {
-        let db_config = match &self.config.database {
-            Some(db) => db,
-            None => return Ok(()),
+        let Some(database_config) = &self.config.database else {
+            anyhow::ensure!(
+                descriptors.is_empty(),
+                "manager returned namespace access without database config"
+            );
+            return Ok(());
         };
-        let database = self
-            .database
-            .as_mut()
-            .context("database config has no runtime")?;
-
-        for cred in credentials {
-            let Some(max_size) = self
-                .startup_db
-                .namespace_capacities
-                .get(&cred.namespace)
-                .copied()
-            else {
-                continue;
-            };
-            let pool = wr_engine::pool::build_guest_pool(
-                &db_config.url,
-                &cred.role,
-                &cred.password,
-                max_size,
-            )?;
-            database
-                .namespace_pools
-                .insert(cred.namespace.clone(), Arc::new(pool));
+        let tenant = database_config
+            .tenant
+            .as_ref()
+            .context("database-enabled engine lacks tenant TLS configuration")?;
+        let node_id = self
+            .config
+            .deployment
+            .as_ref()
+            .context("managed deployment metadata is required")?
+            .node_id
+            .as_str();
+        let platform_database = database_config
+            .url
+            .parse::<tokio_postgres::Config>()
+            .context("invalid platform database URL")?
+            .get_dbname()
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+        self.namespace_access = wr_engine::tenant_db::reconcile_descriptors(
+            node_id,
+            tenant,
+            descriptors,
+            self.startup_db.namespace_capacities.keys().cloned(),
+            &platform_database,
+        )?;
+        let revision_digest = &self
+            .config
+            .deployment
+            .as_ref()
+            .context("managed deployment metadata is required")?
+            .revision_digest;
+        for access in &self.namespace_access {
+            anyhow::ensure!(
+                &access.expectation.deployment_digest == revision_digest,
+                "local namespace deployment digest does not match the authenticated revision"
+            );
+            if access.expectation.migrations.is_empty() {
+                if let Some(bundle) = &self.startup_db.migration_bundle {
+                    anyhow::ensure!(
+                        access.expectation.bundle_digest == bundle.manifest.bundle_digest,
+                        "local namespace migration bundle digest mismatch"
+                    );
+                }
+            }
         }
         Ok(())
     }
 
-    /// Converge target-database roles, schemas, and grants for DB-enabled modules.
-    /// Idempotent and safe across concurrent engine startup.
-    pub async fn provision_schemas(
-        &self,
-        credentials: &[wr_common::wruntime::NamespaceDbCredential],
-    ) -> Result<()> {
-        use std::collections::{BTreeMap, BTreeSet};
-
-        let pool = match self.admin_pool() {
-            Some(pool) => pool,
-            None => return Ok(()),
-        };
-        let credentials: HashMap<_, _> = credentials
-            .iter()
-            .map(|credential| (credential.namespace.as_str(), credential))
-            .collect();
-        let mut schemas: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
-        for schema in &self.startup_db.schemas {
-            schemas
-                .entry(schema.namespace.as_str())
-                .or_default()
-                .insert(schema.schema.clone());
+    pub async fn verify_namespace_readiness(&self) -> Result<()> {
+        if self.namespace_access.is_empty() {
+            return Ok(());
         }
-
-        let specifications = schemas
-            .into_iter()
-            .map(|(namespace, schemas)| {
-                let credential = credentials.get(namespace).ok_or_else(|| {
-                    anyhow::anyhow!("manager omitted database credentials for a namespace")
-                })?;
-                Ok(wr_engine::provisioning::NamespaceProvisioning {
-                    namespace: namespace.to_string(),
-                    role: credential.role.clone(),
-                    password: credential.password.clone(),
-                    schemas: schemas.into_iter().collect(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        wr_engine::provisioning::provision_namespaces(&pool, &specifications).await
+        let tenant = self
+            .config
+            .database
+            .as_ref()
+            .and_then(|database| database.tenant.as_ref())
+            .context("tenant database configuration is missing")?;
+        wr_engine::tenant_db::verify_readiness(
+            tenant,
+            &self.namespace_access,
+            self.startup_db.migration_bundle.as_ref(),
+        )
+        .await
     }
 
-    /// Run database migrations for every module that declares a `migrations_path`.
-    /// Uses advisory locks to serialize across engine replicas and restricts
-    /// `search_path` so migrations can only touch the module's own schema.
-    pub async fn run_migrations(&self) -> Result<()> {
-        let pool = match self.admin_pool() {
-            Some(pool) => pool,
-            None => return Ok(()),
+    /// Construct one runtime pool per namespace only after readiness verification
+    /// and complete verifier disconnect.
+    pub fn build_namespace_pools(&mut self) -> Result<()> {
+        let Some(database_config) = &self.config.database else {
+            return Ok(());
         };
-        for schema in &self.startup_db.schemas {
-            if let Some(migrations_path) = &schema.migrations_path {
-                let migrations_path = migrations_path.to_str().with_context(|| {
-                    format!(
-                        "migration path for module '{}.{}' is not valid UTF-8",
-                        schema.namespace, schema.module
-                    )
-                })?;
-                wr_engine::migration::run_module_migrations(
-                    &pool,
-                    &schema.schema,
-                    migrations_path,
-                    &schema.module,
-                )
-                .await
-                .with_context(|| format!("migration failed for module '{}'", schema.module))?;
-            }
+        let tenant = database_config
+            .tenant
+            .as_ref()
+            .context("tenant database configuration is missing")?;
+        let database = self
+            .database
+            .as_mut()
+            .context("database config has no runtime")?;
+        for access in &self.namespace_access {
+            let max_size = self.startup_db.namespace_capacities[&access.descriptor.namespace];
+            let pool = wr_engine::tenant_db::build_runtime_pool(tenant, access, max_size)?;
+            anyhow::ensure!(
+                database
+                    .namespace_pools
+                    .insert(access.descriptor.namespace.clone(), Arc::new(pool))
+                    .is_none(),
+                "duplicate namespace runtime pool"
+            );
         }
         Ok(())
     }
@@ -298,9 +305,16 @@ impl EngineRunner {
                         module_config.name
                     )
                 })?;
+            let access = self
+                .namespace_access
+                .iter()
+                .find(|access| access.descriptor.namespace == module_config.namespace)
+                .context("namespace pool has no verified access descriptor")?;
             Some(DbAccess {
                 pool,
                 schema: Arc::from(module_schema(module_namespace, module_name)),
+                expected_database: Arc::from(access.descriptor.database.as_str()),
+                expected_user: Arc::from(access.descriptor.runtime_role.as_str()),
                 timeouts: DbTimeouts {
                     statement_timeout_secs: config.statement_timeout_secs,
                     idle_in_transaction_timeout_secs: config.idle_in_transaction_timeout_secs,
@@ -480,7 +494,7 @@ impl EngineRunner {
         // the Postgres queue and dispatches them as HTTP requests.
         if let ExecutionMode::Worker(worker) = execution {
             let admin_pool = self
-                .admin_pool()
+                .platform_pool()
                 .context("validated worker mode requires a database runtime")?;
             let db_url = self
                 .config

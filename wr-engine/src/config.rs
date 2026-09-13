@@ -127,9 +127,12 @@ pub struct JobAdminConfig {
 
 #[derive(Deserialize, Clone)]
 pub struct DatabaseConfig {
-    /// `postgres://user:pass@host:port/dbname` connection string.
-    /// Used for admin operations (schema provisioning, migrations).
+    /// Platform/job-queue database URL. This credential is never used for a
+    /// namespace database.
     pub url: String,
+    /// Certificate-authenticated namespace database configuration. Required
+    /// whenever a module enables the database capability.
+    pub tenant: Option<TenantDatabaseConfig>,
     /// Maximum number of pooled connections. Defaults to 20.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
@@ -146,6 +149,64 @@ pub struct DatabaseConfig {
     /// Database span disclosure controls. Query text is omitted by default.
     #[serde(default)]
     pub telemetry: DatabaseTelemetryConfig,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TenantDatabaseConfig {
+    /// DNS identity verified from the PostgreSQL server certificate.
+    pub server_name: String,
+    /// Optional numeric address used for the TCP connection while preserving
+    /// `server_name` for certificate verification.
+    pub host_addr: Option<String>,
+    #[serde(default = "default_postgres_port")]
+    pub port: u16,
+    pub trust_root_path: String,
+    pub client_cert_path: String,
+    pub client_key_path: String,
+    #[serde(default = "default_tenant_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    #[serde(default)]
+    pub expected_namespaces: Vec<NamespaceDatabaseExpectation>,
+}
+
+#[derive(Deserialize, Clone, Debug, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceDatabaseExpectation {
+    pub namespace: String,
+    pub generation: u64,
+    pub deployment_digest: String,
+    pub bundle_digest: String,
+    /// Complete authenticated migration inventory for this namespace. Generated
+    /// deployments populate this when a namespace's modules span engines.
+    #[serde(default)]
+    pub migrations: Vec<ExpectedMigration>,
+}
+
+#[derive(Deserialize, Clone, Debug, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedMigration {
+    pub module: String,
+    pub version: u64,
+    pub filename: String,
+    pub content_hash: String,
+    pub byte_length: u64,
+}
+
+fn default_postgres_port() -> u16 {
+    5432
+}
+
+fn default_tenant_connect_timeout_secs() -> u64 {
+    10
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.starts_with("sha256:")
+        && value.len() == 71
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -503,6 +564,23 @@ impl EngineConfig {
         wr_common::config::load(path)
     }
 
+    /// Apply service-launch requirements that unbundled example and bundle
+    /// templates intentionally cannot satisfy before node-local expected state
+    /// and certificate paths are staged.
+    pub fn validate_tenant_startup(&self) -> Result<()> {
+        self.validate_inner()?;
+        if self.modules.iter().any(|module| module.database) {
+            anyhow::ensure!(
+                self.database
+                    .as_ref()
+                    .and_then(|database| database.tenant.as_ref())
+                    .is_some(),
+                "database.tenant is required for database-enabled modules at engine startup"
+            );
+        }
+        Ok(())
+    }
+
     fn validate_inner(&self) -> Result<()> {
         use wr_common::config::Validator;
         let mut v = Validator::new();
@@ -648,6 +726,92 @@ impl EngineConfig {
                 database.idle_in_transaction_timeout_secs > 0,
                 "database.idle_in_transaction_timeout_secs must be > 0",
             );
+            if let Some(tenant) = &database.tenant {
+                v.check(
+                    !tenant.server_name.is_empty(),
+                    "database.tenant.server_name is required",
+                );
+                v.check(tenant.port > 0, "database.tenant.port must be > 0");
+                v.check(
+                    !tenant.trust_root_path.is_empty(),
+                    "database.tenant.trust_root_path is required",
+                );
+                v.check(
+                    !tenant.client_cert_path.is_empty(),
+                    "database.tenant.client_cert_path is required",
+                );
+                v.check(
+                    !tenant.client_key_path.is_empty(),
+                    "database.tenant.client_key_path is required",
+                );
+                v.check(
+                    tenant.connect_timeout_secs > 0,
+                    "database.tenant.connect_timeout_secs must be > 0",
+                );
+                let mut namespaces = std::collections::BTreeSet::new();
+                for expected in &tenant.expected_namespaces {
+                    v.check(
+                        namespaces.insert(&expected.namespace),
+                        format!(
+                            "duplicate database.tenant expectation for namespace '{}'",
+                            expected.namespace
+                        ),
+                    );
+                    v.check(
+                        expected.generation > 0,
+                        format!(
+                            "database.tenant expected generation for '{}' must be nonzero",
+                            expected.namespace
+                        ),
+                    );
+                    for (name, digest) in [
+                        ("deployment", &expected.deployment_digest),
+                        ("bundle", &expected.bundle_digest),
+                    ] {
+                        v.check(
+                            valid_sha256_digest(digest),
+                            format!(
+                                "database.tenant {name} digest for '{}' is invalid",
+                                expected.namespace
+                            ),
+                        );
+                    }
+                    let mut migrations = std::collections::BTreeSet::new();
+                    for migration in &expected.migrations {
+                        v.check(
+                            migrations.insert((&migration.module, migration.version)),
+                            format!(
+                                "duplicate database.tenant migration expectation for '{}.{}' version {}",
+                                expected.namespace, migration.module, migration.version
+                            ),
+                        );
+                        v.check(
+                            migration.version > 0
+                                && migration
+                                    .filename
+                                    .starts_with(&format!("V{}__", migration.version))
+                                && migration.filename.ends_with(".sql")
+                                && valid_sha256_digest(&migration.content_hash),
+                            format!(
+                                "database.tenant migration expectation for '{}.{}' is invalid",
+                                expected.namespace, migration.module
+                            ),
+                        );
+                    }
+                }
+                let required = self
+                    .modules
+                    .iter()
+                    .filter(|module| module.database)
+                    .map(|module| &module.namespace)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let supplied = tenant
+                    .expected_namespaces
+                    .iter()
+                    .map(|value| &value.namespace)
+                    .collect::<std::collections::BTreeSet<_>>();
+                v.check(required == supplied, "database.tenant expected_namespaces must exactly match database-enabled namespaces");
+            }
         }
         if let Some(blobstore) = &self.blobstore {
             v.check(
@@ -916,6 +1080,50 @@ url = "postgres://localhost/test"
         assert!(message.contains("job_admin.queue_id"));
         assert!(message.contains("job_admin.advertise_address"));
         assert!(message.contains("must not conflict"));
+    }
+
+    #[test]
+    fn database_enabled_modules_require_local_tls_expected_state() {
+        let mut config = engine_with_database(
+            r#"
+[[module]]
+name = "catalog"
+namespace = "shop"
+version = "1.0.0"
+wasm_path = "catalog.wasm"
+database = true
+"#,
+        );
+        let wasm = tempfile::NamedTempFile::new().expect("wasm fixture");
+        let schema = tempfile::NamedTempFile::new().expect("schema fixture");
+        config.modules[0].wasm_path = wasm.path().to_string_lossy().into_owned();
+        config.modules[0].schema_path = Some(schema.path().to_string_lossy().into_owned());
+        config
+            .validate()
+            .expect("unbundled template validation must not require staged tenant state");
+        let error = config
+            .validate_tenant_startup()
+            .expect_err("service launch must require tenant TLS config");
+        assert!(error.to_string().contains("database.tenant is required"));
+
+        let parsed = toml::from_str::<EngineConfig>(
+            r#"
+listen_address = "127.0.0.1:9100"
+[node]
+proxy_address = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_address = "https://127.0.0.1:9443"
+[database]
+url = "postgres://localhost/jobs"
+[database.tenant]
+server_name = "postgres.internal"
+trust_root_path = "/run/postgres/ca.pem"
+client_cert_path = "/run/postgres/client.pem"
+client_key_path = "/run/postgres/client.key"
+private_key_content = "forbidden"
+"#,
+        );
+        assert!(parsed.is_err(), "inline private material must not parse");
     }
 
     #[test]

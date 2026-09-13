@@ -96,30 +96,27 @@ pub fn redact_database_url(database_url: &str) -> String {
     format!("{scheme}://{redacted_authority}{path_and_query}")
 }
 
-/// Build a connection URL by replacing the user:password in `admin_url` with
-/// `role` and `password`. Preserves host, port, dbname, and query params.
-pub fn guest_pool_url(admin_url: &str, role: &str, password: &str) -> String {
-    // Parse: postgres://user:pass@host:port/db?params
-    let Some(after_scheme) = admin_url.split_once("://") else {
-        return admin_url.to_string();
-    };
-    let (scheme, rest) = (after_scheme.0, after_scheme.1);
-    let host_and_rest = match rest.split_once('@') {
-        Some((_, h)) => h,
-        None => rest,
-    };
-    format!("{scheme}://{role}:{password}@{host_and_rest}")
-}
-
-/// Build a `deadpool_postgres` pool using per-namespace credentials.
-pub fn build_guest_pool(
-    admin_url: &str,
-    role: &str,
-    password: &str,
+/// Build a guest pool from a structured PostgreSQL configuration and an
+/// explicit transport connector. Callers cannot inherit or mutate a platform
+/// URL, and the destructive guest recycle policy is always installed.
+pub fn build_guest_pool_with_connector<T>(
+    pg_config: tokio_postgres::Config,
+    tls: T,
     max_size: usize,
-) -> anyhow::Result<Pool> {
-    let url = guest_pool_url(admin_url, role, password);
-    build_pool_with_options(&url, max_size, None, PoolPolicy::Guest)
+) -> anyhow::Result<Pool>
+where
+    T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket> + Clone + Sync + Send + 'static,
+    T::Stream: Sync + Send,
+    T::TlsConnect: Sync + Send,
+    <T::TlsConnect as tokio_postgres::tls::TlsConnect<tokio_postgres::Socket>>::Future: Send,
+{
+    let manager =
+        deadpool_postgres::Manager::from_config(pg_config, tls, manager_config(PoolPolicy::Guest));
+    Pool::builder(manager)
+        .config(pool_config(max_size, PoolPolicy::Guest))
+        .runtime(Runtime::Tokio1)
+        .build()
+        .map_err(Into::into)
 }
 
 /// Format a `tokio_postgres::Error` with its full source chain.
@@ -146,7 +143,7 @@ mod tests {
 
     use deadpool_postgres::RecyclingMethod;
 
-    use super::{guest_pool_url, manager_config, pool_config, redact_database_url, PoolPolicy};
+    use super::{manager_config, pool_config, redact_database_url, PoolPolicy};
 
     #[test]
     fn pool_policies_are_explicit() {
@@ -178,42 +175,6 @@ mod tests {
         assert_eq!(
             redact_database_url("postgres://postgres@localhost:5433/wruntime_example"),
             "postgres://postgres@localhost:5433/wruntime_example"
-        );
-    }
-
-    #[test]
-    fn test_guest_pool_url_with_user_pass() {
-        assert_eq!(
-            guest_pool_url(
-                "postgres://admin:secret@localhost:5432/mydb",
-                "wr_ns_ecommerce",
-                "abc123"
-            ),
-            "postgres://wr_ns_ecommerce:abc123@localhost:5432/mydb"
-        );
-    }
-
-    #[test]
-    fn test_guest_pool_url_user_only() {
-        assert_eq!(
-            guest_pool_url(
-                "postgres://postgres@localhost:5433/wruntime_example",
-                "wr_ns_payments",
-                "pw"
-            ),
-            "postgres://wr_ns_payments:pw@localhost:5433/wruntime_example"
-        );
-    }
-
-    #[test]
-    fn test_guest_pool_url_with_query_params() {
-        assert_eq!(
-            guest_pool_url(
-                "postgres://admin:pass@host:5432/db?sslmode=require",
-                "role",
-                "pw"
-            ),
-            "postgres://role:pw@host:5432/db?sslmode=require"
         );
     }
 }

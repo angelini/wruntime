@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use deadpool_postgres::tokio_postgres;
+
 #[allow(unused_imports)]
 pub use wr_engine::db::wruntime::db::database::{DbError, Host as DbHost, PgType, PgValue};
 pub use wr_engine::state::{ModuleServices, ModuleState};
@@ -39,8 +41,7 @@ pub async fn manager_pool() -> deadpool_postgres::Pool {
     // other mgr_test_* schemas here: without shared liveness metadata they may still be in use.
     let setup_pool = wr_common::pool::build_pool(&base_url, 1).expect("failed to build setup pool");
     let client = setup_pool.get().await.expect("setup connection");
-    client
-        .batch_execute("CREATE SCHEMA IF NOT EXISTS wr_system")
+    wr_manager::migrate::ensure_system_schema(&client)
         .await
         .expect("create wr_system schema");
     client
@@ -72,8 +73,7 @@ pub async fn manager_pool_in_schema(schema: &str) -> deadpool_postgres::Pool {
     let base_url = require_db_url();
     let setup_pool = wr_common::pool::build_pool(&base_url, 1).expect("failed to build setup pool");
     let client = setup_pool.get().await.expect("setup connection");
-    client
-        .batch_execute("CREATE SCHEMA IF NOT EXISTS wr_system")
+    wr_manager::migrate::ensure_system_schema(&client)
         .await
         .expect("create wr_system schema");
     client
@@ -154,6 +154,78 @@ pub async fn db_state_for_module_with_active_span(
         },
     )
     .expect("ModuleState")
+}
+
+/// Test-owned private PostgreSQL databases for offline provisioner coverage.
+/// Cleanup is restricted to UUID-derived names held by this fixture.
+pub struct PrivateDatabaseFixture {
+    pub platform_database: String,
+    pub retained_database: String,
+}
+
+impl PrivateDatabaseFixture {
+    pub async fn create() -> anyhow::Result<Self> {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let fixture = Self {
+            platform_database: format!("wr_test_platform_{suffix}"),
+            retained_database: format!("wr_test_retained_{suffix}"),
+        };
+        let (client, connection) =
+            tokio_postgres::connect(&require_db_url(), tokio_postgres::NoTls).await?;
+        let task = tokio::spawn(connection);
+        client
+            .batch_execute(&format!("CREATE DATABASE {}", fixture.platform_database))
+            .await?;
+        client
+            .batch_execute(&format!("CREATE DATABASE {}", fixture.retained_database))
+            .await?;
+        task.abort();
+        Ok(fixture)
+    }
+
+    pub async fn cleanup(
+        self,
+        manifest: &wr_common::postgres::PostgresProvisioningManifest,
+    ) -> anyhow::Result<()> {
+        let derived = manifest.derive_namespaces();
+        let (client, connection) =
+            tokio_postgres::connect(&require_db_url(), tokio_postgres::NoTls).await?;
+        let task = tokio::spawn(connection);
+        let mut databases = derived
+            .iter()
+            .map(|namespace| namespace.database.clone())
+            .collect::<Vec<_>>();
+        databases.extend([self.platform_database, self.retained_database]);
+        for database in databases {
+            client
+                .execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1 AND pid <> pg_backend_pid()",
+                    &[&database],
+                )
+                .await?;
+            client
+                .batch_execute(&format!("DROP DATABASE IF EXISTS {database}"))
+                .await?;
+        }
+        for namespace in derived {
+            for login in namespace.node_logins {
+                client
+                    .batch_execute(&format!(
+                        "DROP ROLE IF EXISTS {}; DROP ROLE IF EXISTS {}",
+                        login.runtime, login.readiness
+                    ))
+                    .await?;
+            }
+            client
+                .batch_execute(&format!(
+                    "DROP ROLE IF EXISTS {}; DROP ROLE IF EXISTS {}; DROP ROLE IF EXISTS {}",
+                    namespace.runtime_group, namespace.owner, namespace.maintenance_role
+                ))
+                .await?;
+        }
+        task.abort();
+        Ok(())
+    }
 }
 
 /// Same schema-provisioning body as `db_state_for_module`, but with `limits`.

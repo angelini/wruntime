@@ -226,12 +226,13 @@ async fn guest_pool_recycling_cleans_or_replaces_sessions() {
         .await
         .expect("create guest role");
 
-    let pool = crate::pool::build_guest_pool(&url, &role, password, 1).expect("guest pool");
+    let pool = crate::pool::build_test_guest_pool(&url, &role, password, 1).expect("guest pool");
     let schema = Arc::<str>::from("public");
     let timeouts = crate::state::DbTimeouts {
         statement_timeout_secs: 7,
         idle_in_transaction_timeout_secs: 11,
     };
+    let unchecked_identity = Arc::<str>::from("");
     let first = pool.get().await.expect("first checkout");
     first
         .batch_execute(
@@ -241,9 +242,15 @@ async fn guest_pool_recycling_cleans_or_replaces_sessions() {
         .await
         .expect("dirty transaction");
     drop(first);
-    let replacement = super::connection::get_prepared_connection(&pool, &schema, &timeouts)
-        .await
-        .expect("checkout after raw transaction");
+    let replacement = super::connection::get_prepared_connection(
+        &pool,
+        &schema,
+        &unchecked_identity,
+        &unchecked_identity,
+        &timeouts,
+    )
+    .await
+    .expect("checkout after raw transaction");
     assert!(replacement
         .query_one(
             "SELECT to_regclass('pg_temp.wr_open_transaction') IS NULL",
@@ -264,9 +271,15 @@ async fn guest_pool_recycling_cleans_or_replaces_sessions() {
         .expect("dirty session state");
     drop(replacement);
 
-    let clean = super::connection::get_prepared_connection(&pool, &schema, &timeouts)
-        .await
-        .expect("clean checkout");
+    let clean = super::connection::get_prepared_connection(
+        &pool,
+        &schema,
+        &unchecked_identity,
+        &unchecked_identity,
+        &timeouts,
+    )
+    .await
+    .expect("clean checkout");
     assert_eq!(
         clean
             .query_one("SHOW application_name", &[])
@@ -296,16 +309,22 @@ async fn guest_pool_recycling_cleans_or_replaces_sessions() {
     clean.batch_execute("RESET ALL").await.unwrap();
     drop(clean);
 
-    let prepared = super::connection::get_prepared_connection(&pool, &schema, &timeouts)
-        .await
-        .expect("prepared checkout");
+    let prepared = super::connection::get_prepared_connection(
+        &pool,
+        &schema,
+        &unchecked_identity,
+        &unchecked_identity,
+        &timeouts,
+    )
+    .await
+    .expect("prepared checkout");
     assert_eq!(
         prepared
             .query_one("SHOW search_path", &[])
             .await
             .unwrap()
             .get::<_, &str>(0),
-        "public"
+        "public, pg_catalog"
     );
     assert_eq!(
         prepared
@@ -323,7 +342,33 @@ async fn guest_pool_recycling_cleans_or_replaces_sessions() {
             .get::<_, &str>(0),
         "11s"
     );
+    let previous_pid: i32 = prepared
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
     drop(prepared);
+    let mismatch = super::connection::get_prepared_connection(
+        &pool,
+        &schema,
+        &Arc::from("wrong_database"),
+        &Arc::from(role.as_str()),
+        &timeouts,
+    )
+    .await;
+    assert!(mismatch.is_err(), "identity mismatch must fail checkout");
+    let replacement_pid: i32 = pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_ne!(
+        previous_pid, replacement_pid,
+        "identity failure must destroy the session"
+    );
     drop(pool);
     admin
         .execute(

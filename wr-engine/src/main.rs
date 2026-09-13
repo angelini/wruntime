@@ -365,7 +365,7 @@ async fn run_service(config_path: &str) -> Result<()> {
         let tls = wr_common::tls::build_tonic_server_tls(&job_admin.tls)
             .context("failed to build engine job-admin TLS configuration")?;
         let pool = runner
-            .admin_pool()
+            .platform_pool()
             .context("job-admin listener requires an engine database pool")?;
         let api = wr_engine::job_admin::EngineJobAdminApi::new_authorized(
             job_admin.queue_id.clone(),
@@ -395,7 +395,7 @@ async fn run_service(config_path: &str) -> Result<()> {
     runner.spawn_epoch_ticker(&mut tasks);
     {
         let registry = registry.clone();
-        let database = runner.admin_pool();
+        let database = runner.platform_pool();
         let defaults = Arc::new(wr_engine::worker_http::WorkerDefaults::from_modules(
             &config.modules,
         )?);
@@ -552,14 +552,12 @@ async fn run_service(config_path: &str) -> Result<()> {
         }
         ownership_fence = Some(fence);
 
-        runner
-            .provision_schemas(&registration_response.db_credentials)
-            .await?;
+        runner.accept_namespace_access(&registration_response.namespace_access)?;
+        runner.verify_namespace_readiness().await?;
         runner.run_job_migrations().await?;
         job_admin_ready.store(true, Ordering::Release);
         job_admin_admission.open();
-        runner.run_migrations().await?;
-        runner.build_namespace_pools(&registration_response.db_credentials)?;
+        runner.build_namespace_pools()?;
         runner.start_recovery_coordinator(&mut tasks)?;
 
         let mut secrets = HashMap::new();

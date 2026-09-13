@@ -533,8 +533,8 @@ async fn test_secret_deleted_then_registration_fails() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_concurrent_db_credential_registration_same_password() -> Result<()> {
-    let (_pool, _addr, mut c) = manager_trio().await?;
+async fn test_concurrent_registration_returns_non_secret_namespace_descriptors() -> Result<()> {
+    let (pool, _addr, mut c) = manager_trio().await?;
 
     const N: usize = 8;
     let namespace = "concurrent-db-ns";
@@ -627,23 +627,44 @@ async fn test_concurrent_db_credential_registration_same_password() -> Result<()
         }));
     }
 
-    let mut passwords = Vec::with_capacity(N);
+    let mut descriptors = Vec::with_capacity(N);
     for h in handles {
         let resp = h.await.expect("task panicked")?;
         assert!(resp.accepted);
-        assert_eq!(resp.db_credentials.len(), 1);
-        assert_eq!(resp.db_credentials[0].namespace, namespace);
-        passwords.push(resp.db_credentials[0].password.clone());
+        assert_eq!(resp.namespace_access.len(), 1);
+        assert_eq!(resp.namespace_access[0].namespace, namespace);
+        descriptors.push(resp.namespace_access[0].clone());
     }
 
-    let first = &passwords[0];
-    assert!(!first.is_empty(), "db password should not be empty");
-    assert!(
-        passwords.iter().all(|p| p == first),
-        "all concurrent registrations must return the same db password"
+    let expected = &descriptors[0];
+    assert_eq!(
+        expected.database,
+        wr_common::naming::namespace_database(namespace)
+    );
+    assert_eq!(
+        expected.runtime_role,
+        wr_common::naming::namespace_runtime_login("node-a", namespace)
+    );
+    assert_eq!(
+        expected.readiness_role,
+        wr_common::naming::namespace_readiness_verifier("node-a", namespace)
+    );
+    assert!(descriptors.iter().all(|descriptor| descriptor == expected));
+    let secret_count: i64 = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT count(*) FROM wr_secrets WHERE namespace=$1 AND key='__db_password'",
+            &[&namespace],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        secret_count, 0,
+        "registration must not persist a database password"
     );
 
-    // Fast-path read after the race must match the persisted password.
+    // A later registration derives the same identities without secret state.
     let mut client = c.clone();
     let resp = client
         .register_engine(RegisterEngineRequest {
@@ -670,13 +691,13 @@ async fn test_concurrent_db_credential_registration_same_password() -> Result<()
         })
         .await?
         .into_inner();
-    assert_eq!(&resp.db_credentials[0].password, first);
+    assert_eq!(&resp.namespace_access[0], expected);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_db_credential_reregistration_returns_same_password() -> Result<()> {
+async fn test_namespace_access_reregistration_is_deterministic() -> Result<()> {
     let (pool, _addr, mut c) = manager_trio().await?;
     let namespace = "reg-db-ns";
 
@@ -718,13 +739,9 @@ async fn test_db_credential_reregistration_returns_same_password() -> Result<()>
     .await?
     .into_inner();
 
-    assert_eq!(first.db_credentials.len(), 1);
-    assert_eq!(second.db_credentials.len(), 1);
-    assert!(!first.db_credentials[0].password.is_empty());
-    assert_eq!(
-        first.db_credentials[0].password,
-        second.db_credentials[0].password
-    );
+    assert_eq!(first.namespace_access.len(), 1);
+    assert_eq!(second.namespace_access.len(), 1);
+    assert_eq!(first.namespace_access, second.namespace_access);
 
     Ok(())
 }

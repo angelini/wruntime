@@ -6,6 +6,23 @@ mod embedded {
     embed_migrations!("./migrations");
 }
 
+/// Create the shared manager schema while serializing concurrent first starts.
+///
+/// PostgreSQL's `CREATE SCHEMA IF NOT EXISTS` can still raise a unique-violation
+/// error when two sessions create the same schema concurrently.
+pub async fn ensure_system_schema(client: &deadpool_postgres::Object) -> Result<()> {
+    client
+        .batch_execute(
+            "BEGIN; \
+             SELECT pg_advisory_xact_lock(hashtext('wr-manager-schema-bootstrap')); \
+             CREATE SCHEMA IF NOT EXISTS wr_system; \
+             COMMIT",
+        )
+        .await
+        .context("failed to create wr_system schema")?;
+    Ok(())
+}
+
 /// Run all pending manager migrations.
 ///
 /// The entire run is serialized across active-active managers by a session-level

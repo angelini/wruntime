@@ -5,7 +5,9 @@ Maintainers should select checks by change class in the [validation matrix](agen
 Common recipes:
 
 ```bash
-just dev-up                  # start Postgres, Grafana/LGTM, and RustFS S3
+just dev-up                  # create/reuse compatible shared dev services
+just dev-reprepare           # destructive shared generation/owner replacement
+just test-shared-dev-fixture # hermetic musl/image/shared-fixture contracts
 just multi-node              # run the local two-node topology until Ctrl-C
 just multi-node-inline       # start, verify, and stop the local topology
 just test                    # build test guests, then run all tests
@@ -13,6 +15,7 @@ just test-integration        # build test guests, then run wr-tests
 just test-one <test_name>    # build test guests, then run one named test
 just build-wasm-guests       # build every WASM guest sequentially
 just test-wasm               # build WASM guests, then run host binding tests
+just test-tenant-isolation-e2e # consume-only native certificate/isolation behavior gate
 just clean-wasm-cache        # remove only the shared Cargo guest cache
 just validate-ecommerce      # ecommerce inline run, failing on WARN/WARNING output
 just bench-proxy-routing     # warmed HTTP/2 proxy routing/forwarding benchmark
@@ -43,7 +46,44 @@ just dev-down                # stop dev infrastructure
 first rebuild the test WASM guest artifacts incrementally, then set the
 `WRT_TEST_DB_URL` and `WRT_TEST_S3_*` variables expected by integration tests.
 This prevents changed guest sources or schemas from running against stale staged
-components. Run `just dev-up` first when using those full recipes. The embedded
+components. Run `just dev-up` first when using those full recipes. Development
+PostgreSQL is one greenfield PostgreSQL 18 native-SSL generation shared by linked
+worktrees. The locator canonicalizes `git rev-parse --path-format=absolute
+--git-common-dir` and uses only `<common-dir>/wruntime-dev-state`; there is no root or
+project override. `owner.json` records the worktree supplying the fixed `wruntime-dev`
+Compose project, and `fixture/ready.json` binds source, normalized provisioning,
+migration inventory, endpoint, artifact, PKI, daemon/musl target/toolchain,
+`wr-cli` binary, two-file context, exact provisioner image, and PostgreSQL base-image
+digests. The explicit source hash includes relevant uncommitted/untracked bytes rather
+than commit identity, but excludes unrelated runtime sources and host build output.
+
+Every database-sensitive Just recipe and example holds the same exclusive
+`locks/postgres-fixture.lock` inode; nested recipes inherit and verify the descriptor
+instead of deadlocking. On the Docker-capable host, `just dev-up` creates the first
+generation or reuses only a digest-compatible owner. It maps the Docker daemon to one
+supported Linux-musl target, requires that exact target to be preinstalled in `rustup`
+before lock/state/destructive work (otherwise reporting `rustup target add <target>`
+without running it), reuses the owner's ordinary `target/` and Cargo cache for
+`cargo zigbuild`, validates the ELF, and stages only `Dockerfile` plus `wr-cli` for a
+content-tagged UID-70 no-pull image. It then performs PKI/server/HBA/map, co-located
+provision/migrate, validation, and bucket setup before atomically publishing
+owner/readiness. Run `just test-shared-dev-fixture` for hermetic fake-Docker/Cargo
+coverage of architecture, cache, minimal-context, image, and provenance contracts. Missing, partial, deleted-owner, or mismatched state fails before
+database access with owner and active/required digest evidence. Coordinate all users
+and run destructive host `just dev-reprepare` to replace the fixed project, volumes,
+PKI, artifacts, and ownership; ordinary commands never steal or repair it.
+
+Inside Pi, `test-tenant-isolation-e2e` and all examples are consume-only. They derive
+the shared root automatically, use `postgres.internal` at `127.0.0.1:5433` and fixed
+`wruntime_manager`/`wruntime_jobs` URLs, and accept no state-root, Compose-project,
+PostgreSQL URL, provisioner runner, admin/ident path, certificate path, or tenant
+endpoint inputs. They never invoke Docker, provisioning, migration, reload, or
+server-configuration discovery. The gate proves mapped login,
+same-namespace access, cross-namespace/platform and owner/DDL denial, bounded fresh
+sessions, production engine readiness, and absence of admin material in engine
+environments. Host `dev-up` owns development setup proof; protected deployment E2E
+independently owns deployment-host map install/reload/rollback and deployment-specific
+certificate denials. The embedded
 manager and engine job schemas are each a single clean V1 baseline; old Refinery
 history/checksums are unsupported. Use `just dev-reset-db` to destroy and recreate
 manager and job persistence before testing binaries with a changed baseline.
@@ -155,6 +195,8 @@ VM targets and their baseline snapshots are configured in
 `~/.ssh/wruntime-e2e-known_hosts` and can be overridden with
 `WRT_DEPLOY_E2E_KNOWN_HOSTS`. Never pass protected input values in a checked-in
 config or transcript.
+
+The protected deployment gate additionally owns live co-located provisioning, exact map reload/rollback, mapped-CN login and wrong-CA/CN/login/owner/platform denials, reservation-before-worker timestamps, out-of-band `postgres-client` installation, stale/ambiguous readiness blocking, exact-artifact recovery, and worker admin-secret absence. A Pi `--no-deployment-e2e` result cannot supply this evidence.
 
 The Proxmox HTTPS client uses the Debian/Ubuntu OS CA bundle at
 `/etc/ssl/certs/ca-certificates.crt` instead of Requests' bundled `certifi`
