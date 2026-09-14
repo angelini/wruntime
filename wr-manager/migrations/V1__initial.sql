@@ -151,12 +151,10 @@ CREATE TABLE wr_node_agent_attestations (
     authenticated_principal text NOT NULL,
     protocol_version text NOT NULL,
     binary_digest text NOT NULL,
-    backend text NOT NULL,
     capabilities text[] DEFAULT '{}'::text[] NOT NULL,
     observed_at timestamp with time zone NOT NULL,
     CONSTRAINT wr_node_agent_attestations_agent_instance_id_check CHECK ((agent_instance_id <> ''::text)),
     CONSTRAINT wr_node_agent_attestations_authenticated_principal_check CHECK ((authenticated_principal <> ''::text)),
-    CONSTRAINT wr_node_agent_attestations_backend_check CHECK ((backend = ANY (ARRAY['systemd'::text, 'docker'::text]))),
     CONSTRAINT wr_node_agent_attestations_binary_digest_check CHECK ((binary_digest <> ''::text)),
     CONSTRAINT wr_node_agent_attestations_protocol_version_check CHECK ((protocol_version <> ''::text))
 );
@@ -164,14 +162,12 @@ CREATE TABLE wr_node_agent_attestations (
 CREATE TABLE wr_node_agent_policies (
     node_id text NOT NULL,
     protocol_version text NOT NULL,
-    backend text NOT NULL,
     retention_count integer NOT NULL,
     actor text NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     binary_digest text DEFAULT ''::text NOT NULL,
     capabilities text[] DEFAULT '{}'::text[] NOT NULL,
     CONSTRAINT wr_node_agent_policies_actor_check CHECK ((actor <> ''::text)),
-    CONSTRAINT wr_node_agent_policies_backend_check CHECK ((backend = ANY (ARRAY['systemd'::text, 'docker'::text]))),
     CONSTRAINT wr_node_agent_policies_protocol_version_check CHECK ((protocol_version <> ''::text)),
     CONSTRAINT wr_node_agent_policies_retention_count_check CHECK ((retention_count >= 1))
 );

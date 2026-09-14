@@ -19,10 +19,8 @@ CONFIG="${WRT_DEPLOY_E2E_CONFIG:-dev/deployment-e2e.toml}"
 PROVIDER="${WRT_DEPLOY_E2E_PROVIDER:-dev/deployment-e2e/proxmox.py}"
 ASSERT="dev/deployment-e2e/assert_cluster.py"
 ASSERT_OPERATION="dev/deployment-e2e/assert_operation.py"
-BACKENDS=(systemd docker)
 PRIMARY_STATUS=0
 CLEANUP_STARTED=false
-ACTIVE_BACKEND=""
 ERROR_HANDLED=false
 TUNNEL_PID=""
 TUNNEL_PORT=""
@@ -31,39 +29,17 @@ PROBE_STOP_FILE=""
 
 usage() {
 	cat <<'USAGE'
-Usage: dev/validate-deployment-lifecycle.sh [--backend systemd|docker]
+Usage: dev/validate-deployment-lifecycle.sh
 
-All protected inputs are required. The three disposable deployment targets are
-configured in dev/deployment-e2e.toml. With no --backend, the complete node
-lifecycle runs under systemd and Docker; authenticated manager A→B→A deploy-set
-qualification runs under systemd only. Compose manager deploy-set is unqualified
-until an immutable registry or supported image-transfer mechanism exists.
+Runs the complete protected Systemd node and manager lifecycle qualification
+against the three disposable targets configured in dev/deployment-e2e.toml.
 USAGE
 }
 while [ $# -gt 0 ]; do
 	case "$1" in
-	--backend)
-		[ $# -ge 2 ] || {
-			usage >&2
-			exit 2
-		}
-		case "$2" in systemd | docker) BACKENDS=("$2") ;; *)
-			usage >&2
-			exit 2
-			;;
-		esac
-		shift
-		;;
-	-h | --help)
-		usage
-		exit 0
-		;;
-	*)
-		usage >&2
-		exit 2
-		;;
+	-h | --help) usage; exit 0 ;;
+	*) usage >&2; exit 2 ;;
 	esac
-	shift
 done
 
 for name in PVE_HOST PVE_USER PVE_TOKEN_NAME PVE_TOKEN_VALUE WRT_DEPLOY_E2E_SSH_KEY WRT_DEPLOY_E2E_DB_URL WRT_SECRET_ENCRYPTION_KEY; do
@@ -149,6 +125,7 @@ BASELINE_ONE="$RUN_DIR/baseline-one.tar.gz"
 BASELINE_TWO="$RUN_DIR/baseline-two.tar.gz"
 UPGRADE_TWO="$RUN_DIR/upgrade-two.tar.gz"
 UPGRADE_ONE="$RUN_DIR/upgrade-one.tar.gz"
+EMPTY_INVENTORY="$RUN_DIR/empty-inventory.tar.gz"
 SCENARIO_MANIFEST="$RUN_DIR/scenario-manifest.json"
 MANAGER_ADDR="https://${MANAGER_HOST}:9000"
 MANAGER_B_ADDR="https://${MANAGER_B_HOST}:9000"
@@ -498,12 +475,11 @@ assert_db_clean() {
 	"${SSH[@]}" "$MANAGER_REMOTE" "sudo systemctl is-active postgresql" >/dev/null
 }
 collect_diagnostics() {
-	local backend="$1"
-	local out="$LOG_BASE/$backend-diagnostics"
+	local out="$LOG_BASE/qualification-diagnostics"
 	mkdir -p "$out"
 	collect_diagnostic "cluster status" "$out/cluster.json" \
 		lifecycle_run_watchdog "${CLI_ARGS[@]}" cluster status --node "$NODE_ID" --output json
-	for bundle in "$BASELINE_ONE" "$BASELINE_TWO" "$UPGRADE_TWO" "$UPGRADE_ONE"; do
+	for bundle in "$BASELINE_ONE" "$BASELINE_TWO" "$UPGRADE_TWO" "$UPGRADE_ONE" "$EMPTY_INVENTORY"; do
 		collect_diagnostic "inspect $(basename "$bundle")" "$out/$(basename "$bundle").txt" \
 			lifecycle_run_watchdog "${CLI_ARGS[@]}" node inspect-bundle "$bundle"
 	done
@@ -522,8 +498,6 @@ collect_diagnostics() {
 			"${SSH[@]}" "$remote" "sudo find /var/lib/wruntime/manager-activation -maxdepth 3 -type f -print -exec sha256sum {} \; -exec cat {} \; 2>/dev/null || true"
 		collect_diagnostic "$label files" "$out/$label-files.txt" \
 			"${SSH[@]}" "$remote" "sudo find '$WORKDIR' /var/lib/wruntime/manager-config -maxdepth 6 \( -type f -o -type l \) 2>/dev/null | sort"
-		collect_diagnostic "$label compose" "$out/$label-compose.txt" \
-			"${SSH[@]}" "$remote" "sudo docker ps -a --no-trunc 2>/dev/null || true; for compose in '$WORKDIR'/wr-manager/docker/docker-compose.yml; do test -f \"\$compose\" || continue; sudo docker compose --project-name wruntime-manager -f \"\$compose\" ps -a; sudo docker compose --project-name wruntime-manager -f \"\$compose\" logs --no-color --tail 300; done"
 	done
 	collect_diagnostic "node systemd status" "$out/node-systemd.txt" \
 		"${SSH[@]}" "$NODE_REMOTE" "sudo systemctl status --no-pager 'wr-*'"
@@ -531,10 +505,6 @@ collect_diagnostics() {
 		"${SSH[@]}" "$NODE_REMOTE" "sudo journalctl -q -u 'wr-*' -n 300 --no-pager"
 	collect_diagnostic "node files" "$out/node-files.txt" \
 		"${SSH[@]}" "$NODE_REMOTE" "sudo find '$WORKDIR' -maxdepth 6 \( -type f -o -type l \) | sort"
-	if [ "$backend" = docker ]; then
-		collect_diagnostic "node compose" "$out/node-compose.txt" \
-			"${SSH[@]}" "$NODE_REMOTE" "for compose in '$WORKDIR'/wr-node/releases/*/docker/docker-compose.yml; do test -f \"\$compose\" || continue; sudo docker compose --project-name wruntime-node -f \"\$compose\" ps -a; sudo docker compose --project-name wruntime-node -f \"\$compose\" images; sudo docker compose --project-name wruntime-node -f \"\$compose\" logs --no-color --tail 300; done"
-	fi
 }
 
 # Invoked indirectly by the ERR trap.
@@ -545,7 +515,7 @@ on_error() {
 	ERROR_HANDLED=true
 	trap - ERR
 	report_active_failure "$status"
-	if [ -n "$ACTIVE_BACKEND" ]; then collect_diagnostics "$ACTIVE_BACKEND"; fi
+	collect_diagnostics
 	record_failure "$status"
 	exit "$status"
 }
@@ -624,22 +594,24 @@ run_logged baseline-one-bundle target/debug/wr-cli node bundle --engine-config "
 run_logged baseline-two-bundle target/debug/wr-cli node bundle --engine-config "$BASELINE_DIR/engine-1.toml" --engine-config "$BASELINE_DIR/engine-2.toml" --proxy-config wr-tests/deployment/proxy.toml --skip-build --output "$BASELINE_TWO"
 run_logged upgrade-two-bundle target/debug/wr-cli node bundle --engine-config "$UPGRADE_DIR/engine-1.toml" --engine-config "$UPGRADE_DIR/engine-2.toml" --proxy-config wr-tests/deployment/proxy.toml --skip-build --output "$UPGRADE_TWO"
 run_logged upgrade-one-bundle target/debug/wr-cli node bundle --engine-config "$UPGRADE_DIR/engine-1.toml" --proxy-config wr-tests/deployment/proxy.toml --skip-build --output "$UPGRADE_ONE"
-for role in baseline-one baseline-two upgrade-two upgrade-one; do
+run_logged empty-inventory-bundle target/debug/wr-cli node bundle --proxy-config wr-tests/deployment/proxy.toml --skip-build --output "$EMPTY_INVENTORY"
+for role in baseline-one baseline-two upgrade-two upgrade-one empty-inventory; do
 	bundle_var="${role//-/_}"; bundle_var="${bundle_var^^}"
 	bundle="${!bundle_var}"
 	run_logged "$role-inspect" target/debug/wr-cli node inspect-bundle "$bundle"
 done
-"${PYTHON[@]}" - "$SCENARIO_MANIFEST" "$LOG_BASE" "$BASELINE_ONE" "$BASELINE_TWO" "$UPGRADE_TWO" "$UPGRADE_ONE" "$MANAGER_BUNDLE" <<'PY'
+"${PYTHON[@]}" - "$SCENARIO_MANIFEST" "$LOG_BASE" "$BASELINE_ONE" "$BASELINE_TWO" "$UPGRADE_TWO" "$UPGRADE_ONE" "$EMPTY_INVENTORY" "$MANAGER_BUNDLE" <<'PY'
 import hashlib, json, pathlib, re, sys, tomllib
 output, logs, *paths = map(pathlib.Path, sys.argv[1:])
 manager_path = paths.pop()
-roles = ("baseline-one", "baseline-two", "upgrade-two", "upgrade-one")
-expected = ({"engine-1"}, {"engine-1", "engine-2"}, {"engine-1", "engine-2"}, {"engine-1"})
+roles = ("baseline-one", "baseline-two", "upgrade-two", "upgrade-one", "empty-inventory")
+expected = ({"engine-1"}, {"engine-1", "engine-2"}, {"engine-1", "engine-2"}, {"engine-1"}, set())
 configs = {
     "baseline-one": ["wr-tests/deployment/scenarios/baseline/engine-1.toml"],
     "baseline-two": ["wr-tests/deployment/scenarios/baseline/engine-1.toml", "wr-tests/deployment/scenarios/baseline/engine-2.toml"],
     "upgrade-two": ["wr-tests/deployment/scenarios/upgrade/engine-1.toml", "wr-tests/deployment/scenarios/upgrade/engine-2.toml"],
     "upgrade-one": ["wr-tests/deployment/scenarios/upgrade/engine-1.toml"],
+    "empty-inventory": [],
 }
 entries = []
 for role, path, wanted in zip(roles, paths, expected):
@@ -678,7 +650,7 @@ for index, path in enumerate(paths):
     })
 manifest.write_text(json.dumps(value, indent=2) + '\n')
 PY
-chmod 444 "$SCENARIO_MANIFEST" "$MANAGER_BUNDLE" "$BASELINE_ONE" "$BASELINE_TWO" "$UPGRADE_TWO" "$UPGRADE_ONE"
+chmod 444 "$SCENARIO_MANIFEST" "$MANAGER_BUNDLE" "$BASELINE_ONE" "$BASELINE_TWO" "$UPGRADE_TWO" "$UPGRADE_ONE" "$EMPTY_INVENTORY"
 find "$MANAGER_ROLLOUT_DIR" "$MANAGER_A_SET" "$MANAGER_B_SET" -type f -exec chmod 444 {} +
 cp "$SCENARIO_MANIFEST" "$LOG_BASE/scenario-manifest.json"
 verify_manifest() { lifecycle_verify_manifest "$SCENARIO_MANIFEST"; }
@@ -692,11 +664,12 @@ DIGEST_A_ONE="$(manifest_value baseline-one bundle_digest)"
 DIGEST_A_TWO="$(manifest_value baseline-two bundle_digest)"
 DIGEST_B_TWO="$(manifest_value upgrade-two bundle_digest)"
 DIGEST_B_ONE="$(manifest_value upgrade-one bundle_digest)"
+DIGEST_EMPTY="$(manifest_value empty-inventory bundle_digest)"
 verify_manifest
 lifecycle_artifact prepare "$SCENARIO_MANIFEST" "$(sha256sum "$SCENARIO_MANIFEST" | awk '{print $1}')"
 
 provision_node_agent_fixture() {
-	local backend="$1" fixture="$RUN_DIR/node-agent-$1" binary_digest backend_config
+	local fixture="$RUN_DIR/node-agent-systemd" binary_digest
 	mkdir -p "$fixture"
 	tar -xOf "$BASELINE_ONE" wr-node/agent/wr-cli >"$fixture/wr-cli"
 	# A valid ELF tolerates trailing bytes. Give the provisioned baseline a distinct
@@ -704,11 +677,6 @@ provision_node_agent_fixture() {
 	printf '\0' >>"$fixture/wr-cli"
 	tar -xOf "$BASELINE_ONE" wr-node/agent/wr-node-agent.service >"$fixture/wr-node-agent.service"
 	chmod 700 "$fixture/wr-cli"
-	if [ "$backend" = systemd ]; then
-		backend_config=$'backend = "systemd"\ncompose-project = ""\nsystemctl-path = "/usr/bin/systemctl"\ndocker-path = ""'
-	else
-		backend_config=$'backend = "docker"\ncompose-project = "wruntime-node"\nsystemctl-path = ""\ndocker-path = "/usr/bin/docker"'
-	fi
 	cat >"$fixture/agent.toml" <<EOF
 policy-version = 1
 node-id = "$NODE_ID"
@@ -718,11 +686,11 @@ client-key-path = "$WORKDIR/wr-agent/certs/agent.key"
 ca-cert-path = "$WORKDIR/wr-agent/certs/ca.crt"
 deployment-root = "$WORKDIR"
 runtime-dir = "/run/wruntime"
-$backend_config
+systemctl-path = "/usr/bin/systemctl"
 poll-interval-seconds = 5
 renew-interval-seconds = 5
 protocol-version = "operator-engine-lifecycle-v1"
-capabilities = ["continuous-lease-v1", "manager-authorized-retention-v1", "release-metadata-v1", "typed-backend-v1"]
+capabilities = ["continuous-lease-v1", "manager-authorized-retention-v1", "release-metadata-v1", "systemd-lifecycle-v1"]
 EOF
 	binary_digest="sha256:$(sha256sum "$fixture/wr-cli" | cut -d' ' -f1)"
 	timeout -k 5 60 scp -i "$WRT_DEPLOY_E2E_SSH_KEY" \
@@ -730,40 +698,33 @@ EOF
 		"$CERT_DIR/node-agent/leaf.pem" "$CERT_DIR/node-agent/key.pem" \
 		"$CERT_DIR/server-root/ca.crt" "$NODE_REMOTE:/tmp/"
 	"${SSH[@]}" "$NODE_REMOTE" "sudo install -d -o root -g root -m 0755 '$WORKDIR' '$WORKDIR/wr-node' '$WORKDIR/wr-node/slots'; sudo install -d -o root -g root -m 0700 '$WORKDIR/wr-agent' '$WORKDIR/wr-agent/certs' /run/wruntime; sudo install -o root -g root -m 0755 /tmp/wr-cli '$WORKDIR/wr-agent/wr-cli'; sudo install -o root -g root -m 0600 /tmp/agent.toml '$WORKDIR/wr-agent/agent.toml'; sudo install -o root -g root -m 0600 /tmp/leaf.pem '$WORKDIR/wr-agent/certs/agent.crt'; sudo install -o root -g root -m 0600 /tmp/key.pem '$WORKDIR/wr-agent/certs/agent.key'; sudo install -o root -g root -m 0600 /tmp/ca.crt '$WORKDIR/wr-agent/certs/ca.crt'; sudo install -o root -g root -m 0644 /tmp/wr-node-agent.service /etc/systemd/system/wr-node-agent.service"
-	PGCONNECT_TIMEOUT=5 psql "$WRT_DEPLOY_E2E_DB_URL" -Xv ON_ERROR_STOP=1 -c "SET search_path=wr_system,public; INSERT INTO wr_nodes(node_id) VALUES ('$NODE_ID') ON CONFLICT DO NOTHING; INSERT INTO wr_node_agent_policies(node_id,protocol_version,backend,retention_count,actor,binary_digest,capabilities) VALUES ('$NODE_ID','operator-engine-lifecycle-v1','$backend',3,'deployment-e2e','$binary_digest',ARRAY['continuous-lease-v1','manager-authorized-retention-v1','release-metadata-v1','typed-backend-v1']) ON CONFLICT(node_id) DO UPDATE SET protocol_version=EXCLUDED.protocol_version,backend=EXCLUDED.backend,retention_count=EXCLUDED.retention_count,actor=EXCLUDED.actor,binary_digest=EXCLUDED.binary_digest,capabilities=EXCLUDED.capabilities,updated_at=NOW();"
+	PGCONNECT_TIMEOUT=5 psql "$WRT_DEPLOY_E2E_DB_URL" -Xv ON_ERROR_STOP=1 -c "SET search_path=wr_system,public; INSERT INTO wr_nodes(node_id) VALUES ('$NODE_ID') ON CONFLICT DO NOTHING; INSERT INTO wr_node_agent_policies(node_id,protocol_version,retention_count,actor,binary_digest,capabilities) VALUES ('$NODE_ID','operator-engine-lifecycle-v1',3,'deployment-e2e','$binary_digest',ARRAY['continuous-lease-v1','manager-authorized-retention-v1','release-metadata-v1','systemd-lifecycle-v1']) ON CONFLICT(node_id) DO UPDATE SET protocol_version=EXCLUDED.protocol_version,retention_count=EXCLUDED.retention_count,actor=EXCLUDED.actor,binary_digest=EXCLUDED.binary_digest,capabilities=EXCLUDED.capabilities,updated_at=NOW();"
 	"${SSH[@]}" "$NODE_REMOTE" "sudo systemctl daemon-reload && sudo systemctl enable --now wr-node-agent.service && sudo systemctl is-active --quiet wr-node-agent.service"
 }
 
 lifecycle() {
-	local backend="$1"
-	local pass="$LOG_BASE/$backend"
+	local pass="$LOG_BASE/systemd"
 	mkdir -p "$pass"
-	echo "==> deployment lifecycle: $backend"
-	lifecycle_reset_boundary "$backend-entry"
-	run_to_log "$backend provider reset" "$pass/provider-reset.json" provider reset
-	if [ "$backend" = systemd ]; then
-		run_to_log "manager-b-db-preflight" "$pass/manager-b-db-preflight.log" assert_manager_b_db_reachable
-	fi
+	echo "==> deployment lifecycle: systemd"
+	lifecycle_reset_boundary "systemd-entry"
+	run_to_log "systemd provider reset" "$pass/provider-reset.json" provider reset
+	run_to_log "manager-b-db-preflight" "$pass/manager-b-db-preflight.log" assert_manager_b_db_reachable
 	verify_manifest
-	lifecycle_artifact "$backend" "$SCENARIO_MANIFEST" "$(sha256sum "$SCENARIO_MANIFEST" | awk '{print $1}')"
+	lifecycle_artifact "systemd" "$SCENARIO_MANIFEST" "$(sha256sum "$SCENARIO_MANIFEST" | awk '{print $1}')"
 	assert_db_clean
-	if [ "$backend" = docker ]; then
-		"${SSH[@]}" "$MANAGER_REMOTE" "sudo -n docker info >/dev/null && sudo -n docker compose version >/dev/null"
-		"${SSH[@]}" "$NODE_REMOTE" "sudo -n docker info >/dev/null && sudo -n docker compose version >/dev/null"
-	fi
 
 	# Secrets are passed directly to wr-cli and are never included in an echoed command transcript.
-	run_to_log "$backend manager deploy" "$pass/manager-deploy.log" \
-		lifecycle_run_short 300 "${CLI_ARGS[@]}" managers deploy "$MANAGER_BUNDLE" "$MANAGER_REMOTE" --format "$backend" \
+	run_to_log "systemd manager deploy" "$pass/manager-deploy.log" \
+		lifecycle_run_short 300 "${CLI_ARGS[@]}" managers deploy "$MANAGER_BUNDLE" "$MANAGER_REMOTE" \
 		--db-url "$WRT_DEPLOY_E2E_DB_URL" --secret-key "$WRT_SECRET_ENCRYPTION_KEY" \
 		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR" \
 		--advertise-address "$MANAGER_ADDR"
 	status_json "$pass/manager-status.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/manager-status.json" manager --address "$MANAGER_ADDR" >"$pass/manager-assert.json"
-	run_to_log "$backend node agent fixture provisioning and initial activation" "$pass/node-agent-provision.log" provision_node_agent_fixture "$backend"
-	run_to_log "$backend node agent binary update restart and fresh activation" "$pass/node-agent-install.log" \
+	run_to_log "systemd node agent fixture provisioning and initial activation" "$pass/node-agent-provision.log" provision_node_agent_fixture
+	run_to_log "systemd node agent binary update restart and fresh activation" "$pass/node-agent-install.log" \
 		"${CLI[@]}" node agent install "$BASELINE_ONE" "$NODE_REMOTE" --node-id "$NODE_ID" \
-		--format "$backend" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY"
+		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY"
 	job_admin queues --format json >"$pass/job-queues-empty.json"
 	if "$ROOT/target/debug/wr-cli" --manager "$MANAGER_ADDR" \
 		--ca-cert "$CERT_DIR/server-root/ca.crt" \
@@ -774,8 +735,8 @@ lifecycle() {
 		return 1
 	fi
 
-	run_to_log "$backend node A deploy" "$pass/deploy-a.log" \
-		lifecycle_run_deploy_operation "$backend-deploy-a" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$BASELINE_ONE" "$NODE_REMOTE" --format "$backend" \
+	run_to_log "systemd node A deploy" "$pass/deploy-a.log" \
+		lifecycle_run_deploy_operation "systemd-deploy-a" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$BASELINE_ONE" "$NODE_REMOTE" \
 		--db-url "$WRT_DEPLOY_E2E_DB_URL" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
 	status_json "$pass/status-a.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-a.json" desired --node-id "$NODE_ID" --digest "$DIGEST_A_ONE" --version 1.0.0 --engine-slot engine-1 >"$pass/assert-a.json"
@@ -783,12 +744,12 @@ lifecycle() {
 	assert_job_queues "$pass/job-queues-a.json"
 	job_admin summary --queue deployment-jobs --format json >"$pass/job-summary-a.json"
 	assert_job_summary "$pass/job-summary-a.json"
-	local revision_a revision_b revision_contracted
+	local revision_a revision_b revision_contracted revision_empty
 	revision_a="$(revision_from "$pass/status-a.json")"
-	invoke_probe "probe-$backend-a" "$pass/invoke-a.json"
+	invoke_probe "probe-systemd-a" "$pass/invoke-a.json"
 
-	local failed_status retry_token="$backend-finalized-retry" staged_revision
-	if lifecycle_run_deploy_operation "$backend-deploy-finalize" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$UPGRADE_TWO" "$NODE_REMOTE" --format "$backend" \
+	local failed_status retry_token="systemd-finalized-retry" staged_revision
+	if lifecycle_run_deploy_operation "systemd-deploy-finalize" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$UPGRADE_TWO" "$NODE_REMOTE" \
 		--request-token "$retry_token" --allow-downtime --exit-after-finalization \
 		--db-url "$WRT_DEPLOY_E2E_DB_URL" \
 		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR" >"$pass/interrupted-after-finalization.log" 2>&1; then
@@ -812,8 +773,8 @@ print(target["revision"])
 PY
 )"
 
-	run_to_log "$backend node B same-token retry" "$pass/deploy-b.log" \
-		lifecycle_run_deploy_operation "$backend-deploy-retry" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$UPGRADE_TWO" "$NODE_REMOTE" --format "$backend" \
+	run_to_log "systemd node B same-token retry" "$pass/deploy-b.log" \
+		lifecycle_run_deploy_operation "systemd-deploy-retry" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$UPGRADE_TWO" "$NODE_REMOTE" \
 		--request-token "$retry_token" --allow-downtime --db-url "$WRT_DEPLOY_E2E_DB_URL" \
 		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
 	status_json "$pass/status-b.json"
@@ -825,34 +786,64 @@ PY
 		--node-id "$NODE_ID" --request-token "$retry_token" --action deployment \
 		--target-revision "$staged_revision" --target-digest "$DIGEST_B_TWO" \
 		--slot-order engine-2 --slot-order engine-1 --stopped-engine-slot engine-1 --expect-proxy-stop >"$pass/assert-operation-deploy-b.json"
-	invoke_probe "probe-$backend-b" "$pass/invoke-b.json"
+	invoke_probe "probe-systemd-b" "$pass/invoke-b.json"
 
-	run_to_log "$backend durable engine restart" "$pass/restart.log" \
-		lifecycle_run_deploy_operation "$backend-restart" "${CLI_ARGS[@]}" engines restart --node-id "$NODE_ID" --slot engine-1 \
-		--request-token "$backend-restart"
-	lifecycle_capture_operation_detail "$NODE_ID" "$backend-restart" "$pass/operation-restart.json" "${CLI_ARGS[@]}"
+	run_to_log "systemd durable engine restart" "$pass/restart.log" \
+		lifecycle_run_deploy_operation "systemd-restart" "${CLI_ARGS[@]}" engines restart --node-id "$NODE_ID" --slot engine-1 \
+		--request-token "systemd-restart"
+	lifecycle_capture_operation_detail "$NODE_ID" "systemd-restart" "$pass/operation-restart.json" "${CLI_ARGS[@]}"
 	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-restart.json" \
-		--node-id "$NODE_ID" --request-token "$backend-restart" --action restart \
+		--node-id "$NODE_ID" --request-token "systemd-restart" --action restart \
 		--slot-order engine-1 --stopped-engine-slot engine-1 >"$pass/assert-operation-restart.json"
-	invoke_probe "probe-$backend-restart" "$pass/invoke-restart.json"
+	invoke_probe "probe-systemd-restart" "$pass/invoke-restart.json"
 
-	run_to_log "$backend node inventory contraction" "$pass/contract.log" \
-		lifecycle_run_deploy_operation "$backend-contract" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$BASELINE_ONE" "$NODE_REMOTE" --format "$backend" \
-		--request-token "$backend-contract" --db-url "$WRT_DEPLOY_E2E_DB_URL" \
+	run_to_log "systemd node inventory contraction" "$pass/contract.log" \
+		lifecycle_run_deploy_operation "systemd-contract" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$BASELINE_ONE" "$NODE_REMOTE" \
+		--request-token "systemd-contract" --db-url "$WRT_DEPLOY_E2E_DB_URL" \
 		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
 	status_json "$pass/status-contract.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-contract.json" desired --node-id "$NODE_ID" --digest "$DIGEST_A_ONE" --version 1.0.0 --engine-slot engine-1 >"$pass/assert-contract.json"
 	revision_contracted="$(revision_from "$pass/status-contract.json")"
-	lifecycle_capture_operation_detail "$NODE_ID" "$backend-contract" "$pass/operation-contract.json" "${CLI_ARGS[@]}"
+	lifecycle_capture_operation_detail "$NODE_ID" "systemd-contract" "$pass/operation-contract.json" "${CLI_ARGS[@]}"
 	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-contract.json" \
-		--node-id "$NODE_ID" --request-token "$backend-contract" --action deployment \
+		--node-id "$NODE_ID" --request-token "systemd-contract" --action deployment \
 		--target-digest "$DIGEST_A_ONE" --slot-order engine-1 --slot-order engine-2 \
 		--stopped-engine-slot engine-1 --stopped-engine-slot engine-2 --expect-proxy-stop >"$pass/assert-operation-contract.json"
-	invoke_probe "probe-$backend-contract" "$pass/invoke-contract.json"
+	invoke_probe "probe-systemd-contract" "$pass/invoke-contract.json"
 
-	local rollback_token="$backend-rollback"
-	run_to_log "$backend node rollback" "$pass/rollback.log" \
-		lifecycle_run_deploy_operation "$backend-rollback" "${CLI_ARGS[@]}" node rollback "$NODE_REMOTE" --node-id "$NODE_ID" --to "$revision_b" \
+	run_to_log "systemd empty desired inventory" "$pass/empty-inventory.log" \
+		lifecycle_run_deploy_operation "systemd-empty-inventory" "${CLI_ARGS[@]}" node deploy --node-id "$NODE_ID" "$EMPTY_INVENTORY" "$NODE_REMOTE" \
+		--request-token "systemd-empty-inventory" --allow-downtime --db-url "$WRT_DEPLOY_E2E_DB_URL" \
+		--ssh-key "$WRT_DEPLOY_E2E_SSH_KEY" --cert-dir "$CERT_DIR"
+	status_json "$pass/status-empty-inventory.json"
+	"${PYTHON[@]}" - "$pass/status-empty-inventory.json" "$NODE_ID" "$DIGEST_EMPTY" >"$pass/assert-empty-inventory.json" <<'PY'
+import json, sys
+value, node_id, digest = json.load(open(sys.argv[1])), sys.argv[2], sys.argv[3]
+node = next(item for item in value["nodes"] if item["node_id"] == node_id)
+desired = node.get("desired_deployment") or {}
+if desired.get("state") != "succeeded" or desired.get("bundle_digest") != digest:
+    raise SystemExit("empty desired deployment state or digest mismatch")
+if desired.get("expected_engines") != []:
+    raise SystemExit("empty desired deployment contains expected engines")
+if any(isinstance(engine.get("deployment"), dict) for engine in node.get("engines", [])):
+    raise SystemExit("empty desired deployment retains observed engines")
+services = value.get("services", [])
+if any(service.get("desired_routes") != 0 for service in services):
+    raise SystemExit("empty desired deployment retains desired route counts")
+if any(route.get("desired") is True for service in services for route in service.get("routes", [])):
+    raise SystemExit("empty desired deployment retains authoritative routes")
+print(json.dumps({"revision": desired.get("revision"), "digest": digest, "engine_slots": []}, sort_keys=True))
+PY
+	revision_empty="$(revision_from "$pass/status-empty-inventory.json")"
+	lifecycle_capture_operation_detail "$NODE_ID" "systemd-empty-inventory" "$pass/operation-empty-inventory.json" "${CLI_ARGS[@]}"
+	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-empty-inventory.json" \
+		--node-id "$NODE_ID" --request-token "systemd-empty-inventory" --action deployment \
+		--target-digest "$DIGEST_EMPTY" --slot-order engine-1 \
+		--stopped-engine-slot engine-1 --expect-proxy-stop >"$pass/assert-operation-empty-inventory.json"
+
+	local rollback_token="systemd-rollback"
+	run_to_log "systemd node rollback" "$pass/rollback.log" \
+		lifecycle_run_deploy_operation "systemd-rollback" "${CLI_ARGS[@]}" node rollback "$NODE_REMOTE" --node-id "$NODE_ID" --to "$revision_b" \
 		--request-token "$rollback_token" --ssh-key "$WRT_DEPLOY_E2E_SSH_KEY"
 	lifecycle_capture_operation_detail "$NODE_ID" "$rollback_token" "$pass/operation-rollback.json" "${CLI_ARGS[@]}"
 	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-rollback.json" \
@@ -860,12 +851,11 @@ PY
 		--target-digest "$DIGEST_B_TWO" --slot-order engine-2 --slot-order engine-1 \
 		--stopped-engine-slot engine-1 --expect-proxy-stop >"$pass/assert-operation-rollback.json"
 	status_json "$pass/status-rollback.json"
-	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-rollback.json" rollback --node-id "$NODE_ID" --source-revision "$revision_b" --after-revision "$revision_contracted" --digest "$DIGEST_B_TWO" --version 2.0.0 --engine-slot engine-1 --engine-slot engine-2 >"$pass/assert-rollback.json"
-	invoke_probe "probe-$backend-rollback" "$pass/invoke-rollback.json"
+	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-rollback.json" rollback --node-id "$NODE_ID" --source-revision "$revision_b" --after-revision "$revision_empty" --digest "$DIGEST_B_TWO" --version 2.0.0 --engine-slot engine-1 --engine-slot engine-2 >"$pass/assert-rollback.json"
+	invoke_probe "probe-systemd-rollback" "$pass/invoke-rollback.json"
 	[ "$revision_a" -lt "$revision_b" ]
 
-	if [ "$backend" = systemd ]; then
-		local initial_selector manager_a_trace manager_b_trace failed_trace failed_selector failed_descriptor failed_rollout_id
+	local initial_selector manager_a_trace manager_b_trace failed_trace failed_selector failed_descriptor failed_rollout_id
 		local reset_active_trace reset_mixed_trace reset_complete_trace fresh_trace shim_marker failed_status
 		initial_selector="$("${PYTHON[@]}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["initial_a_selector_digest"])' "$MANAGER_ROLLOUT_DIR/manager-rollout-artifacts.json")"
 		"${SSH[@]}" "$MANAGER_REMOTE" "test \"sha256:\$(sudo sha256sum /var/lib/wruntime/manager-activation/current-activation.json | cut -d' ' -f1)\" = '$initial_selector'"
@@ -976,15 +966,10 @@ PY
 		run_to_log "manager open lifecycle" "$pass/manager-open.json" \
 			wait_for_manager_admission OPEN
 		assert_manager_admission "$pass/manager-open.json" OPEN
-	fi
 	verify_manifest
-	collect_diagnostics "$backend"
+	collect_diagnostics
 }
 
-for backend in "${BACKENDS[@]}"; do
-	ACTIVE_BACKEND="$backend"
-	lifecycle "$backend"
-	ACTIVE_BACKEND=""
-done
+lifecycle
 
 exit 0

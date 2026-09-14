@@ -12,7 +12,7 @@ use wr_cli::cmd::node_agent::{
     execute_fenced, run_activation, ActivationConfig, AgentFuture, AgentManager, FencedExecution,
     LeaseIdentity, LeaseManager, ReportResultError, TokioClock,
 };
-use wr_cli::cmd::node_backend::{BackendFuture, BackendType, InstructionExecutor, StepEvidence};
+use wr_cli::cmd::node_backend::{BackendFuture, InstructionExecutor, StepEvidence};
 use wr_common::wruntime::{
     AgentInstruction, BackendProcessState, InstructionTarget, InstructionTargetKind,
     NodeAgentAttestation, NodeOperationStepKind, ReportNodeObservationRequest,
@@ -31,7 +31,6 @@ fn activation() -> ActivationConfig {
         node_id: "node-a".into(),
         agent_instance_id: "activation-a".into(),
         binary_digest: format!("sha256:{}", "b".repeat(64)),
-        backend: BackendType::Systemd,
         poll: Duration::from_secs(1),
         renew: Duration::from_secs(60),
     }

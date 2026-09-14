@@ -111,11 +111,11 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
             ) AND NOT EXISTS(
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema()
-                  AND table_name = 'wr_node_agent_policies' AND column_name = 'config_digest'
+                  AND table_name = 'wr_node_agent_policies' AND column_name IN ('backend', 'config_digest')
             ) AND NOT EXISTS(
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema()
-                  AND table_name = 'wr_node_agent_attestations' AND column_name IN ('config_digest', 'retention_count')
+                  AND table_name = 'wr_node_agent_attestations' AND column_name IN ('backend', 'config_digest', 'retention_count')
             ) AND NOT EXISTS(
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema()
@@ -158,7 +158,7 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema()
                   AND ((table_name = 'wr_manager_rollouts' AND column_name IN ('recovery_of', 'executor_id', 'lease_epoch', 'lease_expires_at', 'deployment_leaf_fingerprint'))
-                    OR (table_name = 'wr_manager_rollout_members' AND column_name IN ('expected_host_digest', 'expected_config_digest', 'expected_backend', 'expected_executable_digest', 'expected_backend_spec_digest', 'expected_credential_digest', 'expected_old_selector_digest', 'expected_new_selector_digest'))
+                    OR (table_name = 'wr_manager_rollout_members' AND column_name IN ('expected_host_digest', 'expected_config_digest', 'expected_backend', 'expected_executable_digest', 'expected_backend_spec_digest', 'expected_systemd_unit_digest', 'expected_credential_digest', 'expected_old_selector_digest', 'expected_new_selector_digest'))
                     OR (table_name = 'wr_managers' AND column_name = 'rollout_lease_epoch'))
             ) AND EXISTS(
                 SELECT 1 FROM information_schema.columns
@@ -367,7 +367,7 @@ async fn assert_manager_schema_ready(client: &deadpool_postgres::Object) -> Resu
         )
         .await?
         .get(0);
-    assert_eq!(catalog_digest, "0426433291ee97f40db0e46fddd3a373");
+    assert_eq!(catalog_digest, "3934eca3639d0785e6b0b9b94803b8a5");
 
     let detail_triggers: Vec<String> = client
         .query_one(

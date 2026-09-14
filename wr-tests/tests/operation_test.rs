@@ -6,7 +6,7 @@ use prost::Message;
 use tonic::Code;
 use uuid::Uuid;
 use wr_common::wruntime::{
-    BackendKind, BackendProcessState, BackendStopDisposition, BackendTerminationEvidence,
+    BackendProcessState, BackendStopDisposition, BackendTerminationEvidence,
     BeginDeploymentRequest, DeploymentInventoryV1, DeploymentMetadata, DeploymentRecord,
     EngineOwnershipFence, EngineRegistration, ExpectedEngine, ExpectedModule,
     FinalizeDeploymentRequest, InstructionTargetKind, LifecycleStatus, ModuleDescriptor,
@@ -454,7 +454,6 @@ async fn claim_instruction(
         };
         if instruction.step == NodeOperationStepKind::StopBackend as i32 {
             result.termination_evidence = Some(BackendTerminationEvidence {
-                backend: BackendKind::Systemd as i32,
                 backend_instance_id: result.backend_instance_id.clone(),
                 process_instance_id: result.process_instance_id.clone(),
                 graceful_termination_requested: true,
@@ -830,7 +829,6 @@ async fn deployment_replacement_proves_the_source_proxy_before_stop() -> Result<
     stopped.backend_instance_id = "proxy-backend-old".into();
     stopped.process_instance_id = "proxy-process-old".into();
     stopped.termination_evidence = Some(BackendTerminationEvidence {
-        backend: BackendKind::Systemd as i32,
         backend_instance_id: "proxy-backend-old".into(),
         process_instance_id: "proxy-process-old".into(),
         graceful_termination_requested: true,
@@ -1978,7 +1976,6 @@ async fn stop_result_waits_for_post_delivery_observation() -> Result<()> {
     stop_result.backend_instance_id = "backend-old".into();
     stop_result.process_instance_id = "process-old".into();
     stop_result.termination_evidence = Some(BackendTerminationEvidence {
-        backend: BackendKind::Systemd as i32,
         backend_instance_id: "backend-old".into(),
         process_instance_id: "process-old".into(),
         graceful_termination_requested: true,
@@ -2102,7 +2099,6 @@ async fn stop_result_requires_evidence_bound_to_the_pinned_activation() -> Resul
         result.process_instance_id = "process-old".into();
         if case != "missing" {
             result.termination_evidence = Some(BackendTerminationEvidence {
-                backend: BackendKind::Systemd as i32,
                 backend_instance_id: "backend-old".into(),
                 process_instance_id: "process-old".into(),
                 graceful_termination_requested: true,

@@ -13,25 +13,23 @@ use clap::{Args, Subcommand};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use wr_common::agent_policy::{
-    missing_capabilities, AgentPolicy, AgentPolicyBackend, AGENT_CAPABILITIES,
-    AGENT_PROTOCOL_VERSION,
+    missing_capabilities, AgentPolicy, AGENT_CAPABILITIES, AGENT_PROTOCOL_VERSION,
 };
 use wr_common::node::ClientTlsConfig;
 use wr_common::wruntime::{
-    AgentInstruction, AttestNodeAgentRequest, BackendKind, ClaimNodeCleanupRequest,
-    ClaimOperationRequest, GetOperatorStatusRequest, NodeAgentAttestation, NodeAgentPolicy,
-    NodeCleanupInstruction, NodeOperationStepKind, PutNodeAgentPolicyRequest,
-    RenewNodeCleanupLeaseRequest, RenewOperationLeaseRequest, ReportNodeCleanupResultRequest,
-    ReportNodeObservationRequest, ReportStepResultRequest,
+    AgentInstruction, AttestNodeAgentRequest, ClaimNodeCleanupRequest, ClaimOperationRequest,
+    GetOperatorStatusRequest, NodeAgentAttestation, NodeAgentPolicy, NodeCleanupInstruction,
+    NodeOperationStepKind, PutNodeAgentPolicyRequest, RenewNodeCleanupLeaseRequest,
+    RenewOperationLeaseRequest, ReportNodeCleanupResultRequest, ReportNodeObservationRequest,
+    ReportStepResultRequest,
 };
 
 use super::bundle;
 use super::bundle_integrity::{verify_bundle_archive, BundleManifest};
-use super::deploy_config::DeployFormat;
 use super::helpers;
 use super::node_backend::{
-    validate_identity, validate_root_owned_directory, workload_target, BackendType, HostBackend,
-    HostBackendConfig, InstructionExecutor, StepEvidence, WorkloadTarget,
+    validate_identity, validate_root_owned_directory, workload_target, InstructionExecutor,
+    StepEvidence, SystemdExecutor, SystemdExecutorConfig, WorkloadTarget,
 };
 use crate::client;
 
@@ -69,9 +67,6 @@ pub struct AgentInstallArgs {
     /// Stable node identity bound to the installed certificate.
     #[arg(long)]
     pub node_id: String,
-    /// Backend kind already provisioned for this node.
-    #[arg(long)]
-    pub format: super::deploy_config::DeployFormat,
     #[arg(long)]
     pub ssh_key: Option<String>,
     #[arg(long)]
@@ -109,14 +104,7 @@ impl AgentConfig {
 
     pub fn validate(&self) -> Result<()> {
         self.0.validate()?;
-        self.backend_config().validate()
-    }
-
-    fn backend(&self) -> BackendType {
-        match self.0.backend {
-            AgentPolicyBackend::Systemd => BackendType::Systemd,
-            AgentPolicyBackend::Docker => BackendType::Docker,
-        }
+        self.executor_config().validate()
     }
 
     fn tls(&self) -> ClientTlsConfig {
@@ -127,16 +115,11 @@ impl AgentConfig {
         }
     }
 
-    fn backend_config(&self) -> HostBackendConfig {
-        HostBackendConfig {
+    fn executor_config(&self) -> SystemdExecutorConfig {
+        SystemdExecutorConfig {
             deployment_root: PathBuf::from(&self.deployment_root),
             runtime_dir: PathBuf::from(&self.runtime_dir),
-            backend: self.backend(),
-            systemctl_path: (!self.systemctl_path.is_empty())
-                .then(|| PathBuf::from(&self.systemctl_path)),
-            docker_path: (!self.docker_path.is_empty()).then(|| PathBuf::from(&self.docker_path)),
-            compose_project: (!self.compose_project.is_empty())
-                .then(|| self.compose_project.clone()),
+            systemctl_path: PathBuf::from(&self.systemctl_path),
         }
     }
 }
@@ -610,7 +593,6 @@ pub struct ActivationConfig {
     pub node_id: String,
     pub agent_instance_id: String,
     pub binary_digest: String,
-    pub backend: BackendType,
     pub poll: Duration,
     pub renew: Duration,
 }
@@ -621,7 +603,6 @@ fn attestation(config: &ActivationConfig) -> NodeAgentAttestation {
         agent_instance_id: config.agent_instance_id.clone(),
         protocol_version: AGENT_PROTOCOL_VERSION.to_string(),
         binary_digest: config.binary_digest.clone(),
-        backend: config.backend.wire() as i32,
         capabilities: AGENT_CAPABILITIES
             .iter()
             .map(|value| (*value).to_string())
@@ -1029,17 +1010,12 @@ fn safe_install_path(path: &str, label: &str) -> Result<()> {
 
 pub(super) fn wire_policy(
     node_id: &str,
-    backend: AgentPolicyBackend,
     binary_digest: String,
     retention_count: Option<u32>,
 ) -> NodeAgentPolicy {
     NodeAgentPolicy {
         node_id: node_id.to_string(),
         protocol_version: AGENT_PROTOCOL_VERSION.to_string(),
-        backend: match backend {
-            AgentPolicyBackend::Systemd => BackendKind::Systemd,
-            AgentPolicyBackend::Docker => BackendKind::Docker,
-        } as i32,
         retention_count,
         binary_digest,
         capabilities: AGENT_CAPABILITIES
@@ -1064,7 +1040,6 @@ pub(super) fn attestation_matches_policy(
         && attestation.node_id == policy.node_id
         && attestation.protocol_version == policy.protocol_version
         && attestation.binary_digest == policy.binary_digest
-        && attestation.backend == policy.backend
         && capabilities_match
 }
 
@@ -1144,24 +1119,19 @@ fn remote_activate_command(workdir: &str, _material: &AgentInstallMaterial) -> S
 
 async fn install(args: AgentInstallArgs, manager: &str, updating: bool) -> Result<()> {
     validate_identity(&args.node_id, "node_id")?;
-    let format = args.format;
     let ssh_key = args.ssh_key;
     let ssh_port = args.ssh_port;
     let manifest: BundleManifest = bundle::read_manifest(&args.bundle)?;
     verify_bundle_archive(&args.bundle, &manifest)?;
     safe_install_path(&manifest.workdir, "bundle workdir")?;
     let agent_root = format!("{}/wr-agent", manifest.workdir);
-    let backend = match format {
-        DeployFormat::Systemd => AgentPolicyBackend::Systemd,
-        DeployFormat::Docker => AgentPolicyBackend::Docker,
-    };
     let material = AgentInstallMaterial {
         binary: bundle::read_bytes_from_tarball(&args.bundle, "wr-node/agent/wr-cli")?,
     };
     let binary_digest = wr_common::agent_policy::sha256_digest(&material.binary);
     // The updater never owns cleanup retention; omission makes the manager
     // preserve the already-provisioned operator value transactionally.
-    let wire_policy = wire_policy(&args.node_id, backend, binary_digest, None);
+    let wire_policy = wire_policy(&args.node_id, binary_digest, None);
     let ssh = helpers::build_ssh_args(&args.remote, ssh_key.as_deref(), ssh_port);
     anyhow::ensure!(
         helpers::run_ssh_output(
@@ -1308,12 +1278,11 @@ async fn run_agent(args: AgentRunArgs) -> Result<()> {
     validate_root_owned_file(Path::new(&config.ca_cert_path), "CA certificate")?;
     let _activation_lock =
         ActivationLock::acquire(Path::new(&config.runtime_dir), &config.node_id)?;
-    let backend = HostBackend::new(config.backend_config())?;
+    let executor = SystemdExecutor::new(config.executor_config())?;
     let activation = ActivationConfig {
         node_id: config.node_id.clone(),
         agent_instance_id: uuid::Uuid::new_v4().to_string(),
         binary_digest: executable_digest()?,
-        backend: config.backend(),
         poll: Duration::from_secs(config.poll_interval_seconds),
         renew: Duration::from_secs(config.renew_interval_seconds),
     };
@@ -1328,7 +1297,7 @@ async fn run_agent(args: AgentRunArgs) -> Result<()> {
             client::connect_node_agent_with_tls(&config.manager_endpoint, Some(&tls)).await?,
         ),
     };
-    run_activation(&manager, &backend, &TokioClock, activation, shutdown_rx).await
+    run_activation(&manager, &executor, &TokioClock, activation, shutdown_rx).await
 }
 
 pub async fn run(args: AgentArgs, manager: Option<&str>) -> Result<()> {
@@ -1365,10 +1334,7 @@ mod tests {
             ca_cert_path: "/etc/wruntime/ca.crt".into(),
             deployment_root: "/opt/wruntime".into(),
             runtime_dir: "/run/wruntime".into(),
-            backend: AgentPolicyBackend::Systemd,
-            compose_project: String::new(),
             systemctl_path: "/usr/bin/systemctl".into(),
-            docker_path: String::new(),
             poll_interval_seconds: 5,
             renew_interval_seconds: 5,
             protocol_version: AGENT_PROTOCOL_VERSION.into(),
@@ -1479,19 +1445,13 @@ ca_cert_path = "/etc/wruntime/ca.crt"
 
     #[test]
     fn narrow_attestation_matches_required_capability_subsets() {
-        let policy = wire_policy(
-            "node-a",
-            AgentPolicyBackend::Systemd,
-            format!("sha256:{}", "a".repeat(64)),
-            None,
-        );
+        let policy = wire_policy("node-a", format!("sha256:{}", "a".repeat(64)), None);
         assert!(policy.retention_count.is_none());
         let mut attested = NodeAgentAttestation {
             node_id: policy.node_id.clone(),
             agent_instance_id: "activation-a".into(),
             protocol_version: policy.protocol_version.clone(),
             binary_digest: policy.binary_digest.clone(),
-            backend: policy.backend,
             capabilities: policy
                 .capabilities
                 .iter()
@@ -1524,7 +1484,6 @@ ca_cert_path = "/etc/wruntime/ca.crt"
         assert!(changed.validate().is_ok());
         let expected = wire_policy(
             &changed.node_id,
-            changed.backend,
             format!("sha256:{}", "a".repeat(64)),
             Some(3),
         );
@@ -1748,7 +1707,6 @@ ca_cert_path = "/etc/wruntime/ca.crt"
             node_id: "node-a".into(),
             agent_instance_id: "activation-a".into(),
             binary_digest: format!("sha256:{}", "a".repeat(64)),
-            backend: BackendType::Systemd,
             poll: Duration::from_millis(1),
             renew: Duration::from_secs(60),
         }

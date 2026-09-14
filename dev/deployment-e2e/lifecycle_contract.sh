@@ -165,50 +165,46 @@ lifecycle_contract_fixture() {
 		PROBE_STOP_FILE=""
 	fi
 	lifecycle_artifact prepare manifest-a sha256:fixture
-	for backend in systemd docker; do
-		lifecycle_reset_boundary "$backend-entry"
-		"$WRT_CONTRACT_PROVIDER" reset
-		lifecycle_artifact "$backend" manifest-a sha256:fixture
-		lifecycle_run_deploy_operation "$backend-addition" "$WRT_CONTRACT_CLI" node deploy --bundle baseline-two.tar.gz
-		local injected_status submitted_at completed_at probe_log=""
-		if [ -n "${WRT_CONTRACT_TRAFFIC_DIR:-}" ]; then
-			probe_log="$WRT_CONTRACT_TRAFFIC_DIR/$backend-probe.jsonl"
-			start_tunnel "$WRT_CONTRACT_TRAFFIC_DIR/$backend-tunnel.log"
-			invoke_probe_over_tunnel probe "$WRT_CONTRACT_TRAFFIC_DIR/$backend-pre.json"
-			start_probe probe "$probe_log"
-		fi
-		if lifecycle_run_deploy_operation "$backend-replacement-finalize" "$WRT_CONTRACT_CLI" node deploy --request-token replacement-token --exit-after-finalization; then
-			injected_status=0
-		else
-			injected_status=$?
-		fi
-		[ "$injected_status" -eq 1 ] || { echo "documented finalization fault was not observed" >&2; return 1; }
-		submitted_at="$(python3 -c 'import time; print(time.time())')"
-		lifecycle_run_deploy_operation "$backend-replacement-retry" "$WRT_CONTRACT_CLI" node deploy --bundle upgrade-two.tar.gz --request-token replacement-token
-		completed_at="$(python3 -c 'import time; print(time.time())')"
-		lifecycle_capture_operation_detail node-a replacement-token "${WRT_CONTRACT_ARTIFACT:-/tmp/wruntime-operation-detail.json}" "$WRT_CONTRACT_CLI"
-		if [ -n "$probe_log" ]; then
-			invoke_probe_over_tunnel probe "$WRT_CONTRACT_TRAFFIC_DIR/$backend-post.json"
-			stop_probe
-			python3 "$ROOT/dev/deployment-e2e/traffic_probe.py" evaluate --log "$probe_log" --submitted-at "$submitted_at" --completed-at "$completed_at" >"$WRT_CONTRACT_TRAFFIC_DIR/$backend-summary.json"
-			stop_probe
-			stop_tunnel
-			stop_tunnel
-		fi
-		lifecycle_run_deploy_operation "$backend-removal" "$WRT_CONTRACT_CLI" node deploy --bundle upgrade-one.tar.gz
-		lifecycle_run_deploy_operation "$backend-empty-inventory" "$WRT_CONTRACT_CLI" node deploy --bundle empty-inventory.tar.gz --allow-downtime
-		lifecycle_run_deploy_operation "$backend-rollback" "$WRT_CONTRACT_CLI" node rollback --to revision_one_a --allow-downtime
-		if [ "$backend" = systemd ]; then
-			local manager_trace_root="${WRT_CONTRACT_TRAFFIC_DIR:-/tmp}"
-			lifecycle_run_manager_rollout a-to-b "$manager_trace_root/manager-a-to-b.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-a-to-b-systemd.toml
-			lifecycle_run_manager_rollout b-to-a "$manager_trace_root/manager-b-to-a.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-b-to-a-systemd.toml
-			lifecycle_expect_manager_failure failed-closed "$manager_trace_root/manager-failed-closed.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-failed-closed-systemd.toml
-			lifecycle_expect_manager_failure reset-active "$manager_trace_root/manager-reset-active.jsonl" "$WRT_CONTRACT_CLI" managers reset-failed-rollout --manifest manager-failed-closed-systemd.toml --rollout-id failed-rollout
-			lifecycle_expect_manager_failure reset-mixed "$manager_trace_root/manager-reset-mixed.jsonl" "$WRT_CONTRACT_CLI" managers reset-failed-rollout --manifest manager-failed-closed-systemd.toml --rollout-id failed-rollout
-			lifecycle_run_manager_rollout reset-complete "$manager_trace_root/manager-reset-complete.jsonl" "$WRT_CONTRACT_CLI" managers reset-failed-rollout --manifest manager-failed-closed-systemd.toml --rollout-id failed-rollout
-			lifecycle_run_manager_rollout closed-after-reset "$manager_trace_root/manager-closed-after-reset.jsonl" "$WRT_CONTRACT_CLI" lifecycle status
-			lifecycle_run_manager_rollout fresh "$manager_trace_root/manager-fresh.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-fresh-systemd.toml
-		fi
-	done
+	lifecycle_reset_boundary systemd-entry
+	"$WRT_CONTRACT_PROVIDER" reset
+	lifecycle_artifact systemd manifest-a sha256:fixture
+	lifecycle_run_deploy_operation systemd-addition "$WRT_CONTRACT_CLI" node deploy --bundle baseline-two.tar.gz
+	local injected_status submitted_at completed_at probe_log=""
+	if [ -n "${WRT_CONTRACT_TRAFFIC_DIR:-}" ]; then
+		probe_log="$WRT_CONTRACT_TRAFFIC_DIR/systemd-probe.jsonl"
+		start_tunnel "$WRT_CONTRACT_TRAFFIC_DIR/systemd-tunnel.log"
+		invoke_probe_over_tunnel probe "$WRT_CONTRACT_TRAFFIC_DIR/systemd-pre.json"
+		start_probe probe "$probe_log"
+	fi
+	if lifecycle_run_deploy_operation systemd-replacement-finalize "$WRT_CONTRACT_CLI" node deploy --request-token replacement-token --exit-after-finalization; then
+		injected_status=0
+	else
+		injected_status=$?
+	fi
+	[ "$injected_status" -eq 1 ] || { echo "documented finalization fault was not observed" >&2; return 1; }
+	submitted_at="$(python3 -c 'import time; print(time.time())')"
+	lifecycle_run_deploy_operation systemd-replacement-retry "$WRT_CONTRACT_CLI" node deploy --bundle upgrade-two.tar.gz --request-token replacement-token
+	completed_at="$(python3 -c 'import time; print(time.time())')"
+	lifecycle_capture_operation_detail node-a replacement-token "${WRT_CONTRACT_ARTIFACT:-/tmp/wruntime-operation-detail.json}" "$WRT_CONTRACT_CLI"
+	if [ -n "$probe_log" ]; then
+		invoke_probe_over_tunnel probe "$WRT_CONTRACT_TRAFFIC_DIR/systemd-post.json"
+		stop_probe
+		python3 "$ROOT/dev/deployment-e2e/traffic_probe.py" evaluate --log "$probe_log" --submitted-at "$submitted_at" --completed-at "$completed_at" >"$WRT_CONTRACT_TRAFFIC_DIR/systemd-summary.json"
+		stop_probe
+		stop_tunnel
+		stop_tunnel
+	fi
+	lifecycle_run_deploy_operation systemd-removal "$WRT_CONTRACT_CLI" node deploy --bundle upgrade-one.tar.gz
+	lifecycle_run_deploy_operation systemd-empty-inventory "$WRT_CONTRACT_CLI" node deploy --bundle empty-inventory.tar.gz --allow-downtime
+	lifecycle_run_deploy_operation systemd-rollback "$WRT_CONTRACT_CLI" node rollback --to revision_one_a --allow-downtime
+	local manager_trace_root="${WRT_CONTRACT_TRAFFIC_DIR:-/tmp}"
+	lifecycle_run_manager_rollout a-to-b "$manager_trace_root/manager-a-to-b.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-a-to-b-systemd.toml
+	lifecycle_run_manager_rollout b-to-a "$manager_trace_root/manager-b-to-a.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-b-to-a-systemd.toml
+	lifecycle_expect_manager_failure failed-closed "$manager_trace_root/manager-failed-closed.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-failed-closed-systemd.toml
+	lifecycle_expect_manager_failure reset-active "$manager_trace_root/manager-reset-active.jsonl" "$WRT_CONTRACT_CLI" managers reset-failed-rollout --manifest manager-failed-closed-systemd.toml --rollout-id failed-rollout
+	lifecycle_expect_manager_failure reset-mixed "$manager_trace_root/manager-reset-mixed.jsonl" "$WRT_CONTRACT_CLI" managers reset-failed-rollout --manifest manager-failed-closed-systemd.toml --rollout-id failed-rollout
+	lifecycle_run_manager_rollout reset-complete "$manager_trace_root/manager-reset-complete.jsonl" "$WRT_CONTRACT_CLI" managers reset-failed-rollout --manifest manager-failed-closed-systemd.toml --rollout-id failed-rollout
+	lifecycle_run_manager_rollout closed-after-reset "$manager_trace_root/manager-closed-after-reset.jsonl" "$WRT_CONTRACT_CLI" lifecycle status
+	lifecycle_run_manager_rollout fresh "$manager_trace_root/manager-fresh.jsonl" "$WRT_CONTRACT_CLI" managers deploy-set --manifest manager-fresh-systemd.toml
 	lifecycle_final_cleanup "$WRT_CONTRACT_PROVIDER" stop-reset
 }

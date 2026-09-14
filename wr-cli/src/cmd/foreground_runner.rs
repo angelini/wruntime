@@ -13,16 +13,15 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
-use wr_common::agent_policy::AgentPolicyBackend;
 use wr_common::process_lifecycle::PROCESS_INSTANCE_ID_ENV;
 use wr_common::wruntime::{
-    instruction_target, AttestNodeAgentRequest, BackendKind, BackendProcessState,
-    BeginDeploymentRequest, ClaimOperationRequest, DeploymentInventoryV1, ExpectedEngine,
-    ExpectedModule, FinalizeDeploymentRequest, GetOperationRequest, InstructionTargetKind,
-    LifecycleStatus, ListEnginesRequest, ModuleIdentity, NodeAgentAttestation, NodeAgentPolicy,
-    NodeOperationAction, NodeOperationState, NodeOperationStepKind, ProcessLifecycleState,
-    PutNodeAgentPolicyRequest, ReportNodeObservationRequest, ReportStepResultRequest, RoutingRule,
-    ServiceKind, SubmitOperationRequest,
+    instruction_target, AttestNodeAgentRequest, BackendProcessState, BeginDeploymentRequest,
+    ClaimOperationRequest, DeploymentInventoryV1, ExpectedEngine, ExpectedModule,
+    FinalizeDeploymentRequest, GetOperationRequest, InstructionTargetKind, LifecycleStatus,
+    ListEnginesRequest, ModuleIdentity, NodeAgentAttestation, NodeAgentPolicy, NodeOperationAction,
+    NodeOperationState, NodeOperationStepKind, ProcessLifecycleState, PutNodeAgentPolicyRequest,
+    ReportNodeObservationRequest, ReportStepResultRequest, RoutingRule, ServiceKind,
+    SubmitOperationRequest,
 };
 
 use super::config::{DeploymentConfig, EngineConfig};
@@ -1389,7 +1388,6 @@ fn foreground_agent_policy(_manager_endpoint: &str) -> Result<NodeAgentPolicy> {
         })?);
     Ok(super::node_agent::wire_policy(
         "node-a",
-        AgentPolicyBackend::Systemd,
         binary_digest,
         Some(2),
     ))
@@ -1421,7 +1419,6 @@ async fn complete_foreground_operation(manager_endpoint: &str) -> Result<()> {
                 agent_instance_id: "foreground-agent".into(),
                 protocol_version: policy.protocol_version.clone(),
                 binary_digest: policy.binary_digest.clone(),
-                backend: BackendKind::Systemd as i32,
                 capabilities: policy.capabilities.clone(),
                 ..Default::default()
             }),

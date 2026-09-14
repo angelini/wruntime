@@ -14,7 +14,7 @@ use wr_cli::cmd::node_agent::{
 use wr_cli::cmd::node_backend::{BackendFuture, InstructionExecutor, StepEvidence};
 use wr_common::agent_policy::{AGENT_CAPABILITIES, AGENT_PROTOCOL_VERSION};
 use wr_common::wruntime::{
-    AgentInstruction, BackendKind, CleanupReleaseEvidence, NodeAgentAttestation, NodeAgentPolicy,
+    AgentInstruction, CleanupReleaseEvidence, NodeAgentAttestation, NodeAgentPolicy,
     NodeCleanupInstruction, ReleaseInventoryEntry, ReportNodeCleanupResultRequest,
     ReportNodeObservationRequest, ReportStepResultRequest,
 };
@@ -23,7 +23,6 @@ pub fn systemd_policy(node_id: &str, retention_count: u32) -> NodeAgentPolicy {
     NodeAgentPolicy {
         node_id: node_id.into(),
         protocol_version: AGENT_PROTOCOL_VERSION.into(),
-        backend: BackendKind::Systemd as i32,
         retention_count: Some(retention_count),
         binary_digest: format!("sha256:{}", "a".repeat(64)),
         capabilities: AGENT_CAPABILITIES
@@ -39,7 +38,6 @@ pub fn attestation(policy: &NodeAgentPolicy, activation: &str) -> NodeAgentAttes
         agent_instance_id: activation.into(),
         protocol_version: policy.protocol_version.clone(),
         binary_digest: policy.binary_digest.clone(),
-        backend: policy.backend,
         capabilities: policy.capabilities.clone(),
         ..Default::default()
     }

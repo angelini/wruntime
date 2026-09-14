@@ -312,8 +312,8 @@ test-lifecycle-runners:
     cargo test -p wr-cli cmd::helpers::tests
     cargo test -p wr-cli cmd::cluster::tests::expectation
     cargo test -p wr-cli cmd::managers::tests::manager_deploy_propagates_live_tail_failure
-    cargo test -p wr-cli cmd::managers::tests::manager_activation_identity_is_installed_in_every_backend
-    cargo test -p wr-cli cmd::managers::tests::manager_docker_deploy_sequence_resolves_artifacts_before_compose_start
+    cargo test -p wr-cli cmd::managers::tests::manager_activation_identity_is_installed_for_systemd
+    cargo test -p wr-cli cmd::managers::tests::manager_systemd_deploy_sequence_starts_after_runtime_artifacts
     cargo test -p wr-common process_lifecycle::tests
     just deployment-e2e-python-test
 
@@ -321,19 +321,15 @@ test-lifecycle-runners:
 deployment-e2e-preflight:
     uv run --project dev/deployment-e2e --locked python dev/deployment-e2e/proxmox.py preflight
 
-# Protected gate: node lifecycle under systemd+Docker; manager Systemd A→B→A,
+# Protected Systemd gate: complete node lifecycle plus manager A→B→A,
 # failed-closed/reset/closed-startup/fresh-rollout qualification. Fast contract tests
-# are not protected evidence. Compose manager deploy-set remains unqualified.
+# are not protected evidence.
 deployment-e2e:
     bash dev/validate-deployment-lifecycle.sh
 
-# Run only the systemd deployment lifecycle backend
+# Explicit alias for the authoritative Systemd deployment lifecycle gate
 deployment-e2e-systemd:
-    bash dev/validate-deployment-lifecycle.sh --backend systemd
-
-# Run only the Docker deployment lifecycle backend
-deployment-e2e-docker:
-    bash dev/validate-deployment-lifecycle.sh --backend docker
+    bash dev/validate-deployment-lifecycle.sh
 
 # Run the comprehensive validation suite (format, lints, WASM, tests, E2E examples)
 [positional-arguments]

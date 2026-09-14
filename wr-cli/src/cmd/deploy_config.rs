@@ -1,16 +1,7 @@
 use anyhow::{Context, Result};
-use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use super::helpers::DeployPort;
-
-/// Shared deployment format used by both manager and node deploy commands.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DeployFormat {
-    Systemd,
-    Docker,
-}
 
 /// Optional deploy configuration file (`wr-deploy.toml`).
 ///
@@ -19,8 +10,6 @@ pub enum DeployFormat {
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct DeployConfig {
-    /// Deployment format: "systemd" or "docker"
-    pub format: Option<DeployFormat>,
     /// Platform PostgreSQL URL used by manager/proxy/job-queue code only.
     pub db_url: Option<String>,
     /// Node-local endpoint for certificate-authenticated tenant databases.
@@ -35,8 +24,6 @@ pub struct DeployConfig {
     pub target: Option<String>,
     /// Base directory for installed files on the remote host
     pub workdir: Option<String>,
-    /// Docker image name prefix
-    pub image_prefix: Option<String>,
     /// Source proxy config file for node bundle generation
     pub proxy_config: Option<String>,
     /// Disable OpenTelemetry export in generated service units
@@ -284,27 +271,6 @@ pub fn resolve_with_default(
         .unwrap_or_else(|| cli.to_string())
 }
 
-/// Resolve deploy format from CLI > config > env > default (Systemd).
-pub fn resolve_format(cli: Option<DeployFormat>, config: Option<DeployFormat>) -> DeployFormat {
-    resolve_format_from(cli, config, std::env::var("WR_FORMAT").ok())
-}
-
-pub(crate) fn resolve_format_from(
-    cli: Option<DeployFormat>,
-    config: Option<DeployFormat>,
-    environment: Option<String>,
-) -> DeployFormat {
-    cli.or(config)
-        .or_else(|| {
-            environment.and_then(|value| match value.to_lowercase().as_str() {
-                "systemd" => Some(DeployFormat::Systemd),
-                "docker" => Some(DeployFormat::Docker),
-                _ => None,
-            })
-        })
-        .unwrap_or(DeployFormat::Systemd)
-}
-
 fn optional_deploy_port(port: Option<u16>, source: &str) -> Result<Option<DeployPort>> {
     port.map(|value| DeployPort::new(value).with_context(|| format!("invalid {source}")))
         .transpose()
@@ -414,6 +380,12 @@ pub fn resolve_no_otel(cli: bool, config: Option<bool>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_node_backend_config_keys_are_rejected() {
+        assert!(toml::from_str::<DeployConfig>("format = \"docker\"").is_err());
+        assert!(toml::from_str::<DeployConfig>("image_prefix = \"wr\"").is_err());
+    }
 
     #[test]
     fn deployment_ports_reject_malformed_and_zero_values() {

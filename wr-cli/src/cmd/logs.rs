@@ -1,7 +1,6 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use super::deploy_config::DeployFormat;
 use super::helpers;
 
 #[derive(Args)]
@@ -16,18 +15,12 @@ pub enum LogsCommand {
     Node {
         /// Remote host in user@host format
         remote: String,
-        /// Deployment format (systemd or docker)
-        #[arg(long)]
-        format: DeployFormat,
         /// SSH private key path
         #[arg(long)]
         ssh_key: Option<String>,
         /// SSH port (omit to use SSH config default)
         #[arg(long)]
         ssh_port: Option<u16>,
-        /// Base directory for installed files
-        #[arg(long, default_value = "/opt/wruntime")]
-        workdir: String,
         /// Filter to a specific service (e.g. wr-proxy, wr-engine-inventory)
         #[arg(long)]
         service: Option<String>,
@@ -47,24 +40,15 @@ pub async fn run(args: LogsArgs) -> Result<()> {
     match args.command {
         LogsCommand::Node {
             remote,
-            format,
             ssh_key,
             ssh_port,
-            workdir,
             service,
             tail,
             since,
             follow,
         } => {
             let ssh_base = helpers::build_ssh_args(&remote, ssh_key.as_deref(), ssh_port);
-            let cmd = match format {
-                DeployFormat::Systemd => {
-                    build_journalctl_command(service.as_deref(), tail, &since, follow)
-                }
-                DeployFormat::Docker => {
-                    build_docker_logs_command(&workdir, service.as_deref(), tail, follow)
-                }
-            };
+            let cmd = build_journalctl_command(service.as_deref(), tail, &since, follow);
             helpers::run_ssh_streaming(&ssh_base, &cmd)
         }
     }
@@ -142,46 +126,24 @@ fn build_journalctl_command_raw(
     cmd
 }
 
-pub fn build_docker_logs_command(
-    workdir: &str,
-    service: Option<&str>,
-    tail: u32,
-    follow: bool,
-) -> String {
-    let follow_flag = if follow { " -f" } else { "" };
-    match service {
-        Some("proxy") | Some("wr-proxy") => format!(
-            "revision=$(sed -n 's/^revision = //p' {workdir}/wr-node/proxy.selection) && test -n \"$revision\" && sudo docker compose --project-name wruntime-node -f {workdir}/wr-node/releases/$revision/docker/docker-compose.yml logs --tail {tail}{follow_flag} proxy"
-        ),
-        Some(service) => {
-            let slot = service
-                .strip_prefix("engine-")
-                .or_else(|| service.strip_prefix("wr-engine-"))
-                .unwrap_or(service);
-            format!(
-                "revision=$(sed -n 's/^revision = //p' {workdir}/wr-node/slots/{slot}.selection) && test -n \"$revision\" && sudo docker compose --project-name wruntime-node -f {workdir}/wr-node/releases/$revision/docker/docker-compose.yml logs --tail {tail}{follow_flag} engine-{slot}"
-            )
-        }
-        None => format!(
-            "for selection in {workdir}/wr-node/proxy.selection {workdir}/wr-node/slots/*.selection; do test -f \"$selection\" || continue; revision=$(sed -n 's/^revision = //p' \"$selection\"); case \"$selection\" in */proxy.selection) component=proxy;; *) slot=$(basename \"$selection\" .selection); component=engine-$slot;; esac; sudo docker compose --project-name wruntime-node -f {workdir}/wr-node/releases/$revision/docker/docker-compose.yml logs --tail {tail}{follow_flag} \"$component\"; done"
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn docker_logs_use_privileged_isolated_compose_project() {
-        let command = build_docker_logs_command("/opt/wruntime", Some("engine-echo"), 50, true);
-        assert!(command.contains("sudo docker compose"));
-        assert!(command.contains("--project-name wruntime-node"));
-        assert!(command.contains("/opt/wruntime/wr-node/slots/echo.selection"));
-        assert!(
-            command.contains("/opt/wruntime/wr-node/releases/$revision/docker/docker-compose.yml")
+    fn node_logs_use_journalctl() {
+        let command = build_journalctl_command(Some("wr-engine-echo"), 50, "5m", true);
+        assert_eq!(
+            command,
+            "sudo journalctl -q -u wr-engine-echo --since '5 minutes ago' -n 50 --no-pager -f"
         );
-        assert!(!command.contains("wr-node/current"));
-        assert!(command.contains("--tail 50 -f engine-echo"));
+    }
+
+    #[test]
+    fn all_node_logs_discover_systemd_units() {
+        let command = build_journalctl_command(None, 100, "2026-04-06 12:00:00", false);
+        assert!(command.contains("systemctl list-units"));
+        assert!(command.contains("--since '2026-04-06 12:00:00'"));
+        assert!(!command.contains("docker"));
     }
 }

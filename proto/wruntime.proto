@@ -622,12 +622,6 @@ enum InstructionTargetKind {
   INSTRUCTION_TARGET_KIND_RELEASE_CLEANUP = 3;
 }
 
-enum BackendKind {
-  BACKEND_KIND_UNSPECIFIED = 0;
-  BACKEND_KIND_SYSTEMD = 1;
-  BACKEND_KIND_DOCKER = 2;
-}
-
 enum BackendProcessState {
   BACKEND_PROCESS_STATE_UNSPECIFIED = 0;
   BACKEND_PROCESS_STATE_RUNNING = 1;
@@ -644,7 +638,8 @@ enum BackendStopDisposition {
 }
 
 message BackendTerminationEvidence {
-  BackendKind backend = 1;
+  reserved 1;
+  reserved "backend";
   string backend_instance_id = 2;
   string process_instance_id = 3;
   bool graceful_termination_requested = 4;
@@ -811,11 +806,12 @@ message SlotAuthorityStatus {
   string resolved_release_digest = 5;
 }
 message NodeAgentAttestation {
+  reserved 6;
+  reserved "backend";
   string node_id = 1;
   string agent_instance_id = 2;
   string protocol_version = 3;
   string binary_digest = 4;
-  BackendKind backend = 6;
   repeated string capabilities = 7;
   optional google.protobuf.Timestamp observed_at = 8;
   string authenticated_principal = 9;
@@ -824,9 +820,10 @@ message NodeAgentAttestation {
 // policy, not attestation evidence or a claim-eligibility input. Omission on an
 // update preserves the stored value; initial creation requires it.
 message NodeAgentPolicy {
+  reserved 4;
+  reserved "backend";
   string node_id = 1;
   string protocol_version = 2;
-  BackendKind backend = 4;
   optional uint32 retention_count = 5;
   string binary_digest = 7;
   repeated string capabilities = 19;
@@ -1226,16 +1223,18 @@ message ManagerRolloutSource {
 }
 
 message ManagerRolloutTarget {
+  reserved 5, 7;
+  reserved "backend", "backend_spec_digest";
+
   string manager_id = 1;
   string endpoint = 2;
   string host_digest = 3;
   string config_digest = 4;
-  string backend = 5;
   string executable_digest = 6;
-  string backend_spec_digest = 7;
   string credential_digest = 8;
   string old_selector_digest = 9;
   string new_selector_digest = 10;
+  string systemd_unit_digest = 11;
 }
 
 message BeginManagerRolloutRequest {

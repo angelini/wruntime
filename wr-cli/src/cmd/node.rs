@@ -29,12 +29,10 @@ use super::bundle_integrity::{
 use super::config::{
     EngineConfig, NamespaceDatabaseExpectation, ProxyConfig, TenantDatabaseConfig,
 };
-use super::deploy_config::{
-    self, DeployConfig, DeployFormat, TenantDeployConfig, TenantDeployOverrides,
-};
+use super::deploy_config::{self, DeployConfig, TenantDeployConfig, TenantDeployOverrides};
 use super::helpers;
 use super::node_backend::{ReleaseMetadata, ReleaseSlot};
-use super::service_gen::{self, DockerfileSpec, ServiceUnit};
+use super::service_gen::{self, ServiceUnit};
 use crate::client;
 
 #[derive(Args)]
@@ -80,9 +78,6 @@ pub struct BundleArgs {
     /// Base directory for installed files
     #[arg(long, default_value = "/opt/wruntime")]
     workdir: String,
-    /// Docker image name prefix
-    #[arg(long, default_value = "wr")]
-    image_prefix: String,
     /// Output tarball path [default: wr-node-bundle.tar.gz]
     #[arg(long)]
     output: Option<String>,
@@ -108,8 +103,6 @@ pub struct ReserveDeploymentArgs {
     remote: String,
     #[arg(long)]
     config: Option<String>,
-    #[arg(long)]
-    format: Option<DeployFormat>,
     #[arg(long)]
     db_url: Option<String>,
     #[arg(long)]
@@ -146,9 +139,6 @@ pub struct DeployArgs {
     /// Deploy config file (default: auto-discover wr-deploy.toml in CWD)
     #[arg(long)]
     config: Option<String>,
-    /// Deployment format [default: systemd]
-    #[arg(long)]
-    format: Option<DeployFormat>,
     /// Database URL for proxy and engine routing table sync
     #[arg(long)]
     db_url: Option<String>,
@@ -670,21 +660,7 @@ struct DeployArtifactParams<'a> {
     no_otel: bool,
 }
 
-fn engine_docker_extra_copies(
-    has_schema_artifacts: bool,
-    has_migration_artifacts: bool,
-) -> Vec<(&'static str, &'static str)> {
-    let mut copies = vec![("modules/", "modules/")];
-    if has_schema_artifacts {
-        copies.push(("schemas/", "schemas/"));
-    }
-    if has_migration_artifacts {
-        copies.push(("migrations/", "migrations/"));
-    }
-    copies
-}
-
-/// Generate and add systemd units, Dockerfiles, and docker-compose.yml to the tarball.
+/// Generate and add Systemd units to the tarball.
 fn add_deployment_artifacts(
     tar: &mut tar::Builder<GzEncoder<fs::File>>,
     checksums: &mut HashMap<String, String>,
@@ -711,7 +687,6 @@ fn add_deployment_artifacts(
         .map(|(index, (slot, port))| ReleaseSlot {
             engine_slot: slot.clone(),
             systemd_unit: format!("wr-engine-{slot}.service"),
-            docker_service: format!("engine-{slot}"),
             lifecycle_address: format!("http://127.0.0.1:{port}"),
             config_path: format!("config/{}", config_names[index + 1]),
         })
@@ -721,7 +696,6 @@ fn add_deployment_artifacts(
         format_version: 1,
         proxy_lifecycle_address: format!("http://127.0.0.1:{proxy_control_port}"),
         proxy_systemd_unit: "wr-proxy.service".to_string(),
-        proxy_docker_service: "proxy".to_string(),
         slots: release_slots,
     };
     release_metadata.validate()?;
@@ -732,13 +706,6 @@ fn add_deployment_artifacts(
         serde_json::to_vec_pretty(&release_metadata)?.as_slice(),
         0o644,
     )?;
-    let has_schema_artifacts = checksums
-        .keys()
-        .any(|path| path.starts_with("wr-node/schemas/"));
-    let has_migration_artifacts = checksums
-        .keys()
-        .any(|path| path.starts_with("wr-node/migrations/"));
-
     // Systemd units
     let proxy_unit = ServiceUnit {
         description: "wruntime proxy",
@@ -795,115 +762,6 @@ fn add_deployment_artifacts(
         0o644,
     )?;
 
-    // Docker artifacts
-    let proxy_dockerfile = DockerfileSpec {
-        workdir,
-        binary: "bin/wr-proxy",
-        config: "config/proxy.toml",
-        extra_copies: vec![],
-        env_vars: vec![],
-        no_otel,
-    };
-    bundle::tar_add_bytes_checked(
-        tar,
-        checksums,
-        "wr-node/docker/Dockerfile.proxy",
-        proxy_dockerfile.render().as_bytes(),
-        0o644,
-    )?;
-
-    for (i, engine_name) in engine_names.iter().enumerate() {
-        let cfg_name = &config_names[i + 1];
-        let engine_dockerfile = DockerfileSpec {
-            workdir,
-            binary: "bin/wr-engine",
-            config: &format!("config/{cfg_name}"),
-            extra_copies: engine_docker_extra_copies(has_schema_artifacts, has_migration_artifacts),
-            env_vars: vec![],
-            no_otel,
-        };
-        bundle::tar_add_bytes_checked(
-            tar,
-            checksums,
-            &format!("wr-node/docker/Dockerfile.engine-{engine_name}"),
-            engine_dockerfile.render().as_bytes(),
-            0o644,
-        )?;
-    }
-
-    let compose_header = "# Requires vm.max_map_count >= 262144 on the Docker host for wasmtime memory pooling.\n\
-                          # Apply with: sysctl -w vm.max_map_count=262144\n\
-                          # Persist with: echo 'vm.max_map_count = 262144' > /etc/sysctl.d/99-wruntime.conf";
-
-    let mut compose_services = vec![service_gen::ComposeService {
-        name: "proxy".into(),
-        dockerfile: "docker/Dockerfile.proxy".into(),
-        context: "..".into(),
-        image: None,
-        network_mode: Some("host".into()),
-        ports: vec![],
-        volumes: vec!["/etc/wruntime/pki:/etc/wruntime/pki:ro".into()],
-        depends_on: vec![],
-        healthcheck: service_gen::ComposeHealthcheck {
-            test: vec![
-                "CMD".into(),
-                format!("{workdir}/bin/wr-proxy"),
-                "--lifecycle-probe".into(),
-                format!("{workdir}/config/proxy.toml"),
-            ],
-            interval: "2s",
-            timeout: "2s",
-            retries: 15,
-            start_period: "30s",
-        },
-    }];
-
-    for (index, name) in engine_names.iter().enumerate() {
-        let cfg_name = &config_names[index + 1];
-        compose_services.push(service_gen::ComposeService {
-            name: format!("engine-{name}"),
-            dockerfile: format!("docker/Dockerfile.engine-{name}"),
-            context: "..".into(),
-            image: None,
-            network_mode: Some("host".into()),
-            ports: vec![],
-            volumes: vec!["/etc/wruntime/pki:/etc/wruntime/pki:ro".into()],
-            depends_on: vec![service_gen::ComposeDependency {
-                service: "proxy".into(),
-                condition: "service_healthy",
-            }],
-            healthcheck: service_gen::ComposeHealthcheck {
-                test: vec![
-                    "CMD".into(),
-                    format!("{workdir}/bin/wr-engine"),
-                    "--lifecycle-probe".into(),
-                    format!("{workdir}/config/{cfg_name}"),
-                ],
-                interval: "2s",
-                timeout: "2s",
-                retries: 30,
-                start_period: "60s",
-            },
-        });
-    }
-
-    let compose = service_gen::generate_compose(compose_header, &compose_services);
-    bundle::tar_add_bytes_checked(
-        tar,
-        checksums,
-        "wr-node/docker/docker-compose.yml",
-        compose.as_bytes(),
-        0o644,
-    )?;
-
-    bundle::tar_add_bytes_checked(
-        tar,
-        checksums,
-        "wr-node/docker/.dockerignore",
-        b"*.tar.gz\n",
-        0o644,
-    )?;
-
     Ok(())
 }
 
@@ -914,7 +772,6 @@ struct NodeBundleAssembly<'a> {
     target: &'a str,
     host_binary_dir: &'a Path,
     workdir: &'a str,
-    image_prefix: &'a str,
     peer_port: u16,
     no_otel: bool,
     source_proxy_config: Option<&'a ProxyConfig>,
@@ -1073,7 +930,6 @@ fn assemble_node_bundle(input: NodeBundleAssembly<'_>) -> Result<Manifest> {
     let bundle_digest = deterministic_bundle_digest(
         input.target,
         input.workdir,
-        input.image_prefix,
         &engines,
         &manifest_checksums,
         &input.precompile_hash,
@@ -1083,7 +939,6 @@ fn assemble_node_bundle(input: NodeBundleAssembly<'_>) -> Result<Manifest> {
         bundle_digest,
         engines,
         workdir: input.workdir.to_string(),
-        image_prefix: input.image_prefix.to_string(),
         modules: manifest_modules,
         configs: config_names,
         template_vars,
@@ -1100,12 +955,21 @@ fn assemble_node_bundle(input: NodeBundleAssembly<'_>) -> Result<Manifest> {
     Ok(manifest)
 }
 
-fn bundle(args: BundleArgs) -> Result<()> {
-    if args.engine_configs.is_empty() {
-        bail!("At least one --engine-config is required");
-    }
+fn reject_removed_deploy_environment() -> Result<()> {
+    anyhow::ensure!(
+        std::env::var_os("WR_FORMAT").is_none(),
+        "WR_FORMAT is no longer supported; node deployment uses Systemd"
+    );
+    anyhow::ensure!(
+        std::env::var_os("WR_IMAGE_PREFIX").is_none(),
+        "WR_IMAGE_PREFIX is no longer supported; node bundles contain no images"
+    );
+    Ok(())
+}
 
+fn bundle(args: BundleArgs) -> Result<()> {
     let deploy_cfg = DeployConfig::load_or_discover(args.config.as_deref())?;
+    reject_removed_deploy_environment()?;
     let target = deploy_config::resolve_with_default(
         &args.target,
         "x86_64-unknown-linux-gnu",
@@ -1117,12 +981,6 @@ fn bundle(args: BundleArgs) -> Result<()> {
         "/opt/wruntime",
         deploy_cfg.workdir,
         "WR_WORKDIR",
-    );
-    let image_prefix = deploy_config::resolve_with_default(
-        &args.image_prefix,
-        "wr",
-        deploy_cfg.image_prefix,
-        "WR_IMAGE_PREFIX",
     );
     let no_otel = deploy_config::resolve_no_otel(args.no_otel, deploy_cfg.no_otel);
     let peer_port = deploy_config::resolve_peer_port(args.peer_port, deploy_cfg.peer_port)?.get();
@@ -1192,7 +1050,6 @@ fn bundle(args: BundleArgs) -> Result<()> {
         target: &target,
         host_binary_dir: &target_dir,
         workdir: &workdir,
-        image_prefix: &image_prefix,
         peer_port,
         no_otel,
         source_proxy_config: source_proxy_config.as_ref(),
@@ -1206,7 +1063,6 @@ fn bundle(args: BundleArgs) -> Result<()> {
     println!("Bundle contents:");
     println!("  target:       {target}");
     println!("  workdir:      {workdir}");
-    println!("  image_prefix: {image_prefix}");
     for m in &manifest.modules {
         println!("  module:       {}.{} v{}", m.namespace, m.name, m.version);
     }
@@ -1341,7 +1197,6 @@ pub struct NodeDeploymentReservationV1 {
     pub node_id: String,
     pub request_token: String,
     pub remote_host_ip: String,
-    pub deployment_format: DeployFormat,
     pub bundle_digest: String,
     pub canonical_inventory_digest: String,
     pub allocated_revision: u64,
@@ -1425,7 +1280,6 @@ struct ReservationDraft {
     node_id: String,
     request_token: String,
     remote_host_ip: String,
-    deployment_format: DeployFormat,
     bundle_digest: String,
     canonical_inventory_digest: String,
     tenant_database: Option<TenantDeployConfig>,
@@ -1458,7 +1312,6 @@ fn verified_reservation(
         node_id: draft.node_id,
         request_token: draft.request_token,
         remote_host_ip: draft.remote_host_ip,
-        deployment_format: draft.deployment_format,
         bundle_digest: draft.bundle_digest,
         canonical_inventory_digest: draft.canonical_inventory_digest,
         allocated_revision: deployment.revision,
@@ -1684,7 +1537,6 @@ fn materialize_resolved_release(
     revision: u64,
     operation_id: &str,
     revision_digest: &str,
-    format: DeployFormat,
     db_url: &str,
     peer_port: u16,
     remote: &str,
@@ -1806,7 +1658,6 @@ fn materialize_resolved_release(
         "bundle_digest": manifest.bundle_digest,
         "operation_id": operation_id,
         "revision_digest": revision_digest,
-        "format": match format { DeployFormat::Systemd => "systemd", DeployFormat::Docker => "docker" },
         "engines": manifest.engines,
     });
     std::fs::write(
@@ -1817,15 +1668,11 @@ fn materialize_resolved_release(
         release.join("bundle.sha256"),
         format!("{}\n", manifest.bundle_digest),
     )?;
-    let backend = match format {
-        DeployFormat::Systemd => "systemd",
-        DeployFormat::Docker => "docker",
-    };
     let resolved_manifest = build_resolved_manifest(
         &release,
         node_id,
         revision,
-        backend,
+        "systemd",
         &manifest.bundle_digest,
     )?;
     let digest = write_resolved_identity(&release, &resolved_manifest)?;
@@ -1907,7 +1754,6 @@ fn finalize_remote_release(
 async fn require_compatible_attestation(
     manager: &str,
     node_id: &str,
-    format: DeployFormat,
     manifest: &Manifest,
 ) -> Result<()> {
     let status = client::connect_operator(manager, wr_common::manager_client::RetryClass::ReadOnly)
@@ -1918,10 +1764,6 @@ async fn require_compatible_attestation(
         })
         .await?
         .into_inner();
-    let expected_backend = match format {
-        DeployFormat::Systemd => wr_common::agent_policy::AgentPolicyBackend::Systemd,
-        DeployFormat::Docker => wr_common::agent_policy::AgentPolicyBackend::Docker,
-    };
     let expected_binary = format!(
         "sha256:{}",
         manifest
@@ -1929,7 +1771,7 @@ async fn require_compatible_attestation(
             .get("wr-node/agent/wr-cli")
             .context("bundle omits the digest-covered node-agent binary")?
     );
-    let expected = super::node_agent::wire_policy(node_id, expected_backend, expected_binary, None);
+    let expected = super::node_agent::wire_policy(node_id, expected_binary, None);
     anyhow::ensure!(
         status.agent_attestations.iter().any(|attestation| {
             super::node_agent::attestation_matches_policy(attestation, &expected)
@@ -2048,7 +1890,7 @@ async fn reserve_deployment(args: ReserveDeploymentArgs, manager: &str) -> Resul
     );
     anyhow::ensure!(!args.output.exists(), "reservation output already exists");
     let deploy_cfg = DeployConfig::load_or_discover(args.config.as_deref())?;
-    let format = deploy_config::resolve_format(args.format, deploy_cfg.format);
+    reject_removed_deploy_environment()?;
     // Resolve platform configuration here as deploy does, but never persist its potentially
     // credential-bearing value in the non-secret reservation.
     let _platform_db_url = deploy_config::resolve_required(
@@ -2119,7 +1961,6 @@ async fn reserve_deployment(args: ReserveDeploymentArgs, manager: &str) -> Resul
             node_id: args.node_id,
             request_token: args.request_token,
             remote_host_ip: host_ip,
-            deployment_format: format,
             bundle_digest: manifest.bundle_digest.clone(),
             canonical_inventory_digest,
             tenant_database,
@@ -2181,7 +2022,7 @@ async fn durable_deploy(args: DeployArgs, manager: &str) -> Result<()> {
         args.bundle
     );
     let deploy_cfg = DeployConfig::load_or_discover(args.config.as_deref())?;
-    let format = deploy_config::resolve_format(args.format, deploy_cfg.format);
+    reject_removed_deploy_environment()?;
     let db_url = deploy_config::resolve_required(
         args.db_url,
         deploy_cfg.db_url.clone(),
@@ -2283,10 +2124,6 @@ async fn durable_deploy(args: DeployArgs, manager: &str) -> Result<()> {
             "resolved remote host differs from reservation"
         );
         anyhow::ensure!(
-            reservation.deployment_format == format,
-            "deployment format differs from reservation"
-        );
-        anyhow::ensure!(
             reservation.bundle_digest == manifest.bundle_digest,
             "bundle differs from reservation"
         );
@@ -2381,7 +2218,6 @@ async fn durable_deploy(args: DeployArgs, manager: &str) -> Result<()> {
         deployment.revision,
         &deployment.operation_id,
         &deployment.revision_digest,
-        format,
         &db_url,
         peer_port,
         &args.remote,
@@ -2421,7 +2257,7 @@ async fn durable_deploy(args: DeployArgs, manager: &str) -> Result<()> {
     if args.exit_after_finalization {
         bail!("deterministic exit after inactive release finalization");
     }
-    require_compatible_attestation(manager, &args.node_id, format, &manifest).await?;
+    require_compatible_attestation(manager, &args.node_id, &manifest).await?;
     let operation = client::connect_operator(
         manager,
         wr_common::manager_client::RetryClass::DurableCreate,
@@ -2498,6 +2334,7 @@ async fn abandon(args: AbandonArgs, manager: &str) -> Result<()> {
 
 async fn durable_rollback(args: RollbackArgs, manager: &str) -> Result<()> {
     let deploy_cfg = DeployConfig::load_or_discover(args.config.as_deref())?;
+    reject_removed_deploy_environment()?;
     let workdir = deploy_config::resolve_with_default(
         &args.workdir,
         "/opt/wruntime",
@@ -2569,8 +2406,7 @@ for path in sorted(tmp.rglob('*')):
  if path.is_symlink() or (path.exists() and not (path.is_file() or path.is_dir())): raise SystemExit('invalid release entry')
  if path.is_file() and path.name not in ('resolved-release.json','resolved-release.sha256'):
   rel=path.relative_to(tmp).as_posix(); files[rel]={{'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'mode':stat.S_IMODE(path.stat().st_mode)}}
-backend=json.loads(marker.read_text())['format']
-manifest={{'version':1,'node_id':node,'revision':revision,'backend':backend,'bundle_digest':bundle,'files':files}}
+manifest={{'version':1,'node_id':node,'revision':revision,'backend':'systemd','bundle_digest':bundle,'files':files}}
 canonical=json.dumps(manifest,separators=(',',':')).encode(); digest='sha256:'+hashlib.sha256(b'wruntime.resolved-release.v1\0'+canonical).hexdigest()
 (tmp/'resolved-release.json').write_text(json.dumps(manifest,indent=2)+'\n'); (tmp/'resolved-release.sha256').write_text(digest+'\n')
 os.rename(tmp,target); print(digest)
@@ -2654,7 +2490,6 @@ fn status(args: StatusArgs) -> Result<()> {
     println!("  target:       {}", manifest.target);
     println!("  digest:       {}", manifest.bundle_digest);
     println!("  workdir:      {}", manifest.workdir);
-    println!("  image_prefix: {}", manifest.image_prefix);
     println!();
     println!("Engine slots:");
     for engine in &manifest.engines {
@@ -2832,22 +2667,6 @@ mod tests {
         std::env::temp_dir().join(format!("{name}-{}-{nanos}.tar.gz", std::process::id()))
     }
 
-    #[test]
-    fn engine_dockerfile_copies_only_present_optional_artifacts() {
-        assert_eq!(
-            engine_docker_extra_copies(false, false),
-            vec![("modules/", "modules/")]
-        );
-        assert_eq!(
-            engine_docker_extra_copies(true, true),
-            vec![
-                ("modules/", "modules/"),
-                ("schemas/", "schemas/"),
-                ("migrations/", "migrations/")
-            ]
-        );
-    }
-
     struct ProductionBundleOutputs {
         archive: Vec<u8>,
         proxy_config: Vec<u8>,
@@ -2932,7 +2751,6 @@ migrations_path = {migrations:?}
             target: "x86_64-unknown-linux-gnu",
             host_binary_dir: &binaries,
             workdir: "/opt/wruntime",
-            image_prefix: "wr",
             peer_port: 9443,
             no_otel: false,
             source_proxy_config: None,
@@ -2968,13 +2786,18 @@ migrations_path = {migrations:?}
             "wr-node/migrations/inventory/V1__fixture.sql",
             "wr-node/systemd/wr-proxy.service",
             engine_unit_path,
-            "wr-node/docker/docker-compose.yml",
             "wr-node/release-metadata.json",
             "wr-node/manifest.json",
         ] {
             bundle::read_bytes_from_tarball(archive_path, required)
                 .with_context(|| format!("production fixture omitted {required}"))?;
         }
+        assert!(
+            bundle::read_payload_checksums(archive_path)?
+                .keys()
+                .all(|path| !path.starts_with("wr-node/docker/")),
+            "Systemd-only bundle unexpectedly contains Docker artifacts"
+        );
         Ok(ProductionBundleOutputs {
             archive: fs::read(output)?,
             proxy_config: bundle::read_bytes_from_tarball(
@@ -2991,6 +2814,85 @@ migrations_path = {migrations:?}
                 "wr-node/release-metadata.json",
             )?,
         })
+    }
+
+    #[test]
+    fn zero_engine_production_bundle_is_verified_and_deterministic() {
+        let root = std::env::temp_dir().join(format!(
+            "wr-zero-engine-bundle-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let binaries = root.join("bin");
+        fs::create_dir_all(&binaries).unwrap();
+        for name in ["wr-proxy", "wr-engine", "wr-cli"] {
+            fs::write(binaries.join(name), format!("fixture-{name}")).unwrap();
+        }
+        let left = root.join("left.tar.gz");
+        let right = root.join("right.tar.gz");
+        let engines = Vec::new();
+        let proxy: ProxyConfig =
+            toml::from_str(include_str!("../../../wr-tests/deployment/proxy.toml")).unwrap();
+        let assemble = |output: &Path| {
+            assemble_node_bundle(NodeBundleAssembly {
+                output,
+                target: "x86_64-unknown-linux-gnu",
+                host_binary_dir: &binaries,
+                workdir: "/opt/wruntime",
+                peer_port: 9443,
+                no_otel: false,
+                source_proxy_config: Some(&proxy),
+                engine_configs: &engines,
+                precompile_hash: Some("fixture-precompile-hash".into()),
+            })
+            .unwrap()
+        };
+        let left_manifest = assemble(&left);
+        let right_manifest = assemble(&right);
+        verify_bundle_archive(left.to_str().unwrap(), &left_manifest).unwrap();
+        verify_bundle_archive(right.to_str().unwrap(), &right_manifest).unwrap();
+        assert_eq!(fs::read(&left).unwrap(), fs::read(&right).unwrap());
+        assert_eq!(left_manifest.bundle_digest, right_manifest.bundle_digest);
+        assert!(left_manifest.engines.is_empty());
+        assert!(left_manifest.modules.is_empty());
+        for required in [
+            "wr-node/bin/wr-proxy",
+            "wr-node/agent/wr-cli",
+            "wr-node/agent/wr-node-agent.service",
+            "wr-node/config/proxy.toml",
+            "wr-node/systemd/wr-proxy.service",
+            "wr-node/release-metadata.json",
+            "wr-node/manifest.json",
+        ] {
+            bundle::read_bytes_from_tarball(left.to_str().unwrap(), required).unwrap();
+        }
+        let metadata: ReleaseMetadata = serde_json::from_slice(
+            &bundle::read_bytes_from_tarball(
+                left.to_str().unwrap(),
+                "wr-node/release-metadata.json",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(metadata.slots.is_empty());
+        let inventory =
+            wr_common::deployment_contract::canonicalize_inventory(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: expected_engines(&left_manifest, "192.0.2.10").unwrap(),
+            })
+            .unwrap();
+        let right_inventory =
+            wr_common::deployment_contract::canonicalize_inventory(DeploymentInventoryV1 {
+                schema_version: 1,
+                engines: expected_engines(&right_manifest, "192.0.2.10").unwrap(),
+            })
+            .unwrap();
+        assert!(inventory.engines.is_empty());
+        assert_eq!(
+            inventory_digest(&inventory).unwrap(),
+            inventory_digest(&right_inventory).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3079,7 +2981,6 @@ migrations_path = {migrations:?}
             7,
             &operation_id,
             &revision_digest,
-            DeployFormat::Systemd,
             "postgres://localhost/wruntime",
             9443,
             "deploy@example.test",
@@ -3120,7 +3021,6 @@ migrations_path = {migrations:?}
             7,
             "00000000-0000-8000-8000-000000000001",
             &revision_digest,
-            DeployFormat::Systemd,
             "postgres://localhost/wruntime",
             9443,
             "deploy@example.test",
@@ -3143,7 +3043,6 @@ migrations_path = {migrations:?}
             7,
             &other_operation_id,
             &other_revision_digest,
-            DeployFormat::Systemd,
             "postgres://localhost/wruntime",
             9443,
             "deploy@example.test",
@@ -3165,7 +3064,6 @@ migrations_path = {migrations:?}
             node_id: "node-a".into(),
             request_token: "token-a".into(),
             remote_host_ip: "10.0.0.9".into(),
-            deployment_format: DeployFormat::Systemd,
             bundle_digest: format!("sha256:{}", "b".repeat(64)),
             canonical_inventory_digest: format!("sha256:{}", "c".repeat(64)),
             allocated_revision: 7,
@@ -3269,7 +3167,6 @@ migrations_path = {migrations:?}
                 node_id: "node-a".into(),
                 request_token: "prepare-7".into(),
                 remote_host_ip: "10.0.0.4".into(),
-                deployment_format: DeployFormat::Systemd,
                 bundle_digest: bundle_digest.clone(),
                 canonical_inventory_digest: inventory_identity.clone(),
                 tenant_database: None,
@@ -3285,7 +3182,6 @@ migrations_path = {migrations:?}
                 node_id: "node-a".into(),
                 request_token: "prepare-7".into(),
                 remote_host_ip: "10.0.0.4".into(),
-                deployment_format: DeployFormat::Systemd,
                 bundle_digest: bundle_digest.clone(),
                 canonical_inventory_digest: inventory_identity,
                 tenant_database: None,
@@ -3307,7 +3203,6 @@ migrations_path = {migrations:?}
                 node_id: "node-a".into(),
                 request_token: "prepare-7".into(),
                 remote_host_ip: "10.0.0.4".into(),
-                deployment_format: DeployFormat::Systemd,
                 bundle_digest,
                 canonical_inventory_digest: format!("sha256:{}", "d".repeat(64)),
                 tenant_database: None,
@@ -3350,7 +3245,6 @@ migrations_path = {migrations:?}
             node_id: "node-a".into(),
             request_token: "token-a".into(),
             remote_host_ip: "192.0.2.10".into(),
-            deployment_format: DeployFormat::Systemd,
             bundle_digest: manifest.bundle_digest.clone(),
             canonical_inventory_digest: format!("sha256:{}", "c".repeat(64)),
             allocated_revision: 7,
@@ -3382,7 +3276,6 @@ migrations_path = {migrations:?}
             7,
             &operation_id,
             &revision_digest,
-            DeployFormat::Systemd,
             "postgres://platform.internal/jobs",
             9443,
             "deploy@example.test",
@@ -3445,7 +3338,6 @@ migrations_path = {migrations:?}
             deterministic_bundle_digest(
                 "x86_64-unknown-linux-gnu",
                 "/opt/wruntime",
-                "wr",
                 &left,
                 &checksums,
                 &None,
@@ -3454,7 +3346,6 @@ migrations_path = {migrations:?}
             deterministic_bundle_digest(
                 "x86_64-unknown-linux-gnu",
                 "/opt/wruntime",
-                "wr",
                 &right,
                 &checksums,
                 &None,
@@ -3624,18 +3515,10 @@ allowed_hosts = ["api.example.com"]
                 .get("resolved_release_digest")
                 .is_none());
 
-            let engine_dockerfile =
-                bundle::read_file_from_tarball(path.to_str().unwrap(), "Dockerfile.engine-engine")?;
-            assert!(!engine_dockerfile.contains("COPY schemas/ schemas/"));
-            assert!(!engine_dockerfile.contains("COPY migrations/ migrations/"));
-            let compose =
-                bundle::read_file_from_tarball(path.to_str().unwrap(), "docker-compose.yml")?;
             assert_eq!(
                 proxy_value["node"]["peer_address"].as_str(),
                 Some("https://{host}:{peer_port}")
             );
-            assert!(compose.contains("network_mode: host"));
-            assert!(!compose.contains("ports:"));
             Ok(())
         })();
         let _ = fs::remove_file(&path);

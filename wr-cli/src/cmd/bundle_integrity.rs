@@ -49,12 +49,12 @@ impl ResolvedReleaseManifest {
 use super::bundle;
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct BundleManifest {
     pub target: String,
     pub bundle_digest: String,
     pub engines: Vec<ManifestEngine>,
     pub workdir: String,
-    pub image_prefix: String,
     pub modules: Vec<ManifestModule>,
     pub configs: Vec<String>,
     pub template_vars: Vec<String>,
@@ -64,6 +64,7 @@ pub struct BundleManifest {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestEngine {
     pub engine_slot: String,
     pub modules: Vec<ManifestModule>,
@@ -74,6 +75,7 @@ pub struct ManifestEngine {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestModule {
     pub name: String,
     pub namespace: String,
@@ -84,7 +86,6 @@ pub struct ManifestModule {
 pub fn deterministic_bundle_digest(
     target: &str,
     workdir: &str,
-    image_prefix: &str,
     engines: &[ManifestEngine],
     checksums: &BTreeMap<String, String>,
     precompile_hash: &Option<String>,
@@ -104,7 +105,6 @@ pub fn deterministic_bundle_digest(
     let canonical = serde_json::json!({
         "target": target,
         "workdir": workdir,
-        "image_prefix": image_prefix,
         "engines": engines,
         "checksums": checksums,
         "precompile_hash": precompile_hash,
@@ -119,7 +119,6 @@ pub fn verify_manifest_identity(manifest: &BundleManifest) -> Result<()> {
     let digest = deterministic_bundle_digest(
         &manifest.target,
         &manifest.workdir,
-        &manifest.image_prefix,
         &manifest.engines,
         &manifest.checksums,
         &manifest.precompile_hash,
@@ -407,7 +406,6 @@ mod tests {
                 "job_admin_address": "https://127.0.0.1:9200"
             }],
             "workdir": "/opt/wruntime",
-            "image_prefix": "wr",
             "modules": [{"name": "api", "namespace": "test", "version": "1.0.0", "has_schema": false}],
             "configs": [],
             "template_vars": [],
@@ -415,6 +413,9 @@ mod tests {
         });
         let parsed: BundleManifest = serde_json::from_value(complete.clone()).unwrap();
         assert_eq!(parsed.precompile_hash, None);
+        let mut stale = complete.clone();
+        stale["image_prefix"] = serde_json::json!("wr");
+        assert!(serde_json::from_value::<BundleManifest>(stale).is_err());
 
         for field in [
             "secrets",
@@ -452,7 +453,6 @@ mod tests {
             bundle_digest: String::new(),
             engines: vec![],
             workdir: "/opt/wruntime".into(),
-            image_prefix: "wr".into(),
             modules: vec![],
             configs: vec![],
             template_vars: vec![],
@@ -462,7 +462,6 @@ mod tests {
         manifest.bundle_digest = deterministic_bundle_digest(
             &manifest.target,
             &manifest.workdir,
-            &manifest.image_prefix,
             &manifest.engines,
             &manifest.checksums,
             &manifest.precompile_hash,

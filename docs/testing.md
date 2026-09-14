@@ -92,7 +92,7 @@ manager and job persistence before testing binaries with a changed baseline.
 
 Release-cleanup coverage spans `migration_test` (the complete fresh V1 catalog, constraints, triggers, and singleton rows), `operation_test` (terminal rollout commit, staged-allocation protection, transaction-local generation fencing, periodic materialization, exact accounting, and retry), `node_agent_operation_test` (renewal cancellation, generic-work priority, process-local result-loss idempotency, and fresh-activation inspection), `multi_manager_test` (ordered `SKIP LOCKED` batching and takeover), and `manager_test` (five dedicated RPC authorization paths plus degraded status projection). DB-backed skips do not satisfy this evidence.
 
-Job-administration DB tests require Postgres and exercise the clean V1 inventory indexes and direct dead/claim-state constraints, filter-bound keyset pages, summaries, inspection lifecycle validation, persistence size boundaries, retry races, and worker notification. Transport/security qualification proves distinct server/client roots and profiles, exhaustive manager RPC authorization, queue scope, and engine admission only for an enrolled, non-revoked same-cluster manager workload URI principal; human, proxy, node-agent, wrong-cluster, unmapped, revoked, and server-only leaves are denied. It also covers maximum-size inspection across both hops, pre-dispatch-only read failover, deterministic mutation selection, and no retry replay. Deployment changes require protected systemd and Compose qualification.
+Job-administration DB tests require Postgres and exercise the clean V1 inventory indexes and direct dead/claim-state constraints, filter-bound keyset pages, summaries, inspection lifecycle validation, persistence size boundaries, retry races, and worker notification. Transport/security qualification proves distinct server/client roots and profiles, exhaustive manager RPC authorization, queue scope, and engine admission only for an enrolled, non-revoked same-cluster manager workload URI principal; human, proxy, node-agent, wrong-cluster, unmapped, revoked, and server-only leaves are denied. It also covers maximum-size inspection across both hops, pre-dispatch-only read failover, deterministic mutation selection, and no retry replay. Deployment changes require protected Systemd qualification.
 
 Manager-set deployment tests additionally prove immutable binary/OCI and backend-spec evidence, unchanged selectors throughout staging and `FAILED_PRE_CLOSE`, post-`OLD_CLOSED` atomic descriptor selection, digest refusal, bounded sole-manager continuation, multi-manager control-endpoint preservation, and protected roots/config/credential modes. The Pi sandbox command explicitly skips this protected deployment proof; it is not a passing substitute.
 
@@ -167,10 +167,10 @@ when `ANTHROPIC_API_KEY` is set by default; use `--codegen-e2e` to require it
 or `--no-codegen-e2e` to always skip it.
 
 The deployment lifecycle stage always requires an explicit choice. Trusted
-runners use `just validate-all --deployment-e2e`, which runs the systemd and
-Docker passes serially before fixed-port local examples. Local development uses
-`just validate-all --no-deployment-e2e`; the summary records separate `SKIPPED`
-rows for both backends. In the Pi sandbox (`DOTGEN_PI_SANDBOX=1`), use
+runners use `just validate-all --deployment-e2e`, which runs the single complete
+Systemd qualification before fixed-port local examples. Local development uses
+`just validate-all --no-deployment-e2e`; the summary records one explicit
+`SKIPPED` row for that protected scenario. In the Pi sandbox (`DOTGEN_PI_SANDBOX=1`), use
 `just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e`: Docker
 cannot run there, but the existing development services are exposed. Only
 `ANTHROPIC_API_KEY` is unavailable for the local examples, so codegen is skipped
@@ -205,15 +205,15 @@ and run `sudo update-ca-certificates` before preflight. Set `PVE_CA_BUNDLE` to
 an alternate bundle path on other operating systems or runner layouts; TLS
 verification is never disabled.
 
-Each backend starts and ends with snapshot rollback and normally takes several
+The Systemd scenario starts and ends with snapshot rollback and normally takes several
 minutes plus cross-compilation time. Manager deployment restarts/recreates the
 service and waits on the exact launcher-issued activation identity and manager service kind; node
 deployment and rollback wait on exact `VerifyDeployment` identity and conditions. Post-ready guest invocations run
 once. Expected unhealthy evidence uses `cluster wait` and therefore succeeds
 with a matching JSON snapshot rather than an expected non-zero display gate.
-The durable lifecycle path uses single-slot `wr-cli engines restart`, complete-inventory `wr-cli node deploy`, explicit `wr-cli node rollback`, `wr-cli operations` for status/resume/cancel, and an independently installed node-bound agent. The agent's typed systemd/Docker adapter is the sole deployed workload effect and final-exit authority. Focused tests cover zero-to-N creation, exact no-effect submission, replacement, mixed add/retained/remove ordering, N-to-zero downtime protection, rollback, restart, request-token idempotency, activation/epoch fencing, ambiguous delivery, interruption/recovery, complete source restoration, per-slot authority, exact commit evidence, and coherent availability at every stop. The pure locked Python tests validate stable deployment JSON and scenario logging without infrastructure. `just test-lifecycle-runners` remains the local retained-`Child` and teardown proof; `just validate-ecommerce` must emit no `WARN` or `WARNING`, and host-binding changes require `just test-wasm`.
+The durable lifecycle path uses single-slot `wr-cli engines restart`, complete-inventory `wr-cli node deploy`, explicit `wr-cli node rollback`, `wr-cli operations` for status/resume/cancel, and an independently installed node-bound agent. The agent's typed Systemd adapter is the sole deployed workload effect and final-exit authority. Focused tests cover zero-to-N creation, exact no-effect submission, replacement, mixed add/retained/remove ordering, N-to-zero downtime protection, rollback, restart, request-token idempotency, activation/epoch fencing, ambiguous delivery, interruption/recovery, complete source restoration, per-slot authority, exact commit evidence, and coherent availability at every stop. The pure locked Python tests validate stable deployment JSON and scenario logging without infrastructure. `just test-lifecycle-runners` remains the local retained-`Child` and teardown proof; `just validate-ecommerce` must emit no `WARN` or `WARNING`, and host-binding changes require `just test-wasm`.
 
-Protected systemd and Docker qualification is mandatory for generated deployment or remote lifecycle behavior. Manager deploy-set qualification is Systemd-only: the protected run proves successful A→B→A, a harness-only post-close descriptor-digest fault ending in durable `FAILED_CLOSED`, rejection of active and stopped mixed-policy reset evidence, exact stopped/uniform-policy reset, `CLOSED_STARTUP` after reset, and a separate same-principal fresh rollout restoring `OPEN`. Reset itself is not success or admission evidence. Compose manager rollout remains unqualified. The Python/contract seam checks fixture shape and command ordering without protected-host access and must never be cited as live evidence. A local `--no-deployment-e2e` run records an environmental skip; it does not prove this change class. Completion evidence is exactly `just validate-all --deployment-e2e` on the protected runner. In Pi, use exactly `just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e`; it must still run multi-node, ecommerce, and stockmarket.
+Protected Systemd qualification is mandatory for generated deployment or remote lifecycle behavior. The protected run proves successful A→B→A, a harness-only post-close descriptor-digest fault ending in durable `FAILED_CLOSED`, rejection of active and stopped mixed-policy reset evidence, exact stopped/uniform-policy reset, `CLOSED_STARTUP` after reset, and a separate same-principal fresh rollout restoring `OPEN`. Reset itself is not success or admission evidence. The Python/contract seam checks fixture shape and command ordering without protected-host access and must never be cited as live evidence. A local `--no-deployment-e2e` run records an environmental skip; it does not prove this change class. Completion evidence is exactly `just validate-all --deployment-e2e` on the protected runner. In Pi, use exactly `just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e`; it must still run multi-node, ecommerce, and stockmarket.
 Per-task output, lifecycle state JSON, remote diagnostics, bundle inspections,
 and the final reset result are retained under `WR_VALIDATE_LOG_DIR` (or
 `target/validate-all/<timestamp>/`). Diagnostic collection failures are listed
@@ -223,8 +223,7 @@ are present. The provider never creates or deletes snapshots or VMs, and reset
 failures are fatal.
 
 Focused commands are `just deployment-e2e-python-test`, `just
-deployment-e2e-preflight`, `just deployment-e2e-systemd`, `just
-deployment-e2e-docker`, and `just deployment-e2e`. The locked Python test recipe
+deployment-e2e-preflight`, `just deployment-e2e-systemd`, and `just deployment-e2e`. The locked Python test recipe
 runs the provider and JSON assertion `unittest` targets without Proxmox access.
 After intentionally changing Python dependencies, refresh the nested lock with
 `uv lock --project dev/deployment-e2e` and commit `pyproject.toml` and `uv.lock`

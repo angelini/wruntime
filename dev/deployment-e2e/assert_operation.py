@@ -33,8 +33,14 @@ def assert_evidence(evidence: Any, label: str) -> None:
         raise AssertionFailure(f"{label} did not request graceful termination")
     if evidence.get("kill_escalated") is not False:
         raise AssertionFailure(f"{label} used kill escalation")
-    if evidence.get("backend") not in {"systemd", "docker"}:
-        raise AssertionFailure(f"{label} backend kind is invalid")
+    if "backend" in evidence:
+        raise AssertionFailure(f"{label} contains removed backend discriminator")
+    if evidence.get("terminal_result") != "success":
+        raise AssertionFailure(f"{label} terminal result is not successful")
+    if evidence.get("exit_code") != 0:
+        raise AssertionFailure(f"{label} exit code is not zero")
+    if evidence.get("signal") is not None:
+        raise AssertionFailure(f"{label} termination signal is present")
     backend = evidence.get("backend_instance_id")
     process = evidence.get("process_instance_id")
     if not isinstance(backend, str) or not backend:

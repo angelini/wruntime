@@ -1951,14 +1951,13 @@ impl InfrastructureApi {
                 || !Manager::valid_bundle_digest(&target.host_digest)
                 || !Manager::valid_bundle_digest(&target.config_digest)
                 || !Manager::valid_bundle_digest(&target.executable_digest)
-                || !Manager::valid_bundle_digest(&target.backend_spec_digest)
+                || !Manager::valid_bundle_digest(&target.systemd_unit_digest)
                 || !Manager::valid_bundle_digest(&target.credential_digest)
                 || !Manager::valid_bundle_digest(&target.old_selector_digest)
                 || !Manager::valid_bundle_digest(&target.new_selector_digest)
-                || !matches!(target.backend.as_str(), "systemd" | "compose")
             {
                 return Err(Status::invalid_argument(
-                    "target endpoint, backend, and canonical artifact/selector digests are required",
+                    "target endpoint and canonical Systemd artifact/selector digests are required",
                 ));
             }
         }
@@ -3060,9 +3059,8 @@ node_agent_enrollments=[]
             endpoint: format!("https://{manager_id}:9000"),
             host_digest: format!("sha256:{}", digit.to_string().repeat(64)),
             config_digest: format!("sha256:{}", digit.to_string().repeat(64)),
-            backend: "systemd".into(),
             executable_digest: format!("sha256:{}", digit.to_string().repeat(64)),
-            backend_spec_digest: format!("sha256:{}", digit.to_string().repeat(64)),
+            systemd_unit_digest: format!("sha256:{}", digit.to_string().repeat(64)),
             credential_digest: format!("sha256:{}", digit.to_string().repeat(64)),
             old_selector_digest: format!("sha256:{}", digit.to_string().repeat(64)),
             new_selector_digest: format!("sha256:{}", digit.to_string().repeat(64)),

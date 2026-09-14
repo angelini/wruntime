@@ -15,9 +15,9 @@ use wr_common::authorization_policy::ValidatedPolicy;
 use super::build_helpers;
 use super::bundle;
 use super::config::ManagerConfig;
-use super::deploy_config::{self, DeployConfig, DeployFormat};
+use super::deploy_config::{self, DeployConfig};
 use super::helpers;
-use super::service_gen::{self, DockerfileSpec};
+use super::service_gen;
 use crate::{client, display};
 
 #[derive(Args)]
@@ -75,9 +75,6 @@ pub struct BundleArgs {
     /// Base directory for installed files on the remote host
     #[arg(long, default_value = "/opt/wruntime")]
     workdir: String,
-    /// Docker image name prefix
-    #[arg(long, default_value = "wr")]
-    image_prefix: String,
     /// Output tarball path [default: wr-manager-bundle.tar.gz]
     #[arg(long)]
     output: Option<String>,
@@ -98,9 +95,6 @@ pub struct DeployArgs {
     /// Deploy config file (default: auto-discover wr-deploy.toml in CWD)
     #[arg(long)]
     config: Option<String>,
-    /// Deployment format [default: systemd]
-    #[arg(long)]
-    format: Option<DeployFormat>,
     /// Postgres database URL
     #[arg(long)]
     db_url: Option<String>,
@@ -130,11 +124,12 @@ pub struct StatusArgs {
 // --- Manifest ---
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManagerManifest {
     target: String,
     workdir: String,
-    image_prefix: String,
     listen_address: String,
+    no_otel: bool,
     template_vars: Vec<String>,
     checksums: BTreeMap<String, String>,
 }
@@ -265,17 +260,28 @@ async fn list(manager: &str) -> Result<()> {
 
 // --- bundle ---
 
-fn manager_runtime_env() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("WRT_SECRET_ENCRYPTION_KEY", "{secret_key}"),
-        ("WRT_LIFECYCLE_INSTANCE_ID", "{lifecycle_instance_id}"),
-    ]
+fn manager_systemd_environment(
+    secret_key: &str,
+    lifecycle_instance_id: &str,
+    no_otel: bool,
+) -> String {
+    let mut environment = format!(
+        "WRT_SECRET_ENCRYPTION_KEY={secret_key}\nWRT_LIFECYCLE_INSTANCE_ID={lifecycle_instance_id}\n"
+    );
+    if no_otel {
+        environment.push_str("OTEL_SDK_DISABLED=true\n");
+    }
+    environment
 }
 
-fn manager_systemd_environment(secret_key: &str, lifecycle_instance_id: &str) -> String {
-    format!(
-        "WRT_SECRET_ENCRYPTION_KEY={secret_key}\nWRT_LIFECYCLE_INSTANCE_ID={lifecycle_instance_id}\n"
-    )
+fn validate_manager_deploy_config(_config: &DeployConfig) -> Result<()> {
+    if std::env::var_os("WR_FORMAT").is_some() {
+        bail!("manager deployment no longer accepts WR_FORMAT; managers use Systemd");
+    }
+    if std::env::var_os("WR_IMAGE_PREFIX").is_some() {
+        bail!("manager deployment no longer accepts WR_IMAGE_PREFIX; managers use Systemd");
+    }
+    Ok(())
 }
 
 fn bundle(args: BundleArgs) -> Result<()> {
@@ -284,6 +290,7 @@ fn bundle(args: BundleArgs) -> Result<()> {
     }
 
     let deploy_cfg = DeployConfig::load_or_discover(args.config.as_deref())?;
+    validate_manager_deploy_config(&deploy_cfg)?;
     let target = deploy_config::resolve_with_default(
         &args.target,
         "x86_64-unknown-linux-gnu",
@@ -295,12 +302,6 @@ fn bundle(args: BundleArgs) -> Result<()> {
         "/opt/wruntime",
         deploy_cfg.workdir,
         "WR_WORKDIR",
-    );
-    let image_prefix = deploy_config::resolve_with_default(
-        &args.image_prefix,
-        "wr",
-        deploy_cfg.image_prefix,
-        "WR_IMAGE_PREFIX",
     );
     let no_otel = deploy_config::resolve_no_otel(args.no_otel, deploy_cfg.no_otel);
 
@@ -389,48 +390,14 @@ fn bundle(args: BundleArgs) -> Result<()> {
         0o644,
     )?;
 
-    // Docker artifacts
     helpers::extract_port(&config.listen_address)?;
-
-    let dockerfile = DockerfileSpec {
-        workdir: &workdir,
-        binary: "bin/wr-manager",
-        config: "config/manager.toml",
-        extra_copies: vec![("policy/authorization.toml", "policy/authorization.toml")],
-        env_vars: manager_runtime_env(),
-        no_otel,
-    };
-    bundle::tar_add_bytes_checked(
-        &mut tar,
-        &mut checksums,
-        "wr-manager/docker/Dockerfile.manager",
-        dockerfile.render().as_bytes(),
-        0o644,
-    )?;
-
-    let compose = manager_docker_compose(&workdir, &image_prefix);
-    bundle::tar_add_bytes_checked(
-        &mut tar,
-        &mut checksums,
-        "wr-manager/docker/docker-compose.yml",
-        compose.as_bytes(),
-        0o644,
-    )?;
-
-    bundle::tar_add_bytes_checked(
-        &mut tar,
-        &mut checksums,
-        "wr-manager/docker/.dockerignore",
-        b"*.tar.gz\n",
-        0o644,
-    )?;
 
     // Manifest
     let manifest = ManagerManifest {
         target: target.clone(),
         workdir: workdir.clone(),
-        image_prefix: image_prefix.clone(),
         listen_address: config.listen_address.clone(),
+        no_otel,
         template_vars: vec!["db_url".to_string(), "advertise_address".to_string()],
         checksums: checksums.into_iter().collect(),
     };
@@ -497,15 +464,12 @@ const MANAGER_DEPLOY_PHASE_ORDER: [ManagerDeployPhase; 6] = [
     ManagerDeployPhase::FirstStart,
 ];
 
-fn manager_deploy_phase_order(_format: &DeployFormat) -> &'static [ManagerDeployPhase] {
+fn manager_deploy_phase_order() -> &'static [ManagerDeployPhase] {
     &MANAGER_DEPLOY_PHASE_ORDER
 }
 
 fn manager_secret_template_archive_paths() -> &'static [&'static str] {
-    &[
-        "wr-manager/systemd/wr-manager.service",
-        "wr-manager/docker/Dockerfile.manager",
-    ]
+    &["wr-manager/systemd/wr-manager.service"]
 }
 
 fn manager_systemd_install_command(service_path: &str) -> String {
@@ -519,59 +483,6 @@ fn manager_systemd_install_command(service_path: &str) -> String {
 
 fn manager_systemd_start_command() -> &'static str {
     "sudo systemctl daemon-reload && sudo systemctl enable wr-manager.service && sudo systemctl restart wr-manager.service"
-}
-
-fn manager_docker_compose(workdir: &str, image_prefix: &str) -> String {
-    service_gen::generate_compose(
-        "",
-        &[service_gen::ComposeService {
-            name: "manager".into(),
-            dockerfile: "docker/Dockerfile.manager".into(),
-            context: "..".into(),
-            image: Some(format!("{image_prefix}-manager")),
-            network_mode: Some("host".into()),
-            ports: vec![],
-            volumes: vec![
-                "/etc/wruntime/pki:/etc/wruntime/pki:ro".into(),
-                "/var/lib/wruntime/manager-config:/var/lib/wruntime/manager-config:ro".into(),
-            ],
-            depends_on: vec![],
-            healthcheck: service_gen::ComposeHealthcheck {
-                test: vec![
-                    "CMD".into(),
-                    format!("{workdir}/bin/wr-manager"),
-                    "--lifecycle-probe".into(),
-                    format!("{workdir}/config/manager.toml"),
-                ],
-                interval: "2s",
-                timeout: "2s",
-                retries: 15,
-                start_period: "30s",
-            },
-        }],
-    )
-}
-
-const MANAGER_COMPOSE_PROJECT: &str = "wruntime-manager";
-
-fn manager_docker_start_command(workdir: &str) -> String {
-    let compose_file =
-        helpers::shell_quote(&format!("{workdir}/wr-manager/docker/docker-compose.yml"));
-    format!(
-        "sudo docker compose --project-name {MANAGER_COMPOSE_PROJECT} -f {compose_file} up -d --build --force-recreate"
-    )
-}
-
-fn manager_docker_logs_command(workdir: &str, tail: u32, follow: bool) -> String {
-    let compose_file =
-        helpers::shell_quote(&format!("{workdir}/wr-manager/docker/docker-compose.yml"));
-    let mut command = format!(
-        "sudo docker compose --project-name {MANAGER_COMPOSE_PROJECT} -f {compose_file} logs --tail {tail}"
-    );
-    if follow {
-        command.push_str(" -f");
-    }
-    command
 }
 
 fn remote_socket_address(remote_ip: &str, port: u16) -> String {
@@ -698,7 +609,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
 
     // Resolve args from CLI > config file > env vars > defaults
     let deploy_cfg = DeployConfig::load_or_discover(args.config.as_deref())?;
-    let format = deploy_config::resolve_format(args.format, deploy_cfg.format);
+    validate_manager_deploy_config(&deploy_cfg)?;
     let db_url =
         deploy_config::resolve_required(args.db_url, deploy_cfg.db_url, "WR_DB_URL", "db_url")?;
     let secret_key = deploy_config::resolve_required(
@@ -751,30 +662,18 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     };
 
     let mut first_start_timestamp = String::new();
-    for phase in manager_deploy_phase_order(&format) {
+    for phase in manager_deploy_phase_order() {
         match phase {
-            ManagerDeployPhase::PrepareBundle => match format {
-                DeployFormat::Systemd => {
-                    prepare_systemd(
-                        &args.bundle,
-                        &args.remote,
-                        ssh_key.as_deref(),
-                        ssh_port,
-                        &manifest,
-                        &ssh_base,
-                    )?;
-                }
-                DeployFormat::Docker => {
-                    prepare_docker(
-                        &args.bundle,
-                        &args.remote,
-                        ssh_key.as_deref(),
-                        ssh_port,
-                        &manifest,
-                        &ssh_base,
-                    )?;
-                }
-            },
+            ManagerDeployPhase::PrepareBundle => {
+                prepare_systemd(
+                    &args.bundle,
+                    &args.remote,
+                    ssh_key.as_deref(),
+                    ssh_port,
+                    &manifest,
+                    &ssh_base,
+                )?;
+            }
             ManagerDeployPhase::InstallResolvedRuntimeArtifacts => {
                 install_resolved_manager_runtime_artifacts(&ManagerRuntimeArtifactInstall {
                     bundle: &args.bundle,
@@ -785,7 +684,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
                     ssh_base: &ssh_base,
                     secret_key: &secret_key,
                     lifecycle_instance_id: &expected_instance,
-                    format: &format,
+                    no_otel: manifest.no_otel,
                 })?;
             }
             ManagerDeployPhase::UploadResolvedConfig => {
@@ -861,7 +760,6 @@ async fn deploy(args: DeployArgs) -> Result<()> {
                     remote: &args.remote,
                     ssh_key: ssh_key.as_deref(),
                     ssh_port,
-                    format: &format,
                     manifest: &manifest,
                     manager_id: &bundled_config.manager_id,
                     resolved_config: &resolved,
@@ -875,16 +773,8 @@ async fn deploy(args: DeployArgs) -> Result<()> {
                     helpers::get_remote_timestamp(&ssh_base).unwrap_or_default();
             }
             ManagerDeployPhase::FirstStart => {
-                match format {
-                    DeployFormat::Systemd => {
-                        print!("[deploy]  starting service ... ");
-                        start_systemd(&ssh_base)?;
-                    }
-                    DeployFormat::Docker => {
-                        print!("[deploy]  starting container ... ");
-                        start_docker(&ssh_base, &manifest)?;
-                    }
-                }
+                print!("[deploy]  starting service ... ");
+                start_systemd(&ssh_base)?;
                 println!("OK");
             }
         }
@@ -893,12 +783,7 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     // Readiness uses the deploy-scoped certificate directory, not global CLI TLS.
     println!("[deploy]  waiting for replacement manager to become ready...");
 
-    let log_cmd = match format {
-        DeployFormat::Systemd => {
-            super::logs::build_journalctl_command(Some("wr-manager"), 20, "1m", true)
-        }
-        DeployFormat::Docker => manager_docker_logs_command(&manifest.workdir, 20, true),
-    };
+    let log_cmd = super::logs::build_journalctl_command(Some("wr-manager"), 20, "1m", true);
     let log_tail = match helpers::spawn_ssh_prefixed(&ssh_base, &log_cmd, "\t") {
         Ok(tail) => Some(tail),
         Err(error) => {
@@ -926,15 +811,12 @@ async fn deploy(args: DeployArgs) -> Result<()> {
     if !first_start_timestamp.is_empty() {
         println!();
         println!("[deploy]  startup logs:");
-        let dump_cmd = match format {
-            DeployFormat::Systemd => super::logs::build_journalctl_command_absolute(
-                Some("wr-manager"),
-                200,
-                &first_start_timestamp,
-                false,
-            ),
-            DeployFormat::Docker => manager_docker_logs_command(&manifest.workdir, 200, false),
-        };
+        let dump_cmd = super::logs::build_journalctl_command_absolute(
+            Some("wr-manager"),
+            200,
+            &first_start_timestamp,
+            false,
+        );
         if let Err(error) = helpers::run_ssh_prefixed_diagnostic(&ssh_base, &dump_cmd, "\t") {
             eprintln!("[deploy]  startup log diagnostic unavailable: {error:#}");
         }
@@ -1008,45 +890,10 @@ fn prepare_systemd(
     Ok(())
 }
 
-fn prepare_docker(
-    bundle: &str,
-    remote: &str,
-    ssh_key: Option<&str>,
-    ssh_port: Option<u16>,
-    manifest: &ManagerManifest,
-    ssh_base: &[String],
-) -> Result<()> {
-    let workdir = &manifest.workdir;
-
-    print!("[deploy]  copying bundle to remote ... ");
-    let remote_bundle = format!("{workdir}/.manager-bundle-{}.tar.gz", uuid::Uuid::new_v4());
-    helpers::install_remote_file(
-        Path::new(bundle),
-        remote,
-        &remote_bundle,
-        ssh_key,
-        ssh_port,
-        0o600,
-        helpers::RemoteInstallClass::Public,
-        None,
-    )?;
-    println!("OK");
-
-    print!("[deploy]  unpacking on remote ... ");
-    helpers::run_ssh(
-        ssh_base,
-        &format!("sudo mkdir -p {workdir} && sudo tar xzf {remote_bundle} -C {workdir} && sudo rm -f -- {remote_bundle}"),
-    )?;
-    println!("OK");
-
-    Ok(())
-}
-
 struct InitialActivationInstall<'a> {
     remote: &'a str,
     ssh_key: Option<&'a str>,
     ssh_port: Option<u16>,
-    format: &'a DeployFormat,
     manifest: &'a ManagerManifest,
     manager_id: &'a str,
     resolved_config: &'a str,
@@ -1063,28 +910,17 @@ fn install_initial_activation_descriptor(params: &InitialActivationInstall<'_>) 
             .with_context(|| format!("manager bundle manifest omitted {path}"))
     };
     let executable_path = format!("{}/wr-manager/bin/wr-manager", manifest.workdir);
-    let (backend, backend_spec_path, backend_spec_digest) = match params.format {
-        DeployFormat::Systemd => (
-            "systemd",
-            format!("{}/wr-manager/systemd/wr-manager.service", manifest.workdir),
-            checksum("wr-manager/systemd/wr-manager.service")?,
-        ),
-        DeployFormat::Docker => (
-            "compose",
-            format!("{}/wr-manager/docker/docker-compose.yml", manifest.workdir),
-            checksum("wr-manager/docker/docker-compose.yml")?,
-        ),
-    };
+    let systemd_unit_path = format!("{}/wr-manager/systemd/wr-manager.service", manifest.workdir);
+    let systemd_unit_digest = checksum("wr-manager/systemd/wr-manager.service")?;
     let credential_set = PathBuf::from(params.cert_dir).join("manager-endpoint");
     let credential_digest = helpers::local_tree_digest(&credential_set)?;
     let descriptor = serde_json::to_vec_pretty(&serde_json::json!({
         "schema_version": 1,
         "manager_id": params.manager_id,
-        "backend": backend,
         "executable": executable_path,
         "executable_digest": checksum("wr-manager/bin/wr-manager")?,
-        "backend_spec_path": backend_spec_path,
-        "backend_spec_digest": backend_spec_digest,
+        "systemd_unit_path": systemd_unit_path,
+        "systemd_unit_digest": systemd_unit_digest,
         "config_path": format!("{}/wr-manager/config/manager.toml", manifest.workdir),
         "config_digest": format!("sha256:{:x}", Sha256::digest(params.resolved_config.as_bytes())),
         "credential_set_path": "/etc/wruntime/pki/manager-endpoint/sets/v1",
@@ -1111,7 +947,7 @@ struct ManagerRuntimeArtifactInstall<'a> {
     ssh_base: &'a [String],
     secret_key: &'a str,
     lifecycle_instance_id: &'a str,
-    format: &'a DeployFormat,
+    no_otel: bool,
 }
 
 fn install_resolved_manager_runtime_artifacts(
@@ -1142,35 +978,32 @@ fn install_resolved_manager_runtime_artifacts(
         )?;
     }
 
-    if matches!(params.format, DeployFormat::Systemd) {
-        let runtime_environment =
-            manager_systemd_environment(params.secret_key, params.lifecycle_instance_id);
-        helpers::install_remote_bytes(
-            runtime_environment.as_bytes(),
-            params.remote,
-            MANAGER_SECRET_ENV_PATH,
-            params.ssh_key,
-            params.ssh_port,
-            0o600,
-            helpers::RemoteInstallClass::Sensitive,
-            None,
-        )?;
-        let service_path = format!("{workdir}/wr-manager/systemd/wr-manager.service");
-        helpers::run_ssh(
-            params.ssh_base,
-            &manager_systemd_install_command(&service_path),
-        )?;
-    }
+    let runtime_environment = manager_systemd_environment(
+        params.secret_key,
+        params.lifecycle_instance_id,
+        params.no_otel,
+    );
+    helpers::install_remote_bytes(
+        runtime_environment.as_bytes(),
+        params.remote,
+        MANAGER_SECRET_ENV_PATH,
+        params.ssh_key,
+        params.ssh_port,
+        0o600,
+        helpers::RemoteInstallClass::Sensitive,
+        None,
+    )?;
+    let service_path = format!("{workdir}/wr-manager/systemd/wr-manager.service");
+    helpers::run_ssh(
+        params.ssh_base,
+        &manager_systemd_install_command(&service_path),
+    )?;
     println!("OK");
     Ok(())
 }
 
 fn start_systemd(ssh_base: &[String]) -> Result<()> {
     helpers::run_ssh(ssh_base, manager_systemd_start_command())
-}
-
-fn start_docker(ssh_base: &[String], manifest: &ManagerManifest) -> Result<()> {
-    helpers::run_ssh(ssh_base, &manager_docker_start_command(&manifest.workdir))
 }
 
 fn verify_manager_bundle(bundle_path: &str, manifest: &ManagerManifest) -> Result<()> {
@@ -1307,8 +1140,8 @@ mod tests {
         let manifest = ManagerManifest {
             target: "x86_64-unknown-linux-gnu".into(),
             workdir: "/opt/wruntime".into(),
-            image_prefix: "wr".into(),
             listen_address: "0.0.0.0:9000".into(),
+            no_otel: false,
             template_vars: vec!["db_url".into()],
             checksums: BTreeMap::from([(
                 "wr-manager/bin/wr-manager".into(),
@@ -1344,16 +1177,16 @@ mod tests {
     }
 
     #[test]
-    fn manager_activation_identity_is_installed_in_every_backend() {
-        let environment = manager_runtime_env();
-        assert!(environment.contains(&("WRT_LIFECYCLE_INSTANCE_ID", "{lifecycle_instance_id}")));
-        let systemd_environment = manager_systemd_environment(&"a".repeat(64), "activation-id");
+    fn manager_activation_identity_is_installed_for_systemd() {
+        let systemd_environment =
+            manager_systemd_environment(&"a".repeat(64), "activation-id", true);
         assert!(systemd_environment.contains("WRT_SECRET_ENCRYPTION_KEY="));
         assert!(systemd_environment.contains("WRT_LIFECYCLE_INSTANCE_ID=activation-id\n"));
-        assert!(manager_secret_template_archive_paths()
-            .contains(&"wr-manager/systemd/wr-manager.service"));
-        assert!(manager_secret_template_archive_paths()
-            .contains(&"wr-manager/docker/Dockerfile.manager"));
+        assert!(systemd_environment.contains("OTEL_SDK_DISABLED=true\n"));
+        assert_eq!(
+            manager_secret_template_archive_paths(),
+            &["wr-manager/systemd/wr-manager.service"]
+        );
     }
 
     #[test]
@@ -1472,8 +1305,8 @@ mod tests {
         let manifest = ManagerManifest {
             target: "target".into(),
             workdir: "/opt/wruntime".into(),
-            image_prefix: "wr".into(),
             listen_address: "0.0.0.0:9000".into(),
+            no_otel: false,
             template_vars: vec![],
             checksums: BTreeMap::from([("z".into(), "2".into()), ("a".into(), "1".into())]),
         };
@@ -1522,7 +1355,7 @@ advertise_grpc_address = "{advertise_address}"
 
     #[test]
     fn manager_systemd_deploy_sequence_starts_after_runtime_artifacts() {
-        let phases = manager_deploy_phase_order(&DeployFormat::Systemd);
+        let phases = manager_deploy_phase_order();
         assert!(
             index_of(phases, ManagerDeployPhase::PrepareBundle)
                 < index_of(phases, ManagerDeployPhase::InstallResolvedRuntimeArtifacts)
@@ -1553,59 +1386,33 @@ advertise_grpc_address = "{advertise_address}"
         assert!(!install.contains("/etc/systemd/system"));
         assert!(manager_systemd_start_command().contains("enable wr-manager.service"));
         assert!(manager_systemd_start_command().contains("restart wr-manager.service"));
-        assert_eq!(phases, manager_deploy_phase_order(&DeployFormat::Systemd));
+        assert_eq!(phases, manager_deploy_phase_order());
     }
 
     #[test]
-    fn manager_docker_deploy_sequence_resolves_artifacts_before_compose_start() {
-        let phases = manager_deploy_phase_order(&DeployFormat::Docker);
-        assert!(
-            index_of(phases, ManagerDeployPhase::PrepareBundle)
-                < index_of(phases, ManagerDeployPhase::InstallResolvedRuntimeArtifacts)
-        );
-        assert!(
-            index_of(phases, ManagerDeployPhase::InstallResolvedRuntimeArtifacts)
-                < index_of(phases, ManagerDeployPhase::UploadResolvedConfig)
-        );
-        assert!(
-            index_of(phases, ManagerDeployPhase::UploadResolvedConfig)
-                < index_of(phases, ManagerDeployPhase::ProvisionTls)
-        );
-        assert!(
-            index_of(phases, ManagerDeployPhase::ProvisionTls)
-                < index_of(phases, ManagerDeployPhase::CaptureFirstStartTimestamp)
-        );
-        assert!(
-            index_of(phases, ManagerDeployPhase::CaptureFirstStartTimestamp)
-                < index_of(phases, ManagerDeployPhase::FirstStart)
-        );
-        assert!(manager_secret_template_archive_paths()
-            .contains(&"wr-manager/systemd/wr-manager.service"));
-        assert!(manager_secret_template_archive_paths()
-            .contains(&"wr-manager/docker/Dockerfile.manager"));
-        let command = manager_docker_start_command("/opt/wruntime");
-        assert!(command.starts_with("sudo docker compose"));
-        assert!(command.contains("--project-name wruntime-manager"));
-        assert!(command.contains("-f '/opt/wruntime/wr-manager/docker/docker-compose.yml'"));
-        assert!(command.contains("up -d --build --force-recreate"));
-        assert!(!command.contains("cd "));
-        assert!(!command.contains("restart"));
+    fn manager_cli_and_config_reject_removed_backend_selection() {
+        assert!(ManagersTestCli::try_parse_from([
+            "test",
+            "deploy",
+            "bundle.tar.gz",
+            "root@manager.example",
+            "--format",
+            "docker",
+        ])
+        .is_err());
 
-        let compose = manager_docker_compose("/opt/wruntime", "wr");
-        assert!(compose.contains("network_mode: host"));
-        assert!(compose.contains("\"/etc/wruntime/pki:/etc/wruntime/pki:ro\""));
-        assert!(compose
-            .contains("\"/var/lib/wruntime/manager-config:/var/lib/wruntime/manager-config:ro\""));
-        assert!(!compose.contains("ports:"));
+        assert!(toml::from_str::<DeployConfig>("format = \"docker\"").is_err());
+        assert!(toml::from_str::<DeployConfig>("image_prefix = \"wr\"").is_err());
 
-        for follow in [false, true] {
-            let logs = manager_docker_logs_command("/opt/wruntime", 20, follow);
-            assert!(logs.starts_with("sudo docker compose"));
-            assert!(logs.contains("--project-name wruntime-manager"));
-            assert!(logs.contains("-f '/opt/wruntime/wr-manager/docker/docker-compose.yml'"));
-            assert!(logs.contains("--tail 20"));
-            assert!(!logs.contains("cd "));
-            assert_eq!(logs.ends_with(" -f"), follow);
-        }
+        let stale_manifest = r#"{
+            "target":"x86_64-unknown-linux-gnu",
+            "workdir":"/opt/wruntime",
+            "listen_address":"0.0.0.0:9000",
+            "no_otel":false,
+            "image_prefix":"wr",
+            "template_vars":[],
+            "checksums":{}
+        }"#;
+        assert!(serde_json::from_str::<ManagerManifest>(stale_manifest).is_err());
     }
 }

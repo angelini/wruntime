@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -47,14 +48,14 @@ class LifecycleContractTests(unittest.TestCase):
             line for line in harness.splitlines()
             if line.startswith("run_logged ") and "-bundle target/debug/wr-cli node bundle" in line
         ]
-        self.assertEqual(len(bundle_lines), 4)
+        self.assertEqual(len(bundle_lines), 5)
         self.assertTrue(all("--skip-build" in line for line in bundle_lines))
 
     def test_manager_b_database_preflight_follows_systemd_vm_readiness(self):
         harness = HARNESS.read_text()
         lifecycle = harness[harness.index("lifecycle() {"):]
         provider_reset = lifecycle.index(
-            'run_to_log "$backend provider reset" "$pass/provider-reset.json" provider reset'
+            'run_to_log "systemd provider reset" "$pass/provider-reset.json" provider reset'
         )
         preflight_command = (
             'run_to_log "manager-b-db-preflight" '
@@ -67,11 +68,8 @@ class LifecycleContractTests(unittest.TestCase):
         self.assertEqual(lifecycle.count(preflight_command), 1)
         self.assertLess(provider_reset, database_preflight)
         self.assertLess(database_preflight, first_manager_rollout)
-        self.assertIn(
-            'if [ "$backend" = systemd ]; then\n'
-            '\t\trun_to_log "manager-b-db-preflight"',
-            lifecycle,
-        )
+        self.assertNotIn('if [ "$' + 'backend" = systemd ]; then', lifecycle)
+        self.assertNotIn("--" + "backend", lifecycle)
 
     def test_manager_rollout_waits_for_membership_and_checks_source_exit(self):
         harness = HARNESS.read_text()
@@ -163,14 +161,13 @@ fi
             operations = [event for event in events if event["event"] == "operation"]
             self.assertEqual([event["name"] for event in operations], [
                 "systemd-addition", "systemd-replacement-finalize", "systemd-replacement-retry", "systemd-removal", "systemd-empty-inventory", "systemd-rollback",
-                "docker-addition", "docker-replacement-finalize", "docker-replacement-retry", "docker-removal", "docker-empty-inventory", "docker-rollback",
             ])
             for event in operations:
                 self.assertIn("submitted=1000,durable=2800,cli_wait=2860,watchdog=2920", event["detail"])
             artifacts = [event for event in events if event["event"] == "artifact"]
-            self.assertEqual([event["name"] for event in artifacts], ["prepare", "systemd", "docker"])
+            self.assertEqual([event["name"] for event in artifacts], ["prepare", "systemd"])
             self.assertEqual({event["detail"].split("digest=")[1] for event in artifacts}, {"sha256:fixture"})
-            self.assertEqual([event["name"] for event in events if event["event"] == "reset"], ["systemd-entry", "docker-entry"])
+            self.assertEqual([event["name"] for event in events if event["event"] == "reset"], ["systemd-entry"])
             manager_rollouts = [event for event in events if event["event"] == "manager-rollout"]
             self.assertEqual([event["name"] for event in manager_rollouts], [
                 "a-to-b", "b-to-a", "failed-closed", "reset-active", "reset-mixed",
@@ -181,7 +178,7 @@ fi
             self.assertEqual([event["name"] for event in events if event["event"] == "manager-failure"], ["failed-closed", "reset-active", "reset-mixed"])
             self.assertEqual(len([event for event in events if event["event"] == "cleanup"]), 1)
             captures = [event for event in events if event["event"] == "operation-detail"]
-            self.assertEqual([event["name"] for event in captures], ["replacement-token", "replacement-token"])
+            self.assertEqual([event["name"] for event in captures], ["replacement-token"])
             self.assertEqual(json.loads((root / "operation.json").read_text())["operation_id"], "operation-a")
             invoked = calls.read_text().splitlines()
             self.assertTrue(any("operations list" in line for line in invoked))
@@ -193,20 +190,21 @@ fi
                 and '--body {"nonce":"probe"}' in line
                 for line in probe_calls
             ))
-            self.assertEqual([line for line in invoked if line.startswith("provider ")], ["provider reset", "provider reset", "provider stop-reset"])
+            self.assertEqual([line for line in invoked if line.startswith("provider ")], ["provider reset", "provider stop-reset"])
             replacements = [line for line in invoked if "node deploy" in line and "replacement-token" in line]
-            self.assertEqual(len(replacements), 4)
-            self.assertEqual(sum("--exit-after-finalization" in line for line in replacements), 2)
+            self.assertEqual(len(replacements), 2)
+            self.assertEqual(sum("--exit-after-finalization" in line for line in replacements), 1)
             self.assertTrue(all("--request-token replacement-token" in line for line in replacements))
-            self.assertEqual(sum("--bundle upgrade-two.tar.gz" in line for line in replacements), 2)
+            self.assertEqual(sum("--bundle upgrade-two.tar.gz" in line for line in replacements), 1)
             lifecycle = HARNESS.read_text()[HARNESS.read_text().index("lifecycle() {"):]
             initial_manager_deploy = lifecycle.index(
-                'managers deploy "$MANAGER_BUNDLE" "$MANAGER_REMOTE" --format "$backend"'
+                'managers deploy "$MANAGER_BUNDLE" "$MANAGER_REMOTE"'
             )
-            systemd_rollouts = lifecycle.index('if [ "$backend" = systemd ]; then', initial_manager_deploy)
+            self.assertNotIn(
+                'managers deploy "$MANAGER_BUNDLE" "$MANAGER_REMOTE" --format', lifecycle
+            )
             first_deploy_set = lifecycle.index('run_to_log "manager A to B deploy-set"')
-            self.assertLess(initial_manager_deploy, systemd_rollouts)
-            self.assertLess(systemd_rollouts, first_deploy_set)
+            self.assertLess(initial_manager_deploy, first_deploy_set)
             deploy_sets = [line for line in invoked if "managers deploy-set" in line]
             self.assertEqual(len(deploy_sets), 4)
             self.assertIn("manager-a-to-b-systemd.toml", deploy_sets[0])
@@ -216,10 +214,9 @@ fi
             resets = [line for line in invoked if "reset-failed-rollout" in line]
             self.assertEqual(len(resets), 3)
             self.assertTrue(all("--rollout-id failed-rollout" in line for line in resets))
-            self.assertTrue(all((root / f"{backend}-summary.json").exists() for backend in ("systemd", "docker")))
+            self.assertTrue((root / "systemd-summary.json").exists())
             traffic_events = [event for event in events if event["event"] in {"tunnel", "probe"}]
             self.assertEqual([(event["event"], event["name"]) for event in traffic_events], [
-                ("tunnel", "start"), ("probe", "start"), ("probe", "stop"), ("tunnel", "stop"),
                 ("tunnel", "start"), ("probe", "start"), ("probe", "stop"), ("tunnel", "stop"),
             ])
             replacement = replacements[0]
@@ -233,6 +230,65 @@ fi
                 self.assertIn("--deadline 1800", line)
                 self.assertIn("--wait-timeout 1860", line)
                 self.assertNotIn("600", line)
+
+    def test_deployed_runtime_has_no_docker_backend_and_compose_is_support_only(self):
+        owners = [
+            ROOT / "dev" / "validate-deployment-lifecycle.sh",
+            ROOT / "dev" / "validate-all.sh",
+            ROOT / "dev" / "deployment-e2e" / "lifecycle_contract.sh",
+            ROOT / "Justfile",
+            ROOT / "README.md",
+            ROOT / "AGENTS.md",
+            *(ROOT / "docs" / name for name in (
+                "architecture.md", "configuration.md", "deployment.md",
+                "grpc-api.md", "testing.md",
+            )),
+            *(ROOT / "docs" / "agents" / "wruntime-maintainer" / name for name in (
+                "invariants.md", "validation.md", "generated_contracts.md",
+            )),
+        ]
+        forbidden = (
+            "deployment-e2e-" + "docker",
+            "--" + "backend",
+            "--format " + "docker",
+            'backend = "' + 'docker"',
+            "docker-" + "path",
+            "systemd/" + "docker",
+            "systemd/" + "compose",
+            "compose " + "manager",
+        )
+        violations = []
+        for path in owners:
+            lowered = path.read_text().lower()
+            for token in forbidden:
+                if token.lower() in lowered:
+                    violations.append(f"{path.relative_to(ROOT)}: forbidden {token!r}")
+        self.assertEqual(violations, [])
+
+        compose = (ROOT / "docker-compose.yml").read_text()
+        services = compose.split("services:\n", 1)[1].split("\nnetworks:\n", 1)[0]
+        service_names = {
+            line.strip()[:-1]
+            for line in services.splitlines()
+            if line.startswith("  ") and not line.startswith("    ") and line.rstrip().endswith(":")
+        }
+        self.assertEqual(service_names, {"postgres", "postgres-provisioner", "lgtm", "rustfs"})
+        for workload in ("wr-manager", "wr-proxy", "wr-engine", "wr-node-agent"):
+            self.assertNotIn(f"  {workload}:", services)
+
+        # Remaining mentions are classified supporting-infrastructure documentation.
+        classified = {
+            "README.md", "AGENTS.md", "Justfile", "dev/validate-all.sh",
+            "docs/architecture.md", "docs/configuration.md", "docs/deployment.md", "docs/testing.md",
+            "docs/agents/wruntime-maintainer/generated_contracts.md",
+            "docs/agents/wruntime-maintainer/validation.md",
+        }
+        actual = {
+            str(path.relative_to(ROOT))
+            for path in owners
+            if re.search(r"\b(?:docker|compose)\b", path.read_text(), re.IGNORECASE)
+        }
+        self.assertEqual(actual, classified)
 
     def test_manager_fixture_requires_reachable_database_and_monotonic_policies(self):
         import importlib.util
@@ -287,7 +343,7 @@ fi
             target = {
                 "manager_id": "manager-a", "endpoint": "https://manager-a:9000", "remote": "root@manager-a",
                 "executable": "/tmp/wr-manager", "executable_digest": "sha256:" + "1" * 64,
-                "backend_spec": "/tmp/unit", "backend_spec_digest": "sha256:" + "2" * 64,
+                "systemd_unit": "/tmp/unit", "systemd_unit_digest": "sha256:" + "2" * 64,
                 "config": "/tmp/config", "config_digest": "sha256:" + "3" * 64,
                 "credential_set": "/tmp/set", "credential_digest": "sha256:" + "4" * 64,
                 "old_selector_digest": "sha256:" + "5" * 64, "new_selector_digest": "sha256:" + "6" * 64,
@@ -435,7 +491,7 @@ fi
         self.assertEqual(list(json.loads(initial)), sorted(json.loads(initial)))
         self.assertEqual(
             module.digest_bytes(initial),
-            "sha256:146939e3166e4febd9bc963d539288767dc97022b91b929997d5fcc3c8013455",
+            "sha256:f78794edba95c819ee7c67896f109e26250375d8df038ee2dac48df50e8ca44d",
         )
 
         rollout = module.descriptor(*args)
@@ -444,11 +500,10 @@ fi
             [
                 "schema_version",
                 "manager_id",
-                "backend",
                 "executable",
                 "executable_digest",
-                "backend_spec_path",
-                "backend_spec_digest",
+                "systemd_unit_path",
+                "systemd_unit_digest",
                 "config_path",
                 "config_digest",
                 "credential_set_path",
@@ -457,7 +512,7 @@ fi
         )
         self.assertEqual(
             module.digest_bytes(rollout),
-            "sha256:bc2eec1187de56f34a3973047fbdd37821982dd569c13e248bfe691f07a2e262",
+            "sha256:85325d955b7536cdafedf9586a26fa5030cf32bb97b376fd0e0ebf4586840fd8",
         )
 
     def test_stable_slot_fixtures_have_unique_pinned_endpoints(self):

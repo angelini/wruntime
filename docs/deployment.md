@@ -1,12 +1,12 @@
 # Deployment
 
-Wruntime provides CLI commands for packaging and deploying services to remote hosts. The workflow is **bundle once, deploy anywhere** — a single tarball contains everything needed for both systemd and Docker deployments.
+Wruntime provides CLI commands for packaging and deploying services to remote hosts. The workflow is **bundle once, deploy anywhere**: a single tarball contains the complete Systemd deployment payload.
 
 Maintainers changing deployment generation or lifecycle behavior must run the
 protected lifecycle qualification described in [Testing](testing.md) and the
 [maintainer validation matrix](agents/wruntime-maintainer/validation.md). The
 public deployment workflow below is not a substitute for that disposable-VM
-systemd/Docker validation. The protected fixture deploys database-enabled engines and exercises job administration on both backends: generated delegation certificate mounts and advertised engine admin addresses must start successfully, runtime credentials must fail on the operator listener, queue discovery must report one fresh delegate, and a manager-mediated queue summary must reach the engine.
+Systemd validation. The protected fixture deploys database-enabled engines and exercises job administration: generated delegation certificate mounts and advertised engine admin addresses must start successfully, runtime credentials must fail on the operator listener, queue discovery must report one fresh delegate, and a manager-mediated queue summary must reach the engine.
 
 ## Prerequisites
 
@@ -31,17 +31,17 @@ cargo install cargo-zigbuild
 | `wr-cli node agent install/update` | Atomically update only an already provisioned host-agent binary, restart it, and wait for a new compatible attestation |
 | `wr-cli node deploy` | Stage/finalize a complete desired inventory and reconcile initial, replacement, scale, or mixed changes |
 | `wr-cli node rollback` | Stage a retained successful bundle as a new revision and submit explicit rollback |
-| `wr-cli engines status` | Compose lifecycle, availability, revision authority, backend evidence, and active operation status |
+| `wr-cli engines status` | Systemd lifecycle, availability, revision authority, process evidence, and active operation status |
 | `wr-cli engines restart` | Restart one committed desired slot without changing its revision or inventory |
 | `wr-cli operations get/list/resume/cancel` | Inspect and administer durable operation history |
 | `wr-cli node abandon` | Remove an unsubmitted inactive allocation after manager safety checks |
 | `wr-cli node inspect-bundle` | Verify and inspect a node bundle without deploying |
 | `wr-cli cluster status` | Show the authoritative cluster-wide runtime snapshot |
-| `wr-cli logs node` | View logs from services on a remote node (systemd or Docker) |
+| `wr-cli logs node` | View Systemd journal logs from services on a remote node |
 
 ## Bundle structure
 
-Bundles are gzip'd tarballs containing cross-compiled binaries, config templates, WASM modules (with pre-compiled `.cwasm` native artifacts), schemas, migrations, and deployment descriptors for both systemd and Docker.
+Bundles are gzip'd tarballs containing cross-compiled binaries, config templates, WASM modules (with pre-compiled `.cwasm` native artifacts), schemas, migrations, and Systemd deployment descriptors.
 
 **Manager bundle:**
 
@@ -50,9 +50,6 @@ wr-manager/
 ├── bin/wr-manager
 ├── config/manager.toml          # template with {db_url}, {advertise_address} placeholders
 ├── systemd/wr-manager.service   # stable activation-launcher unit
-├── docker/
-│   ├── Dockerfile.manager
-│   └── docker-compose.yml
 └── manifest.json
 ```
 
@@ -81,10 +78,6 @@ wr-node/
 │   ├── wr-node-agent.service
 │   ├── wr-engine-order-service.service
 │   └── 99-wruntime.conf         # sysctl tuning
-├── docker/
-│   ├── Dockerfile.proxy
-│   ├── Dockerfile.engine-order-service
-│   └── docker-compose.yml
 └── manifest.json
 ```
 
@@ -96,7 +89,6 @@ Instead of passing every flag on the command line, you can create a `wr-deploy.t
 
 ```toml
 # wr-deploy.toml — shared settings for bundle and deploy commands
-format     = "systemd"
 target     = "aarch64-unknown-linux-gnu"
 workdir    = "/opt/wruntime"
 proxy_config = "examples/config/proxy.toml"
@@ -114,7 +106,6 @@ port = 5432
 connect_timeout_secs = 10
 
 # ssh_port     = 22
-# image_prefix = "wr"
 ```
 
 All fields are optional. Fields that only apply to specific commands (e.g. `secret_key` for managers) are silently ignored when unused. CLI flags always override the config file.
@@ -125,7 +116,6 @@ All fields are optional. Fields that only apply to specific commands (e.g. `secr
 
 | Flag | Env var | Default |
 | ------ | --------- | --------- |
-| `--format` | `WR_FORMAT` | `systemd` |
 | `--db-url` | `WR_DB_URL` | — |
 | `--secret-key` | `WR_SECRET_KEY` | — |
 | `--ssh-key` | `WR_SSH_KEY` | — |
@@ -151,13 +141,13 @@ Config files use placeholders that are resolved at deploy time:
 | ---------- | --------------- | --------- |
 | `{db_url}` | `--db-url` / `WR_DB_URL` / config | manager, proxy, engine configs |
 | `{host}` | deploy target (`user@host`) | proxy/engine `[node]` addresses |
-| `{secret_key}` | `--secret-key` / `WR_SECRET_KEY` / config | protected manager runtime environment / Dockerfile |
+| `{secret_key}` | `--secret-key` / `WR_SECRET_KEY` / config | protected manager runtime environment |
 | `{peer_port}` | `--peer-port` / `WR_PEER_PORT` / config (default: 9443) | explicit proxy/engine `peer_address` templates |
 | `{operation_id}` | manager-derived deployment allocation identity | engine deployment metadata |
 | `{revision_digest}` | manager-derived canonical revision identity | engine deployment metadata |
 | `{advertise_address}` | `--advertise-address` / `WR_ADVERTISE_ADDRESS` (auto-derived from remote host if omitted) | manager config (`advertise_grpc_address`) |
 
-Unresolved placeholders cause deployment to fail. Systemd manager deployment atomically installs the encryption key in the root-only `/var/lib/wruntime/manager-secrets/runtime.env` environment file referenced by the stable unit; the key is not embedded in that unit. The unit is installed at `/usr/local/lib/systemd/system/wr-manager.service`, below `/run/systemd/system` in the unit load path, so the runtime mask used during manager-set cutover takes precedence. Manager Docker deployments retain host networking for systemd parity and direct listener addressing.
+Unresolved placeholders cause deployment to fail. Systemd manager deployment atomically installs the encryption key in the root-only `/var/lib/wruntime/manager-secrets/runtime.env` environment file referenced by the stable unit; the key is not embedded in that unit. The unit is installed at `/usr/local/lib/systemd/system/wr-manager.service`, below `/run/systemd/system` in the unit load path, so the runtime mask used during manager-set cutover takes precedence.
 
 ### Database-enabled reservation and operator preparation
 
@@ -210,9 +200,9 @@ Install the first manager with `wr-cli managers deploy`. Its normal startup regi
 
 After starting the manager, `wr-cli managers deploy` connects to the resolved SSH-host poll endpoint over mTLS using `ca.crt`, `<ssh-host>.crt`, and `<ssh-host>.key` from that deploy's resolved `cert_dir`. This connection does not use the CLI process's default/global certificate paths. The client certificate must cover the poll endpoint's IP in its SANs.
 
-Deploy exits zero only when the contacted process's `LifecycleService` reports `READY` with the exact activation identity installed into the systemd unit or container image for that deployment. Manager membership remains a later cluster-health assertion and cannot satisfy startup readiness. TLS, transport, malformed lifecycle evidence, process-instance replacement, terminal-before-ready, and 60-second timeout outcomes are distinct non-zero failures with the last typed observation. No `ListManagers` visibility or advertised-address polling is used as the startup gate.
+Deploy exits zero only when the contacted process's `LifecycleService` reports `READY` with the exact activation identity installed into the Systemd unit for that deployment. Manager membership remains a later cluster-health assertion and cannot satisfy startup readiness. TLS, transport, malformed lifecycle evidence, process-instance replacement, terminal-before-ready, and 60-second timeout outcomes are distinct non-zero failures with the last typed observation. No `ListManagers` visibility or advertised-address polling is used as the startup gate.
 
-Live startup logs are stopped and both output-reader tasks are joined before final diagnostics. A bounded startup-log dump is attempted on both readiness success and failure; diagnostic collection reports its own outcome without replacing the primary readiness failure. Manager Docker log collection uses privileged Compose, matching the passwordless-sudo deployment prerequisite.
+Live startup logs are stopped and both output-reader tasks are joined before final diagnostics. A bounded startup-log dump is attempted on both readiness success and failure; diagnostic collection reports its own outcome without replacing the primary readiness failure.
 
 ## Single-node deployment (systemd)
 
@@ -229,7 +219,7 @@ secret_key = "<64-char-hex-key>"
 # 1. Bundle manager (target and output have defaults)
 wr-cli managers bundle --manager-config examples/config/manager.toml
 
-# 2. Deploy manager (format defaults to systemd, advertise-address derived from host)
+# 2. Deploy manager (Systemd is authoritative; advertise-address is derived from host)
 wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.1
 
 # 3. Bundle node
@@ -239,9 +229,9 @@ wr-cli node bundle --engine-config engine.toml
 Add `--proxy-config examples/config/proxy.toml` (or set `proxy_config` in `wr-deploy.toml`) when the source proxy config has runtime sections such as egress allowlists, external routes, or non-default circuit-breaker settings that must be preserved in the bundle.
 
 ```bash
-# 4. After provisioning config, credentials, directories, backend, service unit,
+# 4. After provisioning config, credentials, directories, Systemd unit,
 #    executable, and initial manager policy, update the agent binary.
-wr-cli node agent install --node-id node-a --format systemd wr-node-bundle.tar.gz deploy@10.0.1.1 --manager https://10.0.1.1:9000
+wr-cli node agent install --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.1 --manager https://10.0.1.1:9000
 
 # 5. Stage/finalize the complete desired inventory and submit reconciliation
 wr-cli node deploy --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.1 --manager https://10.0.1.1:9000 --request-token node-a-initial
@@ -267,7 +257,7 @@ wr-cli node bundle \
     --target aarch64-unknown-linux-gnu \
     --output myapp.tar.gz
 
-wr-cli node agent install --node-id node-a --format systemd myapp.tar.gz deploy@10.0.1.1 \
+wr-cli node agent install --node-id node-a myapp.tar.gz deploy@10.0.1.1 \
     --manager https://10.0.1.1:9000
 wr-cli node deploy --node-id node-a myapp.tar.gz deploy@10.0.1.1 \
     --db-url "postgres://postgres@10.0.1.1:5432/wruntime" \
@@ -309,9 +299,9 @@ wr-cli node deploy --node-id node-a wr-node-scaled.tar.gz deploy@10.0.1.1 \
   --request-token node-a-inventory-change --max-unavailable 1
 ```
 
-The bundle's finalized inventory is authoritative; callers do not select initial, upgrade, scale, or canary mechanics. The manager progresses additions, retained replacements, and removals sequentially in deterministic groups. The default is `max_unavailable=1` and a 30-minute durable deadline. Reducing the final serving slot or targeting an empty inventory requires `--allow-downtime`. Submitting the exact committed revision with a new authenticated actor/token creates an immediately successful operation and performs no host, deployment, or authority mutation. `--wait-timeout` is caller-only and `--no-wait` returns after submission. Cancellation before commit restores the complete source inventory and authority without the expired forward deadline; committed work is corrected only by separately authorized rollback.
+A normal `wr-cli node bundle --proxy-config proxy.toml --output empty.tar.gz` invocation with no `--engine-config` encodes a complete empty desired engine inventory while retaining verified proxy, agent, and Systemd support artifacts. The bundle's finalized inventory is authoritative; callers do not select initial, upgrade, scale, or canary mechanics. The manager progresses additions, retained replacements, and removals sequentially in deterministic groups. The default is `max_unavailable=1` and a 30-minute durable deadline. Reducing the final serving slot or targeting an empty inventory requires `--allow-downtime`. Submitting the exact committed revision with a new authenticated actor/token creates an immediately successful operation and performs no host, deployment, or authority mutation. `--wait-timeout` is caller-only and `--no-wait` returns after submission. Cancellation before commit restores the complete source inventory and authority without the expired forward deadline; committed work is corrected only by separately authorized rollback.
 
-The host agent verifies digest-covered release metadata, confines paths below `deployment_root`, atomically selects `wr-node/slots/<slot>`, and invokes only fixed systemd units or Compose services. It has no listener and no root-owned recovery-state directory or journal. The generated unit grants write access to workload state, the runtime directory, and backend-owned unit/socket paths only. Stop sends SIGTERM through that backend; the engine's 30-second shutdown emits `STOPPING`, withdraws routes, converges the proxy, drains, and deregisters. The manager commits delivery ambiguity before returning a mutation. A live agent retries an unacknowledged exact tagged result in memory before claiming more work; after agent replacement, the fresh activation never replays that result and instead receives typed backend inspection from durable manager state. Endpoint disappearance alone is never final-exit proof, and missing or query-error inspection evidence is unknown and pauses rather than authorizing another mutation.
+The host agent verifies digest-covered release metadata, confines paths below `deployment_root`, atomically selects `wr-node/slots/<slot>`, and invokes only fixed Systemd units. It has no listener and no root-owned recovery-state directory or journal. The generated unit grants write access to workload state, the runtime directory, and Systemd unit/socket paths only. Stop sends SIGTERM through that backend; the engine's 30-second shutdown emits `STOPPING`, withdraws routes, converges the proxy, drains, and deregisters. The manager commits delivery ambiguity before returning a mutation. A live agent retries an unacknowledged exact tagged result in memory before claiming more work; after agent replacement, the fresh activation never replays that result and instead receives typed backend inspection from durable manager state. Endpoint disappearance alone is never final-exit proof, and missing or query-error inspection evidence is unknown and pauses rather than authorizing another mutation.
 
 ### Clean-slate persistence baseline
 
@@ -339,13 +329,13 @@ wr-cli managers deploy manager.tar.gz deploy@10.0.1.1
 # --- Node A ---
 
 wr-cli node bundle --engine-config examples/multi-node/node-a/engine-1.toml --output node-a.tar.gz
-wr-cli node agent install --node-id node-a --format systemd node-a.tar.gz deploy@10.0.1.50
+wr-cli node agent install --node-id node-a node-a.tar.gz deploy@10.0.1.50
 wr-cli node deploy --node-id node-a node-a.tar.gz deploy@10.0.1.50 --request-token node-a-initial
 
 # --- Node B ---
 
 wr-cli node bundle --engine-config examples/multi-node/node-b/engine-1.toml --output node-b.tar.gz
-wr-cli node agent install --node-id node-b --format systemd node-b.tar.gz deploy@10.0.1.51
+wr-cli node agent install --node-id node-b node-b.tar.gz deploy@10.0.1.51
 wr-cli node deploy --node-id node-b node-b.tar.gz deploy@10.0.1.51 --request-token node-b-initial
 ```
 
@@ -375,29 +365,15 @@ wr-cli node deploy --node-id node-a node-a.tar.gz deploy@10.0.1.50 \
 
 ## Manager-set deployment
 
-After the first manager is ready, use one replay-stable TOML manifest with `wr-cli managers deploy-set --manifest <path>` for later manager-set changes. Every manifest names a reachable existing manager's peer-HTTPS `manager_endpoint`, along with the caller operation UUID, cluster, exact target policy file, deployment certificate set, ordered source and target manager/host sets, and every executable/image, backend-spec, config, credential, and selector digest. The endpoint may be the sole manager being replaced; it does not imply that multiple managers must remain live simultaneously. The authenticated deployment principal plus operation UUID is the immutable owner; the manifest has no transferable executor or predecessor-recovery identity. Target entries use either a local systemd binary with its SHA-256 or an immutable Compose `name@sha256:...` image. The CLI validates all local bytes and reruns the shared policy/deployment-identity validator before contacting a host. An exact Begin retry returns its original `PREPARED` receipt.
+After the first manager is ready, use one replay-stable TOML manifest with `wr-cli managers deploy-set --manifest <path>` for later manager-set changes. Every manifest names a reachable existing manager's peer-HTTPS `manager_endpoint`, along with the caller operation UUID, cluster, exact target policy file, deployment certificate set, ordered source and target manager/host sets, and every executable, Systemd unit, config, credential, and selector digest. The endpoint may be the sole manager being replaced; it does not imply that multiple managers must remain live simultaneously. The authenticated deployment principal plus operation UUID is the immutable owner; the manifest has no transferable executor or predecessor-recovery identity. Target entries use a local executable and Systemd unit with their SHA-256 digests. The CLI validates all local bytes and reruns the shared policy/deployment-identity validator before contacting a host. An exact Begin retry returns its original `PREPARED` receipt.
 
-Systemd binaries are retained at `/opt/wruntime/manager-artifacts/binaries/<sha256>/wr-manager`; Compose images are pulled and inspected by repo digest. Backend specs are also digest-qualified. During `STAGING`, config is only owner-readable `next.tmp`, credential sets remain immutable below `/etc/wruntime/pki`, and the target descriptor remains unselected. A spontaneous restart therefore uses the source descriptor. `FAILED_PRE_CLOSE` changes no active selector.
+Systemd binaries are retained at `/opt/wruntime/manager-artifacts/binaries/<sha256>/wr-manager`; unit specifications are digest-qualified. During `STAGING`, config is only owner-readable `next.tmp`, credential sets remain immutable below `/etc/wruntime/pki`, and the target descriptor remains unselected. A spontaneous restart therefore uses the source descriptor. `FAILED_PRE_CLOSE` changes no active selector.
 
-After the manager reports `OLD_CLOSED`, fenced target actions maintain only `current.toml` and `previous.toml`, atomically replace `/var/lib/wruntime/manager-activation/current-activation.json`, and start each target with privileged admission closed. The stable launcher verifies executable/image, backend-spec, config, and credential digests before start. An exact `READY_CLOSED` target becomes the control endpoint before each remaining source is selector-fenced, stopped, and masked without changing its selector. Targets open only after all declared sources have typed `STOPPED` evidence and no live non-target membership remains. Owner-only phase transitions are lease-free; digest mismatch, conflicting replay, or any post-closure ambiguity becomes durable `FAILED_CLOSED`. There is no automatic rollback or generic artifact cleanup.
+After the manager reports `OLD_CLOSED`, fenced target actions maintain only `current.toml` and `previous.toml`, atomically replace `/var/lib/wruntime/manager-activation/current-activation.json`, and start each target with privileged admission closed. The stable launcher verifies executable, Systemd unit, config, and credential digests before start. An exact `READY_CLOSED` target becomes the control endpoint before each remaining source is selector-fenced, stopped, and masked without changing its selector. Targets open only after all declared sources have typed `STOPPED` evidence and no live non-target membership remains. Owner-only phase transitions are lease-free; digest mismatch, conflicting replay, or any post-closure ambiguity becomes durable `FAILED_CLOSED`. There is no automatic rollback or generic artifact cleanup.
 
 Recovery is explicit: `wr-cli managers reset-failed-rollout --manifest <path> --rollout-id <id>` first matches the exact durable failed declaration, disconnects, and read-only inspects every declared source and target. The manager accepts only exact role coverage with all processes conclusively stopped and one uniform nonzero installed policy generation/digest. The stable reset receipt clears only the active guard and grants a one-use permit to the same authenticated principal. It does not certify success, change accepted policy, select artifacts, or open admission; a restarted manager reports `CLOSED_STARTUP`. Operators must repair stopped hosts explicitly, then submit a distinct fresh rollout under the same principal to consume the permit and reopen admission on successful completion.
 
-Protected qualification covers node lifecycle under systemd and Compose, but manager deploy-set only under systemd. It proves successful A→B→A, deterministic post-close digest refusal and `FAILED_CLOSED`, active and mixed-policy reset rejection, complete stopped/uniform reset, closed admission after reset, and a separate fresh rollout. Compose manager deploy-set remains explicitly unqualified until immutable image distribution is available.
-
-## Docker deployment
-
-The same bundle works for Docker — override the format via flag, env, or config:
-
-```bash
-# Via flag
-wr-cli node deploy --node-id node-a myapp.tar.gz deploy@10.0.1.50 --format docker
-
-# Via wr-deploy.toml
-# format = "docker"
-
-Docker deployments use Linux host networking so proxy/engine loopback trust boundaries match systemd. Inactive images and Compose metadata are staged first; only the node agent invokes fixed Compose services after manager authorization. Direct Compose startup from an unresolved bundle is not supported.
-```
+Protected qualification covers the complete node lifecycle and manager deploy-set under Systemd. It proves successful A→B→A, deterministic post-close digest refusal and `FAILED_CLOSED`, active and mixed-policy reset rejection, complete stopped/uniform reset, closed admission after reset, and a separate fresh rollout.
 
 ## TLS certificates
 
@@ -407,7 +383,7 @@ Production roots are installed under `/etc/wruntime/pki/roots/`. Immutable crede
 
 ## Remote host requirements
 
-External provisioning owns bootstrap, node-agent config and credentials, directories, backend prerequisites, and the hardened service unit. Systemd node hosts require Linux 5.3 or newer so the agent can use `pidfd_open` for exact process-exit evidence. The product's agent install/update helper uses privileged SSH only to stage, verify, atomically replace the existing agent executable, and restart the existing service; it never transfers private material or repairs missing topology. Inactive release staging and diagnostic commands also use bounded privileged operations. Workload effects do not. The deploy user must have **passwordless sudo** configured on each target host:
+External provisioning owns bootstrap, node-agent config and credentials, directories, Systemd prerequisites, and the hardened service unit. Systemd node hosts require Linux 5.3 or newer so the agent can use `pidfd_open` for exact process-exit evidence. The product's agent install/update helper uses privileged SSH only to stage, verify, atomically replace the existing agent executable, and restart the existing service; it never transfers private material or repairs missing topology. Inactive release staging and diagnostic commands also use bounded privileged operations. Workload effects do not. The deploy user must have **passwordless sudo** configured on each target host:
 
 ```bash
 echo "deploy ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/deploy
@@ -469,13 +445,13 @@ Operators address stable deployment identity and submit durable intent:
 wr-cli engines restart --node-id node-a --slot inventory --request-token restart-42 --json
 ```
 
-Only the continuously fenced node agent maps the typed target to `wr-engine-<slot>.service` or the fixed Compose service. It records backend instance identity, sends the backend's graceful SIGTERM action, and inspects until the exact instance exits. For systemd, it pins and revalidates the activation's `MainPID` before stop so exact process-exit proof survives systemd unloading the inactive unit and clearing `InvocationID`. Manager reconciliation separately requires `STOPPING`, route withdrawal, deregistration, and backend final exit where the action calls for them. A restarted process must have the requested revision/digests and a fresh process/backend identity before authority can return.
+Only the continuously fenced node agent maps the typed target to `wr-engine-<slot>.service`. It records backend instance identity, sends the backend's graceful SIGTERM action, and inspects until the exact instance exits. For systemd, it pins and revalidates the activation's `MainPID` before stop so exact process-exit proof survives systemd unloading the inactive unit and clearing `InvocationID`. Manager reconciliation separately requires `STOPPING`, route withdrawal, deregistration, and backend final exit where the action calls for them. A restarted process must have the requested revision/digests and a fresh process/backend identity before authority can return.
 
 SSH remains available for binary-only host-agent updates on an existing provisioned baseline, pre-staging immutable bytes, and bounded diagnostics. It is never used to execute workload stop/start/select/cleanup effects. If the agent loses its activation lease or cannot inspect the backend, the operation pauses with explicit evidence; a replacement activation begins with inspection and cannot blindly repeat the prior effect.
 
 ## Semantic startup and bounded shutdown
 
-Generated systemd units use `Type=notify`; each process sends `READY=1` only after its semantic startup barriers and sends `STOPPING=1` when final shutdown begins. Units use `SIGTERM`, `TimeoutStopSec=45s`, and final `SIGKILL` only after that external grace period. Generated Compose services use the same binary-native lifecycle probe, `stop_signal: SIGTERM`, and `stop_grace_period: 45s`. Engines depend on the proxy with `condition: service_healthy`, so startup waits for proxy semantic readiness and reverse dependency order stops engines before the proxy.
+Generated systemd units use `Type=notify`; each process sends `READY=1` only after its semantic startup barriers and sends `STOPPING=1` when final shutdown begins. Units use `SIGTERM`, `TimeoutStopSec=45s`, and final `SIGKILL` only after that external grace period. Systemd orders engines after the proxy and stops engines before the proxy.
 
 Each signal-driven stop has one absolute 30-second internal deadline; route convergence, admission waits, deregistration, and task joins consume that deadline without resetting it. The foreground runner's 45-second termination-policy boundary leaves 15 seconds after internal shutdown for process exit and escalation; needing SIGKILL or crossing the boundary is a failed graceful shutdown, while the owner still waits to reap before returning. Healthchecks execute the service binary with `--lifecycle-probe <config>` and succeed only in `READY`; a successful TCP connection while `STARTING` is not readiness.
 
@@ -521,26 +497,13 @@ No direct proxy or host scrape occurs. Each proxy pushes complete authenticated 
 
 ## Viewing logs
 
-Stream logs from remote nodes over SSH:
+Stream Systemd journal logs from remote nodes over SSH:
 
 ```bash
-# All services on a systemd node
-wr-cli logs node deploy@10.0.1.50 --format systemd
-
-# Single service, follow mode
-wr-cli logs node deploy@10.0.1.50 --format systemd --service wr-proxy --follow
-
-# Docker node, last 50 lines from the last hour
-wr-cli logs node deploy@10.0.1.50 --format docker --tail 50 --since 1h
+wr-cli logs node deploy@10.0.1.50
+wr-cli logs node deploy@10.0.1.50 --service wr-proxy --follow
 ```
 
-| Flag | Default | Description |
-| ------ | --------- | ------------- |
-| `--format` | — | `systemd` or `docker` (required) |
-| `--service` | all wr-* units | Filter to a specific service (e.g. `wr-proxy`, `wr-engine-inventory`) |
-| `--tail` | `100` | Number of recent log lines to show |
-| `--since` | `5m` | Lookback window, e.g. `5m`, `1h` (systemd only) |
-| `--follow` | off | Stream new lines as they arrive |
-| `--workdir` | `/opt/wruntime` | Base directory for installed files |
-| `--ssh-key` | — | SSH private key path |
-| `--ssh-port` | — | SSH port |
+`--service` filters a unit, `--tail` bounds recent lines, `--since` selects the
+journal lookback, and `--follow` streams new lines. SSH key/port and workdir
+options retain their normal deployment meanings.

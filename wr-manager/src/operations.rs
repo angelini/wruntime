@@ -10,18 +10,17 @@ use wr_common::agent_policy::{
 };
 use wr_common::deployment_contract::deployment_operation_id;
 use wr_common::wruntime::{
-    instruction_target, operation_target_progress, AgentInstruction, BackendKind,
-    BackendProcessState, BackendStopDisposition, BackendTerminationEvidence,
-    ClaimNodeCleanupResponse, ClaimOperationResponse, DeploymentCondition, DeploymentRecord,
-    EngineSlotTargetIdentity, EngineTargetDetails, InstructionTarget, InstructionTargetKind,
-    NodeAgentAttestation, NodeAgentPolicy, NodeCleanupAuthority, NodeCleanupInstruction,
-    NodeCleanupResultDisposition, NodeCleanupState, NodeCleanupSummary, NodeOperation,
-    NodeOperationAction, NodeOperationPhase, NodeOperationState, NodeOperationStepKind,
-    NodeSlotTransitionKind, OperationEvent, OperationTargetProgress, ProcessLifecycleState,
-    ProxyDeploymentMetadata, ProxyTargetDetails, ProxyTargetIdentity,
-    ReportNodeCleanupResultRequest, ReportNodeCleanupResultResponse, ReportNodeObservationRequest,
-    ReportStepResultRequest, RolloutPolicy, ServiceKind, SlotAuthorityStatus, SlotObservation,
-    SubmitOperationRequest,
+    instruction_target, operation_target_progress, AgentInstruction, BackendProcessState,
+    BackendStopDisposition, BackendTerminationEvidence, ClaimNodeCleanupResponse,
+    ClaimOperationResponse, DeploymentCondition, DeploymentRecord, EngineSlotTargetIdentity,
+    EngineTargetDetails, InstructionTarget, InstructionTargetKind, NodeAgentAttestation,
+    NodeAgentPolicy, NodeCleanupAuthority, NodeCleanupInstruction, NodeCleanupResultDisposition,
+    NodeCleanupState, NodeCleanupSummary, NodeOperation, NodeOperationAction, NodeOperationPhase,
+    NodeOperationState, NodeOperationStepKind, NodeSlotTransitionKind, OperationEvent,
+    OperationTargetProgress, ProcessLifecycleState, ProxyDeploymentMetadata, ProxyTargetDetails,
+    ProxyTargetIdentity, ReportNodeCleanupResultRequest, ReportNodeCleanupResultResponse,
+    ReportNodeObservationRequest, ReportStepResultRequest, RolloutPolicy, ServiceKind,
+    SlotAuthorityStatus, SlotObservation, SubmitOperationRequest,
 };
 
 const LEASE_SECONDS: f64 = 15.0;
@@ -228,9 +227,7 @@ fn stop_evidence_condition(
             "successful stop result requires typed termination evidence",
         ));
     };
-    if BackendKind::try_from(evidence.backend).unwrap_or(BackendKind::Unspecified)
-        == BackendKind::Unspecified
-        || evidence.backend_instance_id != request.backend_instance_id
+    if evidence.backend_instance_id != request.backend_instance_id
         || evidence.process_instance_id != request.process_instance_id
     {
         return Some((
@@ -250,22 +247,6 @@ fn stop_evidence_condition(
         ));
     }
     None
-}
-
-fn backend_name(value: BackendKind) -> Result<&'static str, Status> {
-    match value {
-        BackendKind::Systemd => Ok("systemd"),
-        BackendKind::Docker => Ok("docker"),
-        BackendKind::Unspecified => Err(Status::invalid_argument("backend is required")),
-    }
-}
-
-fn parse_backend(value: &str) -> BackendKind {
-    match value {
-        "systemd" => BackendKind::Systemd,
-        "docker" => BackendKind::Docker,
-        _ => BackendKind::Unspecified,
-    }
 }
 
 fn operation_condition(code: String, detail: String) -> DeploymentCondition {
@@ -2993,7 +2974,6 @@ pub async fn claim(
                AND a.authenticated_principal = $3
                AND a.protocol_version = p.protocol_version
                AND a.binary_digest = p.binary_digest
-               AND a.backend = p.backend
                AND p.capabilities <@ a.capabilities
                AND a.observed_at >= NOW() - INTERVAL '30 seconds'",
             &[&node_id, &agent_instance_id, &agent],
@@ -4241,7 +4221,7 @@ async fn cleanup_attested<C: GenericClient + Sync>(
          JOIN wr_node_agent_policies p ON p.node_id = a.node_id
          WHERE a.node_id = $1 AND a.agent_instance_id = $2 AND a.authenticated_principal = $3
            AND a.protocol_version = p.protocol_version AND a.binary_digest = p.binary_digest
-           AND a.backend = p.backend AND p.capabilities <@ a.capabilities
+           AND p.capabilities <@ a.capabilities
            AND a.observed_at >= NOW() - INTERVAL '30 seconds'",
             &[&node_id, &agent_instance_id, &principal],
         )
@@ -4582,7 +4562,7 @@ pub(crate) async fn cleanup_summaries_from_client<C: GenericClient + Sync>(
         .collect()
 }
 
-fn canonical_agent_policy(policy: &NodeAgentPolicy) -> Result<(String, Vec<String>), Status> {
+fn canonical_agent_policy(policy: &NodeAgentPolicy) -> Result<Vec<String>, Status> {
     validate_identity(&policy.node_id, "node_id")
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     if policy.protocol_version != AGENT_PROTOCOL_VERSION {
@@ -4592,12 +4572,8 @@ fn canonical_agent_policy(policy: &NodeAgentPolicy) -> Result<(String, Vec<Strin
     }
     validate_sha256_digest(&policy.binary_digest, "binary_digest")
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let backend =
-        backend_name(BackendKind::try_from(policy.backend).unwrap_or(BackendKind::Unspecified))?
-            .to_string();
-    let capabilities = normalize_capabilities(&policy.capabilities)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    Ok((backend, capabilities))
+    normalize_capabilities(&policy.capabilities)
+        .map_err(|error| Status::invalid_argument(error.to_string()))
 }
 
 pub async fn put_agent_policy(
@@ -4605,7 +4581,7 @@ pub async fn put_agent_policy(
     actor: &str,
     policy: &NodeAgentPolicy,
 ) -> Result<NodeAgentPolicy, Status> {
-    let (backend, capabilities) = canonical_agent_policy(policy)?;
+    let capabilities = canonical_agent_policy(policy)?;
     let explicit_retention = policy
         .retention_count
         .map(|value| {
@@ -4621,7 +4597,7 @@ pub async fn put_agent_policy(
     let transaction = client.transaction().await.map_err(internal)?;
     let prior = transaction
         .query_opt(
-            "SELECT protocol_version, binary_digest, backend, capabilities, retention_count
+            "SELECT protocol_version, binary_digest, capabilities, retention_count
              FROM wr_node_agent_policies WHERE node_id = $1 FOR UPDATE",
             &[&policy.node_id],
         )
@@ -4639,7 +4615,6 @@ pub async fn put_agent_policy(
     let policy_changed = prior.as_ref().is_some_and(|row| {
         row.get::<_, String>("protocol_version") != policy.protocol_version
             || row.get::<_, String>("binary_digest") != policy.binary_digest
-            || row.get::<_, String>("backend") != backend
             || row.get::<_, Vec<String>>("capabilities") != capabilities
     });
     transaction
@@ -4652,14 +4627,20 @@ pub async fn put_agent_policy(
     transaction
         .execute(
             "INSERT INTO wr_node_agent_policies
-               (node_id, protocol_version, backend, retention_count, actor, binary_digest, capabilities)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+               (node_id, protocol_version, retention_count, actor, binary_digest, capabilities)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT(node_id) DO UPDATE SET protocol_version = EXCLUDED.protocol_version,
-               backend = EXCLUDED.backend, retention_count = EXCLUDED.retention_count,
-               actor = EXCLUDED.actor, binary_digest = EXCLUDED.binary_digest,
-               capabilities = EXCLUDED.capabilities, updated_at = NOW()",
-            &[&policy.node_id, &policy.protocol_version, &backend, &retention, &actor,
-              &policy.binary_digest, &capabilities],
+               retention_count = EXCLUDED.retention_count, actor = EXCLUDED.actor,
+               binary_digest = EXCLUDED.binary_digest, capabilities = EXCLUDED.capabilities,
+               updated_at = NOW()",
+            &[
+                &policy.node_id,
+                &policy.protocol_version,
+                &retention,
+                &actor,
+                &policy.binary_digest,
+                &capabilities,
+            ],
         )
         .await
         .map_err(internal)?;
@@ -4693,7 +4674,6 @@ pub async fn put_agent_policy(
     Ok(NodeAgentPolicy {
         node_id: policy.node_id.clone(),
         protocol_version: policy.protocol_version.clone(),
-        backend: policy.backend,
         retention_count: Some(retention as u32),
         binary_digest: policy.binary_digest.clone(),
         capabilities,
@@ -4713,13 +4693,10 @@ pub async fn attest(
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     let capabilities = normalize_capabilities(&attestation.capabilities)
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let backend = backend_name(
-        BackendKind::try_from(attestation.backend).unwrap_or(BackendKind::Unspecified),
-    )?;
     let client = pool.get().await.map_err(internal)?;
     let policy = client
         .query_opt(
-            "SELECT protocol_version, binary_digest, backend, capabilities
+            "SELECT protocol_version, binary_digest, capabilities
              FROM wr_node_agent_policies WHERE node_id = $1",
             &[&attestation.node_id],
         )
@@ -4731,12 +4708,6 @@ pub async fn attest(
             conditions.push(operation_condition(
                 "PROTOCOL_MISMATCH".into(),
                 "agent protocol does not match manager policy".into(),
-            ));
-        }
-        if policy.get::<_, String>("backend") != backend {
-            conditions.push(operation_condition(
-                "BACKEND_MISMATCH".into(),
-                "agent backend does not match manager policy".into(),
             ));
         }
         if policy.get::<_, String>("binary_digest") != attestation.binary_digest {
@@ -4764,14 +4735,20 @@ pub async fn attest(
         .execute(
             "INSERT INTO wr_node_agent_attestations
                (node_id, agent_instance_id, authenticated_principal, protocol_version,
-                binary_digest, backend, capabilities, observed_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                binary_digest, capabilities, observed_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW())
              ON CONFLICT(node_id, agent_instance_id) DO UPDATE SET
                authenticated_principal = EXCLUDED.authenticated_principal,
                protocol_version = EXCLUDED.protocol_version, binary_digest = EXCLUDED.binary_digest,
-               backend = EXCLUDED.backend, capabilities = EXCLUDED.capabilities, observed_at = NOW()",
-            &[&attestation.node_id, &attestation.agent_instance_id, &principal,
-              &attestation.protocol_version, &attestation.binary_digest, &backend, &capabilities],
+               capabilities = EXCLUDED.capabilities, observed_at = NOW()",
+            &[
+                &attestation.node_id,
+                &attestation.agent_instance_id,
+                &principal,
+                &attestation.protocol_version,
+                &attestation.binary_digest,
+                &capabilities,
+            ],
         )
         .await
         .map_err(internal)?;
@@ -4784,7 +4761,7 @@ where
 {
     Ok(client
         .query(
-            "SELECT node_id, protocol_version, backend, retention_count, binary_digest, capabilities
+            "SELECT node_id, protocol_version, retention_count, binary_digest, capabilities
              FROM wr_node_agent_policies ORDER BY node_id",
             &[],
         )
@@ -4794,7 +4771,6 @@ where
         .map(|row| NodeAgentPolicy {
             node_id: row.get("node_id"),
             protocol_version: row.get("protocol_version"),
-            backend: parse_backend(row.get::<_, String>("backend").as_str()) as i32,
             retention_count: Some(row.get::<_, i32>("retention_count") as u32),
             binary_digest: row.get("binary_digest"),
             capabilities: row.get("capabilities"),
@@ -4812,7 +4788,7 @@ where
     Ok(client
         .query(
             "SELECT node_id, agent_instance_id, authenticated_principal, protocol_version,
-                    binary_digest, backend, capabilities, observed_at
+                    binary_digest, capabilities, observed_at
              FROM wr_node_agent_attestations WHERE ($1 = '' OR node_id = $1)
              ORDER BY node_id, observed_at DESC",
             &[&node_id],
@@ -4825,7 +4801,6 @@ where
             agent_instance_id: row.get("agent_instance_id"),
             protocol_version: row.get("protocol_version"),
             binary_digest: row.get("binary_digest"),
-            backend: parse_backend(row.get::<_, String>("backend").as_str()) as i32,
             capabilities: row.get("capabilities"),
             observed_at: Some(timestamp(row.get("observed_at"))),
             authenticated_principal: row.get("authenticated_principal"),

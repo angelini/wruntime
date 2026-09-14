@@ -74,7 +74,7 @@ The manager also runs a Postgres-backed claim/lease job scheduler that submits s
 
 ### Node lifecycle agent
 
-Provisioning must install the outbound-only, root-owned host executor baseline: complete local config, credentials, directories, backend prerequisites, executable, and hardened service unit. `wr-cli node agent install|update` is only a binary updater for that existing baseline; it transfers no config, credentials, unit, or backend topology. `wr-cli node agent run --config /opt/wruntime/wr-agent/agent.toml` is the provisioned systemd unit's process entry point, not a normal interactive workflow. The strict local config contains no static slot inventory:
+Provisioning must install the outbound-only, root-owned host executor baseline: complete local config, credentials, directories, Systemd prerequisites, executable, and hardened service unit. `wr-cli node agent install|update` is only a binary updater for that existing baseline; it transfers no config, credentials, unit, or backend topology. `wr-cli node agent run --config /opt/wruntime/wr-agent/agent.toml` is the provisioned systemd unit's process entry point, not a normal interactive workflow. The strict local config contains no static slot inventory:
 
 ```toml
 policy-version = 1
@@ -85,19 +85,16 @@ client-key-path = "/opt/wruntime/wr-agent/certs/agent.key"
 ca-cert-path = "/opt/wruntime/wr-agent/certs/ca.crt"
 deployment-root = "/opt/wruntime"
 runtime-dir = "/run/wruntime"
-backend = "systemd"
-compose-project = ""
 systemctl-path = "/usr/bin/systemctl"
-docker-path = ""
 poll-interval-seconds = 5
 renew-interval-seconds = 5
 protocol-version = "operator-engine-lifecycle-v1"
-capabilities = ["continuous-lease-v1", "manager-authorized-retention-v1", "release-metadata-v1", "typed-backend-v1"]
+capabilities = ["continuous-lease-v1", "manager-authorized-retention-v1", "release-metadata-v1", "systemd-lifecycle-v1"]
 ```
 
-For Docker, set `backend = "docker"`, an absolute `docker-path`, and one stable `compose-project`, and leave `systemctl-path` empty. Every path and backend executable is validated locally; the config and credentials are root-owned and owner-only. With the systemd backend, `ProtectSystem=strict` remains enabled and the agent receives write access only to workload state under `wr-node`, `/run/wruntime`, `/etc/systemd/system`, and the configured backend sockets. Activation has no recovery-directory setting: durable recovery belongs to manager delivery/ambiguity records and typed backend inspection. Manager compatibility uses only the authenticated node binding, process-computed binary digest, exact protocol, backend kind, and normalized required-capability subset. Local paths, URL spelling, cadences, and config bytes are never manager authorization inputs. Operator-owned `retention_count` remains on manager policy solely for cleanup and is omitted by agent evidence and binary updates; a dedicated maintenance-policy API is deferred.
+Every path and the Systemd executable are validated locally; config and credentials are root-owned and owner-only. `ProtectSystem=strict` remains enabled and the agent receives write access only to workload state under `wr-node`, `/run/wruntime`, `/etc/systemd/system`, and configured Systemd sockets. Activation has no recovery-directory setting: durable recovery belongs to manager delivery/ambiguity records and typed process inspection. Manager compatibility uses only authenticated node binding, process-computed binary digest, exact protocol, and the normalized required-capability subset. Local paths, URL spelling, cadences, and config bytes are never manager authorization inputs. Operator-owned `retention_count` remains manager cleanup policy and is omitted by agent evidence and binary updates.
 
-Slot/lifecycle/backend mappings come only from each revision's digest-covered release metadata. Systemd targets fixed `wr-engine-<slot>.service` units and Docker targets fixed `engine-<slot>` services. Selection atomically updates only `wr-node/slots/<slot>`; there is no node-wide engine `current`. Inspection errors are reported as unknown/query errors, never as exited, and every observation/result is fenced by activation and lease epoch. Retention deletion is restricted to the manager-provided revision/digest allow-list.
+Slot/lifecycle mappings come only from each revision's digest-covered release metadata. Systemd targets fixed `wr-engine-<slot>.service` units. Selection atomically updates only `wr-node/slots/<slot>`; there is no node-wide engine `current`. Inspection errors are unknown/query errors, never exited, and every observation/result is fenced by activation and lease epoch.
 
 ### Node-agent operation protocol compatibility
 
@@ -735,9 +732,9 @@ Proxies and narrow discovery clients continue to use lease-filtered `ListManager
 
 ### Remote deployment via CLI
 
-The CLI provides `wr-cli managers` and `wr-cli node` command groups for deterministic bundle deployment to systemd and Docker hosts. SSH is a narrow transport for bootstrap, inactive byte staging, node-agent install/update, and diagnostics; it is not a workload process executor. After staging and finalization, `node deploy` submits every complete desired-inventory change, rollback submits a separately authorized monotonic revision through the same reconciler, and the continuously fenced node agent performs every proxy/engine backend effect. Bundles are **host-agnostic** and resolve placeholders such as `{host}` and `{db_url}` before their immutable release digest is finalized.
+The CLI provides `wr-cli managers` and `wr-cli node` command groups for deterministic bundle deployment to Systemd hosts. SSH is a narrow transport for bootstrap, inactive byte staging, node-agent install/update, and diagnostics; it is not a workload process executor. After staging and finalization, `node deploy` submits every complete desired-inventory change, rollback submits a separately authorized monotonic revision through the same reconciler, and the continuously fenced node agent performs every proxy/engine backend effect. Bundles are **host-agnostic** and resolve placeholders such as `{host}` and `{db_url}` before their immutable release digest is finalized.
 
-Both bundle and deploy commands auto-discover a `wr-deploy.toml` file in the current directory (or accept `--config <path>`). This file provides defaults for flags like `target`, `db_url`, `format`, etc. — see [deployment.md](deployment.md) for the full config reference.
+Both bundle and deploy commands auto-discover a `wr-deploy.toml` file in the current directory (or accept `--config <path>`). This file provides defaults for flags such as `target` and `db_url`. — see [deployment.md](deployment.md) for the full config reference.
 
 #### Deploying a manager
 
@@ -754,7 +751,7 @@ wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10 \
 wr-cli managers inspect-bundle wr-manager-bundle.tar.gz
 ```
 
-The same bundle can be deployed to multiple managers against the same shared database. At deploy time the CLI resolves the exact advertised gRPC address. Deploy fails closed unless its mTLS `ListManagers` readiness check returns a non-empty runtime manager ID at that exact advertised address. See the [disposable first-deployment and two-manager acceptance procedure](deployment.md#disposable-first-deployment-and-two-manager-acceptance) for systemd/Docker coverage, non-default certificates, failure handling, and cross-seed verification. With a `wr-deploy.toml`, deploy can reduce to the positional arguments:
+The same bundle can be deployed to multiple managers against the same shared database. At deploy time the CLI resolves the exact advertised gRPC address. Deploy fails closed unless its mTLS `ListManagers` readiness check returns a non-empty runtime manager ID at that exact advertised address. See the [disposable first-deployment and two-manager acceptance procedure](deployment.md#disposable-first-deployment-and-two-manager-acceptance) for Systemd coverage, non-default certificates, failure handling, and cross-seed verification. With a `wr-deploy.toml`, deploy can reduce to the positional arguments:
 
 ```bash
 wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10
@@ -768,15 +765,15 @@ wr-cli node bundle --engine-config examples/codegen/engine.toml
 
 # 2. After provisioning the host-agent baseline and initial manager policy, update its binary, then deploy.
 export WR_MANAGER=https://10.0.1.10:9000
-wr-cli node agent install --node-id node-a --format systemd wr-node-bundle.tar.gz deploy@10.0.1.20
+wr-cli node agent install --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.20
 wr-cli node deploy --node-id node-a wr-node-bundle.tar.gz deploy@10.0.1.20 \
   --db-url "postgres://postgres@10.0.1.10:5432/wruntime" \
   --request-token node-a-initial
 
-wr-cli node agent install --node-id node-b --format systemd wr-node-bundle.tar.gz deploy@10.0.1.30
+wr-cli node agent install --node-id node-b wr-node-bundle.tar.gz deploy@10.0.1.30
 wr-cli node deploy --node-id node-b wr-node-bundle.tar.gz deploy@10.0.1.30 \
   --db-url "postgres://postgres@10.0.1.10:5432/wruntime" \
   --request-token node-b-initial
 ```
 
-Use `node deploy` for later replacement, expansion, contraction, or mixed complete-inventory changes, and `rollback` only for an explicit retained historical target. Their durable deadline is distinct from caller `--wait-timeout`; `--no-wait` returns after submission. Use `--max-unavailable` and explicit `--allow-downtime` as required by coherent serving capacity; final-slot and empty-inventory transitions require downtime acknowledgement. An exact committed-revision submission succeeds immediately without a restart. `--skip-build` reuses compiled artifacts only while rebuilding deterministic bundle metadata.
+Use `node deploy` for later replacement, expansion, contraction, or mixed complete-inventory changes, and `rollback` only for an explicit retained historical target. `node bundle --proxy-config <path>` with no engine configs produces the ordinary verified Systemd bundle for a complete empty desired engine inventory; deploying that N→0 target requires `--allow-downtime`. Their durable deadline is distinct from caller `--wait-timeout`; `--no-wait` returns after submission. Use `--max-unavailable` and explicit `--allow-downtime` as required by coherent serving capacity; final-slot and empty-inventory transitions require downtime acknowledgement. An exact committed-revision submission succeeds immediately without a restart. `--skip-build` reuses compiled artifacts only while rebuilding deterministic bundle metadata.

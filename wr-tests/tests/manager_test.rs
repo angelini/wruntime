@@ -2362,9 +2362,6 @@ async fn rotated_operator_identity_and_attestation_policy_are_applied_over_mtls(
     let mut binary = helpers::node_agent::attestation(&policy, "activation-binary");
     binary.binary_digest = format!("sha256:{}", "b".repeat(64));
     mismatches.push(("BINARY_MISMATCH", binary));
-    let mut backend = helpers::node_agent::attestation(&policy, "activation-backend");
-    backend.backend = wr_common::wruntime::BackendKind::Docker as i32;
-    mismatches.push(("BACKEND_MISMATCH", backend));
     let mut capability = helpers::node_agent::attestation(&policy, "activation-capability");
     capability.capabilities.pop();
     mismatches.push(("CAPABILITY_MISMATCH", capability));

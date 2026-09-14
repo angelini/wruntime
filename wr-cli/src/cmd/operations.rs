@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use wr_common::wruntime::{
-    operation_target_progress, BackendKind, BackendStopDisposition, BackendTerminationEvidence,
+    operation_target_progress, BackendStopDisposition, BackendTerminationEvidence,
     CancelOperationRequest, GetOperationRequest, InstructionTargetKind, ListOperationsRequest,
     NodeOperation, NodeOperationState, NodeSlotTransitionKind, OperationTargetProgress,
     ResumeOperationRequest,
@@ -80,7 +80,6 @@ struct OperationDto<'a> {
 
 #[derive(Serialize)]
 struct TerminationEvidenceDto<'a> {
-    backend: &'static str,
     backend_instance_id: &'a str,
     process_instance_id: &'a str,
     graceful_termination_requested: bool,
@@ -176,14 +175,6 @@ fn phase_name(value: i32) -> &'static str {
     }
 }
 
-fn backend_name(value: i32) -> &'static str {
-    match BackendKind::try_from(value).unwrap_or(BackendKind::Unspecified) {
-        BackendKind::Systemd => "systemd",
-        BackendKind::Docker => "docker",
-        BackendKind::Unspecified => "unknown",
-    }
-}
-
 fn disposition_name(value: i32) -> &'static str {
     match BackendStopDisposition::try_from(value).unwrap_or(BackendStopDisposition::Unknown) {
         BackendStopDisposition::Graceful => "graceful",
@@ -194,7 +185,6 @@ fn disposition_name(value: i32) -> &'static str {
 
 fn termination_dto(evidence: &BackendTerminationEvidence) -> TerminationEvidenceDto<'_> {
     TerminationEvidenceDto {
-        backend: backend_name(evidence.backend),
         backend_instance_id: &evidence.backend_instance_id,
         process_instance_id: &evidence.process_instance_id,
         graceful_termination_requested: evidence.graceful_termination_requested,
@@ -575,12 +565,8 @@ mod tests {
         }
     }
 
-    fn evidence(
-        backend: BackendKind,
-        disposition: BackendStopDisposition,
-    ) -> BackendTerminationEvidence {
+    fn evidence(disposition: BackendStopDisposition) -> BackendTerminationEvidence {
         BackendTerminationEvidence {
-            backend: backend as i32,
             backend_instance_id: "backend-a".into(),
             process_instance_id: "process-a".into(),
             graceful_termination_requested: true,
@@ -641,11 +627,11 @@ mod tests {
 
     #[test]
     fn detail_projection_preserves_engine_and_proxy_termination_evidence() {
-        let engine_evidence = evidence(BackendKind::Systemd, BackendStopDisposition::Graceful);
+        let engine_evidence = evidence(BackendStopDisposition::Graceful);
         let proxy_evidence = BackendTerminationEvidence {
             backend_instance_id: "proxy-backend".into(),
             process_instance_id: "proxy-process".into(),
-            ..evidence(BackendKind::Docker, BackendStopDisposition::Forced)
+            ..evidence(BackendStopDisposition::Forced)
         };
         let operation = NodeOperation {
             targets: vec![
@@ -683,15 +669,16 @@ mod tests {
 
         let value = detail_dto(&operation).expect("detail JSON");
         assert_eq!(value["schema_version"], 1);
-        assert_eq!(
-            value["slots"][0]["termination_evidence"]["backend"],
-            "systemd"
-        );
+        assert!(value["slots"][0]["termination_evidence"]
+            .get("backend")
+            .is_none());
         assert_eq!(
             value["proxy"]["termination_evidence"]["backend_instance_id"],
             "proxy-backend"
         );
-        assert_eq!(value["proxy"]["termination_evidence"]["backend"], "docker");
+        assert!(value["proxy"]["termination_evidence"]
+            .get("backend")
+            .is_none());
         assert_eq!(
             value["proxy"]["termination_evidence"]["disposition"],
             "forced"

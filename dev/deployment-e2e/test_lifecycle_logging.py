@@ -188,11 +188,13 @@ PY_REDACT
         for command in ("node deploy", "engines restart", "node rollback"):
             self.assertIn(command, script)
         self.assertIn("--exit-after-finalization", script)
-        self.assertEqual(script.count("--allow-downtime"), 2)
+        self.assertEqual(script.count("--allow-downtime"), 3)
         self.assertNotIn("--wait-timeout", script)
         self.assertIn("node inventory contraction", script)
+        self.assertIn("systemd empty desired inventory", script)
+        self.assertIn('node bundle --proxy-config wr-tests/deployment/proxy.toml --skip-build --output "$EMPTY_INVENTORY"', script)
         restart_invocation = script.split(
-            'run_to_log "$backend durable engine restart"', 1
+            'run_to_log "systemd durable engine restart"', 1
         )[1].split("lifecycle_capture_operation_detail", 1)[0]
         self.assertNotIn("--json", restart_invocation)
         contract = LIFECYCLE_CONTRACT.read_text()
@@ -225,15 +227,15 @@ PY_REDACT
         )
         self.assertIn('--manager-config "$MANAGER_CONFIG"', script)
         self.assertLess(
-            script.index('run_to_log "$backend node agent fixture provisioning and initial activation"'),
-            script.index('run_to_log "$backend node agent binary update restart and fresh activation"'),
+            script.index('run_to_log "systemd node agent fixture provisioning and initial activation"'),
+            script.index('run_to_log "systemd node agent binary update restart and fresh activation"'),
         )
         self.assertLess(
-            script.index('run_to_log "$backend node agent binary update restart and fresh activation"'),
-            script.index('run_to_log "$backend node A deploy"'),
+            script.index('run_to_log "systemd node agent binary update restart and fresh activation"'),
+            script.index('run_to_log "systemd node A deploy"'),
         )
-        invocation = script.split('run_to_log "$backend node agent binary update restart and fresh activation"', 1)[1].split("job_admin queues", 1)[0]
-        for forbidden in ("--agent-cert", "--agent-key", "--agent-ca-cert", "--retention-count", "--systemctl-path", "--docker-path"):
+        invocation = script.split('run_to_log "systemd node agent binary update restart and fresh activation"', 1)[1].split("job_admin queues", 1)[0]
+        for forbidden in ("--agent-cert", "--agent-key", "--agent-ca-cert", "--retention-count", "--systemctl-path", "--docker-" + "path"):
             self.assertNotIn(forbidden, invocation)
 
     def test_failure_excerpt_is_bounded(self):

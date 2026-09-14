@@ -1,14 +1,7 @@
-//! Parameterized generators for systemd units, Dockerfiles, and docker-compose files.
+//! Parameterized generators for Systemd units.
 //!
 //! Template variables like `{run_user}`, `{run_group}`, `{secret_key}` are emitted
 //! as literal `{...}` strings and resolved later by `helpers::resolve_template()`.
-
-/// Reviewed OCI index identity for distroless cc-debian13 `latest`.
-///
-/// Keep the digest in the generated deployment contract so rebuilding an immutable
-/// wruntime bundle cannot silently select a different base image.
-const DISTROLESS_CC_DEBIAN13: &str =
-    "gcr.io/distroless/cc-debian13@sha256:9b615fff20e1a4fad29c2b30562580b212c7dd5e2225236735cca0070ed11c78";
 
 /// Stable manager unit directory below runtime-mask precedence.
 pub const MANAGER_SYSTEMD_UNIT_DIR: &str = "/usr/local/lib/systemd/system";
@@ -99,8 +92,9 @@ def digest_tree(root):
   r=p.relative_to(root).as_posix().encode(); b=p.read_bytes(); h.update(struct.pack('>Q',len(r))); h.update(r); h.update(struct.pack('>Q',len(b))); h.update(b)
  return 'sha256:'+h.hexdigest()
 d=json.loads(pathlib.Path(DESCRIPTOR).read_text())
-if d.get('schema_version') != 1 or d.get('backend') != 'systemd': sys.exit('invalid systemd activation descriptor')
-for path,key in [(d['executable'],'executable_digest'),(d['backend_spec_path'],'backend_spec_digest'),(d['config_path'],'config_digest')]:
+required={'schema_version','manager_id','executable','executable_digest','systemd_unit_path','systemd_unit_digest','config_path','config_digest','credential_set_path','credential_digest'}
+if set(d) != required or d.get('schema_version') != 1: sys.exit('invalid systemd activation descriptor')
+for path,key in [(d['executable'],'executable_digest'),(d['systemd_unit_path'],'systemd_unit_digest'),(d['config_path'],'config_digest')]:
  if digest_file(path) != d[key]: sys.exit(key+' mismatch')
 if digest_tree(d['credential_set_path']) != d['credential_digest']: sys.exit('credential_digest mismatch')
 env=os.environ.copy(); env['WRT_MANAGER_CREDENTIAL_SET']=d['credential_set_path']
@@ -120,11 +114,10 @@ pub fn manager_source_stop_command(
     }
     let inspect = r#"import json,sys
 d=json.load(open(sys.argv[1]))
-if d.get('schema_version') != 1 or d.get('manager_id') != sys.argv[2]: sys.exit('source activation identity mismatch')
-print(d.get('backend',''))
-print(d.get('backend_spec_path',''))"#;
+required={'schema_version','manager_id','executable','executable_digest','systemd_unit_path','systemd_unit_digest','config_path','config_digest','credential_set_path','credential_digest'}
+if set(d) != required or d.get('schema_version') != 1 or d.get('manager_id') != sys.argv[2]: sys.exit('source activation identity mismatch')"#;
     format!(
-        "set -eu; current={current}; test \"sha256:$(sudo sha256sum -- \"$current\" | cut -d' ' -f1)\" = {selector}; source_info=$(sudo python3 -c {inspect} \"$current\" {manager_id}); backend=$(printf '%s\\n' \"$source_info\" | head -n1); spec=$(printf '%s\\n' \"$source_info\" | tail -n1); case \"$backend\" in systemd) sudo systemctl disable wr-manager.service; sudo systemctl stop wr-manager.service || true; sudo systemctl mask --runtime wr-manager.service || true; if sudo systemctl is-active --quiet wr-manager.service; then echo 'source manager remained active' >&2; exit 1; fi; unit_file_state=$(sudo systemctl is-enabled wr-manager.service || true); test \"$unit_file_state\" = masked-runtime ;; compose) sudo docker compose --project-name wruntime-manager -f \"$spec\" down; test -z \"$(sudo docker compose --project-name wruntime-manager -f \"$spec\" ps -q)\" ;; *) echo 'unsupported source manager backend' >&2; exit 1 ;; esac",
+        "set -eu; current={current}; test \"sha256:$(sudo sha256sum -- \"$current\" | cut -d' ' -f1)\" = {selector}; sudo python3 -c {inspect} \"$current\" {manager_id}; sudo systemctl disable wr-manager.service; sudo systemctl stop wr-manager.service || true; sudo systemctl mask --runtime wr-manager.service || true; if sudo systemctl is-active --quiet wr-manager.service; then echo 'source manager remained active' >&2; exit 1; fi; unit_file_state=$(sudo systemctl is-enabled wr-manager.service || true); test \"$unit_file_state\" = masked-runtime",
         current = q(current_descriptor),
         selector = q(selector_digest),
         inspect = q(inspect),
@@ -165,8 +158,8 @@ selector='sha256:'+hashlib.sha256(raw).hexdigest()
 if selector not in allowed: sys.exit('activation selector mismatch')
 d=json.loads(raw)
 if d.get('schema_version') != 1 or d.get('manager_id') != expected: sys.exit('activation identity mismatch')
-required=('backend','backend_spec_path','backend_spec_digest','config_path','config_digest')
-if any(not isinstance(d.get(k),str) or not d[k] for k in required): sys.exit('malformed activation descriptor')
+required={'schema_version','manager_id','executable','executable_digest','systemd_unit_path','systemd_unit_digest','config_path','config_digest','credential_set_path','credential_digest'}
+if set(d) != required or any(not isinstance(d.get(k),str) or not d[k] for k in required-{'schema_version'}): sys.exit('malformed activation descriptor')
 config=pathlib.Path(d['config_path'])
 expected_config=pathlib.Path('/var/lib/wruntime/manager-config')/expected/'current.toml'
 if config != expected_config: sys.exit('activation config path mismatch')
@@ -177,17 +170,12 @@ policy=pathlib.Path(cfg['authorization']['policy_file'])
 if not policy.is_absolute(): policy=(config.parent/policy).resolve()
 policy_raw=policy.read_bytes()
 if len(policy_raw) > 4194304: sys.exit('authorization policy exceeds inspection limit')
-backend=d['backend']; spec=pathlib.Path(d['backend_spec_path'])
-if backend == 'systemd':
- out=subprocess.run(['systemctl','show','wr-manager.service','--property=ActiveState','--property=SubState','--property=MainPID'],check=True,capture_output=True,text=True).stdout
- require_stopped_systemd(out)
-elif backend == 'compose':
- if not spec.is_absolute() or not spec.is_file(): sys.exit('invalid compose backend spec')
- if 'sha256:'+hashlib.sha256(spec.read_bytes()).hexdigest() != d['backend_spec_digest']: sys.exit('compose backend spec digest mismatch')
- out=subprocess.run(['docker','compose','--project-name','wruntime-manager','-f',str(spec),'ps','-q'],check=True,capture_output=True,text=True).stdout
- if out.strip(): sys.exit('manager compose process is not stopped')
-else: sys.exit('unsupported manager backend')
-print(json.dumps({'manager_id':expected,'selector_digest':selector,'backend':backend,'config_path':str(config),'config_digest':'sha256:'+hashlib.sha256(config_raw).hexdigest(),'policy_path':str(policy),'policy_hex':policy_raw.hex()},sort_keys=True,separators=(',',':')))"#,
+unit=pathlib.Path(d['systemd_unit_path'])
+if not unit.is_absolute() or not unit.is_file(): sys.exit('invalid systemd unit')
+if 'sha256:'+hashlib.sha256(unit.read_bytes()).hexdigest() != d['systemd_unit_digest']: sys.exit('systemd unit digest mismatch')
+out=subprocess.run(['systemctl','show','wr-manager.service','--property=ActiveState','--property=SubState','--property=MainPID'],check=True,capture_output=True,text=True).stdout
+require_stopped_systemd(out)
+print(json.dumps({'manager_id':expected,'selector_digest':selector,'config_path':str(config),'config_digest':'sha256:'+hashlib.sha256(config_raw).hexdigest(),'policy_path':str(policy),'policy_hex':policy_raw.hex()},sort_keys=True,separators=(',',':')))"#,
     );
     let mut command = format!(
         "sudo python3 -c {inspect} {current} {manager_id}",
@@ -205,7 +193,6 @@ print(json.dumps({'manager_id':expected,'selector_digest':selector,'backend':bac
 /// Build the single post-OLD_CLOSED selector transition. Preparatory config
 /// writes may happen first, but the final descriptor rename is authoritative.
 pub fn manager_activation_command(
-    systemd: bool,
     next_descriptor: &str,
     current_descriptor: &str,
     config_dir: &str,
@@ -216,18 +203,9 @@ pub fn manager_activation_command(
     fn q(value: &str) -> String {
         super::helpers::shell_quote(value)
     }
-    let stop = if systemd {
-        "sudo systemctl stop wr-manager.service; sudo systemctl mask --runtime wr-manager.service"
-    } else {
-        r#"if sudo test -e "$current"; then old_spec=$(sudo python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["backend_spec_path"])' "$current"); sudo docker compose --project-name wruntime-manager -f "$old_spec" down; fi"#
-    };
-    let start = if systemd {
-        "sudo systemctl unmask --runtime wr-manager.service; sudo systemctl unmask wr-manager.service; sudo systemctl enable wr-manager.service; sudo systemctl start wr-manager.service"
-    } else {
-        // The immutable backend spec is selected by the descriptor; it contains
-        // the digest-qualified image and stable mounts/project declaration.
-        r#"spec=$(sudo python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["backend_spec_path"])' "$current"); sudo docker compose --project-name wruntime-manager -f "$spec" up -d --force-recreate --no-build"#
-    };
+    let stop =
+        "sudo systemctl stop wr-manager.service; sudo systemctl mask --runtime wr-manager.service";
+    let start = "sudo systemctl unmask --runtime wr-manager.service; sudo systemctl unmask wr-manager.service; sudo systemctl enable wr-manager.service; sudo systemctl start wr-manager.service";
     format!(
         "set -eu; current={current}; next={next}; config={config}; test \"sha256:$(sudo sha256sum -- \"$next\" | cut -d' ' -f1)\" = {new}; if sudo test -e \"$current\"; then test \"sha256:$(sudo sha256sum -- \"$current\" | cut -d' ' -f1)\" = {old}; sudo cp --reflink=auto -- \"$current\" \"$current.previous.tmp\"; sudo sync -f \"$current.previous.tmp\"; sudo mv \"$current.previous.tmp\" \"$current.previous\"; fi; {stop}; test \"sha256:$(sudo sha256sum -- \"$config/next.tmp\" | cut -d' ' -f1)\" = {config_digest}; if sudo test -e \"$config/current.toml\"; then sudo cp --reflink=auto -- \"$config/current.toml\" \"$config/previous.tmp\"; sudo chmod 0600 \"$config/previous.tmp\"; sudo sync -f \"$config/previous.tmp\"; sudo mv \"$config/previous.tmp\" \"$config/previous.toml\"; fi; sudo mv \"$config/next.tmp\" \"$config/current.toml\"; sudo chmod 0600 \"$config/current.toml\"; sudo sync -f \"$config\"; sudo mv \"$next\" \"$current\"; sudo chmod 0600 \"$current\"; sudo sync -f $(dirname \"$current\"); {start}",
         current=q(current_descriptor), next=q(next_descriptor), config=q(config_dir), new=q(new_selector_digest), old=q(old_selector_digest), config_digest=q(config_digest), stop=stop, start=start,
@@ -239,132 +217,8 @@ pub fn manager_activation_command(
 /// own active control process.
 pub fn node_agent_systemd_unit(workdir: &str) -> String {
     format!(
-        "[Unit]\nDescription=wruntime node lifecycle agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=root\nGroup=root\nUMask=0077\nWorkingDirectory={workdir}/wr-agent\nExecStart={workdir}/wr-agent/wr-cli node agent run --config {workdir}/wr-agent/agent.toml\nEnvironment=PATH=\nEnvironment=LANG=C.UTF-8\nNoNewPrivileges=true\nPrivateTmp=true\nPrivateDevices=true\nProtectHome=true\nProtectSystem=strict\nProtectControlGroups=true\nProtectKernelTunables=true\nProtectKernelModules=true\nProtectKernelLogs=true\nProtectClock=true\nProtectHostname=true\nProtectProc=invisible\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nRestrictNamespaces=true\nRestrictSUIDSGID=true\nLockPersonality=true\nRestrictRealtime=true\nSystemCallArchitectures=native\nRuntimeDirectory=wruntime\nRuntimeDirectoryMode=0700\nReadWritePaths={workdir}/wr-node /run/wruntime /etc/systemd/system -/run/docker.sock -/var/run/docker.sock\nRestart=on-failure\nRestartSec=5\nKillSignal=SIGTERM\nTimeoutStopSec=45s\nSendSIGKILL=yes\n\n[Install]\nWantedBy=multi-user.target\n"
+        "[Unit]\nDescription=wruntime node lifecycle agent\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=root\nGroup=root\nUMask=0077\nWorkingDirectory={workdir}/wr-agent\nExecStart={workdir}/wr-agent/wr-cli node agent run --config {workdir}/wr-agent/agent.toml\nEnvironment=PATH=\nEnvironment=LANG=C.UTF-8\nNoNewPrivileges=true\nPrivateTmp=true\nPrivateDevices=true\nProtectHome=true\nProtectSystem=strict\nProtectControlGroups=true\nProtectKernelTunables=true\nProtectKernelModules=true\nProtectKernelLogs=true\nProtectClock=true\nProtectHostname=true\nProtectProc=invisible\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nRestrictNamespaces=true\nRestrictSUIDSGID=true\nLockPersonality=true\nRestrictRealtime=true\nSystemCallArchitectures=native\nRuntimeDirectory=wruntime\nRuntimeDirectoryMode=0700\nReadWritePaths={workdir}/wr-node /run/wruntime /etc/systemd/system\nRestart=on-failure\nRestartSec=5\nKillSignal=SIGTERM\nTimeoutStopSec=45s\nSendSIGKILL=yes\n\n[Install]\nWantedBy=multi-user.target\n"
     )
-}
-
-/// Render a Dockerfile for a service binary.
-pub struct DockerfileSpec<'a> {
-    pub workdir: &'a str,
-    pub binary: &'a str,
-    pub config: &'a str,
-    /// Extra COPY lines as `(src, dst)` pairs.
-    pub extra_copies: Vec<(&'a str, &'a str)>,
-    /// Extra ENV lines as `(key, value)` pairs. Values may contain template vars.
-    pub env_vars: Vec<(&'a str, &'a str)>,
-    pub no_otel: bool,
-}
-
-impl DockerfileSpec<'_> {
-    pub fn render(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!("FROM {DISTROLESS_CC_DEBIAN13}\n"));
-        out.push_str(&format!("WORKDIR {}\n", self.workdir));
-        out.push_str(&format!("COPY {} {}\n", self.binary, self.binary));
-        out.push_str(&format!("COPY {} {}\n", self.config, self.config));
-        for (src, dst) in &self.extra_copies {
-            out.push_str(&format!("COPY {src} {dst}\n"));
-        }
-        for (k, v) in &self.env_vars {
-            out.push_str(&format!("ENV {k}={v}\n"));
-        }
-        if self.no_otel {
-            out.push_str("ENV OTEL_SDK_DISABLED=true\n");
-        }
-        out.push_str(&format!(
-            "ENTRYPOINT [\"{}\", \"{}\"]\n",
-            self.binary, self.config
-        ));
-        out
-    }
-}
-
-pub struct ComposeDependency {
-    pub service: String,
-    pub condition: &'static str,
-}
-
-pub struct ComposeHealthcheck {
-    pub test: Vec<String>,
-    pub interval: &'static str,
-    pub timeout: &'static str,
-    pub retries: u32,
-    pub start_period: &'static str,
-}
-
-/// A service entry in a docker-compose file.
-pub struct ComposeService {
-    pub name: String,
-    pub dockerfile: String,
-    pub context: String,
-    pub image: Option<String>,
-    pub network_mode: Option<String>,
-    pub ports: Vec<String>,
-    pub volumes: Vec<String>,
-    pub depends_on: Vec<ComposeDependency>,
-    pub healthcheck: ComposeHealthcheck,
-}
-
-/// Render a docker-compose.yml from a list of services.
-pub fn generate_compose(header: &str, services: &[ComposeService]) -> String {
-    let mut out = String::new();
-    if !header.is_empty() {
-        out.push_str(header);
-        out.push('\n');
-    }
-    out.push_str("services:\n");
-
-    for svc in services {
-        out.push_str(&format!(
-            "  {}:\n    build:\n      context: {}\n      dockerfile: {}\n",
-            svc.name, svc.context, svc.dockerfile
-        ));
-        if let Some(ref image) = svc.image {
-            out.push_str(&format!("    image: {image}\n"));
-        }
-        if let Some(ref network_mode) = svc.network_mode {
-            out.push_str(&format!("    network_mode: {network_mode}\n"));
-        }
-        if !svc.ports.is_empty() {
-            out.push_str("    ports:\n");
-            for port in &svc.ports {
-                out.push_str(&format!("      - \"{port}\"\n"));
-            }
-        }
-        if !svc.volumes.is_empty() {
-            out.push_str("    volumes:\n");
-            for volume in &svc.volumes {
-                out.push_str(&format!("      - \"{volume}\"\n"));
-            }
-        }
-        if !svc.depends_on.is_empty() {
-            out.push_str("    depends_on:\n");
-            for dependency in &svc.depends_on {
-                out.push_str(&format!(
-                    "      {}:\n        condition: {}\n",
-                    dependency.service, dependency.condition
-                ));
-            }
-        }
-        out.push_str("    healthcheck:\n");
-        let healthcheck_test = match serde_json::to_string(&svc.healthcheck.test) {
-            Ok(test) => test,
-            Err(_) => "[]".to_string(),
-        };
-        out.push_str(&format!("      test: {healthcheck_test}\n"));
-        out.push_str(&format!("      interval: {}\n", svc.healthcheck.interval));
-        out.push_str(&format!("      timeout: {}\n", svc.healthcheck.timeout));
-        out.push_str(&format!("      retries: {}\n", svc.healthcheck.retries));
-        out.push_str(&format!(
-            "      start_period: {}\n",
-            svc.healthcheck.start_period
-        ));
-        out.push_str("    stop_signal: SIGTERM\n");
-        out.push_str("    stop_grace_period: 45s\n");
-        out.push_str("    restart: on-failure\n");
-    }
-
-    out
 }
 
 /// Sysctl config for wasmtime memory pooling.
@@ -397,68 +251,6 @@ mod tests {
         assert!(unit.contains("KillSignal=SIGTERM\n"));
         assert!(unit.contains("TimeoutStopSec=45s\n"));
         assert!(!unit.contains("Type=simple"));
-
-        let compose = generate_compose(
-            "",
-            &[ComposeService {
-                name: "engine".into(),
-                dockerfile: "Dockerfile.engine".into(),
-                context: ".".into(),
-                image: None,
-                network_mode: Some("host".into()),
-                ports: vec![],
-                volumes: vec![],
-                depends_on: vec![ComposeDependency {
-                    service: "proxy".into(),
-                    condition: "service_healthy",
-                }],
-                healthcheck: ComposeHealthcheck {
-                    test: vec![
-                        "CMD".into(),
-                        "/opt/engine".into(),
-                        "--lifecycle-probe".into(),
-                    ],
-                    interval: "2s",
-                    timeout: "2s",
-                    retries: 15,
-                    start_period: "30s",
-                },
-            }],
-        );
-        assert!(compose.contains("condition: service_healthy"));
-        assert!(compose.contains("--lifecycle-probe"));
-        assert!(compose.contains("stop_signal: SIGTERM"));
-        assert!(compose.contains("stop_grace_period: 45s"));
-        assert_eq!(
-            compose,
-            generate_compose(
-                "",
-                &[ComposeService {
-                    name: "engine".into(),
-                    dockerfile: "Dockerfile.engine".into(),
-                    context: ".".into(),
-                    image: None,
-                    network_mode: Some("host".into()),
-                    ports: vec![],
-                    volumes: vec![],
-                    depends_on: vec![ComposeDependency {
-                        service: "proxy".into(),
-                        condition: "service_healthy",
-                    }],
-                    healthcheck: ComposeHealthcheck {
-                        test: vec![
-                            "CMD".into(),
-                            "/opt/engine".into(),
-                            "--lifecycle-probe".into()
-                        ],
-                        interval: "2s",
-                        timeout: "2s",
-                        retries: 15,
-                        start_period: "30s",
-                    },
-                }]
-            )
-        );
     }
 
     #[test]
@@ -472,7 +264,9 @@ mod tests {
         assert!(unit.contains("PrivateDevices=true\n"));
         assert!(unit.contains("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n"));
         assert!(unit.contains("RuntimeDirectory=wruntime\nRuntimeDirectoryMode=0700\n"));
-        assert!(unit.contains("ReadWritePaths=/opt/wruntime/wr-node /run/wruntime /etc/systemd/system -/run/docker.sock -/var/run/docker.sock\n"));
+        assert!(unit
+            .contains("ReadWritePaths=/opt/wruntime/wr-node /run/wruntime /etc/systemd/system\n"));
+        assert!(!unit.contains("docker.sock"));
         assert!(!unit.contains("wr-agent/state"));
         assert!(!unit.contains("ReadWritePaths=/etc "));
         assert!(unit.contains("/opt/wruntime/wr-agent/wr-cli node agent run"));
@@ -496,9 +290,10 @@ mod tests {
         assert!(parser.contains("line.count('=') != 1"));
         assert!(parser.contains("key in fields"));
         assert!(parser.contains("set(fields) != required"));
-        assert!(command.contains("ps"));
-        assert!(command.contains("-q"));
+        assert!(command.contains("systemd_unit_digest"));
+        assert!(command.contains("systemd unit digest mismatch"));
         assert!(command.contains("policy_hex"));
+        assert!(!command.contains("docker"));
         for mutation in [
             "systemctl stop",
             "systemctl start",
@@ -557,12 +352,11 @@ mod tests {
 
         let launcher = manager_launcher_script();
         assert!(launcher.contains("executable_digest"));
-        assert!(launcher.contains("backend_spec_digest"));
+        assert!(launcher.contains("systemd_unit_digest"));
         assert!(launcher.contains("credential_digest"));
         assert!(launcher.find("digest_tree").unwrap() < launcher.find("os.execve").unwrap());
 
         let action = manager_activation_command(
-            true,
             "/state/new.next",
             "/state/current-activation.json",
             "/state/config",
@@ -616,7 +410,7 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("create command test directory");
         let descriptor = directory.path().join("current-activation.json");
-        let bytes = br#"{"schema_version":1,"manager_id":"manager-a","backend":"systemd","backend_spec_path":"/unit"}"#;
+        let bytes = br#"{"schema_version":1,"manager_id":"manager-a","executable":"/bin/wr-manager","executable_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","systemd_unit_path":"/unit","systemd_unit_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","config_path":"/config","config_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","credential_set_path":"/credentials","credential_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}"#;
         std::fs::write(&descriptor, bytes).expect("write activation descriptor");
         let selector_digest = format!("sha256:{:x}", Sha256::digest(bytes));
         let bin = directory.path().join("bin");
@@ -667,21 +461,5 @@ esac
             .status()
             .expect("run inactive source-stop command");
         assert!(inactive.success());
-    }
-
-    #[test]
-    fn dockerfile_base_is_digest_pinned() {
-        let rendered = DockerfileSpec {
-            workdir: "/opt/wruntime",
-            binary: "bin/service",
-            config: "config/service.toml",
-            extra_copies: vec![],
-            env_vars: vec![],
-            no_otel: true,
-        }
-        .render();
-        let first_line = rendered.lines().next().expect("Dockerfile has FROM line");
-        assert!(first_line.starts_with("FROM gcr.io/distroless/cc-debian13@sha256:"));
-        assert_eq!(first_line.matches("sha256:").count(), 1);
     }
 }

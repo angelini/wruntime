@@ -322,4 +322,68 @@ mod tests {
         assert_eq!(tls.ca_cert_path, "server-root.crt");
         assert_eq!(tls.cert_path, "operator.crt");
     }
+    #[test]
+    fn node_commands_reject_removed_docker_selection() {
+        let cases = [
+            vec!["wr-cli", "node", "bundle", "--format", "docker"],
+            vec!["wr-cli", "node", "bundle", "--image-prefix", "wr"],
+            vec![
+                "wr-cli",
+                "node",
+                "deploy",
+                "bundle.tar.gz",
+                "operator@example",
+                "--node-id",
+                "node-a",
+                "--format",
+                "docker",
+            ],
+            vec![
+                "wr-cli",
+                "node",
+                "reserve-deployment",
+                "bundle.tar.gz",
+                "operator@example",
+                "--node-id",
+                "node-a",
+                "--request-token",
+                "token",
+                "--output",
+                "reservation",
+                "--format",
+                "docker",
+            ],
+            vec![
+                "wr-cli",
+                "node",
+                "agent",
+                "install",
+                "bundle.tar.gz",
+                "operator@example",
+                "--node-id",
+                "node-a",
+                "--format",
+                "docker",
+            ],
+            vec![
+                "wr-cli",
+                "logs",
+                "node",
+                "operator@example",
+                "--format",
+                "docker",
+            ],
+            vec![
+                "wr-cli",
+                "logs",
+                "node",
+                "operator@example",
+                "--workdir",
+                "/opt/wruntime",
+            ],
+        ];
+        for args in cases {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 }

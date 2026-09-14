@@ -32,8 +32,8 @@ Usage: dev/validate-all.sh [OPTIONS]
 Options:
   --no-e2e             Skip fixed-port local E2E examples (not deployment E2E).
   --e2e-only           Run only setup and enabled E2E stages.
-  --deployment-e2e    Require node lifecycle under systemd+Docker and manager
-                      A→B→A deploy-set under systemd (protected evidence).
+  --deployment-e2e    Require the complete Systemd node lifecycle and manager
+                      A→B→A/fail-closed/reset qualification (protected evidence).
   --no-deployment-e2e Deliberately skip deployment lifecycle E2E.
   --codegen-e2e        Require codegen E2E; fails if ANTHROPIC_API_KEY is unset.
   --no-codegen-e2e     Skip codegen E2E even if ANTHROPIC_API_KEY is set.
@@ -354,13 +354,10 @@ fi
 
 section "deployment lifecycle E2E"
 if [ "$RUN_DEPLOYMENT_E2E" = true ]; then
-	run_cmd "deployment E2E systemd (node + manager A-to-B-to-A)" "WR_VALIDATE_LOG_DIR='$LOG_ROOT/deployment-e2e-systemd' bash dev/validate-deployment-lifecycle.sh --backend systemd" "$LOG_ROOT/deployment-e2e-systemd"
-	run_cmd "deployment E2E docker" "WR_VALIDATE_LOG_DIR='$LOG_ROOT/deployment-e2e-docker' bash dev/validate-deployment-lifecycle.sh --backend docker" "$LOG_ROOT/deployment-e2e-docker"
+	run_cmd "deployment E2E Systemd node + manager qualification" "WR_VALIDATE_LOG_DIR='$LOG_ROOT/deployment-e2e-systemd' bash dev/validate-deployment-lifecycle.sh" "$LOG_ROOT/deployment-e2e-systemd"
 else
-	printf '  • deployment E2E systemd node + manager deploy-set skipped: --no-deployment-e2e\n'
-	append_result "deployment E2E systemd node + manager deploy-set" SKIPPED "" "--no-deployment-e2e; fast/smoke/profile evidence is not a substitute"
-	printf '  • deployment E2E docker skipped: --no-deployment-e2e\n'
-	append_result "deployment E2E docker" SKIPPED "" "--no-deployment-e2e"
+	printf '  • deployment E2E Systemd node + manager qualification skipped: --no-deployment-e2e\n'
+	append_result "deployment E2E Systemd node + manager qualification" SKIPPED "" "--no-deployment-e2e; fast/smoke/profile evidence is not a substitute"
 fi
 
 if [ "$RUN_E2E" = true ]; then

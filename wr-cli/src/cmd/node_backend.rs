@@ -1,7 +1,6 @@
-//! Constrained host backend for the node lifecycle agent.
+//! Constrained Systemd executor for the node lifecycle agent.
 //!
-//! This module is the only production owner of systemd and Docker workload
-//! effects.  Manager data selects a typed slot/revision; it never contributes
+//! This module is the only production owner of Systemd workload effects.  Manager data selects a typed slot/revision; it never contributes
 //! executable text or argv fragments.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -73,33 +72,15 @@ const COMMAND_BUDGET: Duration = Duration::from_secs(45);
 const COMMAND_OUTPUT_LIMIT: usize = 2_048;
 const STOP_BUDGET: Duration = Duration::from_secs(90);
 const STOP_GRACE_BUDGET: Duration = Duration::from_secs(45);
-const STOP_ESCALATION_BUDGET: Duration = Duration::from_secs(15);
 const STOP_INSPECTION_BUDGET: Duration = Duration::from_secs(15);
 const STOP_MARGIN: Duration = Duration::from_secs(15);
 const INSPECTION_INTERVAL: Duration = Duration::from_millis(500);
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum BackendType {
-    Systemd,
-    Docker,
-}
-
-impl BackendType {
-    pub fn wire(self) -> wr_common::wruntime::BackendKind {
-        match self {
-            Self::Systemd => wr_common::wruntime::BackendKind::Systemd,
-            Self::Docker => wr_common::wruntime::BackendKind::Docker,
-        }
-    }
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseSlot {
     pub engine_slot: String,
     pub systemd_unit: String,
-    pub docker_service: String,
     pub lifecycle_address: String,
     pub config_path: String,
 }
@@ -110,7 +91,6 @@ pub struct ReleaseMetadata {
     pub format_version: u32,
     pub proxy_lifecycle_address: String,
     pub proxy_systemd_unit: String,
-    pub proxy_docker_service: String,
     pub slots: Vec<ReleaseSlot>,
 }
 
@@ -121,7 +101,6 @@ impl ReleaseMetadata {
         }
         validate_loopback_uri(&self.proxy_lifecycle_address, "proxy lifecycle address")?;
         validate_systemd_unit(&self.proxy_systemd_unit, "proxy unit")?;
-        validate_identity(&self.proxy_docker_service, "proxy service")?;
         let mut slots = BTreeSet::new();
         for slot in &self.slots {
             validate_identity(&slot.engine_slot, "engine slot")?;
@@ -129,12 +108,9 @@ impl ReleaseMetadata {
                 bail!("release metadata contains a duplicate engine slot");
             }
             validate_systemd_unit(&slot.systemd_unit, "engine unit")?;
-            validate_identity(&slot.docker_service, "docker service")?;
             validate_loopback_uri(&slot.lifecycle_address, "engine lifecycle address")?;
             validate_relative_path(&slot.config_path, "engine config path")?;
-            if slot.systemd_unit != format!("wr-engine-{}.service", slot.engine_slot)
-                || slot.docker_service != format!("engine-{}", slot.engine_slot)
-            {
+            if slot.systemd_unit != format!("wr-engine-{}.service", slot.engine_slot) {
                 bail!("release metadata service mapping does not match its engine slot");
             }
         }
@@ -220,16 +196,13 @@ pub trait InstructionExecutor: Send + Sync {
 }
 
 #[derive(Clone, Debug)]
-pub struct HostBackendConfig {
+pub struct SystemdExecutorConfig {
     pub deployment_root: PathBuf,
     pub runtime_dir: PathBuf,
-    pub backend: BackendType,
-    pub systemctl_path: Option<PathBuf>,
-    pub docker_path: Option<PathBuf>,
-    pub compose_project: Option<String>,
+    pub systemctl_path: PathBuf,
 }
 
-impl HostBackendConfig {
+impl SystemdExecutorConfig {
     pub fn validate(&self) -> Result<()> {
         if !self.deployment_root.is_absolute() || self.deployment_root == Path::new("/") {
             bail!("deployment_root must be a non-root absolute path");
@@ -237,21 +210,7 @@ impl HostBackendConfig {
         if !self.runtime_dir.is_absolute() || self.runtime_dir == Path::new("/") {
             bail!("runtime_dir must be a non-root absolute path");
         }
-        match self.backend {
-            BackendType::Systemd => validate_binary(
-                self.systemctl_path.as_deref(),
-                "systemctl_path",
-                "systemctl",
-            )?,
-            BackendType::Docker => {
-                validate_binary(self.docker_path.as_deref(), "docker_path", "docker")?;
-                validate_identity(
-                    self.compose_project.as_deref().unwrap_or_default(),
-                    "compose project",
-                )?;
-            }
-        }
-        Ok(())
+        validate_binary(Some(&self.systemctl_path), "systemctl_path", "systemctl")
     }
 }
 
@@ -273,15 +232,15 @@ impl PathAttestor for RootOwnedPathAttestor {
 }
 
 #[derive(Clone)]
-pub struct HostBackend {
-    config: HostBackendConfig,
+pub struct SystemdExecutor {
+    config: SystemdExecutorConfig,
     path_attestor: Arc<dyn PathAttestor>,
     #[cfg(test)]
     cleanup_delay: Option<Duration>,
 }
 
-impl HostBackend {
-    pub fn new(config: HostBackendConfig) -> Result<Self> {
+impl SystemdExecutor {
+    pub fn new(config: SystemdExecutorConfig) -> Result<Self> {
         Self::new_with_attestor(config, Box::new(RootOwnedPathAttestor))
     }
 
@@ -289,19 +248,12 @@ impl HostBackend {
     /// `new`; this seam lets deterministic tests execute the real backend
     /// state machine against an isolated filesystem without root ownership.
     pub fn new_with_attestor(
-        config: HostBackendConfig,
+        config: SystemdExecutorConfig,
         path_attestor: Box<dyn PathAttestor>,
     ) -> Result<Self> {
         config.validate()?;
         path_attestor.attest_directory(&config.runtime_dir, "runtime_dir")?;
-        match config.backend {
-            BackendType::Systemd => {
-                path_attestor.attest_binary(config.systemctl_path.as_deref(), "systemctl_path")?
-            }
-            BackendType::Docker => {
-                path_attestor.attest_binary(config.docker_path.as_deref(), "docker_path")?
-            }
-        }
+        path_attestor.attest_binary(Some(&config.systemctl_path), "systemctl_path")?;
         Ok(Self {
             config,
             path_attestor: Arc::from(path_attestor),
@@ -319,22 +271,6 @@ impl HostBackend {
             .deployment_root
             .join("wr-node/releases")
             .join(revision.to_string()))
-    }
-
-    fn prepare_docker_command(&self, mut command: Command) -> Result<Command> {
-        let docker_config_dir = self.config.runtime_dir.join("docker");
-        match std::fs::create_dir(&docker_config_dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error).context("failed to create Docker CLI config directory")
-            }
-        }
-        std::fs::set_permissions(&docker_config_dir, std::fs::Permissions::from_mode(0o700))?;
-        self.path_attestor
-            .attest_directory(&docker_config_dir, "Docker CLI config directory")?;
-        command.env("DOCKER_CONFIG", docker_config_dir);
-        Ok(command)
     }
 
     fn canonical_release(&self, revision: u64) -> Result<PathBuf> {
@@ -558,7 +494,6 @@ impl HostBackend {
         ReleaseSlot {
             engine_slot: "proxy".into(),
             systemd_unit: metadata.proxy_systemd_unit.clone(),
-            docker_service: metadata.proxy_docker_service.clone(),
             lifecycle_address: metadata.proxy_lifecycle_address.clone(),
             config_path: String::new(),
         }
@@ -714,25 +649,14 @@ impl HostBackend {
     async fn inspect_backend(
         &self,
         slot: &ReleaseSlot,
-        release: &Option<PathBuf>,
+        _release: &Option<PathBuf>,
     ) -> BackendObservation {
-        match self.config.backend {
-            BackendType::Systemd => self.inspect_systemd(&slot.systemd_unit).await,
-            BackendType::Docker => {
-                let Some(release) = release else {
-                    return BackendObservation::query_error("release path unavailable");
-                };
-                self.inspect_docker(&slot.docker_service, release).await
-            }
-        }
+        self.inspect_systemd(&slot.systemd_unit).await
     }
 
     async fn inspect_systemd(&self, unit: &str) -> BackendObservation {
-        let Some(binary) = self.config.systemctl_path.as_deref() else {
-            return BackendObservation::query_error("systemctl_path is unavailable");
-        };
         let output = constrained_command(
-            binary,
+            &self.config.systemctl_path,
             [
                 "show",
                 unit,
@@ -752,118 +676,26 @@ impl HostBackend {
         }
     }
 
-    async fn inspect_docker(&self, service: &str, release: &Path) -> BackendObservation {
-        let Some(binary) = self.config.docker_path.as_deref() else {
-            return BackendObservation::query_error("docker_path is unavailable");
-        };
-        let compose = release.join("docker/docker-compose.yml");
-        let project = self.config.compose_project.as_deref().unwrap_or_default();
-        let command = constrained_command(
-            binary,
-            [
-                "compose",
-                "-p",
-                project,
-                "-f",
-                compose.to_string_lossy().as_ref(),
-                "ps",
-                "-a",
-                "--format",
-                "json",
-                service,
-            ],
-        );
-        let mut command = match self.prepare_docker_command(command) {
-            Ok(command) => command,
-            Err(error) => return BackendObservation::query_error(error),
-        };
-        let output = command.output().await;
-        match output {
-            Ok(output) if output.status.success() => {
-                parse_docker_observation(&output.stdout, service)
-            }
-            Ok(output) => BackendObservation::query_error(format!(
-                "docker compose ps failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )),
-            Err(error) => BackendObservation::query_error(error),
-        }
-    }
-
     fn effect_command(
         &self,
         action: EffectAction,
         slot: &ReleaseSlot,
-        release: &Path,
+        _release: &Path,
     ) -> Result<Command> {
-        match self.config.backend {
-            BackendType::Systemd => {
-                let binary = self
-                    .config
-                    .systemctl_path
-                    .as_deref()
-                    .context("systemctl_path missing")?;
-                Ok(constrained_command(
-                    binary,
-                    [action.systemd(), slot.systemd_unit.as_str()],
-                ))
-            }
-            BackendType::Docker => {
-                let binary = self
-                    .config
-                    .docker_path
-                    .as_deref()
-                    .context("docker_path missing")?;
-                let project = self
-                    .config
-                    .compose_project
-                    .as_deref()
-                    .context("compose project missing")?;
-                let compose = release.join("docker/docker-compose.yml");
-                let mut command = self.prepare_docker_command(constrained_command(
-                    binary,
-                    [
-                        "compose",
-                        "-p",
-                        project,
-                        "-f",
-                        compose.to_string_lossy().as_ref(),
-                    ],
-                ))?;
-                match action {
-                    EffectAction::Start => command.args([
-                        "up",
-                        "-d",
-                        "--build",
-                        "--force-recreate",
-                        "--no-deps",
-                        &slot.docker_service,
-                    ]),
-                    EffectAction::Stop => {
-                        command.args(["stop", "--timeout", "45", &slot.docker_service])
-                    }
-                };
-                Ok(command)
-            }
-        }
+        Ok(constrained_command(
+            &self.config.systemctl_path,
+            [action.systemd(), slot.systemd_unit.as_str()],
+        ))
     }
 
     async fn install_component_unit(&self, unit: &str, release: &Path) -> Result<()> {
-        if self.config.backend != BackendType::Systemd {
-            return Ok(());
-        }
         validate_systemd_unit(unit, "component unit")?;
         let source = release.join("systemd").join(unit);
         let destination = Path::new("/etc/systemd/system").join(unit);
         std::fs::copy(&source, &destination)
             .with_context(|| format!("failed to install verified unit {unit}"))?;
         std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o644))?;
-        let binary = self
-            .config
-            .systemctl_path
-            .as_deref()
-            .context("systemctl_path missing")?;
-        let status = constrained_command(binary, ["daemon-reload"])
+        let status = constrained_command(&self.config.systemctl_path, ["daemon-reload"])
             .status()
             .await?;
         anyhow::ensure!(status.success(), "systemd daemon-reload failed");
@@ -888,41 +720,6 @@ impl HostBackend {
             );
         }
         Ok(())
-    }
-
-    fn docker_signal_command(
-        &self,
-        signal: &str,
-        slot: &ReleaseSlot,
-        release: &Path,
-    ) -> Result<Command> {
-        let binary = self
-            .config
-            .docker_path
-            .as_deref()
-            .context("docker_path missing")?;
-        let project = self
-            .config
-            .compose_project
-            .as_deref()
-            .context("compose project missing")?;
-        let compose = release.join("docker/docker-compose.yml");
-        let mut command = self.prepare_docker_command(constrained_command(
-            binary,
-            [
-                "compose",
-                "-p",
-                project,
-                "-f",
-                compose.to_string_lossy().as_ref(),
-                "kill",
-                "--signal",
-                signal,
-                &slot.docker_service,
-            ],
-        ))?;
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-        Ok(command)
     }
 
     async fn wait_for_terminal_backend(
@@ -1010,72 +807,25 @@ impl HostBackend {
         cancelled: watch::Receiver<bool>,
     ) -> Result<(BackendObservation, bool, bool)> {
         let stop_deadline = tokio::time::Instant::now() + STOP_BUDGET;
-        match self.config.backend {
-            BackendType::Systemd => {
-                let pinned = self.pin_systemd_process(slot, before).await?;
-                let mut command = self.effect_command(EffectAction::Stop, slot, release)?;
-                command.stdout(Stdio::null()).stderr(Stdio::null());
-                let remaining = stop_deadline
-                    .saturating_duration_since(tokio::time::Instant::now())
-                    .min(STOP_GRACE_BUDGET + STOP_MARGIN);
-                let status = run_cancellable(command, cancelled.clone(), remaining).await?;
-                anyhow::ensure!(status.success(), "backend stop failed with status {status}");
-                self.wait_for_pinned_process_exit(&pinned, stop_deadline, cancelled.clone())
-                    .await?;
-                let inspection_deadline = std::cmp::min(
-                    stop_deadline,
-                    tokio::time::Instant::now() + STOP_INSPECTION_BUDGET,
-                );
-                let observation = self
-                    .wait_for_terminal_backend(slot, release, inspection_deadline, cancelled)
-                    .await?
-                    .context("systemd terminal facts remained unavailable")?;
-                Ok((observation, false, true))
-            }
-            BackendType::Docker => {
-                let term = self.docker_signal_command("TERM", slot, release)?;
-                let command_budget = stop_deadline
-                    .saturating_duration_since(tokio::time::Instant::now())
-                    .min(STOP_ESCALATION_BUDGET);
-                let status = run_cancellable(term, cancelled.clone(), command_budget).await?;
-                anyhow::ensure!(
-                    status.success(),
-                    "Docker TERM delivery failed with status {status}"
-                );
-                let grace_deadline = std::cmp::min(
-                    stop_deadline,
-                    tokio::time::Instant::now() + STOP_GRACE_BUDGET,
-                );
-                if let Some(observation) = self
-                    .wait_for_terminal_backend(slot, release, grace_deadline, cancelled.clone())
-                    .await?
-                {
-                    return Ok((observation, false, false));
-                }
-                let kill = self.docker_signal_command("KILL", slot, release)?;
-                let escalation_budget = stop_deadline
-                    .saturating_duration_since(tokio::time::Instant::now())
-                    .min(STOP_ESCALATION_BUDGET);
-                anyhow::ensure!(
-                    !escalation_budget.is_zero(),
-                    "stop deadline expired before escalation"
-                );
-                let status = run_cancellable(kill, cancelled.clone(), escalation_budget).await?;
-                anyhow::ensure!(
-                    status.success(),
-                    "Docker KILL escalation failed with status {status}"
-                );
-                let inspection_deadline = std::cmp::min(
-                    stop_deadline,
-                    tokio::time::Instant::now() + STOP_INSPECTION_BUDGET,
-                );
-                let observation = self
-                    .wait_for_terminal_backend(slot, release, inspection_deadline, cancelled)
-                    .await?
-                    .context("Docker terminal facts remained unavailable after escalation")?;
-                Ok((observation, true, false))
-            }
-        }
+        let pinned = self.pin_systemd_process(slot, before).await?;
+        let mut command = self.effect_command(EffectAction::Stop, slot, release)?;
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let remaining = stop_deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(STOP_GRACE_BUDGET + STOP_MARGIN);
+        let status = run_cancellable(command, cancelled.clone(), remaining).await?;
+        anyhow::ensure!(status.success(), "backend stop failed with status {status}");
+        self.wait_for_pinned_process_exit(&pinned, stop_deadline, cancelled.clone())
+            .await?;
+        let inspection_deadline = std::cmp::min(
+            stop_deadline,
+            tokio::time::Instant::now() + STOP_INSPECTION_BUDGET,
+        );
+        let observation = self
+            .wait_for_terminal_backend(slot, release, inspection_deadline, cancelled)
+            .await?
+            .context("systemd terminal facts remained unavailable")?;
+        Ok((observation, false, true))
     }
 
     fn termination_evidence(
@@ -1085,36 +835,27 @@ impl HostBackend {
         escalated: bool,
         exact_process_exit: bool,
     ) -> BackendTerminationEvidence {
-        // systemd releases inactive units quickly, clearing InvocationID and
+        // Systemd releases inactive units quickly, clearing InvocationID and
         // ExecMain* properties. The pidfd pins the exact pre-stop main process.
         let same_identity = !before.backend_instance_id.is_empty()
             && (terminal.instance_id == before.backend_instance_id
-                || (self.config.backend == BackendType::Systemd
-                    && exact_process_exit
-                    && terminal.instance_id.is_empty()));
-        let forced_terminal = match self.config.backend {
-            BackendType::Systemd => matches!(
-                terminal.terminal_result.as_str(),
-                "timeout" | "watchdog" | "signal" | "core-dump"
-            ),
-            BackendType::Docker => false,
-        };
+                || (exact_process_exit && terminal.instance_id.is_empty()));
+        let forced_terminal = matches!(
+            terminal.terminal_result.as_str(),
+            "timeout" | "watchdog" | "signal" | "core-dump"
+        );
         let disposition = if !same_identity || terminal.state != BackendProcessState::Exited {
             BackendStopDisposition::Unknown
         } else if escalated || forced_terminal {
             BackendStopDisposition::Forced
-        } else if match self.config.backend {
-            BackendType::Systemd => terminal.terminal_result == "success",
-            BackendType::Docker => matches!(terminal.exit_code, Some(0 | 143)),
-        } {
+        } else if terminal.terminal_result == "success" {
             BackendStopDisposition::Graceful
         } else {
             BackendStopDisposition::Unknown
         };
         if disposition == BackendStopDisposition::Unknown {
             eprintln!(
-                "node-agent backend termination evidence is inconclusive: backend={:?} expected_backend_instance_id={} terminal_backend_instance_id={} expected_main_pid={} terminal_main_pid={} exact_process_exit={} terminal_state={:?} terminal_result={} exit_code={:?} signal={:?} escalated={}",
-                self.config.backend,
+                "node-agent Systemd termination evidence is inconclusive: expected_backend_instance_id={} terminal_backend_instance_id={} expected_main_pid={} terminal_main_pid={} exact_process_exit={} terminal_state={:?} terminal_result={} exit_code={:?} signal={:?} escalated={}",
                 before.backend_instance_id,
                 terminal.instance_id,
                 before.backend_main_pid,
@@ -1128,7 +869,6 @@ impl HostBackend {
             );
         }
         BackendTerminationEvidence {
-            backend: self.config.backend.wire() as i32,
             backend_instance_id: before.backend_instance_id.clone(),
             process_instance_id: before.process_instance_id.clone(),
             graceful_termination_requested: true,
@@ -1343,7 +1083,7 @@ impl HostBackend {
     }
 }
 
-impl InstructionExecutor for HostBackend {
+impl InstructionExecutor for SystemdExecutor {
     fn execute_cleanup<'a>(
         &'a self,
         instruction: &'a NodeCleanupInstruction,
@@ -2143,7 +1883,7 @@ async fn run_cancellable(
     budget: Duration,
 ) -> Result<std::process::ExitStatus> {
     // The process group contains only the fixed backend CLI and descendants.
-    // Workload signaling remains owned by systemd/Docker, never by this group.
+    // Workload signaling remains owned by Systemd, never by this group.
     unsafe {
         command.as_std_mut().pre_exec(|| {
             if libc::setsid() == -1 {
@@ -2270,85 +2010,6 @@ fn parse_systemd_observation(bytes: &[u8]) -> BackendObservation {
     }
 }
 
-fn parse_docker_observation(bytes: &[u8], expected_service: &str) -> BackendObservation {
-    let text = String::from_utf8_lossy(bytes);
-    if text.trim().is_empty() {
-        return BackendObservation {
-            state: BackendProcessState::Exited,
-            instance_id: String::new(),
-            main_pid: 0,
-            query_error: String::new(),
-            terminal_result: String::new(),
-            exit_code: None,
-            signal: None,
-        };
-    }
-    let values: Vec<serde_json::Value> = match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(serde_json::Value::Array(values)) => values,
-        Ok(value @ serde_json::Value::Object(_)) => vec![value],
-        _ => match text
-            .lines()
-            .map(serde_json::from_str)
-            .collect::<std::result::Result<Vec<_>, _>>()
-        {
-            Ok(values) => values,
-            Err(error) => return BackendObservation::query_error(error),
-        },
-    };
-    if values.len() != 1 {
-        return BackendObservation::query_error("docker service has an ambiguous container set");
-    }
-    let value = &values[0];
-    let service = json_string(value, &["Service", "service"]);
-    let id = json_string(value, &["ID", "Id", "id"]);
-    let state = json_string(value, &["State", "state"]).to_ascii_lowercase();
-    let exit_code = json_i32(value, &["ExitCode", "exit_code"]);
-    let signal = exit_code
-        .filter(|code| (128..=255).contains(code))
-        .map(|code| code - 128);
-    if service != expected_service || id.is_empty() {
-        return BackendObservation::query_error("docker container identity does not match service");
-    }
-    let state = if state == "running" {
-        BackendProcessState::Running
-    } else if matches!(state.as_str(), "exited" | "dead" | "created") {
-        BackendProcessState::Exited
-    } else {
-        return BackendObservation::query_error(format!("docker state is not conclusive: {state}"));
-    };
-    BackendObservation {
-        state,
-        instance_id: id,
-        main_pid: 0,
-        query_error: String::new(),
-        terminal_result: if state == BackendProcessState::Exited {
-            "exited".to_string()
-        } else {
-            String::new()
-        },
-        exit_code,
-        signal,
-    }
-}
-
-fn json_i32(value: &serde_json::Value, keys: &[&str]) -> Option<i32> {
-    keys.iter().find_map(|key| {
-        value.get(*key).and_then(|value| {
-            value
-                .as_i64()
-                .and_then(|number| i32::try_from(number).ok())
-                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-        })
-    })
-}
-
-fn json_string(value: &serde_json::Value, keys: &[&str]) -> String {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
-        .unwrap_or_default()
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2464,7 +2125,6 @@ mod tests {
         let slot = ReleaseSlot {
             engine_slot: "blue".into(),
             systemd_unit: "wr-engine-blue.service".into(),
-            docker_service: "engine-blue".into(),
             lifecycle_address: "http://127.0.0.1:9100".into(),
             config_path: "config/engine.toml".into(),
         };
@@ -2496,18 +2156,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_effect_failure_preserves_bounded_command_diagnostics() {
-        let root = temp_root("backend-effect-diagnostics");
+    async fn systemd_effect_failure_preserves_bounded_command_diagnostics() {
+        let root = temp_root("systemd-effect-diagnostics");
         let release = root.join("release");
         let runtime_dir = root.join("run");
-        std::fs::create_dir_all(release.join("docker")).expect("create release directory");
+        std::fs::create_dir_all(&release).expect("create release directory");
         std::fs::create_dir(&runtime_dir).expect("create runtime directory");
-        std::fs::create_dir_all(root.join("bin")).expect("create binary directory");
-        let docker = root.join("bin/docker");
+        let systemctl = root.join("systemctl");
         std::fs::write(
-            &docker,
+            &systemctl,
             r#"#!/bin/sh
-printf 'docker-config=%s\n' "${DOCKER_CONFIG:-missing}"
 printf 'args=%s\n' "$*"
 printf 'discarded-prefix-' >&2
 i=0
@@ -2515,77 +2173,40 @@ while [ "$i" -lt 3000 ]; do
   printf x >&2
   i=$((i + 1))
 done
-printf '\ncompose final diagnostic\n' >&2
+printf '\nsystemctl final diagnostic\n' >&2
 exit 1
 "#,
         )
-        .expect("write fake docker CLI");
-        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700))
-            .expect("make fake docker CLI executable");
-        let backend = HostBackend::new_with_attestor(
-            HostBackendConfig {
+        .expect("write fake systemctl");
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake systemctl executable");
+        let executor = SystemdExecutor::new_with_attestor(
+            SystemdExecutorConfig {
                 deployment_root: root.clone(),
-                runtime_dir: runtime_dir.clone(),
-                backend: BackendType::Docker,
-                systemctl_path: None,
-                docker_path: Some(docker),
-                compose_project: Some("wruntime-test".into()),
+                runtime_dir,
+                systemctl_path: systemctl,
             },
             Box::new(TestPathAttestor),
         )
-        .expect("backend");
+        .expect("executor");
         let slot = ReleaseSlot {
             engine_slot: "blue".into(),
             systemd_unit: "wr-engine-blue.service".into(),
-            docker_service: "engine-blue".into(),
             lifecycle_address: "http://127.0.0.1:9100".into(),
             config_path: "config/engine.toml".into(),
         };
         let (_cancel, receiver) = watch::channel(false);
-        let error = backend
+        let error = executor
             .run_effect(EffectAction::Start, &slot, &release, receiver)
             .await
-            .expect_err("fake Docker start must fail");
+            .expect_err("fake systemctl start must fail");
         let detail = format!("{error:#}");
         assert!(detail.contains("backend start failed with status exit status: 1"));
-        assert!(detail.contains(&format!(
-            "stdout: docker-config={}",
-            runtime_dir.join("docker").display()
-        )));
-        assert!(detail.contains("args=compose -p wruntime-test"));
-        assert!(detail.contains("up -d --build --force-recreate --no-deps engine-blue"));
+        assert!(detail.contains("stdout: args=start wr-engine-blue.service"));
         assert!(detail.contains("stderr: [truncated]"));
-        assert!(detail.contains("compose final diagnostic"));
+        assert!(detail.contains("systemctl final diagnostic"));
         assert!(!detail.contains("discarded-prefix"));
-        assert_eq!(
-            std::fs::metadata(runtime_dir.join("docker"))
-                .expect("inspect Docker config directory")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
         std::fs::remove_dir_all(root).expect("remove test root");
-    }
-
-    #[test]
-    fn parses_exact_docker_identity() {
-        let observation = parse_docker_observation(
-            br#"[{"Service":"engine-blue","ID":"container-1","State":"running","ExitCode":0}]"#,
-            "engine-blue",
-        );
-        assert_eq!(observation.state, BackendProcessState::Running);
-        assert_eq!(observation.instance_id, "container-1");
-        assert_eq!(observation.exit_code, Some(0));
-        let killed = parse_docker_observation(
-            br#"[{"Service":"engine-blue","ID":"container-1","State":"exited","ExitCode":137}]"#,
-            "engine-blue",
-        );
-        assert_eq!(killed.signal, Some(9));
-        assert_eq!(
-            parse_docker_observation(b"not json", "engine-blue").state,
-            BackendProcessState::QueryError
-        );
     }
 
     #[test]
@@ -2594,15 +2215,16 @@ exit 1
             format_version: 1,
             proxy_lifecycle_address: "http://127.0.0.1:9001".into(),
             proxy_systemd_unit: "wr-proxy.service".into(),
-            proxy_docker_service: "proxy".into(),
             slots: vec![],
         };
         assert!(empty.validate().is_ok());
+        let mut stale = serde_json::to_value(&empty).unwrap();
+        stale["proxy_docker_service"] = serde_json::json!("proxy");
+        assert!(serde_json::from_value::<ReleaseMetadata>(stale).is_err());
         let mut invalid = empty;
         invalid.slots.push(ReleaseSlot {
             engine_slot: "blue".into(),
             systemd_unit: "wr-engine-red.service".into(),
-            docker_service: "engine-blue".into(),
             lifecycle_address: "http://127.0.0.1:9100".into(),
             config_path: "config/engine.toml".into(),
         });
@@ -2625,98 +2247,19 @@ exit 1
     fn stop_budget_preserves_grace_escalation_inspection_and_margin() {
         assert_eq!(COMMAND_BUDGET, Duration::from_secs(45));
         assert_eq!(
-            STOP_GRACE_BUDGET + STOP_ESCALATION_BUDGET + STOP_INSPECTION_BUDGET + STOP_MARGIN,
-            STOP_BUDGET
+            STOP_GRACE_BUDGET + STOP_INSPECTION_BUDGET + STOP_MARGIN,
+            Duration::from_secs(75)
         );
-    }
-
-    #[test]
-    fn termination_disposition_fails_closed_and_records_escalation() {
-        let backend = HostBackend::new_with_attestor(
-            HostBackendConfig {
-                deployment_root: PathBuf::from("/tmp/wruntime-test"),
-                runtime_dir: PathBuf::from("/run/wruntime"),
-                backend: BackendType::Docker,
-                systemctl_path: None,
-                docker_path: Some(PathBuf::from("/usr/bin/docker")),
-                compose_project: Some("wruntime-test".into()),
-            },
-            Box::new(TestPathAttestor),
-        )
-        .expect("backend");
-        let before = StepEvidence {
-            backend_instance_id: "container-1".into(),
-            process_instance_id: "process-1".into(),
-            ..Default::default()
-        };
-        let terminal = BackendObservation {
-            state: BackendProcessState::Exited,
-            instance_id: "container-1".into(),
-            main_pid: 0,
-            query_error: String::new(),
-            terminal_result: "exited".into(),
-            exit_code: Some(0),
-            signal: None,
-        };
-        assert_eq!(
-            backend
-                .termination_evidence(&before, &terminal, false, false)
-                .disposition,
-            BackendStopDisposition::Graceful as i32
-        );
-        assert_eq!(
-            backend
-                .termination_evidence(&before, &terminal, true, false)
-                .disposition,
-            BackendStopDisposition::Forced as i32
-        );
-        for exit_code in [1, 101, 134, 137, 139] {
-            let failed = BackendObservation {
-                exit_code: Some(exit_code),
-                signal: (exit_code >= 128).then_some(exit_code - 128),
-                ..terminal.clone()
-            };
-            assert_eq!(
-                backend
-                    .termination_evidence(&before, &failed, false, false)
-                    .disposition,
-                BackendStopDisposition::Unknown as i32,
-                "exit code {exit_code} must fail closed"
-            );
-        }
-        let terminated = BackendObservation {
-            exit_code: Some(143),
-            signal: Some(15),
-            ..terminal.clone()
-        };
-        assert_eq!(
-            backend
-                .termination_evidence(&before, &terminated, false, false)
-                .disposition,
-            BackendStopDisposition::Graceful as i32
-        );
-        let replaced = BackendObservation {
-            instance_id: "container-2".into(),
-            ..terminal
-        };
-        assert_eq!(
-            backend
-                .termination_evidence(&before, &replaced, false, false)
-                .disposition,
-            BackendStopDisposition::Unknown as i32
-        );
+        assert_eq!(STOP_BUDGET, Duration::from_secs(90));
     }
 
     #[test]
     fn systemd_termination_requires_same_identity_and_success() {
-        let backend = HostBackend::new_with_attestor(
-            HostBackendConfig {
+        let backend = SystemdExecutor::new_with_attestor(
+            SystemdExecutorConfig {
                 deployment_root: PathBuf::from("/tmp/wruntime-test"),
                 runtime_dir: PathBuf::from("/run/wruntime"),
-                backend: BackendType::Systemd,
-                systemctl_path: Some(PathBuf::from("/usr/bin/systemctl")),
-                docker_path: None,
-                compose_project: None,
+                systemctl_path: PathBuf::from("/usr/bin/systemctl"),
             },
             Box::new(TestPathAttestor),
         )
@@ -2736,11 +2279,38 @@ exit 1
             exit_code: Some(0),
             signal: None,
         };
+        let graceful = backend.termination_evidence(&before, &terminal, false, false);
+        assert_eq!(
+            graceful.disposition,
+            BackendStopDisposition::Graceful as i32
+        );
         assert_eq!(
             backend
-                .termination_evidence(&before, &terminal, false, false)
+                .termination_evidence(&before, &terminal, true, false)
                 .disposition,
-            BackendStopDisposition::Graceful as i32
+            BackendStopDisposition::Forced as i32
+        );
+        let timed_out = BackendObservation {
+            terminal_result: "timeout".into(),
+            signal: Some(9),
+            ..terminal.clone()
+        };
+        assert_eq!(
+            backend
+                .termination_evidence(&before, &timed_out, false, false)
+                .disposition,
+            BackendStopDisposition::Forced as i32
+        );
+        let failed = BackendObservation {
+            terminal_result: "exit-code".into(),
+            exit_code: Some(1),
+            ..terminal.clone()
+        };
+        assert_eq!(
+            backend
+                .termination_evidence(&before, &failed, false, false)
+                .disposition,
+            BackendStopDisposition::Unknown as i32
         );
         let cleared_invocation = BackendObservation {
             instance_id: String::new(),
@@ -2770,15 +2340,12 @@ exit 1
         );
     }
 
-    fn test_backend(root: &Path) -> HostBackend {
-        HostBackend::new_with_attestor(
-            HostBackendConfig {
+    fn test_backend(root: &Path) -> SystemdExecutor {
+        SystemdExecutor::new_with_attestor(
+            SystemdExecutorConfig {
                 deployment_root: root.to_path_buf(),
                 runtime_dir: root.to_path_buf(),
-                backend: BackendType::Systemd,
-                systemctl_path: Some(root.join("systemctl")),
-                docker_path: None,
-                compose_project: None,
+                systemctl_path: root.join("systemctl"),
             },
             Box::new(TestPathAttestor),
         )
@@ -2794,11 +2361,9 @@ exit 1
             format_version: 1,
             proxy_lifecycle_address: "http://127.0.0.1:1".into(),
             proxy_systemd_unit: "wr-proxy.service".into(),
-            proxy_docker_service: "proxy".into(),
             slots: vec![ReleaseSlot {
                 engine_slot: "blue".into(),
                 systemd_unit: "wr-engine-blue.service".into(),
-                docker_service: "engine-blue".into(),
                 lifecycle_address: "http://127.0.0.1:1".into(),
                 config_path: "config/engine.toml".into(),
             }],
@@ -2820,7 +2385,6 @@ exit 1
         let digest = deterministic_bundle_digest(
             "x86_64-unknown-linux-gnu",
             "/opt/wruntime",
-            "wr",
             &engines,
             &checksums,
             &None,
@@ -2831,7 +2395,6 @@ exit 1
             bundle_digest: digest.clone(),
             engines,
             workdir: "/opt/wruntime".into(),
-            image_prefix: "wr".into(),
             modules: vec![],
             configs: vec![],
             template_vars: vec![],

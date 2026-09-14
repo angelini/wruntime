@@ -103,18 +103,17 @@ def render_config(template: str, manager_id: str, endpoint: str, db_url: str, se
 def descriptor(manager_id: str, binary_digest: str, unit_digest: str, config_digest: str, credential_path: str, credential_digest: str, *, initial: bool = False) -> bytes:
     if initial:
         executable = "/opt/wruntime/wr-manager/bin/wr-manager"
-        spec = "/opt/wruntime/wr-manager/systemd/wr-manager.service"
+        unit_path = "/opt/wruntime/wr-manager/systemd/wr-manager.service"
     else:
         executable = f"/opt/wruntime/manager-artifacts/binaries/{binary_digest[7:]}/wr-manager"
-        spec = f"/opt/wruntime/manager-artifacts/backend-specs/{unit_digest[7:]}.json"
+        unit_path = f"/opt/wruntime/manager-artifacts/systemd-units/{unit_digest[7:]}.service"
     value = {
         "schema_version": 1,
         "manager_id": manager_id,
-        "backend": "systemd",
         "executable": executable,
         "executable_digest": binary_digest,
-        "backend_spec_path": spec,
-        "backend_spec_digest": unit_digest,
+        "systemd_unit_path": unit_path,
+        "systemd_unit_digest": unit_digest,
         "config_path": (f"/opt/wruntime/wr-manager/config/manager.toml" if initial else f"/var/lib/wruntime/manager-config/{manager_id}/current.toml"),
         "config_digest": config_digest,
         "credential_set_path": credential_path,
@@ -124,7 +123,7 @@ def descriptor(manager_id: str, binary_digest: str, unit_digest: str, config_dig
 
 
 def host_digest(target: dict[str, str]) -> str:
-    fields = ("manager_id", "endpoint", "remote", "backend", "executable_digest", "backend_spec_digest", "config_digest", "credential_digest", "old_selector_digest", "new_selector_digest")
+    fields = ("manager_id", "endpoint", "remote", "executable_digest", "systemd_unit_digest", "config_digest", "credential_digest", "old_selector_digest", "new_selector_digest")
     return digest_bytes(json.dumps({key: target[key] for key in fields}, separators=(",", ":")).encode())
 
 
@@ -159,8 +158,7 @@ def write_manifest(
         lines.extend(["", "[[targets]]"])
         for key in ("manager_id", "endpoint", "remote"):
             lines.append(f"{key} = {quote(target[key])}")
-        lines.append('backend = "systemd"')
-        for key in ("executable", "executable_digest", "backend_spec", "backend_spec_digest", "config", "config_digest", "credential_set", "credential_digest", "old_selector_digest", "new_selector_digest", "host_digest"):
+        for key in ("executable", "executable_digest", "systemd_unit", "systemd_unit_digest", "config", "config_digest", "credential_set", "credential_digest", "old_selector_digest", "new_selector_digest", "host_digest"):
             lines.append(f"{key} = {quote(target[key])}")
     path.write_text("\n".join(lines) + "\n")
 
@@ -212,9 +210,9 @@ def main() -> int:
         credential_digest = tree_digest(credential_set)
         new_descriptor = descriptor(manager_id, binary_digest, unit_digest, digest_file(configs[name]), f"/etc/wruntime/pki/manager-{manager_id}/sets/{credential_set.name}", credential_digest)
         target = {
-            "manager_id": manager_id, "endpoint": endpoint, "remote": remote, "backend": "systemd",
+            "manager_id": manager_id, "endpoint": endpoint, "remote": remote,
             "executable": str(binary.resolve()), "executable_digest": binary_digest,
-            "backend_spec": str(unit.resolve()), "backend_spec_digest": unit_digest,
+            "systemd_unit": str(unit.resolve()), "systemd_unit_digest": unit_digest,
             "config": str(configs[name].resolve()), "config_digest": digest_file(configs[name]),
             "credential_set": str(credential_set.resolve()), "credential_digest": credential_digest,
             "old_selector_digest": old_selectors[name], "new_selector_digest": digest_bytes(new_descriptor),

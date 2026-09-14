@@ -137,12 +137,11 @@ pub struct TargetManager {
     pub manager_id: String,
     pub endpoint: String,
     pub remote: String,
-    pub backend: Backend,
-    /// Local executable for systemd, or immutable `name@sha256:...` for Compose.
+    /// Local manager executable.
     pub executable: String,
     pub executable_digest: String,
-    pub backend_spec: PathBuf,
-    pub backend_spec_digest: String,
+    pub systemd_unit: PathBuf,
+    pub systemd_unit_digest: String,
     pub config: PathBuf,
     pub config_digest: String,
     /// Local immutable credential set directory. Its basename is the set version.
@@ -153,22 +152,14 @@ pub struct TargetManager {
     pub host_digest: String,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum Backend {
-    Systemd,
-    Compose,
-}
-
 #[derive(Debug, Serialize)]
 struct ActivationDescriptor<'a> {
     schema_version: u32,
     manager_id: &'a str,
-    backend: Backend,
     executable: String,
     executable_digest: &'a str,
-    backend_spec_path: String,
-    backend_spec_digest: &'a str,
+    systemd_unit_path: String,
+    systemd_unit_digest: &'a str,
     config_path: String,
     config_digest: &'a str,
     credential_set_path: String,
@@ -215,9 +206,8 @@ fn target_host_digest(target: &TargetManager) -> Result<String> {
         manager_id: &'a str,
         endpoint: &'a str,
         remote: &'a str,
-        backend: Backend,
         executable_digest: &'a str,
-        backend_spec_digest: &'a str,
+        systemd_unit_digest: &'a str,
         config_digest: &'a str,
         credential_digest: &'a str,
         old_selector_digest: &'a str,
@@ -227,9 +217,8 @@ fn target_host_digest(target: &TargetManager) -> Result<String> {
         manager_id: &target.manager_id,
         endpoint: &target.endpoint,
         remote: &target.remote,
-        backend: target.backend,
         executable_digest: &target.executable_digest,
-        backend_spec_digest: &target.backend_spec_digest,
+        systemd_unit_digest: &target.systemd_unit_digest,
         config_digest: &target.config_digest,
         credential_digest: &target.credential_digest,
         old_selector_digest: &target.old_selector_digest,
@@ -288,7 +277,7 @@ fn load_manifest_with_artifacts(
         }
         for (digest, label) in [
             (&target.executable_digest, "executable digest"),
-            (&target.backend_spec_digest, "backend spec digest"),
+            (&target.systemd_unit_digest, "systemd unit digest"),
             (&target.config_digest, "config digest"),
             (&target.credential_digest, "credential digest"),
             (&target.old_selector_digest, "old selector digest"),
@@ -298,7 +287,7 @@ fn load_manifest_with_artifacts(
             validate_digest(digest, label)?;
         }
         if validate_artifacts {
-            if digest_file(&target.backend_spec)? != target.backend_spec_digest
+            if digest_file(&target.systemd_unit)? != target.systemd_unit_digest
                 || digest_file(&target.config)? != target.config_digest
                 || helpers::local_tree_digest(&target.credential_set)? != target.credential_digest
             {
@@ -307,37 +296,16 @@ fn load_manifest_with_artifacts(
                     target.manager_id
                 );
             }
-            let backend_spec = fs::read_to_string(&target.backend_spec)
-                .context("manager backend spec must be UTF-8")?;
-            match target.backend {
-                Backend::Systemd => {
-                    if digest_file(Path::new(&target.executable))? != target.executable_digest {
-                        bail!("manager {} binary digest mismatch", target.manager_id);
-                    }
-                    if backend_spec != service_gen::manager_activation_systemd_unit() {
-                        bail!(
-                            "manager {} systemd spec must be the stable activation-launcher unit",
-                            target.manager_id
-                        );
-                    }
-                }
-                Backend::Compose => {
-                    if !target.executable.contains("@sha256:")
-                        || !target.executable.ends_with(&target.executable_digest[7..])
-                    {
-                        bail!(
-                            "manager {} Compose image must be an immutable matching repo digest",
-                            target.manager_id
-                        );
-                    }
-                    if !backend_spec.contains(&target.executable)
-                        || backend_spec.contains(".key")
-                        || backend_spec.contains("/release")
-                        || backend_spec.contains("config.toml")
-                    {
-                        bail!("manager {} Compose spec must select only the immutable image and protected stable mounts", target.manager_id);
-                    }
-                }
+            if digest_file(Path::new(&target.executable))? != target.executable_digest {
+                bail!("manager {} binary digest mismatch", target.manager_id);
+            }
+            let systemd_unit = fs::read_to_string(&target.systemd_unit)
+                .context("manager systemd unit must be UTF-8")?;
+            if systemd_unit != service_gen::manager_activation_systemd_unit() {
+                bail!(
+                    "manager {} systemd unit must be the stable activation-launcher unit",
+                    target.manager_id
+                );
             }
         }
         if target_host_digest(target)? != target.host_digest {
@@ -384,13 +352,10 @@ fn load_manifest(path: &Path) -> Result<ValidatedManifest> {
 }
 
 fn activation_descriptor(target: &TargetManager) -> Result<(Vec<u8>, String)> {
-    let executable = match target.backend {
-        Backend::Systemd => format!(
-            "{ARTIFACT_ROOT}/binaries/{}/wr-manager",
-            &target.executable_digest[7..]
-        ),
-        Backend::Compose => target.executable.clone(),
-    };
+    let executable = format!(
+        "{ARTIFACT_ROOT}/binaries/{}/wr-manager",
+        &target.executable_digest[7..]
+    );
     let credential_version = target
         .credential_set
         .file_name()
@@ -399,14 +364,13 @@ fn activation_descriptor(target: &TargetManager) -> Result<(Vec<u8>, String)> {
     let bytes = serde_json::to_vec_pretty(&ActivationDescriptor {
         schema_version: SCHEMA_VERSION,
         manager_id: &target.manager_id,
-        backend: target.backend,
         executable,
         executable_digest: &target.executable_digest,
-        backend_spec_path: format!(
-            "{ARTIFACT_ROOT}/backend-specs/{}.json",
-            &target.backend_spec_digest[7..]
+        systemd_unit_path: format!(
+            "{ARTIFACT_ROOT}/systemd-units/{}.service",
+            &target.systemd_unit_digest[7..]
         ),
-        backend_spec_digest: &target.backend_spec_digest,
+        systemd_unit_digest: &target.systemd_unit_digest,
         config_path: format!(
             "{STATE_ROOT}/manager-config/{}/current.toml",
             target.manager_id
@@ -452,13 +416,8 @@ fn create_request(validated: &ValidatedManifest) -> Result<BeginManagerRolloutRe
                 endpoint: target.endpoint.clone(),
                 host_digest: target.host_digest.clone(),
                 config_digest: target.config_digest.clone(),
-                backend: match target.backend {
-                    Backend::Systemd => "systemd",
-                    Backend::Compose => "compose",
-                }
-                .into(),
                 executable_digest: target.executable_digest.clone(),
-                backend_spec_digest: target.backend_spec_digest.clone(),
+                systemd_unit_digest: target.systemd_unit_digest.clone(),
                 credential_digest: target.credential_digest.clone(),
                 old_selector_digest: target.old_selector_digest.clone(),
                 new_selector_digest: target.new_selector_digest.clone(),
@@ -507,38 +466,36 @@ fn install_systemd_activation_launcher(
     target: &TargetManager,
     manifest: &ManagerSetManifest,
 ) -> Result<()> {
-    if target.backend == Backend::Systemd {
-        let launcher = service_gen::manager_launcher_script().as_bytes();
-        let launcher_digest = digest_bytes(launcher);
-        helpers::install_remote_bytes(
-            launcher,
-            &target.remote,
-            "/usr/local/libexec/wruntime-manager-launch",
-            manifest.ssh_key.as_deref(),
-            manifest.ssh_port,
-            0o555,
-            RemoteInstallClass::Public,
-            Some(&launcher_digest),
-        )?;
-        helpers::run_ssh(
-            &ssh(target, manifest),
-            &format!(
-                "sudo install -d -m 0755 {}",
-                helpers::shell_quote(service_gen::MANAGER_SYSTEMD_UNIT_DIR)
-            ),
-        )?;
-        helpers::install_remote_file(
-            &target.backend_spec,
-            &target.remote,
-            service_gen::MANAGER_SYSTEMD_UNIT_PATH,
-            manifest.ssh_key.as_deref(),
-            manifest.ssh_port,
-            0o444,
-            RemoteInstallClass::Public,
-            Some(&target.backend_spec_digest),
-        )?;
-        helpers::run_ssh(&ssh(target, manifest), "sudo systemctl daemon-reload")?;
-    }
+    let launcher = service_gen::manager_launcher_script().as_bytes();
+    let launcher_digest = digest_bytes(launcher);
+    helpers::install_remote_bytes(
+        launcher,
+        &target.remote,
+        "/usr/local/libexec/wruntime-manager-launch",
+        manifest.ssh_key.as_deref(),
+        manifest.ssh_port,
+        0o555,
+        RemoteInstallClass::Public,
+        Some(&launcher_digest),
+    )?;
+    helpers::run_ssh(
+        &ssh(target, manifest),
+        &format!(
+            "sudo install -d -m 0755 {}",
+            helpers::shell_quote(service_gen::MANAGER_SYSTEMD_UNIT_DIR)
+        ),
+    )?;
+    helpers::install_remote_file(
+        &target.systemd_unit,
+        &target.remote,
+        service_gen::MANAGER_SYSTEMD_UNIT_PATH,
+        manifest.ssh_key.as_deref(),
+        manifest.ssh_port,
+        0o444,
+        RemoteInstallClass::Public,
+        Some(&target.systemd_unit_digest),
+    )?;
+    helpers::run_ssh(&ssh(target, manifest), "sudo systemctl daemon-reload")?;
     Ok(())
 }
 
@@ -563,50 +520,37 @@ fn stage_target(target: &TargetManager, validated: &ValidatedManifest) -> Result
     let manifest = &validated.manifest;
     let ssh = ssh(target, manifest);
     let config_dir = format!("{STATE_ROOT}/manager-config/{}", target.manager_id);
-    let spec_path = format!(
-        "{ARTIFACT_ROOT}/backend-specs/{}.json",
-        &target.backend_spec_digest[7..]
+    let unit_path = format!(
+        "{ARTIFACT_ROOT}/systemd-units/{}.service",
+        &target.systemd_unit_digest[7..]
     );
     helpers::install_remote_file(
-        &target.backend_spec,
+        &target.systemd_unit,
         &target.remote,
-        &spec_path,
+        &unit_path,
         manifest.ssh_key.as_deref(),
         manifest.ssh_port,
         0o444,
         RemoteInstallClass::Public,
-        Some(&target.backend_spec_digest),
+        Some(&target.systemd_unit_digest),
     )?;
-    if target.backend == Backend::Systemd {
-        // A live rollout may target a pristine disposable host. Install the
-        // stable launcher/unit during staging; this does not select or start
-        // the staged manager and therefore preserves the pre-close barrier.
-        install_systemd_activation_launcher(target, manifest)?;
-        let binary_path = format!(
-            "{ARTIFACT_ROOT}/binaries/{}/wr-manager",
-            &target.executable_digest[7..]
-        );
-        helpers::install_remote_file(
-            Path::new(&target.executable),
-            &target.remote,
-            &binary_path,
-            manifest.ssh_key.as_deref(),
-            manifest.ssh_port,
-            0o555,
-            RemoteInstallClass::Public,
-            Some(&target.executable_digest),
-        )?;
-    } else {
-        helpers::run_ssh(
-            &ssh,
-            &format!(
-                "sudo docker pull {} >/dev/null && sudo docker image inspect --format '{{{{join .RepoDigests \"\\n\"}}}}' {} | grep -Fx -- {} >/dev/null",
-                helpers::shell_quote(&target.executable),
-                helpers::shell_quote(&target.executable),
-                helpers::shell_quote(&target.executable)
-            ),
-        )?;
-    }
+    // A live rollout may target a pristine disposable host. Installing the
+    // stable launcher/unit does not select or start the staged manager.
+    install_systemd_activation_launcher(target, manifest)?;
+    let binary_path = format!(
+        "{ARTIFACT_ROOT}/binaries/{}/wr-manager",
+        &target.executable_digest[7..]
+    );
+    helpers::install_remote_file(
+        Path::new(&target.executable),
+        &target.remote,
+        &binary_path,
+        manifest.ssh_key.as_deref(),
+        manifest.ssh_port,
+        0o555,
+        RemoteInstallClass::Public,
+        Some(&target.executable_digest),
+    )?;
     install_credential_tree(target, manifest)?;
     helpers::run_ssh(
         &ssh,
@@ -684,7 +628,6 @@ fn activate_target(
     let current = format!("{STATE_ROOT}/manager-activation/current-activation.json");
     let config_dir = format!("{STATE_ROOT}/manager-config/{}", target.manager_id);
     let action = service_gen::manager_activation_command(
-        target.backend == Backend::Systemd,
         &descriptor_path,
         &current,
         &config_dir,
@@ -853,7 +796,6 @@ async fn begin(
 struct StoppedInspection {
     manager_id: String,
     selector_digest: String,
-    backend: String,
     config_path: String,
     config_digest: String,
     policy_path: String,
@@ -1156,7 +1098,6 @@ pub async fn reset_failed_rollout(
             })?;
         if observation.manager_id != *manager_id
             || !expected.selectors.contains(&observation.selector_digest)
-            || !matches!(observation.backend.as_str(), "systemd" | "compose")
             || observation.config_path
                 != format!("{STATE_ROOT}/manager-config/{manager_id}/current.toml")
             || observation.config_digest.is_empty()
@@ -1222,16 +1163,8 @@ pub fn restore_config(args: RestoreConfigArgs) -> Result<()> {
     let ssh = ssh(target, &validated.manifest);
     let config_dir = format!("{STATE_ROOT}/manager-config/{}", target.manager_id);
     let current = format!("{STATE_ROOT}/manager-activation/current-activation.json");
-    let stop = if target.backend == Backend::Systemd {
-        "sudo systemctl stop wr-manager.service"
-    } else {
-        "sudo docker compose --project-name wruntime-manager down"
-    };
-    let start = if target.backend == Backend::Systemd {
-        "sudo systemctl start wr-manager.service"
-    } else {
-        "previous_spec=$(sudo python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"backend_spec_path\"])' \"$current\"); sudo docker compose --project-name wruntime-manager -f \"$previous_spec\" up -d --force-recreate --no-build"
-    };
+    let stop = "sudo systemctl stop wr-manager.service";
+    let start = "sudo systemctl start wr-manager.service";
     let command = format!(
         "set -eu; current={current}; config={config}; test -f \"$config/previous.toml\"; test -f \"$current.previous\"; {stop}; sudo mv \"$config/current.toml\" \"$config/restore.tmp\"; sudo mv \"$config/previous.toml\" \"$config/current.toml\"; sudo mv \"$config/restore.tmp\" \"$config/previous.toml\"; sudo mv \"$current\" \"$current.restore.tmp\"; sudo mv \"$current.previous\" \"$current\"; sudo mv \"$current.restore.tmp\" \"$current.previous\"; sudo sync -f \"$config\"; sudo sync -f $(dirname \"$current\"); {start}",
         current = helpers::shell_quote(&current),
@@ -1432,11 +1365,10 @@ mod tests {
             manager_id: "manager-a".into(),
             endpoint: "https://manager-a.example:9000".into(),
             remote: "root@manager-a.example".into(),
-            backend: Backend::Systemd,
             executable: "/tmp/wr-manager".into(),
             executable_digest: format!("sha256:{}", "1".repeat(64)),
-            backend_spec: "/tmp/spec".into(),
-            backend_spec_digest: format!("sha256:{}", "2".repeat(64)),
+            systemd_unit: "/tmp/wr-manager.service".into(),
+            systemd_unit_digest: format!("sha256:{}", "2".repeat(64)),
             config: "/tmp/config".into(),
             config_digest: format!("sha256:{}", "3".repeat(64)),
             credential_set: "/tmp/set-v1".into(),
@@ -1499,11 +1431,10 @@ mod tests {
     }
 
     #[test]
-    fn compose_requires_immutable_repo_digest() {
-        let mut target = target();
-        target.backend = Backend::Compose;
-        target.executable = "registry.example/wr-manager:latest".into();
-        assert!(!target.executable.contains("@sha256:"));
+    fn manifest_rejects_removed_backend_keys() {
+        let value = toml::to_string(&reset_manifest()).unwrap();
+        let value = format!("backend = \"compose\"\n{value}");
+        assert!(toml::from_str::<ManagerSetManifest>(&value).is_err());
     }
 
     fn reset_manifest() -> ManagerSetManifest {
@@ -1584,7 +1515,7 @@ mod tests {
         let mut manifest = reset_manifest();
         manifest.manager_endpoint = "http://coordinator.example:9000".into();
         manifest.target_policy = "/definitely/missing/policy.toml".into();
-        manifest.targets[0].backend_spec = "/definitely/missing/spec".into();
+        manifest.targets[0].systemd_unit = "/definitely/missing/unit".into();
         manifest.targets[0].config = "/definitely/missing/config".into();
         manifest.targets[0].credential_set = "/definitely/missing/credentials".into();
         manifest.targets[0].executable = "/definitely/missing/wr-manager".into();

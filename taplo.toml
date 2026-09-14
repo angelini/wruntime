@@ -1,4 +1,4 @@
-exclude = ["**/target/**"]
+exclude = ["**/target/**", ".git/**"]
 
 [formatting]
 align_entries = true

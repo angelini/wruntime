@@ -20,7 +20,6 @@ SPEC.loader.exec_module(assert_operation)
 
 def evidence(backend="backend-a", process="process-a"):
     return {
-        "backend": "systemd",
         "backend_instance_id": backend,
         "process_instance_id": process,
         "graceful_termination_requested": True,
@@ -96,7 +95,10 @@ class OperationAssertionTests(unittest.TestCase):
             ("unknown", lambda value: value["slots"][0]["termination_evidence"].update(disposition="unknown")),
             ("forced", lambda value: value["slots"][0]["termination_evidence"].update(disposition="forced")),
             ("escalated", lambda value: value["slots"][0]["termination_evidence"].update(kill_escalated=True)),
-            ("invalid-backend", lambda value: value["slots"][0]["termination_evidence"].update(backend="unknown")),
+            ("removed-backend", lambda value: value["slots"][0]["termination_evidence"].update(backend="systemd")),
+            ("failed-result", lambda value: value["slots"][0]["termination_evidence"].update(terminal_result="exit-code")),
+            ("nonzero-exit", lambda value: value["slots"][0]["termination_evidence"].update(exit_code=1)),
+            ("signaled", lambda value: value["slots"][0]["termination_evidence"].update(signal=15)),
         )
         for name, mutate in mutations:
             value = detail()

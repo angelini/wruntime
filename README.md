@@ -51,7 +51,7 @@ Wruntime currently provides:
 - guest capabilities for PostgreSQL, S3-compatible blob storage, tracing,
   Anthropic Claude, namespace-scoped secrets/environment values, and ephemeral
   scratch filesystems;
-- systemd and Docker deployment bundles, exact-revision readiness checks,
+- Systemd deployment bundles, exact-revision readiness checks,
   retained-release rollback, and coherent cluster status.
 
 See [Architecture](docs/architecture.md) for the full request and control-plane
@@ -147,7 +147,7 @@ from [Testing](docs/testing.md). To inspect the repository-local CLI, run
 - [Schemas](docs/schemas.md) — protobuf descriptors, validation, and RPC paths
 - [Control-plane and job APIs](docs/grpc-api.md) — manager/node gRPC and worker HTTP
   RPC contracts
-- [Deployment](docs/deployment.md) — bundles, systemd/Docker lifecycle, mTLS,
+- [Deployment](docs/deployment.md) — bundles, Systemd lifecycle, mTLS,
   rollback, and cluster status
 - [Testing](docs/testing.md) — local infrastructure, focused tests, and full
   validation

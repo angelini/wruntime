@@ -15,15 +15,8 @@ pub const AGENT_CAPABILITIES: [&str; 4] = [
     "continuous-lease-v1",
     "manager-authorized-retention-v1",
     "release-metadata-v1",
-    "typed-backend-v1",
+    "systemd-lifecycle-v1",
 ];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentPolicyBackend {
-    Systemd,
-    Docker,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -36,13 +29,7 @@ pub struct AgentPolicy {
     pub ca_cert_path: String,
     pub deployment_root: String,
     pub runtime_dir: String,
-    pub backend: AgentPolicyBackend,
-    /// Empty for systemd; required for Docker.
-    pub compose_project: String,
-    /// Required for systemd; empty for Docker.
     pub systemctl_path: String,
-    /// Required for Docker; empty for systemd.
-    pub docker_path: String,
     pub poll_interval_seconds: u64,
     pub renew_interval_seconds: u64,
     pub protocol_version: String,
@@ -84,21 +71,7 @@ impl AgentPolicy {
         if self.deployment_root == "/" || self.runtime_dir == "/" {
             bail!("deployment-root and runtime-dir must not be filesystem root");
         }
-        match self.backend {
-            AgentPolicyBackend::Systemd => {
-                validate_absolute_path(&self.systemctl_path, "systemctl-path")?;
-                if !self.docker_path.is_empty() || !self.compose_project.is_empty() {
-                    bail!("Docker command/project fields must be empty for systemd");
-                }
-            }
-            AgentPolicyBackend::Docker => {
-                validate_absolute_path(&self.docker_path, "docker-path")?;
-                validate_identity(&self.compose_project, "compose-project")?;
-                if !self.systemctl_path.is_empty() {
-                    bail!("systemctl-path must be empty for Docker");
-                }
-            }
-        }
+        validate_absolute_path(&self.systemctl_path, "systemctl-path")?;
         if self.poll_interval_seconds == 0 || self.renew_interval_seconds == 0 {
             bail!("poll and renew intervals must be positive");
         }
@@ -224,10 +197,7 @@ mod tests {
             ca_cert_path: "/opt/wruntime/wr-agent/certs/ca.crt".into(),
             deployment_root: "/opt/wruntime".into(),
             runtime_dir: "/run/wruntime".into(),
-            backend: AgentPolicyBackend::Systemd,
-            compose_project: String::new(),
             systemctl_path: "/usr/bin/systemctl".into(),
-            docker_path: String::new(),
             poll_interval_seconds: 5,
             renew_interval_seconds: 5,
             protocol_version: AGENT_PROTOCOL_VERSION.into(),
@@ -261,6 +231,23 @@ mod tests {
             let mut invalid = baseline.clone();
             invalidate(&mut invalid);
             assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn removed_backend_keys_are_rejected() {
+        let canonical = String::from_utf8(policy().canonical_bytes().unwrap()).unwrap();
+        for stale in [
+            "backend = \"systemd\"\n",
+            "docker-path = \"/usr/bin/docker\"\n",
+            "compose-project = \"wruntime\"\n",
+        ] {
+            let mut text = canonical.clone();
+            text.push_str(stale);
+            assert!(
+                toml::from_str::<AgentPolicy>(&text).is_err(),
+                "accepted {stale}"
+            );
         }
     }
 

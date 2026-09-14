@@ -1826,7 +1826,7 @@ mod tests {
         PostgresProvisioningManifest,
         wr_common::migration_bundle::MigrationBundleManifest,
     ) {
-        use crate::cmd::deploy_config::{DeployFormat, TenantDeployConfig};
+        use crate::cmd::deploy_config::TenantDeployConfig;
         use wr_common::migration_bundle::{MigrationFileManifest, MigrationLimits};
         let revision_digest = format!("sha256:{}", "1".repeat(64));
         let fingerprint = format!("sha256:{}", "2".repeat(64));
@@ -1836,7 +1836,6 @@ mod tests {
             node_id: "node-a".into(),
             request_token: "stable-token".into(),
             remote_host_ip: "10.0.0.4".into(),
-            deployment_format: DeployFormat::Systemd,
             bundle_digest: format!("sha256:{}", "3".repeat(64)),
             canonical_inventory_digest: format!("sha256:{}", "4".repeat(64)),
             allocated_revision: 7,
