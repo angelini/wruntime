@@ -1,41 +1,60 @@
 # Wruntime
 
-A distributed WASI Preview 2 runtime for building networks of WebAssembly modules.
-Guests call logical HTTP endpoints such as
-`http://ecommerce.inventory/inventory.InventoryService/GetItems`; Wruntime
-intercepts the call, discovers a healthy module instance, and routes it locally
-or across nodes.
+Wruntime is a distributed WASI Preview 2 runtime for building applications from
+small, independently deployable application modules. Each module is packaged as
+a WebAssembly component, exposes protobuf services, and calls other modules
+through logical URLs. Wruntime discovers healthy instances and routes each
+request locally or across nodes.
+
+Guest modules can use managed capabilities such as PostgreSQL, object storage,
+tracing, secrets, external HTTP, and language models without owning the
+underlying infrastructure integrations.
 
 > [!NOTE]
-> Wruntime is an experimental, pre-1.0 project built in part through
-> LLM-assisted development. The custom `wruntime:*` guest WIT APIs may change
-> incompatibly; pin the runtime and SDK versions used by guest modules.
+> Wruntime is built with the assistance of LLM-based development tools.
+
+## How it works
+
+### Build application modules
+
+Write application code with `wr-sdk`, then compile it into a WebAssembly
+component targeting WASI Preview 2.
 
 ```mermaid
 flowchart LR
-    subgraph data_plane["Streaming data plane"]
-        caller["Caller WASM"] -->|"logical HTTP"| source_engine["Source wr-engine<br/>WASI HTTP interception"]
-        source_engine -->|"loopback"| proxy_a["wr-proxy A"]
-        proxy_a --> route{"Selected instance<br/>location"}
-        route -->|"local"| local_engine["Local wr-engine"]
-        route -->|"peer"| proxy_b["wr-proxy B"]
-        proxy_b -->|"local"| remote_engine["Remote wr-engine"]
-        local_engine --> destination["Destination WASM"]
-        remote_engine --> destination
-    end
-
-    subgraph control_plane["Control plane"]
-        postgres[("Shared PostgreSQL")] <--> managers["Active-active<br/>wr-manager cluster"]
-    end
-
-    proxy_a -.->|"engine registration, readiness,<br/>and deployment identity"| managers
-    managers -.->|"route sync and scheduled jobs"| proxy_a
+    code["Application code"] --> sdk["wr-sdk"]
+    sdk --> component["WebAssembly component"]
 ```
 
-The proxy streams internal and cross-node request and response bodies without
-buffering. Public ingress is a separate trust boundary: it strips reserved
-headers, buffers one bounded request body, and transcodes supported protobuf,
-canonical protobuf JSON, or flat form input to validated protobuf wire bytes.
+### Connect modules as services
+
+Modules call one another through logical service URLs. Wruntime discovers a
+healthy instance and routes the request within the same node or across the
+network to another node.
+
+```mermaid
+flowchart TB
+    caller["Orders module"]
+    runtime["Wruntime routing"]
+    destination["Healthy inventory instance<br/>on this node or another node"]
+
+    caller -->|"logical service call"| runtime
+    runtime --> destination
+```
+
+### Use managed capabilities
+
+Modules access infrastructure through runtime-provided APIs rather than
+embedding service-specific integrations.
+
+```mermaid
+flowchart TB
+    module["Guest module"] --> runtime["Wruntime host APIs"]
+    runtime --> capabilities["PostgreSQL · object storage<br/>HTTP · secrets · tracing · LLMs"]
+```
+
+The full data-plane, control-plane, and cross-node request flows are described
+in [Architecture](docs/architecture.md).
 
 ## Scope
 

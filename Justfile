@@ -222,7 +222,7 @@ test-shared-dev-fixture: test-worktree-dev-fixture
 test-postgres-fixture-contract: test-worktree-dev-fixture
 
 # Native PostgreSQL tenant lifecycle/adversarial integration target.
-test-tenant-isolation-e2e:
+test-tenant-isolation-e2e: build-ecommerce build
     bash dev/test-tenant-isolation-e2e.sh
 
 # Run pure deployment E2E Python tests in the locked uv project
