@@ -10,9 +10,6 @@ Guest modules can use managed capabilities such as PostgreSQL, object storage,
 tracing, secrets, external HTTP, and language models without owning the
 underlying infrastructure integrations.
 
-> [!NOTE]
-> Wruntime is built with the assistance of LLM-based development tools.
-
 ## How it works
 
 ### Build application modules
@@ -91,7 +88,6 @@ A source checkout requires:
 rustup target add wasm32-wasip2
 
 just dev-up
-just certs
 just multi-node-inline
 ```
 

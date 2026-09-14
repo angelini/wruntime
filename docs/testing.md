@@ -1,246 +1,187 @@
 # Testing
 
-Maintainers should select checks by change class in the [validation matrix](agents/wruntime-maintainer/validation.md). This page documents command behavior and prerequisites.
+This page documents commands and prerequisites. Maintainers must also follow the
+change-class requirements in the
+[validation matrix](agents/wruntime-maintainer/validation.md).
 
-Common recipes:
-
-```bash
-just dev-up                    # create/reuse this worktree's dev stack
-just test-worktree-dev-fixture # hermetic musl/image/worktree-fixture contracts
-just multi-node              # run the local two-node topology until Ctrl-C
-just multi-node-inline       # start, verify, and stop the local topology
-just test                    # build test guests, then run all tests
-just test-integration        # build test guests, then run wr-tests
-just test-one <test_name>    # build test guests, then run one named test
-just build-wasm-guests       # build every WASM guest sequentially
-just test-wasm               # build WASM guests, then run host binding tests
-just test-tenant-isolation-e2e # consume-only native certificate/isolation behavior gate
-just clean-wasm-cache        # remove only the shared Cargo guest cache
-just validate-ecommerce      # ecommerce inline run, failing on WARN/WARNING output
-just bench-proxy-routing     # warmed HTTP/2 proxy routing/forwarding benchmark
-just validate-changed --explain # inspect conservative focused-feedback selection
-just test-validate-changed   # hermetic selector regression suite
-just validate-all --no-deployment-e2e # full local suite with an explicit live-stage skip
-just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e # Pi sandbox
-just validate-all --deployment-e2e    # trusted runner: require both live deployment backends
-just deployment-e2e-python-test       # locked provider/assertion unit tests
-just test-lifecycle-runners            # foreground runner/barrier/reaping fixtures
-just test-one migration_test          # real DB migration history and constraints
-just test-one job_migration_test      # embedded queue schema and inventory indexes
-just test-one worker_test             # queue queries, cursor, summary, retry races
-just test-one operation_test          # manager evidence/authority/restoration transactions
-just test-one manager_test            # role-gated mTLS and job delegate registration
-just test-one multi_manager_test      # shared-DB manager loss/takeover behavior
-just test-one node_agent_operation_test # deterministic agent lease/inspection/retry/effect tests
-just test-one lifecycle_test          # signal-driven lifecycle and retained Child proof
-just test-one proxy_test
-just test-one version_test
-cargo test -p wr-cli cmd::jobs        # jobs validation, redaction, binary export policy
-just deployment-e2e-preflight         # non-mutating Proxmox target verification
-just dev-down                # stop dev infrastructure
-```
-
-`just test`, `just test-integration`, `just test-one`, and `just test-wasm`
-first rebuild the test WASM guest artifacts incrementally, then verify this worktree's
-fixture and export its published `WRT_TEST_DB_URL` and `WRT_TEST_S3_*` values. This
-prevents changed guest sources or schemas from running against stale staged components.
-Run `just dev-up` from the same worktree before using those full recipes.
-
-Each linked worktree owns one greenfield PostgreSQL 18 native-SSL Compose stack. The
-locator canonicalizes `git rev-parse --path-format=absolute --absolute-git-dir` and
-uses `<git-dir>/wruntime-dev-state`. A persistent atomically claimed slot under the
-common Git directory assigns a disjoint local port block, while the canonical Git-dir
-hash assigns project name `wruntime-dev-<id>`. Compose-project scoping isolates
-containers, networks, and volumes; the port block isolates PostgreSQL, RustFS, LGTM,
-and local manager/proxy/engine listeners. Different worktrees therefore run DB tests
-and local E2Es concurrently without a cross-worktree lock. The small fixture lifecycle
-lock protects only setup, teardown, and destructive reset within one worktree.
-
-`owner.json` and `fixture/ready.json` bind the worktree/Git identities, slot, Compose
-project, published endpoints, source, normalized provisioning, migration inventory,
-artifact, PKI, daemon/musl target/toolchain, `wr-cli` binary, two-file context, exact
-provisioner image, and PostgreSQL base-image digests. The explicit source hash includes
-relevant uncommitted/untracked bytes rather than commit identity. Host `just dev-up`
-creates or reuses only that worktree's compatible generation, using the worktree's
-ordinary `target/` and Cargo cache for the daemon-matched `cargo zigbuild`. Provision,
-migration, validation, and bucket setup finish before atomic publication. Run
-`just test-worktree-dev-fixture` for the hermetic identity, port, image, and provenance
-contracts. Consumers fail before database access when state is missing or mismatched. Host
-`just dev-up` reuses a compatible generation and destructively replaces missing,
-partial, or incompatible state in the same worktree.
-Content-addressed provisioner images may be reused by Docker across projects and are
-not deleted when one worktree stack is replaced. The cutover does not automatically remove
-the legacy singleton `wruntime-dev` project; after confirming no old checkout uses it,
-remove that project explicitly with its former Compose file if desired.
-
-Inside Pi, `test-tenant-isolation-e2e` and all examples are consume-only. They derive
-the worktree state automatically, read its published endpoints, and never invoke
-Docker, provisioning, migration, reload, or server-configuration discovery. The gate
-proves mapped login, same-namespace access, cross-namespace/platform and owner/DDL
-denial, bounded fresh sessions, production engine readiness, and absence of admin
-material in engine environments. Host `dev-up` owns development setup proof. Protected
-deployment E2E independently owns deployment-host map install/reload/rollback and is
-the only globally serialized test stage. The embedded
-manager and engine job schemas are each a single clean V1 baseline; old Refinery
-history/checksums are unsupported. Use `just dev-reset-db` to destroy and recreate
-manager and job persistence before testing binaries with a changed baseline.
-
-`just bench-proxy-routing [iterations] [warmup] [concurrency]` runs only the proxy-to-stub benchmark. It creates one HTTP/2 client, warms its connection before measurement, and reuses it for sequential and concurrent requests. The default dimensions are `500 10 20`; explicit positional values are preserved. `just bench [iterations] [warmup] [concurrency]` applies the same dimension contract to the full benchmark test target. `cargo test -p wr-proxy --features count-allocations direct_selection_core_is_allocation_free_for_eight_candidates` runs the vetted `allocation-counter` gate after a warm routing-core call; selector parsing is checked separately because `semver::VersionReq` parsing is not part of that zero-allocation selection boundary.
-
-Release-cleanup coverage spans `migration_test` (the complete fresh V1 catalog, constraints, triggers, and singleton rows), `operation_test` (terminal rollout commit, staged-allocation protection, transaction-local generation fencing, periodic materialization, exact accounting, and retry), `node_agent_operation_test` (renewal cancellation, generic-work priority, process-local result-loss idempotency, and fresh-activation inspection), `multi_manager_test` (ordered `SKIP LOCKED` batching and takeover), and `manager_test` (five dedicated RPC authorization paths plus degraded status projection). DB-backed skips do not satisfy this evidence.
-
-Job-administration DB tests require Postgres and exercise the clean V1 inventory indexes and direct dead/claim-state constraints, filter-bound keyset pages, summaries, inspection lifecycle validation, persistence size boundaries, retry races, and worker notification. Transport/security qualification proves distinct server/client roots and profiles, exhaustive manager RPC authorization, queue scope, and engine admission only for an enrolled, non-revoked same-cluster manager workload URI principal; human, proxy, node-agent, wrong-cluster, unmapped, revoked, and server-only leaves are denied. It also covers maximum-size inspection across both hops, pre-dispatch-only read failover, deterministic mutation selection, and no retry replay. Deployment changes require protected Systemd qualification.
-
-Manager-set deployment tests additionally prove immutable binary/OCI and backend-spec evidence, unchanged selectors throughout staging and `FAILED_PRE_CLOSE`, post-`OLD_CLOSED` atomic descriptor selection, digest refusal, bounded sole-manager continuation, multi-manager control-endpoint preservation, and protected roots/config/credential modes. The Pi sandbox command explicitly skips this protected deployment proof; it is not a passing substitute.
-
-Direct `cargo test -p wr-tests` runs are allowed for quick local checks.
-DB-backed tests use `WRT_TEST_DB_URL` and skip through the shared helper policy when it is absent. A skip is useful for unrelated local work but is **unmet evidence**, not a passing result, when migration or durable manager semantics changed. S3-backed tests use `WRT_TEST_S3_ENDPOINT`,
-`WRT_TEST_S3_ACCESS_KEY`, and `WRT_TEST_S3_SECRET_KEY`; direct S3-backed cargo
-tests require those variables because the current blobstore helper expects
-them. Required WASM artifacts must be built before direct WASM host binding
-test runs. The LLM guest protocol uses protobuf enums for stop reasons, stream
-events, and error kinds, while the DB guest protocol uses `oneof` parameter and
-column values rather than JSON strings. Positive-path tests can use `RpcPath`
-and `GuestHarness::dispatch_typed`; raw request helpers remain available for
-malformed-input coverage.
-
-Rust guest builds launched by `wr-cli` use the mandatory shared Cargo target
-at `target/wasm-guests`. Each configured guest-local `wasm_path` is a staged,
-stripped runtime artifact; Cargo's unmodified build output remains in the
-shared target. `just build-wasm-guests` resolves every repository guest and
-builds them sequentially in one CLI invocation.
-
-`just clean-wasm-cache` removes only `target/wasm-guests`, not staged guest
-artifacts. Root `cargo clean` removes the whole root `target/` tree, including
-the shared cache. Running `cargo clean` inside an individual guest does not
-clear the shared cache unless Cargo is explicitly given that target directory.
-Deleting a staged guest artifact does not require a cache reset: the next CLI
-guest build recreates it from the shared artifact. Existing guest-local target
-directories containing old Cargo intermediates may be deleted once; subsequent
-CLI builds recreate only the configured staged output directories there.
-
-WASM host binding tests require:
-
-- `rustup target add wasm32-wasip2`
-- `protoc`
-- `wasm-tools`
-- Postgres and RustFS from `just dev-up`
-
-Example inline scripts require the built workspace binaries, the same dev
-infrastructure, and Python 3 for small JSON/config rendering and assertions.
-The multi-node smoke test requires Postgres but not RustFS. `just test-lifecycle-runners` uses focused OS-process and local gRPC fixtures for `dev run` argument validation, fixed startup order and within-wave concurrency, READY activation and exit-before-ready tails, the shared routing deadline and scenario gate, zero-descendant one-shot success, unexpected-service scenario-tree cleanup, primary/cleanup/both-failure reporting, recorded-signal spawn guards, subprocess parent-death protection, and a controlled post-boundary exit that proves reap-before-return while retaining terminal evidence. Real SIGINT fixtures run serially and cover interruption during readiness, routing convergence, no-scenario monitoring, plus second-signal scenario escalation. The runner retains every service `Child` and the scenario process group until reaping proves exit; the fixtures also assert that no owned descendant, state socket, lock, or persistent process state remains. Repository example Just recipes build artifacts first, then each run script makes one foreground `dev run` call with its scenario. The codegen example uses `wr-cli invoke --json` and Python stdlib JSON parsing; no `jq` dependency is required.
-
-### Change-based focused feedback
-
-Use `just validate-changed [--base REF] [--explain] [validate-all flags]` for fast, conservative feedback. The base defaults to local `HEAD`; refs are resolved locally and are never fetched. `--explain` prints the requested and resolved base, deterministically shell-quoted paths, selection reason, and prospective commands without running validation. `just test-validate-changed` runs the selector's isolated temporary-repository tests.
-
-A stable homogeneous change set can select one focused profile:
-
-- `docs`: whitespace checking, workspace formatting, and a manual link/navigation reminder;
-- `workspace`: whitespace, formatting, check, lint, and tests;
-- `wasm`: workspace and guest formatting/linting, checks, all-guest WASM build, and tests.
-
-Focused profiles reject all `validate-all` passthrough flags and do not run `dev-up`. Start Postgres and RustFS with `just dev-up` before focused integration tests that need them; Pi callers use the existing services exposed inside the sandbox. No changes succeeds without dispatch. Unknown or cross-cutting paths, mixed focused ownership, selector files, root agent-guidance files, and the testing/validation policy documents select `full`; deployment-sensitive paths select `protected-full` and require `--deployment-e2e`. Broad selections delegate exactly once to the authoritative `validate-all` command, preserving allowed flags and their order.
-
-The selector examines committed-since-base, staged, unstaged, deleted, renamed, and non-ignored untracked paths. It only permits focused success for a stable before/after fingerprint; changing, unreadable, or otherwise uninspectable inputs fail or conservatively fall back to the broad gate. It performs no Cargo dependency or per-test impact analysis, uses no success cache, and supplies feedback rather than pre-merge evidence. Continue to run every change-sensitive command from the [validation matrix](agents/wruntime-maintainer/validation.md).
-
-For ordinary broad evidence, use `just validate-all --no-deployment-e2e` only when an explicit deployment skip is valid. Pi uses `just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e` and still runs multi-node, ecommerce, and stockmarket. Protected changes require `just validate-all --deployment-e2e` on the trusted runner; a local skip is not equivalent evidence.
-
-`just validate-all` is a thin alias for `dev/validate-all.sh`. The script
-orchestrates existing Just recipes for formatting, compile checks, lints, WASM
-guest builds, Rust tests, and semantic-lifecycle E2E examples. All guests are built
-through one sequential `just build-wasm-guests` invocation so independent
-Cargo processes never contend on the worktree target during that stage. Examples
-remain sequential within one validation run because they intentionally reset that
-worktree's example database and buckets. Different worktrees use disjoint Compose
-resources and listener ports, so their full validation runs may proceed concurrently
-without a local-E2E or database-consumer lock. Logs and `summary.txt` are
-written under `target/validate-all/<timestamp>-<pid>/`; terminal
-failure output is capped for agent-friendly context use. Codegen E2E runs only
-when `ANTHROPIC_API_KEY` is set by default; use `--codegen-e2e` to require it
-or `--no-codegen-e2e` to always skip it.
-
-The deployment lifecycle stage always requires an explicit choice. Trusted
-runners use `just validate-all --deployment-e2e`, which runs the single complete
-Systemd qualification before worktree-local examples. Local development uses
-`just validate-all --no-deployment-e2e`; the summary records one explicit
-`SKIPPED` row for that protected scenario. In the Pi sandbox (`DOTGEN_PI_SANDBOX=1`), use
-`just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e`: Docker
-cannot run there, but the existing development services are exposed. Only
-`ANTHROPIC_API_KEY` is unavailable for the local examples, so codegen is skipped
-while multi-node, ecommerce, and stockmarket still run. Do not pass `--no-e2e`
-in Pi. Outside Pi, `--no-e2e` affects only worktree-local examples, so it may
-be combined with `--deployment-e2e`. `--e2e-only` still requires an explicit
-deployment choice and runs the enabled E2E stages.
-
-Live deployment requires `flock`, `uv`, `cargo-zigbuild`, SSH, and `psql`; its
-protected-target lock remains the sole global test lock.
-Python dependencies and the Python 3.12 toolchain request are owned by the
-nested `dev/deployment-e2e` project through `pyproject.toml`, `.python-version`,
-and the checked-in `uv.lock`. Recipes and the lifecycle harness use
-`uv run --project dev/deployment-e2e --locked`, so no manually activated virtual
-environment or system `pip` installation is required. Protected runner inputs
-are `PVE_HOST`, `PVE_USER`,
-`PVE_TOKEN_NAME`, `PVE_TOKEN_VALUE`, `WRT_DEPLOY_E2E_SSH_KEY`,
-`WRT_DEPLOY_E2E_DB_URL`, and `WRT_SECRET_ENCRYPTION_KEY`. The three disposable
-VM targets and their baseline snapshots are configured in
-`dev/deployment-e2e.toml`. The dedicated SSH known-hosts file defaults to
-`~/.ssh/wruntime-e2e-known_hosts` and can be overridden with
-`WRT_DEPLOY_E2E_KNOWN_HOSTS`. Never pass protected input values in a checked-in
-config or transcript.
-
-The protected deployment gate additionally owns live co-located provisioning, exact map reload/rollback, mapped-CN login and wrong-CA/CN/login/owner/platform denials, reservation-before-worker timestamps, out-of-band `postgres-client` installation, stale/ambiguous readiness blocking, exact-artifact recovery, and worker admin-secret absence. A Pi `--no-deployment-e2e` result cannot supply this evidence.
-
-The Proxmox HTTPS client uses the Debian/Ubuntu OS CA bundle at
-`/etc/ssl/certs/ca-certificates.crt` instead of Requests' bundled `certifi`
-roots. Install the private Proxmox CA under `/usr/local/share/ca-certificates/`
-and run `sudo update-ca-certificates` before preflight. Set `PVE_CA_BUNDLE` to
-an alternate bundle path on other operating systems or runner layouts; TLS
-verification is never disabled.
-
-The Systemd scenario starts and ends with snapshot rollback and normally takes several
-minutes plus cross-compilation time. Manager deployment restarts/recreates the
-service and waits on the exact launcher-issued activation identity and manager service kind; node
-deployment and rollback wait on exact `VerifyDeployment` identity and conditions. Post-ready guest invocations run
-once. Expected unhealthy evidence uses `cluster wait` and therefore succeeds
-with a matching JSON snapshot rather than an expected non-zero display gate.
-The durable lifecycle path uses single-slot `wr-cli engines restart`, complete-inventory `wr-cli node deploy`, explicit `wr-cli node rollback`, `wr-cli operations` for status/resume/cancel, and an independently installed node-bound agent. The agent's typed Systemd adapter is the sole deployed workload effect and final-exit authority. Focused tests cover zero-to-N creation, exact no-effect submission, replacement, mixed add/retained/remove ordering, N-to-zero downtime protection, rollback, restart, request-token idempotency, activation/epoch fencing, ambiguous delivery, interruption/recovery, complete source restoration, per-slot authority, exact commit evidence, and coherent availability at every stop. The pure locked Python tests validate stable deployment JSON and scenario logging without infrastructure. `just test-lifecycle-runners` remains the local retained-`Child` and teardown proof; `just validate-ecommerce` must emit no `WARN` or `WARNING`, and host-binding changes require `just test-wasm`.
-
-Protected Systemd qualification is mandatory for generated deployment or remote lifecycle behavior. The protected run proves successful A→B→A, a harness-only post-close descriptor-digest fault ending in durable `FAILED_CLOSED`, rejection of active and stopped mixed-policy reset evidence, exact stopped/uniform-policy reset, `CLOSED_STARTUP` after reset, and a separate same-principal fresh rollout restoring `OPEN`. Reset itself is not success or admission evidence. The Python/contract seam checks fixture shape and command ordering without protected-host access and must never be cited as live evidence. A local `--no-deployment-e2e` run records an environmental skip; it does not prove this change class. Completion evidence is exactly `just validate-all --deployment-e2e` on the protected runner. In Pi, use exactly `just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e`; it must still run multi-node, ecommerce, and stockmarket.
-Per-task output, lifecycle state JSON, remote diagnostics, bundle inspections,
-and the final reset result are retained under `WR_VALIDATE_LOG_DIR` (or
-`target/validate-all/<timestamp>/`). Diagnostic collection failures are listed
-without replacing a primary failure; cleanup/reset failure makes a nominally
-successful run fail. Live runs must not be started unless all protected inputs
-are present. The provider never creates or deletes snapshots or VMs, and reset
-failures are fatal.
-
-Focused commands are `just deployment-e2e-python-test`, `just
-deployment-e2e-preflight`, `just deployment-e2e-systemd`, and `just deployment-e2e`. The locked Python test recipe
-runs the provider and JSON assertion `unittest` targets without Proxmox access.
-After intentionally changing Python dependencies, refresh the nested lock with
-`uv lock --project dev/deployment-e2e` and commit `pyproject.toml` and `uv.lock`
-together.
-
-The remaining polling in runner code is deliberately outside wruntime service
-readiness: codegen polls application task status, deployment waits for the SSH
-forward and PostgreSQL infrastructure under bounded deadlines, and the Proxmox
-provider waits for asynchronous platform tasks. These paths preserve typed last
-error/status evidence and must not be copied into service lifecycle gates.
-
-### Unified operation-target coverage
-
-Lifecycle-target changes require migration tests for the direct clean V1 target/detail/receipt/termination-evidence constraints and complete rollout, ownership, digest, narrow attestation, and cleanup catalog. The protected runner explicitly provisions clean-VM node-agent config, credentials, directories, backend prerequisites, executable, hardened unit, and initial expected policy before invoking the binary-only updater. Production credentials remain provisioning/certificate-lifecycle responsibility; interrupted updates are rerun from staged/expected/installed state and never roll policy or private material back automatically. Operation/service tests cover proxy-first ordering, exact tagged receipt retries, wrong kind/key/step rejection, restoration ambiguity, and multi-manager takeover. Node-agent/backend tests prove the observation asymmetry—engine targets emit slot observations while proxy targets emit only tagged step results—and the recovery boundary: a live activation retries the exact in-memory request before a new claim, while a replacement activation submits no stale result and follows manager-directed inspection. Tests also require query-error evidence to remain inconclusive with no duplicate protected mutation. Receipts are retained indefinitely in this scope, preserving same-activation response-loss idempotency. Protected deployment qualification verifies installation and generated units do not provision or grant write access to `wr-agent/state`; it remains required for coordinated schema and binary changes.
-
-## Dev infrastructure
-
-Docker Compose provides Postgres, Grafana/LGTM, and RustFS S3:
+## Common commands
 
 ```bash
-just dev-up                  # start all dev services
-just dev-down                # stop all dev services
-just dev-logs                # tail logs from all services
-just dev-logs postgres       # tail logs from a single service
-just dev-ps                  # show running container status
-just dev-reset-db            # drop module schemas, manager tables, migrations
+just build
+just check
+just test
+just test-integration
+just test-one <name>
+just test-wasm
+just test-wasm-one db
+just build-wasm-guests
+just test-tenant-isolation-e2e
+just test-lifecycle-runners
+just validate-ecommerce
+just docs-check
+just validate-changed
+just validate-changed --explain
+just validate-all --no-deployment-e2e
+just validate-all --deployment-e2e
 ```
+
+Use `just` with no arguments for the complete recipe list. `just test-one`
+accepts either an integration-test filename without `.rs` or a Cargo test-name
+filter. Test recipes build required WASM fixtures before invoking Cargo.
+
+`just docs-check` validates repository-local Markdown destinations and anchors
+and parses every fenced `toml` block. Runtime config tests additionally parse the
+marked manager, proxy, and engine examples with their owning Serde types, and
+CLI parser tests cover the documented operator command shapes.
+
+## Development services
+
+PostgreSQL, RustFS, and local observability run in a Docker Compose fixture:
+
+```bash
+just dev-up
+just dev-ps
+just dev-logs
+just dev-down
+```
+
+Run `just dev-up` from each worktree before tests that require PostgreSQL or
+RustFS. Each linked worktree receives an isolated Compose project, persistent
+port allocation, and state under `<absolute-git-dir>/wruntime-dev-state`.
+`owner.json` and `fixture/ready.json` bind that state to the worktree, endpoints,
+PKI, provisioning inputs, migrations, and provisioner artifact. Consumers fail
+before database access if the fixture is absent or incompatible; rerun host
+`just dev-up` in that worktree to replace it.
+
+Inside the Pi sandbox, Docker setup is intentionally unavailable. Tests consume
+the compatible host-prepared fixture exposed to the worktree. Do not attempt to
+provision or repair host infrastructure from the sandbox.
+
+`just dev-reset-db` destroys and recreates this worktree's manager and engine
+job persistence. Use it only when intentionally changing the clean embedded
+migration baseline. Tenant namespace state follows the separate offline
+provision/migrate workflow.
+
+## Prerequisites
+
+Workspace tests require Rust, Cargo, `just`, and `protoc`. WASM host tests also
+require:
+
+```bash
+rustup target add wasm32-wasip2
+```
+
+Install `wasm-tools` and start the development services before DB/S3-backed
+WASM tests. Direct `cargo test` does not build guest artifacts or export fixture
+environment variables; prefer the Just recipes unless the required artifacts
+and `WRT_TEST_DB_URL`/`WRT_TEST_S3_*` variables are already present.
+
+DB-backed tests skip under the shared helper policy when `WRT_TEST_DB_URL` is
+absent. Such a skip is not completion evidence for database, migration, or
+durable-operation changes.
+
+Examples require built workspace binaries, their WASM components, the same
+development fixture, and Python 3 for small rendering/assertion helpers. Codegen
+E2E additionally requires `ANTHROPIC_API_KEY`; its run scripts use Python's JSON
+support and do not require `jq`.
+
+## Focused validation
+
+`just validate-changed [--base REF] [--explain]` inspects committed-since-base,
+staged, unstaged, deleted, renamed, and untracked paths. It selects one
+conservative profile:
+
+- documentation: whitespace, workspace formatting, and `just docs-check`;
+- workspace Rust: formatting, check, lint, and tests;
+- WIT/SDK/engine/guest-host changes: workspace and guest checks plus WASM builds;
+- mixed, unknown, validation-policy, or deployment-sensitive changes: the
+  corresponding broad `validate-all` path.
+
+`--explain` prints the selected profile and commands without running them. The
+selector is feedback, not pre-merge evidence; it does not replace additional
+checks from the maintainer validation matrix.
+
+## Broad validation
+
+Local broad validation requires an explicit deployment choice:
+
+```bash
+just validate-all --no-deployment-e2e
+```
+
+In the Pi sandbox, run exactly:
+
+```bash
+just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e
+```
+
+This skips Docker startup, protected remote deployment, and codegen only. It
+must still run multi-node, ecommerce, and stockmarket E2E; do not pass
+`--no-e2e`.
+
+`validate-all` runs formatting, checks, lints, WASM builds, Rust tests, and the
+enabled E2E examples. Example stages are serial because they reset shared state
+within one worktree. Logs and `summary.txt` are written below
+`target/validate-all/<timestamp>-<pid>/`.
+
+## Change-specific gates
+
+Use the validation matrix for exact selection. Common additional requirements
+are:
+
+| Change | Additional gate |
+| --- | --- |
+| Host bindings, root WIT, SDK, build generator, or test guests | Focused `just test-wasm-one <target>`, then `just test-wasm`. |
+| Tenant provisioning, migration, or deployment | `just test-tenant-isolation-e2e`, provisioning/migration/namespace tests, `just test-wasm`, and affected examples. |
+| Runtime lifecycle or foreground runner | `just test-lifecycle-runners`, lifecycle/proxy/version tests, `just test-wasm`, and all local examples. |
+| Deployment generation, node-agent effects, or manager rollout | Protected `just validate-all --deployment-e2e`. |
+| Ecommerce runtime behavior | `just validate-ecommerce`; any `WARN` or `WARNING` fails. |
+
+A local `--no-deployment-e2e` result records an environmental skip. It cannot
+qualify deployment generation or remote lifecycle behavior.
+
+## Protected deployment runner
+
+Protected deployment uses three disposable Systemd hosts and a locked `uv`
+project under `dev/deployment-e2e/`. Before a live run:
+
+```bash
+just deployment-e2e-python-test
+just deployment-e2e-preflight
+just validate-all --deployment-e2e
+```
+
+The runner requires `flock`, `uv`, `cargo-zigbuild`, SSH, `psql`, and the
+repository-documented `PVE_*`, `WRT_DEPLOY_E2E_*`, and
+`WRT_SECRET_ENCRYPTION_KEY` environment values. Target definitions live in
+`dev/deployment-e2e.toml`; Python dependencies and versions live in the nested
+`pyproject.toml`, `.python-version`, and `uv.lock`.
+
+The live gate starts and ends with target reset and exercises manager and node
+Systemd lifecycle, database-host provisioning, deployment/rollback, ambiguous
+recovery, and manager failed-closed recovery. Do not run it without all
+protected inputs. The Python-only tests validate harness contracts but do not
+replace live evidence.
+
+## Local examples and foreground lifecycle
+
+Repository example recipes build guest artifacts before invoking one foreground
+`wr-cli dev run` owner. Useful commands are:
+
+```bash
+just multi-node-inline
+just validate-ecommerce
+just stockmarket-inline
+just codegen-inline
+```
+
+The foreground runner uses typed lifecycle identity and routing convergence,
+then owns scenario and service teardown. Focused lifecycle tests must leave no
+owned descendant or persistent supervisor state.
+
+## WASM build cache
+
+All repository guests share `target/wasm-guests`. `just build-wasm-guests`
+builds them sequentially. `just clean-wasm-cache` removes only that shared
+cache; `cargo clean` removes the entire root target tree. Deleting a staged guest
+artifact does not require clearing the shared cache—the next build recreates it.

@@ -58,4 +58,4 @@ The manager control API uses present/absent `google.protobuf.Timestamp` values f
 
 Job and schedule counts/durations use `uint32`. `SubmitJobRequest.timeout_secs` and `max_attempts` reserve zero as an explicit configured-default sentinel; schedule interval/timeout/attempt fields must be non-zero. `GetJobStatusResponse.status` is the closed `JobState` enum (`PENDING`, `RUNNING`, `COMPLETE`, `DEAD`) rather than a free-form string.
 
-These field-type changes intentionally break wire compatibility with older control-plane clients while the API remains pre-release. Upgrade managers, proxies, engines, and CLI clients together; mixed-version rolling upgrades are not supported for this transition.
+The control-plane API is pre-release. Managers, proxies, engines, and CLI clients must run compatible protobuf contracts; mixed incompatible versions are unsupported.

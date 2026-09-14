@@ -29,7 +29,7 @@ pub struct EngineConfig {
     pub modules: Vec<ModuleConfig>,
     /// Optional PostgreSQL settings for per-namespace guest connection pools.
     pub database: Option<DatabaseConfig>,
-    /// Delegation-CA-authorized job administration listener. Required with `[database]`.
+    /// Manager-workload-authorized job administration listener. Required with `[database]`.
     pub job_admin: Option<JobAdminConfig>,
     /// Optional S3-compatible blobstore shared across blobstore-enabled modules.
     pub blobstore: Option<BlobstoreConfig>,
@@ -1244,5 +1244,23 @@ worker_max_attempts = 0
             config.modules[0].execution().unwrap(),
             super::ExecutionMode::Service
         ));
+    }
+
+    #[test]
+    fn documented_engine_example_uses_the_runtime_parser() {
+        let docs = include_str!("../../docs/configuration.md");
+        let snippet = docs
+            .split_once("<!-- parser-example:engine -->")
+            .unwrap()
+            .1
+            .split_once("```toml\n")
+            .unwrap()
+            .1
+            .split_once("\n```")
+            .unwrap()
+            .0;
+        let config: EngineConfig = toml::from_str(snippet).unwrap();
+        assert_eq!(config.node.peer_address, "https://node-a:9443");
+        assert_eq!(config.modules.len(), 2);
     }
 }

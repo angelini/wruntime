@@ -38,7 +38,7 @@ impl wr_sdk::ServiceGuest for Component {
 }
 ```
 
-Use `_router` directly when combining generated protobuf RPCs with manual HTTP endpoints. A configured proxy public alias does not pass raw JSON or form bytes to this code: public request transcoding validates those representations and delivers protobuf wire bytes. Manual endpoint dispatch is still useful when a guest intentionally owns a separate JSON/HTML request contract or emits JSON, HTML, redirects, or other non-protobuf responses. The [codegen coordinator](../../../examples/codegen/coordinator/src/lib.rs) demonstrates manual request/response handling, but its existing public-route script predates canonical `rpc_path` alias routing and is not a request-transcoding example.
+Use `_router` directly when combining generated protobuf RPCs with custom responses. A configured proxy public alias validates JSON or form input and delivers protobuf wire bytes on the canonical `rpc_path`. A guest may decode that normalized request and deliberately emit JSON, HTML, redirects, or another representation. The [codegen coordinator](../../../examples/codegen/coordinator/src/lib.rs) demonstrates this pattern: its public aliases transcode requests to protobuf while the coordinator returns guest-owned JSON responses.
 
 ## Ordinary client
 

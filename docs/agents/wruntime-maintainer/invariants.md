@@ -1,15 +1,14 @@
 # Runtime Invariants
 
-For each change, **preserve** the contract, **inspect** the listed implementation boundary, and **prove** it with focused tests.
+Preserve the relevant contract and inspect its implementation boundary. Select focused and broad proof from the [validation matrix](validation.md) instead of duplicating command lists here.
 
 ## Lifecycle and readiness
 
-- **Preserve:** manager, proxy, and engine startup/shutdown ordering; registrations begin with unhealthy routes; semantic readiness opens admission only after each service's documented barriers; engine provisioning, migrations, pools, component loading, module health checks, atomic manager publication, and local proxy routing-version convergence finish before `READY`; periodic engine/module heartbeats continue afterward.
+- **Preserve:** manager, proxy, and engine startup/shutdown ordering; registrations begin with unhealthy routes; semantic readiness opens admission only after each service's documented barriers. Tenant receipt verification, separate `wr__jobs` migrations, runtime pools, component loading, module health checks, manager publication, and local proxy routing convergence finish before engine `READY`; periodic heartbeats continue afterward.
 - **Preserve:** lifecycle state remains distinct from cluster health severity. Every long-lived, listener, connection, module-request, worker, LISTEN, recovery, scheduler, discovery, and heartbeat task is owned and joined. Drain closes the relevant admission before teardown, worker claims stop before waiting, route withdrawal converges before engine HTTP admission closes, heartbeat publication is fenced before drain/deregister, and final deregistration cannot be undone by stale proxy state.
 - **Preserve:** each signal-driven stop operation uses one absolute 30-second deadline; nested convergence, admission, deregistration, and join waits never reset it. Generated Systemd units provide 45 seconds for signal-driven full shutdown, use semantic readiness notification/probes and SIGTERM, and stop engines before their proxy. Deadline escalation aborts and joins named leftovers and exits non-zero. Lifecycle RPC is read-only status; service-specific drain phases remain internal.
 - **Preserve runner ownership:** one scoped foreground `dev run` owner retains every local service `Child`, detects unexpected exit, owns the optional scenario process group, and reaps concurrent engine, proxy, then manager waves. The 45-second per-process boundary latches terminal failure evidence; it does not permit dropping the sole handle, so the owner remains in reap-only mode until exit is proven. Startup is manager, proxies, engines; after engine READY the runner captures one manager routing version and requires every exact READY proxy activation to report at least that installed version. Runners use typed lifecycle/routing/deployment/health expectations rather than PID, TCP, logs, fixed sleeps, or expected-nonzero gates. A primary failure remains primary, while cleanup failure is separately reported and fails a clean run; no socket, lock, or persistent process state belongs to foreground orchestration. Local exit proof belongs to the retained `Child`; deployed exit proof belongs to the continuously fenced node agent's typed Systemd adapter. The agent sends SIGTERM through the backend owner and inspects the exact backend instance; endpoint absence is not exit proof and inspection failure is unknown.
 - **Inspect:** manager service/state/database and orchestration; proxy NodeService/routing/admission/listeners; engine `main.rs`/`server.rs`/`engine.rs`/`worker.rs`/`registry.rs`; lifecycle task ownership; `wr-cli/src/cmd/{dev,foreground_runner,lifecycle,helpers,node}.rs`; example/deployment runners; and deployment generation.
-- **Prove:** lifecycle, manager, health, proxy, version, worker, migration, multi-manager, CLI foreground-runner/expectation/node-stop, and deployment-template tests; `just test-wasm`; `just deployment-e2e-python-test`; warning-free local examples; and protected Systemd lifecycle qualification when generation or remote lifecycle behavior changes.
 
 ## Durable operator lifecycle
 
@@ -17,67 +16,54 @@ For each change, **preserve** the contract, **inspect** the listed implementatio
 - **Preserve:** destructive authorization comes only from manager mTLS leaf fingerprints mapped to operators or node-bound agents. Source/proxy headers are never authorization. The agent advertises only node/activation identity, its process-computed binary digest, exact protocol, backend kind, and normalized capabilities; required capabilities use subset matching. Manager receipt time, fresh activation, and lease epoch remain independent fences. Local config/paths/credentials and manager-owned cleanup retention never authorize claims; protocol mismatch requires binary-update remediation rather than compatibility behavior.
 - **Preserve:** a finalized deployment is the complete desired inventory; the manager derives deterministic sequential additions, retained replacements, and removals without caller-selected rollout mechanics. Exact unchanged identities cause no host effect, and a new actor/token submission of the exact committed revision succeeds immediately without deployment or authority mutation. `max_unavailable` uses coherent serving progress before every destructive stop; final-slot and empty-inventory transitions require explicit downtime acknowledgement. Restart is single-slot maintenance that preserves the committed revision/inventory. Pre-commit cancel/failure/deadline enters deadline-free restoration of the complete source inventory and authority before terminal state; rollback is separately authorized and never automatic. Commit occurs only after exact backend/lifecycle/registration/routing evidence and per-slot authority convergence and is terminally successful. Release cleanup is independent per-node maintenance: periodic reconciliation alone discovers/materializes exact manager-derived revision/digest authority, every protection-changing transaction immediately fences existing authority, renewable generation leases cancel stale effects, and cleanup degradation never poisons serving health.
 - **Inspect:** root protobuf, manager auth/service/operations/status/database and migrations, CLI operation/deploy/agent/backend code, deployment fixtures, and shared integration helpers.
-- **Prove:** migration; the zero-to-N, no-effect, replacement, mixed add/retained/remove, N-to-zero, rollback, restart, availability, restoration, ambiguity, and lease operation matrix; node-agent-operation; manager mTLS; multi-manager takeover; lifecycle/proxy/version integration; deterministic bundle/config/unit tests; pure deployment assertions; and protected Systemd qualification.
 
 ## Routing and circuit breaking
 
 - **Preserve:** routing-table versions increase with durable state updates; persisted state and proxy indexes converge; exact versions, semver ranges, and unpinned requests retain distinct selection semantics; unhealthy routes are excluded. Continuously active forwarding addresses retain their prepared breaker across refreshes; completed publication-plus-eviction is the reset boundary, and in-flight old handles remain isolated from later re-adds.
 - **Inspect:** manager routing persistence, proxy `routing.rs`, `indexed_routing.rs`, routing/forward layers, and circuit-breaker membership eviction.
-- **Prove:** version, proxy, concurrent-routing, circuit-breaker refresh/lifetime, and cross-node tests.
 
 - **Preserve:** local-engine, peer-proxy, public-ingress, and external-egress branches remain explicit. Egress cannot be mistaken for internal module routing, and circuit state applies to the correct destination.
 - **Inspect:** ingress, routing, forward, and egress layers plus node service.
-- **Prove:** ingress, egress, proxy, and cross-node tests.
 
 ## Trust and transport boundaries
 
 - **Preserve:** untrusted ingress cannot supply reserved `x-wr-*` headers; trusted layers set routing metadata; source metadata is observability/routing context, never authorization.
 - **Inspect:** ingress sanitization, engine outbound interception, proxy forwarding, and tests for header spoofing.
-- **Prove:** ingress, egress, namespace, and proxy tests.
 
 - **Preserve:** loopback engine/proxy listeners may use plain HTTP only on their documented boundary; manager gRPC and peer-proxy traffic use mTLS with identity validation. Manager liveness is derived only from PostgreSQL leases using server-side time; manager and proxy discovery thresholds are one cluster-wide contract, stale-row retention remains substantially longer than live membership, and cleanup cannot suspend self-renewal.
 - **Inspect:** manager/proxy/engine listener setup, TLS helpers/config, manager lease registration/heartbeat/reaping, and manager discovery fallback.
-- **Prove:** config, proxy discovery, cross-node, multi-manager, migration, and certificate/identity tests.
 
 ## Database, secrets, and capabilities
 
 - **Preserve tenant authority:** each namespace is a retained private database authorization boundary. A database-host-local offline provisioner owns database/role/schema/`pg_ident` convergence; immutable module migrations run through disposable bounded owner-capable logins and a platform ledger. Engines receive no admin credential or tenant password. Node-bound `postgres-client` certificates authenticate through PostgreSQL 18 native `hostssl cert map=wruntime_nodes`; manager inventory is not namespace authorization. Runtime roles cannot access other namespace/platform databases or owner/DDL/cluster capabilities. `search_path` is only default resolution, and same-namespace modules are mutually trusted.
-- **Preserve topology:** `database.url` remains the platform job-queue URL. Generated `database.tenant` contains only the explicit private endpoint, stable installed certificate paths, and non-secret expected state. Every DB-enabled namespace has one certificate-authenticated clean-recycled pool sized by checked instance contributions; every worker entry has one non-pooled platform `LISTEN` session. One-shot readiness connections disconnect before runtime pools are built. Host `just dev-up` maps daemon architecture, incrementally builds the matching Linux-musl `wr-cli` in the current worktree's Cargo target, verifies and packages it through a two-file content-addressed UID-70 no-pull image, and owns that worktree's PKI/server/map/provision/migrate setup. Each linked worktree derives `<absolute-git-dir>/wruntime-dev-state`, deterministic project `wruntime-dev-<id>`, and a persistent disjoint port slot; its records bind those identities plus source/manifest/artifact/PKI and full image provenance. DB tests and local E2Es take no cross-worktree lock. Pi consumes only its worktree's compatible host-prepared generation, while host `just dev-up` replaces only that worktree's incompatible or partial project state.
-- **Inspect:** manager DB/migrations/crypto, engine startup manifest/database runtime/pool/migration/provisioning/DB host modules, and namespace tests.
-- **Prove:** DB, namespace, migration, and secrets tests.
+- **Preserve topology:** `database.url` is the platform job-queue URL. Generated `database.tenant` contains only the private endpoint, installed certificate paths, and non-secret expected state. Every DB-enabled namespace has one certificate-authenticated clean-recycled pool sized by checked instance contributions; every worker has one non-pooled platform `LISTEN` session. One-shot readiness connections disconnect before runtime pools are built. Development fixture generation and worktree isolation are owned by the test infrastructure and must preserve the same production authority boundary.
+- **Inspect:** manager DB/migrations/crypto; offline PostgreSQL CLI provisioning and migration; engine startup manifest, tenant readiness, job migration, runtime pools, and DB host modules; and namespace tests.
 
 - **Preserve:** secret values never appear in manager APIs, logs, generated config, or guest metadata. Guests receive only resolved environment values for explicitly referenced secrets.
 - **Inspect:** manager secret storage/RPCs, engine registration/environment construction, CLI secret commands.
-- **Prove:** secrets tests and log/diff review.
 
 - **Preserve:** a guest's WIT imports and module capability opt-ins are validated before startup; host implementations still enforce authorization, scope, input, and resource limits as defense in depth.
 - **Inspect:** engine component import validation, config, state, and each capability host implementation.
-- **Prove:** split WASM capability tests, including negative fixtures.
 
 ## Workers and schedules
 
 - **Preserve:** job claims atomically persist a fence plus fixed `lease_expires_at`; stale completion/failure/recovery transitions require the active fence and clear claim metadata; retries honor attempt/timeout policy; delivery is at least once, so handlers must be idempotent. One recovery coordinator runs per engine after queue migration, remains safe alongside other engines, and progresses independently of module worker loops.
 - **Inspect:** engine database runtime/job migrations/`worker.rs`, manager `scheduler.rs`, control-plane proto, SDK jobs, and worker client generator.
-- **Prove:** worker, scheduler, and schedules tests.
 
 - **Preserve:** a non-empty ad-hoc worker version is claimed exactly; an empty ad-hoc version is name-only; manager schedules remain version-pinned. Canonical job types use `/{package}.{Service}/{Method}`.
 - **Inspect:** proxy version headers, SDK jobs, `WrWorkerClientGenerator`, scheduler persistence.
-- **Prove:** worker, schedule, and version tests.
 
 - **Preserve job administration:** every operation has explicit queue scope. Engines sharing one physical `wr__jobs` database use one stable queue ID; different databases use different IDs. `JobService` shares the manager's unified mTLS listener and is default-deny under URI-principal policy. Manager-to-engine calls use the manager's distinct clientAuth workload leaf; engines require an enrolled, non-revoked same-cluster manager principal from a fresh snapshot. Routing/source headers never authorize either hop. The manager stores only delegate metadata and never opens the queue database. Reads qualify delegates before dispatch; mutations qualify one deterministic delegate and never replay. List is metadata-only and bounded; inspect is the only byte-disclosing operation. Compatible size ceilings apply across persistence and transport. Persisted lifecycle corruption fails closed. Retry locks one dead row, resets attempt/terminal/claim state, preserves last failure, notifies before commit, and is never replayed after uncertainty. Engine shutdown closes and drains admitted admin RPCs before route withdrawal.
 - **Inspect:** control-plane proto, manager auth/delegate selection, engine job-admin listener/queue SQL, V3 inventory indexes, CLI redaction/export, and deployment certificate/address generation.
-- **Prove:** job migration, worker query/summary/retry-race, manager registration/delegate, job-admin mTLS/forwarding, CLI, and protected deployment tests.
 
 ## Migrations and generated contracts
 
 - **Preserve:** manager migrations are embedded control-plane migrations under their advisory-lock policy. Engine job-queue migrations are embedded, use a distinct detached-session lock/history in `wr__jobs`, and complete before workers, recovery, or readiness.
 - **Inspect:** `wr-manager/src/migrate.rs`, manager migrations, `wr-engine/src/{startup_db,job_migration,tenant_db}.rs`, `wr-cli/src/postgres/`, engine job migrations, and guest configs/migrations.
-- **Prove:** migration and startup/health tests plus affected example.
 
 - **Preserve module migration policy:** bundle construction authenticates canonical migration bytes and the manager revision digest. Provision and migrate finish before worker mutation; failed/ambiguous ledger state blocks readiness until one explicit exact-artifact approval. Engines verify but never execute module migrations. Manager and job-queue migrations retain separate embedded policies.
 - **Preserve:** canonical protobuf/WIT sources fan out consistently; generated `OUT_DIR` Rust is never edited; WIT mirrors and checked-in descriptors stay synchronized.
 - **Inspect:** [generated contracts](generated_contracts.md).
-- **Prove:** compile checks, generator unit tests, `just test-wasm`, and affected example builds.
 
 ## Manager fleet rollout
 
@@ -85,24 +71,19 @@ For each change, **preserve** the contract, **inspect** the listed implementatio
 - **Preserve reset boundary:** only the recorded owner may reset the exact active `FAILED_CLOSED` declaration. Evidence covers every declared source/target role, proves every process stopped, and reports one uniform nonzero installed policy. The replay-stable receipt clears only the active guard and grants one same-principal fresh-rollout permit; it does not certify success, change accepted policy, select artifacts, or open admission. A distinct successful fresh rollout must consume the permit.
 - **Preserve protected state:** Systemd binaries and unit specifications are digest-qualified, roots are fixed under `/etc/wruntime/pki/roots`, immutable credential sets stay outside releases, and manager/node-agent config retains only `current.toml` and `previous.toml`. Sensitive transfer uses unpredictable owner-only staging, verified mode/digest, atomic install, parent fsync, and invocation-owned cleanup.
 - **Inspect:** `wr-cli/src/cmd/{manager_deploy_set,managers,helpers,service_gen}.rs`, manager rollout services/database, deployment fixtures, and protected Systemd assertions.
-- **Prove:** focused CLI/manager tests, deployment Python tests, selector/digest failure fixtures, and `just validate-all --deployment-e2e` on the protected runner.
 
 ## Telemetry and operations
 
 - **Preserve:** trace context propagates across guest, proxy, peer, and engine boundaries; stable attribute names retain meaning and avoid secrets/high-cardinality surprises.
 - **Inspect:** proxy tracing layer, engine tracing host/interception, SDK tracing helpers.
-- **Prove:** tracing host and integration tests; inspect emitted telemetry when semantics change.
 
 - **Preserve:** ecommerce E2E emits no warnings. Deployment generation is deterministic for the same inputs, and Systemd output preserves deterministic identity, TLS, config, paths, and lifecycle behavior.
 - **Inspect:** `dev/validate-all.sh`, example scripts, CLI bundle/deploy generation, deployment templates.
-- **Prove:** `just validate-ecommerce`; deployment tests and repeated-output diff.
 
 ## Tests and examples
 
 - **Preserve:** shared helpers live under `wr-tests/tests/helpers/`; WASM guests are protocol/negative-test fixtures, not production scaffolds; prerequisite-based skipping remains explicit and consistent.
 - **Inspect:** helper modules, split WASM tests, Just recipes, and test fixture manifests.
-- **Prove:** affected focused tests through the same recipe users run.
 
 - **Preserve:** ecommerce, stockmarket, and codegen examples are executable specifications. Advertised configurations, APIs, schemas, migrations, and run scripts must agree.
 - **Inspect:** all files in the affected example and linked guest documentation.
-- **Prove:** build and inline recipe for that example; use `just validate-ecommerce` for ecommerce.

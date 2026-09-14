@@ -250,7 +250,7 @@ none)
 docs)
 	print_command git diff --check "$base_oid" --
 	print_command just fmt-check
-	printf '  %s\n' 'manual: review documentation links and navigation'
+	print_command just docs-check
 	;;
 workspace)
 	print_command git diff --check "$base_oid" --
@@ -302,7 +302,7 @@ case "$profile" in
 docs)
 	run_command git diff --check "$base_oid" --
 	run_command just fmt-check
-	printf '%s\n' 'manual: review documentation links and navigation'
+	run_command just docs-check
 	;;
 workspace)
 	run_command git diff --check "$base_oid" --

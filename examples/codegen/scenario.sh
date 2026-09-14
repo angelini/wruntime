@@ -29,22 +29,20 @@ print(value)' "$field"
 
 if [ "$INLINE" = true ]; then
 	echo "==> Creating codegen task (worker will process it automatically)..."
-	CREATE_OUTPUT=$(just cli invoke --json \
-		--proxy "http://127.0.0.1:${WRT_PROXY_PORT}" \
-		--destination http://codegen.coordinator/codegen.CoordinatorService/CreateTask \
-		--source test --source-ns codegen \
-		--body '{"repo_url":"https://github.com/dtolnay/anyhow","doc_sources":[{"source_type":"DOC_SOURCE_TYPE_DOCS_RS","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}')
+	CREATE_OUTPUT=$(curl --fail-with-body --silent --show-error \
+		-X POST "http://127.0.0.1:${WRT_EXTERNAL_PORT}/tasks" \
+		-H 'Content-Type: application/json' \
+		-d '{"repo_url":"https://github.com/dtolnay/anyhow","doc_sources":[{"source_type":"DOC_SOURCE_TYPE_DOCS_RS","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}')
 	echo "$CREATE_OUTPUT"
 
-	TASK_ID=$(printf '%s\n' "$CREATE_OUTPUT" | json_field taskId)
+	TASK_ID=$(printf '%s\n' "$CREATE_OUTPUT" | json_field task_id)
 	echo "==> Polling task ${TASK_ID}..."
 
 	while true; do
-		if ! TASK_OUTPUT=$(just cli invoke --json \
-			--proxy "http://127.0.0.1:${WRT_PROXY_PORT}" \
-			--destination http://codegen.coordinator/codegen.CoordinatorService/GetTask \
-			--source test --source-ns codegen \
-			--body "{\"task_id\":\"${TASK_ID}\"}" 2>&1); then
+		if ! TASK_OUTPUT=$(curl --fail-with-body --silent --show-error \
+			-X POST "http://127.0.0.1:${WRT_EXTERNAL_PORT}/tasks/status" \
+			-H 'Content-Type: application/json' \
+			-d "{\"task_id\":\"${TASK_ID}\"}" 2>&1); then
 			echo "ERROR: failed to poll task ${TASK_ID}" >&2
 			echo "$TASK_OUTPUT" >&2
 			exit 1
@@ -78,10 +76,12 @@ All services running. Press Ctrl-C to stop.
 Create a task (returns immediately, processing starts in background):
   curl -X POST http://127.0.0.1:${WRT_EXTERNAL_PORT}/tasks \
     -H 'Content-Type: application/json' \
-    -d '{"repo_url":"https://github.com/dtolnay/anyhow","doc_sources":[{"source_type":"docs_rs","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}'
+    -d '{"repo_url":"https://github.com/dtolnay/anyhow","doc_sources":[{"source_type":"DOC_SOURCE_TYPE_DOCS_RS","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}'
 
 Poll task status until complete:
-  curl http://127.0.0.1:${WRT_EXTERNAL_PORT}/tasks/{task_id}
+  curl -X POST http://127.0.0.1:${WRT_EXTERNAL_PORT}/tasks/status \
+    -H 'Content-Type: application/json' \
+    -d '{"task_id":"{task_id}"}'
 USAGE
 
 trap 'exit 0' INT TERM

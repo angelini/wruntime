@@ -1,207 +1,209 @@
 # Architecture
 
-A **node** is one `wr-proxy` co-located with one or more `wr-engine` instances. Nodes are independent — each proxy handles its own inbound traffic and forwards cross-node requests directly to the peer proxy, which then routes locally to its engines.
+Wruntime runs WASI Preview 2 components as independently deployable modules. A
+node contains one proxy and one or more engines. Managers form an active-active
+control plane backed by shared PostgreSQL.
 
 ```mermaid
 flowchart TB
-    subgraph control_plane["Active-active control plane"]
-        direction TB
-        subgraph manager_cluster["Manager cluster"]
-            direction LR
-            manager_1["wr-manager 1"]
-            manager_2["wr-manager 2"]
-            manager_api["Manager gRPC API served by each manager<br/>registry, routes, schedules, deployment state"]
-            manager_1 --- manager_api
-            manager_2 --- manager_api
-        end
-        postgres[("Shared PostgreSQL<br/>writes serialized by row locks")]
-        manager_1 <--> postgres
-        manager_2 <--> postgres
+    subgraph control["Control plane"]
+        manager_a["wr-manager A"]
+        manager_b["wr-manager B"]
+        postgres[("Shared PostgreSQL")]
+        manager_a <--> postgres
+        manager_b <--> postgres
     end
 
     subgraph node_a["Node A"]
-        direction TB
-        proxy_a["wr-proxy A<br/>trace, route, egress, forward"]
-        engine_a["wr-engine A"]
-        order["order-service<br/>WASM module"]
+        proxy_a["wr-proxy"]
+        engine_a["wr-engine"]
+        module_a["WASM modules"]
         proxy_a <-->|"loopback HTTP"| engine_a
-        engine_a --- order
+        engine_a --- module_a
     end
 
     subgraph node_b["Node B"]
-        direction TB
-        proxy_b["wr-proxy B<br/>trace, route, egress, forward"]
-        engine_b["wr-engine B"]
-        inventory["inventory-service<br/>WASM module"]
+        proxy_b["wr-proxy"]
+        engine_b["wr-engine"]
+        module_b["WASM modules"]
         proxy_b <-->|"loopback HTTP"| engine_b
-        engine_b --- inventory
+        engine_b --- module_b
     end
 
-    proxy_a -.->|"engine registration and heartbeats"| manager_api
-    proxy_b -.->|"engine registration and heartbeats"| manager_api
-    manager_api -.->|"manager discovery and route snapshots"| proxy_a
-    manager_api -.->|"manager discovery and route snapshots"| proxy_b
-    proxy_a <-->|"mTLS peer HTTP"| proxy_b
+    proxy_a -.->|"authenticated control traffic"| manager_a
+    proxy_b -.->|"authenticated control traffic"| manager_b
+    proxy_a <-->|"peer mTLS"| proxy_b
 ```
 
 ## Components
 
-| Binary | Default port | Role |
-| -------- | ------------- | ------ |
-| `wr-manager` | `9000` mTLS gRPC | Registry, routing, policy, lifecycle, infrastructure, and job APIs on one listener. Stable URI-SAN principals and default-deny per-RPC policy separate human, deployment, proxy, node-agent, and manager workloads. PostgreSQL lease timestamps provide manager liveness. Registration transactionally verifies desired deployment and ownership before releasing credentials. |
-| `wr-proxy` | `9001` (HTTP) + `9002` (loopback control) + `9443` (peer mTLS) | Streaming header-based router. It authenticates to managers with its enrolled proxy principal and admits peer proxies only from a fresh, complete workload-policy snapshot. |
-| `wr-engine` | `9100` (loopback HTTP), configured job-admin mTLS port when DB-enabled | Loads WASM modules and host capabilities. Job administration admits only enrolled, non-revoked same-cluster manager workload principals. |
+| Binary | Default listeners | Responsibility |
+| --- | --- | --- |
+| `wr-manager` | `9000` mTLS gRPC | Registry, routing, policy, infrastructure, lifecycle, jobs, schemas, schedules, secrets, and PostgreSQL-backed manager membership. |
+| `wr-proxy` | `9001` loopback HTTP, `9002` loopback control, `9443` peer mTLS | Routes streaming requests to local engines, peer proxies, or allowed external hosts. Optional public ingress validates and transcodes request bodies. |
+| `wr-engine` | `9100` loopback HTTP and a configured manager-only job-admin mTLS listener | Loads components, enforces host capabilities, runs workers, and reports module health. |
+| `wr-cli node agent` | No listener | Pulls manager-authorized lifecycle work and applies typed Systemd effects for one node. |
 
-A **node** groups one `wr-proxy` with one or more `wr-engine` instances. `[node].proxy_address` and `[node].control_address` are explicit loopback URLs; `[node].peer_address` is the separately advertised mTLS URL used across nodes. Engines keep ephemeral process IDs but deployed configs also report a stable operator-supplied node ID, manager-assigned monotonic revision, immutable bundle digest, and stable engine slot. The manager persists desired revision history and verifies those identities against fresh heartbeats and healthy default routes.
+A module is identified by `(namespace, name, version)`. Calls use logical URLs
+such as `http://ecommerce.inventory/inventory.InventoryService/GetItem`; callers
+do not select an engine address.
 
-At component load, the engine inspects top-level WIT imports and rejects modules that import the DB, blobstore, or LLM host interfaces without enabling the corresponding module capability. Enabled capabilities are constructed as scoped bundles: DB access always carries its namespace pool, required module schema, timeouts, and telemetry policy; blobstore access always carries its runtime, namespace prefix, and limits. Host-side missing-capability and input validation remain defense in depth for raw generated bindings.
+## Trust boundaries
 
-Database authorization is a PostgreSQL database boundary per namespace. An offline, database-host-local provisioner creates retained namespace databases, stable owner/runtime/maintenance roles, bounded node logins, module schemas, and platform-owned readiness/migration records. PostgreSQL 18 native TLS requires a dedicated `postgres-client` node certificate; ordered `hostssl cert map=wruntime_nodes` rules map its Common Name only to that node's bounded runtime/readiness logins. The manager returns non-secret deterministic identities and does not authorize from deployment inventory or issue database passwords. Engines never receive cluster-administration credentials.
+Manager gRPC and peer-proxy traffic use mTLS. Manager authorization requires a
+valid client certificate, one project URI SAN, a policy role and scope, and a
+non-revoked leaf SHA-256 fingerprint. The manager uses a distinct client
+certificate when calling an engine's job-admin listener.
 
-Development preserves that authority boundary with one isolated Compose stack per linked worktree. Each caller derives `<absolute-git-dir>/wruntime-dev-state`, deterministic project identity `wruntime-dev-<id>`, and a persistent port slot claimed atomically under the common Git directory. Compose project scoping isolates containers, networks, and volumes; the slot isolates PostgreSQL, RustFS, LGTM, and local runtime listeners. `owner.json` and `fixture/ready.json` bind the worktree/Git identities, slot, source, normalized manifest, migration inventory, image, endpoints, and PKI digests. Host-side `just dev-up` maps the Docker daemon architecture, incrementally builds and verifies a matching Linux-musl `wr-cli` with that worktree's Cargo target/cache, packages only the binary in a content-addressed two-file-context image, and performs certificate generation, native server startup, active-map installation/reload, provisioning, migration, and validation. Consumers verify the published generation but take no cross-worktree database or local-E2E lock, so compatible or incompatible worktrees can run independently. Pi consumes only its worktree's artifacts and published loopback endpoints. Protected deployment independently proves its database-host sequence and remains globally serialized against the shared protected targets.
+Engine and proxy data/control listeners are plain HTTP only on the documented
+loopback boundary. Public ingress removes all caller-supplied `x-wr-*` headers
+before adding trusted routing metadata. Source and routing headers support
+routing and observability; they never grant authorization.
 
-Each DB-enabled namespace has one clean-recycled runtime pool sized by the checked sum of configured instance contributions. A module-specific `search_path` chooses the default schema but is not authorization; fully qualified access between modules in one namespace is allowed because those modules are mutually trusted. Other namespace databases, manager/job platform databases, owner authority, runtime DDL, and dangerous cluster capabilities remain denied. Availability limits are best-effort against a malicious guest; confidentiality and integrity boundaries do not claim provider-enforced CPU, storage, or WAL isolation.
+Guest capabilities are opt-in. Before loading a component, the engine compares
+its WIT imports with the module's configured database, blobstore, and LLM
+capabilities. Host implementations still enforce scope, input limits, and
+resource limits on every call.
 
-Module migrations are immutable release artifacts executed offline by a disposable, bounded owner-capable login before node deployment. A platform ledger records exact hashes and ambiguous outcomes; a `started` or failed attempt blocks readiness until an operator explicitly approves retry of that exact artifact. Engine startup reconciles manager identities with node-local expected generation/digests, performs one-shot read-only readiness checks, disconnects, then builds runtime pools. Engine-owned `wr__jobs` migrations remain a separate platform-database policy and complete before worker loops or readiness. Claims atomically persist a fence and fixed lease expiry derived from the submitted job timeout. One recovery coordinator per engine reclaims expired leases; multiple engines remain safe through row locking and fenced updates.
+## Tenant database lifecycle
 
-Queue administration preserves that ownership. `JobService` shares the manager's single mTLS listener and is authorized by the same URI-principal policy matrix, including explicit queue scope. The manager uses its distinct `clientAuth` workload certificate to reach `EngineJobAdminService`; the engine verifies the manager principal against its fresh workload snapshot and leaf-fingerprint revocations. The manager never opens the queue database. Reads may fail over only before dispatch, while mutations select one deterministic delegate and never replay. Routing headers are not authorization. Engine shutdown closes and drains job admission before route withdrawal and deregistration.
+Tenant data uses one retained PostgreSQL database per namespace. This is an
+authorization boundary; a module's `search_path` is only default name
+resolution. Modules in one namespace are mutually trusted, while runtime roles
+cannot access other namespace databases, platform databases, owner/DDL powers,
+`wr__jobs`, or `wr_system`.
 
-## Service lifecycle and readiness
+Tenant administration is offline and database-host-local:
 
-Every service exposes the monotonic process stages `STARTING → READY → STOPPING` through the read-only `LifecycleService`. Lifecycle is a process-stage contract, not cluster availability: manager lease and route/module health remain in `GetClusterStatus`. Process owners initiate graceful shutdown with SIGTERM or SIGINT; route withdrawal and draining remain internal stop phases rather than lifecycle RPC states.
+1. `wr-cli node reserve-deployment` creates the manager-bound revision identity
+   without changing a worker node.
+2. `wr-cli postgres provision` converges namespace databases, roles, schemas,
+   and PostgreSQL certificate mappings.
+3. `wr-cli postgres migrate` executes immutable module migrations with bounded,
+   disposable owner-capable logins and records their hashes in a platform
+   ledger.
+4. Deployment installs a dedicated `postgres-client` node certificate and
+   generated `[database.tenant]` state outside the release.
+5. Registration returns resolved application secrets and deterministic,
+   non-secret namespace access descriptors. The manager neither creates tenant
+   credentials nor provisions PostgreSQL.
+6. Engine startup compares those descriptors with node-local expected state,
+   uses a one-shot readiness login to verify provisioning and migration
+   receipts, disconnects, and then creates certificate-authenticated runtime
+   pools.
 
-Readiness barriers are service-specific:
+`database.url` is separate platform configuration for the engine's `wr__jobs`
+queue database. The engine applies its embedded job-queue migrations at startup
+before opening job administration or starting workers. Manager migrations and
+tenant module migrations follow separate policies.
 
-- A manager becomes ready after validating its endpoint and distinct workload credentials, immutable authorization policy, database bootstrap and migrations, manager lease registration, scheduler/route-monitor/lease-heartbeat ownership, and the single mTLS gRPC bind. Policy mismatch or an active manager rollout keeps privileged admission closed.
-- A proxy becomes ready after manager discovery succeeds, an initial routing snapshot is installed, and its loopback control, internal, peer mTLS, and optional external listeners are all bound.
-- An engine binds its loopback control/workload listener with workload admission closed and, when database-enabled, binds its manager-workload-authorized job-admin listener with queue admission unavailable. It then registers listener metadata, reconciles non-secret namespace identities with node-local expectations, verifies the offline provision/migration ledger through single-use bounded logins, runs job migrations on the separate platform database, opens queue administration, builds runtime pools, starts owned recovery/worker/module work, loads and health-checks every configured module, and publishes one synchronous readiness heartbeat. The manager atomically records that publication and returns a routing version; the proxy does not acknowledge it until its local routing snapshot contains at least that version. Only then does the engine open workload and worker admission and enter `READY`.
+See [Deployment](deployment.md#database-enabled-nodes) for the operator workflow
+and [Configuration](configuration.md#database-pool-and-timeout-settings) for the
+current keys.
 
-Lifecycle observation remains on existing trusted listeners: a manager serves it on its mTLS gRPC listener, a proxy on its loopback `ProxyNodeControlService` listener, and an engine on its loopback HTTP/2 listener. Engine startup rejects a non-loopback bind, and routed requests cannot invoke lifecycle methods. A restarted proxy rebuilds its process-local engine cache only when the manager accepts the engine's exact ownership-fenced heartbeat; it converges the returned routing version before acknowledging recovery. All listeners, refresh/heartbeat loops, worker/LISTEN/recovery tasks, module request tasks, and accepted connections are owned and joined; unexpected required-task exit fails the process.
+## Lifecycle and readiness
 
-Shutdown closes admission before teardown. An engine first fences queue administration and new worker claims plus healthy-heartbeat publication, asks the manager to make its routes non-serving, waits for the local proxy to install the returned withdrawal version, closes HTTP admission, drains accepted requests and claimed jobs, and only then deregisters. A proxy closes all data listeners before joining its control and background tasks. A manager rejects new mutations while retaining required engine drain/deregister operations during teardown. Each signal-driven stop uses one absolute 30-second internal deadline; nested waits never reset it. Deadline expiry aborts and joins named leftovers and produces a non-zero exit.
+Each process exposes the monotonic stages `STARTING → READY → STOPPING` through
+the read-only `LifecycleService`. Lifecycle describes one process, not cluster
+health. `GetClusterStatus` separately reports manager membership, deployment,
+routing, proxy, engine, and module health.
 
-Local foreground orchestration is owned by one scoped `wr-cli dev run` process; guest artifacts are built separately before the foreground run. It starts fixed waves—manager, named proxies concurrently, then engines concurrently—and validates launcher-issued activation identity plus exact service kind at every READY endpoint. After all engines are READY it captures the manager routing-table version and requires every exact proxy activation to report at least that installed version before launching the optional scenario. The scenario runs in its own session so interruption or service failure terminates its entire process group. Cleanup reaps concurrent engine, proxy, then manager waves; the 45-second termination-policy boundary latches failure evidence but the sole child owner stays alive in reap-only mode until exit is proven. Scenario failure remains primary, while cleanup failure is reported independently and makes a clean scenario fail. The command creates no supervisor socket, lock, or persistent process state. For deployed engines, the Systemd unit remains the process owner and final-exit authority; lifecycle observation is not exit proof.
+Readiness barriers differ by service:
 
-### Durable operator lifecycle
+- A manager validates its TLS identities and authorization policy, connects and
+  migrates its database, registers its lease, starts required background tasks,
+  and binds the unified mTLS endpoint.
+- A proxy reaches a manager, installs an initial routing snapshot, and binds its
+  loopback, peer, and optional public listeners.
+- An engine binds with admission closed, registers initially unhealthy routes,
+  verifies offline tenant state, migrates `wr__jobs`, constructs pools and host
+  capabilities, loads and health-checks modules, and publishes a readiness
+  heartbeat. It opens admission only after its local proxy installs the returned
+  routing version.
 
-Remote lifecycle intent follows `operator → manager → node agent → Systemd → process lifecycle`. `InfrastructureService` authorizes the caller's URI principal, capability, scope, and non-revoked leaf fingerprint under immutable policy. The manager persists immutable request input, actor, policy, per-slot progress, append-only events, and a fenced lease. A node-bound mTLS agent pulls one typed step through `NodeService`; neither manager details nor CLI text become commands. Lease epoch and expiry fence stale agents, and host or lease uncertainty pauses rather than guessing. HTTP source/proxy headers remain routing and observability metadata and never grant lifecycle authority.
+Process owners request shutdown with SIGTERM or SIGINT. Engines stop admitting
+new work, withdraw routes, wait for proxy convergence, drain accepted work, and
+deregister. Proxies close data listeners before background tasks. A service's
+signal-driven shutdown shares one 30-second internal deadline; generated
+Systemd units provide a 45-second external stop window.
 
-The manager persists immutable request input, actor, rollout policy, an absolute forward deadline, tagged target progress, append-only events, lease ownership, effect-delivery ambiguity, observations, and exact result receipts. The installed agent self-reports its activation ID, process-computed binary digest, exact protocol, and normalized advertised capabilities over node-bound mTLS. The leaf fingerprint/principal mapping—not request fields—binds that evidence to the node; manager database receipt time provides freshness. Required capabilities are a subset predicate, and extras grant no RPC or effect authority. Local config, paths, credentials, cadences, deployment root, and lifecycle executable remain locally root-protected and never enter manager compatibility. Operator cleanup retention is co-located in expected policy but is not attested or claim-authorizing; a dedicated maintenance-policy record is deferred. Claims, renewals, observations, and results are fenced by `(node_id, agent_instance_id, lease_epoch)`. A mutation claim is exposed only after its manager delivery/ambiguity transaction commits. Within one live activation, a completed tagged result remains in memory and is retried byte-for-byte before attestation or another claim until the manager acknowledges it; manager advancement and the exact receipt are atomic, and receipts are retained indefinitely. The agent writes no durable recovery journal. After process replacement it creates a fresh activation, never replays the prior activation's instruction or result, and follows the manager's ambiguity-driven typed `InspectBackend` claim. Conclusive backend/process/release evidence may advance or permit a safe reissue; missing or query-error evidence pauses rather than proving absence. A successful verification result still waits for its matching fresh observation, and the agent never receives shell text or a PID.
+Local development uses one foreground `wr-cli dev run` owner. It starts manager,
+proxy, and engine waves in order, verifies the expected service kind and
+activation identity, waits for proxy routing convergence, runs the optional
+scenario, and reaps all children on exit.
 
-Serving commit is the terminal success boundary for desired-inventory deployment and explicit rollback. The clean manager V1 baseline stores release retention in `wr_node_release_cleanup` plus immutable generation/event/receipt history. On startup and at every configured interval (30 seconds by default), managers seed and claim oldest due node rows with bounded `FOR UPDATE SKIP LOCKED` batches, compute one deterministic protection snapshot, and materialize exact generation authority. Transactions that change protected revisions only increment/fence an existing generation and mark it `needs_reconcile`; they never discover or dispatch cleanup. Cleanup leases are renewable and bound to node activation, generation, manager claim, and payload digest. Paused or overdue maintenance degrades node/engine status without changing serving or routing health.
+## Deployed lifecycle and recovery
 
-`wr_nodes.current_revision` is the committed serving snapshot and `target_revision` is the one staged snapshot. Allocation derives a stable operation UUID from the canonical revision digest before release finalization, so digest-covered prelaunch engine metadata and the later durable operation share one manager-owned identity without mutating finalized bytes. Exact per-slot authority permits source and target registrations to overlap while only the selected revision serves. Selection is atomic under `wr-node/slots/<slot>` and is not authority by itself. The manager advances each action only after its required evidence: digest-covered release metadata, backend identity/state, engine lifecycle identity, deregistration, route withdrawal/convergence, and fresh serving routes. It switches authority per slot and commits the deployment only after all required slots converge.
+Remote intent follows `operator → manager → node agent → Systemd → process`.
+The manager stores durable operations and per-slot authority. A node-bound agent
+pulls typed work; it never receives shell commands. Agent activation and lease
+epoch fence stale work, and backend inspection—not endpoint disappearance—proves
+whether a process exited.
 
-A finalized deployment is a complete desired inventory. The manager derives a deterministic sequential diff: additions first, retained replacements second, and removals last, with lexical ordering inside each group. Unchanged exact identities receive no agent instruction or restart; an exact committed-revision submission succeeds immediately without mutating deployment or authority state. Additions and replacements become authoritative only after exact backend, lifecycle, registration, route, and identity convergence. Removals require pinned exit, deregistration, non-serving routes, and zero authority before commit. `max_unavailable` is evaluated from coherent current progress before every destructive stop, not from inventory count alone; stopping the final serving slot or targeting an empty inventory requires explicit downtime acknowledgement. Single-slot restart is the only non-inventory maintenance action and preserves the committed revision and inventory.
+A deployment describes the complete desired engine inventory. The manager
+reconciles additions, replacements, and removals while enforcing
+`max_unavailable`; removing final capacity requires explicit downtime consent.
+Cancellation before commit restores the source inventory. Rollback is a new,
+explicitly authorized revision rather than an automatic response to failure.
+Ambiguous host evidence pauses the operation so an operator can inspect and
+resume it without guessing.
 
-Cancellation or forward-deadline expiry before commit irreversibly fences forward effects and enters deadline-free, lease-fenced restoration of the complete source inventory and authority before becoming terminal. A committed operation is not cancelled; rollback is a separately authorized new monotonic revision that follows the same desired-inventory reconciler and fences any outstanding cleanup generation without rewriting terminal history. Lifecycle stage, deployment availability, and backend running/exited evidence remain independent. `READY` alone cannot commit, and endpoint absence is not lifecycle `STOPPED`. For replacement, removal, or restart, the backend adapter sends SIGTERM; the engine enters `STOPPING`, withdraws routes through `BeginEngineDrain`, waits for proxy convergence, quiesces, deregisters, and exits. The same Systemd adapter then supplies typed final-exit evidence.
+The node agent has no durable recovery journal. Durable intent and receipts live
+at the manager; a replacement agent receives fresh inspection work. Release
+cleanup is independent maintenance and cannot change a committed serving result.
+Operator commands and recovery decisions are documented in
+[Deployment](deployment.md#operations-and-recovery).
 
-Manager policy changes use a separate durable fleet rollout. The authenticated deployment principal and caller operation UUID are its immutable owner; exact `BeginManagerRollout` replay returns the original `PREPARED` receipt, and only that principal may perform lease-free phase compare-and-set transitions. `PREPARED`/`STAGING` create only digest-qualified Systemd binaries and unit specifications, immutable credential sets, owner-only `next.tmp`, and an unselected descriptor. The active config, credentials, Systemd unit selector, and `current-activation.json` remain source-owned, including after `FAILED_PRE_CLOSE`. After every exact source reports `CLOSED_ROLLOUT`, fenced target actions promote bounded `current.toml`/`previous.toml` and atomically select one descriptor containing the executable, Systemd unit, config, and credential paths plus digests. Targets must reach `READY_CLOSED` before remaining source activations are selector-fenced, stopped, and masked; target opening requires exact typed source `STOPPED` evidence and no live non-target membership. The stable launcher refuses any digest mismatch. Post-closure ambiguity is durable `FAILED_CLOSED` and never rolls back or reopens admission automatically.
+## Manager clustering and status
 
-Reset is a separate owner-authorized compare-and-set on the exact failed declaration. It accepts only complete role-qualified evidence for every declared member, with every process conclusively stopped and one uniform nonzero installed policy generation/digest. Its replay-stable receipt records that snapshot, clears the active guard, and grants one same-principal fresh-rollout permit. Reset does not certify rollout success, change the accepted policy, or open admission: startup remains `CLOSED_STARTUP` until a distinct fresh rollout consumes the permit and completes the normal barriers.
+Managers share one PostgreSQL database. Each manager renews a lease using
+server-side database time; only lease-fresh rows appear in discovery. Proxies
+normally discover managers through `ListManagers` and retain direct PostgreSQL
+access only as a bootstrap fallback.
 
-The manager stores workload progress in `wr_node_operation_targets`, keyed by explicit proxy or engine-slot identity. Common claim, delivery, receipt, condition, and restoration evidence is stored once; engine rollout order, authority switching, and serving convergence live in the mandatory typed engine-detail relation. Reconciliation remains strategy-specific: proxy proof precedes engines, then engines advance in persisted rollout order under their existing readiness, route, identity, and availability gates. Engine slot observations remain a separate liveness stream and are never synthesized for proxy targets.
-
-## Manager clustering (active-active)
-
-Multiple `wr-manager` instances can run simultaneously for high availability. All managers share the same Postgres database — concurrent writes are serialized via `SELECT ... FOR UPDATE NOWAIT` on a lock sentinel row. Each manager:
-
-1. Registers its UUID and advertised gRPC address in `wr_managers` on startup.
-2. Renews its PostgreSQL lease at `cluster.manager_heartbeat_interval_secs`.
-3. Treats rows older than `cluster.manager_liveness_threshold_secs` as dead for discovery and status, using PostgreSQL `NOW()` as the common clock.
-4. Reaps rows only after the much longer `cluster.manager_stale_row_reap_threshold_secs` on an independently owned 60-second task, so cleanup lock contention cannot suspend self-renewal, and deregisters itself on graceful shutdown.
-
-`ListManagers` returns exactly the database-lease-fresh rows. Proxies normally use that RPC and preserve direct `wr_managers` bootstrap/fallback when no manager RPC is reachable. Their `database.manager_liveness_threshold_secs` must match the manager cluster value so both paths implement one cluster-wide lease contract. A manager that cannot reach PostgreSQL cannot serve the control plane and correctly stops renewing its lease.
-
-`GetClusterStatus` is the authoritative composed operator view. A contacted manager captures all PostgreSQL evidence—current and historical desired revisions, active operation target progress, proxy inventory reports, engine/module heartbeat times, persisted routes, manager records, manager lease freshness, and routing version—in one repeatable-read transaction. Proxies push bounded complete snapshots over authenticated `NodeService`; status never scrapes a proxy or joins a second client-side query. Manager receipt time controls report freshness, while routing age combines the proxy's monotonic age-at-report with elapsed database time. The operation projection selects source identity before proxy target selection/start, target identity afterward and through engine rollout/commit, and source during restoration; ambiguous paused evidence fails closed. Aggregate severity is derived, never persisted. One fresh exact proxy is selected per desired node; stale replaced processes remain diagnostic without poisoning a recovered node. Node-agent backend/process evidence remains the sole operation authority and proxy reporting never authorizes lifecycle or routing mutations. Only unsupported host CPU/memory remains explicitly unknown/not reported.
-
-## Scheduler (routed job control plane)
-
-Each manager runs a background scheduler that fires `wr_schedules` rows as jobs, using Postgres as a claim/lease queue with a fencing token (`claim_id`) so active-active managers cannot double-fire or clobber each other's in-flight attempts. Every tick runs three short phases:
-
-1. **Claim** — a short transaction claims due, unleased (or lease-expired) rows with `FOR UPDATE SKIP LOCKED`, stamping `claimed_by`, `claimed_until` (a lease), and a fresh `claim_id`, then commits immediately.
-2. **Submit** — outside any transaction, the manager submits each claimed job through its own configured `local_proxy_address` (the local proxy loopback), exactly like `wr-cli invoke`: POST `/wruntime.WorkerService/SubmitJob` with `x-wr-destination: http://{namespace}.{module}/wruntime.WorkerService/SubmitJob`, using the same routing/mTLS path as normal inter-module traffic.
-3. **Finalize** — a fenced `UPDATE ... WHERE claim_id = $claim_id` records success (advances `next_fire_at`, clears the lease) or failure (records `last_error`, bumps `consecutive_failures`, backs off `next_fire_at`); a finalize whose `claim_id` no longer matches (row reclaimed by another manager) affects zero rows and is dropped.
-
-Delivery is **at-least-once** — a manager crash between submit and finalize leaves the lease to expire (`claimed_until < NOW()`), and the row becomes claimable again — so scheduled jobs must be idempotent. The manager's `/wruntime.WorkerService/SubmitJob` submission path is the one place the scheduler couples to the worker/job subsystem's endpoint contract; if that endpoint changes, only `wr_manager::scheduler::submit_job` needs to change. Scheduled jobs are version-pinned. Ad-hoc submissions may omit `worker_version`; these supported name-only jobs are claimed by the first matching namespace/name worker version, while non-empty versions remain exact.
+`GetClusterStatus` returns one manager-composed snapshot. Proxies push
+authenticated inventory reports to managers; status does not scrape proxies or
+hosts. Severity is derived from current deployment, registration, heartbeat,
+route, and proxy evidence. Callers should branch on typed condition code and
+severity rather than parsing explanatory text.
 
 ## Request flow
 
-Public ingress is the guest-module data-plane trust boundary. `IngressLayer` strips reserved headers, authorizes a configured public path and method, and rewrites any REST-style alias to the route's required canonical `rpc_path`. After routing selects an exact healthy module version, `SchemaValidationLayer` buffers the bounded external request body, selects protobuf wire, canonical protobuf JSON, or flat URL-encoded form input from `Content-Type`, and lazily loads that version's descriptor set from the manager. It decodes and validates the selected representation as the exact RPC input message, then forwards normalized protobuf wire bytes. Responses are streamed unchanged. The loopback internal stack and mTLS peer stack deliberately omit this layer, so wruntime-generated module, worker, scheduler, and cross-node continuation traffic remains trusted and streams without repeated validation.
-
 ```mermaid
-flowchart TD
-    caller["Caller WASM<br/>logical inventory service URL"]
-    host["WasiHttpView<br/>set trusted source and destination headers;<br/>rewrite URI to the loopback proxy"]
-
-    subgraph proxy_a["wr-proxy A request stack"]
-        direction TB
-        tracing["1. TracingLayer<br/>open OTel span and inject traceparent"]
-        routing["2. RoutingLayer<br/>resolve namespace, module, version, instance,<br/>and prepared circuit-breaker handle"]
-        egress{"3. EgressLayer"}
-        forward["4. ForwardService<br/>prepare URI, recheck breaker,<br/>and stream without buffering"]
-        tracing --> routing
-        routing -->|"healthy internal route"| egress
-        egress -->|"internal: pass through"| forward
-    end
-
-    caller --> host -->|"stream request"| tracing
-    routing -->|"no healthy matching instance"| unavailable(["503 unavailable"])
-    routing -->|"no internal route and egress enabled"| egress
-    egress -->|"external and allowlisted"| external["External host"]
-    egress -->|"external and denied"| blocked(["Reject request"])
-
-    forward --> location{"Prepared destination"}
-    location -->|"LocalEngine"| local_engine["wr-engine A<br/>parse identity once, select an instance,<br/>and preserve bounded backpressure"]
-    location -->|"RemoteProxy over mTLS"| peer_proxy["wr-proxy B<br/>set via-proxy marker and route locally"]
-    peer_proxy --> remote_engine["wr-engine B<br/>parse identity once, select an instance,<br/>and preserve bounded backpressure"]
-    local_engine --> destination["inventory-service WASM"]
+flowchart LR
+    caller["Caller module"] -->|"logical URL"| host["Engine WASI HTTP host"]
+    host -->|"trusted routing metadata"| local_proxy["Local proxy"]
+    local_proxy -->|"local route"| local_engine["Local engine"]
+    local_proxy -->|"peer mTLS"| peer_proxy["Peer proxy"]
+    peer_proxy --> remote_engine["Remote engine"]
+    local_engine --> destination["Destination module"]
     remote_engine --> destination
-
-    destination -.->|"response streams back over the selected path"| caller
-    external -.->|"response streams back"| caller
+    local_proxy -->|"allowlisted egress"| external["External service"]
 ```
 
-Outbound routing preserves the complete request URI and `x-wr-destination`, including any query required for authentication. Engine and proxy telemetry use a shared query-redacted representation for span names and destination/path attributes, so signed bearer parameters and ordinary query secrets are not recorded while routing and signature verification still see the untouched URI.
+Public ingress additionally maps configured aliases to canonical protobuf RPC
+paths, validates bounded protobuf/JSON/form input against the selected module's
+descriptor, and forwards normalized protobuf bytes. Internal module and peer
+traffic stays streaming and is not transcoded again. Responses stream without
+representation conversion.
 
-The engine does not collect network request or guest response bodies at dispatch. A response-body owner retains the guest task, `Store<ModuleState>`, and owned instance permit through body completion. Normal end joins the task; a body error, timeout, or client drop cancels it so those resources cannot remain detached. Health checks drain their responses. Worker requests enter through the same body type from their already-buffered protobuf payload, and worker responses are deliberately collected only at the job-result persistence boundary.
+Routing distinguishes exact semantic versions, ranges, and unpinned requests.
+Only healthy routes are eligible. Circuit breakers are scoped to concrete local
+engine or peer-proxy destinations and survive routing refreshes while that
+destination remains active.
 
-## Request headers (`x-wr-*`)
+## Workers and schedules
 
-All internal routing uses a set of reserved `x-wr-*` HTTP headers. The proxy strips every `x-wr-*` header from externally-originated requests (public routes) to prevent spoofing.
+Workers consume an engine-managed PostgreSQL queue. Claims record a fence and a
+fixed lease expiry; recovery can redeliver expired work without allowing the
+stale claimant to update queue state. Delivery is at least once, so handlers
+must make side effects idempotent.
 
-| Header | Set by | Read by | Description |
-| -------- | -------- | --------- | ------------- |
-| `x-wr-destination` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (public routes) | `wr-proxy` RoutingLayer, TracingLayer | Full destination URI — e.g. `http://ecommerce.inventory/inventory.InventoryService/GetItems`. The host encodes internal destinations as `{namespace}.{module}`; public ingress replaces any external alias with the route's canonical `rpc_path`. Stripped by ForwardService before reaching the destination engine. |
-| `x-wr-source` | `wr-engine` (outbound WASM call), `wr-proxy` IngressLayer (set to `"external"` for public routes) | `wr-proxy` TracingLayer | Name of the calling module. Recorded as a span attribute for metrics attribution and error reporting. Stripped by ForwardService before reaching the destination engine. |
-| `x-wr-source-ns` | `wr-engine` (outbound WASM call) | — | Namespace of the calling module. Carried alongside `x-wr-source` as attribution metadata; not used for routing or authorization decisions. Stripped by ForwardService before reaching the destination engine. |
-| `x-wr-version` | Caller (optional — WASM module or `wr-cli`) | `wr-proxy` RoutingLayer | Pins the request to a specific semver of the destination module (e.g. `1.2.0`). When omitted the proxy load-balances across all healthy versions of the module. RoutingLayer overwrites the value with the resolved version before forwarding. |
-| `x-wr-module` | `wr-proxy` RoutingLayer | `wr-engine` inbound server | Resolved destination module name. The engine uses this (together with `x-wr-namespace` and `x-wr-version`) to select the correct WASM instance. |
-| `x-wr-namespace` | `wr-proxy` RoutingLayer | `wr-engine` inbound server | Resolved destination module namespace. |
-| `x-wr-via-proxy` | `wr-proxy` ForwardService (cross-node hop) | — | Diagnostic hop marker set to `1` when forwarding to a peer proxy. It is not consumed for routing or loop prevention and is stripped before a local engine or egress target. |
+A non-empty ad-hoc worker version is exact; an empty version is name-only.
+Manager schedules are always version-pinned and submit through the manager's
+configured local proxy. Job administration enters through the manager's normal
+mTLS endpoint and is scoped by authorization policy to explicit queue IDs.
 
-`RoutingRule.source_module` and `source_namespace` follow the same metadata-only semantics as the source headers. They are retained for future policy work but are not part of the current route index or an authorization boundary.
-
-### Header lifecycle per request
-
-```mermaid
-sequenceDiagram
-    actor module as WASM module
-    participant host as WasiHttpView<br/>wr-engine
-    participant local_proxy as Local wr-proxy
-    participant local_engine as Local destination wr-engine
-    participant peer_proxy as Peer wr-proxy
-    participant remote_engine as Remote destination wr-engine
-
-    module->>host: Call logical inventory service URL
-    Note right of host: Set x-wr-destination,<br/>x-wr-source: order-service,<br/>and x-wr-source-ns: ecommerce
-    host->>local_proxy: Forward to same-node proxy
-    Note right of local_proxy: RoutingLayer injects x-wr-module: inventory,<br/>x-wr-namespace: ecommerce, and resolved x-wr-version: 1.2.0
-
-    alt Local engine
-        local_proxy->>local_engine: Strip destination, source, source namespace, and via-proxy headers
-    else Peer proxy
-        local_proxy->>peer_proxy: Set x-wr-via-proxy and preserve x-wr-destination
-        peer_proxy->>remote_engine: Resolve locally, then strip reserved routing headers
-    end
-```
+Exact service and message fields remain in [`proto/wruntime.proto`](../proto/wruntime.proto).
+See [gRPC API](grpc-api.md) for non-obvious control-plane semantics and
+[Host bindings](host-bindings.md) for guest capabilities.

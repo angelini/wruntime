@@ -453,4 +453,27 @@ mod tests {
         assert!(error.contains("manager_id"));
         assert!(error.contains("authorization.policy_file"));
     }
+
+    #[test]
+    fn documented_manager_example_uses_the_runtime_parser() {
+        let docs = include_str!("../../docs/configuration.md");
+        let snippet = docs
+            .split_once("<!-- parser-example:manager -->")
+            .unwrap()
+            .1
+            .split_once("```toml\n")
+            .unwrap()
+            .1
+            .split_once("\n```")
+            .unwrap()
+            .0;
+        let path = std::env::temp_dir().join(format!(
+            "wr-manager-documented-config-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, snippet).unwrap();
+        let parsed = wr_common::config::load::<RawManagerConfig>(path.to_str().unwrap());
+        std::fs::remove_file(path).unwrap();
+        parsed.unwrap();
+    }
 }

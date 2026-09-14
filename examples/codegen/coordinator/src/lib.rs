@@ -12,6 +12,7 @@ mod bindings {
     });
 }
 
+use prost::Message;
 use proto::CoordinatorService;
 use serde::{Deserialize, Serialize};
 use wr_sdk::prelude::*;
@@ -25,7 +26,10 @@ impl wr_sdk::ServiceGuest for Component {
         let path = request.path_with_query().unwrap_or_default();
         let body = read_body(request.consume().unwrap());
 
-        let response = if path.starts_with("/tasks") {
+        let response = if matches!(
+            path.as_str(),
+            "/codegen.CoordinatorService/CreateTask" | "/codegen.CoordinatorService/GetTask"
+        ) {
             let (status, body) = handle_external(&method, &path, &body);
             ServiceResponse::json(status, body)
         } else {
@@ -36,22 +40,6 @@ impl wr_sdk::ServiceGuest for Component {
 }
 
 // ── External ingress (JSON API) ──────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct CreateTaskJson {
-    repo_url: String,
-    #[serde(rename = "ref", default)]
-    git_ref: String,
-    #[serde(default)]
-    doc_sources: Vec<DocSourceJson>,
-    task_description: String,
-    #[serde(default = "default_max_turns")]
-    max_agent_turns: u32,
-}
-
-fn default_max_turns() -> u32 {
-    3
-}
 
 #[derive(Deserialize, Serialize, Clone)]
 struct DocSourceJson {
@@ -96,11 +84,8 @@ fn json_response(status: u16, body: &impl Serialize) -> (u16, Vec<u8>) {
 
 fn handle_external(method: &Method, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
     match (method, path) {
-        (Method::Post, "/tasks") => handle_create_task_json(body),
-        (Method::Get, p) if p.starts_with("/tasks/") => {
-            let task_id = &p[7..];
-            handle_get_task_json(task_id)
-        }
+        (Method::Post, "/codegen.CoordinatorService/CreateTask") => handle_create_task_json(body),
+        (Method::Post, "/codegen.CoordinatorService/GetTask") => handle_get_task_json(body),
         _ => json_response(
             404,
             &ErrorJson {
@@ -111,44 +96,19 @@ fn handle_external(method: &Method, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
 }
 
 fn handle_create_task_json(body: &[u8]) -> (u16, Vec<u8>) {
-    let req: CreateTaskJson = match serde_json::from_slice(body) {
-        Ok(r) => r,
-        Err(e) => {
+    let request = match proto::CreateTaskRequest::decode(body) {
+        Ok(request) => request,
+        Err(error) => {
             return json_response(
                 400,
                 &ErrorJson {
-                    error: format!("invalid JSON: {e}"),
+                    error: format!("invalid protobuf request: {error}"),
                 },
             )
         }
     };
 
-    let doc_sources = match req
-        .doc_sources
-        .into_iter()
-        .map(|source| {
-            parse_doc_source_type(&source.source_type).map(|source_type| proto::DocSourceSpec {
-                source_type: source_type as i32,
-                owner: source.owner,
-                repo: source.repo,
-                ref_or_ver: source.ref_or_ver,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(sources) => sources,
-        Err(error) => return json_response(400, &ErrorJson { error }),
-    };
-
-    let proto_req = proto::CreateTaskRequest {
-        repo_url: req.repo_url,
-        r#ref: req.git_ref,
-        doc_sources,
-        task_description: req.task_description,
-        max_agent_turns: req.max_agent_turns,
-    };
-
-    match Component.create_task(proto_req) {
+    match Component.create_task(request) {
         Ok(resp) => json_response(
             201,
             &CreateResponseJson {
@@ -160,8 +120,19 @@ fn handle_create_task_json(body: &[u8]) -> (u16, Vec<u8>) {
     }
 }
 
-fn handle_get_task_json(task_id: &str) -> (u16, Vec<u8>) {
-    match Component.get_task_inner(task_id) {
+fn handle_get_task_json(body: &[u8]) -> (u16, Vec<u8>) {
+    let request = match proto::GetTaskRequest::decode(body) {
+        Ok(request) => request,
+        Err(error) => {
+            return json_response(
+                400,
+                &ErrorJson {
+                    error: format!("invalid protobuf request: {error}"),
+                },
+            )
+        }
+    };
+    match Component.get_task_inner(&request.task_id) {
         Ok(resp) => json_response(
             200,
             &TaskResponseJson {

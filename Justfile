@@ -56,6 +56,10 @@ fmt-examples:
 fmt-examples-check:
     set -e; for d in {{guest_crates}}; do (cd "$d" && cargo fmt -- --check); done
 
+# Validate local Markdown links, anchors, and fenced TOML examples
+docs-check:
+    python3 dev/check-docs.py
+
 # Run Clippy lints across the workspace
 lint:
     cargo clippy --all-targets --all-features -- -D warnings

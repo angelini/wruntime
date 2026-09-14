@@ -27,13 +27,15 @@ listen_address = "0.0.0.0:${WRT_EXTERNAL_PORT}"
 
 [[external.routes]]
 path      = "/tasks"
+rpc_path  = "/codegen.CoordinatorService/CreateTask"
 methods   = ["POST"]
 module    = "coordinator"
 namespace = "codegen"
 
 [[external.routes]]
-path      = "/tasks/{id}"
-methods   = ["GET"]
+path      = "/tasks/status"
+rpc_path  = "/codegen.CoordinatorService/GetTask"
+methods   = ["POST"]
 module    = "coordinator"
 namespace = "codegen"
 PROXY

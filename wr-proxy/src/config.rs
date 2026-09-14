@@ -546,4 +546,27 @@ mod status_config_tests {
         assert!(valid_sha256_digest(&format!("sha256:{}", "a".repeat(64))));
         assert!(!valid_sha256_digest("sha256:ABC"));
     }
+
+    #[test]
+    fn documented_proxy_example_uses_the_runtime_parser() {
+        let docs = include_str!("../../docs/configuration.md");
+        let snippet = docs
+            .split_once("<!-- parser-example:proxy -->")
+            .unwrap()
+            .1
+            .split_once("```toml\n")
+            .unwrap()
+            .1
+            .split_once("\n```")
+            .unwrap()
+            .0;
+        let path = std::env::temp_dir().join(format!(
+            "wr-proxy-documented-config-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, snippet).unwrap();
+        let parsed = wr_common::config::load::<ProxyConfig>(path.to_str().unwrap());
+        std::fs::remove_file(path).unwrap();
+        parsed.unwrap();
+    }
 }

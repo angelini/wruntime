@@ -1,35 +1,48 @@
 # Documentation Ownership
 
-Use one authority for each information class. Derived documentation explains intent and preferred usage; it must not replace source contracts.
+Each public guide has one purpose. Link to the owning guide instead of copying
+its detailed contract into another page. Rust source and tests remain the
+authority for implementation behavior; protobuf and WIT remain the wire and ABI
+authorities.
+
+## Public guides
+
+| Document | Owns | Does not own |
+| --- | --- | --- |
+| [`README.md`](../../../README.md) | Product overview, capabilities, quick start, examples, and documentation navigation. | Detailed configuration, operation, or protocol reference. |
+| [`docs/architecture.md`](../../architecture.md) | Components, topology, request flow, trust boundaries, readiness model, database lifecycle, and concise failure behavior. | Development-fixture mechanics, exact persistence schemas, or operator command inventories. |
+| [`docs/configuration.md`](../../configuration.md) | Current keys, defaults, constraints, and minimal valid examples for manager, proxy, engine, modules, and CLI environment. | Deployment procedures or duplicated API field reference. |
+| [`docs/deployment.md`](../../deployment.md) | Task-oriented operator workflows, status, rollback, recovery, and troubleshooting. | Test qualification narratives or internal persistence algorithms. |
+| [`docs/grpc-api.md`](../../grpc-api.md) | Service purpose, authorization boundaries, and non-obvious API semantics. | Mechanical message/field duplication; exact wire fields remain in the proto. |
+| [`docs/host-bindings.md`](../../host-bindings.md) | Runtime-provided guest capabilities, behavior, limits, and errors. | Module scaffolding or exact generated signatures. |
+| [`docs/sdk.md`](../../sdk.md) and [`guest-module-author/`](../guest-module-author/) | SDK discovery, module construction, preferred guest usage, and guest constraints. | Host implementation details or operator workflows. |
+| [`docs/testing.md`](../../testing.md) | Commands, prerequisites, fixture consumption, and validation selection. | Repeated lists of what individual tests prove. |
+| [`wruntime-maintainer/`](./) | Exhaustive invariants, repository map, generated-contract fanout, documentation ownership, and change-class validation. | Public tutorials or duplicated operator reference. |
+
+Other exact authorities:
 
 | Information | Authority |
 | --- | --- |
-| Runtime behavior | Rust source and tests |
 | Control-plane wire contract | [`proto/wruntime.proto`](../../../proto/wruntime.proto) |
-| Host ABI | root [`wit/*.wit`](../../../wit/) |
-| Public architecture | [`docs/architecture.md`](../../architecture.md) |
-| Public configuration | [`docs/configuration.md`](../../configuration.md) |
-| Test command behavior | [`Justfile`](../../../Justfile), [`dev/validate-all.sh`](../../../dev/validate-all.sh), and [`docs/testing.md`](../../testing.md) |
-| Local lifecycle CLI and foreground-runner behavior | `wr-cli/src/cmd/{lifecycle,dev,foreground_runner}.rs`, explained in [`docs/testing.md`](../../testing.md) and [`docs/deployment.md`](../../deployment.md) |
-| Guest scaffold and dependency pins | guest [`module_template.md`](../guest-module-author/module_template.md), checked against actual manifests |
-| Guest API discovery and semantics | guest [`api_guide.md`](../guest-module-author/api_guide.md); exact signatures remain owned by Rust/WIT source |
-| Maintainer change guidance | files in this directory |
-| Design narrative | [`docs/demo.md`](../../demo.md), explicitly non-authoritative |
+| Guest host ABI | root [`wit/*.wit`](../../../wit/) |
+| Test recipe behavior | [`Justfile`](../../../Justfile) and [`dev/validate-all.sh`](../../../dev/validate-all.sh) |
+| Guest scaffold and dependency pins | [`guest-module-author/module_template.md`](../guest-module-author/module_template.md), checked against manifests |
+| Guest API semantics | [`guest-module-author/api_guide.md`](../guest-module-author/api_guide.md); exact signatures stay in Rust/WIT source |
 
 ## Change-to-documentation matrix
 
 | Change | Update or review |
 | --- | --- |
-| Root WIT ABI or host implementation | `docs/host-bindings.md`, guest `api_guide.md` when preferred usage or semantics change, `generated_contracts.md`, and relevant constraints/examples |
-| `wr-sdk` public helper or `wr-build` generator | guest `api_guide.md`, `codegen.md`, template/examples when usage changes, and generated-contract guidance |
-| `proto/wruntime.proto` | `docs/grpc-api.md`, architecture/configuration where behavior changes, CLI docs, tests, and generated-contract guidance |
-| Operator lifecycle, authority, or agent backend | `docs/architecture.md`, `docs/deployment.md`, `docs/configuration.md`, `docs/testing.md`, invariants/validation/map, and protected deployment assertions |
-| Engine/manager/proxy configuration | `docs/configuration.md`, example configs, architecture when flow changes, and relevant guest capability guidance |
-| Manager migration | migration policy in configuration/architecture as applicable, repository map, and migration tests |
-| Module migration behavior | `docs/configuration.md`, guest template/constraints, and migration tests/examples |
-| Deployment generation, templates, node-agent installation, or backend effects | `docs/deployment.md`, `docs/configuration.md`, sample deploy config, CLI help/tests, and parity/determinism/final-exit invariants |
-| Executable example | example configs/scripts, guest examples index, README if the advertised workflow changes, and matching validation guidance |
-| Architecture/request flow | `docs/architecture.md`, concise root README/AGENTS summary, invariants, and any affected public guide |
-| Validation recipe or prerequisites | `Justfile`, `dev/validate-all.sh`, `docs/testing.md`, and maintainer `validation.md` |
+| Root WIT ABI or host implementation | Host bindings; guest API guide when preferred usage changes; generated-contract guidance; affected examples. |
+| `wr-sdk` helper or `wr-build` generator | Guest API/codegen guides, template, examples, and generated-contract guidance. |
+| `proto/wruntime.proto` | gRPC semantics, affected architecture/configuration/deployment pages, CLI behavior, and generated-contract guidance. |
+| Operator lifecycle, authorization, or agent backend | Architecture guarantees, deployment workflow/recovery, configuration, testing, maintainer invariants/matrix, and protected assertions. |
+| Manager/proxy/engine configuration | Configuration, maintained examples, deployment templates, and architecture when the boundary changes. |
+| Manager migration | Repository map, migration tests, and concise architecture/configuration policy if externally visible. |
+| Tenant provisioning or module migration | Architecture lifecycle, configuration keys, deployment workflow, guest constraints, and affected examples. |
+| Deployment generation or backend effects | Deployment, configuration, sample deploy config, CLI help/tests, maintainer validation, and protected qualification. |
+| Executable example | Example config/scripts, guest examples index, README when advertised behavior changes, and matching validation guidance. |
+| Validation recipe or prerequisite | Justfile/scripts, testing guide, and maintainer validation matrix. |
 
-Keep repository-wide agent guidance in root `AGENTS.md`. Keep `CLAUDE.md` as a concise pointer to `AGENTS.md` rather than a second copy.
+Keep repository-wide agent guidance in root `AGENTS.md`. Keep `CLAUDE.md` as a
+pointer rather than a second copy.

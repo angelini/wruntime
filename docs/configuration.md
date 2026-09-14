@@ -20,9 +20,11 @@ just manager
 
 `manager.toml`:
 
+<!-- parser-example:manager -->
 ```toml
 manager_id = "manager-a"
 listen_address = "0.0.0.0:9000"
+local_proxy_address = "http://127.0.0.1:9001"
 engine_heartbeat_timeout_secs = 30
 proxy_heartbeat_timeout_secs = 15
 proxy_routing_freshness_secs = 30
@@ -98,7 +100,7 @@ Slot/lifecycle mappings come only from each revision's digest-covered release me
 
 ### Node-agent operation protocol compatibility
 
-Managers and node agents participating in durable operations must use the same tagged-target protobuf revision. The cutover has no legacy empty-engine-slot alias: proxy targets carry the proxy identity variant, engine targets carry a nonempty slot identity, and result reports echo the complete target. A protocol mismatch requires the existing explicit agent install/update remediation before claims resume.
+Managers and node agents participating in durable operations must use the same tagged-target protobuf revision. Proxy targets carry the proxy identity variant, engine targets carry a nonempty slot identity, and result reports echo the complete target. A protocol mismatch requires an explicit agent install/update before claims resume.
 
 ## wr-proxy
 
@@ -108,6 +110,7 @@ just proxy
 
 `proxy.toml`:
 
+<!-- parser-example:proxy -->
 ```toml
 listen_address  = "127.0.0.1:9001"         # loopback only — engines on same host
 control_address = "127.0.0.1:9002"         # gRPC control plane for engine registration/heartbeats
@@ -117,10 +120,15 @@ proxy_address   = "http://127.0.0.1:9001" # local engine data-plane URL
 control_address = "http://127.0.0.1:9002" # local engine control-plane URL
 peer_address    = "https://node-a:9443"   # explicit advertised mTLS peer URL
 
-[node.tls]
-cert_path    = "certs/127.0.0.1.crt"
-key_path     = "certs/127.0.0.1.key"
-ca_cert_path = "certs/ca.crt"
+[endpoint_tls]
+cert_path           = "certs/runtime-proxy-endpoint/leaf.pem"
+key_path            = "certs/runtime-proxy-endpoint/key.pem"
+client_ca_cert_path = "certs/runtime-client-root/ca.crt"
+
+[client_tls]
+cert_path           = "certs/runtime-proxy-client/leaf.pem"
+key_path            = "certs/runtime-proxy-client/key.pem"
+server_ca_cert_path = "certs/runtime-server-root/ca.crt"
 
 [database]
 url                             = "postgres://postgres@localhost:5433/wruntime_example"
@@ -136,16 +144,16 @@ report_interval_secs = 5     # bounded complete inventory snapshot cadence
 [deployment]
 node_id = "node-a"
 revision = 1
-bundle_digest = "sha256:..."
+bundle_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 operation_id = "manager-derived-uuid"
-revision_digest = "sha256:..."
+revision_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 # Optional; omit to block external HTTP from guests.
 [egress]
 allowed_domains = ["api.github.com", "*.openai.com"]
 ```
 
-`listen_address`, `control_address`, `node.proxy_address`, and `node.control_address` must use the documented loopback boundary. `node.peer_address` is a required explicit `https://host:port` URL advertised to other nodes; the proxy binds that port on all interfaces. The runtime rejects the obsolete derived `peer_port` shape so a loopback data-plane URL cannot accidentally become a cross-node advertisement.
+`listen_address`, `control_address`, `node.proxy_address`, and `node.control_address` must use the documented loopback boundary. `node.peer_address` is a required explicit `https://host:port` URL advertised to other nodes; the proxy binds that port on all interfaces. `[endpoint_tls]` configures that peer listener and its accepted client root. `[client_tls]` configures the proxy identity used for manager and peer connections and the server root it trusts.
 
 `control_address` exposes a gRPC `NodeService` that engines on the same node use for registration and heartbeats instead of connecting directly to the manager. This decouples engines from the manager address and enables local-first orchestration. The proxy normally discovers managers through `ListManagers`, but preserves a direct-PostgreSQL bootstrap/fallback path. `database.manager_liveness_threshold_secs` is validated as positive, defaults to 5, and must match every manager's `cluster.manager_liveness_threshold_secs` so both paths use one cluster-wide lease contract.
 
@@ -227,6 +235,7 @@ just engine
 
 `engine.toml`:
 
+<!-- parser-example:engine -->
 ```toml
 listen_address = "127.0.0.1:9100"
 
@@ -234,11 +243,6 @@ listen_address = "127.0.0.1:9100"
 proxy_address   = "http://127.0.0.1:9001" # local proxy; WASM outbound calls rewrite to this
 control_address = "http://127.0.0.1:9002" # proxy's gRPC control plane for registration/heartbeats
 peer_address    = "https://node-a:9443"   # explicit advertised mTLS peer URL
-
-[node.tls]
-cert_path    = "certs/127.0.0.1.crt"
-key_path     = "certs/127.0.0.1.key"
-ca_cert_path = "certs/ca.crt"
 
 [[module]]
 name                 = "order-service"
@@ -261,16 +265,16 @@ schema_path = "schemas/inventory_service.binpb"
 
 > **`schema_path` is required on the first occurrence of each unique module tuple.** The first config occurrence of each unique `(namespace, name, version)` must declare a non-empty existing compiled `FileDescriptorSet`; later duplicate instances may omit `schema_path`. Schemas are uploaded to the manager on registration for discovery purposes.
 
-Module names and namespaces are canonical identifiers: 1–24 characters, lowercase ASCII letters/digits with interior hyphens only. Versions must be valid semantic versions. Because underscores and other punctuation are rejected, the legacy hyphen-to-underscore storage mapping is collision-free for accepted identities and existing schemas/roles/blob prefixes remain stable. Module tuples whose Postgres schema would exceed 63 bytes are rejected. Engine registration also validates engine/proxy URLs and requires an explicit-port `https` peer address.
+Module names and namespaces are canonical identifiers: 1–24 characters, lowercase ASCII letters/digits with interior hyphens only. Versions must be valid semantic versions. Module tuples whose PostgreSQL schema would exceed 63 bytes are rejected. Engine registration also validates engine/proxy URLs and requires an explicit-port `https` peer address.
 
 On startup the engine:
 
-1. Starts an inbound HTTP server on `listen_address`.
-2. Registers itself and its modules with the manager to obtain requested secrets and DB credentials.
-3. The manager creates schemas and default routes as unhealthy and resets module readiness for advertised tuples.
-4. Reconciles non-secret namespace identities with node-local tenant expectations, performs one-shot provision/migration-ledger readiness checks, applies embedded job-queue migrations on the separate platform database, builds certificate-authenticated namespace pools, starts recovery when needed, resolves secrets, validates capability imports, and loads modules. Any mismatch leaves registered routes unhealthy and aborts startup.
-5. Sends an immediate readiness heartbeat after module load, then every 3 seconds, reporting healthy loaded modules.
-6. Deregisters cleanly on `Ctrl+C`, which immediately marks its routing rules as unhealthy.
+1. Binds its loopback workload listener with admission closed and, when configured, its manager-only job-admin mTLS listener.
+2. Registers its modules, requested secret references, and database namespace inventory. The manager returns resolved application secrets and deterministic, non-secret namespace access descriptors while persisting schemas and initially unhealthy routes; it does not provision tenant PostgreSQL state.
+3. Compares those descriptors with generated node-local tenant expectations, verifies offline provisioning and migration receipts with one-shot bounded logins, and disconnects them.
+4. Applies embedded `wr__jobs` migrations on the separate platform database, opens queue administration, builds certificate-authenticated namespace pools, starts recovery and worker tasks, validates capability imports, and loads and health-checks modules.
+5. Sends an immediate readiness heartbeat and waits for the local proxy to install the returned routing version before opening workload admission. Periodic health heartbeats continue afterward.
+6. On shutdown, withdraws routes, drains admitted work, and deregisters.
 
 ### Pool and module loading settings
 
@@ -298,13 +302,13 @@ channel_capacity = 128 # queued inbound dispatches before the engine returns 429
 
 When `cwasm_path` exists and is compatible with the engine, startup deserializes it instead of JIT-compiling `wasm_path`; a missing or incompatible artifact falls back to the WASM file. `channel_capacity` defaults to **128** per configured module instance.
 
-The engine TOML shape and defaults are unchanged. Configuration is parsed into permissive raw values, validated as one aggregate, and only then consumed by runtime startup. Operational capacities and safety deadlines must be positive: pool instance/memory counts, the epoch interval, module request timeout and channel capacity, database pool contributions and safety timeouts, the LLM token limit, and worker lifecycle values reject zero. Zero remains valid as an explicit deny-all ceiling for `[limits]`, `max_outbound_body_bytes`, and blobstore byte/list limits. Flat `worker_*` keys on a service module remain accepted and ignored; they are validated only when `mode = "worker"`.
+Configuration is parsed into permissive raw values, validated as one aggregate, and only then consumed by runtime startup. Operational capacities and safety deadlines must be positive: pool instance/memory counts, the epoch interval, module request timeout and channel capacity, database pool contributions and safety timeouts, the LLM token limit, and worker lifecycle values reject zero. Zero remains valid as an explicit deny-all ceiling for `[limits]`, `max_outbound_body_bytes`, and blobstore byte/list limits. Flat `worker_*` keys on a service module remain accepted and ignored; they are validated only when `mode = "worker"`.
 
 ### Database pool and timeout settings
 
 `database.url` is platform configuration for the engine's physical job-queue database. It is never a tenant endpoint or namespace credential. A database-enabled module additionally requires generated `database.tenant` state: a native PostgreSQL endpoint, dedicated node certificate paths, and the exact provision/migration receipt expected at startup. Operators do not hand-author that state in a release; the host-owned development fixture consumer or `node deploy` materializes it from authenticated artifacts.
 
-For development, each linked worktree derives state under `<absolute-git-dir>/wruntime-dev-state`, a deterministic `wruntime-dev-<id>` Compose project, and an atomically claimed persistent port slot. The slot supplies disjoint loopback ports for PostgreSQL, RustFS, LGTM, managers, proxies, engines, and external example listeners, allowing DB tests and local E2Es to run concurrently across worktrees. Host `just dev-up` in that worktree publishes `owner.json`, `fixture/ready.json`, fixture manifests/migrations, PKI, the content-addressed two-file provisioner context, and `compose-provisioner.generated.yml` only after daemon-matched `cargo zigbuild`, image verification/smoke, native setup, and offline migration succeed. Consumers accept no state/project/endpoint override: they derive the worktree identity, verify source/manifest/migration/artifact/image/endpoint/PKI bindings, and export URLs from the ready record. TLS continues to use server name `postgres.internal`, loopback host address `127.0.0.1`, and a 10-second timeout. Host `just dev-up` reuses compatible state and automatically replaces missing, incompatible, or partial state in the same worktree; no other worktree is affected.
+For development, `just dev-up` prepares isolated worktree-local PostgreSQL state and generated tenant configuration. Tests and examples consume its published endpoints without provisioning authority. See [Testing](testing.md#development-services) for fixture behavior.
 
 The engine creates one certificate-authenticated runtime pool per DB-enabled namespace. Every configured DB-enabled module instance contributes `db_max_connections`, or `[database].max_connections` when absent, and contributions are checked and summed for that namespace. Worker queue operations and each worker's non-pooled `LISTEN` session remain on the distinct platform `database.url`.
 
@@ -322,9 +326,9 @@ advertise_address = "https://node-a.example:9150"
 queue_id          = "primary-jobs"
 
 [job_admin.tls]
-cert_path    = "certs/job-admin-delegation/node.crt"
-key_path     = "certs/job-admin-delegation/node.key"
-ca_cert_path = "certs/job-admin-delegation/ca.crt"
+cert_path           = "certs/job-admin-engine-endpoint/leaf.pem"
+key_path            = "certs/job-admin-engine-endpoint/key.pem"
+client_ca_cert_path = "certs/runtime-client-root/ca.crt"
 
 [[module]]
 name               = "inventory"
@@ -336,7 +340,7 @@ database           = true
 db_max_connections = 10 # this module contributes 10 instead of 20
 ```
 
-`max_connections` defaults to **20**, `statement_timeout_secs` to **30**, and `idle_in_transaction_timeout_secs` to **60**; all three and every effective module contribution must be positive. `[database]` and `[job_admin]` are an all-or-nothing pair. The job-admin bind must be distinct, its advertised address must be explicit-port HTTPS, and `queue_id` identifies one physical job database. Namespace capacity overflow fails validation. Runtime pools use node-bound roles returned as non-secret identities by the manager and native client-certificate authentication. Recycle cleanup precedes module setup. The per-module `search_path` selects a default schema; it is not authorization. Fully qualified access to another module schema in the same namespace is allowed because same-namespace modules are mutually trusted. Other namespace databases, platform databases, owner roles, and runtime DDL are denied by PostgreSQL privileges.
+`max_connections` defaults to **20**, `statement_timeout_secs` to **30**, and `idle_in_transaction_timeout_secs` to **60**; all three and every effective module contribution must be positive. `[database]` and `[job_admin]` are an all-or-nothing pair. The job-admin bind must be distinct, its advertised address must be explicit-port HTTPS, and `queue_id` identifies one physical job database. Namespace capacity overflow fails validation. Runtime pools use native client-certificate authentication and node-bound roles named by the manager's non-secret access descriptors. Recycle cleanup precedes module setup. The per-module `search_path` selects a default schema; it is not authorization. Fully qualified access to another module schema in the same namespace is allowed because same-namespace modules are mutually trusted. Other namespace databases, platform databases, owner roles, and runtime DDL are denied by PostgreSQL privileges.
 
 ### Database telemetry
 
@@ -406,7 +410,7 @@ request_timeout_secs = 120
 
 ### Worker lifecycle settings
 
-Worker modules require the database capability plus global `[database]` configuration and non-zero `worker_concurrency`, `worker_poll_interval_secs`, `worker_job_timeout_secs`, and `worker_max_attempts`. Service modules may retain flat worker keys; those values are ignored. Jobs expose the closed states `pending`, `running`, `complete`, and `dead`; the obsolete `claimed` spelling is rejected. Job submission uses zero only as the explicit wire sentinel for configured timeout/retry defaults.
+Worker modules require the database capability plus global `[database]` configuration and non-zero `worker_concurrency`, `worker_poll_interval_secs`, `worker_job_timeout_secs`, and `worker_max_attempts`. Service modules may retain flat worker keys; those values are ignored. Jobs expose the states `pending`, `running`, `complete`, and `dead`. Job submission uses zero only as the explicit wire sentinel for configured timeout/retry defaults.
 
 Three deadlines are independent: `request_timeout_secs` limits ordinary module HTTP requests; `worker_job_timeout_secs` limits worker handler execution and supplies the queue lease default; an explicit submitted `timeout_secs` overrides only that row's fixed queue lease. Claiming atomically stores its fence and `lease_expires_at`; leases are not renewed. If a submitted lease is shorter than legitimate handler execution, another engine may recover and redeliver the job before the first handler finishes. Fencing prevents the stale handler from changing queue state, but cannot make guest side effects exactly once, so handlers must remain idempotent.
 
@@ -582,70 +586,45 @@ To deploy a **new version** alongside the old one, register a new engine with `v
 
 ### Multi-node deployment
 
-Each proxy and engine binds its internal `listen_address`/`control_address` and `[node]` local URLs to loopback. Cross-node traffic uses the proxy mTLS listener advertised explicitly as `[node].peer_address`.
+Each proxy and engine binds its internal listeners and local `[node]` URLs to
+loopback. Only the proxy's `[node].peer_address` and `[endpoint_tls]` listener
+cross node boundaries. For example, Node B uses:
 
 ```toml
-# examples/multi-node/node-a/proxy.toml
-listen_address  = "127.0.0.1:9001"
-control_address = "127.0.0.1:9002"
-
-[node]
-proxy_address   = "http://127.0.0.1:9001"
-control_address = "http://127.0.0.1:9002"
-peer_address    = "https://node-a-host:9443"
-
-[node.tls]
-cert_path    = "certs/127.0.0.1.crt"
-key_path     = "certs/127.0.0.1.key"
-ca_cert_path = "certs/ca.crt"
-
-[database]
-url = "postgres://postgres@db-host:5432/wruntime"
-
-# examples/multi-node/node-a/engine-1.toml
-listen_address = "127.0.0.1:9100"
-
-[node]
-proxy_address   = "http://127.0.0.1:9001"
-control_address = "http://127.0.0.1:9002"
-peer_address    = "https://node-a-host:9443"
-
-[node.tls]
-cert_path    = "certs/127.0.0.1.crt"
-key_path     = "certs/127.0.0.1.key"
-ca_cert_path = "certs/ca.crt"
-```
-
-```toml
-# examples/multi-node/node-b/proxy.toml
+# proxy.toml
 listen_address  = "127.0.0.1:9003"
 control_address = "127.0.0.1:9004"
 
 [node]
 proxy_address   = "http://127.0.0.1:9003"
 control_address = "http://127.0.0.1:9004"
-peer_address    = "https://node-b-host:9444" # distinct locally for this example
+peer_address    = "https://node-b-host:9444"
 
-[node.tls]
-cert_path    = "certs/127.0.0.1.crt"
-key_path     = "certs/127.0.0.1.key"
-ca_cert_path = "certs/ca.crt"
+[endpoint_tls]
+cert_path           = "certs/runtime-proxy-endpoint/leaf.pem"
+key_path            = "certs/runtime-proxy-endpoint/key.pem"
+client_ca_cert_path = "certs/runtime-client-root/ca.crt"
+
+[client_tls]
+cert_path           = "certs/runtime-proxy-client/leaf.pem"
+key_path            = "certs/runtime-proxy-client/key.pem"
+server_ca_cert_path = "certs/runtime-server-root/ca.crt"
 
 [database]
 url = "postgres://postgres@db-host:5432/wruntime"
+```
 
-# examples/multi-node/node-b/engine-1.toml
+The co-located engine refers to the same peer identity but has no `[node.tls]`
+section:
+
+```toml
+# engine.toml
 listen_address = "127.0.0.1:9200"
 
 [node]
 proxy_address   = "http://127.0.0.1:9003"
 control_address = "http://127.0.0.1:9004"
 peer_address    = "https://node-b-host:9444"
-
-[node.tls]
-cert_path    = "certs/127.0.0.1.crt"
-key_path     = "certs/127.0.0.1.key"
-ca_cert_path = "certs/ca.crt"
 
 [[module]]
 name        = "echo"
@@ -655,27 +634,19 @@ wasm_path   = "examples/multi-node/echo/target/wasm32-wasip2/debug/echo.wasm"
 schema_path = "examples/multi-node/echo/schemas/echo.binpb"
 ```
 
+The maintained local topology is under [`examples/multi-node/`](../examples/multi-node/).
+
 When a module on Node A calls a module whose routing rule has `peer_address = "https://node-b-host:9444"`, Node A's proxy adds `x-wr-via-proxy: 1` and forwards the request to Node B's mTLS peer listener. Node B's `RoutingLayer` resolves the destination as a local engine and forwards to it. The nodes may use the same peer port when deployed on separate hosts; these examples use distinct ports so `just multi-node` can run both proxies on one machine.
 
 ### Manager high availability
 
 Run multiple managers against the same Postgres database for active-active HA. The shared database is both the control plane and the manager liveness authority. Every manager must use the same lease settings and set `advertise_grpc_address` to its externally reachable gRPC address:
 
+Apply the same lease settings and database URL to each complete manager config,
+changing only its stable manager identity and reachable address:
+
 ```toml
-# manager-1.toml
-listen_address       = "0.0.0.0:9000"
-local_proxy_address  = "http://127.0.0.1:9001"
-
-[database]
-url = "postgres://postgres@db-host:5432/wruntime"
-
-[cluster]
-advertise_grpc_address                = "https://manager-1:9000"
-manager_heartbeat_interval_secs       = 1
-manager_liveness_threshold_secs       = 5
-manager_stale_row_reap_threshold_secs = 300
-
-# manager-2.toml
+manager_id           = "manager-2"
 listen_address       = "0.0.0.0:9000"
 local_proxy_address  = "http://127.0.0.1:9001"
 
@@ -689,46 +660,47 @@ manager_liveness_threshold_secs       = 5
 manager_stale_row_reap_threshold_secs = 300
 ```
 
-Proxies and engines can point at any single manager — they all share the same Postgres state. For production, use a load balancer or DNS round-robin in front of the managers.
+The primary manager example above shows the required TLS, client identity, and
+authorization sections. Proxies discover all lease-fresh managers; production
+may place a load balancer or DNS rotation in front of them.
 
 ### CLI access
 
-The CLI does **not** require database access. Ordinary manager commands use runtime mTLS; the certificate flags default to `--ca-cert certs/ca.crt`, `--client-cert certs/127.0.0.1.crt`, and `--client-key certs/127.0.0.1.key` (or the corresponding `WR_CA_CERT`, `WR_CLIENT_CERT`, and `WR_CLIENT_KEY` variables). Job commands use the separate required `WR_JOB_ADMIN_*`/`--job-admin-*` connection described above:
+The CLI does not require direct database access. Manager-facing commands use the
+unified manager endpoint and these default mTLS paths:
+
+- `--ca-cert certs/runtime-server-root/ca.crt`
+- `--client-cert certs/runtime-human-client/leaf.pem`
+- `--client-key certs/runtime-human-client/key.pem`
+
+Set `WR_MANAGER`, `WR_CA_CERT`, `WR_CLIENT_CERT`, and `WR_CLIENT_KEY` or pass the
+global flags explicitly. Job commands use this same connection and authorization
+policy; there are no `WR_JOB_ADMIN_*` or `--job-admin-*` options.
 
 ```bash
-# Via flag
-wr-cli --manager https://manager-1:9000 engines list
-
-# Via environment variable
 export WR_MANAGER=https://manager-1:9000
+export WR_CA_CERT=certs/runtime-server-root/ca.crt
+export WR_CLIENT_CERT=certs/runtime-human-client/leaf.pem
+export WR_CLIENT_KEY=certs/runtime-human-client/key.pem
+
 wr-cli engines list
-
-# One coherent operator snapshot from any seed manager
-wr-cli --manager https://manager-1:9000 cluster status
-wr-cli --manager https://manager-1:9000 cluster status --output json
-
-# Operator-admin queue administration (one bounded list page per invocation)
-export WR_JOB_ADMIN_MANAGER=https://manager-1:9020
-export WR_JOB_ADMIN_CA_CERT=certs/job-admin-operator/ca.crt
-export WR_JOB_ADMIN_CLIENT_CERT=certs/job-admin-operator/operator.crt
-export WR_JOB_ADMIN_CLIENT_KEY=certs/job-admin-operator/operator.key
+wr-cli cluster status --output json
 wr-cli jobs queues
 wr-cli jobs list --queue primary-jobs --status dead --page-size 50
 wr-cli jobs summary --queue primary-jobs --worker-namespace ecommerce
 wr-cli jobs inspect --queue primary-jobs JOB_ID --payload-out payload.bin
 wr-cli jobs retry --queue primary-jobs JOB_ID --yes
-
-# Focus and automation policies
-wr-cli cluster status --node node-a --detail
-wr-cli cluster status --service ecommerce.inventory@1.0.0 --fail-on unhealthy
-wr-cli cluster status --fail-on unknown  # strict: unknown/not-reported is non-zero
 ```
 
-`jobs` never falls back to the ordinary manager address or runtime mTLS files. Every jobs subcommand supports `--format table|json`. List emits one page and its `next_cursor`; reuse the cursor only with identical filters. Inspect reports payload/result lengths by default and writes exact bytes only to explicit create-new output paths (`--force` replaces). Retry is dead-only, requires `--yes`, and is never automatically replayed after an uncertain response. The CLI rejects unknown status values, missing or malformed required timestamps, inconsistent lifecycle counters/claim fields, and inconsistent summary totals instead of rendering plausible output. Payloads and successful results are limited to 1 MiB each, combined job identity/source/type metadata to 64 KiB, and error text to 1 MiB; the admin transport ceiling is 4 MiB.
+Every jobs subcommand supports `--format table|json`. List emits one page and a
+filter-bound `next_cursor`. Inspect prints metadata and writes bytes only to
+explicit output paths. Retry is dead-only, requires `--yes`, and is never
+automatically replayed after an uncertain response.
 
-`cluster status` uses one `GetClusterStatus` RPC and never requires direct PostgreSQL access. The default is display-only; only an explicit `--fail-on` turns reported state into an exit gate. Query and mTLS failures are always non-zero. Engine/module freshness uses the manager's configured `engine_heartbeat_timeout_secs` and `module_heartbeat_timeout_secs`. Manager membership is live while its PostgreSQL lease is within `cluster.manager_liveness_threshold_secs`; stale retained rows are dead and report `STALE_MANAGER_HEARTBEAT`. Proxy report and routing freshness use the configured proxy thresholds above; listener, admission, routing and aggregate breaker evidence is known even when external ingress is disabled, routing is empty, or breaker counts are zero. Host CPU/memory remains unknown/not reported. JSON status uses the strict current schema version 1.
-
-Proxies and narrow discovery clients continue to use lease-filtered `ListManagers`; direct `wr_managers` reads are a bootstrap-only fallback when no manager RPC is reachable and use the matching proxy-side threshold.
+`cluster status` uses one `GetClusterStatus` RPC. The default is display-only;
+`--fail-on` adds an exit gate. Query and mTLS failures are always non-zero.
+Automation should use the JSON severity and condition codes instead of parsing
+human detail.
 
 ### Remote deployment via CLI
 
@@ -751,7 +723,7 @@ wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10 \
 wr-cli managers inspect-bundle wr-manager-bundle.tar.gz
 ```
 
-The same bundle can be deployed to multiple managers against the same shared database. At deploy time the CLI resolves the exact advertised gRPC address. Deploy fails closed unless its mTLS `ListManagers` readiness check returns a non-empty runtime manager ID at that exact advertised address. See the [disposable first-deployment and two-manager acceptance procedure](deployment.md#disposable-first-deployment-and-two-manager-acceptance) for Systemd coverage, non-default certificates, failure handling, and cross-seed verification. With a `wr-deploy.toml`, deploy can reduce to the positional arguments:
+The same bundle can be deployed to multiple managers against the same shared database. At deploy time the CLI resolves the exact advertised gRPC address. Deploy succeeds only when authenticated `LifecycleService.GetStatus` reports `READY` for service kind `manager` and the exact activation identity installed for that deployment. See [manager readiness](deployment.md#manager-readiness) for failure semantics. With a `wr-deploy.toml`, deploy can reduce to the positional arguments:
 
 ```bash
 wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10
@@ -761,7 +733,7 @@ wr-cli managers deploy wr-manager-bundle.tar.gz deploy@10.0.1.10
 
 ```bash
 # 1. Build a host-agnostic node bundle (one build for all nodes)
-wr-cli node bundle --engine-config examples/codegen/engine.toml
+wr-cli node bundle --engine-config examples/multi-node/node-b/engine-1.toml
 
 # 2. After provisioning the host-agent baseline and initial manager policy, update its binary, then deploy.
 export WR_MANAGER=https://10.0.1.10:9000

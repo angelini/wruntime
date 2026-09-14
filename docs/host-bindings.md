@@ -12,23 +12,21 @@ DB, blobstore, and LLM imports require matching per-module opt-ins and valid eng
 
 Defined in `wit/db.wit`. Provides parameterized SQL queries and transactions through a Postgres connection pool created per namespace by the engine.
 
-### Engine configuration
+### Capability and database lifecycle
 
-Add a `[database]` section to `engine.toml` and set `database = true` on each module that should have access:
+Set `database = true` on each module that imports the database interface.
+`db_max_connections` optionally overrides that module instance's contribution
+to its namespace pool:
 
 ```toml
-[database]
-url             = "postgres://user:pass@localhost:5432/mydb"
-max_connections = 20   # default contribution from each DB-enabled module
-
 [[module]]
 name               = "order-service"
 namespace          = "ecommerce"
 version            = "1.0.0"
 wasm_path          = "modules/order_service.wasm"
 schema_path        = "schemas/order_service.binpb"
-database           = true # opt in to DB access
-db_max_connections = 10   # override this module's contribution
+database           = true
+db_max_connections = 10
 
 [[module]]
 name        = "inventory-service"
@@ -36,10 +34,33 @@ namespace   = "ecommerce"
 version     = "1.0.0"
 wasm_path   = "modules/inventory_service.wasm"
 schema_path = "schemas/inventory_service.binpb"
-# database omitted — no DB access for this module
+# No database import or capability for this module.
 ```
 
-The engine has one eager administrative pool capped by `[database].max_connections`. Each namespace gets one guest pool whose maximum size is the checked sum of `db_max_connections` (or the `[database].max_connections` default) contributed by every configured DB-enabled module instance in that namespace. Each worker entry also uses one non-pooled `LISTEN` session. The manager generates and stores the namespace credential; the engine uses its administrative pool to converge the role, admin-owned schemas, and grants before readiness. The guest pool authenticates as that namespace role. A module-specific `search_path` selects the default schema for unqualified SQL but does not prevent fully qualified access to other granted schemas in the same namespace. Namespace roles may create objects in granted schemas but cannot drop the schemas or access `wr__jobs`/`wr_system`.
+Tenant databases are prepared before deployment. A database-host-local operator
+provisions one retained database per namespace, installs node-certificate
+mappings, and executes immutable module migrations. The manager returns only
+non-secret database and role names. It does not generate tenant passwords or
+provision roles and schemas, and engines never receive tenant administrator
+credentials.
+
+At startup the engine verifies the offline provisioning and migration receipt
+with a bounded one-shot login, disconnects it, and then creates one
+certificate-authenticated runtime pool per DB-enabled namespace. The pool size
+is the checked sum of `db_max_connections` values, using
+`[database].max_connections` as the per-module default. Each worker also owns a
+non-pooled `LISTEN` session on the separate platform job database.
+
+A module-specific `search_path` selects the default schema for unqualified SQL;
+it is not an authorization boundary. Modules in one namespace are mutually
+trusted. Runtime roles cannot access other namespace databases, platform
+`wr__jobs`/`wr_system` state, owner roles, or DDL capabilities.
+
+`[database].url` configures the engine's platform job-queue database, not tenant
+access. Generated `[database.tenant]` state supplies the private endpoint,
+node-certificate paths, and expected offline receipt. Operators should not
+hand-author it in a release. See [Configuration](configuration.md#database-pool-and-timeout-settings)
+and [Deployment](deployment.md#database-enabled-nodes).
 
 ### Transport and resources
 

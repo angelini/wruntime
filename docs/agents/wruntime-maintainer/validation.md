@@ -4,7 +4,7 @@ While working, default to `just validate-changed [--base REF] [--explain]`, then
 
 | Change class | Focused validation |
 | --- | --- |
-| Docs only | `git diff --check`, `just fmt-check`, manual link/navigation review |
+| Docs only | `git diff --check`, `just fmt-check`, `just docs-check` |
 | Workspace Rust | `just check` plus the owning crate or named test |
 | Proxy routing/version/circuit breaker | relevant `proxy_test`, `version_test`, `concurrent_routing_test`, `cross_node_test`, and `circuit_breaker_test` targets |
 | Manager lifecycle/readiness/clustering | relevant `manager_test`, `health_test`, and `multi_manager_test` targets |

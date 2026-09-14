@@ -186,9 +186,10 @@ new_fixture docs-sequence
 add_path docs/guide.md
 run_selector
 assert_status 0
-assert_call_count 1
+assert_call_count 2
 assert_call 1 fmt-check
-assert_contains "manual: review documentation links and navigation"
+assert_call 2 docs-check
+assert_not_contains "manual: review documentation links and navigation"
 pass
 
 new_fixture workspace-sequence

@@ -326,9 +326,10 @@ if [ "$START_DEV" = true ]; then
 fi
 
 if [ "$E2E_ONLY" != true ]; then
-	run_parallel "format checks" \
+	run_parallel "format and documentation checks" \
 		"workspace format" "just fmt-check" \
-		"guest format" "just fmt-examples-check"
+		"guest format" "just fmt-examples-check" \
+		"documentation" "just docs-check"
 
 	run_parallel "early compile checks" \
 		"workspace check" "just check"
