@@ -150,13 +150,19 @@ impl EngineRunner {
         &mut self,
         descriptors: &[wr_common::wruntime::NamespaceAccessDescriptor],
     ) -> Result<()> {
-        let Some(database_config) = &self.config.database else {
+        if self.startup_db.namespace_capacities.is_empty() {
             anyhow::ensure!(
                 descriptors.is_empty(),
-                "manager returned namespace access without database config"
+                "manager returned namespace access without database-enabled modules"
             );
+            self.namespace_access.clear();
             return Ok(());
-        };
+        }
+        let database_config = self
+            .config
+            .database
+            .as_ref()
+            .context("database-enabled modules require database configuration")?;
         let tenant = database_config
             .tenant
             .as_ref()
@@ -227,9 +233,18 @@ impl EngineRunner {
     /// Construct one runtime pool per namespace only after readiness verification
     /// and complete verifier disconnect.
     pub fn build_namespace_pools(&mut self) -> Result<()> {
-        let Some(database_config) = &self.config.database else {
+        if self.startup_db.namespace_capacities.is_empty() {
+            anyhow::ensure!(
+                self.namespace_access.is_empty(),
+                "unexpected verified namespace access without database-enabled modules"
+            );
             return Ok(());
-        };
+        }
+        let database_config = self
+            .config
+            .database
+            .as_ref()
+            .context("database-enabled modules require database configuration")?;
         let tenant = database_config
             .tenant
             .as_ref()
@@ -726,5 +741,84 @@ pub async fn check_module_health(tx: &ModuleTx) -> bool {
     {
         Ok(Some(healthy)) => healthy,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wr_common::wruntime::NamespaceAccessDescriptor;
+
+    fn platform_database_only_config() -> EngineConfig {
+        toml::from_str(
+            r#"
+listen_address = "127.0.0.1:9100"
+[node]
+proxy_address = "http://127.0.0.1:9001"
+control_address = "http://127.0.0.1:9002"
+peer_address = "https://127.0.0.1:9443"
+
+[database]
+url = "postgres://localhost/jobs"
+
+[job_admin]
+listen_address = "127.0.0.1:9150"
+advertise_address = "https://127.0.0.1:9150"
+queue_id = "test-jobs"
+
+[job_admin.tls]
+cert_path = "delegate.crt"
+key_path = "delegate.key"
+client_ca_cert_path = "delegate-ca.crt"
+
+[[module]]
+name = "probe"
+namespace = "deployment"
+version = "1.0.0"
+wasm_path = "Cargo.toml"
+schema_path = "Cargo.toml"
+"#,
+        )
+        .expect("platform-only database config")
+    }
+
+    #[test]
+    fn platform_database_without_tenant_modules_skips_namespace_pools() {
+        let config = platform_database_only_config();
+        config
+            .validate_tenant_startup()
+            .expect("platform-only database config must validate");
+        let mut runner = EngineRunner::new(config).expect("engine runner");
+
+        runner
+            .accept_namespace_access(&[])
+            .expect("empty manager namespace inventory");
+        runner
+            .build_namespace_pools()
+            .expect("tenant pool construction must be a no-op");
+
+        assert!(runner.platform_pool().is_some());
+        assert!(runner.namespace_access.is_empty());
+        assert!(runner
+            .database
+            .as_ref()
+            .expect("platform database runtime")
+            .namespace_pools
+            .is_empty());
+    }
+
+    #[test]
+    fn platform_database_without_tenant_modules_rejects_manager_namespace_access() {
+        let mut runner = EngineRunner::new(platform_database_only_config()).expect("engine runner");
+        let error = runner
+            .accept_namespace_access(&[NamespaceAccessDescriptor {
+                namespace: "unexpected".into(),
+                ..Default::default()
+            }])
+            .expect_err("unexpected manager tenant authority must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("without database-enabled modules"));
     }
 }

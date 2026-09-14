@@ -409,6 +409,11 @@ fn proxy_target(operation: &NodeOperation) -> Result<&OperationTargetProgress, S
         .ok_or_else(|| Status::internal("operation proxy target is missing"))
 }
 
+fn restore_engine_slots_before_proxy(operation: &NodeOperation) -> bool {
+    NodeOperationPhase::try_from(operation.phase).ok() == Some(NodeOperationPhase::RestoringSource)
+        && operation.source_revision == 0
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ExpectedProxyProjection {
     pub deployment: Option<ProxyDeploymentMetadata>,
@@ -504,6 +509,7 @@ struct OperationSlotProgress {
     effect_backend_instance_id: String,
     effect_process_instance_id: String,
     effect_condition_code: String,
+    effect_detail: String,
     rollout_order: u32,
     effect_ambiguous: bool,
     source_resolved_release_digest: String,
@@ -546,6 +552,7 @@ fn operation_slots(operation: &NodeOperation) -> Result<Vec<OperationSlotProgres
                 effect_backend_instance_id: target.effect_backend_instance_id.clone(),
                 effect_process_instance_id: target.effect_process_instance_id.clone(),
                 effect_condition_code: target.effect_condition_code.clone(),
+                effect_detail: target.effect_detail.clone(),
                 rollout_order: details.rollout_order,
                 effect_ambiguous: target.effect_ambiguous,
                 source_resolved_release_digest: target.source_resolved_release_digest.clone(),
@@ -1624,7 +1631,11 @@ async fn enter_restoration<C: GenericClient + Sync>(
                  effect_condition_code = '', effect_detail = '',
                  effect_observed_revision = 0, effect_observed_digest = '',
                  effect_backend_instance_id = '', effect_process_instance_id = '',
-                 condition_code = '', condition_detail = '', updated_at = NOW()
+                 condition_code = CASE WHEN changed OR effect_ambiguous
+                     THEN 'SOURCE_RESTORATION_REQUIRED' ELSE '' END,
+                 condition_detail = CASE WHEN changed OR effect_ambiguous
+                     THEN 'source restoration is required before terminal completion' ELSE '' END,
+                 updated_at = NOW()
              WHERE operation_id = $1",
             &[&id],
         )
@@ -2140,6 +2151,22 @@ async fn reconcile_slot<C: GenericClient + Sync>(
             .await?;
             return Ok(false);
         }
+        if slot.effect_ambiguous
+            && observation.is_some_and(|value| !value.backend_query_error.is_empty())
+        {
+            let detail = observation
+                .map(|value| value.backend_query_error.as_str())
+                .unwrap_or("restoration backend state is inconclusive");
+            pause_with_condition(
+                client,
+                id,
+                &slot.engine_slot,
+                "RESTORATION_BACKEND_UNKNOWN",
+                detail,
+            )
+            .await?;
+            return Ok(false);
+        }
         let conclusive = observation.is_some_and(|value| {
             value.backend_query_error.is_empty()
                 && !value.backend_instance_id.is_empty()
@@ -2250,13 +2277,18 @@ async fn reconcile_slot<C: GenericClient + Sync>(
     }
 
     if !slot.effect_condition_code.is_empty() {
+        let failure_detail = if slot.effect_detail.is_empty() {
+            "typed effect failed"
+        } else {
+            &slot.effect_detail
+        };
         enter_restoration(
             client,
             id,
             "manager",
             "failed",
             &slot.effect_condition_code,
-            "typed effect failed; source restoration is required",
+            failure_detail,
         )
         .await?;
         return Ok(false);
@@ -2682,7 +2714,9 @@ async fn reconcile<C: GenericClient + Sync>(
     }
     let phase =
         NodeOperationPhase::try_from(operation.phase).unwrap_or(NodeOperationPhase::Unspecified);
-    if !proxy_target(operation)?.complete {
+    let proxy_complete = proxy_target(operation)?.complete;
+    let engines_before_proxy = restore_engine_slots_before_proxy(operation);
+    if !engines_before_proxy && !proxy_complete {
         return Ok(());
     }
     let slots = operation_slots(operation)?;
@@ -2694,6 +2728,9 @@ async fn reconcile<C: GenericClient + Sync>(
         if !reconcile_slot(client, id, &snapshot, operation, slot).await? {
             return Ok(());
         }
+        return Ok(());
+    }
+    if !proxy_complete {
         return Ok(());
     }
     if phase == NodeOperationPhase::RestoringSource {
@@ -3080,6 +3117,10 @@ pub async fn claim(
     let proxy_step = NodeOperationStepKind::try_from(proxy.next_step)
         .unwrap_or(NodeOperationStepKind::Unspecified);
     let proxy_pending = !proxy.complete;
+    let slots = operation_slots(&operation)?;
+    let pending_slot = slots.iter().find(|slot| !slot.complete);
+    let select_proxy =
+        proxy_pending && (!restore_engine_slots_before_proxy(&operation) || pending_slot.is_none());
     let (
         slot_name,
         step,
@@ -3091,7 +3132,7 @@ pub async fn claim(
         delivered,
         ambiguous,
         target_kind,
-    ) = if proxy_pending {
+    ) = if select_proxy {
         let proving_source = proxy_step == NodeOperationStepKind::VerifyTarget;
         let uses_source = phase == NodeOperationPhase::RestoringSource
             || matches!(
@@ -3123,10 +3164,7 @@ pub async fn claim(
             proxy.effect_ambiguous,
             InstructionTargetKind::Proxy,
         )
-    } else if let Some(slot) = operation_slots(&operation)?
-        .iter()
-        .find(|slot| !slot.complete)
-    {
+    } else if let Some(slot) = pending_slot {
         let step = NodeOperationStepKind::try_from(slot.next_step)
             .unwrap_or(NodeOperationStepKind::Unspecified);
         if matches!(
@@ -4897,6 +4935,23 @@ mod tests {
             &target(1, "same", "same-release", 1, "same", "same-release"),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn restoration_order_depends_on_source_topology() {
+        let mut operation = NodeOperation {
+            phase: NodeOperationPhase::RestoringSource as i32,
+            source_revision: 0,
+            ..Default::default()
+        };
+        assert!(restore_engine_slots_before_proxy(&operation));
+
+        operation.source_revision = 1;
+        assert!(!restore_engine_slots_before_proxy(&operation));
+
+        operation.source_revision = 0;
+        operation.phase = NodeOperationPhase::Forward as i32;
+        assert!(!restore_engine_slots_before_proxy(&operation));
     }
 
     #[test]

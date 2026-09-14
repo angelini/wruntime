@@ -511,6 +511,29 @@ async fn observe(
     .await?)
 }
 
+async fn observe_backend_query_error(
+    pool: &deadpool_postgres::Pool,
+    instruction: &wr_common::wruntime::AgentInstruction,
+    slot: &str,
+    detail: &str,
+) -> Result<wr_common::wruntime::NodeOperation> {
+    Ok(wr_manager::operations::report_observation(
+        pool,
+        &ReportNodeObservationRequest {
+            node_id: instruction.node_id.clone(),
+            engine_slot: slot.into(),
+            backend_state: BackendProcessState::QueryError as i32,
+            backend_query_error: detail.into(),
+            operation_id: instruction.operation_id.clone(),
+            agent_instance_id: instruction.agent_instance_id.clone(),
+            lease_epoch: instruction.lease_epoch,
+            ..Default::default()
+        },
+        "agent-a",
+    )
+    .await?)
+}
+
 async fn report_ok(
     pool: &deadpool_postgres::Pool,
     instruction: &wr_common::wruntime::AgentInstruction,
@@ -1826,13 +1849,28 @@ async fn restoration_targets_only_changed_slots_and_completes_from_observation()
     )
     .await?;
     let start = claim_instruction(&pool, "restore-node", "activation-a").await?;
-    let failed =
-        wr_manager::operations::report_step(&pool, &result_for(&start, "START_FAILED"), "agent-a")
-            .await?;
+    let mut failure = result_for(&start, "START_FAILED");
+    failure.detail = "engine startup failed: unique host diagnostic".into();
+    let failed = wr_manager::operations::report_step(&pool, &failure, "agent-a").await?;
     assert_eq!(
         NodeOperationPhase::try_from(failed.phase)?,
         NodeOperationPhase::RestoringSource
     );
+    assert!(failed.conditions.iter().any(|condition| {
+        condition.code == "START_FAILED"
+            && condition.detail == "engine startup failed: unique host diagnostic"
+    }));
+    assert!(failed.targets.iter().any(|target| {
+        target.conditions.iter().any(|condition| {
+            condition.code == "SOURCE_RESTORATION_REQUIRED"
+                && condition.detail == "source restoration is required before terminal completion"
+        })
+    }));
+    let events = wr_manager::operations::events(&pool, &operation.operation_id).await?;
+    assert!(events.iter().any(|event| {
+        event.event_code == "START_FAILED"
+            && event.detail == "engine startup failed: unique host diagnostic"
+    }));
     let late_target_engine_id = "restore-late-target";
     let error = wr_manager::db::register_engine_and_routes(
         &pool,
@@ -1867,11 +1905,26 @@ async fn restoration_targets_only_changed_slots_and_completes_from_observation()
     assert!(blue.changed && !blue.complete);
     assert!(!green.changed && green.complete);
 
+    let proxy = failed
+        .targets
+        .iter()
+        .find(|target| target.kind == InstructionTargetKind::Proxy as i32)
+        .expect("proxy target");
+    assert!(
+        !proxy.complete,
+        "source-zero proxy restoration remains pending"
+    );
+
     let inspection = claim_instruction(&pool, "restore-node", "activation-a").await?;
     assert!(inspection.restoration);
     assert_eq!(
         inspection.step,
         NodeOperationStepKind::InspectBackend as i32
+    );
+    assert_eq!(
+        InstructionTargetKind::try_from(inspection.target.as_ref().expect("target").kind)?,
+        InstructionTargetKind::EngineSlot,
+        "source-zero restoration must inspect the engine before removing the proxy"
     );
     observe(
         &pool,
@@ -1898,6 +1951,22 @@ async fn restoration_targets_only_changed_slots_and_completes_from_observation()
         "",
     )
     .await?;
+    let proxy_restore =
+        wr_manager::operations::claim(&pool, "restore-node", "activation-a", "agent-a")
+            .await?
+            .expect("proxy restoration instruction")
+            .instruction
+            .expect("typed proxy restoration instruction");
+    assert_eq!(
+        proxy_restore.step,
+        NodeOperationStepKind::RestoreSource as i32
+    );
+    assert_eq!(
+        InstructionTargetKind::try_from(proxy_restore.target.as_ref().expect("target").kind)?,
+        InstructionTargetKind::Proxy,
+        "source-zero restoration removes the proxy only after engine absence"
+    );
+    wr_manager::operations::report_step(&pool, &result_for(&proxy_restore, ""), "agent-a").await?;
     assert!(
         wr_manager::operations::claim(&pool, "restore-node", "activation-a", "agent-a")
             .await?
@@ -2287,6 +2356,46 @@ async fn delivered_effect_ambiguity_is_inspected_for_cancel_deadline_and_error()
         assert_eq!(NodeOperationState::try_from(terminal.state)?, expected);
         assert!(!engine_targets(&terminal)[0].effect_ambiguous);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn inconclusive_restoration_inspection_pauses_without_repeating_claims() -> Result<()> {
+    let pool = manager_pool().await;
+    let (_source, operation, _stop) =
+        delivered_stop_fixture(&pool, "ambiguous-query-error").await?;
+    wr_manager::operations::cancel(&pool, &operation.operation_id, "operator-a").await?;
+
+    let inspection = claim_instruction(&pool, "ambiguous-query-error", "activation-a").await?;
+    assert_eq!(
+        inspection.step,
+        NodeOperationStepKind::InspectBackend as i32
+    );
+    let paused = observe_backend_query_error(
+        &pool,
+        &inspection,
+        "blue",
+        "systemd activation identity is unavailable",
+    )
+    .await?;
+
+    assert_eq!(
+        NodeOperationState::try_from(paused.state)?,
+        NodeOperationState::Paused
+    );
+    assert!(engine_targets(&paused)[0]
+        .conditions
+        .iter()
+        .any(|condition| {
+            condition.code == "RESTORATION_BACKEND_UNKNOWN"
+                && condition.detail == "systemd activation identity is unavailable"
+        }));
+    assert!(
+        wr_manager::operations::claim(&pool, "ambiguous-query-error", "activation-a", "agent-a",)
+            .await?
+            .is_none(),
+        "paused ambiguity must not emit another inspection"
+    );
     Ok(())
 }
 

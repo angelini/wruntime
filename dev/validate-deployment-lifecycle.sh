@@ -475,10 +475,32 @@ assert_db_clean() {
 	"${SSH[@]}" "$MANAGER_REMOTE" "sudo systemctl is-active postgresql" >/dev/null
 }
 collect_diagnostics() {
-	local out="$LOG_BASE/qualification-diagnostics"
+	local out="$LOG_BASE/qualification-diagnostics" since operation_id
 	mkdir -p "$out"
+	since="${LIFECYCLE_OPERATION_SUBMITTED_AT:-0}"
+	[[ "$since" =~ ^[0-9]+$ ]] || since=0
 	collect_diagnostic "cluster status" "$out/cluster.json" \
-		lifecycle_run_watchdog "${CLI_ARGS[@]}" cluster status --node "$NODE_ID" --output json
+		lifecycle_run_short 60 "${CLI_ARGS[@]}" cluster status --node "$NODE_ID" --output json
+	collect_diagnostic "nonterminal operations" "$out/nonterminal-operations.json" \
+		lifecycle_run_short 60 "${CLI_ARGS[@]}" operations list --node-id "$NODE_ID" --json
+	if [ -s "$out/nonterminal-operations.json" ]; then
+		while IFS= read -r operation_id; do
+			[ -n "$operation_id" ] || continue
+			collect_diagnostic "nonterminal operation $operation_id" \
+				"$out/nonterminal-operation-$operation_id.json" \
+				lifecycle_run_short 60 "${CLI_ARGS[@]}" operations get "$operation_id" --json
+		done < <("${PYTHON[@]}" - "$out/nonterminal-operations.json" <<'PY'
+import json, sys
+try:
+    values = json.load(open(sys.argv[1]))
+except (OSError, json.JSONDecodeError):
+    values = []
+for value in values if isinstance(values, list) else []:
+    if value.get("state") in {"queued", "running", "paused"} and value.get("operation_id"):
+        print(value["operation_id"])
+PY
+		)
+	fi
 	for bundle in "$BASELINE_ONE" "$BASELINE_TWO" "$UPGRADE_TWO" "$UPGRADE_ONE" "$EMPTY_INVENTORY"; do
 		collect_diagnostic "inspect $(basename "$bundle")" "$out/$(basename "$bundle").txt" \
 			lifecycle_run_watchdog "${CLI_ARGS[@]}" node inspect-bundle "$bundle"
@@ -503,6 +525,12 @@ collect_diagnostics() {
 		"${SSH[@]}" "$NODE_REMOTE" "sudo systemctl status --no-pager 'wr-*'"
 	collect_diagnostic "node journal" "$out/node-journal.txt" \
 		"${SSH[@]}" "$NODE_REMOTE" "sudo journalctl -q -u 'wr-*' -n 300 --no-pager"
+	collect_diagnostic "engine journal since operation submission" "$out/node-engine-journal.txt" \
+		"${SSH[@]}" "$NODE_REMOTE" "sudo journalctl -q -u 'wr-engine-*.service' --since '@$since' --no-pager"
+	collect_diagnostic "proxy journal since operation submission" "$out/node-proxy-journal.txt" \
+		"${SSH[@]}" "$NODE_REMOTE" "sudo journalctl -q -u wr-proxy.service --since '@$since' --no-pager"
+	collect_diagnostic "node-agent journal since operation submission" "$out/node-agent-journal.txt" \
+		"${SSH[@]}" "$NODE_REMOTE" "sudo journalctl -q -u wr-node-agent.service --since '@$since' --no-pager"
 	collect_diagnostic "node files" "$out/node-files.txt" \
 		"${SSH[@]}" "$NODE_REMOTE" "sudo find '$WORKDIR' -maxdepth 6 \( -type f -o -type l \) | sort"
 }
@@ -848,8 +876,9 @@ PY
 	lifecycle_capture_operation_detail "$NODE_ID" "$rollback_token" "$pass/operation-rollback.json" "${CLI_ARGS[@]}"
 	"${PYTHON[@]}" "$ASSERT_OPERATION" --input "$pass/operation-rollback.json" \
 		--node-id "$NODE_ID" --request-token "$rollback_token" --action rollback \
-		--target-digest "$DIGEST_B_TWO" --slot-order engine-2 --slot-order engine-1 \
-		--stopped-engine-slot engine-1 --expect-proxy-stop >"$pass/assert-operation-rollback.json"
+		--target-digest "$DIGEST_B_TWO" --slot-order engine-1 --slot-order engine-2 \
+		--slot-transition engine-1=addition --slot-transition engine-2=addition \
+		--expect-proxy-stop >"$pass/assert-operation-rollback.json"
 	status_json "$pass/status-rollback.json"
 	"${PYTHON[@]}" "$ASSERT" --input "$pass/status-rollback.json" rollback --node-id "$NODE_ID" --source-revision "$revision_b" --after-revision "$revision_empty" --digest "$DIGEST_B_TWO" --version 2.0.0 --engine-slot engine-1 --engine-slot engine-2 >"$pass/assert-rollback.json"
 	invoke_probe "probe-systemd-rollback" "$pass/invoke-rollback.json"

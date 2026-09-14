@@ -79,6 +79,8 @@ def args():
         target_revision=2,
         target_digest="sha256:target",
         stopped_engine_slot=["blue"],
+        slot_order=None,
+        slot_transition=None,
         expect_proxy_stop=True,
     )
 
@@ -88,6 +90,22 @@ class OperationAssertionTests(unittest.TestCase):
         result = assert_operation.assert_operation(detail(), args())
         self.assertEqual(result["stopped_engine_slots"], ["blue"])
         self.assertTrue(result["proxy_stopped"])
+
+    def test_accepts_success_when_optional_exit_code_is_unavailable(self):
+        operation = detail()
+        operation["slots"][0]["termination_evidence"]["exit_code"] = None
+        result = assert_operation.assert_operation(operation, args())
+        self.assertEqual(result["stopped_engine_slots"], ["blue"])
+
+    def test_expected_slot_transition_must_match(self):
+        operation = detail()
+        operation["slots"][0]["transition"] = "addition"
+        expected = args()
+        expected.slot_transition = ["blue=addition"]
+        assert_operation.assert_operation(operation, expected)
+        expected.slot_transition = ["blue=replacement"]
+        with self.assertRaisesRegex(assert_operation.AssertionFailure, "transition mismatch"):
+            assert_operation.assert_operation(operation, expected)
 
     def test_missing_unknown_forced_and_escalated_evidence_fail_closed(self):
         mutations = (

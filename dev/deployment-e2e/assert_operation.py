@@ -37,7 +37,8 @@ def assert_evidence(evidence: Any, label: str) -> None:
         raise AssertionFailure(f"{label} contains removed backend discriminator")
     if evidence.get("terminal_result") != "success":
         raise AssertionFailure(f"{label} terminal result is not successful")
-    if evidence.get("exit_code") != 0:
+    exit_code = evidence.get("exit_code")
+    if exit_code is not None and exit_code != 0:
         raise AssertionFailure(f"{label} exit code is not zero")
     if evidence.get("signal") is not None:
         raise AssertionFailure(f"{label} termination signal is present")
@@ -76,6 +77,21 @@ def assert_operation(operation: dict[str, Any], args) -> dict[str, Any]:
     slot_order = getattr(args, "slot_order", None)
     if slot_order and names != slot_order:
         raise AssertionFailure(f"operation slot order mismatch: expected {slot_order!r}, found {names!r}")
+    expected_transitions = {}
+    for expectation in getattr(args, "slot_transition", None) or []:
+        name, separator, transition = expectation.partition("=")
+        if not separator or not name or not transition:
+            raise AssertionFailure("expected slot transition must use SLOT=TRANSITION")
+        if name in expected_transitions:
+            raise AssertionFailure(f"duplicate expected transition for engine slot {name!r}")
+        expected_transitions[name] = transition
+    actual_transitions = {slot.get("engine_slot"): slot.get("transition") for slot in slots}
+    for name, transition in expected_transitions.items():
+        if actual_transitions.get(name) != transition:
+            raise AssertionFailure(
+                f"engine slot {name!r} transition mismatch: expected {transition!r}, "
+                f"found {actual_transitions.get(name)!r}"
+            )
     stopped = [slot for slot in slots if slot.get("termination_evidence") is not None]
     stopped_names = [slot.get("engine_slot") for slot in stopped]
     if set(stopped_names) != set(expected_slots) or len(stopped_names) != len(expected_slots):
@@ -115,6 +131,11 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--target-digest")
     value.add_argument("--stopped-engine-slot", action="append")
     value.add_argument("--slot-order", action="append", help="expected rollout order")
+    value.add_argument(
+        "--slot-transition",
+        action="append",
+        help="expected engine slot transition as SLOT=TRANSITION",
+    )
     value.add_argument("--expect-proxy-stop", action="store_true")
     return value
 

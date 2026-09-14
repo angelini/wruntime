@@ -108,27 +108,38 @@ conservative profile:
 - mixed, unknown, validation-policy, or deployment-sensitive changes: the
   corresponding broad `validate-all` path.
 
-`--explain` prints the selected profile and commands without running them. The
-selector is feedback, not pre-merge evidence; it does not replace additional
-checks from the maintainer validation matrix.
+`--explain` prints the selected profile and commands without running them.
+Before completion, preview the selection and then run `just validate-changed`
+with any flags required by the reported profile. The focused result is the
+completion validation for a stable homogeneous change,
+including a documentation-only change. Do not invoke `validate-all` directly
+unless the selector chooses a broad fallback or the maintainer validation matrix
+explicitly requires it. Additional change-class checks from that matrix still
+apply.
 
 ## Broad validation
 
-Local broad validation requires an explicit deployment choice:
+When the selector chooses local broad validation, rerun it with an explicit
+deployment choice:
 
 ```bash
-just validate-all --no-deployment-e2e
+just validate-changed --no-deployment-e2e
 ```
 
-In the Pi sandbox, run exactly:
+An explicit matrix requirement may instead call for the equivalent direct
+`validate-all` command.
+
+In the Pi sandbox, when broad validation is selected or explicitly required,
+run it through the selector:
 
 ```bash
-just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e
+just validate-changed --no-deployment-e2e --skip-dev-up --no-codegen-e2e
 ```
 
-This skips Docker startup, protected remote deployment, and codegen only. It
-must still run multi-node, ecommerce, and stockmarket E2E; do not pass
-`--no-e2e`.
+An explicitly required direct broad run uses the equivalent `validate-all`
+command. These flags skip Docker startup, protected remote deployment, and
+codegen only. Broad validation must still run multi-node, ecommerce, and
+stockmarket E2E; do not pass `--no-e2e`.
 
 `validate-all` runs formatting, checks, lints, WASM builds, Rust tests, and the
 enabled E2E examples. Example stages are serial because they reset shared state

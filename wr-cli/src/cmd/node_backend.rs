@@ -1975,7 +1975,9 @@ fn parse_systemd_observation(bytes: &[u8]) -> BackendObservation {
     if load != "loaded" {
         return BackendObservation::query_error(format!("systemd unit load state is {load}"));
     }
-    let state = if active == "active" && sub == "running" {
+    let state = if (active == "active" && sub == "running")
+        || (active == "activating" && !invocation.is_empty() && main_pid != 0)
+    {
         BackendProcessState::Running
     } else if matches!(active, "inactive" | "failed") && matches!(sub, "dead" | "failed" | "exited")
     {
@@ -2079,10 +2081,28 @@ mod tests {
             "systemd MainPID is missing"
         );
 
-        let unknown = parse_systemd_observation(
+        let activating = parse_systemd_observation(
             b"LoadState=loaded\nActiveState=activating\nSubState=start\nInvocationID=abc\nMainPID=123\n",
         );
-        assert_eq!(unknown.state, BackendProcessState::QueryError);
+        assert_eq!(activating.state, BackendProcessState::Running);
+        assert_eq!(activating.instance_id, "abc");
+        assert_eq!(activating.main_pid, 123);
+
+        let activating_without_identity = parse_systemd_observation(
+            b"LoadState=loaded\nActiveState=activating\nSubState=start\nInvocationID=\nMainPID=123\n",
+        );
+        assert_eq!(
+            activating_without_identity.state,
+            BackendProcessState::QueryError
+        );
+
+        let activating_without_process = parse_systemd_observation(
+            b"LoadState=loaded\nActiveState=activating\nSubState=start\nInvocationID=abc\nMainPID=0\n",
+        );
+        assert_eq!(
+            activating_without_process.state,
+            BackendProcessState::QueryError
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2101,7 +2121,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn systemd_stop_pins_process_when_inactive_unit_clears_invocation() {
+    async fn systemd_stop_pins_activating_process_when_unit_clears_invocation() {
         let root = temp_root("systemd-stop-pidfd");
         std::fs::create_dir_all(&root).expect("create test root");
         let mut child = std::process::Command::new("/bin/sh")
@@ -2113,7 +2133,7 @@ mod tests {
         std::fs::write(
             &systemctl,
             format!(
-                "#!/bin/sh\nstate={}\npid=$(cat {}/pid)\ncase \"$1\" in\nshow)\n if [ -f \"$state\" ]; then\n  printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nInvocationID=\\nMainPID=0\\nResult=success\\n'\n else\n  printf 'LoadState=loaded\\nActiveState=active\\nSubState=running\\nInvocationID=invocation-1\\nMainPID=%s\\nResult=success\\n' \"$pid\"\n fi\n ;;\nstop)\n kill -TERM \"$pid\"\n touch \"$state\"\n ;;\nesac\n",
+                "#!/bin/sh\nstate={}\npid=$(cat {}/pid)\ncase \"$1\" in\nshow)\n if [ -f \"$state\" ]; then\n  printf 'LoadState=loaded\\nActiveState=inactive\\nSubState=dead\\nInvocationID=\\nMainPID=0\\nResult=success\\n'\n else\n  printf 'LoadState=loaded\\nActiveState=activating\\nSubState=start\\nInvocationID=invocation-1\\nMainPID=%s\\nResult=success\\n' \"$pid\"\n fi\n ;;\nstop)\n kill -TERM \"$pid\"\n touch \"$state\"\n ;;\nesac\n",
                 root.join("stopped").display(),
                 root.display(),
             ),

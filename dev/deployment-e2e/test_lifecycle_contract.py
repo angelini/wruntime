@@ -51,6 +51,20 @@ class LifecycleContractTests(unittest.TestCase):
         self.assertEqual(len(bundle_lines), 5)
         self.assertTrue(all("--skip-build" in line for line in bundle_lines))
 
+    def test_empty_inventory_rollback_expects_ordered_additions_without_engine_stops(self):
+        harness = HARNESS.read_text()
+        rollback = harness[
+            harness.index('run_to_log "systemd node rollback"'):
+            harness.index('status_json "$pass/status-rollback.json"')
+        ]
+        self.assertIn("--slot-order engine-1 --slot-order engine-2", rollback)
+        self.assertIn(
+            "--slot-transition engine-1=addition --slot-transition engine-2=addition",
+            rollback,
+        )
+        self.assertNotIn("--stopped-engine-slot", rollback)
+        self.assertIn("--expect-proxy-stop", rollback)
+
     def test_manager_b_database_preflight_follows_systemd_vm_readiness(self):
         harness = HARNESS.read_text()
         lifecycle = harness[harness.index("lifecycle() {"):]
@@ -70,6 +84,25 @@ class LifecycleContractTests(unittest.TestCase):
         self.assertLess(database_preflight, first_manager_rollout)
         self.assertNotIn('if [ "$' + 'backend" = systemd ]; then', lifecycle)
         self.assertNotIn("--" + "backend", lifecycle)
+
+    def test_failure_diagnostics_capture_operation_and_per_unit_journals(self):
+        harness = HARNESS.read_text()
+        diagnostics = harness[harness.index("collect_diagnostics() {"):harness.index("# Invoked indirectly by the ERR trap.")]
+        self.assertIn(
+            'operations list --node-id "$NODE_ID" --json',
+            diagnostics,
+        )
+        self.assertIn(
+            'operations get "$operation_id" --json',
+            diagnostics,
+        )
+        self.assertIn('LIFECYCLE_OPERATION_SUBMITTED_AT', diagnostics)
+        for unit in (
+            "'wr-engine-*.service'",
+            "wr-proxy.service",
+            "wr-node-agent.service",
+        ):
+            self.assertIn(f"-u {unit} --since '@$since'", diagnostics)
 
     def test_manager_rollout_waits_for_membership_and_checks_source_exit(self):
         harness = HARNESS.read_text()
@@ -279,7 +312,7 @@ fi
         # Remaining mentions are classified supporting-infrastructure documentation.
         classified = {
             "README.md", "AGENTS.md", "Justfile", "dev/validate-all.sh",
-            "docs/architecture.md", "docs/configuration.md", "docs/deployment.md", "docs/testing.md",
+            "docs/architecture.md", "docs/deployment.md", "docs/testing.md",
             "docs/agents/wruntime-maintainer/generated_contracts.md",
             "docs/agents/wruntime-maintainer/validation.md",
         }

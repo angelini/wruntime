@@ -222,16 +222,19 @@ wr-cli operations get OPERATION_ID --json
 ```
 
 A timeout or disconnected CLI does not imply failure. Inspect the operation and
-cluster state first. If the manager pauses on uncertain backend evidence, repair
-the underlying host or connectivity issue, then resume:
+cluster state first. Operation detail JSON retains typed condition details and
+host-effect diagnostics; append-only events retain the initiating failure while
+restoration proceeds. If the manager pauses on uncertain backend evidence,
+repair the underlying host or connectivity issue, then resume:
 
 ```bash
 wr-cli operations resume OPERATION_ID
 ```
 
 Cancelling queued or paused work before commit requests restoration of the
-complete source inventory. Committed deployments are corrected with an explicit
-rollback:
+complete source inventory. For source revision zero, engine slots are removed
+before the proxy selector; non-empty source restoration keeps proxy-first order.
+Committed deployments are corrected with an explicit rollback:
 
 ```bash
 wr-cli operations cancel OPERATION_ID

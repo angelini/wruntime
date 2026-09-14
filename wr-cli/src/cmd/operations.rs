@@ -79,6 +79,12 @@ struct OperationDto<'a> {
 }
 
 #[derive(Serialize)]
+struct ConditionDto<'a> {
+    code: &'a str,
+    detail: &'a str,
+}
+
+#[derive(Serialize)]
 struct TerminationEvidenceDto<'a> {
     backend_instance_id: &'a str,
     process_instance_id: &'a str,
@@ -93,23 +99,34 @@ struct TerminationEvidenceDto<'a> {
 #[derive(Serialize)]
 struct OperationSlotDetailDto<'a> {
     engine_slot: &'a str,
+    transition: &'static str,
+    next_step: &'static str,
+    complete: bool,
+    conditions: Vec<ConditionDto<'a>>,
     changed: bool,
     effect_reported: bool,
     pinned_backend_instance_id: &'a str,
     pinned_process_instance_id: &'a str,
     effect_backend_instance_id: &'a str,
     effect_process_instance_id: &'a str,
+    effect_condition_code: &'a str,
+    effect_detail: &'a str,
     termination_evidence: Option<TerminationEvidenceDto<'a>>,
 }
 
 #[derive(Serialize)]
 struct ProxyOperationDetailDto<'a> {
+    next_step: &'static str,
+    complete: bool,
+    conditions: Vec<ConditionDto<'a>>,
     changed: bool,
     effect_reported: bool,
     pinned_backend_instance_id: &'a str,
     pinned_process_instance_id: &'a str,
     effect_backend_instance_id: &'a str,
     effect_process_instance_id: &'a str,
+    effect_condition_code: &'a str,
+    effect_detail: &'a str,
     termination_evidence: Option<TerminationEvidenceDto<'a>>,
 }
 
@@ -253,15 +270,28 @@ fn operation_slots(operation: &NodeOperation) -> Result<Vec<OperationSlotDto<'_>
     Ok(slots)
 }
 
+fn condition_dto(condition: &wr_common::wruntime::DeploymentCondition) -> ConditionDto<'_> {
+    ConditionDto {
+        code: &condition.code,
+        detail: &condition.detail,
+    }
+}
+
 fn slot_detail_dto(target: &OperationTargetProgress) -> Result<OperationSlotDetailDto<'_>> {
     Ok(OperationSlotDetailDto {
         engine_slot: engine_slot(target)?,
+        transition: transition_name(target.transition),
+        next_step: next_step_name(target.next_step),
+        complete: target.complete,
+        conditions: target.conditions.iter().map(condition_dto).collect(),
         changed: target.changed,
         effect_reported: target.effect_reported,
         pinned_backend_instance_id: &target.pinned_backend_instance_id,
         pinned_process_instance_id: &target.pinned_process_instance_id,
         effect_backend_instance_id: &target.effect_backend_instance_id,
         effect_process_instance_id: &target.effect_process_instance_id,
+        effect_condition_code: &target.effect_condition_code,
+        effect_detail: &target.effect_detail,
         termination_evidence: target.termination_evidence.as_ref().map(termination_dto),
     })
 }
@@ -273,12 +303,17 @@ fn proxy_detail_dto(operation: &NodeOperation) -> Result<ProxyOperationDetailDto
         .find(|target| target.kind == InstructionTargetKind::Proxy as i32)
         .context("operation proxy target is missing")?;
     Ok(ProxyOperationDetailDto {
+        next_step: next_step_name(target.next_step),
+        complete: target.complete,
+        conditions: target.conditions.iter().map(condition_dto).collect(),
         changed: target.changed,
         effect_reported: target.effect_reported,
         pinned_backend_instance_id: &target.pinned_backend_instance_id,
         pinned_process_instance_id: &target.pinned_process_instance_id,
         effect_backend_instance_id: &target.effect_backend_instance_id,
         effect_process_instance_id: &target.effect_process_instance_id,
+        effect_condition_code: &target.effect_condition_code,
+        effect_detail: &target.effect_detail,
         termination_evidence: target.termination_evidence.as_ref().map(termination_dto),
     })
 }
@@ -328,6 +363,27 @@ fn detail_dto(operation: &NodeOperation) -> Result<serde_json::Value> {
         .as_object_mut()
         .context("operation JSON projection must be an object")?;
     object.insert("schema_version".into(), 1_u32.into());
+    object.insert(
+        "condition_details".into(),
+        serde_json::to_value(
+            operation
+                .conditions
+                .iter()
+                .map(condition_dto)
+                .collect::<Vec<_>>(),
+        )?,
+    );
+    for (field, timestamp) in [
+        ("created_at", operation.created_at.as_ref()),
+        ("updated_at", operation.updated_at.as_ref()),
+    ] {
+        object.insert(
+            field.into(),
+            timestamp
+                .map(|value| serde_json::json!({"seconds": value.seconds, "nanos": value.nanos}))
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
     object.insert(
         "slots".into(),
         serde_json::to_value(
@@ -634,6 +690,11 @@ mod tests {
             ..evidence(BackendStopDisposition::Forced)
         };
         let operation = NodeOperation {
+            conditions: vec![DeploymentCondition {
+                code: "START_FAILED".into(),
+                detail: "engine startup failed: unique host diagnostic".into(),
+                ..Default::default()
+            }],
             targets: vec![
                 OperationTargetProgress {
                     kind: InstructionTargetKind::Proxy as i32,
@@ -660,6 +721,13 @@ mod tests {
                     details: Some(operation_target_progress::Details::EngineDetails(
                         EngineTargetDetails::default(),
                     )),
+                    conditions: vec![DeploymentCondition {
+                        code: "SOURCE_RESTORATION_REQUIRED".into(),
+                        detail: "source restoration is required before terminal completion".into(),
+                        ..Default::default()
+                    }],
+                    effect_condition_code: "START_FAILED".into(),
+                    effect_detail: "engine startup failed: unique host diagnostic".into(),
                     termination_evidence: Some(engine_evidence),
                     ..Default::default()
                 },
@@ -669,6 +737,19 @@ mod tests {
 
         let value = detail_dto(&operation).expect("detail JSON");
         assert_eq!(value["schema_version"], 1);
+        assert_eq!(
+            value["condition_details"][0]["detail"],
+            "engine startup failed: unique host diagnostic"
+        );
+        assert_eq!(
+            value["slots"][0]["conditions"][0]["code"],
+            "SOURCE_RESTORATION_REQUIRED"
+        );
+        assert_eq!(value["slots"][0]["effect_condition_code"], "START_FAILED");
+        assert_eq!(
+            value["slots"][0]["effect_detail"],
+            "engine startup failed: unique host diagnostic"
+        );
         assert!(value["slots"][0]["termination_evidence"]
             .get("backend")
             .is_none());

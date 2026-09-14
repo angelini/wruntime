@@ -150,10 +150,12 @@ whether a process exited.
 A deployment describes the complete desired engine inventory. The manager
 reconciles additions, replacements, and removals while enforcing
 `max_unavailable`; removing final capacity requires explicit downtime consent.
-Cancellation before commit restores the source inventory. Rollback is a new,
-explicitly authorized revision rather than an automatic response to failure.
-Ambiguous host evidence pauses the operation so an operator can inspect and
-resume it without guessing.
+Cancellation before commit restores the source inventory. Restoration of an
+empty source quiesces engine slots before removing the proxy; restoration of a
+non-empty source restores the proxy first so source engines can reconnect.
+Rollback is a new, explicitly authorized revision rather than an automatic
+response to failure. Ambiguous host evidence pauses the operation so an
+operator can inspect and resume it without guessing.
 
 The node agent has no durable recovery journal. Durable intent and receipts live
 at the manager; a replacement agent receives fresh inspection work. Release
