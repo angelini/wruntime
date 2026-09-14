@@ -242,24 +242,18 @@ PY
 }
 
 wrt_require_compatible_fixture() {
-  local required active artifact ready_digest compatibility generation
-  required="$(wrt_fixture_source_digest)" || return
+  local active artifact ready_digest
   if [ ! -f "$WRT_POSTGRES_OWNER_FILE" ] || [ ! -f "$WRT_POSTGRES_READY_FILE" ]; then
     echo "worktree PostgreSQL fixture is not ready under $WRT_WORKTREE_DEV_STATE_ROOT" >&2
     echo "run 'just dev-up' on the Docker-capable host from $WRT_REPO_ROOT" >&2
     return 1
   fi
   active="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_digest"])' "$WRT_POSTGRES_OWNER_FILE")" || return
-  if [ "$active" != "$required" ]; then
-    printf 'worktree PostgreSQL fixture source mismatch\nworktree: %s\nactive: %s\nrequired: %s\n' "$WRT_REPO_ROOT" "$active" "$required" >&2
-    echo "run 'just dev-up' on the Docker-capable host from $WRT_REPO_ROOT" >&2
-    return 1
-  fi
   artifact="$(wrt_fixture_artifact_digest)" || return
   ready_digest="sha256:$(sha256sum "$WRT_POSTGRES_READY_FILE" | cut -d' ' -f1)"
   wrt_validate_fixture_records "$WRT_POSTGRES_OWNER_FILE" "$WRT_POSTGRES_READY_FILE" \
     "$WRT_GIT_COMMON_DIR" "$WRT_GIT_DIR" "$WRT_REPO_ROOT" "$active" "$artifact" "$ready_digest" || {
-    printf 'worktree PostgreSQL fixture coordination verification failed\nworktree: %s\nactive: %s\nrequired: %s\n' "$WRT_REPO_ROOT" "$active" "$required" >&2
+    printf 'worktree PostgreSQL fixture coordination verification failed\nworktree: %s\nsource: %s\n' "$WRT_REPO_ROOT" "$active" >&2
     echo "run 'just dev-up' on the Docker-capable host from $WRT_REPO_ROOT" >&2
     return 1
   }
@@ -268,37 +262,6 @@ wrt_require_compatible_fixture() {
     echo "worktree PostgreSQL fixture manifest/PKI verification failed; run host 'just dev-up'" >&2
     return 1
   }
-  compatibility="$(mktemp -d "$WRT_WORKTREE_DEV_STATE_ROOT/.compatibility.XXXXXX")" || return
-  mkdir -p "$compatibility/config"
-  cp "$WRT_REPO_ROOT/examples/ecommerce/engine-inventory-1.toml" "$compatibility/config/ecommerce.toml"
-  cp "$WRT_REPO_ROOT/examples/stockmarket/engine-exchange.toml" "$compatibility/config/stock-exchange.toml"
-  cp "$WRT_REPO_ROOT/examples/stockmarket/engine-ledger.toml" "$compatibility/config/stock-ledger.toml"
-  cp "$WRT_REPO_ROOT/examples/codegen/engine.toml" "$compatibility/config/codegen.toml"
-  generation="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["provision_generation"])' "$WRT_POSTGRES_READY_FILE")"
-  if ! cargo run --quiet --manifest-path "$WRT_REPO_ROOT/Cargo.toml" -p wr-tests \
-      --example postgres_tenant_native -- \
-      --output "$compatibility/data" --contract-out "$compatibility/expected.json" --generation "$generation" \
-      --server-ca "$WRT_POSTGRES_PKI_DIR/root/ca.crt" --client-cert "$WRT_POSTGRES_PKI_DIR/node-a/leaf.pem" \
-      --client-key "$WRT_POSTGRES_PKI_DIR/node-a/key.pem" \
-      --config "$compatibility/config/ecommerce.toml" --config "$compatibility/config/stock-exchange.toml" \
-      --config "$compatibility/config/stock-ledger.toml" --config "$compatibility/config/codegen.toml"; then
-    rm -rf "$compatibility"
-    echo "failed to compute desired worktree PostgreSQL manifests; run host 'just dev-up'" >&2
-    return 1
-  fi
-  if ! python3 - "$compatibility/expected.json" "$WRT_POSTGRES_READY_FILE" <<'PY'
-import json, sys
-expected, ready = (json.load(open(path)) for path in sys.argv[1:])
-for key in ('provision_generation', 'provisioning_manifest_digest', 'migration_bundle_digest'):
-    if expected[key] != ready[key]:
-        raise SystemExit(f"worktree PostgreSQL desired {key} mismatch: active={ready[key]} required={expected[key]}")
-PY
-  then
-    rm -rf "$compatibility"
-    echo "worktree PostgreSQL desired manifest mismatch; run host 'just dev-up'" >&2
-    return 1
-  fi
-  rm -rf "$compatibility"
 }
 
 wrt_export_dev_endpoints() {

@@ -11,8 +11,8 @@ if [ "${DOTGEN_PI_SANDBOX:-0}" = 1 ]; then
   exit 2
 fi
 [ "$#" -eq 0 ] || { echo "usage: dev/postgres-fixture-up.sh" >&2; exit 2; }
-# Read-only host preflight precedes the lock-file write, destructive Compose,
-# PKI/publication state, and compilation. It never changes the Rust toolchain.
+# Read-only host preflight precedes the lock-file write and any publication-capable
+# preparation. It never changes the Rust toolchain.
 wrt_detect_daemon_target
 wrt_require_installed_musl_target
 wrt_acquire_postgres_fixture_lock "host PostgreSQL fixture preparation"
@@ -44,15 +44,6 @@ verify_active_local_images() {
   [ "$(docker image inspect --format '{{.Id}}' "$tag")" = "$expected_image" ] || { echo "active provisioner image identity mismatch: $tag" >&2; return 1; }
   [ "$(docker image inspect --format '{{.Id}}' postgres:18-alpine)" = "$expected_base" ] || { echo 'active PostgreSQL base image identity mismatch' >&2; return 1; }
 }
-provenance_matches_record() {
-  python3 - "$1" "$2" <<'PY'
-import json, sys
-actual, record = (json.load(open(path)) for path in sys.argv[1:])
-for key, value in actual.items():
-    if record.get(key) != value:
-        raise SystemExit(f'provisioner provenance mismatch for {key}: active={record.get(key)!r} required={value!r}')
-PY
-}
 prepare_buckets() {
   local attempt bucket endpoint="http://127.0.0.1:${WRT_S3_PORT}"
   for attempt in $(seq 1 30); do
@@ -66,19 +57,13 @@ prepare_buckets() {
 }
 
 reuse_active_generation() {
-  local reuse_provenance reuse_override
-  [ -f "$WRT_POSTGRES_OWNER_FILE" ] && [ -f "$WRT_POSTGRES_READY_FILE" ] || return 1
+  local active_source
+  [ -f "$WRT_POSTGRES_OWNER_FILE" ] && [ -f "$WRT_POSTGRES_READY_FILE" ] \
+    && [ -f "$WRT_POSTGRES_COMPOSE_OVERRIDE" ] || return 1
+  active_source="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_digest"])' "$WRT_POSTGRES_OWNER_FILE")" || return 1
+  [ "$active_source" = "$required_source" ] || return 1
   wrt_require_compatible_fixture || return 1
   verify_active_local_images "$WRT_POSTGRES_OWNER_FILE" || return 1
-  reuse_provenance="$(mktemp "$WRT_WORKTREE_DEV_STATE_ROOT/.provisioner-reuse.XXXXXX.json")" || return 1
-  reuse_override="$reuse_provenance.compose.yml"
-  if ! wrt_prepare_postgres_provisioner_image "$repo" "$WRT_WORKTREE_DEV_STATE_ROOT" "$reuse_provenance" "$reuse_override" \
-      || ! provenance_matches_record "$reuse_provenance" "$WRT_POSTGRES_OWNER_FILE"; then
-    rm -f "$reuse_provenance" "$reuse_override"
-    return 1
-  fi
-  mv "$reuse_override" "$WRT_POSTGRES_COMPOSE_OVERRIDE" || return 1
-  rm -f "$reuse_provenance" || return 1
   wrt_compose up -d --wait || return 1
   prepare_buckets || return 1
 }
@@ -88,15 +73,11 @@ if reuse_active_generation; then
   exit 0
 fi
 
+# New or changed source converges against this worktree's retained volumes. Immutable
+# migration identity checks remain authoritative; developers may reset local data manually
+# if an intentionally incompatible development change cannot migrate forward.
 preparing=true
-echo "CONVERGING worktree project $WRT_COMPOSE_PROJECT_NAME: incompatible or partial local state will be replaced" >&2
-# A removed/recreated Git worktree can reuse its deterministic project identity.
-# Clear only this worktree's project, volumes, PKI, and fixture before publication.
-compose_current down -v --remove-orphans
-rm -rf "$WRT_POSTGRES_PKI_DIR" "$WRT_POSTGRES_FIXTURE_DIR"
-rm -f "$WRT_POSTGRES_OWNER_FILE" "$WRT_POSTGRES_COMPOSE_OVERRIDE"
-
-preparing=true
+echo "UPDATING worktree project $WRT_COMPOSE_PROJECT_NAME: existing database volumes will be retained" >&2
 mkdir -p "$WRT_WORKTREE_DEV_STATE_ROOT" "$repo/dev/observability/data"
 stage="$(mktemp -d "$WRT_WORKTREE_DEV_STATE_ROOT/.prepare.XXXXXX")"
 trap 'rm -rf "$stage"' EXIT

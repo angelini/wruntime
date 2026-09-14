@@ -60,6 +60,13 @@ loopback boundary. Public ingress removes all caller-supplied `x-wr-*` headers
 before adding trusted routing metadata. Source and routing headers support
 routing and observability; they never grant authorization.
 
+Development preserves the database authority boundary with one isolated Compose
+stack per linked worktree. Consumers verify the published generation's internal
+manifest, artifact, endpoint, and PKI bindings without requiring current
+source-hash equality. A later host `just dev-up` converges provisioning and
+immutable migrations against retained volumes and never destroys database state
+automatically.
+
 Guest capabilities are opt-in. Before loading a component, the engine compares
 its WIT imports with the module's configured database, blobstore, and LLM
 capabilities. Host implementations still enforce scope, input limits, and

@@ -50,8 +50,8 @@ for required in \
   'wrt_require_installed_musl_target' \
   'wrt_prepare_postgres_provisioner_image' \
   'reuse_active_generation' \
-  'CONVERGING worktree project' \
-  'compose_current down -v --remove-orphans' \
+  'UPDATING worktree project' \
+  'existing database volumes will be retained' \
   'postgres-provision-native.sh' \
   'postgres-provisioner migrate' \
   'pg_ident_file_mappings' \
@@ -71,14 +71,17 @@ architecture = 'wrt_detect_daemon_target'
 target = 'wrt_require_installed_musl_target'
 lock = 'wrt_acquire_postgres_fixture_lock'
 build = 'wrt_prepare_postgres_provisioner_image'
-destructive = 'compose_current down -v --remove-orphans'
 pki = 'bash dev/postgres-native-certs.sh'
 provision = 'bash dev/postgres-provision-native.sh'
 migrate = 'postgres-provisioner migrate'
 if not text.index(architecture) < text.index(target) < text.index(lock) < text.index(build) < text.index(pki) < text.index(provision) < text.index(migrate):
-    raise SystemExit('daemon/target preflight and local image preparation ordering changed')
-if not text.index(target) < text.index(destructive):
-    raise SystemExit('mapped Rust target preflight must precede destructive Compose')
+    raise SystemExit('daemon preflight, worktree lock, image preparation, provision, and migration ordering changed')
+if 'down -v' in text or 'rm -rf "$WRT_POSTGRES_PKI_DIR"' in text:
+    raise SystemExit('dev-up must not automatically destroy retained worktree database state')
+state = pathlib.Path('dev/shared-dev-state.sh').read_text()
+consumer = state.split('wrt_require_compatible_fixture() {', 1)[1].split('\nwrt_export_dev_endpoints()', 1)[0]
+if 'wrt_fixture_source_digest' in consumer or 'postgres_tenant_native' in consumer:
+    raise SystemExit('fixture consumers must not require current source or desired-manifest equality')
 helper=pathlib.Path('dev/postgres-provisioner-image.sh').read_text()
 if helper.count('wrt_require_installed_musl_target || return') != 1:
     raise SystemExit('defensive build-time Rust target check is absent')
@@ -161,7 +164,10 @@ services:
     image: wruntime-dev-postgres-provisioner:contract-test
     pull_policy: never
 YAML
-WRT_WORKTREE_DEV_STATE_ROOT="$WRT_WORKTREE_DEV_STATE_ROOT" docker compose --project-name "$WRT_COMPOSE_PROJECT_NAME" -f docker-compose.yml -f "$health_case/provisioner.yml" --profile postgres-tools config --format json >"$health_case/compose.json"
+# Rendering this Compose model is credential-free; do not inspect the caller's
+# Docker configuration.
+mkdir -m 700 "$health_case/docker-config"
+DOCKER_CONFIG="$health_case/docker-config" WRT_WORKTREE_DEV_STATE_ROOT="$WRT_WORKTREE_DEV_STATE_ROOT" docker compose --project-name "$WRT_COMPOSE_PROJECT_NAME" -f docker-compose.yml -f "$health_case/provisioner.yml" --profile postgres-tools config --format json >"$health_case/compose.json"
 health_script="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["services"]["postgres"]["healthcheck"]["test"][1])' "$health_case/compose.json")"
 python3 - "$health_case/compose.json" <<'PY'
 import json, sys
@@ -232,7 +238,7 @@ common={'owner_worktree':owner,'git_common_dir':common_dir,'git_dir':git_dir,'wo
 PY
 wrt_validate_fixture_records "$digest_case/owner.json" "$digest_case/ready.json" "$WRT_GIT_COMMON_DIR" "$WRT_GIT_DIR" "$WRT_REPO_ROOT" sha256:source sha256:artifact sha256:ready "$digest_case/override.yml"
 if wrt_validate_fixture_records "$digest_case/owner.json" "$digest_case/ready.json" "$WRT_GIT_COMMON_DIR" "$WRT_GIT_DIR" "$WRT_REPO_ROOT" sha256:different sha256:artifact sha256:ready "$digest_case/override.yml" >/dev/null 2>&1; then
-  echo "source mismatch was accepted" >&2; exit 1
+  echo "fixture record source mismatch was accepted" >&2; exit 1
 fi
 if wrt_validate_fixture_records "$digest_case/owner.json" "$digest_case/ready.json" "$WRT_GIT_COMMON_DIR" "$WRT_GIT_DIR" "$WRT_REPO_ROOT" sha256:source sha256:different sha256:ready "$digest_case/override.yml" >/dev/null 2>&1; then
   echo "artifact mismatch was accepted" >&2; exit 1

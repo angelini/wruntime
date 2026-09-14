@@ -1,5 +1,9 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use crate::blobstore::{BlobError, BlobstoreRuntime};
 use crate::config::{BlobstoreLimits, FsMode, ResourceLimits};
@@ -10,16 +14,10 @@ use http_body_util::{BodyExt, Full};
 use hyper::header::{HeaderName, HeaderValue};
 use tempfile::TempDir;
 use wasmtime::component::ResourceTable;
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{
-    p2::{
-        bindings::http::types::ErrorCode,
-        body::{HyperIncomingBody, HyperOutgoingBody},
-        hyper_request_error,
-        types::{HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig},
-        HttpResult, WasiHttpCtxView, WasiHttpHooks, WasiHttpView,
-    },
-    WasiHttpCtx,
+    p2::body::HyperIncomingBody, Error as WasiHttpError, RequestOptions, WasiBody, WasiHttpCtx,
+    WasiHttpCtxView, WasiHttpHooks, WasiHttpView,
 };
 use wr_common::http_headers::{WR_DESTINATION, WR_SOURCE, WR_SOURCE_NS};
 use wr_common::http_pool::HttpClientPool;
@@ -43,22 +41,76 @@ struct ModuleHttpHooks {
     /// starting a new trace. Modules set this via `start-root`.
     outbound_parent: Arc<std::sync::Mutex<Option<tracing::Span>>>,
     /// Max buffered outbound request body size in bytes; larger bodies are
-    /// rejected with `ErrorCode::HttpRequestBodySize`.
+    /// rejected with `Error::HttpRequestBodySize`.
     max_outbound_body_bytes: usize,
+}
+
+type HttpIoFuture = Box<dyn Future<Output = Result<(), WasiHttpError>> + Send>;
+type HttpResponseFuture = Box<
+    dyn Future<Output = Result<(hyper::Response<WasiBody>, HttpIoFuture), WasiHttpError>> + Send,
+>;
+
+/// Adds the WASI request-options timeout between response body frames.
+struct IncomingBodyWithTimeout {
+    inner: HyperIncomingBody,
+    timeout: Pin<Box<tokio::time::Sleep>>,
+    reset_sleep: bool,
+    between_bytes_timeout: Duration,
+}
+
+impl IncomingBodyWithTimeout {
+    fn new(inner: HyperIncomingBody, between_bytes_timeout: Duration) -> Self {
+        Self {
+            inner,
+            timeout: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            reset_sleep: true,
+            between_bytes_timeout,
+        }
+    }
+}
+
+impl http_body::Body for IncomingBodyWithTimeout {
+    type Data = bytes::Bytes;
+    type Error = WasiHttpError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = Pin::into_inner(self);
+        if this.reset_sleep {
+            this.timeout
+                .as_mut()
+                .reset(tokio::time::Instant::now() + this.between_bytes_timeout);
+            this.reset_sleep = false;
+        }
+        if this.timeout.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Some(Err(WasiHttpError::ConnectionReadTimeout)));
+        }
+        let result = Pin::new(&mut this.inner).poll_frame(cx);
+        this.reset_sleep = result.is_ready();
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 impl WasiHttpHooks for ModuleHttpHooks {
     fn send_request(
         &mut self,
-        mut request: hyper::Request<HyperOutgoingBody>,
-        config: OutgoingRequestConfig,
-    ) -> HttpResult<HostFutureIncomingResponse> {
+        mut request: hyper::Request<WasiBody>,
+        options: Option<RequestOptions>,
+        _io: HttpIoFuture,
+    ) -> HttpResponseFuture {
         let original_uri = request.uri().to_string();
-        let telemetry_uri = wr_common::uri::uri_for_telemetry(&original_uri);
+        let telemetry_uri = wr_common::uri::uri_for_telemetry(&original_uri).to_owned();
 
-        // If the guest set an outbound parent (via `start-root`), parent to
-        // that span so all outbound calls share one trace. Otherwise start a
-        // new root trace per outbound call.
         let parent_lock = self.outbound_parent.lock().unwrap();
         let parent = parent_lock.clone().unwrap_or_else(tracing::Span::none);
         drop(parent_lock);
@@ -74,113 +126,107 @@ impl WasiHttpHooks for ModuleHttpHooks {
             otel.status_code = tracing::field::Empty,
         );
 
-        request.headers_mut().insert(
-            HeaderName::from_static(WR_DESTINATION),
-            HeaderValue::from_str(&original_uri).map_err(|_| ErrorCode::InternalError(None))?,
-        );
-        request.headers_mut().insert(
-            HeaderName::from_static(WR_SOURCE),
-            HeaderValue::from_str(&self.module_name).map_err(|_| ErrorCode::InternalError(None))?,
-        );
-        request.headers_mut().insert(
-            HeaderName::from_static(WR_SOURCE_NS),
-            HeaderValue::from_str(&self.module_namespace)
-                .map_err(|_| ErrorCode::InternalError(None))?,
-        );
-
-        // Inject trace context so downstream services (proxy, destination engine)
-        // join this trace instead of starting a new one.
-        {
-            let _guard = outbound_span.enter();
-            wr_common::telemetry::inject_context(request.headers_mut());
-        }
-
-        // Preserve the original path+query; only replace scheme and authority.
-        let path_and_query = request
-            .uri()
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-        let scheme = self.proxy_uri.scheme_str().unwrap_or("http");
-        let authority = self.proxy_uri.authority().map(|a| a.as_str()).unwrap_or("");
-        let new_uri: hyper::Uri = format!("{scheme}://{authority}{path_and_query}")
-            .parse()
-            .map_err(|_| ErrorCode::InternalError(None))?;
-        tracing::debug!(
-            original = %telemetry_uri,
-            proxy_uri = %self.proxy_uri,
-            rewritten = %wr_common::uri::uri_for_telemetry(&new_uri.to_string()),
-            "outgoing request rewrite"
-        );
-        *request.uri_mut() = new_uri;
-
+        let proxy_uri = self.proxy_uri.clone();
+        let module_name = self.module_name.clone();
+        let module_namespace = self.module_namespace.clone();
         let client = self.http_pool.get().clone();
-        let between_bytes_timeout = config.between_bytes_timeout;
+        let between_bytes_timeout = options
+            .and_then(|options| options.between_bytes_timeout)
+            .unwrap_or(Duration::from_secs(600));
         let max_outbound_body_bytes = self.max_outbound_body_bytes;
 
-        let handle = wasmtime_wasi::runtime::spawn(async move {
-            Ok(async move {
-                // Buffer the outgoing body up to `max_outbound_body_bytes`, aborting as
-                // soon as the running total exceeds the cap so an oversized body is never
-                // fully materialized. The pooled client requires a single concrete
-                // Send + 'static body type (Full<Bytes>), so the under-cap path is buffered.
-                let (parts, mut body) = request.into_parts();
+        Box::new(async move {
+            request.headers_mut().insert(
+                HeaderName::from_static(WR_DESTINATION),
+                HeaderValue::from_str(&original_uri)
+                    .map_err(|_| WasiHttpError::InternalError(None))?,
+            );
+            request.headers_mut().insert(
+                HeaderName::from_static(WR_SOURCE),
+                HeaderValue::from_str(&module_name)
+                    .map_err(|_| WasiHttpError::InternalError(None))?,
+            );
+            request.headers_mut().insert(
+                HeaderName::from_static(WR_SOURCE_NS),
+                HeaderValue::from_str(&module_namespace)
+                    .map_err(|_| WasiHttpError::InternalError(None))?,
+            );
 
-                // Fast pre-check: reject without reading a frame if the body advertises an
-                // upper bound over the cap. `upper` is usually absent for guest bodies, so
-                // the running-total guard below is the authoritative check.
-                if let Some(upper) = http_body::Body::size_hint(&body).upper() {
-                    if upper > max_outbound_body_bytes as u64 {
-                        return Err(ErrorCode::HttpRequestBodySize(Some(upper)));
-                    }
-                }
-
-                let mut collected = bytes::BytesMut::new();
-                while let Some(frame) = body.frame().await {
-                    let frame = frame?;
-                    if let Ok(data) = frame.into_data() {
-                        if collected.len() + data.len() > max_outbound_body_bytes {
-                            return Err(ErrorCode::HttpRequestBodySize(Some(
-                                (collected.len() + data.len()) as u64,
-                            )));
-                        }
-                        collected.extend_from_slice(data.as_ref());
-                    }
-                }
-                let buffered = hyper::Request::from_parts(parts, Full::new(collected.freeze()));
-
-                let resp = client.request(buffered).await.map_err(|e| {
-                    tracing::warn!(error = ?e, "outgoing http request failed");
-                    outbound_span.record("otel.status_code", "ERROR");
-                    if e.is_connect() {
-                        ErrorCode::ConnectionRefused
-                    } else {
-                        ErrorCode::InternalError(Some(e.to_string()))
-                    }
-                })?;
-
-                let status = resp.status().as_u16();
-                outbound_span.record("http.response.status_code", status);
-                if status >= 400 {
-                    outbound_span.record("otel.status_code", "ERROR");
-                } else {
-                    outbound_span.record("otel.status_code", "OK");
-                }
-
-                let (resp_parts, resp_body) = resp.into_parts();
-                let incoming_body: HyperIncomingBody =
-                    resp_body.map_err(hyper_request_error).boxed_unsync();
-
-                Ok::<IncomingResponse, ErrorCode>(IncomingResponse {
-                    resp: hyper::Response::from_parts(resp_parts, incoming_body),
-                    worker: None,
-                    between_bytes_timeout,
-                })
+            {
+                let _guard = outbound_span.enter();
+                wr_common::telemetry::inject_context(request.headers_mut());
             }
-            .await)
-        });
 
-        Ok(HostFutureIncomingResponse::pending(handle))
+            let path_and_query = request
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/");
+            let scheme = proxy_uri.scheme_str().unwrap_or("http");
+            let authority = proxy_uri.authority().map(|a| a.as_str()).unwrap_or("");
+            let new_uri: hyper::Uri = format!("{scheme}://{authority}{path_and_query}")
+                .parse()
+                .map_err(|_| WasiHttpError::HttpRequestUriInvalid)?;
+            tracing::debug!(
+                original = %telemetry_uri,
+                proxy_uri = %proxy_uri,
+                rewritten = %wr_common::uri::uri_for_telemetry(&new_uri.to_string()),
+                "outgoing request rewrite"
+            );
+            *request.uri_mut() = new_uri;
+
+            // Buffer the outgoing body up to `max_outbound_body_bytes`, aborting as
+            // soon as the running total exceeds the cap so an oversized body is never
+            // fully materialized. The pooled client requires a single concrete
+            // Send + 'static body type (Full<Bytes>), so the under-cap path is buffered.
+            let (parts, mut body) = request.into_parts();
+
+            if let Some(upper) = http_body::Body::size_hint(&body).upper() {
+                if upper > max_outbound_body_bytes as u64 {
+                    return Err(WasiHttpError::HttpRequestBodySize(Some(upper)));
+                }
+            }
+
+            let mut collected = bytes::BytesMut::new();
+            while let Some(frame) = body.frame().await {
+                let frame = frame?;
+                if let Ok(data) = frame.into_data() {
+                    if collected.len() + data.len() > max_outbound_body_bytes {
+                        return Err(WasiHttpError::HttpRequestBodySize(Some(
+                            (collected.len() + data.len()) as u64,
+                        )));
+                    }
+                    collected.extend_from_slice(data.as_ref());
+                }
+            }
+            let buffered = hyper::Request::from_parts(parts, Full::new(collected.freeze()));
+
+            let resp = client.request(buffered).await.map_err(|error| {
+                tracing::warn!(error = ?error, "outgoing http request failed");
+                outbound_span.record("otel.status_code", "ERROR");
+                if error.is_connect() {
+                    WasiHttpError::ConnectionRefused
+                } else {
+                    WasiHttpError::InternalError(Some(error.to_string()))
+                }
+            })?;
+
+            let status = resp.status().as_u16();
+            outbound_span.record("http.response.status_code", status);
+            if status >= 400 {
+                outbound_span.record("otel.status_code", "ERROR");
+            } else {
+                outbound_span.record("otel.status_code", "OK");
+            }
+
+            let (resp_parts, resp_body) = resp.into_parts();
+            let incoming_body: HyperIncomingBody =
+                resp_body.map_err(WasiHttpError::from).boxed_unsync();
+            let incoming_body =
+                IncomingBodyWithTimeout::new(incoming_body, between_bytes_timeout).boxed_unsync();
+            let io: HttpIoFuture = Box::new(async { Ok(()) });
+            Ok((hyper::Response::from_parts(resp_parts, incoming_body), io))
+        })
     }
 }
 
@@ -464,7 +510,7 @@ impl ModuleState {
         let fs_root = match services.fs.as_ref() {
             Some(FsMode::Tempdir) => {
                 let dir = tempfile::tempdir()?;
-                builder.preopened_dir(dir.path(), "/", DirPerms::all(), FilePerms::all())?;
+                builder.preopened_dir(dir.path(), "/", FsPerms::ReadWrite)?;
                 Some(dir)
             }
             None => None,
@@ -609,6 +655,29 @@ impl WasiHttpView for ModuleState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PendingBody;
+
+    impl http_body::Body for PendingBody {
+        type Data = bytes::Bytes;
+        type Error = WasiHttpError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn incoming_body_enforces_between_bytes_timeout() {
+        let body: HyperIncomingBody = PendingBody.boxed_unsync();
+        let mut body = IncomingBodyWithTimeout::new(body, Duration::ZERO);
+
+        let error = body.frame().await.unwrap().unwrap_err();
+        assert!(matches!(error, WasiHttpError::ConnectionReadTimeout));
+    }
 
     #[test]
     fn resource_counters_share_one_allocation_and_release_exactly() {

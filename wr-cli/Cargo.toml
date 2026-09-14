@@ -40,7 +40,7 @@ wr-common = { path = "../wr-common", features = [
   "signal",
   "tls",
 ] }
-wasmtime = { version = "46", default-features = false, features = [
+wasmtime = { version = "=48.0.2", default-features = false, features = [
   "all-arch",
   "anyhow",
   "component-model",

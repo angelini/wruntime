@@ -45,17 +45,28 @@ just dev-logs
 just dev-down
 ```
 
-Run `just dev-up` from each worktree before tests that require PostgreSQL or
+Run `just dev-up` once from each worktree before tests that require PostgreSQL or
 RustFS. Each linked worktree receives an isolated Compose project, persistent
-port allocation, and state under `<absolute-git-dir>/wruntime-dev-state`.
-`owner.json` and `fixture/ready.json` bind that state to the worktree, endpoints,
-PKI, provisioning inputs, migrations, and provisioner artifact. Consumers fail
-before database access if the fixture is absent or incompatible; rerun host
-`just dev-up` in that worktree to replace it.
+port allocation, retained volumes, and state under
+`<absolute-git-dir>/wruntime-dev-state`. Different worktrees can run DB tests and
+local E2Es concurrently without a cross-worktree lock.
+
+`owner.json` and `fixture/ready.json` bind the state to the worktree, endpoints,
+source at preparation, PKI, provisioning inputs, migrations, provisioner
+artifact, and image provenance. Consumers verify those published bindings
+internally without comparing the recorded source digest with current source, so
+ordinary source changes do not require another infrastructure setup. An
+unchanged host `just dev-up` reuses the published generation. A rerun after
+provisioning or migration changes converges the retained volumes through the
+immutable migration ledger and never deletes the database automatically;
+intentionally incompatible local data requires an explicit manual reset.
+Consumers fail before database access only when the fixture is missing or
+internally invalid. Run `just test-worktree-dev-fixture` for the worktree,
+fixture, image, and provenance contracts.
 
 Inside the Pi sandbox, Docker setup is intentionally unavailable. Tests consume
-the compatible host-prepared fixture exposed to the worktree. Do not attempt to
-provision or repair host infrastructure from the sandbox.
+the internally valid host-prepared fixture exposed to the worktree. Do not
+attempt to provision or repair host infrastructure from the sandbox.
 
 `just dev-reset-db` destroys and recreates this worktree's manager and engine
 job persistence. Use it only when intentionally changing the clean embedded

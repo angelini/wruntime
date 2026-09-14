@@ -13,8 +13,9 @@ use http_body_util::BodyExt as _;
 use tokio::sync::{oneshot, OwnedSemaphorePermit};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Store, Trap};
-use wasmtime_wasi_http::p2::{
-    bindings::http::types::Scheme, bindings::ProxyPre, body::HyperOutgoingBody, WasiHttpView as _,
+use wasmtime_wasi_http::{
+    p2::{bindings::http::types::Scheme, bindings::ProxyPre, body::HyperOutgoingBody},
+    WasiHttpView as _,
 };
 
 use crate::config::PoolConfig;

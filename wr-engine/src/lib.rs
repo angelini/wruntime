@@ -1,8 +1,8 @@
 use bytes::Bytes;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt as _, Full};
 use tokio::sync::{mpsc, oneshot};
-use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::p2::body::HyperIncomingBody;
+use wasmtime_wasi_http::Error as WasiHttpError;
 
 pub mod blobstore;
 pub mod config;
@@ -37,7 +37,7 @@ impl std::error::Error for EngineBodyError {}
 
 pub fn inbound_full(body: Bytes) -> InboundBody {
     Full::new(body)
-        .map_err(|never: std::convert::Infallible| -> ErrorCode { match never {} })
+        .map_err(|never: std::convert::Infallible| -> WasiHttpError { match never {} })
         .boxed_unsync()
 }
 
@@ -48,7 +48,7 @@ pub fn response_full(body: Bytes) -> ResponseBody {
 }
 
 pub fn inbound_network(body: hyper::body::Incoming) -> InboundBody {
-    body.map_err(ErrorCode::from).boxed_unsync()
+    body.map_err(WasiHttpError::from).boxed_unsync()
 }
 
 /// A single inbound request dispatched to a WASM module task.

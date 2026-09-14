@@ -195,6 +195,16 @@ attempt evidence.
 Namespace databases, roles, and mappings are retained. Their retirement and
 access revocation belong to PostgreSQL administration, not node deployment.
 
+Development setup is host-owned rather than a sandbox deployment workflow. Each
+linked worktree has an isolated Compose project, retained volumes, PKI, fixture
+artifacts, and readiness records. Pi consumes the internally consistent
+published state without requiring current source-hash equality and performs no
+Docker, provisioning, migration, or topology discovery. When rerun after
+provisioning or migration changes, host `just dev-up` converges the retained
+volumes through the immutable migration ledger and never deletes them
+automatically. Intentionally incompatible local data requires an explicit
+manual reset. See [Testing](testing.md#development-services) for details.
+
 ## Operations and recovery
 
 `node deploy` always submits a complete desired inventory. It handles initial

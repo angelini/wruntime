@@ -33,8 +33,8 @@ crate-type = ["cdylib"]
 [dependencies]
 prost = "0.14"
 wr-sdk = { path = "{{RELATIVE_PATH_TO_WR_SDK}}" }
-wit-bindgen = "0.51.0"
-wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+wit-bindgen = "=0.60.0"
+wit-bindgen-rt = { version = "=0.44.0", features = ["bitflags"] }
 
 [build-dependencies]
 prost-build = "0.14"
