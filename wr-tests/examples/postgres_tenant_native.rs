@@ -111,7 +111,10 @@ fn main() -> Result<()> {
         .unwrap_or(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64);
     let tenant_server_name = "postgres.internal".to_string();
     let tenant_host_addr = Some("127.0.0.1".to_string());
-    let tenant_port = 5433;
+    let tenant_port = std::env::var("WRT_POSTGRES_PORT")
+        .context("WRT_POSTGRES_PORT is required")?
+        .parse()
+        .context("WRT_POSTGRES_PORT is not a valid port")?;
     let deployment_digest = format!("sha256:{}", "0".repeat(64));
     let mut sources = BTreeMap::new();
     for module in configs

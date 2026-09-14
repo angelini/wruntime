@@ -5,9 +5,8 @@ Maintainers should select checks by change class in the [validation matrix](agen
 Common recipes:
 
 ```bash
-just dev-up                  # create/reuse compatible shared dev services
-just dev-reprepare           # destructive shared generation/owner replacement
-just test-shared-dev-fixture # hermetic musl/image/shared-fixture contracts
+just dev-up                    # create/reuse this worktree's dev stack
+just test-worktree-dev-fixture # hermetic musl/image/worktree-fixture contracts
 just multi-node              # run the local two-node topology until Ctrl-C
 just multi-node-inline       # start, verify, and stop the local topology
 just test                    # build test guests, then run all tests
@@ -25,7 +24,6 @@ just validate-all --no-deployment-e2e # full local suite with an explicit live-s
 just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e # Pi sandbox
 just validate-all --deployment-e2e    # trusted runner: require both live deployment backends
 just deployment-e2e-python-test       # locked provider/assertion unit tests
-just test-local-e2e-lock              # same-host fixed-port exclusion fixture
 just test-lifecycle-runners            # foreground runner/barrier/reaping fixtures
 just test-one migration_test          # real DB migration history and constraints
 just test-one job_migration_test      # embedded queue schema and inventory indexes
@@ -43,47 +41,46 @@ just dev-down                # stop dev infrastructure
 ```
 
 `just test`, `just test-integration`, `just test-one`, and `just test-wasm`
-first rebuild the test WASM guest artifacts incrementally, then set the
-`WRT_TEST_DB_URL` and `WRT_TEST_S3_*` variables expected by integration tests.
-This prevents changed guest sources or schemas from running against stale staged
-components. Run `just dev-up` first when using those full recipes. Development
-PostgreSQL is one greenfield PostgreSQL 18 native-SSL generation shared by linked
-worktrees. The locator canonicalizes `git rev-parse --path-format=absolute
---git-common-dir` and uses only `<common-dir>/wruntime-dev-state`; there is no root or
-project override. `owner.json` records the worktree supplying the fixed `wruntime-dev`
-Compose project, and `fixture/ready.json` binds source, normalized provisioning,
-migration inventory, endpoint, artifact, PKI, daemon/musl target/toolchain,
-`wr-cli` binary, two-file context, exact provisioner image, and PostgreSQL base-image
-digests. The explicit source hash includes relevant uncommitted/untracked bytes rather
-than commit identity, but excludes unrelated runtime sources and host build output.
+first rebuild the test WASM guest artifacts incrementally, then verify this worktree's
+fixture and export its published `WRT_TEST_DB_URL` and `WRT_TEST_S3_*` values. This
+prevents changed guest sources or schemas from running against stale staged components.
+Run `just dev-up` from the same worktree before using those full recipes.
 
-Every database-sensitive Just recipe and example holds the same exclusive
-`locks/postgres-fixture.lock` inode; nested recipes inherit and verify the descriptor
-instead of deadlocking. On the Docker-capable host, `just dev-up` creates the first
-generation or reuses only a digest-compatible owner. It maps the Docker daemon to one
-supported Linux-musl target, requires that exact target to be preinstalled in `rustup`
-before lock/state/destructive work (otherwise reporting `rustup target add <target>`
-without running it), reuses the owner's ordinary `target/` and Cargo cache for
-`cargo zigbuild`, validates the ELF, and stages only `Dockerfile` plus `wr-cli` for a
-content-tagged UID-70 no-pull image. It then performs PKI/server/HBA/map, co-located
-provision/migrate, validation, and bucket setup before atomically publishing
-owner/readiness. Run `just test-shared-dev-fixture` for hermetic fake-Docker/Cargo
-coverage of architecture, cache, minimal-context, image, and provenance contracts. Missing, partial, deleted-owner, or mismatched state fails before
-database access with owner and active/required digest evidence. Coordinate all users
-and run destructive host `just dev-reprepare` to replace the fixed project, volumes,
-PKI, artifacts, and ownership; ordinary commands never steal or repair it.
+Each linked worktree owns one greenfield PostgreSQL 18 native-SSL Compose stack. The
+locator canonicalizes `git rev-parse --path-format=absolute --absolute-git-dir` and
+uses `<git-dir>/wruntime-dev-state`. A persistent atomically claimed slot under the
+common Git directory assigns a disjoint local port block, while the canonical Git-dir
+hash assigns project name `wruntime-dev-<id>`. Compose-project scoping isolates
+containers, networks, and volumes; the port block isolates PostgreSQL, RustFS, LGTM,
+and local manager/proxy/engine listeners. Different worktrees therefore run DB tests
+and local E2Es concurrently without a cross-worktree lock. The small fixture lifecycle
+lock protects only setup, teardown, and destructive reset within one worktree.
+
+`owner.json` and `fixture/ready.json` bind the worktree/Git identities, slot, Compose
+project, published endpoints, source, normalized provisioning, migration inventory,
+artifact, PKI, daemon/musl target/toolchain, `wr-cli` binary, two-file context, exact
+provisioner image, and PostgreSQL base-image digests. The explicit source hash includes
+relevant uncommitted/untracked bytes rather than commit identity. Host `just dev-up`
+creates or reuses only that worktree's compatible generation, using the worktree's
+ordinary `target/` and Cargo cache for the daemon-matched `cargo zigbuild`. Provision,
+migration, validation, and bucket setup finish before atomic publication. Run
+`just test-worktree-dev-fixture` for the hermetic identity, port, image, and provenance
+contracts. Consumers fail before database access when state is missing or mismatched. Host
+`just dev-up` reuses a compatible generation and destructively replaces missing,
+partial, or incompatible state in the same worktree.
+Content-addressed provisioner images may be reused by Docker across projects and are
+not deleted when one worktree stack is replaced. The cutover does not automatically remove
+the legacy singleton `wruntime-dev` project; after confirming no old checkout uses it,
+remove that project explicitly with its former Compose file if desired.
 
 Inside Pi, `test-tenant-isolation-e2e` and all examples are consume-only. They derive
-the shared root automatically, use `postgres.internal` at `127.0.0.1:5433` and fixed
-`wruntime_manager`/`wruntime_jobs` URLs, and accept no state-root, Compose-project,
-PostgreSQL URL, provisioner runner, admin/ident path, certificate path, or tenant
-endpoint inputs. They never invoke Docker, provisioning, migration, reload, or
-server-configuration discovery. The gate proves mapped login,
-same-namespace access, cross-namespace/platform and owner/DDL denial, bounded fresh
-sessions, production engine readiness, and absence of admin material in engine
-environments. Host `dev-up` owns development setup proof; protected deployment E2E
-independently owns deployment-host map install/reload/rollback and deployment-specific
-certificate denials. The embedded
+the worktree state automatically, read its published endpoints, and never invoke
+Docker, provisioning, migration, reload, or server-configuration discovery. The gate
+proves mapped login, same-namespace access, cross-namespace/platform and owner/DDL
+denial, bounded fresh sessions, production engine readiness, and absence of admin
+material in engine environments. Host `dev-up` owns development setup proof. Protected
+deployment E2E independently owns deployment-host map install/reload/rollback and is
+the only globally serialized test stage. The embedded
 manager and engine job schemas are each a single clean V1 baseline; old Refinery
 history/checksums are unsupported. Use `just dev-reset-db` to destroy and recreate
 manager and job persistence before testing binaries with a changed baseline.
@@ -151,16 +148,13 @@ For ordinary broad evidence, use `just validate-all --no-deployment-e2e` only wh
 
 `just validate-all` is a thin alias for `dev/validate-all.sh`. The script
 orchestrates existing Just recipes for formatting, compile checks, lints, WASM
-guest builds, Rust tests, and semantic-lifecycle fixed-port E2E examples. All guests are built
+guest builds, Rust tests, and semantic-lifecycle E2E examples. All guests are built
 through one sequential `just build-wasm-guests` invocation so independent
-Cargo processes never contend on the shared target during that stage. E2E
-examples run sequentially because they share ports and example resources. The
-runner holds a non-blocking, per-user host lock before resetting those resources;
-individual example scripts acquire the same lock, so conflicting runs from
-another worktree fail before starting services or mutating the example database.
-The lock defaults to `${XDG_RUNTIME_DIR:-/tmp}/wruntime-local-e2e-<uid>.lock` and
-can be overridden with `WRT_LOCAL_E2E_LOCK_FILE`. Kernel `flock` ownership makes
-stale lock files harmless after a runner exits. Logs and `summary.txt` are
+Cargo processes never contend on the worktree target during that stage. Examples
+remain sequential within one validation run because they intentionally reset that
+worktree's example database and buckets. Different worktrees use disjoint Compose
+resources and listener ports, so their full validation runs may proceed concurrently
+without a local-E2E or database-consumer lock. Logs and `summary.txt` are
 written under `target/validate-all/<timestamp>-<pid>/`; terminal
 failure output is capped for agent-friendly context use. Codegen E2E runs only
 when `ANTHROPIC_API_KEY` is set by default; use `--codegen-e2e` to require it
@@ -168,20 +162,19 @@ or `--no-codegen-e2e` to always skip it.
 
 The deployment lifecycle stage always requires an explicit choice. Trusted
 runners use `just validate-all --deployment-e2e`, which runs the single complete
-Systemd qualification before fixed-port local examples. Local development uses
+Systemd qualification before worktree-local examples. Local development uses
 `just validate-all --no-deployment-e2e`; the summary records one explicit
 `SKIPPED` row for that protected scenario. In the Pi sandbox (`DOTGEN_PI_SANDBOX=1`), use
 `just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e`: Docker
 cannot run there, but the existing development services are exposed. Only
 `ANTHROPIC_API_KEY` is unavailable for the local examples, so codegen is skipped
 while multi-node, ecommerce, and stockmarket still run. Do not pass `--no-e2e`
-in Pi. Outside Pi, `--no-e2e` affects only fixed-port local examples, so it may
+in Pi. Outside Pi, `--no-e2e` affects only worktree-local examples, so it may
 be combined with `--deployment-e2e`. `--e2e-only` still requires an explicit
 deployment choice and runs the enabled E2E stages.
 
-Fixed-port local E2Es require `flock`. Live deployment additionally requires
-`uv`, `cargo-zigbuild`, SSH, and `psql`; its protected-target lock remains
-separate from the local example lock.
+Live deployment requires `flock`, `uv`, `cargo-zigbuild`, SSH, and `psql`; its
+protected-target lock remains the sole global test lock.
 Python dependencies and the Python 3.12 toolchain request are owned by the
 nested `dev/deployment-e2e` project through `pyproject.toml`, `.python-version`,
 and the checked-in `uv.lock`. Recipes and the lifecycle harness use

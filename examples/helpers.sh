@@ -20,24 +20,21 @@ export INLINE
 # ── Repo root ────────────────────────────────────────────────────────────────
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
-# shellcheck source=dev/local-e2e-lock.sh
-source "$REPO_ROOT/dev/local-e2e-lock.sh"
 # shellcheck source=dev/shared-dev-state.sh
 source "$REPO_ROOT/dev/shared-dev-state.sh"
-wrt_acquire_postgres_fixture_lock "example runner: $0"
 if [ "$HELPER_CONTRACT_TEST" != true ]; then
 	wrt_require_compatible_fixture
 fi
-wrt_acquire_local_e2e_lock "example runner: $0"
+wrt_export_dev_endpoints
 
-# ── Environment defaults ─────────────────────────────────────────────────────
-DB_URL="postgres://wr_manager_platform:wruntime-dev-manager@localhost:5433/wruntime_manager"
-JOB_DB_URL="postgres://wr_jobs_platform:wruntime-dev-jobs@localhost:5433/wruntime_jobs"
-S3_ENDPOINT="${S3_ENDPOINT:-http://localhost:8900}"
-S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
-S3_SECRET_KEY="${S3_SECRET_KEY:-rustfsadmin}"
+# ── Worktree endpoints ────────────────────────────────────────────────────────
+DB_URL="$WRT_EXAMPLE_DB_URL"
+JOB_DB_URL="$WRT_JOBS_DB_URL"
+S3_ENDPOINT="$WRT_TEST_S3_ENDPOINT"
+S3_ACCESS_KEY="$WRT_TEST_S3_ACCESS_KEY"
+S3_SECRET_KEY="$WRT_TEST_S3_SECRET_KEY"
 export RUST_LOG="${RUST_LOG:-info}"
-export WR_MANAGER="${WR_MANAGER:-https://127.0.0.1:9000}"
+export WR_MANAGER="https://127.0.0.1:${WRT_MANAGER_PORT}"
 
 RUN_DIR="${WR_EXAMPLE_RUN_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/wr-example.XXXXXX")}"
 CONFIG_DIR="${RUN_DIR}/config"
@@ -210,6 +207,24 @@ for old, new in zip(pairs[0::2], pairs[1::2]):
     if old not in text:
         raise SystemExit(f"{src}: expected template value not found: {old!r}")
     text = text.replace(old, new)
+ports = {
+    8080: int(os.environ["WRT_EXTERNAL_PORT"]),
+    9000: int(os.environ["WRT_MANAGER_PORT"]),
+    9001: int(os.environ["WRT_PROXY_PORT"]),
+    9002: int(os.environ["WRT_PROXY_CONTROL_PORT"]),
+    9003: int(os.environ["WRT_SECOND_PROXY_PORT"]),
+    9004: int(os.environ["WRT_SECOND_PROXY_CONTROL_PORT"]),
+    9100: int(os.environ["WRT_ENGINE_BASE_PORT"]),
+    9101: int(os.environ["WRT_ENGINE_BASE_PORT"]) + 1,
+    9150: int(os.environ["WRT_JOB_ADMIN_BASE_PORT"]),
+    9151: int(os.environ["WRT_JOB_ADMIN_BASE_PORT"]) + 1,
+    9200: int(os.environ["WRT_SIMULATOR_PORT"]),
+    9443: int(os.environ["WRT_PROXY_PEER_PORT"]),
+    9444: int(os.environ["WRT_SECOND_PROXY_PEER_PORT"]),
+}
+for original, allocated in ports.items():
+    text = text.replace(f"127.0.0.1:{original}", f"127.0.0.1:{allocated}")
+    text = text.replace(f"0.0.0.0:{original}", f"0.0.0.0:{allocated}")
 dest.parent.mkdir(parents=True, exist_ok=True)
 dest.write_text(text)
 PY
@@ -219,8 +234,8 @@ copy_config() {
 	render_config "$1" "$2"
 }
 
-# Consume the host-owned fixture. This command only validates fixed public artifacts and
-# materializes tenant expectations into the caller's run-directory config copies.
+# Consume this worktree's host-owned fixture. This command validates published artifacts
+# and materializes tenant expectations into the caller's run-directory config copies.
 prepare_example_tenant_native() {
 	if [ "$#" -eq 0 ]; then
 		echo "prepare_example_tenant_native requires engine config paths" >&2

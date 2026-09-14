@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Permission boundary for shared PostgreSQL issuance and provisioner material.
+# Permission boundary for worktree PostgreSQL issuance and provisioner material.
 wrt_set_postgres_pki_permissions() {
   local root="$1"
   chmod 0755 "$root"

@@ -8,6 +8,11 @@ for arg in "$@"; do
 	esac
 done
 
+: "${WRT_MANAGER_PORT:=9000}"
+: "${WRT_PROXY_PORT:=9001}"
+: "${WRT_ENGINE_BASE_PORT:=9100}"
+: "${WRT_EXTERNAL_PORT:=8080}"
+
 json_field() {
 	local field="$1"
 	python3 -c 'import json, sys
@@ -25,7 +30,7 @@ print(value)' "$field"
 if [ "$INLINE" = true ]; then
 	echo "==> Creating codegen task (worker will process it automatically)..."
 	CREATE_OUTPUT=$(just cli invoke --json \
-		--proxy http://127.0.0.1:9001 \
+		--proxy "http://127.0.0.1:${WRT_PROXY_PORT}" \
 		--destination http://codegen.coordinator/codegen.CoordinatorService/CreateTask \
 		--source test --source-ns codegen \
 		--body '{"repo_url":"https://github.com/dtolnay/anyhow","doc_sources":[{"source_type":"DOC_SOURCE_TYPE_DOCS_RS","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}')
@@ -36,7 +41,7 @@ if [ "$INLINE" = true ]; then
 
 	while true; do
 		if ! TASK_OUTPUT=$(just cli invoke --json \
-			--proxy http://127.0.0.1:9001 \
+			--proxy "http://127.0.0.1:${WRT_PROXY_PORT}" \
 			--destination http://codegen.coordinator/codegen.CoordinatorService/GetTask \
 			--source test --source-ns codegen \
 			--body "{\"task_id\":\"${TASK_ID}\"}" 2>&1); then
@@ -62,21 +67,21 @@ if [ "$INLINE" = true ]; then
 	done
 fi
 
-cat <<'USAGE'
+cat <<USAGE
 
 All services running. Press Ctrl-C to stop.
-  Manager     : https://127.0.0.1:9000 (mTLS gRPC)
-  Proxy       : http://127.0.0.1:9001
-  External API: http://127.0.0.1:8080
-  Engine      : http://127.0.0.1:9100 (collector + agent + coordinator)
+  Manager     : https://127.0.0.1:${WRT_MANAGER_PORT} (mTLS gRPC)
+  Proxy       : http://127.0.0.1:${WRT_PROXY_PORT}
+  External API: http://127.0.0.1:${WRT_EXTERNAL_PORT}
+  Engine      : http://127.0.0.1:${WRT_ENGINE_BASE_PORT} (collector + agent + coordinator)
 
 Create a task (returns immediately, processing starts in background):
-  curl -X POST http://localhost:8080/tasks \
+  curl -X POST http://127.0.0.1:${WRT_EXTERNAL_PORT}/tasks \
     -H 'Content-Type: application/json' \
     -d '{"repo_url":"https://github.com/dtolnay/anyhow","doc_sources":[{"source_type":"docs_rs","owner":"anyhow","ref_or_ver":"1.0"}],"task_description":"Add a context_with method"}'
 
 Poll task status until complete:
-  curl http://localhost:8080/tasks/{task_id}
+  curl http://127.0.0.1:${WRT_EXTERNAL_PORT}/tasks/{task_id}
 USAGE
 
 trap 'exit 0' INT TERM

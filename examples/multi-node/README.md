@@ -26,12 +26,9 @@ just multi-node-inline
 
 ## Ports
 
-| Process | Local HTTP/control | Peer mTLS |
-|---|---|---|
-| Manager | `9000` (mTLS gRPC) | — |
-| Node A proxy | `9001` / `9002` | `9443` |
-| Node A engines | `9100`, `9101` | — |
-| Node B proxy | `9003` / `9004` | `9444` |
-| Node B engine | `9200` | — |
+The checked-in configs use the conventional 9000/9100/9200/9443 ranges as
+templates. The runner renders them into the current worktree's persistent port
+block before startup. `just dev-up` prints the stack endpoints; the runner's
+startup summary prints the resolved manager, proxy, peer, and engine ports.
 
 A successful startup reports three healthy engines and `multinode.echo` on Node B, then prints `echo response: hello across nodes`. The same peer-routing behavior is also covered in-process by `wr-tests/tests/cross_node_test.rs`.

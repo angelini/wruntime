@@ -17,13 +17,13 @@ prepare_example_tenant_native "$CG_ENGINE_CFG"
 # ── Prepare manager + proxy configs ──────────────────────────────────────
 MANAGER_CFG=$(prepare_manager_config)
 PROXY_CFG=$(prepare_proxy_config "${CONFIG_DIR}/codegen-proxy.toml")
-cat >>"$PROXY_CFG" <<'PROXY'
+cat >>"$PROXY_CFG" <<PROXY
 
 [egress]
 allowed_domains = ["api.github.com", "codeload.github.com", "docs.rs", "*.docs.rs", "crates.io", "static.crates.io"]
 
 [external]
-listen_address = "0.0.0.0:8080"
+listen_address = "0.0.0.0:${WRT_EXTERNAL_PORT}"
 
 [[external.routes]]
 path      = "/tasks"

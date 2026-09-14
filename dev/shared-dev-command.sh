@@ -7,24 +7,35 @@ source "$repo/dev/shared-dev-state.sh"
 action="${1:-}"
 shift || true
 case "$action" in
-up) exec bash dev/postgres-fixture-up.sh up ;;
-reprepare) exec bash dev/postgres-fixture-up.sh reprepare ;;
+up) exec bash dev/postgres-fixture-up.sh ;;
 down)
   wrt_acquire_postgres_fixture_lock "dev-down"
   wrt_compose down "$@"
   ;;
 ps)
-  wrt_acquire_postgres_fixture_lock "dev-ps"
   wrt_compose ps "$@"
   ;;
 logs)
-  wrt_acquire_postgres_fixture_lock "dev-logs"
   wrt_compose logs -f "$@"
+  ;;
+endpoints)
+  wrt_export_dev_endpoints
+  printf 'Compose:     %s (slot %s)\n' "$WRT_COMPOSE_PROJECT_NAME" "$WRT_WORKTREE_SLOT"
+  printf 'Postgres:    127.0.0.1:%s\n' "$WRT_POSTGRES_PORT"
+  printf '             example: %s\n' "$WRT_EXAMPLE_DB_URL"
+  printf '             test:    %s\n' "$WRT_TEST_DB_URL"
+  printf 'Grafana:     http://127.0.0.1:%s (admin/admin)\n' "$WRT_GRAFANA_PORT"
+  printf 'OTLP gRPC:   127.0.0.1:%s\n' "$WRT_OTLP_GRPC_PORT"
+  printf 'OTLP HTTP:   127.0.0.1:%s\n' "$WRT_OTLP_HTTP_PORT"
+  printf 'RustFS S3:   %s\n' "$WRT_TEST_S3_ENDPOINT"
+  printf 'RustFS Web:  http://127.0.0.1:%s\n' "$WRT_S3_CONSOLE_PORT"
+  printf 'S3 buckets:  test-bucket, stockmarket, codegen (ready)\n'
   ;;
 reset-db)
   wrt_acquire_postgres_fixture_lock "dev-reset-db"
   wrt_require_compatible_fixture
-  psql 'postgres://wr_manager_platform:wruntime-dev-manager@localhost:5433/wruntime_manager' -v ON_ERROR_STOP=1 -c "
+  wrt_export_dev_endpoints
+  psql "$WRT_EXAMPLE_DB_URL" -v ON_ERROR_STOP=1 -c "
     DO \$\$DECLARE r RECORD;
     BEGIN
       FOR r IN SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'wr\\_\\_%' ESCAPE '\\' LOOP
@@ -37,5 +48,14 @@ reset-db)
       END LOOP;
     END\$\$;"
   ;;
-*) echo "usage: dev/shared-dev-command.sh up|reprepare|down|ps|logs|reset-db" >&2; exit 2 ;;
+reset-blobstore)
+  bucket="${1:-codegen}"
+  wrt_require_compatible_fixture
+  wrt_export_dev_endpoints
+  export AWS_ACCESS_KEY_ID="$WRT_TEST_S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$WRT_TEST_S3_SECRET_KEY"
+  aws --endpoint-url "$WRT_TEST_S3_ENDPOINT" s3 mb "s3://$bucket" 2>/dev/null || true
+  aws --endpoint-url "$WRT_TEST_S3_ENDPOINT" s3 rm "s3://$bucket" --recursive
+  printf 'Cleared s3://%s\n' "$bucket"
+  ;;
+*) echo "usage: dev/shared-dev-command.sh up|down|ps|logs|endpoints|reset-db|reset-blobstore [bucket]" >&2; exit 2 ;;
 esac

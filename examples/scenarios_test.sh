@@ -31,10 +31,10 @@ scripts=(
 	"examples/codegen/scenario.sh"
 )
 usage_needles=(
-	"Local multi-node topology is running. Press Ctrl-C to stop."
-	"All services running. Press Ctrl-C to stop."
-	"Exchange  : :9100 + :9101 + :9102 (3 engine(s), DB-backed order book)"
-	"External API: http://127.0.0.1:8080"
+	"Node A engines: http://127.0.0.1:21010 and :21011"
+	"Inventory: http://127.0.0.1:21010 + :21011"
+	"Exchange  : :21010 + :21011 + :21012 (3 engine(s), DB-backed order book)"
+	"External API: http://127.0.0.1:21020"
 )
 scenario_arguments=("" "" "--exchanges 3" "")
 
@@ -46,6 +46,10 @@ for index in "${!names[@]}"; do
 	read -r -a args <<<"${scenario_arguments[$index]}"
 
 	setsid env PATH="${MOCK_BIN}:${PATH}" JUST_CALLS="$calls" \
+		WRT_MANAGER_PORT=21000 WRT_PROXY_PORT=21001 WRT_PROXY_CONTROL_PORT=21002 \
+		WRT_PROXY_PEER_PORT=21003 WRT_SECOND_PROXY_PORT=21004 \
+		WRT_SECOND_PROXY_CONTROL_PORT=21005 WRT_SECOND_PROXY_PEER_PORT=21006 \
+		WRT_ENGINE_BASE_PORT=21010 WRT_SIMULATOR_PORT=21015 WRT_EXTERNAL_PORT=21020 \
 		bash "$REPO_ROOT/${scripts[$index]}" "${args[@]}" >"$output" 2>&1 &
 	scenario_pid=$!
 	for _ in $(seq 1 50); do
@@ -95,6 +99,9 @@ JOB_DB_URL=postgres://jobs.test
 S3_ENDPOINT=http://s3.test
 S3_ACCESS_KEY=test
 S3_SECRET_KEY=test
+WRT_ENGINE_BASE_PORT=19100
+WRT_SIMULATOR_PORT=19200
+WRT_JOB_ADMIN_BASE_PORT=19300
 render_config() {
 	mkdir -p "$(dirname "$2")"
 	: >"$2"

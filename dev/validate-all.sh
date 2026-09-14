@@ -2,15 +2,13 @@
 # Comprehensive validation runner for wruntime.
 #
 # Orchestrates existing Just recipes for formatting, compile checks, lints,
-# WASM guest builds, the Rust test suite, and fixed-port E2E examples. Stages
+# WASM guest builds, the Rust test suite, and worktree-isolated E2E examples. Stages
 # fail fast, while independent tasks inside a stage run in parallel.
 
 set -u -o pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT" || exit 1
-# shellcheck source=dev/local-e2e-lock.sh
-source "$ROOT/dev/local-e2e-lock.sh"
 # shellcheck source=dev/shared-dev-state.sh
 source "$ROOT/dev/shared-dev-state.sh"
 
@@ -30,7 +28,7 @@ usage() {
 Usage: dev/validate-all.sh [OPTIONS]
 
 Options:
-  --no-e2e             Skip fixed-port local E2E examples (not deployment E2E).
+  --no-e2e             Skip worktree-local E2E examples (not deployment E2E).
   --e2e-only           Run only setup and enabled E2E stages.
   --deployment-e2e    Require the complete Systemd node lifecycle and manager
                       A→B→A/fail-closed/reset qualification (protected evidence).
@@ -42,7 +40,6 @@ Options:
 
 Environment:
   ANTHROPIC_API_KEY       Enables codegen E2E in default auto mode.
-  WRT_LOCAL_E2E_LOCK_FILE Override the same-host local E2E lock path.
   WR_VALIDATE_LOG_DIR     Override the log directory (default: target/validate-all/<timestamp>-<pid>).
 
 Exactly one deployment E2E flag is required. --no-e2e may be combined with
@@ -304,7 +301,7 @@ fi
 if [ "$RUN_E2E" = true ]; then
 	require_cmd aws
 fi
-if [ "$RUN_E2E" = true ] || [ "$RUN_DEPLOYMENT_E2E" = true ]; then
+if [ "$RUN_DEPLOYMENT_E2E" = true ]; then
 	require_cmd flock
 fi
 if [ "$RUN_DEPLOYMENT_E2E" = true ]; then
@@ -315,9 +312,6 @@ fi
 
 section "setup"
 printf 'logs: %s\n' "$LOG_ROOT"
-if ! wrt_acquire_postgres_fixture_lock "validate-all database interval"; then
-	finish_failure 1
-fi
 if [ "$START_DEV" != true ] && ! wrt_require_compatible_fixture; then
 	finish_failure 1
 fi
@@ -362,10 +356,6 @@ fi
 
 if [ "$RUN_E2E" = true ]; then
 	section "semantic lifecycle E2E examples"
-	if ! wrt_acquire_local_e2e_lock "validate-all semantic lifecycle E2E stage"; then
-		append_result "local E2E host lock" FAILED "" "another fixed-port E2E run is active"
-		finish_failure 1
-	fi
 	run_cmd "reset example db for multi-node" "just dev-reset-db"
 	run_cmd "multi-node cross-node echo" "just multi-node-inline"
 

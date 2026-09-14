@@ -15,14 +15,16 @@ printf '%s\n' "$*" >>"${JUST_CALLS:?}"
 MOCK
 chmod +x "${MOCK_BIN}/just"
 
-inline_output=$(PATH="${MOCK_BIN}:${PATH}" JUST_CALLS="$JUST_CALLS" \
+inline_output=$(PATH="${MOCK_BIN}:${PATH}" JUST_CALLS="$JUST_CALLS" WRT_PROXY_PORT=29001 \
 	bash "$REPO_ROOT/examples/ecommerce/scenario.sh" --inline)
 mapfile -t inline_calls <"$JUST_CALLS"
 if [ "${#inline_calls[@]}" -ne 2 ]; then
 	printf 'inline ecommerce scenario made %s calls, expected seed then client\n' "${#inline_calls[@]}" >&2
 	exit 1
 fi
-if [[ "${inline_calls[0]}" != *"ecommerce.InventoryService/Seed"* ]] ||
+if [[ "${inline_calls[0]}" != *"--proxy http://127.0.0.1:29001"* ]] ||
+	[[ "${inline_calls[0]}" != *"ecommerce.InventoryService/Seed"* ]] ||
+	[[ "${inline_calls[1]}" != *"--proxy http://127.0.0.1:29001"* ]] ||
 	[[ "${inline_calls[1]}" != *"ecommerce.ClientService/Run"* ]]; then
 	printf 'unexpected inline call order:\n%s\n' "${inline_calls[*]}" >&2
 	exit 1

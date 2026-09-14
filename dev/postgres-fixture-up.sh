@@ -7,11 +7,10 @@ source "$repo/dev/shared-dev-state.sh"
 # shellcheck source=postgres-provisioner-image.sh
 source "$repo/dev/postgres-provisioner-image.sh"
 if [ "${DOTGEN_PI_SANDBOX:-0}" = 1 ]; then
-  echo "PostgreSQL fixture preparation is host-only; run 'just dev-reprepare' on the Docker-capable host" >&2
+  echo "PostgreSQL fixture preparation is host-only; run 'just dev-up' on the Docker-capable host" >&2
   exit 2
 fi
-mode="${1:-up}"
-[ "$mode" = up ] || [ "$mode" = reprepare ] || { echo "usage: dev/postgres-fixture-up.sh [up|reprepare]" >&2; exit 2; }
+[ "$#" -eq 0 ] || { echo "usage: dev/postgres-fixture-up.sh" >&2; exit 2; }
 # Read-only host preflight precedes the lock-file write, destructive Compose,
 # PKI/publication state, and compilation. It never changes the Rust toolchain.
 wrt_detect_daemon_target
@@ -24,8 +23,8 @@ on_error() {
   trap - ERR
   if [ "$preparing" = true ]; then
     rm -f "$WRT_POSTGRES_READY_FILE" "$WRT_POSTGRES_OWNER_FILE"
-    echo "shared PostgreSQL preparation failed; no generation is ready" >&2
-    echo "coordinate users, then rerun 'just dev-reprepare' from $repo" >&2
+    echo "worktree PostgreSQL preparation failed; no generation is ready" >&2
+    echo "rerun 'just dev-up' from $repo" >&2
   fi
   exit "$status"
 }
@@ -34,7 +33,7 @@ trap on_error ERR
 compose_current() {
   local files=(-f "$repo/docker-compose.yml")
   [ ! -f "$WRT_POSTGRES_COMPOSE_OVERRIDE" ] || files+=(-f "$WRT_POSTGRES_COMPOSE_OVERRIDE")
-  WRT_SHARED_DEV_STATE_ROOT="$WRT_SHARED_DEV_STATE_ROOT" docker compose \
+  WRT_WORKTREE_DEV_STATE_ROOT="$WRT_WORKTREE_DEV_STATE_ROOT" docker compose \
     --project-name "$WRT_COMPOSE_PROJECT_NAME" --project-directory "$repo" \
     "${files[@]}" "$@"
 }
@@ -55,69 +54,57 @@ for key, value in actual.items():
 PY
 }
 prepare_buckets() {
-  local attempt bucket
+  local attempt bucket endpoint="http://127.0.0.1:${WRT_S3_PORT}"
   for attempt in $(seq 1 30); do
-    if AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin aws --endpoint-url http://localhost:8900 s3api list-buckets >/dev/null 2>&1; then break; fi
+    if AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin aws --endpoint-url "$endpoint" s3api list-buckets >/dev/null 2>&1; then break; fi
     [ "$attempt" -lt 30 ] || { echo "RustFS did not become ready" >&2; return 1; }; sleep 1
   done
   for bucket in test-bucket stockmarket codegen; do
-    AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin aws --endpoint-url http://localhost:8900 s3api head-bucket --bucket "$bucket" >/dev/null 2>&1 || \
-      AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin aws --endpoint-url http://localhost:8900 s3 mb "s3://$bucket" >/dev/null
+    AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin aws --endpoint-url "$endpoint" s3api head-bucket --bucket "$bucket" >/dev/null 2>&1 || \
+      AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin aws --endpoint-url "$endpoint" s3 mb "s3://$bucket" >/dev/null
   done
 }
 
-if [ "$mode" = up ] && { [ -f "$WRT_POSTGRES_OWNER_FILE" ] || [ -f "$WRT_POSTGRES_READY_FILE" ]; }; then
-  wrt_require_compatible_fixture
-  verify_active_local_images "$WRT_POSTGRES_OWNER_FILE"
-  active_owner="$(wrt_owner_worktree)"
-  reuse_provenance="$(mktemp "$WRT_SHARED_DEV_STATE_ROOT/.provisioner-reuse.XXXXXX.json")"
+reuse_active_generation() {
+  local reuse_provenance reuse_override
+  [ -f "$WRT_POSTGRES_OWNER_FILE" ] && [ -f "$WRT_POSTGRES_READY_FILE" ] || return 1
+  wrt_require_compatible_fixture || return 1
+  verify_active_local_images "$WRT_POSTGRES_OWNER_FILE" || return 1
+  reuse_provenance="$(mktemp "$WRT_WORKTREE_DEV_STATE_ROOT/.provisioner-reuse.XXXXXX.json")" || return 1
   reuse_override="$reuse_provenance.compose.yml"
-  wrt_prepare_postgres_provisioner_image "$active_owner" "$WRT_SHARED_DEV_STATE_ROOT" "$reuse_provenance" "$reuse_override"
-  provenance_matches_record "$reuse_provenance" "$WRT_POSTGRES_OWNER_FILE"
-  mv "$reuse_override" "$WRT_POSTGRES_COMPOSE_OVERRIDE"
-  rm -f "$reuse_provenance"
-  wrt_compose up -d --wait
-  prepare_buckets
-  echo "shared PostgreSQL fixture reused from $(wrt_owner_worktree): $WRT_POSTGRES_READY_FILE"
-  exit 0
-fi
-if [ "$mode" = up ] && { [ -e "$WRT_POSTGRES_OWNER_FILE" ] || [ -e "$WRT_POSTGRES_FIXTURE_DIR" ] || [ -e "$WRT_POSTGRES_PKI_DIR" ]; }; then
-  echo "partial shared PostgreSQL state exists at $WRT_SHARED_DEV_STATE_ROOT" >&2
-  echo "run 'just dev-reprepare' on the Docker-capable host after coordinating other worktrees" >&2
-  exit 1
-fi
+  if ! wrt_prepare_postgres_provisioner_image "$repo" "$WRT_WORKTREE_DEV_STATE_ROOT" "$reuse_provenance" "$reuse_override" \
+      || ! provenance_matches_record "$reuse_provenance" "$WRT_POSTGRES_OWNER_FILE"; then
+    rm -f "$reuse_provenance" "$reuse_override"
+    return 1
+  fi
+  mv "$reuse_override" "$WRT_POSTGRES_COMPOSE_OVERRIDE" || return 1
+  rm -f "$reuse_provenance" || return 1
+  wrt_compose up -d --wait || return 1
+  prepare_buckets || return 1
+}
 
-if [ "$mode" = reprepare ]; then
-  preparing=true
-  echo "REPREPARING shared project wruntime-dev: named volumes, PKI, fixture, owner, and ready records will be replaced" >&2
-  old_image_tag=""
-  if [ -f "$WRT_POSTGRES_OWNER_FILE" ]; then
-    old_owner="$(wrt_owner_worktree 2>/dev/null || true)"
-    old_image_tag="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("provisioner_image_tag", ""))' "$WRT_POSTGRES_OWNER_FILE" 2>/dev/null || true)"
-    if [ -n "$old_owner" ] && [ -f "$old_owner/docker-compose.yml" ]; then
-      wrt_compose down -v --remove-orphans
-    else
-      compose_current down -v --remove-orphans
-    fi
-  else
-    compose_current down -v --remove-orphans
-  fi
-  if [ -n "$old_image_tag" ] && docker image inspect "$old_image_tag" >/dev/null 2>&1; then
-    docker image rm "$old_image_tag"
-  fi
-  rm -rf "$WRT_POSTGRES_PKI_DIR" "$WRT_POSTGRES_FIXTURE_DIR"
-  rm -f "$WRT_POSTGRES_OWNER_FILE" "$WRT_POSTGRES_COMPOSE_OVERRIDE"
+if reuse_active_generation; then
+  echo "worktree PostgreSQL fixture reused: $WRT_POSTGRES_READY_FILE"
+  exit 0
 fi
 
 preparing=true
-mkdir -p "$WRT_SHARED_DEV_STATE_ROOT" "$repo/dev/observability/data"
-stage="$(mktemp -d "$WRT_SHARED_DEV_STATE_ROOT/.prepare.XXXXXX")"
+echo "CONVERGING worktree project $WRT_COMPOSE_PROJECT_NAME: incompatible or partial local state will be replaced" >&2
+# A removed/recreated Git worktree can reuse its deterministic project identity.
+# Clear only this worktree's project, volumes, PKI, and fixture before publication.
+compose_current down -v --remove-orphans
+rm -rf "$WRT_POSTGRES_PKI_DIR" "$WRT_POSTGRES_FIXTURE_DIR"
+rm -f "$WRT_POSTGRES_OWNER_FILE" "$WRT_POSTGRES_COMPOSE_OVERRIDE"
+
+preparing=true
+mkdir -p "$WRT_WORKTREE_DEV_STATE_ROOT" "$repo/dev/observability/data"
+stage="$(mktemp -d "$WRT_WORKTREE_DEV_STATE_ROOT/.prepare.XXXXXX")"
 trap 'rm -rf "$stage"' EXIT
 trap 'rm -f "$WRT_POSTGRES_READY_FILE" "$WRT_POSTGRES_OWNER_FILE"; exit 130' INT
 trap 'rm -f "$WRT_POSTGRES_READY_FILE" "$WRT_POSTGRES_OWNER_FILE"; exit 143' TERM
 
 provenance="$stage/provisioner-provenance.json"
-wrt_prepare_postgres_provisioner_image "$repo" "$WRT_SHARED_DEV_STATE_ROOT" "$provenance"
+wrt_prepare_postgres_provisioner_image "$repo" "$WRT_WORKTREE_DEV_STATE_ROOT" "$provenance"
 bash dev/postgres-native-certs.sh
 compose_current up -d --wait
 expected_base_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_postgres_image_id"])' "$provenance")"
@@ -157,7 +144,7 @@ compose_current --profile postgres-tools run --rm \
   --bundle-root /work/migrations \
   --admin-url-file /var/lib/postgresql/wruntime-config/admin-url
 
-admin_ssl="postgres://postgres:wruntime-dev-admin@127.0.0.1:5433/wruntime_test?sslmode=verify-full&sslrootcert=$WRT_POSTGRES_PKI_DIR/root/ca.crt"
+admin_ssl="postgres://postgres:wruntime-dev-admin@127.0.0.1:${WRT_POSTGRES_PORT}/wruntime_test?sslmode=verify-full&sslrootcert=$WRT_POSTGRES_PKI_DIR/root/ca.crt"
 psql "$admin_ssl" -XAtqc "SELECT current_setting('server_version_num')::int / 10000 = 18 AND current_setting('ssl') = 'on' AND (SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid())" | grep -Fx t >/dev/null
 psql "$admin_ssl" -XAtqc "SELECT min(rule_number) < (SELECT min(rule_number) FROM pg_hba_file_rules WHERE type IN ('host','hostssl') AND auth_method='scram-sha-256') FROM pg_hba_file_rules WHERE type='hostssl' AND user_name::text LIKE '%+wr__tenant_client_auth%' AND auth_method='cert' AND options::text LIKE '%map=wruntime_nodes%'" | grep -Fx t >/dev/null
 psql "$admin_ssl" -XAtqc "SELECT count(*) = 0 FROM pg_hba_file_rules WHERE user_name::text LIKE '%+wr__tenant_client_auth%' AND auth_method IN ('trust','password','md5','scram-sha-256')" | grep -Fx t >/dev/null
@@ -175,10 +162,10 @@ for part in parts: h.update(struct.pack('>Q', len(part))); h.update(part.encode(
 print('wr_runtime_node_a__stockmarket_' + h.hexdigest()[:12])
 PY
 )"
-psql "host=postgres.internal hostaddr=127.0.0.1 port=5433 user=$runtime_role dbname=wr_db_stockmarket sslmode=verify-full sslrootcert=$WRT_POSTGRES_PKI_DIR/root/ca.crt sslcert=$WRT_POSTGRES_PKI_DIR/node-a/leaf.pem sslkey=$WRT_POSTGRES_PKI_DIR/node-a/key.pem" -XAtqc 'SELECT current_user' | grep -Fx "$runtime_role" >/dev/null
+psql "host=postgres.internal hostaddr=127.0.0.1 port=$WRT_POSTGRES_PORT user=$runtime_role dbname=wr_db_stockmarket sslmode=verify-full sslrootcert=$WRT_POSTGRES_PKI_DIR/root/ca.crt sslcert=$WRT_POSTGRES_PKI_DIR/node-a/leaf.pem sslkey=$WRT_POSTGRES_PKI_DIR/node-a/key.pem" -XAtqc 'SELECT current_user' | grep -Fx "$runtime_role" >/dev/null
 while read -r namespace expected; do
   database="wr_db_${namespace//-/_}"
-  actual="$(PGPASSWORD=wruntime-dev-admin psql "host=127.0.0.1 port=5433 user=postgres dbname=$database sslmode=verify-full sslrootcert=$WRT_POSTGRES_PKI_DIR/root/ca.crt" -XAtqc "SELECT count(*) FROM (SELECT DISTINCT ON(namespace,module,migration_version) state FROM wr__platform.migration_attempts ORDER BY namespace,module,migration_version,attempt DESC) latest WHERE state='succeeded'")"
+  actual="$(PGPASSWORD=wruntime-dev-admin psql "host=127.0.0.1 port=$WRT_POSTGRES_PORT user=postgres dbname=$database sslmode=verify-full sslrootcert=$WRT_POSTGRES_PKI_DIR/root/ca.crt" -XAtqc "SELECT count(*) FROM (SELECT DISTINCT ON(namespace,module,migration_version) state FROM wr__platform.migration_attempts ORDER BY namespace,module,migration_version,attempt DESC) latest WHERE state='succeeded'")"
   [ "$actual" = "$expected" ] || { echo "migration ledger incomplete for $namespace: expected $expected, got $actual" >&2; exit 1; }
 done < <(python3 - "$stage/data/migration-bundle.toml" <<'PY'
 import collections, sys, tomllib
@@ -188,28 +175,34 @@ PY
 )
 
 artifact_digest="$(wrt_fixture_artifact_digest "$stage/data")"
-python3 - "$stage/data" "$stage/provision-receipt.json" "$provenance" "$stage/ready.json" "$repo" "$WRT_GIT_COMMON_DIR" "$required_source" "$artifact_digest" <<'PY'
+python3 - "$stage/data" "$stage/provision-receipt.json" "$provenance" "$stage/ready.json" \
+  "$repo" "$WRT_GIT_COMMON_DIR" "$WRT_GIT_DIR" "$WRT_COMPOSE_PROJECT_NAME" "$WRT_WORKTREE_SLOT" \
+  "$WRT_POSTGRES_PORT" "$WRT_S3_PORT" "$required_source" "$artifact_digest" <<'PY'
 import json, pathlib, sys, tomllib
 source, provision_path, provenance_path, output = map(pathlib.Path, sys.argv[1:5])
-owner, common, source_digest, artifact_digest = sys.argv[5:]
+owner, common, git_dir, project, slot, postgres_port, s3_port, source_digest, artifact_digest = sys.argv[5:]
 provision = json.loads(provision_path.read_text()); provenance = json.loads(provenance_path.read_text()); manifest = tomllib.loads((source/'provisioning.toml').read_text()); migrations = tomllib.loads((source/'migration-bundle.toml').read_text())
-ready = {'schema_version': 2, 'owner_worktree': owner, 'git_common_dir': common, 'source_digest': source_digest,
- 'fixture_artifact_digest': artifact_digest, 'compose_project': 'wruntime-dev', 'postgres_image': 'postgres:18-alpine', 'postgres_image_id': provenance['base_postgres_image_id'],
+ready = {'schema_version': 3, 'owner_worktree': owner, 'git_common_dir': common, 'git_dir': git_dir,
+ 'worktree_slot': int(slot), 'source_digest': source_digest, 'fixture_artifact_digest': artifact_digest,
+ 'compose_project': project, 'postgres_image': 'postgres:18-alpine', 'postgres_image_id': provenance['base_postgres_image_id'],
  'provision_generation': manifest['generation'], 'provisioning_manifest_digest': provision['manifest_digest'],
  'migration_bundle_digest': migrations['bundle_digest'], 'successful_migrations': migrations.get('files', []),
  'postgres_major': manifest['postgres_major'], 'postgres_ca_sha256': manifest['postgres_ca_sha256'],
  'postgres_client_leaf_fingerprint': manifest['nodes'][0]['certificate_sha256'], 'server_name': 'postgres.internal',
- 'host_addr': '127.0.0.1', 'port': 5433, 'connect_timeout_secs': 10}
+ 'host_addr': '127.0.0.1', 'port': int(postgres_port), 's3_port': int(s3_port), 'connect_timeout_secs': 10}
 ready.update(provenance)
 output.write_text(json.dumps(ready, sort_keys=True, indent=2)+'\n')
 PY
 ready_digest="sha256:$(sha256sum "$stage/ready.json" | cut -d' ' -f1)"
-python3 - "$stage/data/provisioning.toml" "$stage/data/migration-bundle.toml" "$provenance" "$stage/owner.json" "$repo" "$WRT_GIT_COMMON_DIR" "$required_source" "$artifact_digest" "$ready_digest" <<'PY'
+python3 - "$stage/data/provisioning.toml" "$stage/data/migration-bundle.toml" "$provenance" "$stage/owner.json" \
+  "$repo" "$WRT_GIT_COMMON_DIR" "$WRT_GIT_DIR" "$WRT_COMPOSE_PROJECT_NAME" "$WRT_WORKTREE_SLOT" \
+  "$required_source" "$artifact_digest" "$ready_digest" <<'PY'
 import datetime, json, pathlib, sys, tomllib
-provision, migration, provenance_path, output = map(pathlib.Path, sys.argv[1:5]); owner, common, source, artifact, ready = sys.argv[5:]
+provision, migration, provenance_path, output = map(pathlib.Path, sys.argv[1:5]); owner, common, git_dir, project, slot, source, artifact, ready = sys.argv[5:]
 p = tomllib.loads(provision.read_text()); m = tomllib.loads(migration.read_text()); provenance = json.loads(provenance_path.read_text())
-value = {'schema_version': 1, 'owner_worktree': owner, 'git_common_dir': common, 'compose_project': 'wruntime-dev',
- 'source_digest': source, 'preparation_generation': p['generation'], 'prepared_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+value = {'schema_version': 2, 'owner_worktree': owner, 'git_common_dir': common, 'git_dir': git_dir,
+ 'worktree_slot': int(slot), 'compose_project': project, 'source_digest': source,
+ 'preparation_generation': p['generation'], 'prepared_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
  'provisioning_manifest_digest': p.get('manifest_digest', ''), 'migration_bundle_digest': m['bundle_digest'],
  'fixture_artifact_digest': artifact, 'ready_artifact_digest': ready}
 value.update(provenance)
@@ -227,9 +220,9 @@ mkdir -p "$WRT_POSTGRES_FIXTURE_DIR"
 cp -a "$stage/data/." "$WRT_POSTGRES_FIXTURE_DIR/"
 install -m 0644 "$stage/ready.json" "$WRT_POSTGRES_FIXTURE_DIR/.ready.json.tmp"
 mv "$WRT_POSTGRES_FIXTURE_DIR/.ready.json.tmp" "$WRT_POSTGRES_READY_FILE"
-install -m 0644 "$stage/owner.json" "$WRT_SHARED_DEV_STATE_ROOT/.owner.json.tmp"
-mv "$WRT_SHARED_DEV_STATE_ROOT/.owner.json.tmp" "$WRT_POSTGRES_OWNER_FILE"
+install -m 0644 "$stage/owner.json" "$WRT_WORKTREE_DEV_STATE_ROOT/.owner.json.tmp"
+mv "$WRT_WORKTREE_DEV_STATE_ROOT/.owner.json.tmp" "$WRT_POSTGRES_OWNER_FILE"
 
 prepare_buckets
 wrt_require_compatible_fixture
-echo "shared PostgreSQL fixture ready: $WRT_POSTGRES_READY_FILE"
+echo "worktree PostgreSQL fixture ready: $WRT_POSTGRES_READY_FILE"

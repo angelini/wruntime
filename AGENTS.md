@@ -15,7 +15,7 @@ just test-integration
 just test-one <name>
 just test-lifecycle-runners
 just test-tenant-isolation-e2e
-just test-shared-dev-fixture
+just test-worktree-dev-fixture
 just tidy                    # format + clippy -D warnings
 
 # WASM and examples
@@ -36,7 +36,6 @@ just validate-all --deployment-e2e    # protected runner, live Systemd node + ma
 # Development infrastructure and services
 just certs
 just dev-up
-just dev-reprepare          # destructive shared-fixture ownership transfer
 just dev-down
 just manager
 just proxy
@@ -47,7 +46,7 @@ Continuous compilation is available through `just watch [check|clippy|test|build
 
 While working, default to `just validate-changed` for conservative feedback over current worktree changes; pass `--base <ref>` when committed branch changes must also be included, and use `--explain` to preview selection. This focused feedback does not replace required change-class checks or final broad evidence.
 
-In the Pi sandbox (`DOTGEN_PI_SANDBOX=1`), before declaring work complete always run `just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e`. Docker is unavailable, but host `just dev-up` has already used `cargo-zigbuild` with the owner's existing target/cache to package a daemon-native Linux-musl `wr-cli` in a verified two-file, exact no-pull provisioner image, exposed the one `wruntime-dev` Compose project, and atomically published the provenance-compatible fixture under `<absolute-git-common-dir>/wruntime-dev-state`. Every linked worktree automatically derives that root, verifies `owner.json`/`fixture/ready.json` plus source/manifest/PKI digests, and shares one inherited-inode global lock. Sandbox tests/examples use fixed dev URLs without fixture variables or setup calls. A mismatch must fail before database access; coordinate other worktrees and run host `just dev-reprepare` intentionally rather than creating or repairing per-worktree state. `--skip-dev-up` avoids Docker startup, and `--no-codegen-e2e` skips only codegen because `ANTHROPIC_API_KEY` is not exposed. The multi-node, ecommerce, and stockmarket E2E examples must still run; do not pass `--no-e2e` or omit the rest of `validate-all`.
+In the Pi sandbox (`DOTGEN_PI_SANDBOX=1`), before declaring work complete always run `just validate-all --no-deployment-e2e --skip-dev-up --no-codegen-e2e`. Docker is unavailable, so host `just dev-up` must first prepare this worktree's deterministic `wruntime-dev-<id>` Compose project. Per-worktree state lives under `<absolute-git-dir>/wruntime-dev-state`; its published record supplies the worktree-specific PostgreSQL and RustFS ports while preserving provenance, manifest, migration, artifact, image, and PKI bindings. Linked worktrees have distinct projects, volumes, ports, state, and lifecycle locks, so DB tests and local E2Es may run concurrently across worktrees. Sandbox consumers never invoke Docker or perform fixture setup. A missing or incompatible fixture fails before database access and requires host `just dev-up` in that same worktree; `dev-up` replaces incompatible or partial local state. `--skip-dev-up` avoids Docker startup, and `--no-codegen-e2e` skips only codegen because `ANTHROPIC_API_KEY` is not exposed. The multi-node, ecommerce, and stockmarket E2E examples must still run; do not pass `--no-e2e` or omit the rest of `validate-all`. Only protected deployment E2E remains globally serialized.
 
 ## Agent modes
 
@@ -70,7 +69,7 @@ Keep documentation synchronized according to [documentation ownership](docs/agen
 
 **Prerequisites:** `rustc`, `cargo`, `just`, `protoc`, and `taplo`. WASM work also requires `wasm32-wasip2` and `wasm-tools`. Cross-compilation requires `zig`, `cargo-zigbuild`, `rustup`, and the selected target; host fixture preparation fails without mutation and prints the exact `rustup target add <target>` action when it is missing. Live deployment E2E also requires `uv`.
 
-Integration helpers live in `wr-tests/tests/helpers/mod.rs`. Direct DB-backed tests use `WRT_TEST_DB_URL=postgres://postgres:wruntime-dev-admin@localhost:5433/wruntime_test` and skip under the shared policy when it is absent. Just test recipes acquire the shared fixture lock, verify compatibility, and set required DB/S3 variables; run host `just dev-up` first.
+Integration helpers live in `wr-tests/tests/helpers/mod.rs`. Direct DB-backed tests use `WRT_TEST_DB_URL` and skip under the shared policy when it is absent. Just test recipes verify this worktree's fixture and export its published DB/S3 endpoints; run host `just dev-up` from the same worktree first.
 
 ## Architecture summary
 

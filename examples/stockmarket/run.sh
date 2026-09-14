@@ -18,18 +18,16 @@ for ((i = 0; i < ${#args[@]}; i++)); do
 	fi
 done
 
-if ! [[ "$NUM_EXCHANGES" =~ ^[0-9]+$ ]] || [ "$NUM_EXCHANGES" -lt 1 ]; then
-	echo "Error: --exchanges must be a positive integer (got: $NUM_EXCHANGES)"
+if ! [[ "$NUM_EXCHANGES" =~ ^[0-9]+$ ]] || [ "$NUM_EXCHANGES" -lt 1 ] || [ "$NUM_EXCHANGES" -gt 63 ]; then
+	echo "Error: --exchanges must be between 1 and 63 (got: $NUM_EXCHANGES)"
 	exit 1
 fi
 
 # ── Port layout ─────────────────────────────────────────────────────────
-# Exchanges: 9100 .. 9100+(N-1)
-# Ledger:    9100+N
-# Simulator: 9200
-EXCHANGE_BASE_PORT=9100
+# Each worktree receives a disjoint runtime port block.
+EXCHANGE_BASE_PORT=$WRT_ENGINE_BASE_PORT
 LEDGER_PORT=$((EXCHANGE_BASE_PORT + NUM_EXCHANGES))
-SIMULATOR_PORT=9200
+SIMULATOR_PORT=$WRT_SIMULATOR_PORT
 
 echo "DB_URL: ${DB_URL}"
 echo "S3_ENDPOINT: ${S3_ENDPOINT}"
@@ -58,7 +56,10 @@ for ((i = 0; i < NUM_EXCHANGES; i++)); do
 	port=$((EXCHANGE_BASE_PORT + i))
 	cfg="${CONFIG_DIR}/stockmarket-exchange-${i}.toml"
 	render_exchange_config examples/stockmarket/engine-exchange.toml "$cfg"
-	render_config "$cfg" "$cfg" "127.0.0.1:9100" "127.0.0.1:${port}"
+	job_admin_port=$((WRT_JOB_ADMIN_BASE_PORT + i))
+	render_config "$cfg" "$cfg" \
+		"127.0.0.1:${WRT_ENGINE_BASE_PORT}" "127.0.0.1:${port}" \
+		"127.0.0.1:${WRT_JOB_ADMIN_BASE_PORT}" "127.0.0.1:${job_admin_port}"
 	EXCHANGE_CONFIGS+=("$cfg")
 done
 
@@ -66,7 +67,9 @@ done
 LEDGER_CFG="${CONFIG_DIR}/stockmarket-ledger.toml"
 SIMULATOR_CFG="${CONFIG_DIR}/stockmarket-simulator.toml"
 render_ledger_config examples/stockmarket/engine-ledger.toml "$LEDGER_CFG"
-render_config "$LEDGER_CFG" "$LEDGER_CFG" "127.0.0.1:9101" "127.0.0.1:${LEDGER_PORT}"
+render_config "$LEDGER_CFG" "$LEDGER_CFG" \
+	"127.0.0.1:$((WRT_ENGINE_BASE_PORT + 1))" "127.0.0.1:${LEDGER_PORT}" \
+	"127.0.0.1:$((WRT_JOB_ADMIN_BASE_PORT + 1))" "127.0.0.1:$((WRT_JOB_ADMIN_BASE_PORT + NUM_EXCHANGES))"
 copy_config examples/stockmarket/engine-simulator.toml "$SIMULATOR_CFG"
 prepare_example_tenant_native "${EXCHANGE_CONFIGS[@]}" "$LEDGER_CFG"
 

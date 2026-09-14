@@ -2,17 +2,19 @@
 # Run the wr-cli invoke command 50 times in parallel and verify all succeeded.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
+# shellcheck source=dev/shared-dev-state.sh
+source "$REPO_ROOT/dev/shared-dev-state.sh"
 
-export WR_MANAGER="${WR_MANAGER:-https://127.0.0.1:9000}"
+export WR_MANAGER="https://127.0.0.1:${WRT_MANAGER_PORT}"
 
 PIDS=()
 TMPDIR_OUT="$(mktemp -d)"
 
 for i in $(seq 1 50); do
     just cli invoke \
-        --proxy http://127.0.0.1:9001 \
+        --proxy "http://127.0.0.1:${WRT_PROXY_PORT}" \
         --destination http://ecommerce.client/ecommerce.ClientService/Run \
         --source loadtest --source-ns ecommerce \
         --body '{"count": 1000}' \

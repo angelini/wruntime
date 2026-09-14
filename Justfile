@@ -74,21 +74,11 @@ tidy-examples: fmt-examples lint-examples
 
 # Run all tests
 test: build-test-guests
-    bash dev/with-postgres-fixture.sh env \
-        WRT_TEST_DB_URL={{db_url_test}} \
-        WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
-        WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-        WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-        cargo test --timings
+    bash dev/with-postgres-fixture.sh cargo test --timings
 
 # Run integration tests only
 test-integration: build-test-guests
-    bash dev/with-postgres-fixture.sh env \
-        WRT_TEST_DB_URL={{db_url_test}} \
-        WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
-        WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-        WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-        cargo test -p wr-tests
+    bash dev/with-postgres-fixture.sh cargo test -p wr-tests
 
 # Run one integration-test target when its file exists, otherwise filter by test name
 test-one name: build-test-guests
@@ -97,12 +87,7 @@ test-one name: build-test-guests
     else \
         test_args='{{name}}'; \
     fi; \
-    bash dev/with-postgres-fixture.sh env \
-        WRT_TEST_DB_URL={{db_url_test}} \
-        WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
-        WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-        WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-        cargo test $test_args
+    bash dev/with-postgres-fixture.sh cargo test $test_args
 
 # ── Run services ──────────────────────────────────────────────────────────────
 
@@ -139,12 +124,12 @@ build-multi-node:
 # Run the full local multi-node topology (requires Postgres — see `just dev-up`)
 multi-node: build-multi-node build
     WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
-    DB_URL={{db_url_example}} bash examples/multi-node/run.sh
+    bash examples/multi-node/run.sh
 
 # Verify a cross-node echo request, then stop the local topology
 multi-node-inline: build-multi-node build
     WRT_SECRET_ENCRYPTION_KEY="${WRT_SECRET_ENCRYPTION_KEY:-$(openssl rand -hex 32)}" \
-    DB_URL={{db_url_example}} bash examples/multi-node/run.sh --inline
+    bash examples/multi-node/run.sh --inline
 
 # Start only node A proxy (listens :9001, peer TLS :9443)
 node-a-proxy:
@@ -168,54 +153,31 @@ node-b-engine-1: build-multi-node
 
 # ── Dev infrastructure (Docker Compose) ──────────────────────────────────────
 
-db_url_example := "postgres://wr_manager_platform:wruntime-dev-manager@localhost:5433/wruntime_manager"
-db_url_jobs    := "postgres://wr_jobs_platform:wruntime-dev-jobs@localhost:5433/wruntime_jobs"
-db_url_test    := "postgres://postgres:wruntime-dev-admin@localhost:5433/wruntime_test"
-s3_endpoint    := "http://localhost:8900"
-s3_access_key  := "rustfsadmin"
-s3_secret_key  := "rustfsadmin"
-
-# Start all dev services (Postgres, LGTM, RustFS S3) and create test buckets
+# Start this worktree's dev services (Postgres, LGTM, RustFS S3) and create test buckets.
 dev-up:
     bash dev/shared-dev-command.sh up
-    @echo "Postgres:   localhost:5433"
-    @echo "            example: {{db_url_example}}"
-    @echo "            test:    {{db_url_test}}"
-    @echo "Grafana:    http://localhost:3000  (admin/admin)"
-    @echo "OTLP gRPC:  localhost:4317"
-    @echo "OTLP HTTP:  localhost:4318"
-    @echo "RustFS S3:  {{s3_endpoint}}"
-    @echo "RustFS Web: http://localhost:8901"
-    @echo "S3 buckets: test-bucket, stockmarket, codegen (ready)"
+    @bash dev/shared-dev-command.sh endpoints
 
-# Destructively replace the one shared dev project and fixture from this worktree.
-dev-reprepare:
-    bash dev/shared-dev-command.sh reprepare
-
-# Stop all shared dev services through the recorded owner.
+# Stop this worktree's dev services.
 dev-down:
     bash dev/shared-dev-command.sh down
 
-# Tail logs through the recorded owner — optionally filter to one service.
+# Tail this worktree's logs — optionally filter to one service.
 dev-logs service="":
     bash dev/shared-dev-command.sh logs {{service}}
 
-# Show shared project status through the recorded owner.
+# Show this worktree's project status.
 dev-ps:
     bash dev/shared-dev-command.sh ps
 
-# Reset example DB under the shared database lock.
+# Reset this worktree's example DB.
 dev-reset-db:
     bash dev/shared-dev-command.sh reset-db
     @echo "Done."
 
 # Clear all objects from the codegen S3 bucket
 dev-reset-blobstore bucket="codegen":
-    -AWS_ACCESS_KEY_ID={{s3_access_key}} AWS_SECRET_ACCESS_KEY={{s3_secret_key}} \
-        aws --endpoint-url {{s3_endpoint}} s3 mb s3://{{bucket}} 2>/dev/null
-    AWS_ACCESS_KEY_ID={{s3_access_key}} AWS_SECRET_ACCESS_KEY={{s3_secret_key}} \
-        aws --endpoint-url {{s3_endpoint}} s3 rm s3://{{bucket}} --recursive
-    @echo "Cleared s3://{{bucket}}"
+    bash dev/shared-dev-command.sh reset-blobstore {{bucket}}
 
 # ── WASM Guest Test Harness ───────────────────────────────────────────────────
 
@@ -229,12 +191,7 @@ build-test-guests:
 
 # Run all WASM host binding tests (sets env vars for dev infrastructure automatically)
 test-wasm: build-test-guests
-    bash dev/with-postgres-fixture.sh env \
-        WRT_TEST_DB_URL={{db_url_test}} \
-        WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
-        WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-        WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-        cargo test -p wr-tests \
+    bash dev/with-postgres-fixture.sh cargo test -p wr-tests \
         --test wasm_db_host_test \
         --test wasm_blobstore_host_test \
         --test wasm_tracing_host_test \
@@ -252,21 +209,17 @@ test-wasm-one target: build-test-guests
         wasm_*) test_target="{{target}}" ;; \
         *) echo "unknown WASM test target '{{target}}'; use db, blobstore, tracing, llm, http, or a wasm_* target" >&2; exit 2 ;; \
     esac; \
-    bash dev/with-postgres-fixture.sh env \
-        WRT_TEST_DB_URL={{db_url_test}} \
-        WRT_TEST_S3_ENDPOINT={{s3_endpoint}} \
-        WRT_TEST_S3_ACCESS_KEY={{s3_access_key}} \
-        WRT_TEST_S3_SECRET_KEY={{s3_secret_key}} \
-        cargo test -p wr-tests --test "$test_target"
+    bash dev/with-postgres-fixture.sh cargo test -p wr-tests --test "$test_target"
 
-# Hermetic shared-fixture build, producer, and consume-only contracts.
-test-shared-dev-fixture:
+# Hermetic per-worktree fixture build, producer, and consume-only contracts.
+test-worktree-dev-fixture:
     bash dev/postgres-provisioner-image-test.sh
     bash dev/postgres-fixture-contract-test.sh
 
-# Backward-compatible focused name for the shared fixture contract gate.
-test-postgres-fixture-contract:
-    just test-shared-dev-fixture
+# Backward-compatible focused names for the worktree fixture contract gate.
+test-shared-dev-fixture: test-worktree-dev-fixture
+
+test-postgres-fixture-contract: test-worktree-dev-fixture
 
 # Native PostgreSQL tenant lifecycle/adversarial integration target.
 test-tenant-isolation-e2e:
@@ -294,13 +247,8 @@ deployment-e2e-contract-test:
     just test-one manager_test
     just test-one multi_manager_test
 
-# Test same-host exclusion for fixed-port local E2E runners
-test-local-e2e-lock:
-    bash dev/test-local-e2e-lock.sh
-
 # Run focused foreground-runner, example-helper, waiter, and cleanup fixtures
 test-lifecycle-runners:
-    just test-local-e2e-lock
     just test-postgres-fixture-contract
     bash examples/helpers_test.sh
     bash examples/ecommerce/scenario_test.sh
@@ -347,19 +295,19 @@ test-validate-changed:
 
 # Run hot-path benchmarks (WASM→proxy→WASM).
 bench iterations="5000" warmup="30" concurrency="20": build-test-guests
-    WRT_TEST_DB_URL={{db_url_test}} \
-    BENCH_ITERATIONS={{iterations}} \
-    BENCH_WARMUP={{warmup}} \
-    BENCH_CONCURRENCY={{concurrency}} \
-    cargo test -p wr-tests --test bench_test --release -- --nocapture
+    bash dev/with-postgres-fixture.sh env \
+        BENCH_ITERATIONS={{iterations}} \
+        BENCH_WARMUP={{warmup}} \
+        BENCH_CONCURRENCY={{concurrency}} \
+        cargo test -p wr-tests --test bench_test --release -- --nocapture
 
 # Run the warmed-client proxy routing/forwarding benchmark only.
 bench-proxy-routing iterations="500" warmup="10" concurrency="20":
-    WRT_TEST_DB_URL={{db_url_test}} \
-    BENCH_ITERATIONS={{iterations}} \
-    BENCH_WARMUP={{warmup}} \
-    BENCH_CONCURRENCY={{concurrency}} \
-    cargo test -p wr-tests --test bench_test --release bench_proxy_only -- --nocapture
+    bash dev/with-postgres-fixture.sh env \
+        BENCH_ITERATIONS={{iterations}} \
+        BENCH_WARMUP={{warmup}} \
+        BENCH_CONCURRENCY={{concurrency}} \
+        cargo test -p wr-tests --test bench_test --release bench_proxy_only -- --nocapture
 
 # ── Ecommerce Example ─────────────────────────────────────────────────────────
 

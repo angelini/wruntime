@@ -2,12 +2,9 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
-source "$root/dev/local-e2e-lock.sh"
 # shellcheck source=shared-dev-state.sh
 source "$root/dev/shared-dev-state.sh"
-wrt_acquire_postgres_fixture_lock "tenant isolation fixture consumer"
 wrt_require_compatible_fixture
-wrt_acquire_local_e2e_lock "tenant isolation fixture consumer"
 stage="$(mktemp -d "${TMPDIR:-/tmp}/wr-tenant-e2e.XXXXXX")"
 trap 'rm -rf "$stage"' EXIT INT TERM
 mkdir -p "$stage/config"

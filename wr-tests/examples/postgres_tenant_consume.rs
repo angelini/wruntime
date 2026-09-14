@@ -12,10 +12,12 @@ use wr_common::postgres::{PostgresProvisioningManifest, SUPPORTED_POSTGRES_MAJOR
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReadyV1 {
+struct ReadyV3 {
     schema_version: u32,
     owner_worktree: String,
     git_common_dir: String,
+    git_dir: String,
+    worktree_slot: u16,
     source_digest: String,
     fixture_artifact_digest: String,
     compose_project: String,
@@ -44,6 +46,7 @@ struct ReadyV1 {
     server_name: String,
     host_addr: String,
     port: u16,
+    s3_port: u16,
     connect_timeout_secs: u64,
 }
 
@@ -81,7 +84,7 @@ fn main() -> Result<()> {
         "at least one --config is required"
     );
     let ready_path = fixture.join("ready.json");
-    let ready: ReadyV1 =
+    let ready: ReadyV3 =
         serde_json::from_slice(&std::fs::read(&ready_path).with_context(|| {
             format!(
                 "development PostgreSQL fixture is not ready at {}; run `just dev-up` on the host",
@@ -89,19 +92,27 @@ fn main() -> Result<()> {
             )
         })?)?;
     ensure!(
-        ready.schema_version == 2,
+        ready.schema_version == 3,
         "unsupported development fixture marker"
     );
     ensure!(
         ready.server_name == "postgres.internal"
             && ready.host_addr == "127.0.0.1"
-            && ready.port == 5433
+            && ready.port > 0
+            && ready.s3_port > 0
+            && ready.port != ready.s3_port
             && ready.connect_timeout_secs == 10,
-        "development fixture endpoint is not the fixed repository contract"
+        "development fixture endpoint binding is invalid"
     );
     ensure!(ready.postgres_major == SUPPORTED_POSTGRES_MAJOR);
     ensure!(
-        ready.compose_project == "wruntime-dev"
+        ready
+            .compose_project
+            .strip_prefix("wruntime-dev-")
+            .is_some_and(
+                |value| value.len() == 12 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+            )
+            && ready.worktree_slot < 128
             && ready.postgres_image == "postgres:18-alpine"
             && ready.postgres_image_id.starts_with("sha256:")
             && ready.source_digest.starts_with("sha256:")
@@ -130,7 +141,8 @@ fn main() -> Result<()> {
             && !ready.cargo_zigbuild_version.is_empty()
             && !ready.zig_version.is_empty()
             && !ready.owner_worktree.is_empty()
-            && !ready.git_common_dir.is_empty(),
+            && !ready.git_common_dir.is_empty()
+            && !ready.git_dir.is_empty(),
         "development fixture ownership binding is invalid"
     );
 
@@ -154,7 +166,13 @@ fn main() -> Result<()> {
     );
     let state_root = fixture
         .parent()
-        .context("fixture has no shared-state parent")?;
+        .context("fixture has no worktree-state parent")?;
+    ensure!(
+        state_root
+            .parent()
+            .is_some_and(|path| path == Path::new(&ready.git_dir)),
+        "development fixture Git-directory binding is stale"
+    );
     let root = state_root.join("pki/root/ca.crt");
     let client = state_root.join("pki/node-a/leaf.pem");
     ensure!(
@@ -205,8 +223,8 @@ fn main() -> Result<()> {
             .context("database-enabled config lacks [database]")?
             .tenant = Some(TenantDatabaseConfig {
             server_name: "postgres.internal".into(),
-            host_addr: Some("127.0.0.1".into()),
-            port: 5433,
+            host_addr: Some(ready.host_addr.clone()),
+            port: ready.port,
             trust_root_path: state_root.join("pki/root/ca.crt").display().to_string(),
             client_cert_path: state_root.join("pki/node-a/leaf.pem").display().to_string(),
             client_key_path: state_root.join("pki/node-a/key.pem").display().to_string(),

@@ -8,6 +8,11 @@ for arg in "$@"; do
 	esac
 done
 
+: "${WRT_MANAGER_PORT:=9000}"
+: "${WRT_PROXY_PORT:=9001}"
+: "${WRT_ENGINE_BASE_PORT:=9100}"
+: "${WRT_SIMULATOR_PORT:=9200}"
+
 if [ "$INLINE" = true ]; then
 	if [ "${WRT_ASSERT_ENGINE_ADMIN_ENV_ABSENT:-0}" = 1 ]; then
 		engine_count=0
@@ -27,7 +32,7 @@ if [ "$INLINE" = true ]; then
 	# every service READY and every proxy has crossed the routing barrier.
 	echo "==> Seeding inventory..."
 	just cli invoke \
-		--proxy http://127.0.0.1:9001 \
+		--proxy "http://127.0.0.1:${WRT_PROXY_PORT}" \
 		--destination http://ecommerce.inventory/ecommerce.InventoryService/Seed \
 		--source bootstrap \
 		--source-ns ecommerce \
@@ -35,39 +40,39 @@ if [ "$INLINE" = true ]; then
 
 	echo "==> Running client inline with {\"count\": 1}..."
 	just cli invoke \
-		--proxy http://127.0.0.1:9001 \
+		--proxy "http://127.0.0.1:${WRT_PROXY_PORT}" \
 		--destination http://ecommerce.client/ecommerce.ClientService/Run \
 		--source loadtest --source-ns ecommerce \
 		--body '{"count": 1}'
 	exit $?
 fi
 
-cat <<'USAGE'
+cat <<USAGE
 
 All services running. Press Ctrl-C to stop.
-  Manager  : https://127.0.0.1:9000
-  Proxy    : http://127.0.0.1:9001
-  Inventory: http://127.0.0.1:9100 + :9101 (2 engines, shared Postgres)
-  Client   : http://127.0.0.1:9200 (3 instances, ServiceGuest)
+  Manager  : https://127.0.0.1:${WRT_MANAGER_PORT}
+  Proxy    : http://127.0.0.1:${WRT_PROXY_PORT}
+  Inventory: http://127.0.0.1:${WRT_ENGINE_BASE_PORT} + :$((WRT_ENGINE_BASE_PORT + 1)) (2 engines, worktree Postgres)
+  Client   : http://127.0.0.1:${WRT_SIMULATOR_PORT} (3 instances, ServiceGuest)
 
 Trigger a load run (default 100 iterations):
   just cli invoke \
-    --manager https://127.0.0.1:9000 \
-    --proxy http://127.0.0.1:9001 \
+    --manager https://127.0.0.1:${WRT_MANAGER_PORT} \
+    --proxy http://127.0.0.1:${WRT_PROXY_PORT} \
     --destination http://ecommerce.client/ecommerce.ClientService/Run \
     --source loadtest --source-ns ecommerce \
     --body ''
 
 Trigger with a custom request count (e.g. 1000):
   just cli invoke \
-    --manager https://127.0.0.1:9000 \
-    --proxy http://127.0.0.1:9001 \
+    --manager https://127.0.0.1:${WRT_MANAGER_PORT} \
+    --proxy http://127.0.0.1:${WRT_PROXY_PORT} \
     --destination http://ecommerce.client/ecommerce.ClientService/Run \
     --source loadtest --source-ns ecommerce \
     --body '{"count": 1000}'
 
 Inspect metrics:
-  just cli --manager https://127.0.0.1:9000 metrics summary
+  just cli --manager https://127.0.0.1:${WRT_MANAGER_PORT} metrics summary
 USAGE
 
 trap 'exit 0' INT TERM

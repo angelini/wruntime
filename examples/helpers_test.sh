@@ -63,12 +63,24 @@ if [ "$prepared_manager" != "$manager" ]; then
 	echo "prepare_manager_config returned an unexpected path: $prepared_manager" >&2
 	exit 1
 fi
-if ! cmp -s examples/config/policy/authorization.toml "${CONFIG_DIR}/policy/authorization.toml"; then
-	echo "prepare_manager_config did not stage the relative authorization policy" >&2
+if ! grep -Fq "endpoint   = \"https://127.0.0.1:${WRT_MANAGER_PORT}\"" "${CONFIG_DIR}/policy/authorization.toml"; then
+	echo "prepare_manager_config did not render the worktree manager endpoint" >&2
 	exit 1
 fi
 if ! grep -Fq 'policy_file = "policy/authorization.toml"' "$manager"; then
 	echo "prepare_manager_config changed the settled relative policy path" >&2
+	exit 1
+fi
+if ! grep -Fq "listen_address                = \"0.0.0.0:${WRT_MANAGER_PORT}\"" "$manager" || \
+	! grep -Fq "local_proxy_address           = \"http://127.0.0.1:${WRT_PROXY_PORT}\"" "$manager"; then
+	echo "prepare_manager_config did not render the worktree runtime ports" >&2
+	exit 1
+fi
+rendered_proxy="${CONFIG_DIR}/rendered-proxy.toml"
+prepare_proxy_config "$rendered_proxy" >/dev/null
+if ! grep -Fq "listen_address  = \"127.0.0.1:${WRT_PROXY_PORT}\"" "$rendered_proxy" || \
+	! grep -Fq "control_address = \"127.0.0.1:${WRT_PROXY_CONTROL_PORT}\"" "$rendered_proxy"; then
+	echo "prepare_proxy_config did not render the worktree proxy ports" >&2
 	exit 1
 fi
 proxy_a="${CONFIG_DIR}/proxy-a.toml"
@@ -110,12 +122,12 @@ if grep -Eq 'postgres (provision|migrate)|postgres-provision|postgres-native-cer
 	exit 1
 fi
 if ! grep -Fq 'WRT_POSTGRES_FIXTURE_DIR' "$REPO_ROOT/examples/helpers.sh"; then
-	echo "example helper does not consume the canonical shared fixture" >&2
+	echo "example helper does not consume the worktree fixture" >&2
 	exit 1
 fi
-if [ "$DB_URL" != 'postgres://wr_manager_platform:wruntime-dev-manager@localhost:5433/wruntime_manager' ] || \
-	[ "$JOB_DB_URL" != 'postgres://wr_jobs_platform:wruntime-dev-jobs@localhost:5433/wruntime_jobs' ]; then
-	echo "example helper did not lock the fixed development platform URLs" >&2
+if [ "$DB_URL" != "postgres://wr_manager_platform:wruntime-dev-manager@127.0.0.1:${WRT_POSTGRES_PORT}/wruntime_manager" ] || \
+	[ "$JOB_DB_URL" != "postgres://wr_jobs_platform:wruntime-dev-jobs@127.0.0.1:${WRT_POSTGRES_PORT}/wruntime_jobs" ]; then
+	echo "example helper did not select this worktree's platform URLs" >&2
 	exit 1
 fi
 

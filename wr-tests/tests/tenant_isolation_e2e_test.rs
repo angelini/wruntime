@@ -22,19 +22,19 @@ fn repository_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn shared_state_root(root: &Path) -> Result<PathBuf> {
+fn worktree_state_root(root: &Path) -> Result<PathBuf> {
     let output = Command::new("git")
         .args([
             "-C",
             root.to_str().context("repository path is not UTF-8")?,
             "rev-parse",
             "--path-format=absolute",
-            "--git-common-dir",
+            "--absolute-git-dir",
         ])
         .output()?;
     ensure!(
         output.status.success(),
-        "cannot derive common Git directory"
+        "cannot derive worktree Git directory"
     );
     Ok(std::fs::canonicalize(String::from_utf8(output.stdout)?.trim())?.join("wruntime-dev-state"))
 }
@@ -61,12 +61,18 @@ fn run_psql(connection: &str, sql: &str) -> Result<Output> {
             sql,
         ])
         .output()
-        .context("executing fixed development fixture probe")
+        .context("executing worktree development fixture probe")
 }
 
-fn tenant_connection(state_root: &Path, user: &str, database: &str) -> String {
+fn tenant_connection(
+    state_root: &Path,
+    host_addr: &str,
+    port: u16,
+    user: &str,
+    database: &str,
+) -> String {
     format!(
-        "host=postgres.internal hostaddr=127.0.0.1 port=5433 user={user} dbname={database} sslmode=verify-full sslrootcert={} sslcert={} sslkey={}",
+        "host=postgres.internal hostaddr={host_addr} port={port} user={user} dbname={database} sslmode=verify-full sslrootcert={} sslcert={} sslkey={}",
         state_root.join("pki/root/ca.crt").display(),
         state_root.join("pki/node-a/leaf.pem").display(),
         state_root.join("pki/node-a/key.pem").display()
@@ -74,10 +80,10 @@ fn tenant_connection(state_root: &Path, user: &str, database: &str) -> String {
 }
 
 #[test]
-fn fixed_native_fixture_enforces_behavior_and_engine_readiness_without_admin_inputs() -> Result<()>
-{
+fn worktree_native_fixture_enforces_behavior_and_engine_readiness_without_admin_inputs(
+) -> Result<()> {
     let root = repository_root();
-    let state_root = shared_state_root(&root)?;
+    let state_root = worktree_state_root(&root)?;
     let fixture = state_root.join("fixture");
     let ready = fixture.join("ready.json");
     ensure!(
@@ -85,11 +91,16 @@ fn fixed_native_fixture_enforces_behavior_and_engine_readiness_without_admin_inp
         "development PostgreSQL fixture is not ready; run host `just dev-up`"
     );
     let marker: serde_json::Value = serde_json::from_slice(&std::fs::read(&ready)?)?;
-    ensure!(marker["schema_version"] == 2);
-    ensure!(marker["compose_project"] == "wruntime-dev");
+    ensure!(marker["schema_version"] == 3);
+    ensure!(marker["compose_project"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("wruntime-dev-")));
     ensure!(marker["server_name"] == "postgres.internal");
-    ensure!(marker["host_addr"] == "127.0.0.1");
-    ensure!(marker["port"] == 5433);
+    let host_addr = marker["host_addr"]
+        .as_str()
+        .context("fixture host address is absent")?;
+    let port = u16::try_from(marker["port"].as_u64().context("fixture port is absent")?)?;
+    ensure!(host_addr == "127.0.0.1" && port > 0);
     let provisioning = PostgresProvisioningManifest::parse_toml(&std::fs::read_to_string(
         fixture.join("provisioning.toml"),
     )?)?;
@@ -126,7 +137,7 @@ fn fixed_native_fixture_enforces_behavior_and_engine_readiness_without_admin_inp
 
     let runtime = namespace_runtime_login("node-a", "stockmarket");
     let database = namespace_database("stockmarket");
-    let connection = tenant_connection(&state_root, &runtime, &database);
+    let connection = tenant_connection(&state_root, host_addr, port, &runtime, &database);
     let exchange = module_schema("stockmarket", "exchange");
     let ledger = module_schema("stockmarket", "ledger");
     let output = run_psql(
@@ -157,7 +168,13 @@ fn fixed_native_fixture_enforces_behavior_and_engine_readiness_without_admin_inp
         "runtime role assumed namespace owner"
     );
     let cross = run_psql(
-        &tenant_connection(&state_root, &runtime, &namespace_database("ecommerce")),
+        &tenant_connection(
+            &state_root,
+            host_addr,
+            port,
+            &runtime,
+            &namespace_database("ecommerce"),
+        ),
         "SELECT 1",
     )?;
     ensure!(
@@ -167,6 +184,8 @@ fn fixed_native_fixture_enforces_behavior_and_engine_readiness_without_admin_inp
     let platform = run_psql(
         &tenant_connection(
             &state_root,
+            host_addr,
+            port,
             &runtime,
             &provisioning.platform_databases.manager,
         ),
@@ -203,8 +222,8 @@ fn fixed_native_fixture_enforces_behavior_and_engine_readiness_without_admin_inp
     };
     let tenant = TenantDatabaseConfig {
         server_name: "postgres.internal".into(),
-        host_addr: Some("127.0.0.1".into()),
-        port: 5433,
+        host_addr: Some(host_addr.into()),
+        port,
         trust_root_path: state_root.join("pki/root/ca.crt").display().to_string(),
         client_cert_path: state_root.join("pki/node-a/leaf.pem").display().to_string(),
         client_key_path: state_root.join("pki/node-a/key.pem").display().to_string(),
